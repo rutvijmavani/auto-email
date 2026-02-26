@@ -1,40 +1,60 @@
-# job_fetcher.py
+from job_cache import init_cache, get_job, save_job
+from job_scraper import JobScraper, detect_portal
 
-import requests
-from bs4 import BeautifulSoup
-from config import JOB_TEXT_LIMIT
+init_cache()
+
+scraper = JobScraper()
+
 
 def fetch_job_description(url):
 
     if not url:
         return None
 
+    # 1. Check cache first
+    cached = get_job(url)
+    if cached:
+        print("Using cached job description")
+        return cached
+
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        # 2. Auto-detect if Playwright is needed
+        portal = detect_portal(url)
+        use_playwright = portal in ("workday", "icims", "taleo")
 
-        response = requests.get(url, headers=headers, timeout=10)
+        job = scraper.scrape(url, use_playwright=use_playwright)
 
-        if response.status_code != 200:
+        if not job:
+            print("Scraper returned None.")
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        # 3. Convert JobPosting to clean structured text
+        job_text = f"""
+Job Title: {job.title}
 
-        # Remove script & style
-        for script in soup(["script", "style", "noscript"]):
-            script.decompose()
+Company: {job.company}
 
-        text = soup.get_text(separator="\n")
+Location: {job.location}
 
-        # Clean blank lines
-        lines = [line.strip() for line in text.splitlines()]
-        lines = [line for line in lines if line]
+Job Type: {job.job_type}
 
-        cleaned_text = "\n".join(lines)
+Department: {job.department}
 
-        return cleaned_text[:JOB_TEXT_LIMIT]
+Salary: {job.salary}
+
+Description:
+{job.description}
+"""
+
+        if not job.description or len(job.description.strip()) < 200:
+            print("Job description too short. Skipping cache save.")
+            return None
+
+        # 4. Save structured text to cache
+        save_job(url, job_text)
+
+        return job_text
 
     except Exception as e:
-        print("Job fetch failed:", e)
+        print("Scraper integration failed:", e)
         return None
