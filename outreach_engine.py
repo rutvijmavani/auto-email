@@ -57,7 +57,8 @@ def process_leads(csv_file="recruiters.csv"):
                 template = get_template(
                     row.get("stage") or "initial",
                     row["name"],
-                    row["company"]
+                    row["company"],
+                    row.get("job_url")
                 )
 
                 if template:

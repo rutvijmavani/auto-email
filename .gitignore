@@ -15,6 +15,7 @@ env/
 # Sensitive / Personal Files
 Resume.pdf
 recruiters.csv
+*.csv
 
 # Logs
 *.log

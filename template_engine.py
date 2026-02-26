@@ -1,6 +1,32 @@
-def get_template(stage, name, company):
+from ai_personalizer import generate_job_based_intro
+from job_fetcher import fetch_job_description
+
+def get_template(stage, name, company , job_url):
+
+    stage = stage or "initial"
+
+    job_text = fetch_job_description(job_url)
+    personalized_intro = generate_job_based_intro(company, job_text)
+
 
     if stage == "initial":
+        if job_text and personalized_intro:
+            return f"""
+Hi {name},
+
+I recently came across the Backend Engineer role at {company}:
+{job_url}
+
+{personalized_intro if personalized_intro else ""}
+
+I would love the opportunity to discuss how I can contribute to your team.
+
+I’ve attached my resume for your review.
+
+Best,
+Rutvij
+"""
+
         return f"""
 Hi {name},
 
@@ -21,6 +47,16 @@ Rutvij Mavani
 """
 
     elif stage == "followup1":
+        if job_text and personalized_intro:
+            return f"""
+Hi {name},
+
+I wanted to follow up regarding the Backend Engineer role at {company}:
+{job_url}
+
+Best,
+Rutvij
+"""
         return f"""
 Hi {name},
 
@@ -37,6 +73,16 @@ Rutvij
 """
 
     elif stage == "followup2":
+        if job_text and personalized_intro:
+            return f"""
+Hi {name},
+
+This is my final follow-up regarding the Backend Engineer role at {company}:
+{job_url}
+
+Regards,
+Rutvij
+"""
         return f"""
 Hi {name},
 
