@@ -57,3 +57,40 @@ Limit to under 120 words.
     except Exception as e:
         print("Gemini error:", e)
         return ""
+
+
+def generate_subject(company, job_title):
+
+    prompt = f"""
+Generate a professional email subject line for a job outreach email.
+
+Rules:
+- Under 10 words
+- Include company name
+- Include job title
+- Professional tone
+- No emojis
+
+Company: {company}
+Job Title: {job_title}
+
+Return ONLY the subject line.
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
+
+        subject = response.text.strip()
+
+        # Safety fallback
+        if not subject or len(subject) > 100:
+            return f"{job_title} – {company}"
+
+        return subject
+
+    except Exception as e:
+        print("Subject generation failed:", e)
+        return f"{job_title} – {company}"

@@ -3,12 +3,17 @@ from email.message import EmailMessage
 from config import EMAIL, APP_PASSWORD, RESUME_PATH
 
 
-def send_email(to_email, body, company):
+def send_email(to_email, body, company, subject=None):
 
     msg = EmailMessage()
     msg["From"] = EMAIL
     msg["To"] = to_email
-    msg["Subject"] = f"{company} – Backend Engineer Interest"
+
+    # Smart fallback
+    if subject:
+        msg["Subject"] = subject
+    else:
+        msg["Subject"] = f"{company} – Backend Engineer Interest"
 
     msg.set_content(body)
 
@@ -26,7 +31,7 @@ def send_email(to_email, body, company):
             server.login(EMAIL, APP_PASSWORD)
             server.send_message(msg)
 
-        print("Sent email to", to_email)
+        print(f"Sent email to {to_email} | Subject: {msg['Subject']}")
 
     except Exception as e:
         print("Email sending failed:", e)

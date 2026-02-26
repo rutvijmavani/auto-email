@@ -8,10 +8,29 @@ def get_template(stage, name, company , job_url):
     job_text = fetch_job_description(job_url)
     personalized_intro = generate_job_based_intro(company, job_text)
 
+    # ---------- SUBJECT CREATION LOGIC (ADDED) ----------
+
+    job_title = "Software Engineer"
+
+    if job_text:
+        # Try extracting job title from structured text
+        for line in job_text.split("\n"):
+            if "Job Title:" in line:
+                job_title = line.replace("Job Title:", "").strip()
+                break
+
+    if job_text and personalized_intro:
+        from ai_personalizer import generate_subject
+        subject = generate_subject(company, job_title)
+    else:
+        subject = f"{company} – Backend Engineer Interest"
+
+    # -----------------------------------------------------
+
 
     if stage == "initial":
         if job_text and personalized_intro:
-            return f"""
+            body = f"""
 Hi {name},
 
 I recently came across the Backend Engineer role at {company}:
@@ -27,7 +46,8 @@ Best,
 Rutvij
 """
 
-        return f"""
+        else:
+            body = f"""
 Hi {name},
 
 I hope you're doing well.
@@ -45,10 +65,11 @@ I’ve attached my resume and would appreciate the opportunity to connect.
 Best regards,  
 Rutvij Mavani
 """
+        return body , subject
 
     elif stage == "followup1":
         if job_text and personalized_intro:
-            return f"""
+            body = f"""
 Hi {name},
 
 I wanted to follow up regarding the Backend Engineer role at {company}:
@@ -57,7 +78,8 @@ I wanted to follow up regarding the Backend Engineer role at {company}:
 Best,
 Rutvij
 """
-        return f"""
+        else:
+            body = f"""
 Hi {name},
 
 I wanted to briefly follow up on my previous message regarding backend opportunities at {company}.
@@ -71,10 +93,11 @@ Please let me know if there’s a good time to connect — I’d be happy to sha
 Best regards,  
 Rutvij
 """
+        return body , subject
 
     elif stage == "followup2":
         if job_text and personalized_intro:
-            return f"""
+            body = f"""
 Hi {name},
 
 This is my final follow-up regarding the Backend Engineer role at {company}:
@@ -83,7 +106,8 @@ This is my final follow-up regarding the Backend Engineer role at {company}:
 Regards,
 Rutvij
 """
-        return f"""
+        else:
+            body = f"""
 Hi {name},
 
 Just checking in one last time regarding potential backend or software engineering roles at {company}.
@@ -96,6 +120,7 @@ If there’s someone else on your team I should reach out to, I’d greatly appr
 Thank you for your time,  
 Rutvij
 """
+        return body , subject
 
     return None
 
