@@ -16,6 +16,7 @@ env/
 Resume.pdf
 recruiters.csv
 *.csv
+*.db
 
 # Logs
 *.log
