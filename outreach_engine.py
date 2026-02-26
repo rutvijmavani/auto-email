@@ -63,10 +63,12 @@ def process_leads(csv_file="recruiters.csv"):
 
                 if template:
 
+                    body, subject = template  # ← unpack here
                     send_email(
                         row["email"],
-                        template,
-                        row["company"]
+                        body,
+                        row["company"],
+                        subject
                     )
 
                     email_count = row.get("email_count", "0")

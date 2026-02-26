@@ -56,7 +56,10 @@ Description:
         # 4. Save structured text to cache
         save_job(url, job_text)
 
-        return job_text
+        return {
+            "job_text": job_text,
+            "job_title": job.title
+        }
 
     except Exception as e:
         logger.exception("Scraper integration failed for url=%s", url)
