@@ -65,7 +65,11 @@ def get_job(url):
         delete_job(url)
         return None
 
-    return zlib.decompress(content).decode()
+    try:
+        return zlib.decompress(content).decode("utf-8")
+    except (zlib.error, UnicodeDecodeError):
+        delete_job(url)
+        return None
 
 
 def delete_job(url):

@@ -1,5 +1,8 @@
 from job_cache import init_cache, get_job, save_job
 from job_scraper import JobScraper, detect_portal
+import logging
+
+logger = logging.getLogger(__name__)
 
 init_cache()
 
@@ -56,5 +59,5 @@ Description:
         return job_text
 
     except Exception as e:
-        print("Scraper integration failed:", e)
+        logger.exception("Scraper integration failed for url=%s", url)
         return None

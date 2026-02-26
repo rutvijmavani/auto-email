@@ -16,7 +16,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse , urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -148,7 +148,14 @@ class LeverScraper:
     def scrape(url: str, soup: BeautifulSoup, html: str) -> JobPosting:
         job = JobPosting(url=url, portal="lever")
 
-        json_url = url.rstrip("/") + "/json" if "/json" not in url else url
+        #json_url = url.rstrip("/") + "/json" if "/json" not in url else url
+        parsed = urlparse(url)
+        if parsed.path.rstrip("/").endswith("/json"):
+            json_url = url
+        else:
+            json_path = parsed.path.rstrip("/") + "/json"
+            json_url = urlunparse(parsed._replace(path=json_path, query="", fragment=""))
+
         try:
             resp = requests.get(json_url, timeout=10)
             if resp.ok:
