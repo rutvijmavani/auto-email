@@ -35,11 +35,16 @@ def should_send(row):
 
     # Date validation
     try:
-        last_date = datetime.strptime(last_sent, "%Y-%m-%d")
+        last_date = datetime.strptime(last_sent, "%m/%d/%Y").date()
     except ValueError:
-        return False  # safer than forcing resend
+        try:
+            last_date = datetime.strptime(last_sent, "%Y-%m-%d").date()
+        except ValueError:
+            return False
 
-    return datetime.now() - last_date > timedelta(days=SEND_INTERVAL_DAYS)
+    today = datetime.now().date()
+
+    return (today - last_date).days > SEND_INTERVAL_DAYS
 
 
 def process_leads(csv_file="recruiters.csv"):
