@@ -26,9 +26,6 @@ FALLBACK_MODEL = "gemini-2.5-flash"
 CACHE_DIR = "ai_cache"
 CACHE_TTL_DAYS = 15
 
-PRIMARY_QUOTA = 20
-FALLBACK_QUOTA = 20
-
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
@@ -109,23 +106,12 @@ Rules:
 """
 
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        if not PRIMARY_QUOTA and model == PRIMARY_MODEL:
-            continue
-        
-        if not FALLBACK_QUOTA and model == FALLBACK_MODEL:
-            return {}
 
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=prompt
             )
-
-            if model == PRIMARY_MODEL:
-                PRIMARY_QUOTA -= 1
-            
-            if model == FALLBACK_MODEL:
-                FALLBACK_QUOTA -= 1
 
             text = response.text.strip()
 
