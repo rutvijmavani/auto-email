@@ -4,7 +4,7 @@ import time
 import zlib
 
 DB_FILE = "job_cache.db"
-TTL_DAYS = 7   # auto expire jobs after 7 days
+TTL_DAYS = 15   # auto expire jobs after 7 days
 
 
 def _hash_url(url):

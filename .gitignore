@@ -12,6 +12,8 @@ venv/
 .venv/
 env/
 
+ai_cache/
+
 # Sensitive / Personal Files
 Resume.pdf
 recruiters.csv

@@ -1,30 +1,46 @@
-from ai_personalizer import generate_job_based_intro
+#from ai_personalizer import generate_job_based_intro , generate_subject , generate_followup_content
 from job_fetcher import fetch_job_description
+from ai_full_personalizer import generate_all_content
 
 def get_template(stage, name, company , job_url):
 
     stage = stage or "initial"
 
-    job_text = fetch_job_description(job_url)
-    personalized_intro = generate_job_based_intro(company, job_text)
-
-    # ---------- SUBJECT CREATION LOGIC (ADDED) ----------
-
+    # -------- SAFE INITIALIZATION --------
+    job_text = None
+    personalized_intro = None
+    follow_up_body = None
     job_title = "Software Engineer"
 
-    if job_text:
-        # Try extracting job title from structured text
-        for line in job_text.split("\n"):
-            if "Job Title:" in line:
-                job_title = line.replace("Job Title:", "").strip()
+    if job_url:
+        job_text = fetch_job_description(job_url)
+
+    if job_text: 
+        # Try extracting job title from structured text 
+        for line in job_text.split("\n"): 
+            if "Job Title:" in line: 
+                job_title = line.replace("Job Title:", "").strip() 
                 break
 
-    if job_text and personalized_intro:
-        from ai_personalizer import generate_subject
-        subject = generate_subject(company, job_title)
-    else:
-        subject = f"{company} – Backend Engineer Interest"
 
+    if job_text:
+        #  SINGLE AI CALL
+        ai_content = generate_all_content(company, job_title, job_text)
+
+        # Map AI JSON to existing variables
+        personalized_intro = ai_content.get("intro")
+
+        if stage == "followup1":
+            follow_up_body = ai_content.get("followup1")
+        elif stage == "followup2":
+            follow_up_body = ai_content.get("followup2")
+
+        subject = ai_content.get(
+            f"subject_{stage}",
+            f"{company} – Software Engineer Interest"
+        )
+    else:
+        subject = f"{company} – Software Engineer Interest"
     # -----------------------------------------------------
 
 
@@ -68,12 +84,13 @@ Rutvij Mavani
         return body , subject
 
     elif stage == "followup1":
-        if job_text and personalized_intro:
+        if job_text and personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
-I wanted to follow up regarding the Backend Engineer role at {company}:
-{job_url}
+{follow_up_body if follow_up_body else ""}
+
+Please let me know if there’s a good time to connect — I’d be happy to share more details about my experience.
 
 Best,
 Rutvij
@@ -96,12 +113,11 @@ Rutvij
         return body , subject
 
     elif stage == "followup2":
-        if job_text and personalized_intro:
+        if job_text and personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
-This is my final follow-up regarding the Backend Engineer role at {company}:
-{job_url}
+{follow_up_body if follow_up_body else ""}
 
 Regards,
 Rutvij

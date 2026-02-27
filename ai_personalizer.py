@@ -40,6 +40,7 @@ Candidate Background:
 Write 3 concise professional sentences explaining why I am a strong fit.
 Do not include email subject.
 Directly include 3 statements in the body of the email.
+Do not include greetings to the recruiter/hiring manager.
 Be confident and specific.
 Limit to under 120 words.
 """
@@ -59,17 +60,49 @@ Limit to under 120 words.
         return ""
 
 
-def generate_subject(company, job_title):
+def generate_followup_content(company, job_title, job_text, stage):
 
     prompt = f"""
-Generate a professional email subject line for a job outreach email.
+Write a concise professional follow-up email for a {job_title} role at {company}.
 
-Rules:
+Stage: {stage}
+
+Keep it under 120 words.
+No emojis.
+Professional tone.
+Return only the email body.
+"""
+
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=prompt
+    )
+
+    return response.text.strip()
+
+
+def generate_subject(company, job_title, stage="initial"):
+
+    stage_instruction = {
+        "initial": "This is the first outreach email.",
+        "followup1": "This is a polite first follow-up email.",
+        "followup2": "This is a final follow-up email."
+    }.get(stage, "This is a job outreach email.")
+
+    prompt = f"""
+Generate a professional email subject line.
+
+Context:
+{stage_instruction}
+
+Requirements:
 - Under 10 words
 - Include company name
 - Include job title
 - Professional tone
 - No emojis
+- Do not use Software Engineer in subject if job title is different.
+- Only use Software Engineer if job title is empty or Software Engineer.
 
 Company: {company}
 Job Title: {job_title}
@@ -85,12 +118,16 @@ Return ONLY the subject line.
 
         subject = response.text.strip()
 
-        # Safety fallback
         if not subject or len(subject) > 100:
-            return f"{job_title} – {company}"
+            raise ValueError("Invalid subject")
 
         return subject
 
-    except Exception as e:
-        print("Subject generation failed:", e)
-        return f"{job_title} – {company}"
+    except:
+        # Smart fallback per stage
+        if stage == "followup1":
+            return f"Following Up – {job_title} at {company}"
+        elif stage == "followup2":
+            return f"Final Follow-Up – {job_title} at {company}"
+        else:
+            return f"{job_title} – {company}"
