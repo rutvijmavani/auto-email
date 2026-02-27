@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from google import genai
 from dotenv import load_dotenv
 import re
+from quota_manager import can_call, increment_usage, all_models_exhausted
 
 load_dotenv()
 
@@ -105,13 +106,23 @@ Rules:
 - Write 3 concise professional sentences explaining why I am a strong fit in a body.
 """
 
+    if all_models_exhausted():
+        print("All model quotas exhausted for today.")
+        return {}
+
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
+
+        if not can_call(model):
+            print(f"{model} daily limit reached (local guard).")
+            continue
 
         try:
             response = client.models.generate_content(
                 model=model,
                 contents=prompt
             )
+
+            increment_usage(model)
 
             text = response.text.strip()
 

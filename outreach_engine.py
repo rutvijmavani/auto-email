@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from config import SEND_INTERVAL_DAYS, MAX_EMAIL_COUNT
 from template_engine import get_template, next_stage
 from email_sender import send_email
+from quota_manager import all_models_exhausted
 
 
 def should_send(row):
@@ -59,11 +60,20 @@ def process_leads(csv_file="recruiters.csv"):
 
             if should_send(row):
 
+                job_url = row.get("job_url")
+
+                #  AI quota exhausted AND job URL exists → queue for tomorrow
+                if job_url and all_models_exhausted():
+                    print(f"Quota exhausted. Queuing {row['email']} for tomorrow.")
+                    updated_rows.append(row)
+                    continue
+
+                # Otherwise generate normally
                 template = get_template(
                     row.get("stage") or "initial",
                     row["name"],
                     row["company"],
-                    row.get("job_url")
+                    job_url
                 )
 
                 if template:
