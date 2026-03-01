@@ -1,38 +1,50 @@
-# Environment Variables
+# ─────────────────────────────────────────
+# Environment & Secrets
+# ─────────────────────────────────────────
 .env
+credentials.json
 
-# Python Cache
+# ─────────────────────────────────────────
+# Runtime Data (never commit)
+# ─────────────────────────────────────────
+data/
+*.db
+
+# ─────────────────────────────────────────
+# CareerShift Session
+# ─────────────────────────────────────────
+careershift_session.json
+
+# ─────────────────────────────────────────
+# Resume (personal file)
+# ─────────────────────────────────────────
+Resume.pdf
+
+# ─────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
 
+# ─────────────────────────────────────────
 # Virtual Environment
+# ─────────────────────────────────────────
 venv/
 .venv/
 env/
+.env/
 
-ai_cache/
-
-# Sensitive / Personal Files
-Resume.pdf
-recruiters.csv
-*.csv
-*.db
-
-# Logs
-*.log
-logs/
-
-# OS Files
-.DS_Store
-Thumbs.db
-
-# IDE
+# ─────────────────────────────────────────
+# IDE & OS
+# ─────────────────────────────────────────
 .vscode/
 .idea/
-
-# Distribution / Build
-dist/
-build/
-*.egg-info/
+*.DS_Store
+Thumbs.db

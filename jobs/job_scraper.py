@@ -192,11 +192,25 @@ class AshbyScraper:
         job = JobPosting(url=url, portal="ashby")
         job.title = _text(soup, ["h1", ".ashby-job-posting-heading"])
         job.location = _text(soup, [".ashby-job-posting-brief-item", "[class*='location']"])
-        job.description = _text(soup, [
-            ".ashby-job-posting-description",
-            "[class*='description']",
-            "main section"
-        ])
+
+        # Try JSON-LD first (most reliable for Ashby)
+        ld_data = _extract_json_ld(soup, "JobPosting")
+        if ld_data:
+            job.title = job.title or ld_data.get("title", "")
+            job.description = ld_data.get("description", "")
+            job.location = job.location or ld_data.get("jobLocation", {}).get("address", {}).get("addressLocality", "")
+
+        # Fallback to CSS selectors
+        if not job.description:
+            job.description = _text(soup, [
+                ".ashby-job-posting-description",
+                "[class*='jobDescription']",
+                "[class*='description']",
+                "[data-testid*='description']",
+                "main section",
+                "article",
+            ])
+
         return job
 
 
@@ -404,6 +418,14 @@ class PlaywrightScraper:
             elif portal == "lever":
                 try:
                     page.wait_for_selector(".posting-description", timeout=10000)
+                except Exception:
+                    pass
+            elif portal == "ashby":
+                try:
+                    page.wait_for_selector(
+                        ".ashby-job-posting-description, [class*='description'], main section",
+                        timeout=10000
+                    )
                 except Exception:
                     pass
             else:

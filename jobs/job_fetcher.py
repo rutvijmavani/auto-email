@@ -1,5 +1,5 @@
-from job_cache import init_cache, get_job, save_job
-from job_scraper import JobScraper, detect_portal
+from db.job_cache import init_cache, get_job, save_job
+from jobs.job_scraper import JobScraper, detect_portal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -14,16 +14,14 @@ def fetch_job_description(url):
     if not url:
         return None
 
-    # 1. Check cache first
     cached = get_job(url)
     if cached:
         print("Using cached job description")
         return cached
 
     try:
-        # 2. Auto-detect if Playwright is needed
         portal = detect_portal(url)
-        use_playwright = portal in ("workday", "icims", "taleo")
+        use_playwright = portal in ("workday", "icims", "taleo", "ashby")
 
         job = scraper.scrape(url, use_playwright=use_playwright)
 
@@ -31,7 +29,6 @@ def fetch_job_description(url):
             print("Scraper returned None.")
             return None
 
-        # 3. Convert JobPosting to clean structured text
         job_text = f"""
 Job Title: {job.title}
 
@@ -53,7 +50,6 @@ Description:
             print("Job description too short. Skipping cache save.")
             return None
 
-        # 4. Save structured text to cache
         save_job(url, job_text)
 
         return {
