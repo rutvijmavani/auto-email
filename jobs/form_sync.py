@@ -47,7 +47,7 @@ def _get_sheet():
     """Authenticate and return the Google Sheet worksheet."""
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open("Job Applications")
+    sheet = client.open_by_key(SHEET_ID)
     return sheet.worksheet(SHEET_NAME)
 
 
@@ -140,7 +140,7 @@ def run():
             continue
 
         # Insert into applications table
-        app_id = add_application(
+        app_id, created = add_application(
             company=company,
             job_url=job_url,
             job_title=job_title,
@@ -148,7 +148,13 @@ def run():
         )
 
         if not app_id:
-            print(f"       [SKIP]  Already exists in DB — skipping")
+            print(f"       [ERROR] Failed to insert application — skipping")
+            skipped += 1
+            rows_to_delete.append(sheet_row_index)
+            continue
+
+        if not created:
+            print(f"       [SKIP] Already exists in DB — skipping")
             skipped += 1
             rows_to_delete.append(sheet_row_index)
             continue

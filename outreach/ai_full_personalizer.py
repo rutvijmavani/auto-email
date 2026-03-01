@@ -11,12 +11,20 @@ from db.db import get_ai_cache, save_ai_cache
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+_client = None
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env file")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+def _get_client():
+    """Lazy-initialize Gemini client. Returns None if API key is not set."""
+    global _client
+    if _client is not None:
+        return _client
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("[WARNING] GEMINI_API_KEY not set. AI generation will be skipped.")
+        return None
+    _client = genai.Client(api_key=api_key)
+    return _client
 
 # -----------------------
 # CONFIG
@@ -34,13 +42,13 @@ CACHE_TTL_DAYS = 21
 def _cache_key(company, job_title, job_text):
     """Cache key for full JD-based generation."""
     raw = f"{company}-{job_title}-{job_text}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _fallback_cache_key(company, job_title):
     """Separate cache key for fallback generation (no JD)."""
     raw = f"fallback-{company}-{job_title}"
-    return hashlib.md5(raw.encode()).hexdigest()
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 # -----------------------
@@ -55,6 +63,10 @@ def _call_model(prompt, cache_key, company, job_title):
     """
     if all_models_exhausted():
         print("All model quotas exhausted for today.")
+        return {}
+
+    client = _get_client()
+    if client is None:
         return {}
 
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:

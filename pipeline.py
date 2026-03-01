@@ -39,7 +39,7 @@ def add_job_interactively():
         return
 
     # Insert application
-    app_id = add_application(
+    app_id, created = add_application(
         company=company,
         job_url=job_url,
         job_title=job_title,
@@ -47,7 +47,11 @@ def add_job_interactively():
     )
 
     if not app_id:
-        print("[WARNING]  Job URL already exists in DB.")
+        print("[ERROR] Failed to add application.")
+        return
+
+    if not created:
+        print("[WARNING] Job URL already exists in DB.")
         return
 
     print(f"[OK] Added: {company} | {job_url} (id={app_id})")

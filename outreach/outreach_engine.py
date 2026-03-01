@@ -10,6 +10,7 @@ Send window logic:
 
 import time
 import random
+import smtplib
 from datetime import datetime, timedelta
 
 try:
@@ -26,6 +27,7 @@ from db.db import (
     get_pending_outreach,
     mark_outreach_sent,
     mark_outreach_failed,
+    mark_outreach_bounced,
     schedule_outreach,
     schedule_next_outreach,
     has_pending_or_sent_outreach,
@@ -177,12 +179,9 @@ def process_outreach():
 
         print(f"[INFO] [{stage}] {recruiter_name} @ {company} → {recruiter_email}")
 
-        # Check AI quota
-        if job_url and all_models_exhausted():
-            print(f"   [WARNING]  AI quota exhausted. Skipping until tomorrow.")
-            continue
-
         # Check AI cache — warn and skip if missing
+        # NOTE: quota check is done AFTER template fetch so cached content
+        # always sends even when AI quota is exhausted
         try:
             template = get_template(
                 stage=stage,
@@ -192,7 +191,10 @@ def process_outreach():
             )
 
             if not template:
-                print(f"   [WARNING]  No AI cache found for {company}. Run --find-only first. Skipping.")
+                if job_url and all_models_exhausted():
+                    print(f"   [WARNING] AI quota exhausted and no cached template for {company}. Skipping until tomorrow.")
+                else:
+                    print(f"   [WARNING] No AI content found for {company}. Run --find-only first. Skipping.")
                 continue
 
             body, subject = template
@@ -204,18 +206,31 @@ def process_outreach():
                 subject=subject,
             )
 
-            mark_outreach_sent(outreach_id)
-            sent_count += 1
-            print(f"   [OK] Sent | Subject: {subject}")
-
-            # Schedule next stage if no reply
-            if not row["replied"]:
-                schedule_next_outreach(recruiter_id, application_id)
+        except smtplib.SMTPRecipientsRefused:
+            print(f"   [ERROR] Hard bounce for {recruiter_email} — marking recruiter inactive")
+            mark_outreach_bounced(outreach_id, recruiter_id)
+            failed_count += 1
+            time.sleep(random.randint(30, 90))
+            continue
 
         except Exception as e:
-            print(f"   [ERROR] Failed: {e}")
+            print(f"   [ERROR] Failed to send: {e}")
             mark_outreach_failed(outreach_id)
             failed_count += 1
+            time.sleep(random.randint(30, 90))
+            continue
+
+        # Only reached if send succeeded
+        mark_outreach_sent(outreach_id)
+        sent_count += 1
+        print(f"   [OK] Sent | Subject: {subject}")
+
+        # Schedule next stage if no reply
+        try:
+            if not row["replied"]:
+                schedule_next_outreach(recruiter_id, application_id)
+        except Exception as e:
+            print(f"   [WARNING] Could not schedule next outreach: {e}")
 
         # Human-like delay between emails
         time.sleep(random.randint(30, 90))
