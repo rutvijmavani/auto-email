@@ -259,9 +259,16 @@ def update_recruiter(recruiter_id, name=None, position=None,
         fields.append("recruiter_status = ?"); values.append(recruiter_status)
     fields.append("verified_at = CURRENT_TIMESTAMP")
     values.append(recruiter_id)
-    c.execute(f"UPDATE recruiters SET {', '.join(fields)} WHERE id = ?", values)
-    conn.commit()
-    conn.close()
+    try:
+        c.execute(f"UPDATE recruiters SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        # email already belongs to another recruiter — skip email update
+        print(f"[WARNING] update_recruiter: email already exists for another recruiter — skipping email update")
+        return False
+    finally:
+        conn.close()
 
 
 def get_recruiters_by_tier(days_tier1=30, days_tier2=60):
