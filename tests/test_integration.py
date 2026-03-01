@@ -183,8 +183,8 @@ class TestIntegration(unittest.TestCase):
     # ─────────────────────────────────────────
     # TEST 5: AI cache reused on second run
     # ─────────────────────────────────────────
-    @patch("outreach.ai_full_personalizer.client")
-    def test_ai_cache_reused(self, mock_client):
+    @patch("outreach.ai_full_personalizer._get_client")
+    def test_ai_cache_reused(self, mock_get_client):
         """AI API not called when cache is warm."""
         from outreach.ai_full_personalizer import generate_all_content
         import hashlib
@@ -205,7 +205,7 @@ class TestIntegration(unittest.TestCase):
         result = generate_all_content("Apple", "SWE", job_text)
 
         # AI API should NOT have been called
-        mock_client.models.generate_content.assert_not_called()
+        mock_get_client.return_value.models.generate_content.assert_not_called()
         self.assertEqual(result["subject_initial"], "SWE at Apple")
         print("[OK] TEST 5 PASSED: AI cache reused correctly, no duplicate API calls")
 
