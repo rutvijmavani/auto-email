@@ -242,7 +242,7 @@ def add_recruiter(company, name, position, email, confidence):
 
 
 def update_recruiter(recruiter_id, name=None, position=None,
-                     confidence=None, recruiter_status=None):
+                     confidence=None, recruiter_status=None, email=None):
     conn = get_conn()
     c = conn.cursor()
     fields = []
@@ -253,6 +253,8 @@ def update_recruiter(recruiter_id, name=None, position=None,
         fields.append("position = ?"); values.append(position)
     if confidence is not None:
         fields.append("confidence = ?"); values.append(confidence)
+    if email is not None:
+        fields.append("email = ?"); values.append(email)
     if recruiter_status is not None:
         fields.append("recruiter_status = ?"); values.append(recruiter_status)
     fields.append("verified_at = CURRENT_TIMESTAMP")
@@ -333,6 +335,9 @@ def mark_outreach_bounced(outreach_id, recruiter_id):
     conn.commit()
     conn.close()
     mark_recruiter_inactive(recruiter_id, reason="email bounced")
+
+
+def recruiter_email_exists(email):
     """Returns recruiter id if exists, None otherwise."""
     conn = get_conn()
     c = conn.cursor()
