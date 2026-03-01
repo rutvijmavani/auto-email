@@ -14,8 +14,9 @@ SYMPLICITY_URL = "https://northeastern-csm.symplicity.com/students/"
 def login():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False, slow_mo=500)
-        context = browser.new_context()
-        page = context.new_page()
+        try:
+            context = browser.new_context()
+            page = context.new_page()
 
         # --- Step 1: Open Symplicity portal ---
         print("Opening Northeastern Symplicity portal...")
@@ -99,12 +100,14 @@ def login():
             print("Press Enter to save anyway, or Ctrl+C to cancel.")
             input()
 
-        context.storage_state(path=SESSION_FILE)
-        print(f"[OK] Session saved to '{SESSION_FILE}'")
-        print("[DONE] Future runs will reuse this session.")
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            context.storage_state(path=SESSION_FILE)
+            print(f"[OK] Session saved to '{SESSION_FILE}'")
+            print("[DONE] Future runs will reuse this session.")
 
-        input("\nPress Enter to close the browser...")
-        browser.close()
+            input("\nPress Enter to close the browser...")
+        finally:
+            browser.close()
 
 
 if __name__ == "__main__":

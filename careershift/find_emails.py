@@ -26,8 +26,10 @@ from db.db import (
     get_conn,
     get_all_active_applications,
     get_recruiters_by_company,
+    get_recruiters_by_tier,
     add_recruiter,
     update_recruiter,
+    mark_recruiter_inactive,
     recruiter_email_exists,
     link_recruiter_to_application,
     get_unique_companies_needing_scraping,
@@ -76,6 +78,11 @@ EXCLUDE_KEYWORDS = [
 
 
 CAREERSHIFT_QUOTA_URL = "https://www.careershift.com/App/Settings/ResetPassword"
+
+# Tiered verification thresholds (days)
+TIER1_DAYS = 30   # trust — skip verification
+TIER2_DAYS = 60   # lightweight search check
+# > TIER2_DAYS  → full profile visit (free, cached)
 
 
 def fetch_real_quota(page):
@@ -132,6 +139,165 @@ def fetch_real_quota(page):
 
 def human_delay(min_sec=1.0, max_sec=3.0):
     time.sleep(random.uniform(min_sec, max_sec))
+
+
+def verify_tier2_recruiter(page, recruiter):
+    """
+    Tier 2: Lightweight verification — search by company name and look for
+    recruiter name in results. No profile visit needed.
+    Returns True if recruiter found, False if missing (escalate to Tier 3).
+    """
+    company = recruiter["company"]
+    name = recruiter["name"].strip().lower()
+
+    try:
+        ok = submit_search(page, company, hr_term=None, require_email=False)
+        if not ok:
+            return True  # search failed — assume still valid
+
+        human_delay(2.0, 3.0)
+        html = page.content()
+        cards = parse_cards_from_html(html)
+
+        for card_name, _, _, _ in cards:
+            if name in card_name.strip().lower():
+                update_recruiter(recruiter["id"])
+                print(f"     [OK] Tier 2 verified: {recruiter['name']} still at {company}")
+                return True
+
+        print(f"     [WARNING] Tier 2: {recruiter['name']} not found in search results — escalating to Tier 3")
+        return False
+
+    except Exception as e:
+        print(f"     [WARNING] Tier 2 check failed for {recruiter['name']}: {e} — assuming valid")
+        return True
+
+
+def verify_tier3_recruiter(page, recruiter):
+    """
+    Tier 3: Full profile visit — free since profile is cached.
+    Checks company, title, and email are still current.
+    Updates DB or marks inactive accordingly.
+    """
+    name = recruiter["name"]
+    company = recruiter["company"]
+
+    # Search for recruiter by name + company to get their detail URL
+    try:
+        ok = submit_search(page, company, hr_term=None, require_email=False)
+        if not ok:
+            update_recruiter(recruiter["id"])
+            return
+
+        human_delay(2.0, 3.0)
+        html = page.content()
+        cards = parse_cards_from_html(html)
+
+        detail_url = None
+        for card_name, position, url, _ in cards:
+            if name.strip().lower() in card_name.strip().lower():
+                detail_url = url
+                break
+
+        if not detail_url:
+            print(f"     [INFO] Tier 3: {name} not found at {company} — marking inactive")
+            mark_recruiter_inactive(recruiter["id"], reason="not found in company search")
+            return
+
+        # Visit profile (cached — free)
+        human_delay(3.0, 6.0)
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+        human_delay(2.0, 4.0)
+
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Check company still matches
+        page_text = soup.get_text(separator=" ").lower()
+        if company.lower() not in page_text:
+            print(f"     [INFO] Tier 3: {name} no longer at {company} — marking inactive")
+            mark_recruiter_inactive(recruiter["id"], reason="company mismatch on profile")
+            return
+
+        # Check for updated email
+        new_email = extract_email(page)
+        current_email = recruiter["email"]
+
+        # Check for updated title
+        h4s = soup.find_all("h4")
+        new_position = h4s[1].get_text(strip=True) if len(h4s) >= 2 else None
+
+        # Update fields if changed
+        updates = {}
+        if new_email and new_email != current_email:
+            print(f"     [INFO] Email updated: {current_email} → {new_email}")
+            updates["email"] = new_email
+        if new_position and new_position != recruiter["position"]:
+            print(f"     [INFO] Title updated: {recruiter['position']} → {new_position}")
+            updates["position"] = new_position
+
+        update_recruiter(recruiter["id"], **updates)
+        print(f"     [OK] Tier 3 verified: {name} still active at {company}")
+
+        page.goto(f"{CAREERSHIFT_SEARCH_URL}#contacts_search_results",
+                  wait_until="domcontentloaded", timeout=20000)
+        human_delay(2.0, 3.0)
+
+    except Exception as e:
+        print(f"     [WARNING] Tier 3 check failed for {name}: {e}")
+        update_recruiter(recruiter["id"])  # update timestamp at minimum
+
+
+def run_tiered_verification(page, applications):
+    """
+    Run tiered verification for all existing recruiters.
+
+    Tier 1 (< 30 days):  skip — recently verified, trust as-is
+    Tier 2 (30-60 days): lightweight search check — free, no profile visit
+    Tier 3 (> 60 days):  full profile visit — free (cached), update all fields
+
+    After verification, link all active recruiters to their applications.
+    """
+    tiers = get_recruiters_by_tier(TIER1_DAYS, TIER2_DAYS)
+
+    tier1 = tiers["tier1"]
+    tier2 = tiers["tier2"]
+    tier3 = tiers["tier3"]
+
+    print(f"\n[INFO] Recruiter verification tiers:")
+    print(f"  Tier 1 (< {TIER1_DAYS} days, trust):        {len(tier1)} recruiter(s) — skipping")
+    print(f"  Tier 2 ({TIER1_DAYS}-{TIER2_DAYS} days, search check): {len(tier2)} recruiter(s)")
+    print(f"  Tier 3 (> {TIER2_DAYS} days, full visit):   {len(tier3)} recruiter(s)")
+
+    # Tier 2: lightweight search check
+    if tier2:
+        print(f"\n[INFO] Running Tier 2 verification ({len(tier2)} recruiter(s))...")
+        for recruiter in tier2:
+            print(f"  Checking: {recruiter['name']} @ {recruiter['company']}")
+            found = verify_tier2_recruiter(page, recruiter)
+            if not found:
+                # Escalate to Tier 3
+                verify_tier3_recruiter(page, recruiter)
+            human_delay(1.0, 2.0)
+
+    # Tier 3: full profile visit
+    if tier3:
+        print(f"\n[INFO] Running Tier 3 verification ({len(tier3)} recruiter(s))...")
+        for recruiter in tier3:
+            print(f"  Verifying: {recruiter['name']} @ {recruiter['company']}")
+            verify_tier3_recruiter(page, recruiter)
+            human_delay(1.0, 2.0)
+
+    # Link all still-active recruiters to their applications
+    print(f"\n[INFO] Linking verified recruiters to applications...")
+    for app in applications:
+        existing = get_recruiters_by_company(app["company"])
+        linked = 0
+        for recruiter in existing:
+            link_recruiter_to_application(app["id"], recruiter["id"])
+            linked += 1
+        if linked:
+            print(f"  [OK] {app['company']}: linked {linked} recruiter(s) to application id={app['id']}")
 
 
 def slow_type(element, text):
@@ -522,34 +688,11 @@ def run():
         print(f"[INFO] Quota remaining today: {remaining}/50\n")
 
         # ─────────────────────────────────────────
-        # STEP 1: Check existing recruiters per application
+        # STEP 1: Tiered verification of existing recruiters
         # ─────────────────────────────────────────
         print("=" * 55)
-        print("[INFO] STEP 1: Checking existing recruiters in DB...")
-
-        for app in applications:
-            company = app["company"]
-            app_id = app["id"]
-
-            existing = get_recruiters_by_company(company)
-            print(f"\n  [INFO] {company} → {len(existing)} recruiter(s) in DB")
-
-            if len(existing) >= MIN_RECRUITERS_PER_COMPANY:
-                # Validate existing recruiters (free — cached profiles)
-                for recruiter in existing:
-                    print(f"     [INFO] Validating: {recruiter['name']} ({recruiter['email']})")
-                    update_recruiter(recruiter["id"])
-                    print(f"     [OK] verified_at updated")
-
-                # Link all existing recruiters to this application
-                linked = 0
-                for recruiter in existing:
-                    link_recruiter_to_application(app_id, recruiter["id"])
-                    linked += 1
-                print(f"     [INFO] Linked {linked} recruiter(s) to application id={app_id}")
-
-            else:
-                print(f"     [WARNING]  Only {len(existing)} recruiter(s) — will scrape CareerShift")
+        print("[INFO] STEP 1: Verifying existing recruiters (tiered)...")
+        run_tiered_verification(page, applications)
 
         # ─────────────────────────────────────────
         # STEP 2: Scrape companies that need more recruiters

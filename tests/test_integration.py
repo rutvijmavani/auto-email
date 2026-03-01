@@ -20,12 +20,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
-db_module.DB_FILE = TEST_DB
 
 
 class TestIntegration(unittest.TestCase):
 
     def setUp(self):
+        db_module.DB_FILE = TEST_DB
         if os.path.exists(TEST_DB):
             os.remove(TEST_DB)
         db_module.init_db()
@@ -41,7 +41,7 @@ class TestIntegration(unittest.TestCase):
         """Complete flow: add → find → outreach."""
 
         # --- STEP 1: --add ---
-        app_id = db_module.add_application(
+        app_id, _ = db_module.add_application(
             "Google", "https://google.com/jobs/1", "Backend Engineer"
         )
         db_module.save_job(
@@ -58,7 +58,7 @@ class TestIntegration(unittest.TestCase):
 
         import hashlib
         job_text = db_module.get_job("https://google.com/jobs/1")
-        cache_key = hashlib.md5(f"Google-Backend Engineer-{job_text}".encode()).hexdigest()
+        cache_key = hashlib.sha256(f"Google-Backend Engineer-{job_text}".encode()).hexdigest()
         db_module.save_ai_cache(cache_key, "Google", "Backend Engineer", {
             "subject_initial": "Backend Engineer at Google",
             "subject_followup1": "Following Up: Google Application",
@@ -98,8 +98,8 @@ class TestIntegration(unittest.TestCase):
     # ─────────────────────────────────────────
     def test_two_applications_share_recruiters(self):
         """Two Google applications share same recruiter, both get outreach."""
-        app1 = db_module.add_application("Google", "https://google.com/jobs/1", "Backend")
-        app2 = db_module.add_application("Google", "https://google.com/jobs/2", "Platform")
+        app1, _ = db_module.add_application("Google", "https://google.com/jobs/1", "Backend")
+        app2, _ = db_module.add_application("Google", "https://google.com/jobs/2", "Platform")
 
         rid = db_module.add_recruiter(
             "Google", "John Smith", "Recruiter", "john@google.com", "auto"
@@ -129,7 +129,7 @@ class TestIntegration(unittest.TestCase):
     # ─────────────────────────────────────────
     def test_full_outreach_sequence(self):
         """All 3 stages scheduled and sent correctly."""
-        app_id = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
+        app_id, _ = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
         rid = db_module.add_recruiter("Meta", "Jane Doe", "HR", "jane@meta.com", "auto")
         db_module.link_recruiter_to_application(app_id, rid)
 
@@ -190,7 +190,7 @@ class TestIntegration(unittest.TestCase):
         import hashlib
 
         job_text = "Job Title: SWE\nDescription: Build things."
-        cache_key = hashlib.md5(f"Apple-SWE-{job_text}".encode()).hexdigest()
+        cache_key = hashlib.sha256(f"Apple-SWE-{job_text}".encode()).hexdigest()
 
         # Pre-populate cache
         db_module.save_ai_cache(cache_key, "Apple", "SWE", {
@@ -217,7 +217,7 @@ class TestIntegration(unittest.TestCase):
         import hashlib
         from datetime import timedelta
 
-        cache_key = hashlib.md5("Test-key".encode()).hexdigest()
+        cache_key = hashlib.sha256("Test-key".encode()).hexdigest()
 
         # Insert with already-expired date
         conn = db_module.get_conn()

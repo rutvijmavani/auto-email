@@ -12,7 +12,15 @@ def get_template(stage, name, company, job_url):
     job_title = "Software Engineer"
 
     if job_url:
-        job_text = fetch_job_description(job_url)
+        job_data = fetch_job_description(job_url)
+        # Normalize — returns dict on fresh scrape, str from cache
+        if isinstance(job_data, dict):
+            job_text = job_data.get("job_text", "")
+            job_title = job_data.get("job_title") or job_title
+        elif isinstance(job_data, str):
+            job_text = job_data
+        else:
+            job_text = None
 
     if job_text:
         for line in job_text.split("\n"):

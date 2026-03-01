@@ -24,7 +24,6 @@ TEST_DB = "data/test_pipeline.db"
 os.environ["TEST_MODE"] = "1"
 
 import db.db as db_module
-db_module.DB_FILE = TEST_DB
 
 
 class TestAdd(unittest.TestCase):
@@ -46,7 +45,7 @@ class TestAdd(unittest.TestCase):
     # ─────────────────────────────────────────
     def test_add_application_success(self):
         """Application row is inserted with correct data."""
-        app_id = db_module.add_application(
+        app_id, created = db_module.add_application(
             company="Google",
             job_url="https://google.com/jobs/123",
             job_title="Backend Engineer",
@@ -55,6 +54,7 @@ class TestAdd(unittest.TestCase):
 
         self.assertIsNotNone(app_id)
         self.assertGreater(app_id, 0)
+        self.assertTrue(created)
 
         # Verify in DB
         conn = db_module.get_conn()
@@ -75,18 +75,20 @@ class TestAdd(unittest.TestCase):
     # ─────────────────────────────────────────
     def test_duplicate_job_url_rejected(self):
         """Inserting same job URL twice returns existing id."""
-        app_id_1 = db_module.add_application(
+        app_id_1, created_1 = db_module.add_application(
             company="Google",
             job_url="https://google.com/jobs/123",
             job_title="Backend Engineer",
         )
-        app_id_2 = db_module.add_application(
+        app_id_2, created_2 = db_module.add_application(
             company="Google",
             job_url="https://google.com/jobs/123",
             job_title="Backend Engineer",
         )
 
         self.assertEqual(app_id_1, app_id_2)
+        self.assertTrue(created_1)
+        self.assertFalse(created_2)
 
         # Only one row in DB
         conn = db_module.get_conn()
@@ -101,27 +103,19 @@ class TestAdd(unittest.TestCase):
     # ─────────────────────────────────────────
     # TEST 3: JD scraping stores in jobs table
     # ─────────────────────────────────────────
-    @patch("jobs.job_fetcher.fetch_job_description")
-    def test_jd_scraping_stores_in_jobs_table(self, mock_fetch):
-        """JD is scraped and stored in jobs table during --add."""
-        mock_fetch.return_value = {
-            "job_text": "Backend Engineer role at Google...",
-            "job_title": "Backend Engineer"
-        }
+    def test_jd_scraping_stores_in_jobs_table(self):
+        """JD scraped during --add is stored in jobs table."""
+        url = "https://google.com/jobs/456"
+        content = "Job Title: Backend Engineer\nDescription: " + "A" * 300
 
-        # Simulate what --add does
-        db_module.add_application(
-            company="Google",
-            job_url="https://google.com/jobs/456",
-            job_title="Backend Engineer",
-        )
+        # Simulate what --add does: scrape and store JD
+        db_module.save_job(url, content)
 
-        from jobs.job_fetcher import fetch_job_description
-        result = fetch_job_description("https://google.com/jobs/456")
-
-        self.assertIsNotNone(result)
-        mock_fetch.assert_called_once_with("https://google.com/jobs/456")
-        print("[OK] TEST 3 PASSED: JD scraping called correctly")
+        # Verify it was actually stored in jobs table
+        retrieved = db_module.get_job(url)
+        self.assertIsNotNone(retrieved)
+        self.assertIn("Backend Engineer", retrieved)
+        print("[OK] TEST 3 PASSED: JD stored in jobs table correctly")
 
     # ─────────────────────────────────────────
     # TEST 4: save_job and get_job roundtrip
@@ -143,7 +137,7 @@ class TestAdd(unittest.TestCase):
     # ─────────────────────────────────────────
     def test_add_application_without_job_title(self):
         """Application without job title inserts with None job_title."""
-        app_id = db_module.add_application(
+        app_id, _ = db_module.add_application(
             company="Meta",
             job_url="https://meta.com/jobs/001",
         )

@@ -24,18 +24,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
-db_module.DB_FILE = TEST_DB
 
 
 class TestOutreachOnly(unittest.TestCase):
 
     def setUp(self):
+        db_module.DB_FILE = TEST_DB
         if os.path.exists(TEST_DB):
             os.remove(TEST_DB)
         db_module.init_db()
 
         # Setup: application + recruiter + link
-        self.app_id = db_module.add_application(
+        self.app_id, _ = db_module.add_application(
             "Google", "https://google.com/jobs/1", "Backend Engineer"
         )
         self.recruiter_id = db_module.add_recruiter(

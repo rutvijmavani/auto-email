@@ -95,7 +95,7 @@ def init_db():
             recruiter_id   INTEGER NOT NULL REFERENCES recruiters(id),
             application_id INTEGER NOT NULL REFERENCES applications(id),
             stage          TEXT DEFAULT 'initial',
-            status         TEXT DEFAULT 'pending',
+            status         TEXT DEFAULT 'pending',  -- pending/sent/failed/cancelled/bounced
             replied        INTEGER DEFAULT 0,
             scheduled_for  DATE,
             sent_at        TIMESTAMP,
@@ -161,7 +161,11 @@ def init_db():
 # ─────────────────────────────────────────
 
 def add_application(company, job_url, job_title=None, applied_date=None):
-    """Insert a new application. Returns new id or existing id if duplicate URL."""
+    """
+    Insert a new application.
+    Returns (application_id, created) where created=True means newly inserted,
+    created=False means the URL already existed in DB.
+    """
     conn = get_conn()
     c = conn.cursor()
     try:
@@ -171,11 +175,11 @@ def add_application(company, job_url, job_title=None, applied_date=None):
         """, (company, job_url, job_title,
               applied_date or datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
-        return c.lastrowid
+        return c.lastrowid, True
     except sqlite3.IntegrityError:
         c.execute("SELECT id FROM applications WHERE job_url = ?", (job_url,))
         row = c.fetchone()
-        return row["id"] if row else None
+        return (row["id"], False) if row else (None, False)
     finally:
         conn.close()
 
@@ -258,7 +262,77 @@ def update_recruiter(recruiter_id, name=None, position=None,
     conn.close()
 
 
-def recruiter_email_exists(email):
+def get_recruiters_by_tier(days_tier1=30, days_tier2=60):
+    """
+    Return all active recruiters grouped by verification tier:
+      tier1: verified_at < days_tier1 days ago → trust, skip
+      tier2: verified_at between tier1 and tier2 days ago → lightweight search check
+      tier3: verified_at > days_tier2 days ago or never verified → full profile visit
+    Returns dict with keys: tier1, tier2, tier3
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT * FROM recruiters
+        WHERE recruiter_status = 'active'
+        ORDER BY verified_at ASC
+    """)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+
+    tier1, tier2, tier3 = [], [], []
+    now = datetime.now()
+
+    for r in rows:
+        if not r["verified_at"]:
+            tier3.append(r)
+            continue
+        try:
+            verified = datetime.fromisoformat(r["verified_at"])
+            days_ago = (now - verified).days
+            if days_ago < days_tier1:
+                tier1.append(r)
+            elif days_ago < days_tier2:
+                tier2.append(r)
+            else:
+                tier3.append(r)
+        except (ValueError, TypeError):
+            tier3.append(r)
+
+    return {"tier1": tier1, "tier2": tier2, "tier3": tier3}
+
+
+def mark_recruiter_inactive(recruiter_id, reason=""):
+    """Mark a recruiter as inactive and cancel pending outreach."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE recruiters
+        SET recruiter_status = 'inactive', verified_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (recruiter_id,))
+    # Cancel all pending outreach for this recruiter
+    c.execute("""
+        UPDATE outreach SET status = 'cancelled'
+        WHERE recruiter_id = ? AND status = 'pending'
+    """, (recruiter_id,))
+    conn.commit()
+    conn.close()
+    if reason:
+        print(f"[INFO] Recruiter id={recruiter_id} marked inactive: {reason}")
+
+
+def mark_outreach_bounced(outreach_id, recruiter_id):
+    """
+    Mark an outreach email as bounced and deactivate the recruiter.
+    Called when email delivery fails permanently.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE outreach SET status = 'bounced' WHERE id = ?", (outreach_id,))
+    conn.commit()
+    conn.close()
+    mark_recruiter_inactive(recruiter_id, reason="email bounced")
     """Returns recruiter id if exists, None otherwise."""
     conn = get_conn()
     c = conn.cursor()
@@ -303,7 +377,7 @@ def get_unique_companies_needing_scraping(min_recruiters=2):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT a.id, a.company, COUNT(ar.recruiter_id) as recruiter_count
+        SELECT a.id, a.company, COUNT(r.id) as recruiter_count
         FROM applications a
         LEFT JOIN application_recruiters ar ON ar.application_id = a.id
         LEFT JOIN recruiters r ON r.id = ar.recruiter_id AND r.recruiter_status = 'active'
@@ -542,7 +616,7 @@ def save_ai_cache(cache_key, company, job_title, data, ttl_days=21):
 # ─────────────────────────────────────────
 
 def _hash_url(url):
-    return hashlib.md5(url.encode()).hexdigest()
+    return hashlib.sha256(url.encode()).hexdigest()
 
 
 def save_job(url, content):

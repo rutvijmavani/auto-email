@@ -29,10 +29,9 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
-db_module.DB_FILE = TEST_DB
 
+TEST_DB = "data/test_pipeline.db"
 LIVE = "--live" in sys.argv
 
 # Live job URLs — update with current active postings before running --live
@@ -845,6 +844,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
 class TestJobFetcherIntegration(unittest.TestCase):
 
     def setUp(self):
+        db_module.DB_FILE = TEST_DB
         if os.path.exists(TEST_DB):
             os.remove(TEST_DB)
         db_module.init_db()
@@ -947,6 +947,7 @@ class TestJobScraperLive(unittest.TestCase):
     """
 
     def setUp(self):
+        db_module.DB_FILE = TEST_DB
         if os.path.exists(TEST_DB):
             os.remove(TEST_DB)
         db_module.init_db()

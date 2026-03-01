@@ -20,20 +20,20 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
-db_module.DB_FILE = TEST_DB
 
 
 class TestFindOnly(unittest.TestCase):
 
     def setUp(self):
+        db_module.DB_FILE = TEST_DB
         if os.path.exists(TEST_DB):
             os.remove(TEST_DB)
         db_module.init_db()
 
         # Add test applications
-        self.app1_id = db_module.add_application("Google", "https://google.com/jobs/1", "Backend Engineer")
-        self.app2_id = db_module.add_application("Google", "https://google.com/jobs/2", "Platform Engineer")
-        self.app3_id = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
+        self.app1_id, _ = db_module.add_application("Google", "https://google.com/jobs/1", "Backend Engineer")
+        self.app2_id, _ = db_module.add_application("Google", "https://google.com/jobs/2", "Platform Engineer")
+        self.app3_id, _ = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
 
     def tearDown(self):
         if os.path.exists(TEST_DB):
@@ -175,7 +175,7 @@ class TestFindOnly(unittest.TestCase):
     def test_ai_cache_roundtrip(self):
         """AI content saved and retrieved from SQLite cache."""
         import hashlib
-        cache_key = hashlib.md5("Google-Backend Engineer-job text".encode()).hexdigest()
+        cache_key = hashlib.sha256("Google-Backend Engineer-job text".encode()).hexdigest()
 
         data = {
             "subject_initial": "Backend Engineer at Google",
