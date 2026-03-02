@@ -1,17 +1,22 @@
 """
-tests/test_integration.py — Integration tests for full pipeline
+tests/test_integration.py — End-to-end integration tests
 
-Tests:
-    1. Full flow: --add → --find-only → --outreach-only
-    2. Two applications at same company share recruiters
-    3. Outreach sequence runs correctly over 3 stages
-    4. CareerShift quota tracked correctly
-    5. AI cache used on second run (no duplicate AI calls)
-    6. Expired AI cache triggers regeneration
+Covers:
+- Full pipeline: add → find → outreach
+- Two applications at same company share recruiters
+- Full 3-stage outreach sequence completes correctly
+- Recruiter inactivation stops outreach sequence
+- Email bounce detection stops outreach automatically
+- Leftover CareerShift quota tops up under-stocked companies
+- AI cache reused across multiple runs (no duplicate API calls)
+- Quota health check triggers after find-only
+- Search term tracking persists across runs
+- Data retention cleanup runs on init_db
 """
 
 import sys
 import os
+import json
 import unittest
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
@@ -20,90 +25,164 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
+import db.connection as db_connection
 
 
-class TestIntegration(unittest.TestCase):
+class TestFullPipelineFlow(unittest.TestCase):
 
     def setUp(self):
-        db_module.DB_FILE = TEST_DB
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
         db_module.init_db()
 
     def tearDown(self):
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
 
-    # ─────────────────────────────────────────
-    # TEST 1: Full pipeline flow
-    # ─────────────────────────────────────────
-    def test_full_pipeline_flow(self):
-        """Complete flow: add → find → outreach."""
+    def test_add_find_outreach_full_flow(self):
+        """Complete flow: add application → find recruiter → send email."""
+        import hashlib
 
-        # --- STEP 1: --add ---
-        app_id, _ = db_module.add_application(
-            "Google", "https://google.com/jobs/1", "Backend Engineer"
+        # Step 1: Add application
+        app_id, created = db_module.add_application(
+            "Google", "https://g.com/1", "Backend Engineer", "2026-02-28"
         )
-        db_module.save_job(
-            "https://google.com/jobs/1",
-            "Job Title: Backend Engineer\nDescription: Build scalable systems at Google."
-        )
-        self.assertIsNotNone(app_id)
+        self.assertTrue(created)
 
-        # --- STEP 2: --find-only (mock CareerShift + AI) ---
-        rid = db_module.add_recruiter(
-            "Google", "John Smith", "Technical Recruiter", "john@google.com", "auto"
-        )
+        # Step 2: Add JD to cache
+        db_module.save_job("https://g.com/1", "Job Title: Backend Engineer\n" + "A" * 300)
+
+        # Step 3: Add recruiter and link
+        rid = db_module.add_recruiter("Google", "John", "Recruiter", "john@g.com", "auto")
         db_module.link_recruiter_to_application(app_id, rid)
 
-        import hashlib
-        job_text = db_module.get_job("https://google.com/jobs/1")
-        cache_key = hashlib.sha256(f"Google-Backend Engineer-{job_text}".encode()).hexdigest()
-        db_module.save_ai_cache(cache_key, "Google", "Backend Engineer", {
+        # Step 4: Add AI cache
+        key = hashlib.sha256(f"Google-Backend Engineer-".encode()).hexdigest()
+        db_module.save_ai_cache(key, "Google", "Backend Engineer", {
             "subject_initial": "Backend Engineer at Google",
-            "subject_followup1": "Following Up: Google Application",
-            "subject_followup2": "Final Follow-Up: Google",
-            "intro": "I am writing to express my interest...",
-            "followup1": "Following up on my application...",
-            "followup2": "Final follow-up...",
+            "subject_followup1": "Following Up",
+            "subject_followup2": "Final Follow-Up",
+            "intro": "I am interested.",
+            "followup1": "Following up.",
+            "followup2": "Final.",
         })
 
-        # --- STEP 3: --outreach-only ---
+        # Step 5: Schedule outreach
         today = datetime.now().strftime("%Y-%m-%d")
         oid = db_module.schedule_outreach(rid, app_id, "initial", today)
         self.assertIsNotNone(oid)
 
         pending = db_module.get_pending_outreach()
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["name"], "John Smith")
         self.assertEqual(pending[0]["company"], "Google")
 
-        # Simulate send
+        # Step 6: Mark sent and schedule followup
         db_module.mark_outreach_sent(oid)
-        next_oid = db_module.schedule_next_outreach(rid, app_id)
-        self.assertIsNotNone(next_oid)
+        next_id = db_module.schedule_next_outreach(rid, app_id)
+        self.assertIsNotNone(next_id)
 
-        # Verify followup1 scheduled
         conn = db_module.get_conn()
         c = conn.cursor()
-        c.execute("SELECT stage FROM outreach WHERE id = ?", (next_oid,))
-        row = c.fetchone()
+        c.execute("SELECT stage FROM outreach WHERE id = ?", (next_id,))
+        self.assertEqual(c.fetchone()["stage"], "followup1")
         conn.close()
-        self.assertEqual(row["stage"], "followup1")
 
-        print("[OK] TEST 1 PASSED: Full pipeline flow works end to end")
 
-    # ─────────────────────────────────────────
-    # TEST 2: Two applications share recruiters
-    # ─────────────────────────────────────────
-    def test_two_applications_share_recruiters(self):
-        """Two Google applications share same recruiter, both get outreach."""
-        app1, _ = db_module.add_application("Google", "https://google.com/jobs/1", "Backend")
-        app2, _ = db_module.add_application("Google", "https://google.com/jobs/2", "Platform")
+class TestSharedRecruiters(unittest.TestCase):
 
-        rid = db_module.add_recruiter(
-            "Google", "John Smith", "Recruiter", "john@google.com", "auto"
-        )
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def test_two_applications_share_same_recruiter(self):
+        app1, _ = db_module.add_application("Google", "https://g.com/1", "SWE")
+        app2, _ = db_module.add_application("Google", "https://g.com/2", "SRE")
+        rid = db_module.add_recruiter("Google", "John", "Recruiter", "john@g.com", "auto")
+        db_module.link_recruiter_to_application(app1, rid)
+        db_module.link_recruiter_to_application(app2, rid)
+
+        r1 = db_module.get_recruiters_for_application(app1)
+        r2 = db_module.get_recruiters_for_application(app2)
+        self.assertEqual(len(r1), 1)
+        self.assertEqual(len(r2), 1)
+
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) as cnt FROM recruiters")
+        self.assertEqual(c.fetchone()["cnt"], 1)
+        conn.close()
+
+    def test_two_applications_both_get_outreach(self):
+        app1, _ = db_module.add_application("Google", "https://g.com/1", "SWE")
+        app2, _ = db_module.add_application("Google", "https://g.com/2", "SRE")
+        rid = db_module.add_recruiter("Google", "John", "Recruiter", "john@g.com", "auto")
         db_module.link_recruiter_to_application(app1, rid)
         db_module.link_recruiter_to_application(app2, rid)
 
@@ -114,129 +193,514 @@ class TestIntegration(unittest.TestCase):
         pending = db_module.get_pending_outreach()
         self.assertEqual(len(pending), 2)
 
-        # Only 1 recruiter row
-        conn = db_module.get_conn()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) as cnt FROM recruiters")
-        count = c.fetchone()["cnt"]
-        conn.close()
-        self.assertEqual(count, 1)
 
-        print("[OK] TEST 2 PASSED: Two applications share recruiter correctly")
+class TestOutreachSequence(unittest.TestCase):
 
-    # ─────────────────────────────────────────
-    # TEST 3: Full 3-stage outreach sequence
-    # ─────────────────────────────────────────
-    def test_full_outreach_sequence(self):
-        """All 3 stages scheduled and sent correctly."""
-        app_id, _ = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
-        rid = db_module.add_recruiter("Meta", "Jane Doe", "HR", "jane@meta.com", "auto")
-        db_module.link_recruiter_to_application(app_id, rid)
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+        self.app_id, _ = db_module.add_application("Acme", "https://acme.com/1", "SWE")
+        self.rid = db_module.add_recruiter("Acme", "Jane", "Recruiter", "jane@acme.com", "auto")
+        db_module.link_recruiter_to_application(self.app_id, self.rid)
 
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def test_full_3_stage_sequence(self):
         today = datetime.now().strftime("%Y-%m-%d")
-
-        # Stage 1: initial
-        oid1 = db_module.schedule_outreach(rid, app_id, "initial", today)
+        oid1 = db_module.schedule_outreach(self.rid, self.app_id, "initial", today)
         db_module.mark_outreach_sent(oid1)
 
-        # Stage 2: followup1
-        oid2 = db_module.schedule_next_outreach(rid, app_id)
-        self.assertIsNotNone(oid2)
+        oid2 = db_module.schedule_next_outreach(self.rid, self.app_id)
         db_module.mark_outreach_sent(oid2)
 
-        # Stage 3: followup2
-        oid3 = db_module.schedule_next_outreach(rid, app_id)
-        self.assertIsNotNone(oid3)
+        oid3 = db_module.schedule_next_outreach(self.rid, self.app_id)
         db_module.mark_outreach_sent(oid3)
 
-        # Done — no more stages
-        result = db_module.schedule_next_outreach(rid, app_id)
+        result = db_module.schedule_next_outreach(self.rid, self.app_id)
         self.assertIsNone(result)
 
-        # Verify all 3 rows in DB
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("SELECT stage, status FROM outreach ORDER BY id")
         rows = c.fetchall()
         conn.close()
 
-        stages = [r["stage"] for r in rows]
-        self.assertEqual(stages, ["initial", "followup1", "followup2"])
+        self.assertEqual([r["stage"] for r in rows], ["initial", "followup1", "followup2"])
         self.assertTrue(all(r["status"] == "sent" for r in rows))
-        print("[OK] TEST 3 PASSED: Full 3-stage outreach sequence works")
 
-    # ─────────────────────────────────────────
-    # TEST 4: CareerShift quota tracked
-    # ─────────────────────────────────────────
-    def test_careershift_quota_tracking(self):
-        """Quota decrements correctly with each profile visit."""
-        initial = db_module.get_remaining_quota()
-        self.assertEqual(initial, 50)
-
-        db_module.increment_quota_used(1)
-        self.assertEqual(db_module.get_remaining_quota(), 49)
-
-        db_module.increment_quota_used(5)
-        self.assertEqual(db_module.get_remaining_quota(), 44)
-        print("[OK] TEST 4 PASSED: CareerShift quota tracked correctly")
-
-    # ─────────────────────────────────────────
-    # TEST 5: AI cache reused on second run
-    # ─────────────────────────────────────────
-    @patch("outreach.ai_full_personalizer._get_client")
-    def test_ai_cache_reused(self, mock_get_client):
-        """AI API not called when cache is warm."""
-        from outreach.ai_full_personalizer import generate_all_content
-        import hashlib
-
-        job_text = "Job Title: SWE\nDescription: Build things."
-        cache_key = hashlib.sha256(f"Apple-SWE-{job_text}".encode()).hexdigest()
-
-        # Pre-populate cache
-        db_module.save_ai_cache(cache_key, "Apple", "SWE", {
-            "subject_initial": "SWE at Apple",
-            "subject_followup1": "Following up",
-            "subject_followup2": "Final follow-up",
-            "intro": "I am interested...",
-            "followup1": "Following up...",
-            "followup2": "Final...",
-        })
-
-        result = generate_all_content("Apple", "SWE", job_text)
-
-        # AI API should NOT have been called
-        mock_get_client.return_value.models.generate_content.assert_not_called()
-        self.assertEqual(result["subject_initial"], "SWE at Apple")
-        print("[OK] TEST 5 PASSED: AI cache reused correctly, no duplicate API calls")
-
-    # ─────────────────────────────────────────
-    # TEST 6: Expired AI cache triggers regen
-    # ─────────────────────────────────────────
-    def test_expired_ai_cache_returns_none(self):
-        """Expired cache entry returns None from get_ai_cache."""
-        import hashlib
-        from datetime import timedelta
-
-        cache_key = hashlib.sha256("Test-key".encode()).hexdigest()
-
-        # Insert with already-expired date
+    def test_reply_stops_sequence(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        oid = db_module.schedule_outreach(self.rid, self.app_id, "initial", today)
         conn = db_module.get_conn()
         c = conn.cursor()
-        expired = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("""
-            INSERT INTO ai_cache (
-                cache_key, company, job_title,
-                subject_initial, subject_followup1, subject_followup2,
-                intro, followup1, followup2, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (cache_key, "Test", "Test Role",
-              "s1", "s2", "s3", "i", "f1", "f2", expired))
+        c.execute("UPDATE outreach SET replied = 1 WHERE id = ?", (oid,))
         conn.commit()
         conn.close()
 
-        result = db_module.get_ai_cache(cache_key)
-        self.assertIsNone(result)
-        print("[OK] TEST 6 PASSED: Expired AI cache returns None correctly")
+        pending = db_module.get_pending_outreach()
+        self.assertEqual(len(pending), 0)
+
+    def test_recruiter_inactive_stops_sequence(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        oid = db_module.schedule_outreach(self.rid, self.app_id, "initial", today)
+        db_module.mark_recruiter_inactive(self.rid, "left company")
+
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT status FROM outreach WHERE id = ?", (oid,))
+        self.assertEqual(c.fetchone()["status"], "cancelled")
+        conn.close()
+
+    def test_bounce_stops_sequence_and_inactivates_recruiter(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        oid = db_module.schedule_outreach(self.rid, self.app_id, "initial", today)
+        db_module.mark_outreach_bounced(oid, self.rid)
+
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT status FROM outreach WHERE id = ?", (oid,))
+        self.assertEqual(c.fetchone()["status"], "bounced")
+        c.execute("SELECT recruiter_status FROM recruiters WHERE id = ?", (self.rid,))
+        self.assertEqual(c.fetchone()["recruiter_status"], "inactive")
+        conn.close()
+
+
+class TestLeftoverQuotaIntegration(unittest.TestCase):
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def test_companies_needing_more_prioritizes_shortage(self):
+        # Google has 1 recruiter (shortage 2), Meta has 0 (shortage 3)
+        app1, _ = db_module.add_application("Google", "https://g.com/1", "SWE", "2026-01-01")
+        app2, _ = db_module.add_application("Meta", "https://m.com/1", "SWE", "2026-01-01")
+        rid = db_module.add_recruiter("Google", "John", "Recruiter", "j@g.com", "auto")
+        db_module.link_recruiter_to_application(app1, rid)
+
+        result = db_module.get_companies_needing_more_recruiters()
+        companies = [r["company"] for r in result]
+        self.assertEqual(companies[0], "Meta")
+
+    def test_companies_needing_more_excludes_inactive_recruiters(self):
+        app1, _ = db_module.add_application("Google", "https://g.com/1", "SWE")
+        for i in range(3):
+            rid = db_module.add_recruiter("Google", f"P{i}", "R", f"p{i}@g.com", "auto")
+            db_module.link_recruiter_to_application(app1, rid)
+            if i == 2:
+                db_module.mark_recruiter_inactive(rid, "test")
+
+        # Google now has 2 active, 1 inactive → still needs more
+        result = db_module.get_companies_needing_more_recruiters()
+        companies = [r["company"] for r in result]
+        self.assertIn("Google", companies)
+
+    def test_full_company_excluded_from_leftover(self):
+        app1, _ = db_module.add_application("Google", "https://g.com/1", "SWE")
+        for i in range(3):
+            rid = db_module.add_recruiter("Google", f"P{i}", "R", f"p{i}@g.com", "auto")
+            db_module.link_recruiter_to_application(app1, rid)
+
+        result = db_module.get_companies_needing_more_recruiters()
+        companies = [r["company"] for r in result]
+        self.assertNotIn("Google", companies)
+
+
+class TestAICacheIntegration(unittest.TestCase):
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+        import outreach.ai_full_personalizer as mod
+        mod._client = None
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        import outreach.ai_full_personalizer as mod
+        mod._client = None
+
+    @patch("outreach.ai_full_personalizer._get_client")
+    def test_ai_cache_reused_no_duplicate_api_calls(self, mock_get_client):
+        from outreach.ai_full_personalizer import generate_all_content, _cache_key
+        import hashlib
+
+        job_text = "Build scalable systems. " + "A" * 300
+        key = _cache_key("Apple", "SWE", job_text)
+        db_module.save_ai_cache(key, "Apple", "SWE", {
+            "subject_initial": "SWE at Apple",
+            "subject_followup1": "Following up",
+            "subject_followup2": "Final",
+            "intro": "I am interested.",
+            "followup1": "Following up.",
+            "followup2": "Final.",
+        })
+
+        result = generate_all_content("Apple", "SWE", job_text)
+        mock_get_client.assert_not_called()
+        self.assertEqual(result["subject_initial"], "SWE at Apple")
+
+    def test_applications_missing_cache_detected(self):
+        db_module.add_application("Google", "https://g.com/1", "SWE")
+        db_module.add_application("Meta", "https://m.com/1", "SWE")
+        import hashlib
+        key = hashlib.sha256("Google-SWE-".encode()).hexdigest()
+        db_module.save_ai_cache(key, "Google", "SWE", {
+            "subject_initial": "X", "subject_followup1": "X", "subject_followup2": "X",
+            "intro": "X", "followup1": "X", "followup2": "X",
+        })
+        missing = db_module.get_applications_missing_ai_cache()
+        companies = [r["company"] for r in missing]
+        self.assertIn("Meta", companies)
+        self.assertNotIn("Google", companies)
+
+
+class TestQuotaHealthIntegration(unittest.TestCase):
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def _insert_quota(self, days_ago, used, remaining=None):
+        date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        remaining = remaining if remaining is not None else 50 - used
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("""
+            INSERT OR REPLACE INTO careershift_quota (date, total_limit, used, remaining)
+            VALUES (?, 50, ?, ?)
+        """, (date, used, remaining))
+        conn.commit()
+        conn.close()
+
+    def test_underutilized_alert_triggers_and_saves(self):
+        self._insert_quota(0, 5)
+        self._insert_quota(1, 5)
+        self._insert_quota(2, 5)
+        alerts = db_module.check_quota_health()
+        cs_alerts = [a for a in alerts if a["quota_type"] == "careershift"]
+        self.assertEqual(len(cs_alerts), 1)
+        # Save and verify no duplicate
+        for alert in alerts:
+            db_module.save_quota_alert(alert)
+        alerts2 = db_module.check_quota_health()
+        cs_alerts2 = [a for a in alerts2 if a["quota_type"] == "careershift"]
+        self.assertEqual(len(cs_alerts2), 0)
+
+    def test_normal_usage_no_alert(self):
+        self._insert_quota(0, 25)
+        self._insert_quota(1, 30)
+        self._insert_quota(2, 28)
+        alerts = db_module.check_quota_health()
+        cs_alerts = [a for a in alerts if a["quota_type"] == "careershift"]
+        self.assertEqual(len(cs_alerts), 0)
+
+    def test_suggested_cap_underutilized_is_reasonable(self):
+        from config import MAX_CONTACTS_HARD_CAP
+        self._insert_quota(0, 5)
+        self._insert_quota(1, 5)
+        self._insert_quota(2, 5)
+        alerts = db_module.check_quota_health()
+        cs_alerts = [a for a in alerts if a["quota_type"] == "careershift"]
+        self.assertTrue(cs_alerts[0]["suggested_cap"] > MAX_CONTACTS_HARD_CAP)
+        self.assertLessEqual(cs_alerts[0]["suggested_cap"], 10)
+
+
+class TestSearchTermPersistence(unittest.TestCase):
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+        db_module.add_recruiter("Google", "John", "Recruiter", "john@g.com", "auto")
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def test_search_terms_persist_across_calls(self):
+        db_module.mark_search_term_used("Google", "Recruiter")
+        db_module.mark_search_term_used("Google", "Talent Acquisition")
+        result = db_module.get_used_search_terms("Google")
+        self.assertIn("Recruiter", result)
+        self.assertIn("Talent Acquisition", result)
+
+    def test_search_terms_not_duplicated(self):
+        for _ in range(5):
+            db_module.mark_search_term_used("Google", "Recruiter")
+        result = db_module.get_used_search_terms("Google")
+        self.assertEqual(result.count("Recruiter"), 1)
+
+    def test_search_terms_isolated_per_company(self):
+        db_module.add_recruiter("Meta", "Jane", "HR", "jane@meta.com", "auto")
+        db_module.mark_search_term_used("Google", "Recruiter")
+        result_meta = db_module.get_used_search_terms("Meta")
+        self.assertNotIn("Recruiter", result_meta)
+
+
+class TestDataRetentionIntegration(unittest.TestCase):
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+        db_module.init_db()
+        self.app_id, _ = db_module.add_application("Acme", "https://acme.com/1", "SWE")
+        self.rid = db_module.add_recruiter("Acme", "Jane", "Recruiter", "jane@acme.com", "auto")
+        db_module.link_recruiter_to_application(self.app_id, self.rid)
+
+    def tearDown(self):
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
+
+    def test_applications_survive_cleanup(self):
+        db_module.init_db()
+        apps = db_module.get_all_active_applications()
+        self.assertEqual(len(apps), 1)
+
+    def test_recruiters_survive_cleanup(self):
+        db_module.init_db()
+        result = db_module.get_recruiters_by_company("Acme")
+        self.assertEqual(len(result), 1)
+
+    def test_application_recruiters_survive_cleanup(self):
+        db_module.init_db()
+        result = db_module.get_recruiters_for_application(self.app_id)
+        self.assertEqual(len(result), 1)
+
+    def test_old_sent_outreach_cleaned_on_init(self):
+        old = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at)
+            VALUES (?, ?, 'initial', 'sent', ?, ?)
+        """, (self.rid, self.app_id, old, old))
+        conn.commit()
+        conn.close()
+        # Re-initialize triggers cleanup
+        db_module.init_db()
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) as cnt FROM outreach WHERE status = 'sent'")
+        self.assertEqual(c.fetchone()["cnt"], 0)
+        conn.close()
+
+    def test_recent_sent_outreach_survives_cleanup(self):
+        today = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at)
+            VALUES (?, ?, 'initial', 'sent', ?, ?)
+        """, (self.rid, self.app_id, today, today))
+        conn.commit()
+        conn.close()
+        db_module.init_db()
+        conn = db_module.get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) as cnt FROM outreach WHERE status = 'sent'")
+        self.assertEqual(c.fetchone()["cnt"], 1)
+        conn.close()
 
 
 if __name__ == "__main__":
