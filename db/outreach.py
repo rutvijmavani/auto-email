@@ -49,26 +49,35 @@ def schedule_next_outreach(recruiter_id, application_id):
         print(f"   [OK] Outreach sequence complete for recruiter_id={recruiter_id}")
         return None
 
-    # Idempotency check — don't create duplicate follow-ups
-    conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id FROM outreach
-        WHERE recruiter_id = ? AND application_id = ?
-        AND stage = ? AND status IN ('pending', 'sent')
-        LIMIT 1
-    """, (recruiter_id, application_id, next_stage))
-    existing = c.fetchone()
-    conn.close()
-    if existing:
-        print(f"   [INFO] {next_stage} already scheduled for recruiter_id={recruiter_id}")
-        return existing["id"]
-
     from config import SEND_INTERVAL_DAYS
     scheduled_for = (datetime.now() + timedelta(days=SEND_INTERVAL_DAYS)).strftime("%Y-%m-%d")
-    oid = schedule_outreach(recruiter_id, application_id, next_stage, scheduled_for)
-    print(f"   [INFO] Scheduled {next_stage} for {scheduled_for}")
-    return oid
+
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        # Atomic check + insert — BEGIN IMMEDIATE prevents concurrent duplicates
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("""
+            SELECT id FROM outreach
+            WHERE recruiter_id = ? AND application_id = ?
+            AND stage = ? AND status IN ('pending', 'sent')
+            LIMIT 1
+        """, (recruiter_id, application_id, next_stage))
+        existing = c.fetchone()
+        if existing:
+            conn.commit()
+            print(f"   [INFO] {next_stage} already scheduled for recruiter_id={recruiter_id}")
+            return existing["id"]
+        c.execute("""
+            INSERT INTO outreach (recruiter_id, application_id, stage, scheduled_for)
+            VALUES (?, ?, ?, ?)
+        """, (recruiter_id, application_id, next_stage, scheduled_for))
+        oid = c.lastrowid
+        conn.commit()
+        print(f"   [INFO] Scheduled {next_stage} for {scheduled_for}")
+        return oid
+    finally:
+        conn.close()
 
 
 def get_pending_outreach():
