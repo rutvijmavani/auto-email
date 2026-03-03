@@ -34,6 +34,9 @@ TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
 import db.connection as db_connection
 
+# Override DB_FILE at module level — before any test runs
+db_connection.DB_FILE = TEST_DB
+
 
 def make_app(company="Acme", url=None, title="SWE"):
     url = url or f"https://{company.lower()}.com/jobs/{id(company)}"

@@ -29,10 +29,14 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+TEST_DB = "data/test_pipeline.db"
+
 import db.db as db_module
 import db.connection as db_connection
 
-TEST_DB = "data/test_pipeline.db"
+# Override DB_FILE at module level — before any test runs
+db_connection.DB_FILE = TEST_DB
+
 LIVE = "--live" in sys.argv
 
 # Live job URLs — update with current active postings before running --live
