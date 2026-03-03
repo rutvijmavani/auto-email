@@ -67,15 +67,15 @@ def get_companies_needing_more_recruiters():
         SELECT
             a.company,
             MAX(a.applied_date) as latest_applied,
-            COUNT(r.id) as recruiter_count,
-            (? - COUNT(r.id)) as shortage
+            COUNT(DISTINCT r.id) as recruiter_count,
+            (? - COUNT(DISTINCT r.id)) as shortage
         FROM applications a
         LEFT JOIN application_recruiters ar ON ar.application_id = a.id
         LEFT JOIN recruiters r ON r.id = ar.recruiter_id
             AND r.recruiter_status = 'active'
         WHERE a.status = 'active'
         GROUP BY a.company
-        HAVING recruiter_count < ?
+        HAVING COUNT(DISTINCT r.id) < ?
         ORDER BY shortage DESC, latest_applied DESC
     """, (MAX_CONTACTS_HARD_CAP, MAX_CONTACTS_HARD_CAP))
     rows = [dict(r) for r in c.fetchall()]

@@ -49,6 +49,21 @@ def schedule_next_outreach(recruiter_id, application_id):
         print(f"   [OK] Outreach sequence complete for recruiter_id={recruiter_id}")
         return None
 
+    # Idempotency check — don't create duplicate follow-ups
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id FROM outreach
+        WHERE recruiter_id = ? AND application_id = ?
+        AND stage = ? AND status IN ('pending', 'sent')
+        LIMIT 1
+    """, (recruiter_id, application_id, next_stage))
+    existing = c.fetchone()
+    conn.close()
+    if existing:
+        print(f"   [INFO] {next_stage} already scheduled for recruiter_id={recruiter_id}")
+        return existing["id"]
+
     from config import SEND_INTERVAL_DAYS
     scheduled_for = (datetime.now() + timedelta(days=SEND_INTERVAL_DAYS)).strftime("%Y-%m-%d")
     oid = schedule_outreach(recruiter_id, application_id, next_stage, scheduled_for)
@@ -96,13 +111,24 @@ def mark_outreach_failed(outreach_id):
 
 
 def mark_outreach_bounced(outreach_id, recruiter_id):
-    """Mark outreach as bounced and deactivate the recruiter."""
+    """Mark outreach as bounced and deactivate the recruiter atomically."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE outreach SET status = 'bounced' WHERE id = ?", (outreach_id,))
-    conn.commit()
-    conn.close()
-    mark_recruiter_inactive(recruiter_id, reason="email bounced")
+    try:
+        c.execute("UPDATE outreach SET status = 'bounced' WHERE id = ?", (outreach_id,))
+        c.execute("""
+            UPDATE recruiters
+            SET recruiter_status = 'inactive', verified_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (recruiter_id,))
+        c.execute("""
+            UPDATE outreach SET status = 'cancelled'
+            WHERE recruiter_id = ? AND status = 'pending'
+        """, (recruiter_id,))
+        conn.commit()
+        print(f"[INFO] Recruiter id={recruiter_id} marked inactive: email bounced")
+    finally:
+        conn.close()
 
 
 def has_pending_or_sent_outreach(recruiter_id, application_id):

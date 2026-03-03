@@ -12,16 +12,15 @@ def get_today_quota():
     conn = get_conn()
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
+    # Atomic upsert — no race condition between SELECT and INSERT
+    c.execute("""
+        INSERT INTO careershift_quota (date, total_limit, used, remaining)
+        VALUES (?, 50, 0, 50)
+        ON CONFLICT(date) DO NOTHING
+    """, (today,))
+    conn.commit()
     c.execute("SELECT * FROM careershift_quota WHERE date = ?", (today,))
     row = c.fetchone()
-    if not row:
-        c.execute("""
-            INSERT INTO careershift_quota (date, total_limit, used, remaining)
-            VALUES (?, 50, 0, 50)
-        """, (today,))
-        conn.commit()
-        c.execute("SELECT * FROM careershift_quota WHERE date = ?", (today,))
-        row = c.fetchone()
     result = dict(row)
     conn.close()
     return result
@@ -31,9 +30,17 @@ def increment_quota_used(count=1):
     conn = get_conn()
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
+    # Ensure row exists before updating
+    c.execute("""
+        INSERT INTO careershift_quota (date, total_limit, used, remaining)
+        VALUES (?, 50, 0, 50)
+        ON CONFLICT(date) DO NOTHING
+    """, (today,))
+    # MAX(0, remaining - ?) prevents negative remaining
     c.execute("""
         UPDATE careershift_quota
-        SET used = used + ?, remaining = remaining - ?
+        SET used = used + ?,
+            remaining = MAX(0, remaining - ?)
         WHERE date = ?
     """, (count, count, today))
     conn.commit()

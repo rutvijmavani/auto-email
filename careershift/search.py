@@ -75,8 +75,9 @@ def extract_email(page):
         candidate = page.locator("span:has-text('@'), a:has-text('@'), p:has-text('@')").first
         candidate.wait_for(timeout=3000)
         text = candidate.inner_text().strip()
-        if "@" in text and "linkedin" not in text.lower():
-            return text
+        match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+        if match and "linkedin" not in match.group(0).lower():
+            return match.group(0)
     except:
         pass
     try:

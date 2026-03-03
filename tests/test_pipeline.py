@@ -9,6 +9,7 @@ from unittest.mock import patch, MagicMock, call
 from datetime import datetime
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from tests.conftest import cleanup_db
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
@@ -19,43 +20,11 @@ class TestPipelineAddFlow(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_add_application_new_returns_true(self):
         app_id, created = db_module.add_application("Google", "https://g.com/1", "SWE")
@@ -79,43 +48,11 @@ class TestGenerateAIContentForAll(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _add_app(self, company="Google", url="https://g.com/1", title="SWE"):
         db_module.add_application(company, url, title)
@@ -126,7 +63,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "Test"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "Test"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=True)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=True)
     @patch("db.db.get_applications_missing_ai_cache", return_value=[])
     def test_uses_jd_when_available(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -141,7 +78,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "Test"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "Test"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=True)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=True)
     @patch("db.db.get_applications_missing_ai_cache", return_value=[])
     def test_uses_fallback_when_no_jd(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -156,7 +93,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "Test"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "Test"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=True)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=True)
     @patch("db.db.get_applications_missing_ai_cache", return_value=[])
     def test_uses_fallback_when_empty_jd(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -171,7 +108,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "Test"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "Test"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=True)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=True)
     @patch("db.db.get_applications_missing_ai_cache", return_value=[])
     def test_normalizes_dict_jd_response(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -190,7 +127,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "X"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "X"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=True)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=True)
     @patch("db.db.get_applications_missing_ai_cache")
     def test_no_leftover_when_quota_exhausted(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -206,7 +143,7 @@ class TestGenerateAIContentForAll(unittest.TestCase):
            return_value={"subject_initial": "X"})
     @patch("outreach.ai_full_personalizer.generate_all_content_without_jd",
            return_value={"subject_initial": "X"})
-    @patch("db.quota_manager.all_models_exhausted", return_value=False)
+    @patch("outreach.ai_full_personalizer.all_models_exhausted", return_value=False)
     @patch("db.db.get_applications_missing_ai_cache")
     def test_leftover_quota_fills_missing_cache(
             self, mock_missing, mock_exhausted, mock_fallback, mock_gen, mock_fetch):
@@ -224,43 +161,11 @@ class TestQuotaReport(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     @patch("db.db.check_quota_health", return_value=[])
     def test_silent_when_healthy_and_silent_flag(self, mock_health):
@@ -355,43 +260,11 @@ class TestCLIFlags(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _run_main_with_args(self, args):
         import pipeline
