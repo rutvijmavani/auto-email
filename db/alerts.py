@@ -123,8 +123,13 @@ def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
         conn = get_conn()
         c = conn.cursor()
         c.execute("""
-            SELECT AVG(used) as avg_used FROM careershift_quota
-            ORDER BY date DESC LIMIT ?
+            SELECT AVG(used) AS avg_used
+            FROM (
+                SELECT used
+                FROM careershift_quota
+                ORDER BY date DESC
+                LIMIT ?
+            )
         """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
         row = c.fetchone()
         conn.close()
@@ -136,14 +141,15 @@ def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
 
 
 def save_quota_alert(alert):
-    """Save alert to quota_alerts table and mark as notified."""
+    """Save alert to quota_alerts table. notified flag controlled by caller."""
     conn = get_conn()
     c = conn.cursor()
+    notified = 1 if alert.get("notified", True) else 0
     c.execute("""
         INSERT INTO quota_alerts (
             alert_type, quota_type, start_date, end_date,
             avg_used, avg_remaining, suggested_cap, notified
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         alert["alert_type"],
         alert["quota_type"],
@@ -152,6 +158,7 @@ def save_quota_alert(alert):
         alert["avg_used"],
         alert["avg_remaining"],
         alert.get("suggested_cap"),
+        notified,
     ))
     conn.commit()
     conn.close()

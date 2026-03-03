@@ -22,7 +22,9 @@ def add_application(company, job_url, job_title=None, applied_date=None):
               applied_date or datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
         return c.lastrowid, True
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed: applications.job_url" not in str(e):
+            raise
         c.execute("SELECT id FROM applications WHERE job_url = ?", (job_url,))
         row = c.fetchone()
         return (row["id"], False) if row else (None, False)

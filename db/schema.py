@@ -178,7 +178,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS coverage_stats (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            date                DATE NOT NULL,
+            date                DATE NOT NULL UNIQUE,
             total_applications  INTEGER,
             companies_attempted INTEGER,
             auto_found          INTEGER,
@@ -188,6 +188,19 @@ def init_db():
             metric2             REAL,
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+
+    # Migration: ensure coverage_stats.date has a unique index
+    # Deduplicates existing rows keeping latest per date before creating index
+    c.execute("""
+        DELETE FROM coverage_stats
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM coverage_stats GROUP BY date
+        )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
+        ON coverage_stats(date)
     """)
 
     _cleanup_expired_ai_cache(c)

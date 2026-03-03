@@ -28,6 +28,7 @@ import unittest
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from tests.conftest import cleanup_db
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
@@ -49,43 +50,11 @@ class TestSchema(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_all_tables_created(self):
         conn = db_module.get_conn()
@@ -150,43 +119,11 @@ class TestApplications(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_insert_returns_id_and_created_true(self):
         app_id, created = db_module.add_application("Google", "https://g.com/1", "SWE")
@@ -280,43 +217,11 @@ class TestRecruiters(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_add_recruiter_returns_id(self):
         rid = db_module.add_recruiter("Google", "John", "Recruiter", "john@g.com", "auto")
@@ -424,46 +329,14 @@ class TestApplicationRecruiters(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
         self.app1 = make_app("Google", "https://g.com/1", "SWE")
         self.app2 = make_app("Google", "https://g.com/2", "SRE")
         self.app3 = make_app("Meta", "https://m.com/1", "SWE")
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_link_recruiter_to_application(self):
         rid = make_recruiter("Google", "John", "john@g.com")
@@ -542,46 +415,14 @@ class TestOutreach(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
         self.app_id = make_app()
         self.rid = make_recruiter()
         db_module.link_recruiter_to_application(self.app_id, self.rid)
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _today(self):
         return datetime.now().strftime("%Y-%m-%d")
@@ -727,43 +568,11 @@ class TestJobCache(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_save_and_get_job(self):
         url = "https://g.com/jobs/1"
@@ -795,43 +604,11 @@ class TestAICache(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _sample_data(self):
         return {
@@ -904,43 +681,11 @@ class TestCareerShiftQuota(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_initial_quota_is_50(self):
         remaining = db_module.get_remaining_quota()
@@ -968,43 +713,11 @@ class TestTieredVerification(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _add_recruiter_with_verified_at(self, days_ago, email_suffix=""):
         rid = db_module.add_recruiter(
@@ -1068,44 +781,12 @@ class TestSearchTermTracking(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
         make_recruiter("Google", "John", "john@g.com")
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_initial_used_terms_empty(self):
         result = db_module.get_used_search_terms("Google")
@@ -1148,43 +829,11 @@ class TestQuotaHealthMonitor(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _insert_quota_row(self, days_ago, used, remaining=None, total=50):
         date = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
@@ -1301,46 +950,14 @@ class TestRetentionCleanup(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
         self.app_id = make_app()
         self.rid = make_recruiter()
         db_module.link_recruiter_to_application(self.app_id, self.rid)
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _old_date(self, days=200):
         return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")

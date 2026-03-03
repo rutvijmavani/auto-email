@@ -30,6 +30,7 @@ from unittest.mock import patch, MagicMock, call
 from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from tests.conftest import cleanup_db
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
@@ -51,43 +52,11 @@ class TestSendWindow(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _mock_now(self, hour, minute=0):
         from zoneinfo import ZoneInfo
@@ -143,15 +112,17 @@ class TestSendWindow(unittest.TestCase):
         self.assertEqual(get_send_status(), "wait")
 
     def test_reschedule_remaining_pushes_to_tomorrow(self):
-        from outreach.outreach_engine import reschedule_remaining
+        from outreach.outreach_engine import reschedule_remaining, _now
         app_id = make_app()
         rid = make_recruiter()
         db_module.link_recruiter_to_application(app_id, rid)
-        today = datetime.now().strftime("%Y-%m-%d")
+        # Use engine's clock as single source of truth
+        now = _now()
+        today = now.strftime("%Y-%m-%d")
+        tomorrow = (now + timedelta(days=1)).strftime("%Y-%m-%d")
         oid = db_module.schedule_outreach(rid, app_id, "initial", today)
         pending = db_module.get_pending_outreach()
         reschedule_remaining(pending)
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("SELECT scheduled_for FROM outreach WHERE id = ?", (oid,))
@@ -168,43 +139,11 @@ class TestScheduleInitialOutreach(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def test_schedules_initial_for_new_recruiter(self):
         from outreach.outreach_engine import schedule_initial_outreach
@@ -230,12 +169,12 @@ class TestScheduleInitialOutreach(unittest.TestCase):
         conn.close()
 
     def test_schedules_for_today(self):
-        from outreach.outreach_engine import schedule_initial_outreach
+        from outreach.outreach_engine import schedule_initial_outreach, _now
         app_id = make_app()
         rid = make_recruiter()
         db_module.link_recruiter_to_application(app_id, rid)
+        today = _now().strftime("%Y-%m-%d")
         schedule_initial_outreach()
-        today = datetime.now().strftime("%Y-%m-%d")
         pending = db_module.get_pending_outreach()
         self.assertEqual(pending[0]["scheduled_for"], today)
 
@@ -262,49 +201,18 @@ class TestProcessOutreach(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
 
     def _setup_pending_email(self):
+        from outreach.outreach_engine import _now
         app_id = make_app()
         rid = make_recruiter()
         db_module.link_recruiter_to_application(app_id, rid)
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = _now().strftime("%Y-%m-%d")
         oid = db_module.schedule_outreach(rid, app_id, "initial", today)
         return app_id, rid, oid
 
@@ -421,46 +329,14 @@ class TestAIPersonalizer(unittest.TestCase):
 
     def setUp(self):
         db_connection.DB_FILE = TEST_DB
-        # Force close any lingering WAL connections before deleting
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         db_module.init_db()
         # Reset module-level _client
         import outreach.ai_full_personalizer as mod
         mod._client = None
 
     def tearDown(self):
-        # Force WAL checkpoint and close all connections before deleting on Windows
-        try:
-            import sqlite3
-            conn = sqlite3.connect(TEST_DB)
-            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            conn.close()
-        except Exception:
-            pass
-        import gc
-        gc.collect()
-        for ext in ['', '-wal', '-shm']:
-            path = TEST_DB + ext
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except PermissionError:
-                    pass
+        cleanup_db(TEST_DB)
         import outreach.ai_full_personalizer as mod
         mod._client = None
 

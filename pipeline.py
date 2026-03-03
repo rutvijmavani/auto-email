@@ -264,13 +264,15 @@ def run_quota_report(silent_if_healthy=False):
         from config import EMAIL
         send_email(to_email=EMAIL, body=body, company="Pipeline", subject=subject)
         print(f"[INFO] Quota alert email sent: {subject}")
+        # Only mark as notified after successful send
+        for alert in alerts:
+            save_quota_alert(alert)
     except Exception as e:
         print(f"[WARNING] Could not send quota alert email: {e}")
         print(f"[INFO] Alert details:\n{body}")
-
-    # Save all alerts to DB
-    for alert in alerts:
-        save_quota_alert(alert)
+        # Save without notified flag so future runs still attempt to send
+        for alert in alerts:
+            save_quota_alert({**alert, "notified": False})
 
 
 def main():

@@ -80,6 +80,7 @@ def get_applications_missing_ai_cache():
         AND NOT EXISTS (
             SELECT 1 FROM ai_cache ac
             WHERE ac.company = a.company
+            AND COALESCE(ac.job_title, '') = COALESCE(a.job_title, '')
             AND ac.expires_at > CURRENT_TIMESTAMP
         )
         ORDER BY a.applied_date DESC

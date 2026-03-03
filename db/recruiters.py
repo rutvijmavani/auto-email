@@ -30,7 +30,9 @@ def add_recruiter(company, name, position, email, confidence):
         """, (company, name, position, email, confidence))
         conn.commit()
         return c.lastrowid
-    except sqlite3.IntegrityError:
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed: recruiters.email" not in str(e):
+            raise
         c.execute("SELECT id FROM recruiters WHERE email = ?", (email,))
         row = c.fetchone()
         return row["id"] if row else None
@@ -57,11 +59,28 @@ def update_recruiter(recruiter_id, name=None, position=None,
     fields.append("verified_at = CURRENT_TIMESTAMP")
     values.append(recruiter_id)
     try:
-        c.execute(f"UPDATE recruiters SET {', '.join(fields)} WHERE id = ?", values)
+        c.execute(
+            "UPDATE recruiters SET " + ", ".join(fields) + " WHERE id = ?",
+            values
+        )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
-        print(f"[WARNING] update_recruiter: email already exists for another recruiter — skipping email update")
+    except sqlite3.IntegrityError as e:
+        if "UNIQUE constraint failed: recruiters.email" not in str(e):
+            raise
+        # Email conflict — retry without email field to preserve other updates
+        retry_fields = [f for f in fields if f != "email = ?"]
+        retry_values = [v for f, v in zip(fields, values[:-1]) if f != "email = ?"]
+        retry_values.append(recruiter_id)
+        if len(retry_fields) > 1:  # more than just verified_at
+            c.execute(
+                "UPDATE recruiters SET " + ", ".join(retry_fields) + " WHERE id = ?",
+                retry_values
+            )
+            conn.commit()
+            print("[WARNING] update_recruiter: email already exists — applied non-email updates only")
+            return True
+        print("[WARNING] update_recruiter: email already exists — no other fields to update")
         return False
     finally:
         conn.close()
