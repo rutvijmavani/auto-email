@@ -177,7 +177,7 @@ def process_outreach():
         recruiter_id    = row["recruiter_id"]
         application_id  = row["application_id"]
 
-        print(f"[INFO] [{stage}] {recruiter_name} @ {company} → {recruiter_email}")
+        print(f"[INFO] [{stage}] {recruiter_name} @ {company} -> {recruiter_email}")
 
         # Check AI cache — warn and skip if missing
         # NOTE: quota check is done AFTER template fetch so cached content

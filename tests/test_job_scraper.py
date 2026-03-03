@@ -30,6 +30,7 @@ from bs4 import BeautifulSoup
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import db.db as db_module
+import db.connection as db_connection
 
 TEST_DB = "data/test_pipeline.db"
 LIVE = "--live" in sys.argv
@@ -844,14 +845,44 @@ class TestJobScraperOrchestrator(unittest.TestCase):
 class TestJobFetcherIntegration(unittest.TestCase):
 
     def setUp(self):
-        db_module.DB_FILE = TEST_DB
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
         db_module.init_db()
 
     def tearDown(self):
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
 
     def test_returns_none_for_empty_url(self):
         from jobs.job_fetcher import fetch_job_description
@@ -947,16 +978,46 @@ class TestJobScraperLive(unittest.TestCase):
     """
 
     def setUp(self):
-        db_module.DB_FILE = TEST_DB
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        db_connection.DB_FILE = TEST_DB
+        # Force close any lingering WAL connections before deleting
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
         db_module.init_db()
         from jobs.job_scraper import JobScraper
         self.scraper = JobScraper()
 
     def tearDown(self):
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        # Force WAL checkpoint and close all connections before deleting on Windows
+        try:
+            import sqlite3
+            conn = sqlite3.connect(TEST_DB)
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            conn.close()
+        except Exception:
+            pass
+        import gc
+        gc.collect()
+        for ext in ['', '-wal', '-shm']:
+            path = TEST_DB + ext
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except PermissionError:
+                    pass
 
     def _assert_valid_job(self, job, portal):
         self.assertIsNotNone(job, f"Scraper returned None for {portal}")

@@ -1,0 +1,201 @@
+# db/schema.py — Database schema creation and cleanup
+
+import time
+from datetime import datetime, timedelta
+
+from db.connection import get_conn
+from config import (
+    RETENTION_OUTREACH_SENT,
+    RETENTION_OUTREACH_PENDING,
+    RETENTION_OUTREACH_FAILED,
+    RETENTION_JOB_CACHE,
+    RETENTION_MODEL_USAGE,
+    RETENTION_CAREERSHIFT_QUOTA,
+    RETENTION_QUOTA_ALERTS,
+)
+
+
+def _cleanup_expired_ai_cache(c):
+    c.execute("DELETE FROM ai_cache WHERE expires_at <= CURRENT_TIMESTAMP")
+
+
+def _cleanup_expired_jobs(c):
+    c.execute("DELETE FROM jobs WHERE created_at <= ?",
+              (int(time.time()) - RETENTION_JOB_CACHE * 86400,))
+
+
+def _cleanup_old_model_usage(c):
+    cutoff = (datetime.now() - timedelta(days=RETENTION_MODEL_USAGE)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM model_usage WHERE date < ?", (cutoff,))
+
+
+def _cleanup_outreach(c):
+    """Tiered outreach cleanup based on status."""
+    c.execute("""
+        DELETE FROM outreach WHERE status = 'sent'
+        AND sent_at < DATE('now', ?)
+    """, (f"-{RETENTION_OUTREACH_SENT} days",))
+
+    c.execute("""
+        DELETE FROM outreach WHERE status = 'pending'
+        AND scheduled_for < DATE('now', ?)
+    """, (f"-{RETENTION_OUTREACH_PENDING} days",))
+
+    c.execute("""
+        DELETE FROM outreach WHERE status IN ('failed', 'bounced', 'cancelled')
+        AND created_at < DATE('now', ?)
+    """, (f"-{RETENTION_OUTREACH_FAILED} days",))
+
+
+def _cleanup_careershift_quota(c):
+    cutoff = (datetime.now() - timedelta(days=RETENTION_CAREERSHIFT_QUOTA)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM careershift_quota WHERE date < ?", (cutoff,))
+
+
+def _cleanup_quota_alerts(c):
+    c.execute("""
+        DELETE FROM quota_alerts
+        WHERE created_at < DATE('now', ?)
+    """, (f"-{RETENTION_QUOTA_ALERTS} days",))
+
+
+def init_db():
+    conn = get_conn()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS applications (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            company      TEXT NOT NULL,
+            job_url      TEXT NOT NULL UNIQUE,
+            job_title    TEXT,
+            applied_date DATE DEFAULT (DATE('now')),
+            status       TEXT DEFAULT 'active',
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS recruiters (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            company           TEXT NOT NULL,
+            name              TEXT,
+            position          TEXT,
+            email             TEXT UNIQUE,
+            confidence        TEXT,
+            recruiter_status  TEXT DEFAULT 'active',
+            last_scraped_at   TIMESTAMP,
+            used_search_terms TEXT DEFAULT '[]',
+            verified_at       TIMESTAMP,
+            created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS application_recruiters (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            application_id INTEGER NOT NULL REFERENCES applications(id),
+            recruiter_id   INTEGER NOT NULL REFERENCES recruiters(id),
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(application_id, recruiter_id)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS outreach (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            recruiter_id   INTEGER NOT NULL REFERENCES recruiters(id),
+            application_id INTEGER NOT NULL REFERENCES applications(id),
+            stage          TEXT DEFAULT 'initial',
+            status         TEXT DEFAULT 'pending',
+            replied        INTEGER DEFAULT 0,
+            scheduled_for  DATE,
+            sent_at        TIMESTAMP,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS careershift_quota (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            date        DATE NOT NULL UNIQUE DEFAULT (DATE('now')),
+            total_limit INTEGER DEFAULT 50,
+            used        INTEGER DEFAULT 0,
+            remaining   INTEGER DEFAULT 50
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS ai_cache (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            cache_key         TEXT NOT NULL UNIQUE,
+            company           TEXT NOT NULL,
+            job_title         TEXT NOT NULL,
+            subject_initial   TEXT,
+            subject_followup1 TEXT,
+            subject_followup2 TEXT,
+            intro             TEXT,
+            followup1         TEXT,
+            followup2         TEXT,
+            created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at        TIMESTAMP NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            url_hash   TEXT PRIMARY KEY,
+            job_url    TEXT,
+            content    BLOB,
+            created_at INTEGER
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS model_usage (
+            model TEXT,
+            date  TEXT,
+            count INTEGER,
+            PRIMARY KEY (model, date)
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS quota_alerts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type    TEXT NOT NULL,
+            quota_type    TEXT NOT NULL,
+            start_date    DATE NOT NULL,
+            end_date      DATE NOT NULL,
+            avg_used      REAL,
+            avg_remaining REAL,
+            suggested_cap INTEGER,
+            notified      INTEGER DEFAULT 0,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS coverage_stats (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            date                DATE NOT NULL,
+            total_applications  INTEGER,
+            companies_attempted INTEGER,
+            auto_found          INTEGER,
+            rejected_count      INTEGER,
+            exhausted_count     INTEGER,
+            metric1             REAL,
+            metric2             REAL,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    _cleanup_expired_ai_cache(c)
+    _cleanup_expired_jobs(c)
+    _cleanup_old_model_usage(c)
+    _cleanup_outreach(c)
+    _cleanup_careershift_quota(c)
+    _cleanup_quota_alerts(c)
+    conn.commit()
+    conn.close()
+    print("[OK] Database initialized: data/recruiter_pipeline.db")
