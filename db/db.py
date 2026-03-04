@@ -34,9 +34,11 @@ from db.applications import (
     get_all_active_applications,
     get_application_by_id,
     mark_application_exhausted,
+    mark_applications_exhausted,
     reactivate_application,
     update_application_expected_domain,
     get_existing_domain_for_company,
+    convert_prospective_to_active,
 )
 
 # ─────────────────────────────────────────
@@ -113,6 +115,21 @@ from db.alerts import (
     get_coverage_stats,
     _calculate_suggested_cap,
     _alert_already_sent,
+)
+
+# ─────────────────────────────────────────
+# PROSPECTIVE COMPANIES
+# ─────────────────────────────────────────
+from db.prospective import (
+    add_prospective_company,
+    get_pending_prospective,
+    get_prospective_companies,
+    mark_prospective_scraped,
+    mark_prospective_exhausted,
+    mark_prospective_converted,
+    is_prospective,
+    get_prospective_status_summary,
+    get_prospective_company,
 )
 
 # ─────────────────────────────────────────

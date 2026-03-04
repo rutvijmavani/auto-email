@@ -13,18 +13,34 @@ Daily schedule:
 CLI flags:
   --sync-forms    pull Google Form responses → insert into DB + scrape JD
   --add           add a single job application interactively
-  --find-only     scrape CareerShift + generate AI content + quota health check
-  --verify-only   verify all active recruiters + report under-stocked companies
-  --outreach-only schedule + send outreach emails
-  --quota-report  check quota health and send alert email if needed
+  --find-only           scrape CareerShift + generate AI content + quota health check
+  --verify-only         verify all active recruiters + report under-stocked companies
+  --import-prospects    bulk import prospective companies from prospects.txt
+  --prospects-status    show prospective pipeline status summary
+  --outreach-only       schedule + send outreach emails
+  --quota-report        check quota health and send alert email if needed
 """
 
 import os
 import sys
+import random
 from datetime import datetime
+from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
+from careershift.constants import SESSION_FILE
+from careershift.utils import human_delay
+from careershift.verification import run_tiered_verification
+from config import MIN_RECRUITERS_PER_COMPANY
 
-from db.db import init_db, add_application, get_remaining_quota,\
-    update_application_expected_domain
+from db.db import (
+    init_db, add_application, get_remaining_quota,
+    update_application_expected_domain, get_application_by_id,
+    convert_prospective_to_active, is_prospective, mark_prospective_converted,
+    add_prospective_company, get_prospective_status_summary,
+    get_prospective_companies,
+    get_all_active_applications, get_unique_companies_needing_scraping,
+    get_recruiters_by_company,
+)
 
 
 def extract_expected_domain(job_url):
@@ -93,6 +109,23 @@ def add_job_interactively():
 
     expected_domain = extract_expected_domain(job_url)
 
+    # ── Prospective detection ──
+    # Check if recruiters already pre-scraped for this company
+    if is_prospective(company):
+        print(f"[INFO] '{company}' found in prospective pipeline — recruiters already pre-scraped!")
+        converted_id = convert_prospective_to_active(
+            company=company,
+            real_job_url=job_url,
+            job_title=job_title,
+            expected_domain=expected_domain,
+        )
+        if converted_id:
+            mark_prospective_converted(company)
+            print(f"[OK] Converted prospective → active (id={converted_id})")
+            print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
+            return
+        # Conversion failed (e.g. placeholder URL mismatch) → fall through to normal --add
+
     app_id, created = add_application(
         company=company,
         job_url=job_url,
@@ -106,9 +139,11 @@ def add_job_interactively():
         return
 
     if not created:
-        # URL already exists — update expected_domain in case it improved
+        # URL already exists — backfill expected_domain only if currently NULL
         if expected_domain:
-            update_application_expected_domain(app_id, expected_domain)
+            existing = get_application_by_id(app_id)
+            if existing and not existing.get("expected_domain"):
+                update_application_expected_domain(app_id, expected_domain)
         print("[WARNING] Job URL already exists in DB.")
         return
 
@@ -241,6 +276,74 @@ def _generate_ai_content_for_all():
     print(f"\n[OK] AI content — Generated: {generated} | Skipped (cached): {skipped} | Failed: {failed}")
 
 
+def run_import_prospects(filepath="prospects.txt"):
+    """
+    Bulk import prospective companies from a text file.
+    One company name per line. Lines starting with # and blank lines ignored.
+    """
+    if not os.path.exists(filepath):
+        print(f"[ERROR] File not found: {filepath}")
+        print(f"[INFO] Create a prospects.txt file with one company name per line.")
+        return
+
+    print(f"\n[INFO] Importing prospective companies from {filepath}...")
+
+    added = 0
+    skipped = 0
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            company = line.strip()
+            if not company or company.startswith("#"):
+                continue
+            if add_prospective_company(company):
+                print(f"  [+] {company}")
+                added += 1
+            else:
+                skipped += 1
+
+    print(f"\n[OK] Import complete — Added: {added} | Already existed: {skipped}")
+    print(f"[INFO] Run --find-only to start pre-scraping during leftover quota.")
+
+
+def run_prospects_status():
+    """Show status summary of all prospective companies."""
+    summary = get_prospective_status_summary()
+
+    if not summary:
+        print("\n[INFO] No prospective companies found.")
+        print("[INFO] Import one with: python pipeline.py --import-prospects prospects.txt")
+        return
+
+    print("\n" + "=" * 55)
+    print("[INFO] Prospective Companies Status")
+    print("=" * 55)
+
+    total = sum(summary.values())
+    for status in ["pending", "scraped", "converted", "exhausted"]:
+        count = summary.get(status, 0)
+        label = {
+            "pending":   "Pending (not yet scraped)",
+            "scraped":   "Scraped (recruiters ready)",
+            "converted": "Converted (applied)",
+            "exhausted": "Exhausted (no data found)",
+        }[status]
+        print(f"  {label:<35} {count:>3}")
+
+    print(f"  {'─'*39}")
+    print(f"  {'Total':<35} {total:>3}")
+
+    # Show scraped companies ready for outreach
+    scraped = get_prospective_companies(status="scraped")
+    if scraped:
+        print(f"\n[OK] Ready for immediate outreach when you apply:")
+        for p in scraped[:10]:
+            print(f"  → {p['company']}")
+        if len(scraped) > 10:
+            print(f"  ... and {len(scraped) - 10} more")
+
+    print("=" * 55)
+
+
 def run_verify_only():
     """
     Verify all active recruiters and report under-stocked companies.
@@ -251,19 +354,6 @@ def run_verify_only():
       3. Detect companies that dropped below MIN_RECRUITERS threshold
       4. Print summary report — under-stocked companies picked up by next --find-only
     """
-    import random
-    from playwright.sync_api import sync_playwright
-    from dotenv import load_dotenv
-    from careershift.constants import SESSION_FILE
-    from careershift.utils import human_delay
-    from careershift.verification import run_tiered_verification
-    from db.db import (
-        get_all_active_applications,
-        get_unique_companies_needing_scraping,
-        get_recruiters_by_company,
-    )
-    from config import MIN_RECRUITERS_PER_COMPANY
-
     load_dotenv()
 
     if not os.path.exists(SESSION_FILE):
@@ -449,6 +539,16 @@ def main():
 
     if "--verify-only" in args:
         run_verify_only()
+        return
+
+    if "--import-prospects" in args:
+        # Optional custom filepath: python pipeline.py --import-prospects mylist.txt
+        filepath = next((a for a in args if not a.startswith("--")), "prospects.txt")
+        run_import_prospects(filepath)
+        return
+
+    if "--prospects-status" in args:
+        run_prospects_status()
         return
 
     if "--quota-report" in args:

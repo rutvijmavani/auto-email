@@ -22,6 +22,10 @@ from db.db import (
     add_recruiter,
     link_recruiter_to_application,
     mark_application_exhausted,
+    mark_applications_exhausted,
+    get_pending_prospective,
+    mark_prospective_scraped,
+    mark_prospective_exhausted,
 )
 from careershift.constants import SESSION_FILE, MIN_RECRUITERS_PER_COMPANY
 from careershift.utils import human_delay
@@ -36,6 +40,22 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
 ]
+
+
+def _get_apps_and_domain(applications, company):
+    """
+    Return (matching_apps, expected_domain) for a company.
+    matching_apps: all active applications for this company.
+    expected_domain: first non-empty expected_domain found, or "".
+    Centralises repeated lookup used in Step 2 and Step 3.
+    """
+    matching_apps = [a for a in applications if a["company"] == company]
+    expected_domain = next(
+        (a.get("expected_domain") for a in matching_apps
+         if a.get("expected_domain")),
+        ""
+    )
+    return matching_apps, expected_domain
 
 
 def _save_contacts(contacts, company, applications):
@@ -59,6 +79,45 @@ def _save_contacts(contacts, company, applications):
         for app in matching_apps:
             link_recruiter_to_application(app["id"], recruiter_id)
             print(f"   [INFO] Linked to application id={app['id']} ({app['job_title'] or app['job_url']})")
+
+
+def _save_prospective_contacts(contacts, company):
+    """
+    Save prospective recruiter contacts to DB under a placeholder application.
+    When user later applies (--add), the placeholder converts to real application.
+    """
+    from db.db import add_application
+
+    # Create placeholder application for this prospective company
+    placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
+    app_id, _ = add_application(
+        company=company,
+        job_url=placeholder_url,
+        job_title=None,
+        status_override="prospective",
+    )
+
+    if not app_id:
+        print(f"   [WARNING] Could not create placeholder for {company}")
+        return
+
+    for contact in contacts:
+        existing_id = recruiter_email_exists(contact["email"])
+        if existing_id:
+            recruiter_id = existing_id
+            print(f"   [SKIP] Already in DB: {contact['email']}")
+        else:
+            recruiter_id = add_recruiter(
+                company=company,
+                name=contact["name"],
+                position=contact["position"],
+                email=contact["email"],
+                confidence=contact["confidence"],
+            )
+            print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
+
+        link_recruiter_to_application(app_id, recruiter_id)
+
 
 
 def run():
@@ -133,12 +192,9 @@ def run():
                 print(f"\n{'='*55}")
                 print(f"[INFO] [{i+1}/{len(companies_to_scrape)}] {company} (max {max_contacts})")
 
-                # Get all matching applications for this company
-                matching_apps = [a for a in applications if a["company"] == company]
-                expected_domain = next(
-                    (a.get("expected_domain") for a in matching_apps
-                     if a.get("expected_domain")),
-                    ""
+                # Get all matching applications and expected_domain for this company
+                matching_apps, expected_domain = _get_apps_and_domain(
+                    applications, company
                 )
 
                 contacts = scrape_company(page, company, max_contacts,
@@ -148,10 +204,9 @@ def run():
                     # None = skip (weak signal, retry tomorrow) — not exhausted
                     print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
                 elif not contacts:
-                    # [] = exhaust — mark ALL matching applications exhausted
+                    # [] = exhaust — mark ALL matching applications exhausted atomically
                     print(f"   [INFO] Exhausting {company} — no valid recruiters found")
-                    for app in matching_apps:
-                        mark_application_exhausted(app["id"])
+                    mark_applications_exhausted([app["id"] for app in matching_apps])
                 else:
                     _save_contacts(contacts, company, applications)
 
@@ -181,12 +236,8 @@ def run():
 
                     print(f"\n[INFO] {company} — needs {shortage} more recruiter(s), fetching {max_extra}")
 
-                    matching_apps = [a for a in applications
-                                      if a["company"] == company]
-                    expected_domain = next(
-                        (a.get("expected_domain") for a in matching_apps
-                         if a.get("expected_domain")),
-                        ""
+                    matching_apps, expected_domain = _get_apps_and_domain(
+                        applications, company
                     )
 
                     contacts = scrape_company(page, company, max_extra,
@@ -196,6 +247,41 @@ def run():
                         print(f"   [INFO] Skipping {company} — weak signal")
                     elif contacts:
                         _save_contacts(contacts, company, applications)
+
+                    human_delay(3.0, 7.0)
+
+        # ─────────────────────────────────────────
+        # STEP 3 — Priority 2: Prospective companies
+        # ─────────────────────────────────────────
+        remaining_prospective = get_remaining_quota()
+        if remaining_prospective > 0:
+            pending = get_pending_prospective()
+            if pending:
+                print(f"\n{'='*55}")
+                print(f"[INFO] STEP 3 (Priority 2): Pre-scraping prospective companies")
+                print(f"[INFO] {remaining_prospective} credits remaining — "
+                      f"{len(pending)} prospective companies pending")
+
+                for prospect in pending:
+                    if get_remaining_quota() == 0:
+                        break
+
+                    company  = prospect["company"]
+                    max_extra = min(3, get_remaining_quota())
+
+                    print(f"\n[INFO] Prospective: {company} (max {max_extra})")
+
+                    contacts = scrape_company(page, company, max_extra, "")
+
+                    if contacts is None:
+                        print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
+                    elif not contacts:
+                        print(f"   [INFO] Exhausting prospective {company}")
+                        mark_prospective_exhausted(company)
+                    else:
+                        # Save recruiters under a placeholder application
+                        _save_prospective_contacts(contacts, company)
+                        mark_prospective_scraped(company)
 
                     human_delay(3.0, 7.0)
 
