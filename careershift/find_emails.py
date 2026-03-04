@@ -139,6 +139,10 @@ def run():
         print("[INFO] Import prospects:   python pipeline.py --import-prospects prospects.txt")
         return
 
+    # Stats tracking — initialized before playwright so accessible after
+    _scrape_stats = []
+    _prospective_stats = {"scraped": 0, "exhausted": 0}
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, slow_mo=100)
         context = browser.new_context(
@@ -219,6 +223,16 @@ def run():
                     mark_applications_exhausted([app["id"] for app in matching_apps])
                 else:
                     _save_contacts(contacts, company, applications)
+                    _scrape_stats.append({
+                        "name": company, "status": "found",
+                        "count": len(contacts),
+                    })
+
+                # Track non-success statuses
+                if contacts is None:
+                    _scrape_stats.append({"name": company, "status": "skipped", "count": 0})
+                elif contacts == []:
+                    _scrape_stats.append({"name": company, "status": "exhausted", "count": 0})
 
                 human_delay(3.0, 7.0)
 
@@ -293,16 +307,28 @@ def run():
                         saved = _save_prospective_contacts(contacts, company)
                         if saved:
                             mark_prospective_scraped(company)
+                            _prospective_stats["scraped"] += 1
                         else:
                             print(f"   [WARNING] Could not persist contacts for {company} — not marking scraped")
+
+                    if not contacts:
+                        _prospective_stats["exhausted"] += 1
 
                     human_delay(3.0, 7.0)
 
         browser.close()
 
     remaining_after = get_remaining_quota()
+    quota_used = 50 - remaining_after
     print(f"\n{'='*55}")
-    print(f"[OK] Done! Quota used: {50 - remaining_after}/50 | Remaining: {remaining_after}/50")
+    print(f"[OK] Done! Quota used: {quota_used}/50 | Remaining: {remaining_after}/50")
+
+    return {
+        "quota_used":            quota_used,
+        "companies":             _scrape_stats,
+        "prospective_scraped":   _prospective_stats.get("scraped", 0),
+        "prospective_exhausted": _prospective_stats.get("exhausted", 0),
+    }
 
 
 if __name__ == "__main__":
