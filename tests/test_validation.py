@@ -354,15 +354,16 @@ class TestAnalyzeBuffer(unittest.TestCase):
         self.assertEqual(result[0]["email"], "john@collectivela.com")
 
     def test_no_reference_domain_empty_string(self):
-        # No reference at all — all same domain → insert all
+        # No reference domain at all → trust buffer as-is
+        # Empty string reference means we have no baseline to compare against
+        # Correct behavior: return full buffer (don't discard valid recruiters)
         buffer = [
             self._record("john@collective.com"),
             self._record("jane@collective.com", "Jane"),
         ]
         result = analyze_buffer(buffer, "")
-        # All same domain — consistent signal regardless of reference
-        # buffer_root = "collective", reference = "" → not equal → discard
-        self.assertEqual(result, [])
+        # No reference → trust buffer → insert all
+        self.assertEqual(len(result), 2)
 
     # ── Top-up scenario ──
 
@@ -404,6 +405,31 @@ class TestAnalyzeBuffer(unittest.TestCase):
         result = analyze_buffer(buffer, "collective")
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["email"], "john@collective.com")
+
+    def test_no_reference_domain_returns_full_buffer(self):
+        """No expected_domain and no existing_db_domain → trust buffer as-is."""
+        buffer = [
+            self._record("john@collective.com"),
+            self._record("jane@collective.com", "Jane"),
+        ]
+        result = analyze_buffer(buffer, "")
+        self.assertEqual(len(result), 2)
+
+    def test_none_reference_domain_returns_full_buffer(self):
+        """None expected_domain and no existing_db_domain → trust buffer as-is."""
+        buffer = [self._record("john@collective.com")]
+        result = analyze_buffer(buffer, None)
+        self.assertEqual(len(result), 1)
+
+    def test_no_reference_mixed_domains_returns_full_buffer(self):
+        """No reference domain with mixed domains → return all (no tiebreaker)."""
+        buffer = [
+            self._record("john@collective.com"),
+            self._record("jane@collective-la.com", "Jane"),
+        ]
+        result = analyze_buffer(buffer, "")
+        # No reference to compare against → trust both
+        self.assertEqual(len(result), 2)
 
 
 # ─────────────────────────────────────────
@@ -730,7 +756,7 @@ class TestScrapeCompanyValidation(unittest.TestCase):
         ]
 
         page = MagicMock()
-        result = scrape_company(page, "Collective", 3, "collective")
+        scrape_company(page, "Collective", 3, "collective")
         mock_visit.assert_not_called()
 
     @patch("careershift.scraper.submit_search", return_value=True)
@@ -758,7 +784,7 @@ class TestScrapeCompanyValidation(unittest.TestCase):
         }
 
         page = MagicMock()
-        result = scrape_company(page, "Collective", 1, "collective")
+        scrape_company(page, "Collective", 1, "collective")
         # Only 1 profile should be visited
         self.assertEqual(mock_visit.call_count, 1)
 
@@ -981,7 +1007,7 @@ class TestScrapeCompanyValidation(unittest.TestCase):
         }
 
         page = MagicMock()
-        result = scrape_company(page, "Collective", 3, "collective")
+        scrape_company(page, "Collective", 3, "collective")
         # Only John (exact match) visited — Jane and Bob are suffix variations
         # URL deduplication prevents John from being visited multiple times
         self.assertEqual(mock_visit.call_count, 1)

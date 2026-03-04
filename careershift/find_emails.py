@@ -133,11 +133,13 @@ def run():
                 print(f"\n{'='*55}")
                 print(f"[INFO] [{i+1}/{len(companies_to_scrape)}] {company} (max {max_contacts})")
 
-                # Get expected_domain from application record
-                app_record = next(
-                    (a for a in applications if a["company"] == company), {}
+                # Get all matching applications for this company
+                matching_apps = [a for a in applications if a["company"] == company]
+                expected_domain = next(
+                    (a.get("expected_domain") for a in matching_apps
+                     if a.get("expected_domain")),
+                    ""
                 )
-                expected_domain = app_record.get("expected_domain") or ""
 
                 contacts = scrape_company(page, company, max_contacts,
                                           expected_domain)
@@ -146,10 +148,10 @@ def run():
                     # None = skip (weak signal, retry tomorrow) — not exhausted
                     print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
                 elif not contacts:
-                    # [] = exhaust — no valid recruiters found
+                    # [] = exhaust — mark ALL matching applications exhausted
                     print(f"   [INFO] Exhausting {company} — no valid recruiters found")
-                    if app_record.get("id"):
-                        mark_application_exhausted(app_record["id"])
+                    for app in matching_apps:
+                        mark_application_exhausted(app["id"])
                 else:
                     _save_contacts(contacts, company, applications)
 
@@ -179,10 +181,13 @@ def run():
 
                     print(f"\n[INFO] {company} — needs {shortage} more recruiter(s), fetching {max_extra}")
 
-                    app_record = next(
-                        (a for a in applications if a["company"] == company), {}
+                    matching_apps = [a for a in applications
+                                      if a["company"] == company]
+                    expected_domain = next(
+                        (a.get("expected_domain") for a in matching_apps
+                         if a.get("expected_domain")),
+                        ""
                     )
-                    expected_domain = app_record.get("expected_domain") or ""
 
                     contacts = scrape_company(page, company, max_extra,
                                               expected_domain)

@@ -19,6 +19,7 @@ CLI flags:
   --quota-report  check quota health and send alert email if needed
 """
 
+import os
 import sys
 from datetime import datetime
 
@@ -105,6 +106,9 @@ def add_job_interactively():
         return
 
     if not created:
+        # URL already exists — update expected_domain in case it improved
+        if expected_domain:
+            update_application_expected_domain(app_id, expected_domain)
         print("[WARNING] Job URL already exists in DB.")
         return
 

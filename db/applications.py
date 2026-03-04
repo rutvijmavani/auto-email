@@ -28,9 +28,19 @@ def add_application(company, job_url, job_title=None, applied_date=None,
     except sqlite3.IntegrityError as e:
         if "UNIQUE constraint failed: applications.job_url" not in str(e):
             raise
-        c.execute("SELECT id FROM applications WHERE job_url = ?", (job_url,))
+        c.execute("SELECT id, expected_domain FROM applications WHERE job_url = ?",
+                  (job_url,))
         row = c.fetchone()
-        return (row["id"], False) if row else (None, False)
+        if not row:
+            return (None, False)
+        # Backfill expected_domain if existing row has NULL and we have a value
+        if expected_domain and not row["expected_domain"]:
+            c.execute(
+                "UPDATE applications SET expected_domain = ? WHERE id = ?",
+                (expected_domain, row["id"])
+            )
+            conn.commit()
+        return (row["id"], False)
     finally:
         conn.close()
 
@@ -113,6 +123,7 @@ def get_existing_domain_for_company(company):
         INNER JOIN application_recruiters ar ON ar.recruiter_id = r.id
         INNER JOIN applications a ON a.id = ar.application_id
         WHERE a.company = ? AND r.recruiter_status = 'active'
+        ORDER BY r.id ASC
         LIMIT 1
     """, (company,))
     row = c.fetchone()
