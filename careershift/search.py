@@ -36,7 +36,7 @@ def is_excluded_title(title):
 def parse_cards_from_html(html):
     """
     Parse result cards from search results HTML.
-    Returns list of (name, position, detail_url, has_email).
+    Returns list of (name, company, position, detail_url, has_email).
     """
     soup = BeautifulSoup(html, "html.parser")
     cards = soup.find_all("li", attrs={"data-type": "contact"})
@@ -46,6 +46,8 @@ def parse_cards_from_html(html):
             name_tag = card.find("h3", class_="title")
             name = name_tag.get_text(strip=True) if name_tag else ""
             h4s = card.find_all("h4")
+            # h4[0] = company name, h4[1] = position (title)
+            company = h4s[0].get_text(strip=True) if len(h4s) >= 1 else ""
             position = h4s[1].get_text(strip=True) if len(h4s) >= 2 else ""
             detail_link = card.find("a", href=re.compile(r"/App/Contacts/SearchDetails"))
             detail_url = ""
@@ -53,8 +55,8 @@ def parse_cards_from_html(html):
                 href = detail_link.get("href", "")
                 detail_url = "https://www.careershift.com" + href if href.startswith("/") else href
             has_email = card.find("span", class_="fa-envelope-o") is not None
-            if name and position and detail_url:
-                results.append((name, position, detail_url, has_email))
+            if name and detail_url:
+                results.append((name, company, position, detail_url, has_email))
         except:
             continue
     return results

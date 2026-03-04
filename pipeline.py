@@ -4,6 +4,7 @@ pipeline.py — Master orchestrator for the recruiter outreach pipeline.
 Daily schedule:
   Evening:   python pipeline.py --sync-forms    → pull form responses + scrape JD
   Night:     python pipeline.py --find-only     → find recruiters + generate AI content
+  Weekly:    python pipeline.py --verify-only   → verify recruiters + report under-stocked
   Morning:   python pipeline.py --outreach-only → send emails (9 AM - 11 AM window)
 
   Or all at once:
@@ -13,6 +14,7 @@ CLI flags:
   --sync-forms    pull Google Form responses → insert into DB + scrape JD
   --add           add a single job application interactively
   --find-only     scrape CareerShift + generate AI content + quota health check
+  --verify-only   verify all active recruiters + report under-stocked companies
   --outreach-only schedule + send outreach emails
   --quota-report  check quota health and send alert email if needed
 """
@@ -20,7 +22,56 @@ CLI flags:
 import sys
 from datetime import datetime
 
-from db.db import init_db, add_application, get_remaining_quota
+from db.db import init_db, add_application, get_remaining_quota,\
+    update_application_expected_domain
+
+
+def extract_expected_domain(job_url):
+    """
+    Extract expected company domain root from job URL.
+
+    Examples:
+      https://jobs.ashbyhq.com/collective/54259edc  → "collective"
+      https://boards.greenhouse.io/collectiveinc/   → "collectiveinc"
+      https://collective.com/careers/engineer       → "collective"
+      https://jobs.lever.co/stripe/abc123           → "stripe"
+    """
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(job_url)
+        hostname = parsed.hostname or ""           # "jobs.ashbyhq.com"
+        path     = parsed.path.strip("/")          # "collective/54259edc"
+
+        # ATS platforms — extract company slug from path
+        ats_hosts = [
+            "jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io",
+            "jobs.lever.co", "boards.eu.greenhouse.io", "jobs.jobvite.com",
+            "jobs.smartrecruiters.com", "apply.workable.com",
+        ]
+        for ats in ats_hosts:
+            if ats in hostname:
+                slug = path.split("/")[0].lower()
+                if slug:
+                    # Remove common suffixes from slug
+                    import re
+                    slug = re.sub(r'(jobs?|careers?|hiring)$', '', slug)
+                    return slug.strip("-_") or None
+
+        # Direct company domain — extract root
+        # e.g. "collective.com" → "collective"
+        # e.g. "careers.stripe.com" → "stripe"
+        parts = hostname.split(".")
+        if len(parts) >= 2:
+            # Skip common subdomains
+            skip = {"www", "jobs", "careers", "boards", "apply", "hire",
+                    "talent", "recruiting", "work"}
+            for part in parts[:-1]:  # exclude TLD
+                if part not in skip:
+                    return part.lower()
+
+        return None
+    except Exception:
+        return None
 
 
 def add_job_interactively():
@@ -39,11 +90,14 @@ def add_job_interactively():
         print("[ERROR] Company and Job URL are required.")
         return
 
+    expected_domain = extract_expected_domain(job_url)
+
     app_id, created = add_application(
         company=company,
         job_url=job_url,
         job_title=job_title,
         applied_date=applied_date,
+        expected_domain=expected_domain,
     )
 
     if not app_id:
@@ -183,6 +237,100 @@ def _generate_ai_content_for_all():
     print(f"\n[OK] AI content — Generated: {generated} | Skipped (cached): {skipped} | Failed: {failed}")
 
 
+def run_verify_only():
+    """
+    Verify all active recruiters and report under-stocked companies.
+
+    Steps:
+      1. Run tiered verification for all active recruiters (free — cached profiles)
+      2. Mark departed recruiters inactive + cancel their pending outreach
+      3. Detect companies that dropped below MIN_RECRUITERS threshold
+      4. Print summary report — under-stocked companies picked up by next --find-only
+    """
+    import random
+    from playwright.sync_api import sync_playwright
+    from dotenv import load_dotenv
+    from careershift.constants import SESSION_FILE
+    from careershift.utils import human_delay
+    from careershift.verification import run_tiered_verification
+    from db.db import (
+        get_all_active_applications,
+        get_unique_companies_needing_scraping,
+        get_recruiters_by_company,
+    )
+    from config import MIN_RECRUITERS_PER_COMPANY
+
+    load_dotenv()
+
+    if not os.path.exists(SESSION_FILE):
+        print("[ERROR] Session file not found. Run careershift/auth.py first.")
+        return
+
+    print("\n" + "=" * 55)
+    print("[INFO] STEP 1: Recruiter Verification")
+    print("=" * 55)
+
+    applications = get_all_active_applications()
+    if not applications:
+        print("[INFO] No active applications found.")
+        return
+
+    USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    ]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, slow_mo=100)
+        context = browser.new_context(
+            storage_state=SESSION_FILE,
+            user_agent=random.choice(USER_AGENTS),
+            viewport={"width": random.randint(1280, 1920), "height": random.randint(768, 1080)},
+        )
+        page = context.new_page()
+
+        # Verify session
+        print("[INFO] Verifying CareerShift session...")
+        page.goto("https://www.careershift.com/App/Dashboard/Overview",
+                  wait_until="domcontentloaded", timeout=30000)
+        human_delay(2.0, 4.0)
+
+        if "login" in page.url.lower() or "signin" in page.url.lower():
+            print("[ERROR] Session expired. Run careershift/auth.py again.")
+            browser.close()
+            return
+
+        print("[OK] Session valid.\n")
+
+        # Run tiered verification
+        run_tiered_verification(page, applications)
+
+        browser.close()
+
+    # ── Step 2: Check for under-stocked companies ──
+    print("\n" + "=" * 55)
+    print("[INFO] STEP 2: Checking for under-stocked companies")
+    print("=" * 55)
+
+    under_stocked = get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY)
+
+    if not under_stocked:
+        print("[OK] All companies have enough active recruiters.")
+    else:
+        print(f"\n[WARNING] {len(under_stocked)} company/companies under-stocked after verification:")
+        for company in under_stocked:
+            recruiters = get_recruiters_by_company(company)
+            active_count = len(recruiters)
+            print(f"  - {company}: {active_count} active recruiter(s) "
+                  f"(needs {MIN_RECRUITERS_PER_COMPANY - active_count} more)")
+        print("\n[INFO] Run --find-only to top up under-stocked companies.")
+
+    print("\n" + "=" * 55)
+    print("[OK] Verification complete!")
+    print("=" * 55)
+
+
 def run_outreach():
     """Schedule and send outreach emails within the send window."""
     print("\n" + "=" * 55)
@@ -293,6 +441,10 @@ def main():
 
     if "--outreach-only" in args:
         run_outreach()
+        return
+
+    if "--verify-only" in args:
+        run_verify_only()
         return
 
     if "--quota-report" in args:

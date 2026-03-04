@@ -8,11 +8,9 @@ and pipeline performance monitoring.
 
 ---
 
-## Validation Pipeline
+## What Changes vs Existing Code
 
-### What changes vs existing code
-
-Only `scrape_company()` in `find_emails.py` is replaced.
+Only `scrape_company()` in `careershift/scraper.py` is replaced.
 Everything else remains unchanged:
 - Session verification
 - Tiered recruiter verification (Tier 1, 2, 3)
@@ -37,12 +35,12 @@ def normalize(company_name):
     return name.strip()
 
 # Examples:
-normalize("Collective")         → "collective"
-normalize("Collective Inc")     → "collective inc"
-normalize("Collective LLC")     → "collective llc"
-normalize("Collective, Inc.")   → "collective inc"
-normalize("Collective Junction")→ "collective junction"
-normalize("Collective Health")  → "collective health"
+normalize("Collective")          → "collective"
+normalize("Collective Inc")      → "collective inc"
+normalize("Collective LLC")      → "collective llc"
+normalize("Collective, Inc.")    → "collective inc"
+normalize("Collective Junction") → "collective junction"
+normalize("Collective Health")   → "collective health"
 ```
 
 ### is_suffix_variation()
@@ -69,32 +67,62 @@ is_suffix_variation("collective health", "collective")   → False
 is_suffix_variation("ilovecollective", "collective")     → False
 ```
 
-### analyze_buffer()
-Analyzes visited profiles for domain consistency before DB insertion.
+### domain_matches_expected()
+Checks if email domain root matches expected domain.
 
 ```python
-def analyze_buffer(buffer):
-    if len(buffer) < MIN_BUFFER_SIZE:
-        return []  # too few records, discard all
+def domain_matches_expected(email, expected_domain):
+    domain = email.split("@")[1]    # "collective.com"
+    root = domain.split(".")[0]     # "collective"
+    return root == expected_domain
+
+# Examples:
+domain_matches_expected("john@collective.com", "collective")      → True
+domain_matches_expected("jane@collective-la.com", "collective")   → False
+domain_matches_expected("bob@collectiveinc.com", "collective")    → False
+domain_matches_expected("alice@ilovecollective.com", "collective") → False
+```
+
+### analyze_buffer()
+Analyzes visited profiles for domain consistency before DB insertion.
+Uses existing DB domain as reference if available, otherwise expected_domain.
+
+```python
+def analyze_buffer(buffer, expected_domain, existing_db_domain=None):
+    """
+    reference = existing DB domain (trusted) OR expected_domain (from job URL)
+    DB domain takes priority — already verified and potentially used for outreach.
+    """
+    if not buffer:
+        return []
+
+    reference = existing_db_domain if existing_db_domain else expected_domain
 
     domains = [entry["email"].split("@")[1] for entry in buffer]
     unique_domains = set(domains)
 
-    # All same domain → insert all
+    # All same domain in buffer
     if len(unique_domains) == 1:
-        return buffer
+        buffer_domain_root = domains[0].split(".")[0]
 
-    # Find majority domain
-    majority_domain = Counter(domains).most_common(1)[0][0]
-    majority_records = [r for r in buffer
-                        if r["email"].split("@")[1] == majority_domain]
+        if buffer_domain_root == reference:
+            # Consistent + matches reference → insert all
+            return buffer
+        else:
+            # Consistent but conflicts with reference (DB or expected)
+            # → Trust DB, discard buffer silently
+            # → Log to coverage_stats (reason: buffer_domain_conflict)
+            return []
 
-    # All different domains (no majority) → discard all
-    if len(majority_records) == 1:
-        return []
+    # Mixed domains in buffer
+    # → Use reference as tiebreaker
+    matched = [r for r in buffer
+               if domain_matches_expected(r["email"], reference)]
 
-    # 2+ same domain wins → insert majority, discard minority
-    return majority_records
+    if matched:
+        return matched  # insert matching, discard rest
+
+    return []  # nothing matches → discard all
 ```
 
 ---
@@ -123,158 +151,242 @@ For each card:
 
 ## Confidence Scoring
 
-Calculated per batch of 10 cards, per HR search term.
+Calculated per batch of cards, per HR search term.
+Uses actual cards returned — handles fewer than SAMPLE_SIZE gracefully.
 
-```
-cnt       = exact "collective" matches in current batch of 10
-confidence = (cnt / CAREERSHIFT_SAMPLE_SIZE) * 100
+```python
+actual_count = len(cards)
+sample_size  = min(actual_count, CAREERSHIFT_SAMPLE_SIZE)
 
-Examples:
-  7/10 exact matches → confidence = 70%
-  9/10 exact matches → confidence = 90%
-  3/10 exact matches → confidence = 30%
+if sample_size == 0:
+    continue  # no results → skip to next HR term
+
+confidence = (cnt / sample_size) * 100
+
+# Examples:
+# 3 cards returned, all correct:
+#   sample_size = min(3, 10) = 3
+#   confidence = (3/3) * 100 = 100%  ← correct
+
+# 7 cards returned, 5 correct:
+#   sample_size = min(7, 10) = 7
+#   confidence = (5/7) * 100 = 71.4% ← correct
 ```
 
 ---
 
 ## scrape_company() Pseudocode
 
-```
-def scrape_company(page, company, max_contacts):
+```python
+def scrape_company(page, company, max_contacts, expected_domain):
+    """
+    max_contacts:     from calculate_distribution — controls quota usage per company
+    expected_domain:  from application.expected_domain — used as domain tiebreaker
+    """
+    normalized_expected = normalize(company)
+    hashmap = {normalized_expected: 0}
+    all_exact_profiles = []
+    skip_remaining = False
 
-  normalized_expected = normalize(company)
-  hashmap = {normalized_expected: 0}
-  all_exact_profiles = []
-  skip_remaining = False
+    # ── Step 1: Fetch cards and build signal ──
 
-  FOR each HR term in HR_SEARCH_TERMS:
+    for hr_term in HR_SEARCH_TERMS:
+        if skip_remaining:
+            break
 
-    if skip_remaining: break
+        cnt = 0
+        cards = fetch_cards(page, company, hr_term, limit=CAREERSHIFT_SAMPLE_SIZE)
 
-    cnt = 0
-    cards = fetch_cards(page, company, hr_term, limit=10)
+        actual_count = len(cards)
+        sample_size = min(actual_count, CAREERSHIFT_SAMPLE_SIZE)
 
-    FOR each card:
-      normalized_card = normalize(card.company)
+        if sample_size == 0:
+            continue  # no results for this term
 
-      if normalized_card == normalized_expected:
-        cnt += 1
-        hashmap[normalized_expected] += 1
-        all_exact_profiles.append(card)
+        for card in cards:
+            normalized_card = normalize(card["company"])
 
-      elif is_suffix_variation(normalized_card, normalized_expected):
-        hashmap[normalized_card] += 1  ← track but don't add to profiles
+            if normalized_card == normalized_expected:
+                cnt += 1
+                hashmap[normalized_expected] += 1
+                all_exact_profiles.append(card)
 
-      else:
-        ignore  ← completely different company
+            elif is_suffix_variation(normalized_card, normalized_expected):
+                if normalized_card not in hashmap:
+                    hashmap[normalized_card] = 0
+                hashmap[normalized_card] += 1
 
-    confidence = (cnt / 10) * 100
+            else:
+                pass  # different company → ignore
 
-    if confidence >= 90% (HIGH):
-      skip_remaining = True  ← strong signal, skip remaining HR terms
+        confidence = (cnt / sample_size) * 100
 
-    elif confidence >= 70% (MEDIUM):
-      continue  ← move to next HR term, keep accumulating
+        if confidence >= CAREERSHIFT_HIGH_CONFIDENCE:
+            skip_remaining = True   # strong signal → skip remaining terms
 
-    else:
-      continue  ← low signal, keep accumulating
+        elif confidence >= CAREERSHIFT_MEDIUM_CONFIDENCE:
+            continue                # medium signal → try next term
 
-  # ── After all HR terms processed ──
+        else:
+            continue                # low signal → keep accumulating
 
-  if hashmap[normalized_expected] == 0:
-    return []  ← no exact matches found at all → exhaust application
+    # ── After all HR terms ──
 
-  profiles_to_visit = all_exact_profiles[:CAREERSHIFT_MAX_PROFILES]
-  # Note: Python slicing is safe even if list has fewer than MAX_PROFILES items
+    if hashmap[normalized_expected] == 0:
+        return []  # no exact matches found → exhaust application
 
-  # ── Visit profiles, collect into buffer ──
-  buffer = []
+    # ── Step 2: Visit profiles ──
 
-  FOR each profile in profiles_to_visit:
-    human_delay(2.0, 4.0)
-    detail = visit_profile(page, profile.url)
+    # Respect quota allocation — never visit more than max_contacts
+    # CAREERSHIFT_MAX_PROFILES is the hard ceiling
+    visit_limit = min(max_contacts, CAREERSHIFT_MAX_PROFILES)
+    profiles_to_visit = all_exact_profiles[:visit_limit]
 
-    if not detail: continue
-    if normalize(detail.company) != normalized_expected: continue
-    if not detail.email: continue
+    buffer = []
 
-    buffer.append({
-      name:     detail.name,
-      position: detail.position,
-      email:    detail.email,
-      company:  company,
-    })
+    for profile in profiles_to_visit:
 
-  # ── Analyze buffer for domain consistency ──
-  verified_records = analyze_buffer(buffer)
+        # Stop if quota exhausted during visits
+        if get_remaining_quota() == 0:
+            print("[INFO] Quota exhausted — stopping profile visits early")
+            break
 
-  if not verified_records:
-    return []  ← buffer empty or all different domains → exhaust application
+        human_delay(2.0, 4.0)
+        detail = visit_profile(page, profile["url"])
 
-  return verified_records
+        if not detail:
+            continue
+        if normalize(detail["company"]) != normalized_expected:
+            continue
+        if not detail["email"]:
+            continue
+
+        buffer.append({
+            "name":     detail["name"],
+            "position": detail["position"],
+            "email":    detail["email"],
+            "company":  company,
+        })
+
+    # ── Step 3: Get existing DB domain for this company (top-up scenario) ──
+
+    existing_db_domain = get_existing_domain_for_company(company)
+    # Returns root domain of first active recruiter in DB for this company
+    # Returns None if no existing recruiters
+
+    # ── Step 4: Analyze buffer ──
+
+    # Special case: single profile visit (max_contacts = 1 due to quota)
+    if visit_limit == 1:
+        if not buffer:
+            return []
+
+        single = buffer[0]
+        total_cards_seen = max(sum(hashmap.values()), 1)
+        hashmap_confidence = (hashmap[normalized_expected] / total_cards_seen) * 100
+
+        reference = existing_db_domain if existing_db_domain else expected_domain
+
+        if hashmap_confidence >= CAREERSHIFT_MEDIUM_CONFIDENCE:
+            # Enough signal → use reference domain as gate
+            if domain_matches_expected(single["email"], reference):
+                return [single]   # confident + domain matches → insert
+            else:
+                return []         # domain mismatch → exhaust
+        else:
+            # Weak signal → not worth inserting single record
+            return []             # skip → retry tomorrow (not exhaust)
+
+    # Normal case: multiple profiles
+    verified = analyze_buffer(buffer, expected_domain, existing_db_domain)
+    return verified
 ```
 
 ---
 
 ## Buffer Analysis — All Cases
 
+### Fresh company (no existing DB records):
+
 ```
-Buffer has 3+ records, all same domain:
-  john@collective.com
-  jane@collective.com
-  bob@collective.com
-  → Insert all 3 ✓
+reference = expected_domain (from job URL)
 
-Buffer has 3 records, majority domain (2+1):
-  john@collective.com     ← majority
-  jane@collective.com     ← majority
-  bob@collective-la.com   ← minority
-  → Insert john + jane, discard bob ✓
+Buffer 3 records, all same domain matching expected:
+  → Insert all ✓
 
-Buffer has 3 records, all different domains:
-  john@collective.com
-  jane@collective-la.com
-  bob@collectivehq.com
+Buffer 3 records, majority domain matches expected (2+1):
+  → Insert 2 matching, discard 1 ✓
+
+Buffer 3 records, all different, 1 matches expected:
+  → Insert 1 matching, discard 2 ✓
+
+Buffer 3 records, none match expected:
   → Discard all → exhaust application
 
-Buffer has 2 records, same domain:
-  john@collective.com
-  jane@collective.com
+Buffer 2 records, same domain matching expected:
   → Insert both ✓
 
-Buffer has 2 records, different domains:
-  john@collective.com
-  jane@collective-la.com
-  → Discard both → exhaust application
+Buffer 2 records, different domains:
+  → Apply expected_domain tiebreaker
+  → Keep matching, discard other
 
-Buffer has 1 record:
-  → Too risky, can't verify domain consistency
-  → Discard → exhaust application
+Buffer 1 record (quota = 1):
+  → hashmap confidence >= 70% AND domain matches expected → insert
+  → hashmap confidence < 70% → skip (retry tomorrow, not exhaust)
+  → domain doesn't match → exhaust
 
-Buffer is empty:
-  → No profiles visited or all failed validation
+Buffer empty:
   → Exhaust application
+```
+
+### Top-up scenario (existing DB records):
+
+```
+reference = existing_db_domain (trusted, takes priority)
+
+Buffer records, all match DB domain:
+  → Insert all ✓
+
+Buffer records, mixed — some match DB domain:
+  → Insert matching only, discard rest ✓
+
+Buffer records, all same domain but conflicts with DB:
+  → Buffer consistent but untrusted
+  → Discard buffer silently
+  → Log to coverage_stats (reason: buffer_domain_conflict)
+  → Leave DB unchanged ✓
+
+Buffer records, none match DB domain:
+  → Discard all buffer
+  → Log to coverage_stats
+  → DB unchanged ✓
 ```
 
 ---
 
-## Exhaust Application Logic
-
-Triggered when `scrape_company()` returns empty list.
+## Quota Distribution with MIN_BUFFER_SIZE
 
 ```
-Before marking exhausted:
-  Check pipeline performance metrics:
+Total quota: 50
+Companies to scrape: 30
 
-  Metric 1 >= 50% AND Metric 2 >= 60%
-    → Mark application status = 'exhausted' silently
-    → Log to coverage_stats
-    → No alert
+calculate_distribution(50, 30):
+  base  = 50 // 30 = 1
+  extra = 50 % 30  = 20
 
-  Metric 1 < 50% OR Metric 2 < 60%
-    → Do NOT exhaust yet
-    → Fire alert email
-    → Human intervention required
+  Company 1-20  → max_contacts = 2
+  Company 21-30 → max_contacts = 1
+
+visit_limit = min(max_contacts, CAREERSHIFT_MAX_PROFILES)
+
+Company with max_contacts = 1:
+  → visit_limit = 1
+  → Single profile visit path
+  → hashmap confidence + domain check as gate
+
+Company with max_contacts = 2:
+  → visit_limit = 2
+  → Normal buffer analysis path
 ```
 
 ---
@@ -325,12 +437,40 @@ Metric 2 < 60% for 3 consecutive days → alert
 
 ---
 
+## Exhaust vs Skip Decision
+
+```
+Exhaust application (status = 'exhausted'):
+  → hashmap[expected] == 0 after ALL HR terms
+     (CareerShift has no data for this company)
+  → buffer empty after profile visits
+  → domain mismatch with no fallback
+  → Single profile: hashmap confident BUT domain doesn't match
+
+Skip (retry tomorrow, not exhausted):
+  → Single profile: hashmap confidence < 70%
+     (weak signal, might find more tomorrow)
+  → Quota exhausted mid-visit
+     (incomplete data, not company's fault)
+
+Before exhausting — check metrics:
+  Metric 1 >= 50% AND Metric 2 >= 60%
+    → exhaust silently, log to coverage_stats
+
+  Metric 1 < 50% OR Metric 2 < 60%
+    → do NOT exhaust
+    → fire alert email
+    → human intervention required
+```
+
+---
+
 ## Status Values
 
 ### applications.status
 ```
 'active'     → normal, included in all pipeline steps
-'exhausted'  → no recruiters found after all validation, excluded from scraping
+'exhausted'  → no recruiters found after all validation
 'closed'     → job closed/withdrawn by user
 ```
 
@@ -342,7 +482,7 @@ Metric 2 < 60% for 3 consecutive days → alert
 ### recruiters.recruiter_status
 ```
 'active'   → sendable, included in outreach
-'inactive' → bounced or left company, excluded from outreach
+'inactive' → bounced or left company, excluded
 ```
 
 ---
@@ -351,9 +491,9 @@ Metric 2 < 60% for 3 consecutive days → alert
 
 ### coverage_stats
 ```sql
-CREATE TABLE coverage_stats (
+CREATE TABLE IF NOT EXISTS coverage_stats (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    date                DATE NOT NULL,
+    date                DATE NOT NULL UNIQUE,
     total_applications  INTEGER,
     companies_attempted INTEGER,
     auto_found          INTEGER,
@@ -363,6 +503,8 @@ CREATE TABLE coverage_stats (
     metric2             REAL,
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
+ON coverage_stats(date);
 ```
 
 ### applications table — new columns
@@ -382,8 +524,10 @@ ALTER TABLE applications ADD COLUMN exhausted_at TIMESTAMP;
 CAREERSHIFT_SAMPLE_SIZE       = 10   # cards per batch
 CAREERSHIFT_HIGH_CONFIDENCE   = 90   # skip remaining HR terms
 CAREERSHIFT_MEDIUM_CONFIDENCE = 70   # continue to next HR term
-CAREERSHIFT_MAX_PROFILES      = 3    # max profiles to visit per company
-MIN_BUFFER_SIZE               = 2    # minimum records before trusting domain
+CAREERSHIFT_MAX_PROFILES      = 3    # hard cap — never visit more than this
+MIN_BUFFER_SIZE               = 2    # minimum for domain consistency check
+MIN_RECRUITERS_PER_COMPANY    = 1    # minimum to start outreach (not exhaust)
+MAX_CONTACTS_HARD_CAP         = 3    # target ceiling — topped up over time
 GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 
 # ─────────────────────────────────────────
@@ -428,7 +572,6 @@ Most exhausted companies (last 7 days):
 Recommendation:
   Review CAREERSHIFT_HIGH_CONFIDENCE (currently 90)
   Review CAREERSHIFT_MEDIUM_CONFIDENCE (currently 70)
-  Review MIN_BUFFER_SIZE (currently 2)
   Or manually reactivate exhausted applications:
     python pipeline.py --reactivate "Collective"
 ```
@@ -442,31 +585,55 @@ Recommendation:
 
   For each company needing scraping:
 
-    scrape_company():
+    scrape_company(page, company, max_contacts, expected_domain):
 
-      For each HR term:
-        Fetch 10 cards (sample)
-        Classify each card:
-          exact match      → cnt++, hashmap[expected]++, add to profiles
-          suffix variation → hashmap[variation]++, ignore for profiles
-          different company → ignore completely
+      Step 1: Card analysis across HR terms
+        For each HR term:
+          Fetch cards (up to CAREERSHIFT_SAMPLE_SIZE)
+          sample_size = min(actual_cards, CAREERSHIFT_SAMPLE_SIZE)
+          if sample_size == 0 → skip term
 
-        confidence = (cnt/10) * 100
-        >= 90% → skip remaining terms (high confidence)
-        >= 70% → continue to next term (medium confidence)
-        < 70%  → continue accumulating (low confidence)
+          For each card:
+            exact match      → cnt++, hashmap[expected]++, add to profiles
+            suffix variation → hashmap[variation]++, ignore for profiles
+            different company→ ignore completely
 
-      After all terms:
-        hashmap[expected] == 0 → no exact matches → exhaust
+          confidence = (cnt / sample_size) * 100
+          >= 90% → skip remaining terms
+          >= 70% → continue to next term
+          <  70% → continue accumulating
 
-        Visit up to 3 exact match profiles
-        Collect into buffer
+      Step 2: Profile visits
+        visit_limit = min(max_contacts, CAREERSHIFT_MAX_PROFILES)
+        profiles_to_visit = all_exact_profiles[:visit_limit]
 
-        analyze_buffer():
-          < 2 records          → discard all → exhaust
-          all same domain      → insert all
-          majority domain      → insert majority, discard minority
-          all different domains→ discard all → exhaust
+        For each profile:
+          get_remaining_quota() == 0 → break (stop early)
+          visit profile → validate company name → collect email → buffer
+
+      Step 3: Get existing DB domain for this company
+        existing_db_domain = get_existing_domain_for_company(company)
+
+      Step 4: Buffer analysis
+
+        visit_limit == 1 (quota forced single visit):
+          hashmap_confidence >= 70% AND domain matches reference
+            → insert single record
+          hashmap_confidence < 70%
+            → skip (retry tomorrow, not exhaust)
+          domain doesn't match reference
+            → exhaust
+
+        visit_limit > 1 (normal case):
+          analyze_buffer(buffer, expected_domain, existing_db_domain):
+            reference = existing_db_domain OR expected_domain
+
+            All same domain, matches reference     → insert all
+            All same domain, conflicts reference   → discard, log
+            Mixed domains                          → keep matching reference
+            Nothing matches reference              → discard all
+
+          Empty result → exhaust or skip based on metrics
 
   Coverage stats recorded daily
   Metrics checked → alert if below threshold for 3 consecutive days

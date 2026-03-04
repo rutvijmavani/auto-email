@@ -65,13 +65,15 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS applications (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            company      TEXT NOT NULL,
-            job_url      TEXT NOT NULL UNIQUE,
-            job_title    TEXT,
-            applied_date DATE DEFAULT (DATE('now')),
-            status       TEXT DEFAULT 'active',
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            company        TEXT NOT NULL,
+            job_url        TEXT NOT NULL UNIQUE,
+            job_title      TEXT,
+            applied_date   DATE DEFAULT (DATE('now')),
+            status         TEXT DEFAULT 'active',
+            expected_domain TEXT,
+            exhausted_at   TIMESTAMP,
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -189,6 +191,16 @@ def init_db():
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migration: add expected_domain and exhausted_at to applications if missing
+    try:
+        c.execute("ALTER TABLE applications ADD COLUMN expected_domain TEXT")
+    except Exception:
+        pass  # column already exists
+    try:
+        c.execute("ALTER TABLE applications ADD COLUMN exhausted_at TIMESTAMP")
+    except Exception:
+        pass  # column already exists
 
     # Migration: ensure coverage_stats.date has a unique index
     # Deduplicates existing rows keeping latest per date before creating index

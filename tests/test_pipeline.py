@@ -290,6 +290,11 @@ class TestCLIFlags(unittest.TestCase):
         self._run_main_with_args(["--find-only"])
         mock_find.assert_called_once()
 
+    @patch("pipeline.run_verify_only")
+    def test_verify_only_flag(self, mock_verify):
+        self._run_main_with_args(["--verify-only"])
+        mock_verify.assert_called_once()
+
     @patch("pipeline.run_outreach")
     def test_outreach_only_flag(self, mock_outreach):
         self._run_main_with_args(["--outreach-only"])

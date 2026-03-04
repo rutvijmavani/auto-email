@@ -21,6 +21,7 @@ from db.db import (
     recruiter_email_exists,
     add_recruiter,
     link_recruiter_to_application,
+    mark_application_exhausted,
 )
 from careershift.constants import SESSION_FILE, MIN_RECRUITERS_PER_COMPANY
 from careershift.utils import human_delay
@@ -132,11 +133,25 @@ def run():
                 print(f"\n{'='*55}")
                 print(f"[INFO] [{i+1}/{len(companies_to_scrape)}] {company} (max {max_contacts})")
 
-                contacts = scrape_company(page, company, max_contacts)
-                _save_contacts(contacts, company, applications)
+                # Get expected_domain from application record
+                app_record = next(
+                    (a for a in applications if a["company"] == company), {}
+                )
+                expected_domain = app_record.get("expected_domain") or ""
 
-                if not contacts:
-                    print(f"   [ERROR] No contacts found for {company}")
+                contacts = scrape_company(page, company, max_contacts,
+                                          expected_domain)
+
+                if contacts is None:
+                    # None = skip (weak signal, retry tomorrow) — not exhausted
+                    print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
+                elif not contacts:
+                    # [] = exhaust — no valid recruiters found
+                    print(f"   [INFO] Exhausting {company} — no valid recruiters found")
+                    if app_record.get("id"):
+                        mark_application_exhausted(app_record["id"])
+                else:
+                    _save_contacts(contacts, company, applications)
 
                 human_delay(3.0, 7.0)
 
@@ -155,7 +170,7 @@ def run():
                 print(f"[INFO] {remaining_after} credits remaining — topping up {len(under_stocked)} company/companies")
 
                 for company_row in under_stocked:
-                    if get_remaining_quota() <= 0:
+                    if get_remaining_quota() == 0:
                         break
 
                     company   = company_row["company"]
@@ -164,8 +179,18 @@ def run():
 
                     print(f"\n[INFO] {company} — needs {shortage} more recruiter(s), fetching {max_extra}")
 
-                    contacts = scrape_company(page, company, max_extra)
-                    _save_contacts(contacts, company, applications)
+                    app_record = next(
+                        (a for a in applications if a["company"] == company), {}
+                    )
+                    expected_domain = app_record.get("expected_domain") or ""
+
+                    contacts = scrape_company(page, company, max_extra,
+                                              expected_domain)
+
+                    if contacts is None:
+                        print(f"   [INFO] Skipping {company} — weak signal")
+                    elif contacts:
+                        _save_contacts(contacts, company, applications)
 
                     human_delay(3.0, 7.0)
 
