@@ -174,21 +174,43 @@ def run_sync_forms():
 
 def run_find_emails():
     """Scrape CareerShift for recruiters + generate AI content + quota health check."""
+    from datetime import datetime
+    from outreach.report_templates.find_report import build_find_report
+
     print("\n" + "=" * 55)
     print("[INFO] STEP 1: Finding recruiter emails via CareerShift")
     print("=" * 55)
     from careershift.find_emails import run as find_run
-    find_run()
+    find_stats = find_run()  # returns stats dict
 
     print("\n" + "=" * 55)
     print("[INFO] STEP 2: Generating AI email content")
     print("=" * 55)
-    _generate_ai_content_for_all()
+    ai_stats = _generate_ai_content_for_all()
 
     print("\n" + "=" * 55)
     print("[INFO] STEP 3: Quota health check")
     print("=" * 55)
     run_quota_report(silent_if_healthy=True)
+
+    # Send HTML report
+    try:
+        date_str = datetime.now().strftime("%B %-d, %Y")
+    except ValueError:
+        date_str = datetime.now().strftime("%B %d, %Y")
+
+    report_stats = {
+        "date":                 date_str,
+        "quota_used":           find_stats.get("quota_used", 0) if find_stats else 0,
+        "quota_total":          50,
+        "companies":            find_stats.get("companies", []) if find_stats else [],
+        "prospective_scraped":  find_stats.get("prospective_scraped", 0) if find_stats else 0,
+        "prospective_exhausted":find_stats.get("prospective_exhausted", 0) if find_stats else 0,
+        "ai_generated":         ai_stats.get("generated", 0) if ai_stats else 0,
+        "ai_cached":            ai_stats.get("skipped", 0) if ai_stats else 0,
+        "ai_failed":            ai_stats.get("failed", 0) if ai_stats else 0,
+    }
+    build_find_report(report_stats)
 
 
 def _generate_ai_content_for_all():
@@ -276,6 +298,7 @@ def _generate_ai_content_for_all():
                     generated += 1
 
     print(f"\n[OK] AI content — Generated: {generated} | Skipped (cached): {skipped} | Failed: {failed}")
+    return {"generated": generated, "skipped": skipped, "failed": failed}
 
 
 def run_import_prospects(filepath="prospects.txt"):
@@ -426,6 +449,36 @@ def run_verify_only():
     print("[OK] Verification complete!")
     print("=" * 55)
 
+    # ── Send HTML report ──
+    from outreach.report_templates.verify_report import build_verify_report
+    from datetime import datetime
+    try:
+        date_str = datetime.now().strftime("%B %-d, %Y")
+    except ValueError:
+        date_str = datetime.now().strftime("%B %d, %Y")
+
+    under_stocked_detail = []
+    for company in under_stocked:
+        recruiters = get_recruiters_by_company(company)
+        active_count = len(recruiters)
+        under_stocked_detail.append({
+            "company":      company,
+            "active_count": active_count,
+            "needed":       max(0, MIN_RECRUITERS_PER_COMPANY - active_count),
+        })
+
+    build_verify_report({
+        "date":           date_str,
+        "tier1_count":    0,
+        "tier2_count":    0,
+        "tier2_verified": 0,
+        "tier3_count":    0,
+        "tier3_verified": 0,
+        "tier3_inactive": 0,
+        "changes":        [],
+        "under_stocked":  under_stocked_detail,
+    })
+
 
 def run_outreach():
     """Schedule and send outreach emails within the send window."""
@@ -433,7 +486,20 @@ def run_outreach():
     print("[INFO] Sending outreach emails")
     print("=" * 55)
     from outreach.outreach_engine import run as outreach_run
-    outreach_run()
+    from outreach.report_templates.outreach_report import build_outreach_report
+    from db.db import get_pending_outreach, get_conn
+    from datetime import datetime
+
+    stats = outreach_run()  # returns stats dict from outreach_engine
+
+    # Send HTML report
+    if stats:
+        stats["date"] = datetime.now().strftime("%B %-d, %Y") if hasattr(datetime, 'strptime') else datetime.now().strftime("%B %d, %Y")
+        try:
+            stats["date"] = datetime.now().strftime("%B %-d, %Y")
+        except ValueError:
+            stats["date"] = datetime.now().strftime("%B %d, %Y")
+        build_outreach_report(stats)
 
 
 def run_quota_report(silent_if_healthy=False):

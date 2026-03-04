@@ -33,6 +33,7 @@ from db.db import (
     has_pending_or_sent_outreach,
     get_recruiters_for_application,
     get_all_active_applications,
+    get_conn,
 )
 
 HARD_CUTOFF_HOUR = SEND_WINDOW_END + GRACE_PERIOD_HOURS  # 12 PM
@@ -236,14 +237,48 @@ def process_outreach():
         time.sleep(random.randint(30, 90))
 
     print(f"\n[OK] Sent: {sent_count} | Failed: {failed_count}")
+    return {"sent": sent_count, "failed": failed_count}
 
 
 def run():
+    from db.db import get_all_active_applications
+    from db.outreach import get_pending_outreach as _get_pending
+
     init_db()
     print("[INFO] Scheduling initial outreach emails...")
     schedule_initial_outreach()
     print("\n[INFO] Processing pending outreach emails...")
-    process_outreach()
+    result = process_outreach() or {}
+
+    # Collect sequence stats
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("""
+            SELECT
+              SUM(CASE WHEN status IN ('sent','scheduled') THEN 1 ELSE 0 END) as active,
+              SUM(CASE WHEN stage = 'followup2' AND status = 'sent' THEN 1 ELSE 0 END) as completed,
+              SUM(CASE WHEN status = 'sent' AND replied = 0 THEN 1 ELSE 0 END) as pending_reply
+            FROM outreach
+        """)
+        row = c.fetchone()
+        conn.close()
+        active_seq    = row["active"]    or 0
+        completed_seq = row["completed"] or 0
+        pending_reply = row["pending_reply"] or 0
+    except Exception:
+        active_seq = completed_seq = pending_reply = 0
+
+    return {
+        "sent":                result.get("sent", 0),
+        "failed":              result.get("failed", 0),
+        "bounced":             result.get("bounced", 0),
+        "skipped":             result.get("skipped", 0),
+        "emails":              result.get("emails", []),
+        "active_sequences":    active_seq,
+        "completed_sequences": completed_seq,
+        "pending_reply":       pending_reply,
+    }
 
 
 if __name__ == "__main__":
