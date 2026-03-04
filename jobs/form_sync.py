@@ -20,7 +20,6 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 from db.db import init_db, add_application, save_job
-from pipeline import extract_expected_domain
 from jobs.job_fetcher import fetch_job_description
 
 load_dotenv()
@@ -78,6 +77,7 @@ def _is_valid_url(url):
 
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
+    from pipeline import extract_expected_domain  # local import avoids circular dependency
     if not SHEET_ID:
         print("[ERROR] GOOGLE_SHEET_ID not set in .env")
         return

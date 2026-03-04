@@ -1,5 +1,6 @@
 # db/schema.py — Database schema creation and cleanup
 
+import sqlite3
 import time
 from datetime import datetime, timedelta
 
@@ -195,12 +196,14 @@ def init_db():
     # Migration: add expected_domain and exhausted_at to applications if missing
     try:
         c.execute("ALTER TABLE applications ADD COLUMN expected_domain TEXT")
-    except Exception:
-        pass  # column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
     try:
         c.execute("ALTER TABLE applications ADD COLUMN exhausted_at TIMESTAMP")
-    except Exception:
-        pass  # column already exists
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
 
     # Migration: ensure coverage_stats.date has a unique index
     # Deduplicates existing rows keeping latest per date before creating index

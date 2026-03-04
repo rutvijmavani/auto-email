@@ -79,6 +79,9 @@ def analyze_buffer(buffer, expected_domain, existing_db_domain=None):
     reference = existing DB domain (trusted) OR expected_domain (from job URL)
     Domain check ONLY triggered when domains conflict — not for consistent buffers.
 
+    If no reference domain available → trust the buffer as-is (consistent signal
+    is sufficient without a reference to compare against).
+
     Returns list of verified records to insert, empty list to exhaust/skip.
     """
     if not buffer:
@@ -86,6 +89,12 @@ def analyze_buffer(buffer, expected_domain, existing_db_domain=None):
 
     # DB domain takes priority — already verified, possibly used for outreach
     reference = existing_db_domain if existing_db_domain else expected_domain
+
+    # No reference domain available — can't do domain validation
+    # Trust buffer as-is: consistent or not, we have no baseline to compare against
+    if not reference:
+        print(f"   [INFO] No reference domain available — trusting buffer as-is")
+        return buffer
 
     domains = [entry["email"].split("@")[1] for entry in buffer]
     unique_domains = set(domains)
@@ -208,7 +217,7 @@ def scrape_company(page, company, max_contacts, expected_domain):
         total_cards_seen += sample_size
         cnt = 0  # exact matches in this batch
 
-        for card in cards:
+        for card in cards[:sample_size]:  # only process sampled subset
             name, card_company, position, detail_url, has_email = card
             normalized_card = normalize(card_company)
 
