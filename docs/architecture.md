@@ -12,40 +12,68 @@ The Recruiter Outreach Pipeline is an automated system that finds recruiter cont
 Pulls new job applications from a Google Form, inserts them into the database, and immediately attempts to scrape the job description from the provided URL. Fast portals (Greenhouse, Lever) succeed here. JS-heavy portals (Ashby, Workday) are retried during `--find-only`.
 
 **`--find-only`** — Contact Discovery
-The core intelligence stage. Runs overnight and does three things:
+The core intelligence stage. Runs overnight and does four things:
 1. Verifies existing recruiters using the tiered verification system
 2. Scrapes CareerShift for new recruiter contacts using quota-aware distribution
 3. Generates personalized AI email content via Gemini for all applications
+4. Tops up under-stocked companies using leftover quota
+
+**`--import-prospects`** — Prospective Company Import
+Bulk imports a list of target companies to pre-scrape during quiet quota periods.
+Recruiters found in advance so outreach begins immediately when you apply.
+
+**`--monitor-jobs`** — Job Monitoring
+Queries public ATS APIs (Greenhouse, Lever, Ashby, SmartRecruiters) and scrapes
+Workday/custom career pages to find newly posted jobs matching your profile.
+Sends a daily digest email with ranked results so you know exactly what to apply to.
+
+**`--verify-only`** — Recruiter Freshness Check
+Keeps recruiter data up to date independent of job search activity.
+1. Runs full tiered verification for all active recruiters (free — cached profiles)
+2. Detects and reports companies that became under-stocked after verification
+3. Under-stocked companies are automatically picked up by next --find-only run
 
 **`--outreach-only`** — Email Sending
 Sends scheduled outreach emails within the configured morning send window (9 AM - 11 AM). Handles the full email sequence (initial, follow-up 1, follow-up 2) and detects hard bounces automatically.
 
 ---
 
-## Daily Workflow
+## Recommended Schedule
 
 ```
-Evening
-  └── Fill Google Form for each job applied
-  └── python pipeline.py --sync-forms
-        → inserts applications into DB
-        → scrapes job descriptions (fast portals)
-
-Night
-  └── python pipeline.py --find-only
-        → tiered verification of existing recruiters (free)
-        → scrapes CareerShift for new recruiters (quota-aware)
-        → uses leftover CareerShift quota for under-stocked companies
-        → generates AI email content via Gemini
-        → uses leftover Gemini quota for applications missing cache
-        → runs quota health check → sends alert email if needed
-
-Morning (9 AM - 11 AM)
+Daily (9 AM — automated)
   └── python pipeline.py --outreach-only
         → schedules initial emails for new recruiter+application pairs
         → sends due emails within send window
         → schedules next follow-up after each send
         → detects hard bounces → marks recruiter inactive
+
+Weekly (Monday — automated)
+  └── python pipeline.py --verify-only
+        → tiered verification of ALL active recruiters (free)
+        → marks departed recruiters as inactive
+        → cancels their pending outreach
+        → reports under-stocked companies
+
+As needed (when applying to new jobs)
+  └── python pipeline.py --add
+        → interactive: company, job URL, title, date
+        → extracts expected_domain from job URL
+        → scrapes and caches job description
+
+  └── python pipeline.py --find-only
+        → tiered verification of existing recruiters (free)
+        → tops up companies flagged as under-stocked by --verify-only
+        → scrapes CareerShift for new companies (quota-aware)
+        → generates AI email content via Gemini
+        → uses leftover Gemini quota for missing cache
+        → runs quota health check → alert if needed
+
+  OR (via Google Form)
+  └── python pipeline.py --sync-forms
+        → pulls Google Form responses into DB
+        → scrapes job descriptions automatically
+  └── python pipeline.py --find-only
 ```
 
 ---

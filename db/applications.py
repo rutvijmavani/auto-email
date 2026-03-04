@@ -6,7 +6,8 @@ from datetime import datetime
 from db.connection import get_conn
 
 
-def add_application(company, job_url, job_title=None, applied_date=None):
+def add_application(company, job_url, job_title=None, applied_date=None,
+                    expected_domain=None):
     """
     Insert a new application.
     Returns (application_id, created) where created=True means newly inserted,
@@ -16,10 +17,12 @@ def add_application(company, job_url, job_title=None, applied_date=None):
     c = conn.cursor()
     try:
         c.execute("""
-            INSERT INTO applications (company, job_url, job_title, applied_date)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO applications (company, job_url, job_title, applied_date,
+                                      expected_domain)
+            VALUES (?, ?, ?, ?, ?)
         """, (company, job_url, job_title,
-              applied_date or datetime.now().strftime("%Y-%m-%d")))
+              applied_date or datetime.now().strftime("%Y-%m-%d"),
+              expected_domain))
         conn.commit()
         return c.lastrowid, True
     except sqlite3.IntegrityError as e:
@@ -80,3 +83,41 @@ def reactivate_application(company):
     count = c.rowcount
     conn.close()
     return count
+
+
+def update_application_expected_domain(application_id, expected_domain):
+    """Update expected_domain for an existing application."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        UPDATE applications SET expected_domain = ?
+        WHERE id = ?
+    """, (expected_domain, application_id))
+    conn.commit()
+    conn.close()
+
+
+def get_existing_domain_for_company(company):
+    """
+    Return the email domain root already stored in DB for this company.
+    Used as reference when adding more recruiters (top-up scenario).
+    Returns None if no existing active recruiters.
+
+    Example:
+      john@collective.com is in DB → returns "collective"
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT r.email FROM recruiters r
+        INNER JOIN application_recruiters ar ON ar.recruiter_id = r.id
+        INNER JOIN applications a ON a.id = ar.application_id
+        WHERE a.company = ? AND r.recruiter_status = 'active'
+        LIMIT 1
+    """, (company,))
+    row = c.fetchone()
+    conn.close()
+    if row and row["email"] and "@" in row["email"]:
+        domain = row["email"].split("@")[1]   # "collective.com"
+        return domain.split(".")[0]            # "collective"
+    return None

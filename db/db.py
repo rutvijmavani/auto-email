@@ -35,6 +35,8 @@ from db.applications import (
     get_application_by_id,
     mark_application_exhausted,
     reactivate_application,
+    update_application_expected_domain,
+    get_existing_domain_for_company,
 )
 
 # ─────────────────────────────────────────

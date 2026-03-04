@@ -20,6 +20,7 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 from db.db import init_db, add_application, save_job
+from pipeline import extract_expected_domain
 from jobs.job_fetcher import fetch_job_description
 
 load_dotenv()
@@ -140,11 +141,13 @@ def run():
             continue
 
         # Insert into applications table
+        expected_domain = extract_expected_domain(job_url)
         app_id, created = add_application(
             company=company,
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
+            expected_domain=expected_domain,
         )
 
         if not app_id:

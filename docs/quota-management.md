@@ -39,6 +39,7 @@ extra = remaining_quota % new_companies
 First `extra` companies get base + 1 contacts
 Remaining companies get base contacts
 Total = remaining_quota (fully utilized)
+Max per company capped at MAX_CONTACTS_HARD_CAP (3)
 ```
 
 Example with 50 quota and 20 new companies:
@@ -48,6 +49,21 @@ extra = 50 % 20 = 10
 → first 10 companies get 3 contacts
 → last 10 companies get 2 contacts
 → total used = 50
+```
+
+Example with 50 quota and 40 new companies (heavy day):
+```
+base = 50 // 40 = 1
+extra = 50 % 40 = 10
+→ first 10 companies get 2 contacts
+→ last 30 companies get 1 contact
+→ total used = 50
+
+With MIN_RECRUITERS_PER_COMPANY = 1:
+  → All 40 companies get ≥ 1 recruiter ✓
+  → Outreach starts immediately for all 40 ✓
+  → Leftover quota on future days tops up to MAX (3)
+  → Prospective pipeline reduces new companies needed
 ```
 
 ### Leftover quota utilization
@@ -234,3 +250,28 @@ Once an alert is sent (`notified = 1`), no further alerts are sent for the same 
 ```bash
 python pipeline.py --quota-report
 ```
+
+---
+
+## `--verify-only` and Quota
+
+The `--verify-only` command runs tiered verification independently
+of job search activity. Key quota facts:
+
+```
+CareerShift quota used: 0
+  → All profile re-visits are cached (free)
+  → Only first-time profile visits count against quota
+
+Gemini quota used: 0
+  → No AI generation during verification
+  → Only checks recruiter status
+
+Time cost:
+  ~10 seconds per Tier 2 recruiter (search only)
+  ~20 seconds per Tier 3 recruiter (profile visit)
+  Typical weekly run: 5-15 minutes
+```
+
+This means `--verify-only` can run as frequently as needed
+at zero cost to either quota.

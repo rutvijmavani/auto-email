@@ -46,3 +46,22 @@ RETENTION_QUOTA_ALERTS         = 30
 # GOOGLE SHEETS INTEGRATION
 # ─────────────────────────────────────────
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
+# ─────────────────────────────────────────
+# RECRUITER VALIDATION SETTINGS
+# ─────────────────────────────────────────
+CAREERSHIFT_SAMPLE_SIZE       = 10   # cards per batch
+CAREERSHIFT_HIGH_CONFIDENCE   = 90   # skip remaining HR terms
+CAREERSHIFT_MEDIUM_CONFIDENCE = 70   # continue to next HR term
+CAREERSHIFT_MAX_PROFILES      = 3    # hard cap — never visit more than this
+MIN_BUFFER_SIZE               = 2    # minimum for domain consistency check
+MIN_RECRUITERS_PER_COMPANY    = 1    # minimum active recruiters to start outreach
+                                      # pipeline tops up to MAX_CONTACTS_HARD_CAP over time
+GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
+
+# ─────────────────────────────────────────
+# PIPELINE PERFORMANCE THRESHOLDS
+# ─────────────────────────────────────────
+METRIC1_ALERT_THRESHOLD       = 50   # find-only performance % (Red)
+METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
+METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires

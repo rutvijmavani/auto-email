@@ -31,7 +31,7 @@ def verify_tier2_recruiter(page, recruiter):
         html = page.content()
         cards = parse_cards_from_html(html)
 
-        for card_name, _, _, _ in cards:
+        for card_name, _, _, _, _ in cards:
             if name in card_name.strip().lower():
                 update_recruiter(recruiter["id"])
                 print(f"     [OK] Tier 2 verified: {recruiter['name']} still at {company}")
@@ -64,7 +64,7 @@ def verify_tier3_recruiter(page, recruiter):
         cards = parse_cards_from_html(html)
 
         detail_url = None
-        for card_name, position, url, _ in cards:
+        for card_name, _, position, url, _ in cards:
             if name.strip().lower() in card_name.strip().lower():
                 detail_url = url
                 break
