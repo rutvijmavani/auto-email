@@ -85,6 +85,7 @@ def _save_prospective_contacts(contacts, company):
     """
     Save prospective recruiter contacts to DB under a placeholder application.
     When user later applies (--add), the placeholder converts to real application.
+    Returns True if contacts were saved successfully, False otherwise.
     """
     from db.db import add_application
 
@@ -99,7 +100,7 @@ def _save_prospective_contacts(contacts, company):
 
     if not app_id:
         print(f"   [WARNING] Could not create placeholder for {company}")
-        return
+        return False
 
     for contact in contacts:
         existing_id = recruiter_email_exists(contact["email"])
@@ -118,6 +119,8 @@ def _save_prospective_contacts(contacts, company):
 
         link_recruiter_to_application(app_id, recruiter_id)
 
+    return True
+
 
 
 def run():
@@ -128,8 +131,12 @@ def run():
     init_db()
 
     applications = get_all_active_applications()
-    if not applications:
-        print("[INFO] No active applications found. Add one with: python pipeline.py --add")
+    pending_prospective = get_pending_prospective()
+
+    if not applications and not pending_prospective:
+        print("[INFO] No active applications and no pending prospective companies.")
+        print("[INFO] Add an application: python pipeline.py --add")
+        print("[INFO] Import prospects:   python pipeline.py --import-prospects prospects.txt")
         return
 
     with sync_playwright() as p:
@@ -161,14 +168,17 @@ def run():
         # ─────────────────────────────────────────
         # STEP 1: Tiered verification
         # ─────────────────────────────────────────
-        print("=" * 55)
-        print("[INFO] STEP 1: Verifying existing recruiters (tiered)...")
-        run_tiered_verification(page, applications)
+        if applications:
+            print("=" * 55)
+            print("[INFO] STEP 1: Verifying existing recruiters (tiered)...")
+            run_tiered_verification(page, applications)
+        else:
+            print("[INFO] STEP 1: Skipped — no active applications to verify.")
 
         # ─────────────────────────────────────────
         # STEP 2: Scrape new companies
         # ─────────────────────────────────────────
-        companies_to_scrape = get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY)
+        companies_to_scrape = get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY) if applications else []
 
         if not companies_to_scrape:
             print("\n[OK] All applications have enough recruiters. No scraping needed.")
@@ -279,9 +289,12 @@ def run():
                         print(f"   [INFO] Exhausting prospective {company}")
                         mark_prospective_exhausted(company)
                     else:
-                        # Save recruiters under a placeholder application
-                        _save_prospective_contacts(contacts, company)
-                        mark_prospective_scraped(company)
+                        # Save recruiters — only mark scraped if persistence succeeded
+                        saved = _save_prospective_contacts(contacts, company)
+                        if saved:
+                            mark_prospective_scraped(company)
+                        else:
+                            print(f"   [WARNING] Could not persist contacts for {company} — not marking scraped")
 
                     human_delay(3.0, 7.0)
 

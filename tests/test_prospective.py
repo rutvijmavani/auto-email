@@ -120,6 +120,42 @@ class TestProspectiveDB(unittest.TestCase):
         self.assertIsNotNone(company)
         self.assertEqual(company["company"], "Google")
 
+    def test_add_prospective_empty_string_raises(self):
+        """Empty string raises ValueError."""
+        with self.assertRaises(ValueError):
+            db_module.add_prospective_company("")
+
+    def test_add_prospective_whitespace_only_raises(self):
+        """Whitespace-only string raises ValueError."""
+        with self.assertRaises(ValueError):
+            db_module.add_prospective_company("   ")
+
+    def test_add_prospective_none_raises(self):
+        """None raises ValueError."""
+        with self.assertRaises(ValueError):
+            db_module.add_prospective_company(None)
+
+    def test_lookup_with_whitespace_finds_normalized(self):
+        """Lookup with padded whitespace finds correctly normalized entry."""
+        db_module.add_prospective_company("Google")
+        # Lookup with whitespace should still find the record
+        company = db_module.get_prospective_company("  Google  ")
+        self.assertIsNotNone(company)
+        self.assertEqual(company["company"], "Google")
+
+    def test_is_prospective_with_whitespace(self):
+        """is_prospective normalizes before lookup."""
+        db_module.add_prospective_company("Google")
+        db_module.mark_prospective_scraped("Google")
+        self.assertTrue(db_module.is_prospective("  Google  "))
+
+    def test_mark_scraped_with_whitespace(self):
+        """mark_prospective_scraped normalizes company name."""
+        db_module.add_prospective_company("Google")
+        db_module.mark_prospective_scraped("  Google  ")
+        company = db_module.get_prospective_company("Google")
+        self.assertEqual(company["status"], "scraped")
+
     def test_get_pending_prospective_returns_only_pending(self):
         """Only pending companies returned."""
         db_module.add_prospective_company("Google")
@@ -365,6 +401,28 @@ class TestConvertProspectiveToActive(unittest.TestCase):
         )
         stripe = db_module.get_prospective_company("Stripe")
         self.assertEqual(stripe["status"], "scraped")
+
+    def test_conversion_returns_none_on_duplicate_url(self):
+        """Returns None and rolls back if real_job_url already exists."""
+        self._setup_prospective_with_recruiter("Google")
+        # Add another application with the same URL we'll try to convert to
+        db_module.add_application("Other", "https://careers.google.com/jobs/123", "SWE")
+
+        result = db_module.convert_prospective_to_active(
+            "Google", "https://careers.google.com/jobs/123"
+        )
+        self.assertIsNone(result)
+
+    def test_conversion_leaves_prospective_intact_on_url_conflict(self):
+        """On URL conflict prospective application stays prospective."""
+        app_id, _ = self._setup_prospective_with_recruiter("Google")
+        db_module.add_application("Other", "https://careers.google.com/jobs/123", "SWE")
+
+        db_module.convert_prospective_to_active(
+            "Google", "https://careers.google.com/jobs/123"
+        )
+        app = db_module.get_application_by_id(app_id)
+        self.assertEqual(app["status"], "prospective")
 
 
 # ─────────────────────────────────────────
@@ -722,6 +780,64 @@ class TestMarkApplicationsExhaustedBulk(unittest.TestCase):
         db_module.mark_applications_exhausted([id1])
         app = db_module.get_application_by_id(id1)
         self.assertEqual(app["status"], "exhausted")
+
+
+# ─────────────────────────────────────────
+# TEST: find_emails early return logic
+# ─────────────────────────────────────────
+
+class TestFindEmailsEarlyReturn(unittest.TestCase):
+    """
+    Tests that find_emails.run() only returns early when BOTH
+    active applications AND pending prospective are empty.
+    """
+
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        cleanup_db(TEST_DB)
+        db_module.init_db()
+
+    def tearDown(self):
+        cleanup_db(TEST_DB)
+
+    def _mock_run(self):
+        """Run find_emails.run() with all external calls mocked."""
+        from careershift import find_emails
+
+        with patch("careershift.find_emails.os.path.exists", return_value=True),              patch("careershift.find_emails.sync_playwright") as mock_pw,              patch("careershift.find_emails.fetch_real_quota", return_value=10),              patch("careershift.find_emails.run_tiered_verification"),              patch("careershift.find_emails.scrape_company", return_value=None),              patch("careershift.find_emails.human_delay"),              patch("sys.stdout", new_callable=StringIO) as mock_out:
+            mock_page = MagicMock()
+            mock_page.url = "https://www.careershift.com/App/Dashboard/Overview"
+            mock_browser = MagicMock()
+            mock_context = MagicMock()
+            mock_context.new_page.return_value = mock_page
+            mock_browser.new_context.return_value = mock_context
+            mock_playwright = MagicMock()
+            mock_playwright.chromium.launch.return_value = mock_browser
+            mock_pw.return_value.__enter__ = MagicMock(return_value=mock_playwright)
+            mock_pw.return_value.__exit__ = MagicMock(return_value=False)
+
+            find_emails.run()
+            return mock_out.getvalue(), mock_pw
+
+    def test_no_apps_no_prospects_returns_early(self):
+        """No active apps and no pending prospects → return early, no Playwright."""
+        output, mock_pw = self._mock_run()
+        self.assertIn("No active applications", output)
+        mock_pw.assert_not_called()
+
+    def test_no_apps_with_pending_prospects_continues(self):
+        """No active apps but pending prospects exist → Playwright launched."""
+        db_module.add_prospective_company("Google")
+        output, mock_pw = self._mock_run()
+        # Should NOT return early — prospective scraping needed
+        self.assertNotIn("No active applications and no pending", output)
+        mock_pw.assert_called_once()
+
+    def test_active_apps_no_prospects_continues(self):
+        """Active apps present → Playwright launched regardless of prospects."""
+        db_module.add_application("Stripe", "https://s.com/1", "SWE")
+        output, mock_pw = self._mock_run()
+        mock_pw.assert_called_once()
 
 
 if __name__ == "__main__":
