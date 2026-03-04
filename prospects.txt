@@ -1,0 +1,178 @@
+# prospects.txt — H1B Sponsoring Companies for Software Developer/Engineer Roles
+# Source: h1bdata.info/topcompanies.php (2025 data)
+# Filtered: product/tech companies only — removed staffing firms, consulting, universities, hospitals
+# Format: one company name per line (use exactly as shown for CareerShift search)
+# Last updated: March 2026
+
+# ─────────────────────────────────────────
+# FAANG / Big Tech
+# ─────────────────────────────────────────
+Google
+Amazon
+Microsoft
+Apple
+Meta
+Netflix
+
+# ─────────────────────────────────────────
+# High-Growth Tech (high salaries, strong H1B)
+# ─────────────────────────────────────────
+Nvidia
+Salesforce
+Adobe
+Uber
+Airbnb
+Stripe
+LinkedIn
+ByteDance
+TikTok
+Waymo
+Doordash
+Rivian
+Lucid
+Tesla
+Lyft
+Snap
+Pinterest
+Spotify
+Dropbox
+Block
+Databricks
+Snowflake
+Robinhood
+Instacart
+Roku
+Zillow
+Wayfair
+Chewy
+
+# ─────────────────────────────────────────
+# Enterprise Software / Cloud
+# ─────────────────────────────────────────
+Workday
+ServiceNow
+Okta
+Palo Alto Networks
+Splunk
+Nutanix
+Autodesk
+Intuit
+PayPal
+eBay
+Twilio
+Docusign
+Pure Storage
+NetApp
+Informatica
+Akamai Technologies
+Citrix
+Fortinet
+Synopsys
+Cadence Design Systems
+Zoom
+VMware
+SAP America
+Red Hat
+MathWorks
+
+# ─────────────────────────────────────────
+# Semiconductor / Hardware
+# ─────────────────────────────────────────
+Intel
+Qualcomm
+AMD
+Micron Technology
+Applied Materials
+Texas Instruments
+KLA Corporation
+Lam Research
+Marvell Semiconductor
+Western Digital
+NXP USA
+ASML
+Broadcom
+Xilinx
+Analog Devices
+Arm
+Samsung Electronics America
+
+# ─────────────────────────────────────────
+# Fintech / Finance Tech
+# ─────────────────────────────────────────
+JPMorgan Chase
+Goldman Sachs
+Morgan Stanley
+Visa
+Mastercard
+American Express
+Capital One
+BlackRock
+Fidelity
+Charles Schwab
+Bloomberg
+Coinbase
+Barclays
+Deutsche Bank
+Citibank
+Bank of America
+Wells Fargo
+US Bank
+State Street
+
+# ─────────────────────────────────────────
+# Automotive / EV / Autonomous
+# ─────────────────────────────────────────
+Ford Motor Company
+General Motors
+Waymo
+Rivian
+Lucid
+Zoox
+Cruise
+Aptiv
+Bosch
+
+# ─────────────────────────────────────────
+# Telecom / Media / Entertainment
+# ─────────────────────────────────────────
+T-Mobile
+Comcast
+AT&T
+Charter Communications
+Sony Interactive Entertainment
+Electronic Arts
+Sirius XM
+
+# ─────────────────────────────────────────
+# Healthcare Tech
+# ─────────────────────────────────────────
+Optum
+Elevance Health
+Humana
+Cigna
+
+# ─────────────────────────────────────────
+# Other Strong Tech Sponsors
+# ─────────────────────────────────────────
+Indeed
+GoDaddy
+Expedia
+Nike
+Nordstrom
+Target
+Walmart
+Best Buy
+Home Depot
+Starbucks
+FedEx
+Honeywell
+Caterpillar
+Siemens
+Nokia
+Ericsson
+Juniper Networks
+Motorola Solutions
+Cox Automotive
+Illumina
+Genentech
+Gilead Sciences

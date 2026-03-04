@@ -155,8 +155,11 @@ def process_outreach():
     print(f"[INFO] {len(pending)} outreach email(s) to send.")
     print(f"[INFO] Send window: {SEND_WINDOW_START}:00 AM - {HARD_CUTOFF_HOUR}:00 AM ({SEND_TIMEZONE})\n")
 
-    sent_count = 0
+    sent_count   = 0
     failed_count = 0
+    bounced      = 0
+    skipped      = 0
+    emails       = []
 
     for row in pending:
 
@@ -196,6 +199,7 @@ def process_outreach():
                     print(f"   [WARNING] AI quota exhausted and no cached template for {company}. Skipping until tomorrow.")
                 else:
                     print(f"   [WARNING] No AI content found for {company}. Run --find-only first. Skipping.")
+                skipped += 1
                 continue
 
             body, subject = template
@@ -210,7 +214,14 @@ def process_outreach():
         except smtplib.SMTPRecipientsRefused:
             print(f"   [ERROR] Hard bounce for {recruiter_email} — marking recruiter inactive")
             mark_outreach_bounced(outreach_id, recruiter_id)
+            bounced      += 1
             failed_count += 1
+            emails.append({
+                "name":    recruiter_name,
+                "company": company,
+                "stage":   stage,
+                "status":  "bounced",
+            })
             time.sleep(random.randint(30, 90))
             continue
 
@@ -218,6 +229,12 @@ def process_outreach():
             print(f"   [ERROR] Failed to send: {e}")
             mark_outreach_failed(outreach_id)
             failed_count += 1
+            emails.append({
+                "name":    recruiter_name,
+                "company": company,
+                "stage":   stage,
+                "status":  "failed",
+            })
             time.sleep(random.randint(30, 90))
             continue
 
@@ -225,6 +242,12 @@ def process_outreach():
         mark_outreach_sent(outreach_id)
         sent_count += 1
         print(f"   [OK] Sent | Subject: {subject}")
+        emails.append({
+            "name":    recruiter_name,
+            "company": company,
+            "stage":   stage,
+            "status":  "sent",
+        })
 
         # Schedule next stage if no reply
         try:
@@ -237,7 +260,13 @@ def process_outreach():
         time.sleep(random.randint(30, 90))
 
     print(f"\n[OK] Sent: {sent_count} | Failed: {failed_count}")
-    return {"sent": sent_count, "failed": failed_count}
+    return {
+        "sent":    sent_count,
+        "failed":  failed_count,
+        "bounced": bounced,
+        "skipped": skipped,
+        "emails":  emails,
+    }
 
 
 def run():
@@ -251,6 +280,8 @@ def run():
     result = process_outreach() or {}
 
     # Collect sequence stats
+    active_seq = completed_seq = pending_reply = 0
+    conn = None
     try:
         conn = get_conn()
         c = conn.cursor()
@@ -262,12 +293,16 @@ def run():
             FROM outreach
         """)
         row = c.fetchone()
-        conn.close()
-        active_seq    = row["active"]    or 0
-        completed_seq = row["completed"] or 0
-        pending_reply = row["pending_reply"] or 0
-    except Exception:
+        if row:
+            active_seq    = row["active"]       or 0
+            completed_seq = row["completed"]     or 0
+            pending_reply = row["pending_reply"] or 0
+    except Exception as e:
+        print(f"[WARNING] Could not collect sequence stats: {e}")
         active_seq = completed_seq = pending_reply = 0
+    finally:
+        if conn:
+            conn.close()
 
     return {
         "sent":                result.get("sent", 0),

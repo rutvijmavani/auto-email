@@ -311,7 +311,7 @@ def run():
                         else:
                             print(f"   [WARNING] Could not persist contacts for {company} — not marking scraped")
 
-                    if not contacts:
+                    if contacts == []:
                         _prospective_stats["exhausted"] += 1
 
                     human_delay(3.0, 7.0)
