@@ -6,7 +6,7 @@ SESSION_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "careershif
 CAREERSHIFT_SEARCH_URL = "https://www.careershift.com/App/Contacts/Search"
 CAREERSHIFT_QUOTA_URL  = "https://www.careershift.com/App/Settings/ResetPassword"
 
-MIN_RECRUITERS_PER_COMPANY = 2
+MIN_RECRUITERS_PER_COMPANY = 1
 
 HR_SEARCH_TERMS = [
     "Recruiter",

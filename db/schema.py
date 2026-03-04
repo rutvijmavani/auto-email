@@ -193,6 +193,18 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS prospective_companies (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            company      TEXT NOT NULL UNIQUE,
+            priority     INTEGER DEFAULT 0,
+            status       TEXT DEFAULT 'pending',
+            scraped_at   TIMESTAMP,
+            converted_at TIMESTAMP,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Migration: add expected_domain and exhausted_at to applications if missing
     try:
         c.execute("ALTER TABLE applications ADD COLUMN expected_domain TEXT")

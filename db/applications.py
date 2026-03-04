@@ -7,22 +7,24 @@ from db.connection import get_conn
 
 
 def add_application(company, job_url, job_title=None, applied_date=None,
-                    expected_domain=None):
+                    expected_domain=None, status_override=None):
     """
     Insert a new application.
     Returns (application_id, created) where created=True means newly inserted,
     created=False means the URL already existed in DB.
+    status_override: set custom status (e.g. 'prospective') instead of default 'active'
     """
     conn = get_conn()
     c = conn.cursor()
+    status = status_override or "active"
     try:
         c.execute("""
             INSERT INTO applications (company, job_url, job_title, applied_date,
-                                      expected_domain)
-            VALUES (?, ?, ?, ?, ?)
+                                      expected_domain, status)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, (company, job_url, job_title,
               applied_date or datetime.now().strftime("%Y-%m-%d"),
-              expected_domain))
+              expected_domain, status))
         conn.commit()
         return c.lastrowid, True
     except sqlite3.IntegrityError as e:
@@ -80,6 +82,26 @@ def mark_application_exhausted(application_id):
     conn.close()
 
 
+def mark_applications_exhausted(application_ids):
+    """
+    Atomically mark multiple applications as exhausted in a single transaction.
+    Prevents partial updates if one row fails mid-loop.
+    """
+    if not application_ids:
+        return
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.executemany("""
+            UPDATE applications
+            SET status = 'exhausted', exhausted_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, [(app_id,) for app_id in application_ids])
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def reactivate_application(company):
     """Reactivate exhausted application by company name."""
     conn = get_conn()
@@ -93,6 +115,39 @@ def reactivate_application(company):
     count = c.rowcount
     conn.close()
     return count
+
+
+def convert_prospective_to_active(company, real_job_url, job_title=None,
+                                   expected_domain=None):
+    """
+    Convert a prospective placeholder application to active when user applies.
+    Updates the placeholder URL to the real job URL and marks status active.
+    Returns app_id if converted, None if no prospective found.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
+    c.execute("""
+        SELECT id FROM applications
+        WHERE company = ? AND job_url = ? AND status = 'prospective'
+    """, (company, placeholder_url))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    c.execute("""
+        UPDATE applications
+        SET job_url = ?,
+            job_title = COALESCE(?, job_title),
+            expected_domain = COALESCE(?, expected_domain),
+            status = 'active',
+            applied_date = DATE('now')
+        WHERE id = ?
+    """, (real_job_url, job_title, expected_domain, row["id"]))
+    conn.commit()
+    app_id = row["id"]
+    conn.close()
+    return app_id
 
 
 def update_application_expected_domain(application_id, expected_domain):

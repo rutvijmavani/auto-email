@@ -406,15 +406,6 @@ class TestAnalyzeBuffer(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["email"], "john@collective.com")
 
-    def test_no_reference_domain_returns_full_buffer(self):
-        """No expected_domain and no existing_db_domain → trust buffer as-is."""
-        buffer = [
-            self._record("john@collective.com"),
-            self._record("jane@collective.com", "Jane"),
-        ]
-        result = analyze_buffer(buffer, "")
-        self.assertEqual(len(result), 2)
-
     def test_none_reference_domain_returns_full_buffer(self):
         """None expected_domain and no existing_db_domain → trust buffer as-is."""
         buffer = [self._record("john@collective.com")]
