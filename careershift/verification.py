@@ -49,6 +49,7 @@ def verify_tier3_recruiter(page, recruiter):
     """
     Tier 3: Full profile visit — free since profile is cached.
     Checks company, title, email still current. Updates DB or marks inactive.
+    Returns True if recruiter was marked inactive, False otherwise.
     """
     name = recruiter["name"]
     company = recruiter["company"]
@@ -57,7 +58,7 @@ def verify_tier3_recruiter(page, recruiter):
         ok = submit_search(page, company, hr_term=None, require_email=False)
         if not ok:
             update_recruiter(recruiter["id"])
-            return
+            return False
 
         human_delay(2.0, 3.0)
         html = page.content()
@@ -72,7 +73,7 @@ def verify_tier3_recruiter(page, recruiter):
         if not detail_url:
             print(f"     [INFO] Tier 3: {name} not found at {company} — marking inactive")
             mark_recruiter_inactive(recruiter["id"], reason="not found in company search")
-            return
+            return True
 
         human_delay(3.0, 6.0)
         page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
@@ -85,7 +86,7 @@ def verify_tier3_recruiter(page, recruiter):
         if company.lower() not in page_text:
             print(f"     [INFO] Tier 3: {name} no longer at {company} — marking inactive")
             mark_recruiter_inactive(recruiter["id"], reason="company mismatch on profile")
-            return
+            return True
 
         new_email = extract_email(page)
         current_email = recruiter["email"]
@@ -107,16 +108,19 @@ def verify_tier3_recruiter(page, recruiter):
         page.goto(f"{CAREERSHIFT_SEARCH_URL}#contacts_search_results",
                   wait_until="domcontentloaded", timeout=20000)
         human_delay(2.0, 3.0)
+        return False
 
     except Exception as e:
         print(f"     [WARNING] Tier 3 check failed for {name}: {e}")
         update_recruiter(recruiter["id"])
+        return False
 
 
 def run_tiered_verification(page, applications):
     """
     Run tiered verification for all existing recruiters.
     After verification, link active recruiters to their applications.
+    Returns stats dict with tier counts and changes.
     """
     tiers = get_recruiters_by_tier(TIER1_DAYS, TIER2_DAYS)
 
@@ -129,20 +133,46 @@ def run_tiered_verification(page, applications):
     print(f"  Tier 2 ({TIER1_DAYS}-{TIER2_DAYS} days, search check): {len(tier2)} recruiter(s)")
     print(f"  Tier 3 (> {TIER2_DAYS} days, full visit):   {len(tier3)} recruiter(s)")
 
+    tier2_verified = 0
+    tier3_verified = 0
+    tier3_inactive = 0
+    changes        = []
+
     if tier2:
         print(f"\n[INFO] Running Tier 2 verification ({len(tier2)} recruiter(s))...")
         for recruiter in tier2:
             print(f"  Checking: {recruiter['name']} @ {recruiter['company']}")
             found = verify_tier2_recruiter(page, recruiter)
-            if not found:
-                verify_tier3_recruiter(page, recruiter)
+            if found:
+                tier2_verified += 1
+            else:
+                # Escalate to Tier 3
+                marked_inactive = verify_tier3_recruiter(page, recruiter)
+                if marked_inactive:
+                    tier3_inactive += 1
+                    changes.append({
+                        "name":    recruiter["name"],
+                        "company": recruiter["company"],
+                        "action":  "marked inactive",
+                    })
+                else:
+                    tier3_verified += 1
             human_delay(1.0, 2.0)
 
     if tier3:
         print(f"\n[INFO] Running Tier 3 verification ({len(tier3)} recruiter(s))...")
         for recruiter in tier3:
             print(f"  Verifying: {recruiter['name']} @ {recruiter['company']}")
-            verify_tier3_recruiter(page, recruiter)
+            marked_inactive = verify_tier3_recruiter(page, recruiter)
+            if marked_inactive:
+                tier3_inactive += 1
+                changes.append({
+                    "name":    recruiter["name"],
+                    "company": recruiter["company"],
+                    "action":  "marked inactive",
+                })
+            else:
+                tier3_verified += 1
             human_delay(1.0, 2.0)
 
     print(f"\n[INFO] Linking verified recruiters to applications...")
@@ -154,3 +184,13 @@ def run_tiered_verification(page, applications):
             linked += 1
         if linked:
             print(f"  [OK] {app['company']}: linked {linked} recruiter(s) to application id={app['id']}")
+
+    return {
+        "tier1_count":    len(tier1),
+        "tier2_count":    len(tier2),
+        "tier2_verified": tier2_verified,
+        "tier3_count":    len(tier3),
+        "tier3_verified": tier3_verified,
+        "tier3_inactive": tier3_inactive,
+        "changes":        changes,
+    }

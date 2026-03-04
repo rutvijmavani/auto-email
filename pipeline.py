@@ -422,8 +422,8 @@ def run_verify_only():
 
         print("[OK] Session valid.\n")
 
-        # Run tiered verification
-        run_tiered_verification(page, applications)
+        # Run tiered verification — capture stats for report
+        verify_stats = run_tiered_verification(page, applications) or {}
 
         browser.close()
 
@@ -469,13 +469,13 @@ def run_verify_only():
 
     build_verify_report({
         "date":           date_str,
-        "tier1_count":    0,
-        "tier2_count":    0,
-        "tier2_verified": 0,
-        "tier3_count":    0,
-        "tier3_verified": 0,
-        "tier3_inactive": 0,
-        "changes":        [],
+        "tier1_count":    verify_stats.get("tier1_count",    0),
+        "tier2_count":    verify_stats.get("tier2_count",    0),
+        "tier2_verified": verify_stats.get("tier2_verified", 0),
+        "tier3_count":    verify_stats.get("tier3_count",    0),
+        "tier3_verified": verify_stats.get("tier3_verified", 0),
+        "tier3_inactive": verify_stats.get("tier3_inactive", 0),
+        "changes":        verify_stats.get("changes",        []),
         "under_stocked":  under_stocked_detail,
     })
 
@@ -494,7 +494,6 @@ def run_outreach():
 
     # Send HTML report
     if stats:
-        stats["date"] = datetime.now().strftime("%B %-d, %Y") if hasattr(datetime, 'strptime') else datetime.now().strftime("%B %d, %Y")
         try:
             stats["date"] = datetime.now().strftime("%B %-d, %Y")
         except ValueError:
