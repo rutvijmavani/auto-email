@@ -122,10 +122,11 @@ def convert_prospective_to_active(company, real_job_url, job_title=None,
     """
     Convert a prospective placeholder application to active when user applies.
     Updates the placeholder URL to the real job URL and marks status active.
-    Returns app_id if converted, None if no prospective found.
+    Returns app_id if converted, None if no prospective found or URL conflict.
     """
     conn = get_conn()
     c = conn.cursor()
+    company = company.strip()
     placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
     c.execute("""
         SELECT id FROM applications
@@ -135,19 +136,26 @@ def convert_prospective_to_active(company, real_job_url, job_title=None,
     if not row:
         conn.close()
         return None
-    c.execute("""
-        UPDATE applications
-        SET job_url = ?,
-            job_title = COALESCE(?, job_title),
-            expected_domain = COALESCE(?, expected_domain),
-            status = 'active',
-            applied_date = DATE('now')
-        WHERE id = ?
-    """, (real_job_url, job_title, expected_domain, row["id"]))
-    conn.commit()
-    app_id = row["id"]
-    conn.close()
-    return app_id
+    try:
+        c.execute("""
+            UPDATE applications
+            SET job_url = ?,
+                job_title = COALESCE(?, job_title),
+                expected_domain = COALESCE(?, expected_domain),
+                status = 'active',
+                applied_date = DATE('now')
+            WHERE id = ?
+        """, (real_job_url, job_title, expected_domain, row["id"]))
+        conn.commit()
+        app_id = row["id"]
+        return app_id
+    except sqlite3.IntegrityError:
+        # real_job_url already exists in applications table
+        conn.rollback()
+        print(f"   [WARNING] Job URL already exists: {real_job_url}")
+        return None
+    finally:
+        conn.close()
 
 
 def update_application_expected_domain(application_id, expected_domain):

@@ -110,17 +110,19 @@ def add_job_interactively():
     expected_domain = extract_expected_domain(job_url)
 
     # ── Prospective detection ──
-    # Check if recruiters already pre-scraped for this company
-    if is_prospective(company):
-        print(f"[INFO] '{company}' found in prospective pipeline — recruiters already pre-scraped!")
+    # Normalize company name so " Google ", "google", "Google" all match
+    # the stored prospective entry regardless of how user typed it
+    company_normalized = company.strip()
+    if is_prospective(company_normalized):
+        print(f"[INFO] '{company_normalized}' found in prospective pipeline — recruiters already pre-scraped!")
         converted_id = convert_prospective_to_active(
-            company=company,
+            company=company_normalized,
             real_job_url=job_url,
             job_title=job_title,
             expected_domain=expected_domain,
         )
         if converted_id:
-            mark_prospective_converted(company)
+            mark_prospective_converted(company_normalized)
             print(f"[OK] Converted prospective → active (id={converted_id})")
             print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
             return

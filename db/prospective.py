@@ -3,18 +3,35 @@
 from db.connection import get_conn
 
 
+def _normalize_company(name):
+    """
+    Normalize a company name — strip whitespace and validate non-empty.
+    Raises ValueError if the result is empty.
+    All prospective functions pass company names through this helper
+    so " Google " and "Google" resolve to the same canonical value.
+    """
+    if name is None:
+        raise ValueError("Company name cannot be None")
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("Company name cannot be empty or whitespace")
+    return normalized
+
+
 def add_prospective_company(company, priority=0):
     """
     Add a company to the prospective list.
     Silently ignores duplicates (INSERT OR IGNORE).
     Returns True if newly inserted, False if already existed.
+    Raises ValueError if company name is empty/whitespace.
     """
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
         INSERT OR IGNORE INTO prospective_companies (company, priority, status)
         VALUES (?, ?, 'pending')
-    """, (company.strip(), priority))
+    """, (company, priority))
     conn.commit()
     inserted = c.rowcount > 0
     conn.close()
@@ -68,6 +85,7 @@ def get_prospective_companies(status=None):
 
 def mark_prospective_scraped(company):
     """Mark prospective company as scraped — recruiters found."""
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -81,6 +99,7 @@ def mark_prospective_scraped(company):
 
 def mark_prospective_exhausted(company):
     """Mark prospective company as exhausted — no recruiters found."""
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -97,6 +116,7 @@ def mark_prospective_converted(company):
     Mark prospective company as converted — user applied and ran --add.
     Called when --add detects existing prospective entry for a company.
     """
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -114,6 +134,7 @@ def is_prospective(company):
     Used by --add to detect if recruiters are already pre-scraped.
     Returns True if company is scraped and ready for outreach.
     """
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -144,6 +165,7 @@ def get_prospective_status_summary():
 
 def get_prospective_company(company):
     """Return single prospective company record or None."""
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
