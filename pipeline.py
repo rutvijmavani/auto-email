@@ -629,9 +629,15 @@ def main():
 
     if "--detect-ats" in args:
         from jobs.job_monitor import run_detect_ats
-        # Optional specific company: --detect-ats "Stripe"
-        company = next((a for a in args if not a.startswith("--")), None)
-        run_detect_ats(company)
+        # Usage:
+        #   --detect-ats                          (all companies)
+        #   --detect-ats "Stripe"                 (single company)
+        #   --detect-ats "Capital One" --override workday capitalone
+        non_flag_args = [a for a in args if not a.startswith("--")]
+        company           = non_flag_args[0] if len(non_flag_args) > 0 else None
+        override_platform = non_flag_args[1] if len(non_flag_args) > 1 else None
+        override_slug     = non_flag_args[2] if len(non_flag_args) > 2 else None
+        run_detect_ats(company, override_platform, override_slug)
         return
 
     if "--monitor-status" in args:

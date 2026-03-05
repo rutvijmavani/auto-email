@@ -143,6 +143,7 @@ from db.job_monitor import (
     mark_first_scan_complete,
     update_company_check,
     get_all_monitored_companies,
+    get_monitorable_companies,
     save_monitor_stats,
     get_monitor_stats,
     get_pipeline_reliability,

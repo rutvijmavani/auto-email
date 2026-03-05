@@ -8,6 +8,7 @@ from datetime import datetime
 from db.db import (
     init_db,
     get_all_monitored_companies,
+    get_monitorable_companies,
     job_url_exists,
     job_hash_exists,
     save_job_posting,
@@ -39,11 +40,18 @@ def run():
     start_time = time.time()
     init_db()
 
-    companies = get_all_monitored_companies()
+    companies = get_monitorable_companies()
     if not companies:
-        print("[INFO] No companies to monitor.")
+        print("[INFO] No monitorable companies found.")
         print("[INFO] Run: python pipeline.py --import-prospects prospects.txt")
+        print("[INFO] Then: python pipeline.py --detect-ats")
         return {}
+
+    all_companies = get_all_monitored_companies()
+    skipped = len(all_companies) - len(companies)
+    if skipped > 0:
+        print(f"[INFO] Skipping {skipped} company/companies with "
+              f"unknown/unverified ATS — run --detect-ats to fix")
 
     print(f"\n{'='*55}")
     print(f"[INFO] Job Monitor — {datetime.now().strftime('%B %d, %Y')}")
@@ -328,11 +336,19 @@ def _send_text_fallback(postings):
     return send_report_email(subject, html)
 
 
-def run_detect_ats(company=None):
+def run_detect_ats(company=None, override_platform=None,
+                   override_slug=None):
     """
     Run ATS detection for all companies or a specific one.
     Called by --detect-ats flag.
+
+    company:           specific company name (optional)
+    override_platform: manually set ATS platform (requires company)
+    override_slug:     manually set ATS slug (requires company)
     """
+    from outreach.report_templates.detection_report import build_detection_report
+    from datetime import datetime
+
     init_db()
     companies = get_all_monitored_companies()
 
@@ -341,18 +357,30 @@ def run_detect_ats(company=None):
               "Run --import-prospects first.")
         return
 
+    # ── Manual override ──
+    if company and override_platform and override_slug:
+        from jobs.ats_detector import override_ats
+        override_ats(company.strip(), override_platform, override_slug)
+        return
+
+    # ── Single company re-detection ──
     if company:
-        # Single company detection
         company_normalized = company.strip()
         matches = [c for c in companies
                    if c["company"] == company_normalized]
         if not matches:
             print(f"[ERROR] '{company}' not found in monitored companies.")
             return
-        detect_ats(company_normalized)
+        result = detect_ats(company_normalized)
+        # Send email if close call or unknown
+        try:
+            date_str = datetime.now().strftime("%B %-d, %Y")
+        except ValueError:
+            date_str = datetime.now().strftime("%B %d, %Y")
+        build_detection_report([result], date_str)
         return
 
-    # Detect for all unknown or stale companies
+    # ── Detect for all unknown or stale companies ──
     to_detect = [c for c in companies
                  if needs_redetection(c, JOB_MONITOR_REDETECT_DAYS)]
 
@@ -361,8 +389,20 @@ def run_detect_ats(company=None):
         return
 
     print(f"[INFO] Detecting ATS for {len(to_detect)} companies...\n")
+
+    results = []
     for company_row in to_detect:
-        detect_ats(company_row["company"])
+        result = detect_ats(company_row["company"])
+        results.append(result)
+
+    # ── Send summary email ──
+    try:
+        date_str = datetime.now().strftime("%B %-d, %Y")
+    except ValueError:
+        date_str = datetime.now().strftime("%B %d, %Y")
+
+    print(f"\n[INFO] Detection complete. Sending summary email...")
+    build_detection_report(results, date_str)
 
 
 def run_monitor_status():
