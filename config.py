@@ -65,3 +65,70 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 METRIC1_ALERT_THRESHOLD       = 50   # find-only performance % (Red)
 METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
 METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires
+
+# ─────────────────────────────────────────
+# JOB MONITORING SETTINGS
+# ─────────────────────────────────────────
+
+# Priority 1 — Job title keywords (broad match)
+TARGET_JOB_TITLES = [
+    "software engineer",
+    "software developer",
+    "software development engineer",
+    "backend engineer",
+    "frontend engineer",
+    "full stack engineer",
+    "full stack developer",
+    "web developer",
+    "platform engineer",
+    "application engineer",
+    "member of technical staff",
+    "swe",
+]
+
+# Priority 2 — Seniority (soft score only — no hard reject)
+TARGET_SENIORITY = [
+    "senior", "staff", "principal", "lead",
+]
+
+# Priority 3 — Skills (soft score — description match)
+TARGET_SKILLS = [
+    "python", "javascript", "typescript",
+    "react", "node.js", "aws", "go",
+    "java", "kubernetes", "docker",
+]
+
+# Priority 4 — USA location keywords
+USA_LOCATION_KEYWORDS = [
+    "united states", "usa", "u.s.", "remote",
+    "new york", "san francisco", "seattle",
+    "austin", "boston", "chicago", "denver",
+    "los angeles", "atlanta", "miami", "dallas",
+    "new jersey", "washington", "virginia",
+    "texas", "california", "new york",
+]
+EXCLUDE_LOCATIONS = [
+    "canada", "toronto", "uk", "london",
+    "india", "bangalore", "germany", "berlin",
+    "australia", "singapore", "ireland", "dublin",
+    "poland", "netherlands", "france", "paris",
+    "mexico", "brazil", "japan", "china",
+]
+
+# Freshness
+JOB_MONITOR_DAYS_FRESH        = 3    # days to consider a job fresh
+JOB_MONITOR_REDETECT_DAYS     = 14   # re-detect ATS after X consecutive empty days
+JOB_MONITOR_PDF_RETENTION     = 30   # days to keep PDF digest files
+JOB_MONITOR_MAX_JOBS          = 0    # 0 = no cap (show ALL matching jobs)
+JOB_MONITOR_API_TIMEOUT       = 10   # seconds per API request
+
+# ATS detection
+ATS_PLATFORMS = ["greenhouse", "lever", "ashby",
+                 "smartrecruiters", "workday"]
+
+# Alert thresholds
+MONITOR_COVERAGE_ALERT        = 0.70  # alert if < 70% companies returned jobs
+MONITOR_ATS_UNKNOWN_ALERT     = 0.20  # alert if > 20% companies unknown ATS
+MONITOR_RELIABILITY_ALERT     = 0.90  # alert if < 90% runs succeed (7 days)
+MONITOR_MATCH_RATE_LOW_ALERT  = 0.05  # alert if < 5% fetched jobs match filters
+MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% fetched jobs match filters

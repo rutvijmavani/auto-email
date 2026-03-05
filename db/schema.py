@@ -30,6 +30,27 @@ def _cleanup_old_model_usage(c):
     c.execute("DELETE FROM model_usage WHERE date < ?", (cutoff,))
 
 
+def _cleanup_job_postings(c):
+    """Archive expired job postings and remove old dismissed ones."""
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    # Archive new postings older than 7 days (clear description to save space)
+    c.execute("""
+        UPDATE job_postings
+        SET status = 'expired', description = NULL
+        WHERE status = 'new'
+        AND first_seen < DATE('now', '-7 days')
+    """)
+    # Delete dismissed postings older than 30 days
+    c.execute("""
+        DELETE FROM job_postings
+        WHERE status = 'dismissed'
+        AND first_seen < DATE('now', '-30 days')
+    """)
+    # Delete applied postings (already in applications table)
+    c.execute("DELETE FROM job_postings WHERE status = 'applied'")
+
+
 def _cleanup_outreach(c):
     """Tiered outreach cleanup based on status."""
     c.execute("""
@@ -205,6 +226,66 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS job_postings (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            company      TEXT NOT NULL,
+            title        TEXT NOT NULL,
+            job_url      TEXT NOT NULL UNIQUE,
+            content_hash TEXT,
+            location     TEXT,
+            posted_at    TIMESTAMP,
+            description  TEXT,
+            skill_score  INTEGER DEFAULT 0,
+            status       TEXT DEFAULT 'new',
+            first_seen   DATE NOT NULL,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_job_postings_hash
+        ON job_postings(content_hash)
+        WHERE content_hash IS NOT NULL
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_postings_status_seen
+        ON job_postings(status, first_seen)
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS monitor_stats (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            date                   DATE NOT NULL UNIQUE,
+            companies_monitored    INTEGER DEFAULT 0,
+            companies_with_results INTEGER DEFAULT 0,
+            companies_unknown_ats  INTEGER DEFAULT 0,
+            api_failures           INTEGER DEFAULT 0,
+            total_jobs_fetched     INTEGER DEFAULT 0,
+            new_jobs_found         INTEGER DEFAULT 0,
+            jobs_matched_filters   INTEGER DEFAULT 0,
+            run_duration_seconds   INTEGER DEFAULT 0,
+            pdf_generated          INTEGER DEFAULT 0,
+            email_sent             INTEGER DEFAULT 0,
+            created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Migration: add ATS detection columns to prospective_companies
+    for col, definition in [
+        ("ats_platform",          "TEXT DEFAULT 'unknown'"),
+        ("ats_slug",              "TEXT"),
+        ("ats_detected_at",       "TIMESTAMP"),
+        ("first_scanned_at",      "TIMESTAMP"),
+        ("last_checked_at",       "TIMESTAMP"),
+        ("consecutive_empty_days","INTEGER DEFAULT 0"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE prospective_companies "
+                      f"ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
     # Migration: add expected_domain and exhausted_at to applications if missing
     try:
         c.execute("ALTER TABLE applications ADD COLUMN expected_domain TEXT")
@@ -234,6 +315,7 @@ def init_db():
     _cleanup_expired_jobs(c)
     _cleanup_old_model_usage(c)
     _cleanup_outreach(c)
+    _cleanup_job_postings(c)
     _cleanup_careershift_quota(c)
     _cleanup_quota_alerts(c)
     conn.commit()

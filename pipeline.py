@@ -17,6 +17,10 @@ CLI flags:
   --verify-only         verify all active recruiters + report under-stocked companies
   --import-prospects    bulk import prospective companies from prospects.txt
   --prospects-status    show prospective pipeline status summary
+  --monitor-jobs        scan all companies for new job postings + send PDF digest
+  --detect-ats          auto-detect ATS for all undetected companies
+  --detect-ats "Name"   force re-detect ATS for specific company
+  --monitor-status      show job monitoring status summary
   --outreach-only       schedule + send outreach emails
   --quota-report        check quota health and send alert email if needed
 """
@@ -616,6 +620,23 @@ def main():
 
     if "--prospects-status" in args:
         run_prospects_status()
+        return
+
+    if "--monitor-jobs" in args:
+        from jobs.job_monitor import run as monitor_run
+        monitor_run()
+        return
+
+    if "--detect-ats" in args:
+        from jobs.job_monitor import run_detect_ats
+        # Optional specific company: --detect-ats "Stripe"
+        company = next((a for a in args if not a.startswith("--")), None)
+        run_detect_ats(company)
+        return
+
+    if "--monitor-status" in args:
+        from jobs.job_monitor import run_monitor_status
+        run_monitor_status()
         return
 
     if "--quota-report" in args:
