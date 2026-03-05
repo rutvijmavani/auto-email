@@ -82,10 +82,11 @@ def _normalize(job, company, company_slug=""):
         loc_str = "Remote"
 
     # Build job URL using slug derived from caller
-    job_id      = job.get("id", "")
-    title_slug  = slugify(job.get("name", ""))
-    title_slug  = title_slug[0] if title_slug else ""
-    job_suffix  = f"{job_id}-{title_slug}" if title_slug else job_id
+    job_id     = job.get("id", "")
+    raw_name   = job.get("name")
+    name_str   = str(raw_name).strip() if raw_name is not None else ""
+    title_slug = slugify(name_str)[0] if name_str and slugify(name_str) else ""
+    job_suffix = f"{job_id}-{title_slug}" if title_slug else job_id
     job_url = (
         f"https://jobs.smartrecruiters.com/{company_slug}/{job_suffix}"
         if company_slug else
