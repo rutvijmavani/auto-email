@@ -32,8 +32,6 @@ def _cleanup_old_model_usage(c):
 
 def _cleanup_job_postings(c):
     """Archive expired job postings and remove old dismissed ones."""
-    from datetime import datetime
-    today = datetime.now().strftime("%Y-%m-%d")
     # Archive new postings older than 7 days (clear description to save space)
     c.execute("""
         UPDATE job_postings

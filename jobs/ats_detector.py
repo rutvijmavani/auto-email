@@ -95,14 +95,17 @@ def needs_redetection(company_row, redetect_days=14):
       2. consecutive_empty_days >= redetect_days
       3. ats_detected_at is NULL (never detected)
     """
-    platform = company_row.get("ats_platform", "unknown")
-    slug = company_row.get("ats_slug")
-    empty_days = company_row.get("consecutive_empty_days", 0) or 0
+    platform      = company_row.get("ats_platform", "unknown")
+    slug          = company_row.get("ats_slug")
+    empty_days    = company_row.get("consecutive_empty_days", 0) or 0
+    detected_at   = company_row.get("ats_detected_at")
 
     if not platform or platform == "unknown":
         return True
     if not slug:
         return True
+    if detected_at is None:
+        return True  # never successfully detected
     if empty_days >= redetect_days:
         return True
     return False

@@ -105,7 +105,7 @@ USA_LOCATION_KEYWORDS = [
     "austin", "boston", "chicago", "denver",
     "los angeles", "atlanta", "miami", "dallas",
     "new jersey", "washington", "virginia",
-    "texas", "california", "new york",
+    "texas", "california",
 ]
 EXCLUDE_LOCATIONS = [
     "canada", "toronto", "uk", "london",

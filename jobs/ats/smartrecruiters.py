@@ -57,10 +57,10 @@ def fetch_jobs(slug, company):
         if offset >= total:
             break
 
-    return [_normalize(j, company) for j in all_jobs if j.get("name")]
+    return [_normalize(j, company, slug) for j in all_jobs if j.get("name")]
 
 
-def _normalize(job, company):
+def _normalize(job, company, company_slug=""):
     """Normalize SmartRecruiters job to standard format."""
     posted_at = None
     released = job.get("releasedDate")
@@ -72,26 +72,30 @@ def _normalize(job, company):
         except (ValueError, AttributeError):
             posted_at = None
 
-    location = job.get("location", {})
+    location = job.get("location", {}) or {}
     loc_str = ", ".join(filter(None, [
         location.get("city", ""),
         location.get("region", ""),
         location.get("country", ""),
     ]))
-    if job.get("location", {}).get("remote"):
+    if location.get("remote"):
         loc_str = "Remote"
+
+    # Build job URL using slug derived from caller
+    job_id = job.get("id", "")
+    job_url = (
+        f"https://jobs.smartrecruiters.com/{company_slug}/{job_id}"
+        if company_slug else
+        f"https://jobs.smartrecruiters.com/{job_id}"
+    )
 
     return {
         "company":     company,
         "title":       job.get("name", ""),
-        "job_url":     f"https://jobs.smartrecruiters.com/{slug}/{job.get('id', '')}",
+        "job_url":     job_url,
         "location":    loc_str,
         "posted_at":   posted_at,
-        "description": job.get("jobAd", {}).get("sections", {})
+        "description": (job.get("jobAd") or {}).get("sections", {})
                            .get("jobDescription", {}).get("text", ""),
         "ats":         "smartrecruiters",
     }
-
-
-# Module-level slug needed for URL construction
-slug = ""
