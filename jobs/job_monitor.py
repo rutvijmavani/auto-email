@@ -194,7 +194,7 @@ def run():
             email_sent = _send_text_fallback(new_postings)
     else:
         print(f"\n[INFO] No new matching jobs today.")
-        _send_no_jobs_email()
+        email_sent = _send_no_jobs_email()
 
     # ── Save stats ──
     final_stats = {
@@ -274,7 +274,7 @@ def _print_metric_alerts(stats, total_companies):
 
 
 def _send_no_jobs_email():
-    """Send brief email when no new jobs found today."""
+    """Send brief email when no new jobs found today. Returns bool."""
     from outreach.report_templates.base import send_report_email
     try:
         date_str = datetime.now().strftime("%B %-d, %Y")
@@ -293,11 +293,12 @@ def _send_no_jobs_email():
       </p>
     </body></html>
     """
-    send_report_email(subject, html)
+    return send_report_email(subject, html)
 
 
 def _send_text_fallback(postings):
     """Send plain text email when PDF generation fails."""
+    import html as html_lib
     from outreach.report_templates.base import send_report_email
     try:
         date_str = datetime.now().strftime("%B %-d, %Y")
@@ -309,10 +310,18 @@ def _send_text_fallback(postings):
                 f"<p>{len(postings)} new jobs matching your profile:</p>",
                 "<ul>"]
     for job in postings:
+        company  = html_lib.escape(str(job.get("company", "")))
+        title    = html_lib.escape(str(job.get("title", "")))
+        location = html_lib.escape(str(job.get("location", "")))
+        raw_url  = str(job.get("job_url", ""))
+        # Only allow safe URL schemes
+        from urllib.parse import urlparse
+        parsed = urlparse(raw_url)
+        safe_url = html_lib.escape(raw_url) if parsed.scheme in ("http", "https") else "#"
         lines.append(
-            f"<li><strong>{job['company']}</strong> — "
-            f"{job['title']} ({job['location']})<br>"
-            f"<a href='{job['job_url']}'>{job['job_url']}</a></li>"
+            f"<li><strong>{company}</strong> — "
+            f"{title} ({location})<br>"
+            f"<a href='{safe_url}'>{html_lib.escape(raw_url)}</a></li>"
         )
     lines.append("</ul>")
     html = "\n".join(lines)

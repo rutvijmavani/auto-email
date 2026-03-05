@@ -2,6 +2,7 @@
 # PDF digest generation + email for --monitor-jobs
 
 import os
+import html as html_lib
 from datetime import datetime
 from collections import defaultdict
 
@@ -33,8 +34,6 @@ DIGESTS_DIR = "data/digests"
 
 def _get_styles():
     """Build custom paragraph styles."""
-    base = getSampleStyleSheet()
-
     styles = {}
 
     styles["title"] = ParagraphStyle(
@@ -344,10 +343,19 @@ def _build_job_listings(jobs_by_company, styles):
                 styles["job_meta"]
             ))
             if job_url:
-                elements.append(Paragraph(
-                    f'<a href="{job_url}" color="#3b82f6">{_safe_text(job_url)}</a>',
-                    styles["job_url"]
-                ))
+                # Validate URL scheme before embedding in PDF href
+                from urllib.parse import urlparse
+                _parsed = urlparse(job_url)
+                if _parsed.scheme in ("http", "https"):
+                    _safe_href = _safe_text(job_url)
+                    elements.append(Paragraph(
+                        f'<a href="{_safe_href}" color="#3b82f6">{_safe_text(job_url)}</a>',
+                        styles["job_url"]
+                    ))
+                else:
+                    elements.append(Paragraph(
+                        _safe_text(job_url), styles["job_url"]
+                    ))
 
         elements.append(Spacer(1, 8))
 
@@ -479,7 +487,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
       {"".join(
         f'<p style="color:#b45309;background:#fef3c7;'
         f'padding:8px;border-radius:4px;font-size:12px;">'
-        f'⚠ {a["message"]}</p>'
+        f'⚠ {html_lib.escape(str(a["message"]))}</p>'
         for a in alerts if a["level"] in ("warning","error")
       )}
     </body></html>

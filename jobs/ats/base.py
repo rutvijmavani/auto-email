@@ -1,6 +1,7 @@
 # jobs/ats/base.py — Shared ATS client logic
 
 import time
+import json
 import requests
 from config import JOB_MONITOR_API_TIMEOUT
 
@@ -22,7 +23,7 @@ def fetch_json(url, params=None, retries=2):
             if resp.status_code == 429:
                 # Rate limited — wait 60s and retry once
                 if attempt < retries:
-                    print(f"   [WARNING] Rate limited — waiting 60s before retry")
+                    print("   [WARNING] Rate limited — waiting 60s before retry")
                     time.sleep(60)
                     continue
                 return None
@@ -41,7 +42,8 @@ def fetch_json(url, params=None, retries=2):
                 time.sleep(5)
                 continue
             return None
-        except (ValueError, Exception):
+        except (ValueError, json.JSONDecodeError,
+                KeyError, AttributeError):
             return None
     return None
 

@@ -282,13 +282,13 @@ class TestGreenhouseClient(unittest.TestCase):
         mock_fetch.return_value = {
             "jobs": [self._job()], "meta": {"total": 1}
         }
-        slug, jobs = self.gh.detect("Stripe")
+        slug, _ = self.gh.detect("Stripe")
         self.assertEqual(slug, "stripe")
 
     @patch("jobs.ats.greenhouse.fetch_json")
     def test_detect_returns_none_on_all_fail(self, mock_fetch):
         mock_fetch.return_value = None
-        slug, jobs = self.gh.detect("NonExistent Corp")
+        slug, _ = self.gh.detect("NonExistent Corp")
         self.assertIsNone(slug)
 
     @patch("jobs.ats.greenhouse.fetch_json")
@@ -376,7 +376,7 @@ class TestLeverClient(unittest.TestCase):
     @patch("jobs.ats.lever.fetch_json")
     def test_detect_success(self, mock_fetch):
         mock_fetch.return_value = [self._job()]
-        slug, jobs = self.lever.detect("Netflix")
+        slug, _ = self.lever.detect("Netflix")
         self.assertEqual(slug, "netflix")
 
     @patch("jobs.ats.lever.fetch_json")
@@ -1249,7 +1249,8 @@ class TestATSDetectionLogic(unittest.TestCase):
 
     def _row(self, **kw):
         base = {"ats_platform": "greenhouse", "ats_slug": "stripe",
-                "consecutive_empty_days": 0}
+                "consecutive_empty_days": 0,
+                "ats_detected_at": "2026-03-01T00:00:00"}
         base.update(kw)
         return base
 
@@ -1273,6 +1274,25 @@ class TestATSDetectionLogic(unittest.TestCase):
 
     def test_fresh_company_no_redetection(self):
         self.assertFalse(self.needs(self._row(consecutive_empty_days=0)))
+
+    def test_null_detected_at_needs_redetection(self):
+        """ats_detected_at=None means never successfully detected."""
+        self.assertTrue(self.needs(
+            self._row(ats_detected_at=None)
+        ))
+
+    def test_missing_detected_at_needs_redetection(self):
+        """Missing ats_detected_at key treated as None."""
+        row = {"ats_platform": "greenhouse", "ats_slug": "stripe",
+               "consecutive_empty_days": 0}
+        # No ats_detected_at key at all
+        self.assertTrue(self.needs(row))
+
+    def test_with_detected_at_no_redetection(self):
+        """Company with ats_detected_at set and healthy → no redetection."""
+        self.assertFalse(self.needs(
+            self._row(ats_detected_at="2026-03-01T00:00:00")
+        ))
 
     def test_under_threshold_no_redetection(self):
         self.assertFalse(self.needs(self._row(consecutive_empty_days=5), 14))
@@ -1766,7 +1786,7 @@ class TestMonitorCLIFlags(unittest.TestCase):
 
     def _run(self, args):
         import pipeline
-        with patch.object(sys, "argv", ["pipeline.py"] + args),              patch("pipeline.init_db"):
+        with patch.object(sys, "argv", ["pipeline.py", *args]),              patch("pipeline.init_db"):
             pipeline.main()
 
     @patch("jobs.job_monitor.run")
@@ -1791,19 +1811,19 @@ class TestMonitorCLIFlags(unittest.TestCase):
 
     @patch("jobs.job_monitor.run")
     @patch("pipeline.run_outreach")
-    def test_outreach_does_not_trigger_monitor(self, mock_out, mock_mon):
+    def test_outreach_does_not_trigger_monitor(self, _mock_out, mock_mon):
         self._run(["--outreach-only"])
         mock_mon.assert_not_called()
 
     @patch("jobs.job_monitor.run")
     @patch("pipeline.run_find_emails")
-    def test_find_only_does_not_trigger_monitor(self, mock_find, mock_mon):
+    def test_find_only_does_not_trigger_monitor(self, _mock_find, mock_mon):
         self._run(["--find-only"])
         mock_mon.assert_not_called()
 
     @patch("jobs.job_monitor.run")
     @patch("pipeline.run_verify_only")
-    def test_verify_only_does_not_trigger_monitor(self, mock_ver, mock_mon):
+    def test_verify_only_does_not_trigger_monitor(self, _mock_ver, mock_mon):
         self._run(["--verify-only"])
         mock_mon.assert_not_called()
 
