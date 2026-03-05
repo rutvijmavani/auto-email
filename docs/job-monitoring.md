@@ -160,90 +160,187 @@ Remaining ~45: Big tech custom pages
 
 ---
 
-## ATS Detection (Option C — Hybrid)
+## ATS Detection — Confidence Scoring Buffer
+
+### Philosophy
+```
+Never trust the first API response that returns jobs.
+A short slug like "capital" on Lever returns jobs for
+"Capital Group" — not "Capital One". First-match-wins
+produces wrong company data in your digest.
+
+Instead: try ALL platforms × ALL slug variants, score
+every response, pick the best one with enough confidence.
+
+Same buffer approach as recruiter domain validation.
+```
 
 ### How it works
 ```
-First time a company is monitored:
-  1. Try Greenhouse: boards-api.greenhouse.io/v1/boards/{slug}/jobs
-  2. Try Lever:      api.lever.co/v0/postings/{slug}
-  3. Try Ashby:      api.ashbyhq.com/posting-api/job-board/{slug}
-  4. Try SmartRecruiters
-  5. Try Workday variants (wd1, wd2, wd3, wd5)
-  6. None matched → mark 'unknown'
+For each company (e.g. "Capital One"):
 
-Slug variants tried per attempt:
-  "Stripe"          → "stripe"
-  "JPMorgan Chase"  → "jpmorganchase", "jpmorgan-chase", "jpmorgan"
-  "Palo Alto Networks" → "paloaltonetworks", "palo-alto-networks",
-                         "paloalto"
+Step 1 — Generate slug variants:
+  "Capital One" → ["capitalone", "capital-one", "capital"]
 
-Result stored in prospective_companies table:
-  ats_platform    = 'greenhouse'
-  ats_slug        = 'stripe'
-  ats_detected_at = 2026-03-04
+Step 2 — Try ALL platforms × ALL slug variants:
+  Greenhouse × capitalone → 404   → skip
+  Greenhouse × capital    → jobs  → score it
+  Lever      × capitalone → jobs  → score it
+  Lever      × capital    → jobs  → score it
+  Ashby      × capitalone → 404   → skip
+  Workday    × capitalone × wd5 → jobs → score it
+  ... (every combination)
 
-Subsequent runs: read from DB — no re-detection
+Step 3 — Score each response:
+  confidence% = jobs where ALL company keywords appear
+                ─────────────────────────────────────
+                total sampled jobs (max 20)
+
+  final_score = confidence% × log10(job_count + 1)
+
+  Example:
+    Lever "capital"    → 50 jobs, "capital" in URL
+                       → "one" missing → 0/20 match
+                       → confidence = 0%
+                       → final_score = 0
+
+    Lever "capitalone" → 61 jobs, "capital one" in URL+title
+                       → 19/20 match
+                       → confidence = 95%
+                       → final_score = 95 × log10(62) = 170
+
+Step 4 — Classify:
+  Clear winner:  top score > threshold AND gap > 10%
+                 → auto-accept silently
+  Close call:    top score > threshold AND gap ≤ 10%
+                 → auto-select best + send email to verify
+  Unknown:       top score < threshold
+                 → mark unknown + send email to review
+
+Step 5 — Tie-break by date reliability:
+  When two platforms score within 10% of each other:
+    ashby > lever > workday > smartrecruiters > greenhouse
+  Reason: prefer most reliable posted_at date field
+```
+
+### Scoring formula
+```
+confidence% × log10(job_count + 1)
+
+Why log10()?
+  Prevents huge job counts from dominating
+  Same as recruiter pipeline domain scoring
+
+  100 jobs: log10(101) = 2.00  → 95 × 2.00 = 190
+  500 jobs: log10(501) = 2.70  → 95 × 2.70 = 257
+  10  jobs: log10(11)  = 1.04  → 95 × 1.04 = 99
+
+Empty jobs (hiring freeze):
+  confidence = 50 (neutral — ATS structure confirmed)
+  final_score = 50 × log10(1) = 0
+  Only accepted if no other viable match exists
+```
+
+### Keyword extraction
+```
+Company name → significant keywords (ALL must match)
+
+"Capital One"        → ["capital", "one"]
+"JPMorgan Chase"     → ["jpmorgan", "chase"]
+"AT&T"               → ["at"]  (& removed, t too short)
+"Palo Alto Networks" → ["palo", "alto"]  (networks = stop word)
+"Stripe"             → ["stripe"]
+
+Stop words filtered:
+  inc, corp, llc, ltd, co, the, and, jobs, careers,
+  group, technologies, tech, systems, solutions,
+  services, america, usa, global, international
+
+ALL keywords must appear in job title+URL for a match.
+This prevents partial matches (Capital Group ≠ Capital One).
+```
+
+### Detection status values
+```
+detected    → high confidence, auto-accepted silently
+close_call  → auto-selected by tie-break, email sent to verify
+unknown     → low confidence, email sent for manual review
+manual      → manually overridden by user, never auto-re-detected
 ```
 
 ### Re-detection triggers
 ```
 Automatic re-detection when:
-  → consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS (14)
-    (company may have switched ATS)
   → ats_platform = 'unknown' or NULL
   → ats_slug = NULL or empty
+  → ats_detected_at is NULL (never detected)
+  → consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS (14)
+
+Never re-detected:
+  → ats_platform = 'manual' (user override is permanent)
 
 Manual re-detection:
   → python pipeline.py --detect-ats "Stripe"
   → Forces fresh detection for specific company
+
+Manual override:
+  → python pipeline.py --detect-ats "Capital One" --override workday capitalone
+  → Permanently sets platform + slug, never auto-changed
 ```
 
 ### Empty day counter reset (critical behavior)
 ```
-After EVERY successful ATS detection:
+After EVERY detection attempt:
   → consecutive_empty_days reset to 0
-  → Regardless of how many jobs were returned
+  → Prevents infinite re-detection loops
 
-Why this matters:
-  Two very different scenarios both result in 0 jobs:
+Two scenarios both produce 0 jobs:
 
   Scenario A — Company switched ATS:
-    → Ashby returns 0 jobs (wrong ATS now)
+    → Ashby returns 0 jobs (wrong ATS)
     → 14 days accumulate → re-detect → Lever found
-    → consecutive_empty_days reset to 0
-    → Next 14 days accumulate before re-detect again
-    → Correct: re-detection fires when needed ✓
+    → consecutive_empty_days reset to 0 ✓
 
-  Scenario B — Hiring freeze (same ATS, 0 openings):
-    → Ashby returns 0 jobs (correct ATS, no openings)
-    → 14 days accumulate → re-detect → Ashby confirmed again
+  Scenario B — Hiring freeze (correct ATS, 0 openings):
+    → Ashby returns 0 jobs (correct ATS, no roles)
+    → 14 days accumulate → re-detect → Ashby confirmed
     → consecutive_empty_days reset to 0
-    → Next 14 days accumulate before re-detect again
-    → Correct: no infinite re-detection loop ✓
-
-  Without reset:
-    → Hiring freeze company re-detected EVERY day
-    → Wastes API calls on all 5 ATS platforms daily
-    → 137 companies × 5 APIs × daily = massive waste
+    → No re-detection again for 14 more days ✓
 
 Maximum job posting gap when ATS switches:
-  → Switch happens Day 0
-  → Re-detection triggers Day 14
-  → Configurable: JOB_MONITOR_REDETECT_DAYS = 14
-  → Lower = faster detection, more API calls
-  → Higher = slower detection, fewer API calls
+  → 14 days (configurable via JOB_MONITOR_REDETECT_DAYS)
 ```
 
-### Detection validation
+### Detection summary email
 ```
-When API returns jobs during detection:
-  → Verify: at least 1 job returned
-    (empty response = wrong slug or hiring freeze)
-  → Verify: response company name fuzzy-matches
-    expected company name
-    (prevents "apple" matching "Apple Leisure Group")
-  → If validation fails → try next slug variant
+ONE email sent after --detect-ats completes.
+Only sent when there are close calls or unknowns.
+Silently skipped when everything detected cleanly.
+
+Subject: 🔍 ATS Detection Complete · March 4, 2026
+         ✅ 131 auto-detected | ⚠ 2 close calls | ❌ 1 unknown
+
+CLOSE CALLS section:
+  Company | Selected ATS | Confidence | Verify Link
+  Linear  | Ashby (94%)  | 201 jobs   | jobs.ashbyhq.com/linear
+  Runner-up: Lever (91%, 198 jobs)
+  Override: python pipeline.py --detect-ats "Linear" --override ashby linear
+
+NEEDS MANUAL REVIEW section:
+  Company      | Best Attempt              | Override Command
+  Obscure Corp | smartrecruiters/obscure   | --override <ats> <slug>
+               | (40% conf, 3 jobs)
+```
+
+### Monitorable companies
+```
+--monitor-jobs only processes companies with confirmed ATS:
+  ats_platform NOT NULL
+  ats_platform != 'unknown'
+  ats_slug NOT NULL
+
+Unknown companies are SKIPPED in daily monitoring.
+"X companies with unknown ATS — run --detect-ats" shown in output.
 ```
 
 ---
@@ -363,9 +460,13 @@ Solution:
 
 ### ATS Detection
 ```
-E1: Wrong slug returns wrong company
-    → Validate: company name in response fuzzy-matches expected
-    → If mismatch → try next variant
+E1: Wrong slug matches wrong company (e.g. "capital" → Capital Group)
+    → Confidence scoring catches this:
+      "capital" on Lever → 0% confidence for "Capital One"
+      (keyword "one" missing from all job URLs/titles)
+    → Score too low → rejected automatically
+    → "capitalone" slug → 95% confidence → accepted ✓
+    → No manual intervention needed
 
 E2: Company switches ATS (e.g. Ashby → Lever)
     → Trigger: consecutive_empty_days >= 14
@@ -776,11 +877,16 @@ Page 2+ — Grouped by company (score sorted within group)
 # Run job monitoring + send PDF digest
 python pipeline.py --monitor-jobs
 
-# Detect ATS for all undetected companies
+# Detect ATS for all undetected/stale companies
 python pipeline.py --detect-ats
 
-# Force re-detect ATS for specific company
+# Re-detect ATS for specific company
 python pipeline.py --detect-ats "Stripe"
+
+# Manually override ATS for a company
+# Use after reviewing close call / unknown email
+python pipeline.py --detect-ats "Capital One" --override workday capitalone
+python pipeline.py --detect-ats "Linear" --override ashby linear
 
 # Check monitoring status
 python pipeline.py --monitor-status
@@ -856,8 +962,18 @@ Phase 2 — ATS clients:
   jobs/ats/workday.py     → Workday undocumented API
 
 Phase 3 — ATS detection:
-  jobs/ats_detector.py    → try slugs, validate, store result
+  jobs/ats_detector.py    → confidence scoring buffer
+                          → try ALL platforms x ALL slugs
+                          → score: confidence% x log10(jobs+1)
+                          → classify: detected/close_call/unknown
+                          → tie-break by date reliability
                           → re-detection logic
+                          → manual override support
+
+  outreach/report_templates/detection_report.py
+                          → detection summary email
+                          → close calls + unknowns batched
+                          → verify URLs + override commands
 
 Phase 4 — Job filtering:
   jobs/job_filter.py      → title/seniority/skills/location

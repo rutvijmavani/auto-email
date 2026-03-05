@@ -82,6 +82,7 @@ def get_new_postings_for_digest():
         rows = conn.execute("""
             SELECT * FROM job_postings
             WHERE status = 'new'
+            AND first_seen >= DATE('now')
             ORDER BY company ASC, skill_score DESC
         """).fetchall()
         return [dict(r) for r in rows]
@@ -135,6 +136,7 @@ def get_all_monitored_companies():
     """
     Return all companies from prospective_companies table.
     Includes ATS detection info.
+    Used by --monitor-status and --detect-ats.
     """
     conn = get_conn()
     try:
@@ -145,6 +147,32 @@ def get_all_monitored_companies():
             FROM prospective_companies
             ORDER BY company ASC
         """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_monitorable_companies():
+    """
+    Return only companies that are ready for daily job monitoring.
+    Excludes unknown and close_call companies — these need
+    manual review before we can trust their job results.
+    Only includes: detected, manual, close_call platforms
+    (close_call auto-selected but user notified to verify).
+    """
+    from config import ATS_STATUS_UNKNOWN
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT company, ats_platform, ats_slug,
+                   ats_detected_at, first_scanned_at,
+                   last_checked_at, consecutive_empty_days
+            FROM prospective_companies
+            WHERE ats_platform IS NOT NULL
+            AND ats_platform != ?
+            AND ats_slug IS NOT NULL
+            ORDER BY company ASC
+        """, (ATS_STATUS_UNKNOWN,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -210,6 +238,7 @@ def get_pipeline_reliability(days=7):
     # ran and found 0 jobs (valid outcome)
     successful = sum(
         1 for s in stats
-        if s.get("companies_monitored", 0) > 0
+        if s.get("pdf_generated", 0) == 1
+        or s.get("companies_monitored", 0) == 0
     )
     return successful / len(stats)

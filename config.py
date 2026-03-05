@@ -126,6 +126,36 @@ JOB_MONITOR_API_TIMEOUT       = 10   # seconds per API request
 ATS_PLATFORMS = ["greenhouse", "lever", "ashby",
                  "smartrecruiters", "workday"]
 
+# ATS confidence scoring
+ATS_DETECTION_THRESHOLD = 50    # min final_score to accept any detection
+ATS_MIN_CONFIDENCE      = 80    # min confidence% standalone (0-100)
+ATS_CLOSE_CALL_GAP      = 10    # % gap between top two — below = close call
+ATS_SAMPLE_SIZE         = 20    # max jobs to sample when scoring response
+
+# Tie-break order by date field reliability (best → worst)
+ATS_DATE_RELIABILITY = [
+    "ashby",           # publishedAt — exact original date ✓✓✓
+    "lever",           # createdAt   — Unix ms, never changes ✓✓✓
+    "workday",         # postedOn    — original date ✓✓
+    "smartrecruiters", # releasedDate— original date ✓✓
+    "greenhouse",      # updated_at  — changes on edit ✗ (last resort)
+]
+
+# ATS detection status values
+ATS_STATUS_DETECTED       = "detected"           # high confidence, auto-accepted
+ATS_STATUS_CLOSE_CALL     = "close_call"         # auto-selected, verify recommended
+ATS_STATUS_UNKNOWN        = "unknown"            # low confidence, needs manual review
+ATS_STATUS_MANUAL         = "manual"             # manually overridden by user
+
+# Stop words excluded from company keyword extraction
+ATS_KEYWORD_STOP_WORDS = {
+    "inc", "corp", "llc", "ltd", "co", "the", "and",
+    "jobs", "careers", "group", "holding", "holdings",
+    "technologies", "technology", "tech", "systems",
+    "solutions", "services", "america", "usa", "us",
+    "global", "international", "national", "interactive",
+}
+
 # Alert thresholds
 MONITOR_COVERAGE_ALERT        = 0.70  # alert if < 70% companies returned jobs
 MONITOR_ATS_UNKNOWN_ALERT     = 0.20  # alert if > 20% companies unknown ATS
