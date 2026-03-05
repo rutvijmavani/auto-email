@@ -1,0 +1,97 @@
+# jobs/ats/smartrecruiters.py — SmartRecruiters public API client
+# Date field: releasedDate (RELIABLE — original release date)
+
+from datetime import datetime
+from jobs.ats.base import fetch_json, slugify, validate_company_match
+
+
+BASE_URL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+
+
+def detect(company):
+    """
+    Try to detect if company uses SmartRecruiters.
+    Returns (slug, sample_jobs) or (None, None).
+    """
+    for slug in slugify(company):
+        data = fetch_json(BASE_URL.format(slug=slug))
+        if data is None:
+            continue
+        jobs = data.get("content", [])
+        if len(jobs) == 0:
+            # Check if response structure is valid
+            if "totalFound" in data:
+                return slug, []
+            continue
+        # Validate using company name in response
+        resp_company = data.get("company", {}).get("name", "")
+        if not validate_company_match(resp_company, company):
+            continue
+        return slug, jobs
+    return None, None
+
+
+def fetch_jobs(slug, company):
+    """
+    Fetch all jobs for company from SmartRecruiters.
+    Handles pagination.
+    Returns list of normalized job dicts.
+    """
+    all_jobs = []
+    offset = 0
+    limit = 100
+
+    while True:
+        data = fetch_json(
+            BASE_URL.format(slug=slug),
+            params={"limit": limit, "offset": offset}
+        )
+        if not data:
+            break
+        jobs = data.get("content", [])
+        if not jobs:
+            break
+        all_jobs.extend(jobs)
+        total = data.get("totalFound", 0)
+        offset += limit
+        if offset >= total:
+            break
+
+    return [_normalize(j, company) for j in all_jobs if j.get("name")]
+
+
+def _normalize(job, company):
+    """Normalize SmartRecruiters job to standard format."""
+    posted_at = None
+    released = job.get("releasedDate")
+    if released:
+        try:
+            posted_at = datetime.fromisoformat(
+                released.replace("Z", "+00:00")
+            )
+        except (ValueError, AttributeError):
+            posted_at = None
+
+    location = job.get("location", {})
+    loc_str = ", ".join(filter(None, [
+        location.get("city", ""),
+        location.get("region", ""),
+        location.get("country", ""),
+    ]))
+    if job.get("location", {}).get("remote"):
+        loc_str = "Remote"
+
+    return {
+        "company":     company,
+        "title":       job.get("name", ""),
+        "job_url":     f"https://jobs.smartrecruiters.com/{slug}/{job.get('id', '')}",
+        "location":    loc_str,
+        "posted_at":   posted_at,
+        "description": job.get("jobAd", {}).get("sections", {})
+                           .get("jobDescription", {}).get("text", ""),
+        "ats":         "smartrecruiters",
+    }
+
+
+# Module-level slug needed for URL construction
+slug = ""

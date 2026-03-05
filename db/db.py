@@ -133,6 +133,22 @@ from db.prospective import (
 )
 
 # ─────────────────────────────────────────
+# JOB MONITORING
+# ─────────────────────────────────────────
+from db.job_monitor import (
+    job_url_exists,
+    job_hash_exists,
+    save_job_posting,
+    get_new_postings_for_digest,
+    mark_first_scan_complete,
+    update_company_check,
+    get_all_monitored_companies,
+    save_monitor_stats,
+    get_monitor_stats,
+    get_pipeline_reliability,
+)
+
+# ─────────────────────────────────────────
 # SCHEMA CLEANUP (used by tests directly)
 # ─────────────────────────────────────────
 from db.schema import (
@@ -142,6 +158,7 @@ from db.schema import (
     _cleanup_expired_ai_cache,
     _cleanup_expired_jobs,
     _cleanup_old_model_usage,
+    _cleanup_job_postings,
 )
 
 
