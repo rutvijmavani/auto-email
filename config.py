@@ -134,18 +134,23 @@ ATS_SAMPLE_SIZE         = 20    # max jobs to sample when scoring response
 
 # Tie-break order by date field reliability (best → worst)
 ATS_DATE_RELIABILITY = [
-    "ashby",           # publishedAt — exact original date ✓✓✓
-    "lever",           # createdAt   — Unix ms, never changes ✓✓✓
-    "workday",         # postedOn    — original date ✓✓
-    "smartrecruiters", # releasedDate— original date ✓✓
-    "greenhouse",      # updated_at  — changes on edit ✗ (last resort)
+    "ashby",           # publishedAt  — exact original date ✓✓✓
+    "lever",           # createdAt    — Unix ms, never changes ✓✓✓
+    "oracle_hcm",      # PostedDate   — original date ✓✓✓
+    "workday",         # postedOn     — original date ✓✓
+    "smartrecruiters", # releasedDate — original date ✓✓
+    "greenhouse",      # updated_at   — changes on edit ✗ (last resort)
 ]
 
+# ATS platforms that require Google detection (can't be slug-guessed)
+ATS_GOOGLE_ONLY = ["oracle_hcm", "icims", "successfactors"]
+
 # ATS detection status values
-ATS_STATUS_DETECTED       = "detected"           # high confidence, auto-accepted
-ATS_STATUS_CLOSE_CALL     = "close_call"         # auto-selected, verify recommended
-ATS_STATUS_UNKNOWN        = "unknown"            # low confidence, needs manual review
-ATS_STATUS_MANUAL         = "manual"             # manually overridden by user
+ATS_STATUS_DETECTED       = "detected"   # found via Google ✓
+ATS_STATUS_CLOSE_CALL     = "close_call" # API buffer close call (legacy)
+ATS_STATUS_UNKNOWN        = "unknown"    # not found, needs manual review
+ATS_STATUS_CUSTOM         = "custom"     # uses custom ATS (out of scope)
+ATS_STATUS_MANUAL         = "manual"     # manually overridden, never re-detected
 
 # Stop words excluded from company keyword extraction
 ATS_KEYWORD_STOP_WORDS = {

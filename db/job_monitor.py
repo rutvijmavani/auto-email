@@ -82,7 +82,6 @@ def get_new_postings_for_digest():
         rows = conn.execute("""
             SELECT * FROM job_postings
             WHERE status = 'new'
-            AND first_seen >= DATE('now')
             ORDER BY company ASC, skill_score DESC
         """).fetchall()
         return [dict(r) for r in rows]
@@ -154,13 +153,18 @@ def get_all_monitored_companies():
 
 def get_monitorable_companies():
     """
-    Return only companies that are ready for daily job monitoring.
-    Excludes unknown and close_call companies — these need
-    manual review before we can trust their job results.
-    Only includes: detected, manual, close_call platforms
-    (close_call auto-selected but user notified to verify).
+    Return only companies ready for daily job monitoring.
+
+    Excludes:
+      - unknown: never detected
+      - custom:  uses unsupported ATS (out of scope)
+      - NULL slug: detection incomplete
+
+    Includes:
+      - detected: found via Google ✓
+      - manual:   user-overridden ✓
+      - close_call: legacy API buffer result
     """
-    from config import ATS_STATUS_UNKNOWN
     conn = get_conn()
     try:
         rows = conn.execute("""
@@ -169,10 +173,10 @@ def get_monitorable_companies():
                    last_checked_at, consecutive_empty_days
             FROM prospective_companies
             WHERE ats_platform IS NOT NULL
-            AND ats_platform != ?
+            AND ats_platform NOT IN ('unknown', 'custom')
             AND ats_slug IS NOT NULL
             ORDER BY company ASC
-        """, (ATS_STATUS_UNKNOWN,)).fetchall()
+        """).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

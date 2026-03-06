@@ -19,7 +19,9 @@ from db.db import (
     get_monitor_stats,
     get_pipeline_reliability,
 )
-from jobs.ats_detector import detect_ats, needs_redetection, get_ats_module
+from jobs.ats_detector import (
+    detect_ats, needs_redetection, override_ats, get_ats_module
+)
 from jobs.job_filter import filter_jobs, is_fresh
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
@@ -103,8 +105,11 @@ def run():
             if platform == "workday":
                 try:
                     slug_info = json.loads(slug)
+                    # Ensure path key exists — default to "careers"
+                    if "path" not in slug_info:
+                        slug_info["path"] = "careers"
                 except (json.JSONDecodeError, TypeError):
-                    slug_info = {"slug": slug, "wd": "wd5"}
+                    slug_info = {"slug": slug, "wd": "wd5", "path": "careers"}
                 raw_jobs = ats_module.fetch_jobs(slug_info, company)
             else:
                 raw_jobs = ats_module.fetch_jobs(slug, company)
@@ -339,14 +344,16 @@ def _send_text_fallback(postings):
 def run_detect_ats(company=None, override_platform=None,
                    override_slug=None):
     """
-    Run ATS detection for all companies or a specific one.
-    Called by --detect-ats flag.
+    Run ATS detection using Google search + API verification.
+    Launches Playwright browser for Google searches.
 
     company:           specific company name (optional)
     override_platform: manually set ATS platform (requires company)
     override_slug:     manually set ATS slug (requires company)
     """
     from outreach.report_templates.detection_report import build_detection_report
+    from playwright.sync_api import sync_playwright
+    from careershift.utils import human_delay
     from datetime import datetime
 
     init_db()
@@ -363,44 +370,95 @@ def run_detect_ats(company=None, override_platform=None,
         override_ats(company.strip(), override_platform, override_slug)
         return
 
-    # ── Single company re-detection ──
-    if company:
-        company_normalized = company.strip()
-        matches = [c for c in companies
-                   if c["company"] == company_normalized]
-        if not matches:
-            print(f"[ERROR] '{company}' not found in monitored companies.")
-            return
-        result = detect_ats(company_normalized)
-        # Send email if close call or unknown
-        try:
-            date_str = datetime.now().strftime("%B %-d, %Y")
-        except ValueError:
-            date_str = datetime.now().strftime("%B %d, %Y")
-        build_detection_report([result], date_str)
-        return
-
-    # ── Detect for all unknown or stale companies ──
-    to_detect = [c for c in companies
-                 if needs_redetection(c, JOB_MONITOR_REDETECT_DAYS)]
-
-    if not to_detect:
-        print("[OK] All companies have ATS detected.")
-        return
-
-    print(f"[INFO] Detecting ATS for {len(to_detect)} companies...\n")
-
-    results = []
-    for company_row in to_detect:
-        result = detect_ats(company_row["company"])
-        results.append(result)
-
-    # ── Send summary email ──
     try:
         date_str = datetime.now().strftime("%B %-d, %Y")
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
+    # ── Launch Playwright for Google search ──
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            slow_mo=100,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                # Randomize viewport to avoid bot detection
+            ]
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/121.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+
+        # ── Single company detection ──
+        if company:
+            company_normalized = company.strip()
+            matches = [c for c in companies
+                       if c["company"] == company_normalized]
+            if not matches:
+                print(f"[ERROR] '{company}' not found.")
+                browser.close()
+                return
+            result = detect_ats(company_normalized, page)
+            browser.close()
+            build_detection_report([result], date_str)
+            return
+
+        # ── Detect all unknown or stale companies ──
+        to_detect = [c for c in companies
+                     if needs_redetection(c, JOB_MONITOR_REDETECT_DAYS)]
+
+        if not to_detect:
+            print("[OK] All companies have ATS detected.")
+            browser.close()
+            return
+
+        print(f"[INFO] Detecting ATS for {len(to_detect)} companies "
+              f"via Google + API...\n")
+
+        results  = []
+        total    = len(to_detect)
+
+        for i, company_row in enumerate(to_detect, 1):
+            comp = company_row["company"]
+            print(f"[{i}/{total}] {comp}")
+
+            result = detect_ats(comp, page)
+            results.append(result)
+
+            # Restart browser every 50 companies
+            # prevents memory buildup + reduces CAPTCHA risk
+            if i % 50 == 0 and i < total:
+                print(f"\n[INFO] Restarting browser "
+                      f"(memory cleanup)...\n")
+                browser.close()
+                p_new = p.chromium.launch(
+                    headless=True, slow_mo=100,
+                    args=["--no-sandbox",
+                          "--disable-blink-features=AutomationControlled"]
+                )
+                context = p_new.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 800},
+                )
+                page    = context.new_page()
+                browser = p_new
+
+            human_delay(1.0, 2.0)
+
+        browser.close()
+
+    # ── Send summary email ──
     print(f"\n[INFO] Detection complete. Sending summary email...")
     build_detection_report(results, date_str)
 

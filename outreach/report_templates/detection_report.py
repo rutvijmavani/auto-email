@@ -8,7 +8,7 @@ from outreach.report_templates.base import (
     table_row, table_header_row, alert_box, info_box,
     send_report_email,
 )
-from config import ATS_STATUS_CLOSE_CALL, ATS_STATUS_UNKNOWN
+from config import ATS_STATUS_CLOSE_CALL, ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM
 
 
 def build_detection_report(results, date_str):
@@ -23,10 +23,12 @@ def build_detection_report(results, date_str):
     Silently skips if everything was cleanly detected.
     """
     close_calls = [r for r in results if r["status"] == ATS_STATUS_CLOSE_CALL]
-    unknowns    = [r for r in results if r["status"] == ATS_STATUS_UNKNOWN]
+    unknowns    = [r for r in results
+                   if r["status"] in (ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM)]
     detected    = [r for r in results
                    if r["status"] not in (ATS_STATUS_CLOSE_CALL,
-                                          ATS_STATUS_UNKNOWN)]
+                                          ATS_STATUS_UNKNOWN,
+                                          ATS_STATUS_CUSTOM)]
 
     # Only send email if there's something to review
     if not close_calls and not unknowns:
@@ -217,9 +219,9 @@ def build_detection_report(results, date_str):
         unknowns_html = f"""
         {section_header("Needs Manual Review")}
         {alert_box(
-            f"<strong>{len(unknowns)} company/companies</strong> could not be "
-            f"confidently detected. Check their careers pages manually and "
-            f"use the override command to set the correct ATS.",
+            f"<strong>{len(unknowns)} company/companies</strong> use a "
+            f"custom or unsupported ATS. Check their careers pages manually "
+            f"and use the override command if a supported ATS exists.",
             COLORS["danger"]
         )}
         <table width="100%" cellpadding="0" cellspacing="0" border="0"
