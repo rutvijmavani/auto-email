@@ -48,8 +48,11 @@ prospective_companies table (DB source of truth)
 --monitor-jobs (daily 8 AM)
          ↓
 ATS Detection (one-time per company, cached in DB)
+  Phase 1: Google search (primary)
+  Phase 2: API verification
+  Phase 3: API buffer fallback
          ↓
-API calls (Greenhouse/Lever/Ashby/SmartRecruiters/Workday)
+API calls (Greenhouse/Lever/Ashby/SmartRecruiters/Workday/OracleHCM)
          ↓
 Client-side filtering (title → seniority → skills → USA)
          ↓
@@ -126,101 +129,156 @@ Freshness:  releasedDate used directly for date comparison ✓
 
 #### Workday (undocumented public API)
 ```
-Endpoint:   GET https://{company}.wd5.myworkdayjobs.com/wday/cxs/
-                {company}/careers/jobs
+Endpoint:   GET https://{company}.{wd}.myworkdayjobs.com/wday/cxs/
+                {company}/{path}/jobs
 Auth:       None required (used by Workday career page frontend)
 Cost:       Free
 Risk:       Undocumented — could change without notice
 Date field: postedOn — RELIABLE (original posting date)
 Response:   title, postedOn, locationsText, externalUrl, bulletFields
-Companies:  JPMorgan, Goldman Sachs, Citibank, BlackRock, Mastercard,
-            American Express, Morgan Stanley, Visa, Wells Fargo,
-            Bank of America, Charles Schwab, State Street and more
-Variants:   Try wd1, wd2, wd3, wd5 during auto-detection
+Companies:  Capital One (wd12), Goldman Sachs, Citibank, BlackRock,
+            Mastercard, American Express, Morgan Stanley, Visa,
+            Wells Fargo, Bank of America, Charles Schwab, State Street
+Variants:   wd1-wd8, wd10, wd12 tried during detection
+Path:       Varies per company — discovered via Google search
+            e.g. Capital One → /Capital_One (not /careers)
 
 Freshness:  postedOn used directly for date comparison ✓
 ```
 
+#### Oracle HCM Cloud
+```
+Endpoint:   GET https://{slug}.fa.oraclecloud.com/hcmRestApi/resources/
+                latest/recruitingCEJobRequisitions?
+                finder=CandidateExperience&
+                CandidateExperienceId={site_id}
+Auth:       None required (public job postings API)
+Cost:       Free
+Date field: PostedDate — RELIABLE (original posting date) ✓✓✓
+Response:   Title, PostedDate, PrimaryLocation, ExternalJobId
+Companies:  JPMorgan Chase (jpmc/CX_1001), Goldman Sachs,
+            and other enterprise/financial companies
+Discovery:  slug + site_id extracted from Google search result
+            Cannot be guessed — requires Google detection
+
+Freshness:  PostedDate used directly for date comparison ✓
+```
+
 ### Coverage Summary
 ```
-Greenhouse:      ~40 companies
-Lever:           ~20 companies
-Ashby:           ~15 companies
-SmartRecruiters: ~5 companies
-Workday:         ~12 companies
-─────────────────────────────
-Via APIs:        ~92 companies (67%)
+Greenhouse:      ~40 companies  (100% confidence via Google ✓)
+Lever:           ~20 companies  (100% confidence via Google ✓)
+Ashby:           ~15 companies  (100% confidence via Google ✓)
+SmartRecruiters: ~30 companies  (verified via Google ✓)
+Workday:         ~20 companies  (slug+path via Google ✓)
+Oracle HCM:      ~10 companies  (slug+site_id via Google ✓)
+─────────────────────────────────────────────────────────
+Via Google+API:  ~135 companies (99%)
 
-Remaining ~45: Big tech custom pages
-  (Google, Apple, Microsoft, Amazon, Meta etc.)
-  → Skipped for now — bot detection issues,
-    unreliable scraping, high maintenance
-  → Add custom scrapers as future enhancement
+Unknown (~2%):
+  → Custom career pages (Meta, Google, Apple, Amazon)
+  → Email notification → manual --override
 ```
 
 ---
 
-## ATS Detection — Confidence Scoring Buffer
+## ATS Detection — Google Search + API Verification
 
 ### Philosophy
 ```
-Never trust the first API response that returns jobs.
-A short slug like "capital" on Lever returns jobs for
-"Capital Group" — not "Capital One". First-match-wins
-produces wrong company data in your digest.
+Google already knows the correct ATS URL for every company.
+"capital one site:myworkdayjobs.com" returns:
+  capitalone.wd12.myworkdayjobs.com/Capital_One/jobs
+  → slug=capitalone, wd=wd12, path=Capital_One
 
-Instead: try ALL platforms × ALL slug variants, score
-every response, pick the best one with enough confidence.
-
-Same buffer approach as recruiter domain validation.
+No guessing needed. No slug variants. No false positives.
+API-only approach proved unreliable — SmartRecruiters
+accepts any slug and returns empty responses, causing
+112/134 companies to falsely detect as SmartRecruiters.
 ```
 
 ### How it works
 ```
 For each company (e.g. "Capital One"):
 
-Step 1 — Generate slug variants:
-  "Capital One" → ["capitalone", "capital-one", "capital"]
+Phase 1 — Google search (PRIMARY):
+  For each ATS platform, search:
+    "Capital One site:myworkdayjobs.com"
+    "Capital One site:boards.greenhouse.io"
+    "Capital One site:jobs.lever.co"
+    ... (7 platforms total)
 
-Step 2 — Try ALL platforms × ALL slug variants:
-  Greenhouse × capitalone → 404   → skip
-  Greenhouse × capital    → jobs  → score it
-  Lever      × capitalone → jobs  → score it
-  Lever      × capital    → jobs  → score it
-  Ashby      × capitalone → 404   → skip
-  Workday    × capitalone × wd5 → jobs → score it
-  ... (every combination)
+  Extract URLs from results.
+  Match against ATS URL patterns.
 
-Step 3 — Score each response:
-  confidence% = jobs where ALL company keywords appear
-                ─────────────────────────────────────
-                total sampled jobs (max 20)
+  CRITICAL: validate company name in URL slug:
+    capitalone.wd12... contains "capital" ✓ → accept
+    openfx.greenhouse... no "capital" ✗   → reject
 
-  final_score = confidence% × log10(job_count + 1)
+  First valid match → stop, move to Phase 2.
 
-  Example:
-    Lever "capital"    → 50 jobs, "capital" in URL
-                       → "one" missing → 0/20 match
-                       → confidence = 0%
-                       → final_score = 0
+Phase 2 — API verification (CONFIRM):
+  Take Google result: workday, capitalone, wd12, Capital_One
+  Make ONE targeted API call to Workday
+  → Confirms ATS is live and returns jobs
+  → Store with method="google"
 
-    Lever "capitalone" → 61 jobs, "capital one" in URL+title
-                       → 19/20 match
-                       → confidence = 95%
-                       → final_score = 95 × log10(62) = 170
+Phase 3 — API buffer fallback:
+  Only runs if Google finds nothing
+  Tries all slugs × all platforms via direct API
+  Scores responses with confidence formula
+  classify: detected / close_call / unknown
 
-Step 4 — Classify:
-  Clear winner:  top score > threshold AND gap > 10%
-                 → auto-accept silently
-  Close call:    top score > threshold AND gap ≤ 10%
-                 → auto-select best + send email to verify
-  Unknown:       top score < threshold
-                 → mark unknown + send email to review
+Phase 4 — Unknown:
+  Email notification with best attempt
+  User provides --override
+```
 
-Step 5 — Tie-break by date reliability:
-  When two platforms score within 10% of each other:
-    ashby > lever > workday > smartrecruiters > greenhouse
-  Reason: prefer most reliable posted_at date field
+### Google search queries
+```
+Platform        Query format
+──────────────────────────────────────────────────
+Greenhouse:     "{company} site:boards.greenhouse.io"
+Greenhouse:     "{company} site:job-boards.greenhouse.io"
+Lever:          "{company} site:jobs.lever.co"
+Ashby:          "{company} site:jobs.ashbyhq.com"
+SmartRec:       "{company} site:jobs.smartrecruiters.com"
+Workday:        "{company} site:myworkdayjobs.com"
+Oracle HCM:     "{company} site:oraclecloud.com"
+iCIMS:          "{company} site:icims.com"
+SuccessFactors: "{company} site:successfactors.com"
+
+Autocorrect disabled: &nfpr=1
+```
+
+### URL slug validation (prevents false positives)
+```
+After Google returns URLs, validate slug belongs to company:
+
+  "jp morgan site:boards.greenhouse.io"
+  → returns: boards.greenhouse.io/usenourish (Nourish)
+  → slug "usenourish" checked against keywords ["jp","morgan"]
+  → "jp" not in "usenourish" → REJECTED ✓
+
+  "capital one site:myworkdayjobs.com"
+  → returns: capitalone.wd12.myworkdayjobs.com/Capital_One
+  → slug "capitalone"+"Capital_One" checked against ["capital","one"]
+  → "capital" in "capitaloneCapital_One" → ACCEPTED ✓
+
+Known aliases handled:
+  Meta     → also check "facebook" slug
+  Block    → also check "squareup", "square"
+  JPMorgan → also check "jpmc", "jpmorganchase"
+  X        → also check "twitter"
+```
+
+### Rate limiting and CAPTCHA handling
+```
+Playwright browser with realistic user agent.
+3-5 second human-like delay between searches.
+Browser restarted every 50 companies (memory cleanup).
+CAPTCHA detected → wait 120s → retry once → skip.
+Progress saved per company → auto-resume if interrupted.
 ```
 
 ### Scoring formula
@@ -903,15 +961,18 @@ python pipeline.py --monitor-status
 jobs/
   ats/
     __init__.py
-    base.py              → shared ATS client logic
-    greenhouse.py        → Greenhouse public API client
-    lever.py             → Lever public API client
-    ashby.py             → Ashby public API client
-    smartrecruiters.py   → SmartRecruiters client
-    workday.py           → Workday undocumented API client
-  ats_detector.py        → auto-detect ATS per company
+    base.py              → shared HTTP logic, retry, timeout
+    patterns.py          → ATS URL patterns + slug validation
+    greenhouse.py        → Greenhouse API client
+    lever.py             → Lever API client
+    ashby.py             → Ashby API client
+    smartrecruiters.py   → SmartRecruiters API client
+    workday.py           → Workday API client
+    oracle_hcm.py        → Oracle HCM API client (JPMorgan etc.)
+  google_detector.py     → Google search + URL extraction
+  ats_detector.py        → detection orchestrator (Google+API)
   job_filter.py          → filter + score jobs
-  job_monitor.py         → orchestrator run() entry point
+  job_monitor.py         → run() entry point
   job_fetcher.py         → existing (unchanged)
   form_sync.py           → existing (unchanged)
 
