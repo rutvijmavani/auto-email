@@ -95,7 +95,7 @@ def run():
 
         if platform == "unknown" or not slug:
             stats["companies_unknown_ats"] += 1
-            print(f"   [SKIP] Unknown ATS — skipping")
+            print("   [SKIP] Unknown ATS — skipping")
             continue
 
         # ── Fetch jobs ──
@@ -135,7 +135,7 @@ def run():
 
         if not raw_jobs:
             update_company_check(company, found_jobs=False)
-            print(f"   [INFO] No jobs returned")
+            print("   [INFO] No jobs returned")
             continue
 
         stats["companies_with_results"] += 1
@@ -175,8 +175,11 @@ def run():
             if platform == "icims" and job.get("_base_url"):
                 try:
                     job = ats_module.fetch_job_detail(job)
-                except Exception:
-                    pass  # detail fetch failed — save with what we have
+                except Exception as e:
+                    logger.error(
+                        "iCIMS fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )  # save with partial data
 
             # Genuinely new job
             if save_job_posting(job, status="new"):
@@ -221,7 +224,7 @@ def run():
             email_sent    = result.get("email_sent", False)
         except Exception as e:
             print(f"[ERROR] PDF generation failed: {e}")
-            print(f"[INFO] Sending plain text digest instead...")
+            print("[INFO] Sending plain text digest instead...")
             email_sent = _send_text_fallback(new_postings)
     else:
         print(f"\n[INFO] No new matching jobs today.")
@@ -411,7 +414,7 @@ def run_detect_ats(company=None, override_platform=None,
             result = detect_ats(company_normalized, domain=domain)
             build_detection_report([result], date_str)
         except QuotaExhaustedException:
-            print(f"[WARNING] Serper credits exhausted")
+            print("[WARNING] Serper credits exhausted")
         return
 
     # ── Batch detection ──
@@ -486,7 +489,7 @@ def run_detect_ats(company=None, override_platform=None,
         except QuotaExhaustedException:
             print(f"\n[WARNING] Serper credits exhausted after "
                   f"{i-1} companies.")
-            print(f"[INFO] Buy more credits at serper.dev then retry.")
+            print("[INFO] Buy more credits at serper.dev then retry.")
             break
 
     credits = get_serper_credits()

@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 # jobs/ats_verifier.py — Phase 2: ATS detection via API name probe
 #
 # Each supported ATS exposes a public endpoint that returns
@@ -104,7 +108,8 @@ def _probe_lever(company, candidates):
                     if company.lower().replace(" ", "") in job_url.lower():
                         return {"platform": "lever", "slug": slug}
 
-        except Exception:
+        except Exception as e:
+            logger.debug("Probe failed: %s", e, exc_info=True)
             continue
 
     return None
@@ -140,7 +145,8 @@ def _probe_ashby(company, candidates):
             if _name_matches(api_name, company, slug):
                 return {"platform": "ashby", "slug": slug}
 
-        except Exception:
+        except Exception as e:
+            logger.debug("Probe failed: %s", e, exc_info=True)
             continue
 
     return None
@@ -182,7 +188,8 @@ def _probe_icims(company, candidates):
 
             return {"platform": "icims", "slug": slug}
 
-        except Exception:
+        except Exception as e:
+            logger.debug("Probe failed: %s", e, exc_info=True)
             continue
 
     return None
@@ -259,22 +266,11 @@ def _name_matches(api_name, company, slug):
 
     Strategy (NO fuzzy matching):
     1. Exact normalized match
-       "Charles Schwab" == "Charles Schwab Corporation" → normalize both
     2. All significant keywords present in API name
-       company="Capital One" → keywords=["capital","one"]
-       api_name="Capital One Financial" → has both → MATCH ✓
-       api_name="Capital Group" → missing "one" → REJECT ✓
-    3. Slug validation as final check
-       validates using word boundary rules
+    3. Slug-based validation as final disambiguator
 
-    Edge cases handled:
-    - "H&R Block" → api_name contains "block"
-      BUT company="Block" → keywords=["block"]
-      slug="block" → validate_slug_for_company("block","Block") ✓
-      BUT api_name="H&R Block" → "h" and "r" also in name
-      → keyword "block" IS in api_name → would ACCEPT ❌
-      FIX: If api_name has MORE significant words than company,
-           check that no extra unrelated words appear
+    The slug parameter is used as a final check when keyword
+    logic is ambiguous (e.g. API name has extra significant words).
     """
     if not api_name or not company:
         return False
@@ -286,11 +282,20 @@ def _name_matches(api_name, company, slug):
     if company_lower == api_lower:
         return True
     if company_lower in api_lower:
-        # Extra check: company words must all be in api name
         return _all_keywords_present(company, api_name)
 
     # Rule 2: All keywords present
-    return _all_keywords_present(company, api_name)
+    if not _all_keywords_present(company, api_name):
+        return False
+
+    # Rule 3: Slug-based fallback when keyword match is ambiguous
+    # e.g. company="Block", api_name="H&R Block"
+    # keywords pass but slug "block" should not match "hrblock"
+    if slug:
+        from jobs.ats.patterns import validate_slug_for_company
+        return validate_slug_for_company(slug, company)
+
+    return True
 
 
 def _all_keywords_present(company, api_name):

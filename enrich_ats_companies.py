@@ -83,7 +83,7 @@ def enrich_lever(slug):
         if not isinstance(data, list):
             return None, "error"
         # Company name from first job's hostedUrl or categories
-        name    = _extract_lever_company_name(slug, data)
+        name    = _extract_lever_company_name(slug)
         website = _extract_lever_website(data)
         return {
             "company_name": name,
@@ -283,7 +283,7 @@ def _extract_website_from_jobs(jobs):
     return ""
 
 
-def _extract_lever_company_name(slug, jobs):
+def _extract_lever_company_name(slug):
     """
     Lever doesn't return company name directly.
     Infer from slug or job URLs.
@@ -414,7 +414,7 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
 
     # Summary
     print(f"\n{'='*60}")
-    print(f"ENRICHMENT COMPLETE")
+    print("ENRICHMENT COMPLETE")
     print(f"  OK:       {stats['ok']:,}")
     print(f"  Inactive: {stats['inactive']:,}")
     print(f"  Errors:   {stats['error']:,}")

@@ -120,6 +120,8 @@ EXCLUDED_SLUGS = {
     "privacy", "terms", "register", "search",
     "help", "support", "blog", "news", "press",
     "legal", "security", "static", "assets",
+    # URL schemes — never valid slugs
+    "http", "https", "ftp", "ftps", "mailto",
 }
 
 HEADERS = {

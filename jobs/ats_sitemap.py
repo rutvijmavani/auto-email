@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 # jobs/ats_sitemap.py — Phase 1: ats_discovery.db lookup
 #
 # Queries ats_discovery.db for known company slugs.
@@ -64,8 +68,11 @@ def detect_via_sitemap(company):
 
         return None
 
-    except Exception:
-        # DB access failure — fall through to Phase 2
+    except Exception as e:
+        logger.debug(
+            "DB access failed, falling through to Phase 2: %s",
+            e, exc_info=True
+        )
         return None
 
 
@@ -83,5 +90,9 @@ def _db_exists():
     try:
         from db.ats_companies import get_total_count
         return get_total_count() > 0
-    except Exception:
+    except Exception as e:
+        logger.error(
+            "Failed to check discovery DB in _db_exists: %s",
+            e, exc_info=True
+        )
         return False

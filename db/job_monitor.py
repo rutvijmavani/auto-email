@@ -210,23 +210,39 @@ def get_detection_queue(batch_size=10):
 def get_detection_queue_stats():
     """
     Get counts for each priority bucket.
+    Uses same CASE expression as get_detection_queue()
+    to avoid double-counting — matches real selection logic.
     Used by --monitor-status.
     """
     conn = get_conn()
     try:
         row = conn.execute("""
             SELECT
-                SUM(CASE WHEN ats_detected_at IS NULL THEN 1 ELSE 0 END)
+                COALESCE(SUM(CASE WHEN priority = 1 THEN 1 ELSE 0 END), 0)
                     AS priority1_new,
-                SUM(CASE WHEN consecutive_empty_days >= 14
-                          AND ats_detected_at IS NOT NULL THEN 1 ELSE 0 END)
+                COALESCE(SUM(CASE WHEN priority = 2 THEN 1 ELSE 0 END), 0)
                     AS priority2_quiet,
-                SUM(CASE WHEN ats_platform = 'unknown'
-                          AND ats_detected_at IS NOT NULL THEN 1 ELSE 0 END)
+                COALESCE(SUM(CASE WHEN priority = 3 THEN 1 ELSE 0 END), 0)
                     AS priority3_unknown,
-                SUM(CASE WHEN ats_platform = 'custom' THEN 1 ELSE 0 END)
+                COALESCE(SUM(CASE WHEN priority = 4 THEN 1 ELSE 0 END), 0)
                     AS priority4_custom
-            FROM prospective_companies
+            FROM (
+                SELECT
+                    CASE
+                        WHEN ats_detected_at IS NULL THEN 1
+                        WHEN consecutive_empty_days >= 14 THEN 2
+                        WHEN ats_platform = 'unknown' THEN 3
+                        WHEN ats_platform = 'custom'  THEN 4
+                        ELSE 99
+                    END AS priority
+                FROM prospective_companies
+                WHERE (
+                    ats_detected_at IS NULL
+                    OR consecutive_empty_days >= 14
+                    OR ats_platform IN ('unknown', 'custom')
+                )
+            ) sub
+            WHERE priority < 99
         """).fetchone()
         return dict(row) if row else {}
     finally:

@@ -346,10 +346,7 @@ def run_import_prospects(filepath="prospects.txt"):
                 print(f"  [+] {company}{domain_str}")
                 added += 1
             else:
-                # Update domain if not set
-                if domain:
-                    add_prospective_company(company, domain=domain)
-                skipped += 1
+                skipped += 1  # already exists, domain backfilled by add_prospective_company
 
     print(f"\n[OK] Import complete — Added: {added} | Already existed: {skipped}")
     print(f"[INFO] Run --detect-ats --batch to start ATS detection.")

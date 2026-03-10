@@ -108,7 +108,7 @@ def detect_ats(company, domain=None, page=None, sb=None):
     print(f"   [INFO] Detecting ATS for {company}...")
 
     # Phase 1: Sitemap lookup
-    print(f"   [P1] Sitemap lookup...")
+    print("   [P1] Sitemap lookup...")
     from jobs.ats_sitemap import detect_via_sitemap
     result = detect_via_sitemap(company)
     if result:
@@ -117,7 +117,7 @@ def detect_ats(company, domain=None, page=None, sb=None):
         return _store_and_return(company, result)
 
     # Phase 2: ATS API name probe
-    print(f"   [P2] API name probe...")
+    print("   [P2] API name probe...")
     from jobs.ats_verifier import detect_via_api
     result = detect_via_api(company)
     if result:
@@ -149,7 +149,7 @@ def detect_ats(company, domain=None, page=None, sb=None):
             "ats_slug":     None,
         }
 
-    print(f"   [P3b] Serper API search...")
+    print("   [P3b] Serper API search...")
     from jobs.serper import detect_via_serper, SERPER_EXHAUSTED
     serper_result = detect_via_serper(company)
 
@@ -209,8 +209,12 @@ def _store_and_return(company, result):
             slug=slug,
             company_name=company,
         )
-    except Exception:
-        pass  # DB self-population is best-effort, never blocks detection
+    except Exception as e:
+        logger.error(
+            "Failed to self-populate ats_discovery.db "
+            "for %s/%s (%s): %s",
+            platform, slug, company, e, exc_info=True
+        )  # best-effort — never blocks detection
 
     print(f"   {label} {company} -> {platform} (slug: {slug})")
 

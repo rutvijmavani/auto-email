@@ -50,83 +50,64 @@ class TestSchemaDiscovery(unittest.TestCase):
     """Tests for db/schema_discovery.py."""
 
     def test_init_creates_ats_companies_table(self):
-        """init_discovery_db creates ats_companies table."""
+        """init_discovery_db creates ats_companies + scanned_crawls tables."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            conn = sqlite3.connect(db_path)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ats_companies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    platform TEXT NOT NULL,
-                    slug TEXT NOT NULL,
-                    company_name TEXT,
-                    website TEXT,
-                    job_count INTEGER DEFAULT 0,
-                    crawl_source TEXT,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_verified TIMESTAMP,
-                    last_seen_crawl TEXT,
-                    is_active INTEGER DEFAULT 1,
-                    is_enriched INTEGER DEFAULT 0,
-                    source TEXT DEFAULT 'crawl',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(platform, slug)
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS scanned_crawls (
-                    crawl_id TEXT PRIMARY KEY,
-                    scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    slugs_found INTEGER DEFAULT 0,
-                    slugs_new INTEGER DEFAULT 0,
-                    query_type TEXT DEFAULT 'athena'
-                )
-            """)
-            conn.commit()
 
-            # Verify tables exist
-            tables = [r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()]
-            self.assertIn("ats_companies", tables)
-            self.assertIn("scanned_crawls", tables)
-            conn.close()
+            # Use production initializer
+            import db.schema_discovery as sd
+            original = sd.DISCOVERY_DB
+            sd.DISCOVERY_DB = db_path
+            try:
+                sd.init_discovery_db()
+                conn = sqlite3.connect(db_path)
+                tables = [r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()]
+                self.assertIn("ats_companies", tables)
+                self.assertIn("scanned_crawls", tables)
+                conn.close()
+            finally:
+                sd.DISCOVERY_DB = original
 
     def test_ats_companies_unique_constraint(self):
         """UNIQUE(platform, slug) prevents duplicates."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
-            conn = sqlite3.connect(db_path)
-            conn.execute("""
-                CREATE TABLE ats_companies (
-                    platform TEXT NOT NULL,
-                    slug TEXT NOT NULL,
-                    UNIQUE(platform, slug)
+
+            import db.schema_discovery as sd
+            original = sd.DISCOVERY_DB
+            sd.DISCOVERY_DB = db_path
+            try:
+                sd.init_discovery_db()
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "INSERT INTO ats_companies (platform, slug) "
+                    "VALUES ('greenhouse', 'stripe')"
                 )
-            """)
-            conn.execute(
-                "INSERT INTO ats_companies VALUES ('greenhouse', 'stripe')"
-            )
-            conn.commit()
+                conn.commit()
 
-            # Second insert should be ignored
-            conn.execute(
-                "INSERT OR IGNORE INTO ats_companies "
-                "VALUES ('greenhouse', 'stripe')"
-            )
-            conn.commit()
+                # Second insert should be ignored
+                conn.execute(
+                    "INSERT OR IGNORE INTO ats_companies (platform, slug) "
+                    "VALUES ('greenhouse', 'stripe')"
+                )
+                conn.commit()
 
-            count = conn.execute(
-                "SELECT COUNT(*) FROM ats_companies"
-            ).fetchone()[0]
-            self.assertEqual(count, 1)
-            conn.close()
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM ats_companies"
+                ).fetchone()[0]
+                self.assertEqual(count, 1)
+                conn.close()
+            finally:
+                sd.DISCOVERY_DB = original
 
     def test_scanned_crawls_primary_key(self):
         """crawl_id is primary key — no duplicates."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
             conn.execute("""
                 CREATE TABLE scanned_crawls (
                     crawl_id TEXT PRIMARY KEY,

@@ -25,7 +25,7 @@ Job applied Day 7+:
   → Recruiter may have found strong candidates
   → Position may be in interview stage
   → Your application buried in queue
-```text
+```
 
 This pipeline is the entry point of the entire system.
 If it fails to detect new jobs early, every downstream
@@ -64,7 +64,7 @@ job_postings table
 PDF generation (grouped by company)
          ↓
 Email with PDF attachment (8 AM daily)
-```text
+```
 
 ---
 
@@ -74,34 +74,35 @@ The pipeline uses a 4-phase detection approach to identify which ATS
 each company uses. Detection runs once per company and results are
 cached in the database indefinitely.
 
-### Phase 1 — Sitemap Lookup (Free, Instant)
+### Phase 1 — Fast Slug Probe (Free, ~100ms)
 
-Greenhouse, Lever, and Ashby expose public sitemaps listing every
-company on their platform. We download once and cache for 7 days.
+Generates the top 3 most likely slug variants from the company name
+and probes each ATS API directly. Stops immediately on first hit.
 
 ```text
-https://boards.greenhouse.io/sitemap.xml
-https://jobs.lever.co/sitemap.xml
-https://jobs.ashbyhq.com/sitemap.xml
+Company: "Stripe"
+Candidates: ["stripe"]
+
+Try: boards-api.greenhouse.io/v1/boards/stripe
+→ 200 {"name": "Stripe"} → name matches → ACCEPT ✓
+
+Company: "Capital One"
+Candidates: ["capitalone", "capital-one", "capital"]
+
+Try: boards-api.greenhouse.io/v1/boards/capitalone → 404
+Try: boards-api.greenhouse.io/v1/boards/capital-one → 404
+Try: api.lever.co/v0/postings/capitalone → 404
+... → MISS → proceed to Phase 2
 ```
 
-The sitemap is standard XML listing all job board URLs:
-
-```xml
-<urlset>
-  <url>
-    <loc>https://boards.greenhouse.io/stripe/jobs/123</loc>
-  </url>
-  <url>
-    <loc>https://boards.greenhouse.io/airbnb/jobs/456</loc>
-  </url>
-</urlset>
+For Greenhouse, the API name is also verified against the company:
+```text
+boards-api.greenhouse.io/v1/boards/charles
+→ {"name": "Charles River Analytics"}
+→ "schwab" missing from name → REJECT ✓
 ```
 
-We extract slugs (`stripe`, `airbnb`) and match against company names
-using `validate_slug_for_company()` with word boundary rules.
-
-Expected coverage: ~60% of companies.
+Expected coverage: ~55% of companies.
 
 ### Phase 2 — ATS API Name Probe (Free, ~50ms)
 
@@ -222,7 +223,7 @@ Companies:  Stripe, Doordash, Coinbase, Robinhood, Databricks,
 
 Freshness:  first_seen + content_hash approach
             (updated_at not used for freshness — unreliable)
-```text
+```
 
 #### Lever
 ```text
@@ -235,7 +236,7 @@ Response:   id, text, createdAt, categories, descriptionPlain, hostedUrl
 Companies:  Netflix, Waymo, Cruise, Lyft, Spotify, Airtable and more
 
 Freshness:  createdAt used directly for date comparison ✓
-```text
+```
 
 #### Ashby
 ```text
@@ -249,7 +250,7 @@ Companies:  Linear, Vercel, Loom, Retool, Ramp, Brex,
             Modern Treasury and more
 
 Freshness:  publishedAt used directly for date comparison ✓
-```text
+```
 
 #### SmartRecruiters
 ```text
@@ -261,7 +262,7 @@ Response:   id, title, location, releasedDate, department, description
 Companies:  Starbucks, Visa, Bosch and more
 
 Freshness:  releasedDate used directly for date comparison ✓
-```text
+```
 
 #### Workday (undocumented public API)
 ```text
@@ -280,7 +281,7 @@ Path:       Varies per company — discovered via Google search
             e.g. Capital One → /Capital_One (not /careers)
 
 Freshness:  postedOn used directly for date comparison ✓
-```text
+```
 
 #### Oracle HCM Cloud
 ```text
@@ -298,7 +299,7 @@ Discovery:  slug + site_id extracted from Google search result
             Cannot be guessed — requires Google detection
 
 Freshness:  PostedDate used directly for date comparison ✓
-```text
+```
 
 ### Coverage Summary
 ```text
@@ -314,7 +315,7 @@ Via Google+API:  ~135 companies (99%)
 Unknown (~2%):
   → Custom career pages (Meta, Google, Apple, Amazon)
   → Email notification → manual --override
-```text
+```
 
 ---
 
@@ -331,7 +332,7 @@ No guessing needed. No slug variants. No false positives.
 API-only approach proved unreliable — SmartRecruiters
 accepts any slug and returns empty responses, causing
 112/134 companies to falsely detect as SmartRecruiters.
-```text
+```
 
 ### How it works
 ```text
@@ -368,7 +369,7 @@ Phase 3 — API buffer fallback:
 Phase 4 — Unknown:
   Email notification with best attempt
   User provides --override
-```text
+```
 
 ### Google search queries
 ```text
@@ -389,7 +390,7 @@ Platforms not listed (e.g. Taleo, Jobvite, Workable):
   → Use --override to manually set if company is critical
 
 Autocorrect disabled: &nfpr=1
-```text
+```
 
 ### URL slug validation (prevents false positives)
 ```text
@@ -410,7 +411,7 @@ Known aliases handled:
   Block    → also check "squareup", "square"
   JPMorgan → also check "jpmc", "jpmorganchase"
   X        → also check "twitter"
-```text
+```
 
 ### Rate limiting and CAPTCHA handling
 ```text
@@ -419,7 +420,7 @@ Playwright browser with realistic user agent.
 Browser restarted every 50 companies (memory cleanup).
 CAPTCHA detected → wait 120s → retry once → skip.
 Progress saved per company → auto-resume if interrupted.
-```text
+```
 
 ### Scoring formula
 ```text
@@ -437,7 +438,7 @@ Empty jobs (hiring freeze):
   confidence = 50 (neutral — ATS structure confirmed)
   final_score = 50 × log10(1) = 0
   Only accepted if no other viable match exists
-```text
+```
 
 ### Keyword extraction
 ```text
@@ -456,7 +457,7 @@ Stop words filtered:
 
 ALL keywords must appear in job title+URL for a match.
 This prevents partial matches (Capital Group ≠ Capital One).
-```text
+```
 
 ### Detection status values
 ```text
@@ -464,7 +465,7 @@ detected    → high confidence, auto-accepted silently
 close_call  → auto-selected by tie-break, email sent to verify
 unknown     → low confidence, email sent for manual review
 manual      → manually overridden by user, never auto-re-detected
-```text
+```
 
 ### Re-detection triggers
 ```text
@@ -484,7 +485,7 @@ Manual re-detection:
 Manual override:
   → python pipeline.py --detect-ats "Capital One" --override workday capitalone
   → Permanently sets platform + slug, never auto-changed
-```text
+```
 
 ### Empty day counter reset (critical behavior)
 ```text
@@ -507,7 +508,7 @@ Two scenarios both produce 0 jobs:
 
 Maximum job posting gap when ATS switches:
   → 14 days (configurable via JOB_MONITOR_REDETECT_DAYS)
-```text
+```
 
 ### Detection summary email
 ```text
@@ -528,7 +529,7 @@ NEEDS MANUAL REVIEW section:
   Company      | Best Attempt              | Override Command
   Obscure Corp | smartrecruiters/obscure   | --override <ats> <slug>
                | (40% conf, 3 jobs)
-```text
+```
 
 ### Monitorable companies
 ```text
@@ -539,7 +540,7 @@ NEEDS MANUAL REVIEW section:
 
 Unknown companies are SKIPPED in daily monitoring.
 "X companies with unknown ATS — run --detect-ats" shown in output.
-```text
+```
 
 ---
 
@@ -578,7 +579,7 @@ Priority 4 — Location (USA only):
   Reject: "canada", "uk", "india", "germany",
           "australia", "singapore" etc.
   Default: include if location unclear
-```text
+```
 
 ### Relevance scoring
 ```python
@@ -597,7 +598,7 @@ score += 1  if posted 2-3 days ago
 ## Freshness Detection
 
 ### The Greenhouse problem
-```text
+```
 Greenhouse updated_at changes on every edit:
   → Job posted 6 months ago, edited yesterday
   → updated_at = yesterday
@@ -608,7 +609,7 @@ Solution: Do NOT use updated_at for freshness
 ```text
 
 ### Two-layer deduplication
-```text
+```
 Layer 1 — URL check:
   Job URL already in job_postings table
   (any status including 'expired') → SKIP
@@ -624,7 +625,7 @@ Both layers must pass for job to be "new"
 ```text
 
 ### Date-based freshness (when reliable date available)
-```text
+```
 Lever, Ashby, SmartRecruiters, Workday:
   posted_at available and reliable
   → If (today - posted_at) > JOB_MONITOR_DAYS_FRESH
@@ -637,7 +638,7 @@ Greenhouse:
 ```text
 
 ### First run per company
-```text
+```
 CRITICAL edge case:
   First time we scan a company →
   All 50-200 existing jobs appear as "new"
@@ -657,7 +658,7 @@ Solution:
 ## Edge Cases
 
 ### ATS Detection
-```text
+```
 E1: Wrong slug matches wrong company (e.g. "capital" → Capital Group)
     → Confidence scoring catches this:
       "capital" on Lever → 0% confidence for "Capital One"
@@ -688,7 +689,7 @@ E4: Workday URL variant (wd1/wd2/wd3/wd5)
 ```text
 
 ### API Calls
-```text
+```
 E5: API pagination
     → Greenhouse/Lever may paginate for large companies
     → Always fetch all pages before filtering
@@ -719,7 +720,7 @@ E9: Partial run failure (VM crash mid-run)
 ```text
 
 ### Job Data
-```text
+```
 E10: Empty job title
      → Skip — can't filter without title
 
@@ -750,7 +751,7 @@ E16: Special characters in title/description
 ```text
 
 ### PDF Generation
-```text
+```
 E17: 0 jobs match filters
      → Don't generate PDF
      → Send brief email: "No matching jobs today"
@@ -775,7 +776,7 @@ E20: Very large PDF (200+ jobs)
 ## Performance Metrics
 
 ### Why metrics are critical
-```text
+```
 This is the entry pipeline. If it fails silently:
   → You never see relevant job postings
   → You apply late → lower response rate
@@ -787,7 +788,7 @@ Metrics catch silent failures before they compound.
 ### Metrics tracked per run
 
 #### Metric 1 — Detection Coverage
-```text
+```
 Formula: companies_with_results / total_monitored
 Target:  ≥ 70%
 Alert:   < 70% for 3 consecutive days
@@ -797,7 +798,7 @@ Meaning: How many companies returned at least 1 job?
 ```text
 
 #### Metric 2 — ATS Known Rate
-```text
+```
 Formula: companies_with_known_ats / total_companies
 Target:  ≥ 80%
 Alert:   < 80%
@@ -806,7 +807,7 @@ Meaning: What % of companies have confirmed ATS?
 ```text
 
 #### Metric 3 — Filter Match Rate
-```text
+```
 Formula: jobs_matched_filters / total_jobs_fetched
 Target:  5% - 40%
 Alert:   < 5% (filters too strict)
@@ -815,7 +816,7 @@ Meaning: Are our title/skill filters calibrated?
 ```text
 
 #### Metric 4 — New Job Rate
-```text
+```
 Formula: new_jobs_found / total_jobs_fetched
 Target:  varies by season
 Meaning: Hiring activity indicator
@@ -824,7 +825,7 @@ Meaning: Hiring activity indicator
 ```text
 
 #### Metric 5 — Pipeline Reliability
-```text
+```
 Formula: successful_runs / total_runs (last 7 days)
 Target:  ≥ 90%
 Alert:   < 90%
@@ -833,7 +834,7 @@ Meaning: How often does --monitor-jobs complete?
 ```text
 
 #### Metric 6 — API Failure Rate
-```text
+```
 Formula: api_failures / total_api_calls
 Target:  < 10%
 Alert:   > 10% for 3 consecutive days
@@ -841,7 +842,7 @@ Meaning: Are APIs degrading or rate limiting us?
 ```text
 
 #### Metric 7 — Application Conversion Rate (future)
-```text
+```
 Formula: jobs_applied / jobs_shown_in_digest
 Target:  TBD after data collected
 Meaning: Quality of job recommendations
@@ -850,7 +851,7 @@ Meaning: Quality of job recommendations
 ```text
 
 #### Metric 8 — Time to Apply (future)
-```text
+```
 Formula: avg(applied_date - posted_date) in hours
 Target:  < 24 hours
 Meaning: Are you applying fast enough?
@@ -875,7 +876,7 @@ CREATE TABLE IF NOT EXISTS monitor_stats (
     email_sent             INTEGER DEFAULT 0,
     created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-```text
+```
 
 ### Alert delivery
 ```text
@@ -889,7 +890,7 @@ Weekly summary email (Mondays):
   → 7-day trend for all metrics
   → Filter calibration suggestion if needed
   → Pipeline reliability score
-```text
+```
 
 ---
 
@@ -930,7 +931,7 @@ ALTER TABLE prospective_companies
   ADD COLUMN first_scanned_at TIMESTAMP;
   ADD COLUMN last_checked_at  TIMESTAMP;
   ADD COLUMN consecutive_empty_days INTEGER DEFAULT 0;
-```text
+```
 
 ### Retention policy
 ```text
@@ -954,7 +955,7 @@ job_postings cleanup (runs in init_db()):
 PDF digests:
   Keep last 30 days only
   Cron: find data/digests/ -name "*.pdf" -mtime +30 -delete
-```text
+```
 
 ---
 
@@ -1029,7 +1030,7 @@ MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% jobs match
 
 ## PDF Digest Format
 
-```text
+```
 data/digests/jobs_digest_2026-03-04.pdf
 
 Page 1 — Summary + Pipeline Health
@@ -1091,7 +1092,7 @@ python pipeline.py --monitor-status
 
 # Remove company from monitoring (future feature)
 # python pipeline.py --remove-prospect "CompanyName"
-```text
+```
 
 ---
 
@@ -1130,7 +1131,7 @@ data/
 
 tests/
   test_job_monitor.py    → comprehensive tests
-```text
+```
 
 ---
 
@@ -1148,7 +1149,7 @@ tests/
 
 ## Implementation Plan
 
-```text
+```
 Phase 1 — DB + Config:
   db/schema.py        → add job_postings + monitor_stats tables
                       → add columns to prospective_companies
@@ -1225,7 +1226,7 @@ Phase 9 — Tests:
 
 ## Known Limitations
 
-```text
+```
 1. Big tech custom pages not monitored
    (Google, Apple, Microsoft, Amazon, Meta)
    → Add custom scrapers as future enhancement
