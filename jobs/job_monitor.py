@@ -133,6 +133,11 @@ def run():
 
         stats["total_jobs_fetched"] += len(raw_jobs)
 
+        # Delay between companies — reduces per-IP concentration
+        # 0.5s ±0.2s — minimal but meaningful
+        from jobs.ats.base import between_companies_delay
+        between_companies_delay()
+
         if not raw_jobs:
             update_company_check(company, found_jobs=False)
             print("   [INFO] No jobs returned")

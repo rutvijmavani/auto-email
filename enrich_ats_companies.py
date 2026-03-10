@@ -34,7 +34,8 @@ HEADERS = {
     )
 }
 TIMEOUT     = 8
-CALL_DELAY  = 0.1   # seconds between API calls
+# Delays now per-platform via config.py
+# Loaded dynamically in _get_platform_delay()
 
 
 # ─────────────────────────────────────────
@@ -344,6 +345,199 @@ def _extract_title_name(html):
 # MAIN ENRICHMENT RUNNER
 # ─────────────────────────────────────────
 
+def _enrich_delay(platform):
+    """
+    Apply per-platform delay with jitter during enrichment.
+    Spread 910 requests over 18-hour window naturally.
+    """
+    import random
+    from config import PLATFORM_DELAYS
+    cfg   = PLATFORM_DELAYS.get(
+        platform, {"base": 0.3, "jitter": 0.1}
+    )
+    delay = cfg["base"] + random.uniform(
+        -cfg["jitter"], cfg["jitter"]
+    )
+    time.sleep(max(0.05, delay))
+
+
+def run_priority_enrichment():
+    """
+    Phase A: Enrich YOUR prospect companies first.
+    Run once — gives immediate Phase 1 benefit for
+    your 134 monitored companies.
+    """
+    from db.connection import get_conn
+    from db.ats_companies import get_discovery_conn
+
+    init_discovery_db()
+
+    # Get all prospect company domains
+    try:
+        conn = get_conn()
+        prospects = conn.execute("""
+            SELECT company, domain
+            FROM prospective_companies
+        """).fetchall()
+        conn.close()
+        prospect_names = {
+            r["company"].lower() for r in prospects
+        }
+        prospect_domains = {
+            r["domain"].lower().replace("www.", "")
+            for r in prospects if r["domain"]
+        }
+    except Exception:
+        print("[WARNING] Could not load prospects — "
+              "running standard enrichment")
+        return run_enrichment(limit=200)
+
+    if not prospect_names:
+        print("[INFO] No prospects found — "
+              "running standard enrichment")
+        return run_enrichment(limit=200)
+
+    # Find slugs matching prospect companies
+    disc_conn = get_discovery_conn()
+    try:
+        rows = disc_conn.execute("""
+            SELECT platform, slug, company_name, website
+            FROM ats_companies
+            WHERE is_enriched = 0
+            AND is_active = 1
+            ORDER BY platform ASC
+        """).fetchall()
+    finally:
+        disc_conn.close()
+
+    # Filter to prospect matches
+    priority_slugs = []
+    for row in rows:
+        name    = (row["company_name"] or "").lower()
+        website = (row["website"] or "").lower().replace("www.", "")
+        slug    = row["slug"].lower()
+
+        # Match by name, website, or slug similarity
+        if (any(p in name or name in p
+                for p in prospect_names if len(p) > 4)
+                or website in prospect_domains
+                or any(slug in p or p in slug
+                       for p in prospect_names if len(p) > 4)):
+            priority_slugs.append(dict(row))
+
+    if not priority_slugs:
+        print("[INFO] No prospect matches in discovery DB yet. "
+              "Run build_ats_slug_list.py first.")
+        return
+
+    print(f"\n[Phase A] Priority enrichment: "
+          f"{len(priority_slugs)} prospect-matching slugs")
+    print(f"{'Platform':<15} {'Slug':<30} {'Result':<10} {'Name'}")
+    print("─" * 80)
+
+    stats = {"ok": 0, "inactive": 0, "error": 0}
+    for row in priority_slugs:
+        plat = row["platform"]
+        slug = row["slug"]
+        enricher = ENRICHERS.get(plat)
+        if not enricher:
+            continue
+        data, status = enricher(slug)
+        if status == "inactive":
+            delete_company(plat, slug)
+            stats["inactive"] += 1
+            print(f"  {plat:<13} {slug[:28]:<30} DELETED (404)")
+        elif status == "ok" and data:
+            upsert_company(
+                platform=plat, slug=slug,
+                company_name=data.get("company_name"),
+                website=data.get("website"),
+                job_count=data.get("job_count"),
+            )
+            stats["ok"] += 1
+            name = data.get("company_name", "")[:30]
+            print(f"  {plat:<13} {slug[:28]:<30} OK         {name}")
+        elif status == "error":
+            stats["error"] += 1
+        _enrich_delay(plat)
+
+    print(f"\n[Phase A] Complete — "
+          f"OK: {stats['ok']} | "
+          f"Inactive: {stats['inactive']} | "
+          f"Errors: {stats['error']}")
+
+
+def run_platform_aware_enrichment(test_mode=False):
+    """
+    Phase B: Daily background enrichment with per-platform limits.
+    Spread over 18-hour window — ~910 requests/day total.
+    Start minimal, increase only after 30 days clean api_health.
+
+    Daily limits (config.py ENRICH_DAILY_LIMITS):
+      greenhouse:  300
+      ashby:       300
+      lever:       150
+      icims:       100
+      workday:      30
+      oracle_hcm:   30
+    """
+    from config import ENRICH_DAILY_LIMITS
+
+    init_discovery_db()
+
+    print("\n[Phase B] Platform-aware daily enrichment")
+    print(f"  Window: 18 hours | "
+          f"Total: ~{sum(ENRICH_DAILY_LIMITS.values())}/day")
+    print()
+
+    total_stats = {"ok": 0, "inactive": 0, "error": 0}
+
+    for platform, daily_limit in ENRICH_DAILY_LIMITS.items():
+        if test_mode:
+            daily_limit = 3
+
+        slugs = get_unenriched(
+            platform=platform, limit=daily_limit
+        )
+
+        if not slugs:
+            print(f"  {platform:<15} — no unenriched slugs")
+            continue
+
+        print(f"  {platform:<15} {len(slugs):>4} slugs to enrich")
+
+        for row in slugs:
+            slug     = row["slug"]
+            enricher = ENRICHERS.get(platform)
+            if not enricher:
+                continue
+
+            data, status = enricher(slug)
+
+            if status == "inactive":
+                delete_company(platform, slug)
+                total_stats["inactive"] += 1
+            elif status == "ok" and data:
+                upsert_company(
+                    platform=platform,
+                    slug=slug,
+                    company_name=data.get("company_name"),
+                    website=data.get("website"),
+                    job_count=data.get("job_count"),
+                )
+                total_stats["ok"] += 1
+            elif status == "error":
+                total_stats["error"] += 1
+
+            _enrich_delay(platform)
+
+    print(f"\n[Phase B] Complete — "
+          f"OK: {total_stats['ok']} | "
+          f"Inactive: {total_stats['inactive']} | "
+          f"Errors: {total_stats['error']}")
+    return total_stats
+
+
 def run_enrichment(platform=None, limit=500, test_mode=False):
     """
     Enrich all unenriched slugs in ats_discovery.db.
@@ -410,7 +604,7 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
         elif status == "skip":
             stats["skip"] += 1
 
-        time.sleep(CALL_DELAY)
+        _enrich_delay(plat)
 
     # Summary
     print(f"\n{'='*60}")
@@ -431,10 +625,25 @@ if __name__ == "__main__":
                         default=None)
     parser.add_argument("--limit",   type=int, default=500)
     parser.add_argument("--test",    action="store_true")
+    parser.add_argument(
+        "--priority",
+        action="store_true",
+        help="Phase A: enrich prospect companies first"
+    )
+    parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="Phase B: platform-aware daily enrichment"
+    )
     args = parser.parse_args()
 
-    run_enrichment(
-        platform=args.platform,
-        limit=args.limit,
-        test_mode=args.test,
-    )
+    if args.priority:
+        run_priority_enrichment()
+    elif args.daily:
+        run_platform_aware_enrichment(test_mode=args.test)
+    else:
+        run_enrichment(
+            platform=args.platform,
+            limit=args.limit,
+            test_mode=args.test,
+        )

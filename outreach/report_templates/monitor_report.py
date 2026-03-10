@@ -362,6 +362,72 @@ def _build_job_listings(jobs_by_company, styles):
     return elements
 
 
+def _build_api_warning_section():
+    """
+    Build warning section for daily digest email.
+    Shows Tier 2 (warning-level) pipeline alerts.
+    Returns HTML string — empty if no warnings.
+    """
+    try:
+        from db.pipeline_alerts import get_pending_warnings, mark_warnings_sent
+        from config import (
+            RATE_LIMIT_WARNING_THRESHOLD,
+            SERPER_WARNING_THRESHOLD,
+        )
+        warnings = get_pending_warnings()
+        if not warnings:
+            return ""
+
+        items = []
+        for w in warnings:
+            platform = w.get("platform", "")
+            msg      = w.get("message", "")
+            val      = w.get("value", 0)
+            typ      = w.get("alert_type", "")
+
+            if typ == "rate_limit":
+                items.append(
+                    f"⚠ {platform.title()} rate limit warning: "
+                    f"{val}% of requests returned 429. "
+                    f"Monitor api_health table."
+                )
+            elif typ == "slow_response":
+                items.append(
+                    f"⚠ {platform.title()} responses slow: "
+                    f"avg {int(val)}ms. May indicate throttling."
+                )
+            elif typ == "serper_low":
+                items.append(
+                    f"⚠ Serper credits low: {int(val)} remaining. "
+                    f"Consider purchasing more at serper.dev."
+                )
+            elif msg:
+                items.append(f"⚠ {msg}")
+
+        if not items:
+            return ""
+
+        # Mark as sent
+        mark_warnings_sent([w["id"] for w in warnings])
+
+        rows = "".join(
+            f'<p style="color:#92400e;background:#fffbeb;'
+            f'padding:8px;border-radius:4px;'
+            f'font-size:12px;margin:4px 0;">{item}</p>'
+            for item in items
+        )
+        return (
+            f'<hr style="border:none;border-top:1px solid #e2e8f0;'
+            f'margin:16px 0;">'
+            f'<p style="font-weight:600;color:#374151;'
+            f'font-size:13px;margin-bottom:8px;">'
+            f'⚠ Pipeline Warnings</p>'
+            f'{rows}'
+        )
+    except Exception:
+        return ""
+
+
 def build_monitor_report(new_postings, stats, alerts):
     """
     Build PDF digest and send as email attachment.
@@ -490,6 +556,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         f'⚠ {html_lib.escape(str(a["message"]))}</p>'
         for a in alerts if a["level"] in ("warning","error")
       )}
+      {_build_api_warning_section()}
     </body></html>
     """
 

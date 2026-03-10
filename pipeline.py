@@ -21,6 +21,7 @@ CLI flags:
   --detect-ats          auto-detect ATS for all undetected companies
   --detect-ats "Name"   force re-detect ATS for specific company
   --monitor-status      show job monitoring status summary
+  --weekly-summary      send Monday weekly summary email
   --outreach-only       schedule + send outreach emails
   --quota-report        check quota health and send alert email if needed
 """
@@ -609,6 +610,13 @@ def run_quota_report(silent_if_healthy=False):
 def main():
     init_db()
     args = sys.argv[1:]
+
+    if "--weekly-summary" in args:
+        from outreach.report_templates.weekly_summary import (
+            build_weekly_summary
+        )
+        build_weekly_summary()
+        return
 
     if "--sync-forms" in args:
         run_sync_forms()

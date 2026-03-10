@@ -288,6 +288,61 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS api_health (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            date            DATE    NOT NULL,
+            platform        TEXT    NOT NULL,
+
+            -- Request counts
+            requests_made   INTEGER DEFAULT 0,
+            requests_ok     INTEGER DEFAULT 0,
+            requests_429    INTEGER DEFAULT 0,
+            requests_404    INTEGER DEFAULT 0,
+            requests_error  INTEGER DEFAULT 0,
+
+            -- Timing (milliseconds)
+            avg_response_ms INTEGER DEFAULT 0,
+            max_response_ms INTEGER DEFAULT 0,
+            total_ms        INTEGER DEFAULT 0,
+
+            -- Rate limit details
+            first_429_at    TIMESTAMP,
+            backoff_total_s INTEGER DEFAULT 0,
+
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            UNIQUE(date, platform)
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_api_health_date_platform
+        ON api_health(date, platform)
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pipeline_alerts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_type   TEXT    NOT NULL,
+            severity     TEXT    NOT NULL,
+            platform     TEXT,
+            value        REAL,
+            threshold    REAL,
+            message      TEXT,
+            notified     INTEGER DEFAULT 0,
+            notified_at  TIMESTAMP,
+            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_pipeline_alerts_type_platform
+        ON pipeline_alerts(alert_type, platform, created_at)
+    """)
+
     # Migration: add ATS detection columns to prospective_companies
     for col, definition in [
         ("ats_platform",          "TEXT DEFAULT 'unknown'"),
