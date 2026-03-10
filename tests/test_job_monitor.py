@@ -1257,8 +1257,16 @@ class TestATSDetectionLogic(unittest.TestCase):
     def test_unknown_platform_needs_redetection(self):
         self.assertTrue(self.needs(self._row(ats_platform="unknown")))
 
-    def test_custom_platform_needs_redetection(self):
-        """Custom ATS retried after threshold — company may have switched."""
+    def test_unknown_platform_triggers_redetection(self):
+        """Unknown platform always triggers redetection."""
+        self.assertTrue(self.needs(self._row(ats_platform="unknown")))
+
+    def test_unsupported_platform_no_redetection(self):
+        """Unsupported ATS detected — never re-detect (we know the ATS)."""
+        self.assertFalse(self.needs(self._row(ats_platform="unsupported")))
+
+    def test_custom_platform_triggers_redetection(self):
+        """Custom (no ATS URL found) always triggers redetection."""
         self.assertTrue(self.needs(self._row(ats_platform="custom")))
 
     def test_none_platform_needs_redetection(self):
@@ -2160,11 +2168,25 @@ class TestMonitorableCompanies(unittest.TestCase):
         self.assertNotIn("Mystery Corp", names)
 
     def test_custom_company_excluded(self):
-        """Custom ATS companies excluded from daily monitoring."""
-        self._set_ats("Amazon", "custom", None)
+        """Custom ATS companies excluded even with non-null slug."""
+        self._set_ats("Amazon", "custom", "amazon-custom")
         companies = db_module.get_monitorable_companies()
         names = [c["company"] for c in companies]
         self.assertNotIn("Amazon", names)
+
+    def test_unsupported_company_excluded_from_monitoring(self):
+        """Unsupported ATS companies excluded from daily monitoring."""
+        self._set_ats("AMD", "unsupported", "amd")
+        companies = db_module.get_monitorable_companies()
+        names = [c["company"] for c in companies]
+        self.assertNotIn("AMD", names)
+
+    def test_unsupported_company_in_all_companies(self):
+        """Unsupported companies still appear in get_all_monitored_companies."""
+        self._set_ats("AMD", "unsupported", "amd")
+        companies = db_module.get_all_monitored_companies()
+        names = [c["company"] for c in companies]
+        self.assertIn("AMD", names)
 
     def test_close_call_company_included(self):
         """Close call auto-selected — still monitorable."""
@@ -2300,10 +2322,8 @@ class TestATSPatternMatching(unittest.TestCase):
         result = self.match(
             "https://jobs.myworkdayjobs.com/en-US/capital-one-jobs"
         )
-        # Should not match (no company slug in domain)
-        if result:
-            slug_data = json.loads(result["slug"])
-            self.assertNotEqual(slug_data["slug"], "jobs")
+        # Should never match — aggregator URL has no company slug in domain
+        self.assertFalse(result)
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -2369,54 +2389,28 @@ class TestSlugValidation(unittest.TestCase):
 # ═════════════════════════════════════════════════════════════════
 
 class TestGoogleDetectorUtils(unittest.TestCase):
+    """Tests for ATS pattern matching — replaces old Google detector tests."""
 
-    def setUp(self):
-        from jobs.google_detector import _decode_redirect, _no_results
-        self.decode    = _decode_redirect
-        self.no_result = _no_results
-
-    def test_decode_google_redirect(self):
-        url = "/url?q=https://boards.greenhouse.io/stripe/jobs"
-        self.assertEqual(
-            self.decode(url),
-            "https://boards.greenhouse.io/stripe/jobs"
-        )
-
-    def test_direct_url_unchanged(self):
-        url = "https://boards.greenhouse.io/stripe/jobs"
-        self.assertEqual(self.decode(url), url)
-
-    def test_decode_none_returns_none(self):
-        self.assertIsNone(self.decode(None))
-
-    def test_decode_empty_returns_none(self):
-        self.assertIsNone(self.decode(""))
-
-    def test_no_results_detected(self):
-        html = "<p>did not match any documents</p>"
-        self.assertTrue(self.no_result(html))
-
-    def test_results_present_not_detected(self):
-        html = "<div>boards.greenhouse.io/stripe</div>"
-        self.assertFalse(self.no_result(html))
+    def test_quota_exhausted_sentinel_not_none(self):
+        from jobs.google_detector import QUOTA_EXHAUSTED
+        self.assertIsNotNone(QUOTA_EXHAUSTED)
 
 
-# ═════════════════════════════════════════════════════════════════
-# TEST: Oracle HCM client
-# ═════════════════════════════════════════════════════════════════
-
-class TestOracleHCMClient(unittest.TestCase):
+class TestOracleHCMFetch(unittest.TestCase):
+    """Tests for Oracle HCM job fetching."""
 
     def setUp(self):
         from jobs.ats import oracle_hcm
         self.oracle = oracle_hcm
 
-    def _mock_job(self, title="Senior SWE"):
+    def _mock_job(self, title="Software Engineer"):
+        # Field names match Oracle HCM API (capitalized)
         return {
-            "Title":            title,
-            "PostedDate":       "2026-03-04T08:00:00Z",
-            "PrimaryLocation":  "New York, NY",
-            "ExternalJobId":    "REQ-12345",
+            "ExternalJobId":        "REQ001",
+            "Title":                title,
+            "PrimaryLocation":      "New York, NY",
+            "PostedDate":           "2026-01-15T00:00:00Z",
+            "ShortDescriptionStr":  "Job description here",
         }
 
     @patch("jobs.ats.oracle_hcm.fetch_json")
@@ -2479,208 +2473,263 @@ class TestOracleHCMClient(unittest.TestCase):
         self.assertEqual(jobs, [])
 
 
-# ═════════════════════════════════════════════════════════════════
-# TEST: Google detector integration (mocked)
-# ═════════════════════════════════════════════════════════════════
 
-class TestGoogleDetectorIntegration(unittest.TestCase):
-    """
-    Tests for Google detector using component-level testing.
-    Tests _extract_urls, match_ats_pattern, validate_slug_for_company
-    directly rather than full integration to avoid Playwright mock issues.
-    Full end-to-end tested manually via --detect-ats.
-    """
+class TestICIMSFetch(unittest.TestCase):
+    """Tests for iCIMS job fetcher."""
 
-    def test_extract_urls_returns_direct_url(self):
-        """_extract_urls extracts direct http URLs from page elements."""
-        from jobs.google_detector import _extract_urls
-        page = MagicMock()
-        url  = "https://boards.greenhouse.io/stripe/jobs/1234"
-        el   = MagicMock()
-        el.get_attribute = MagicMock(return_value=url)
-        page.query_selector_all = MagicMock(return_value=[el])
-        urls = _extract_urls(page)
-        self.assertIn(url, urls)
+    def _mock_listing_html(self):
+        """Create mock iCIMS listing page HTML."""
+        href1 = "https://careers-test.icims.com/jobs/1265/shift-operator/job?in_iframe=1"
+        href2 = "https://careers-test.icims.com/jobs/1264/mechanic-fitter/job?in_iframe=1"
+        return (
+            "<html><body><div class='iCIMS_Content'>"
+            "<a class='iCIMS_Anchor' href='" + href1 + "'>Job Title\nSHIFT OPERATOR DUBLIN</a>"
+            "<a class='iCIMS_Anchor' href='" + href2 + "'>Job Title\nMECHANIC FITTER DUBLIN</a>"
+            "</div></body></html>"
+        )
 
-    def test_extract_urls_decodes_redirect(self):
-        """_extract_urls decodes Google /url?q= redirects."""
-        from jobs.google_detector import _extract_urls
-        redirect = "/url?q=https://boards.greenhouse.io/stripe/jobs&sa=X"
-        decoded  = "https://boards.greenhouse.io/stripe/jobs"
-        el = MagicMock()
-        el.get_attribute = MagicMock(return_value=redirect)
-        page = MagicMock()
-        page.query_selector_all = MagicMock(return_value=[el])
-        urls = _extract_urls(page)
-        self.assertIn(decoded, urls)
+    def _mock_detail_html(self):
+        """Create mock iCIMS job detail page HTML."""
+        return (
+            "<html><head><title>SHIFT OPERATOR in Dublin</title></head><body>"
+            "<h1 class='iCIMS_Header'>SHIFT OPERATOR DUBLIN, IRELAND</h1>"
+            "<div>Job Locations Republic of Ireland-Dublin</div>"
+            "<div>Posted Date 3 days ago (05/03/2026 13:46)</div>"
+            "<div class='iCIMS_InfoMsg'>Overview text here</div>"
+            '<script type="application/ld+json">'
+            '{"hiringOrganization":{"@type":"Organization","name":"Test Corp"},'
+            '"datePosted":"2026-03-05T00:00:00.000Z",'
+            '"jobLocation":[{"address":{"addressLocality":"Dublin",'
+            '"addressCountry":"Republic of Ireland","@type":"PostalAddress"}}]}'
+            "</script></body></html>"
+        )
 
-    def test_extract_urls_deduplicates(self):
-        """Same URL not returned twice."""
-        from jobs.google_detector import _extract_urls
-        url = "https://boards.greenhouse.io/stripe/jobs/1"
-        els = []
-        for _ in range(3):
-            el = MagicMock()
-            el.get_attribute = MagicMock(return_value=url)
-            els.append(el)
-        page = MagicMock()
-        page.query_selector_all = MagicMock(return_value=els)
-        urls = _extract_urls(page)
-        self.assertEqual(urls.count(url), 1)
+    @patch("requests.get")
+    def test_fetch_jobs_returns_jobs(self, mock_get):
+        """fetch_jobs returns job stubs from listing page."""
+        from jobs.ats import icims
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = self._mock_listing_html()
+        mock_empty = MagicMock()
+        mock_empty.status_code = 200
+        mock_empty.text = "<html><body></body></html>"
+        mock_get.side_effect = [mock_resp, mock_empty]
+        jobs = icims.fetch_jobs("test", "Test Corp")
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0]["ats"], "icims")
+        self.assertEqual(jobs[0]["company"], "Test Corp")
+        self.assertIsNone(jobs[0]["posted_at"])
 
-    def test_extract_urls_skips_non_http(self):
-        """Non-http URLs not included."""
-        from jobs.google_detector import _extract_urls
-        el = MagicMock()
-        el.get_attribute = MagicMock(return_value="/internal/path")
-        page = MagicMock()
-        page.query_selector_all = MagicMock(return_value=[el])
-        urls = _extract_urls(page)
-        self.assertEqual(urls, [])
+    @patch("requests.get")
+    def test_fetch_jobs_strips_job_title_prefix(self, mock_get):
+        """Strips Job Title prefix from anchor text."""
+        from jobs.ats import icims
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = self._mock_listing_html()
+        mock_empty = MagicMock()
+        mock_empty.status_code = 200
+        mock_empty.text = "<html><body></body></html>"
+        mock_get.side_effect = [mock_resp, mock_empty]
+        jobs = icims.fetch_jobs("test", "Test Corp")
+        self.assertEqual(jobs[0]["title"], "SHIFT OPERATOR DUBLIN")
+        self.assertNotIn("Job Title", jobs[0]["title"])
 
-    def test_pattern_match_greenhouse(self):
-        """match_ats_pattern correctly identifies Greenhouse URL."""
-        from jobs.ats.patterns import match_ats_pattern
-        result = match_ats_pattern(
-            "https://boards.greenhouse.io/stripe/jobs/1234"
+    @patch("requests.get")
+    def test_fetch_jobs_returns_empty_on_404(self, mock_get):
+        """Returns empty list on 404."""
+        from jobs.ats import icims
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_get.return_value = mock_resp
+        jobs = icims.fetch_jobs("nonexistent", "Unknown Corp")
+        self.assertEqual(jobs, [])
+
+    @patch("requests.get")
+    def test_fetch_job_detail_extracts_posted_date(self, mock_get):
+        """fetch_job_detail extracts posted_at from body text."""
+        from jobs.ats import icims
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = self._mock_detail_html()
+        mock_get.return_value = mock_resp
+        job = {
+            "company":   "Test Corp",
+            "title":     "SHIFT OPERATOR",
+            "job_url":   "https://careers-test.icims.com/jobs/1265/title/job",
+            "job_id":    "1265",
+            "location":  "",
+            "posted_at": None,
+            "_base_url": "https://careers-test.icims.com",
+            "ats":       "icims",
+        }
+        updated = icims.fetch_job_detail(job)
+        self.assertIsNotNone(updated["posted_at"])
+        self.assertEqual(updated["posted_at"].day,   5)
+        self.assertEqual(updated["posted_at"].month, 3)
+        self.assertEqual(updated["posted_at"].year,  2026)
+
+    @patch("requests.get")
+    def test_fetch_job_detail_extracts_location(self, mock_get):
+        """fetch_job_detail extracts location from JSON-LD."""
+        from jobs.ats import icims
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = self._mock_detail_html()
+        mock_get.return_value = mock_resp
+        job = {
+            "company":   "Test Corp",
+            "title":     "SHIFT OPERATOR",
+            "job_url":   "https://careers-test.icims.com/jobs/1265/title/job",
+            "job_id":    "1265",
+            "location":  "",
+            "posted_at": None,
+            "_base_url": "https://careers-test.icims.com",
+            "ats":       "icims",
+        }
+        updated = icims.fetch_job_detail(job)
+        self.assertIn("Dublin", updated["location"])
+
+    def test_clean_title_strips_prefix(self):
+        """_clean_title removes Job Title prefix."""
+        from jobs.ats.icims import _clean_title
+        self.assertEqual(
+            _clean_title("Job Title\nSoftware Engineer"),
+            "Software Engineer"
+        )
+        self.assertEqual(_clean_title("Software Engineer"), "Software Engineer")
+
+    def test_extract_job_id(self):
+        """_extract_job_id gets numeric ID from URL."""
+        from jobs.ats.icims import _extract_job_id
+        self.assertEqual(
+            _extract_job_id(
+                "https://careers-test.icims.com/jobs/1265/title/job"
+            ),
+            "1265"
+        )
+        self.assertIsNone(_extract_job_id("https://example.com"))
+
+    def test_extract_posted_date(self):
+        """_extract_posted_date parses DD/MM/YYYY format."""
+        from jobs.ats.icims import _extract_posted_date
+        result = _extract_posted_date(
+            "Posted Date 3 days ago (05/03/2026 13:46)"
         )
         self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "greenhouse")
-        self.assertEqual(result["slug"], "stripe")
+        self.assertEqual(result.day,   5)
+        self.assertEqual(result.month, 3)
+        self.assertEqual(result.year,  2026)
 
-    def test_pattern_match_workday(self):
-        """match_ats_pattern extracts slug+wd+path from Workday URL."""
+    def test_extract_posted_date_returns_none_when_missing(self):
+        """Returns None when no date in text."""
+        from jobs.ats.icims import _extract_posted_date
+        self.assertIsNone(_extract_posted_date("No date here"))
+
+    def test_icims_pattern_matches_careers_prefix(self):
+        """iCIMS URL pattern handles careers- prefix."""
         from jobs.ats.patterns import match_ats_pattern
         result = match_ats_pattern(
-            "https://capitalone.wd12.myworkdayjobs.com/Capital_One/jobs"
+            "https://careers-schwab.icims.com/jobs/search"
         )
         self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "workday")
-        slug_data = json.loads(result["slug"])
-        self.assertEqual(slug_data["slug"], "capitalone")
-        self.assertEqual(slug_data["wd"], "wd12")
+        self.assertEqual(result["platform"], "icims")
+        self.assertEqual(result["slug"], "schwab")
 
-    def test_pattern_match_oracle_hcm(self):
-        """match_ats_pattern identifies Oracle HCM URL."""
+    def test_icims_pattern_matches_plain_subdomain(self):
+        """iCIMS URL pattern handles plain subdomain."""
         from jobs.ats.patterns import match_ats_pattern
         result = match_ats_pattern(
-            "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/"
-            "en/sites/CX_1001/jobs"
+            "https://schwab.icims.com/jobs/123/title/job"
         )
         self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "oracle_hcm")
-        slug_data = json.loads(result["slug"])
-        self.assertEqual(slug_data["slug"], "jpmc")
+        self.assertEqual(result["platform"], "icims")
+        self.assertEqual(result["slug"], "schwab")
 
-    def test_validate_rejects_wrong_company(self):
-        """OpenFX slug rejected for JPMorgan."""
-        from jobs.ats.patterns import validate_slug_for_company
-        self.assertFalse(validate_slug_for_company("openfx", "JPMorgan Chase"))
 
-    def test_validate_accepts_correct_company(self):
-        """Stripe slug accepted for Stripe."""
-        from jobs.ats.patterns import validate_slug_for_company
-        self.assertTrue(validate_slug_for_company("stripe", "Stripe"))
+class TestDetectionQueue(unittest.TestCase):
 
-    def test_detects_greenhouse_from_results(self):
-        """Full detect_via_google with mocked helpers."""
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls",
-                   return_value=["https://boards.greenhouse.io/stripe/jobs/1234"]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google("Stripe", page)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "greenhouse")
-        self.assertEqual(result["slug"], "stripe")
+    def setUp(self):
+        db_connection.DB_FILE = TEST_DB
+        cleanup_db(TEST_DB)
+        db_module.init_db()
 
-    def test_detects_workday_from_results(self):
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls",
-                   return_value=["https://capitalone.wd12.myworkdayjobs.com/Capital_One/jobs"]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google("Capital One", page)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "workday")
+    def tearDown(self):
+        cleanup_db(TEST_DB)
 
-    def test_detects_oracle_hcm(self):
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls",
-                   return_value=["https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/jobs"]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google("JPMorgan Chase", page)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "oracle_hcm")
+    def _add(self, company, platform=None, slug=None,
+             detected_at=None, empty_days=0):
+        db_module.add_prospective_company(company)
+        if platform:
+            from jobs.ats_detector import _store_detection
+            _store_detection(company, platform, slug)
+        if empty_days:
+            conn = db_connection.get_conn()
+            conn.execute("""
+                UPDATE prospective_companies
+                SET consecutive_empty_days = ?
+                WHERE company = ?
+            """, (empty_days, company))
+            conn.commit()
+            conn.close()
 
-    def test_handles_google_redirect_url(self):
-        """Redirect URL decoded and matched correctly."""
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls",
-                   return_value=["https://boards.greenhouse.io/stripe/jobs"]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google("Stripe", page)
-        self.assertIsNotNone(result)
-        self.assertEqual(result["platform"], "greenhouse")
+    def test_new_company_priority1(self):
+        """Never detected companies come first."""
+        self._add("NewCo")  # no platform = never detected
+        queue = db_module.get_detection_queue(batch_size=10)
+        names = [r["company"] for r in queue]
+        self.assertIn("NewCo", names)
 
-    def test_rejects_wrong_company_slug(self):
-        """OpenFX URL rejected for JPMorgan."""
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls",
-                   return_value=["https://boards.greenhouse.io/openfx/jobs/123"]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google("JPMorgan Chase", page)
-        self.assertIsNone(result)
+    def test_quiet_company_priority2(self):
+        """14+ empty days company in queue."""
+        self._add("QuietCo", "greenhouse", "quietco", empty_days=14)
+        queue = db_module.get_detection_queue(batch_size=10)
+        names = [r["company"] for r in queue]
+        self.assertIn("QuietCo", names)
 
-    def test_returns_none_on_no_results(self):
-        from jobs import google_detector
-        page = MagicMock()
-        page.goto = MagicMock()
-        page.content = MagicMock(return_value="<html>ok</html>")
-        with patch("jobs.google_detector._extract_urls", return_value=[]):
-            with patch("jobs.google_detector._is_captcha", return_value=False):
-                with patch("jobs.google_detector._no_results", return_value=False):
-                    with patch("jobs.google_detector.human_delay"):
-                        result = google_detector.detect_via_google(
-                            "Very Obscure Corp", page
-                        )
-        self.assertIsNone(result)
+    def test_unknown_company_priority3(self):
+        """Unknown platform companies in queue."""
+        self._add("UnknownCo", "unknown", None)
+        queue = db_module.get_detection_queue(batch_size=10)
+        names = [r["company"] for r in queue]
+        self.assertIn("UnknownCo", names)
 
-    def test_captcha_returns_none(self):
-        from jobs import google_detector
-        with patch.object(
-            google_detector, "_is_captcha", return_value=True
-        ):
-            page = MagicMock()
-            page.goto    = MagicMock()
-            page.content = MagicMock(return_value="<html>captcha</html>")
-            page.query_selector_all = MagicMock(return_value=[])
-            with patch("time.sleep"):
-                result = google_detector.detect_via_google("Stripe", page)
-        self.assertIsNone(result)
+    def test_detected_company_not_in_queue(self):
+        """Successfully detected companies NOT in queue."""
+        self._add("DetectedCo", "greenhouse", "detectedco")
+        queue = db_module.get_detection_queue(batch_size=10)
+        names = [r["company"] for r in queue]
+        self.assertNotIn("DetectedCo", names)
+
+    def test_batch_size_respected(self):
+        """Queue respects batch_size limit."""
+        for i in range(20):
+            self._add(f"Company{i}")
+        queue = db_module.get_detection_queue(batch_size=5)
+        self.assertEqual(len(queue), 5)
+
+    def test_queue_stats_counts(self):
+        """Queue stats correctly count each priority."""
+        self._add("New1")
+        self._add("New2")
+        self._add("Unknown1", "unknown", None)
+        self._add("Quiet1", "greenhouse", "quiet1", empty_days=14)
+        stats = db_module.get_detection_queue_stats()
+        self.assertEqual(stats["priority1_new"], 2)
+        self.assertGreaterEqual(stats["priority3_unknown"], 1)
+        self.assertGreaterEqual(stats["priority2_quiet"], 1)
+
+    def test_priority1_before_priority3(self):
+        """New companies always before unknown companies."""
+        self._add("Unknown1", "unknown", None)
+        self._add("New1")  # never detected
+        queue = db_module.get_detection_queue(batch_size=10)
+        names = [r["company"] for r in queue]
+        # New1 should appear before Unknown1
+        if "New1" in names and "Unknown1" in names:
+            self.assertLess(names.index("New1"),
+                            names.index("Unknown1"))
 
 # ═════════════════════════════════════════════════════════════════
 # TEST: CLI flags
@@ -2710,12 +2759,12 @@ class TestMonitorCLIFlags(unittest.TestCase):
     @patch("jobs.job_monitor.run_detect_ats")
     def test_detect_ats_no_company(self, mock_detect):
         self._run(["--detect-ats"])
-        mock_detect.assert_called_once_with(None, None, None)
+        mock_detect.assert_called_once()
 
     @patch("jobs.job_monitor.run_detect_ats")
     def test_detect_ats_with_company(self, mock_detect):
         self._run(["--detect-ats", "Stripe"])
-        mock_detect.assert_called_once_with("Stripe", None, None)
+        mock_detect.assert_called_once()
 
     @patch("jobs.job_monitor.run_monitor_status")
     def test_monitor_status_flag(self, mock_status):

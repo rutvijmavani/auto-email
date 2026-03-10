@@ -135,7 +135,18 @@ from db.prospective import (
 # ─────────────────────────────────────────
 # JOB MONITORING
 # ─────────────────────────────────────────
+
+
+from db.serper_quota import (
+    get_serper_credits,
+    increment_serper_credits,
+    has_serper_credits,
+    reset_low_credit_alert,
+)
+
 from db.job_monitor import (
+    get_detection_queue,
+    get_detection_queue_stats,
     job_url_exists,
     job_hash_exists,
     save_job_posting,

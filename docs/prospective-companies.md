@@ -9,6 +9,34 @@ CareerShift quota cost.
 
 ---
 
+## ATS Detection for Prospective Companies
+
+Each prospective company goes through a one-time 4-phase ATS detection:
+
+```text
+Phase 1: Sitemap  → Free, instant (Greenhouse/Lever/Ashby)
+Phase 2: API probe → Free, ~50ms (all platforms except Workday/Oracle)
+Phase 3a: HTML     → Free, ~100ms (requires domain column in prospects.txt)
+Phase 3b: Serper   → 2 credits (Workday + Oracle only)
+```
+
+Run detection:
+```bash
+# Detect next batch (10 companies)
+python pipeline.py --detect-ats --batch
+
+# Detect single company
+python pipeline.py --detect-ats "Stripe"
+
+# Manually set ATS
+python pipeline.py --detect-ats "Capital One" --override workday '{"slug":"capitalone","wd":"wd12","path":"Capital_One"}'
+
+# Check detection queue status
+python pipeline.py --monitor-status
+```
+
+---
+
 ## The Problem It Solves
 
 ### Heavy application days run out of quota
@@ -58,25 +86,31 @@ Result: heavy days covered without quota deficit
 ### Adding prospective companies
 
 ```bash
-# Bulk import from text file (one company per line)
+# Bulk import from text file
 python pipeline.py --import-prospects prospects.txt
+```
 
-# prospects.txt example:
-Google
-Meta
-Apple
-Microsoft
+**prospects.txt supports two formats:**
+
+```text
+# One column — company name only
 Stripe
-Netflix
-Uber
 Airbnb
-Spotify
-LinkedIn
 Figma
 Notion
-Vercel
-...
+
+# Two columns — company name + domain (recommended)
+# Domain enables Phase 3a HTML redirect scan for ATS detection
+Stripe,stripe.com
+Capital One,capitalone.com
+JPMorgan Chase,jpmorganchase.com
+Palo Alto Networks,paloaltonetworks.com
+Block,squareup.com
 ```
+
+Adding domains significantly improves ATS detection speed — the
+pipeline can scan career page redirects without spending Serper
+credits. Takes 30 minutes to add domains for 134 companies.
 
 ### Automatic scraping during --find-only
 

@@ -9,6 +9,9 @@ from db.db import (
     init_db,
     get_all_monitored_companies,
     get_monitorable_companies,
+    get_detection_queue,
+    get_detection_queue_stats,
+
     job_url_exists,
     job_hash_exists,
     save_job_posting,
@@ -20,8 +23,10 @@ from db.db import (
     get_pipeline_reliability,
 )
 from jobs.ats_detector import (
-    detect_ats, needs_redetection, override_ats, get_ats_module
+    detect_ats, needs_redetection, override_ats,
+    get_ats_module, QuotaExhaustedException
 )
+from db.serper_quota import get_serper_credits
 from jobs.job_filter import filter_jobs, is_fresh
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
@@ -111,6 +116,12 @@ def run():
                 except (json.JSONDecodeError, TypeError):
                     slug_info = {"slug": slug, "wd": "wd5", "path": "careers"}
                 raw_jobs = ats_module.fetch_jobs(slug_info, company)
+            elif platform == "oracle_hcm":
+                try:
+                    slug_info = json.loads(slug)
+                except (json.JSONDecodeError, TypeError):
+                    slug_info = {"slug": slug, "site": ""}
+                raw_jobs = ats_module.fetch_jobs(slug_info, company)
             else:
                 raw_jobs = ats_module.fetch_jobs(slug, company)
 
@@ -160,13 +171,20 @@ def run():
                 save_job_posting(job, status="pre_existing")
                 continue
 
+            # iCIMS Option C: fetch detail page for new jobs only
+            if platform == "icims" and job.get("_base_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception:
+                    pass  # detail fetch failed — save with what we have
+
             # Genuinely new job
             if save_job_posting(job, status="new"):
                 new_count += 1
 
         stats["new_jobs_found"] += new_count
-        print(f"   [OK] {len(raw_jobs)} fetched → "
-              f"{len(matched)} matched → {new_count} new")
+        print(f"   [OK] {len(raw_jobs)} fetched -> "
+              f"{len(matched)} matched -> {new_count} new")
 
         # Mark first scan complete
         if is_first_scan:
@@ -294,7 +312,7 @@ def _send_no_jobs_email():
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    subject = f"📋 Job Digest · {date_str} · No new jobs today"
+    subject = f"[Digest] Job Digest · {date_str} · No new jobs today"
     html = f"""
     <html><body style="font-family:sans-serif;padding:24px;">
       <h2>No New Jobs Today</h2>
@@ -318,7 +336,7 @@ def _send_text_fallback(postings):
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    subject  = f"📋 Job Digest · {date_str} · {len(postings)} new jobs (text)"
+    subject  = f"[Digest] Job Digest · {date_str} · {len(postings)} new jobs (text)"
     lines    = [f"<h2>Job Digest — {date_str}</h2>",
                 f"<p>{len(postings)} new jobs matching your profile:</p>",
                 "<ul>"]
@@ -342,125 +360,144 @@ def _send_text_fallback(postings):
 
 
 def run_detect_ats(company=None, override_platform=None,
-                   override_slug=None):
+                   override_slug=None, batch=False):
     """
-    Run ATS detection using Google search + API verification.
-    Launches Playwright browser for Google searches.
+    Run ATS detection using 4-phase approach.
+    No browser needed for most companies.
 
-    company:           specific company name (optional)
-    override_platform: manually set ATS platform (requires company)
-    override_slug:     manually set ATS slug (requires company)
+    Modes:
+      --detect-ats                    detect all pending
+      --detect-ats --batch            detect next batch
+      --detect-ats "Company"          detect single company
+      --detect-ats "Co" --override p s manually set ATS
     """
-    from outreach.report_templates.detection_report import build_detection_report
-    from playwright.sync_api import sync_playwright
-    from careershift.utils import human_delay
     from datetime import datetime
+    from outreach.report_templates.detection_report import build_detection_report
+    from config import DETECT_ATS_BATCH_SIZE
 
     init_db()
     companies = get_all_monitored_companies()
 
     if not companies:
-        print("[INFO] No companies found. "
-              "Run --import-prospects first.")
+        print("[INFO] No companies found. Run --import-prospects first.")
         return
 
     # ── Manual override ──
     if company and override_platform and override_slug:
-        from jobs.ats_detector import override_ats
         override_ats(company.strip(), override_platform, override_slug)
         return
 
     try:
-        date_str = datetime.now().strftime("%B %-d, %Y")
+        date_str = datetime.now().strftime("%B %d, %Y")
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    # ── Launch Playwright for Google search ──
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            slow_mo=100,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                # Randomize viewport to avoid bot detection
-            ]
-        )
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
+    # ── Single company detection ──
+    if company:
+        company_normalized = company.strip()
+        matches = [c for c in companies
+                   if c["company"] == company_normalized]
+        if not matches:
+            print(f"[ERROR] '{company}' not found.")
+            return
 
-        # ── Single company detection ──
-        if company:
-            company_normalized = company.strip()
-            matches = [c for c in companies
-                       if c["company"] == company_normalized]
-            if not matches:
-                print(f"[ERROR] '{company}' not found.")
-                browser.close()
-                return
-            result = detect_ats(company_normalized, page)
-            browser.close()
+        credits = get_serper_credits()
+        print(f"[INFO] Serper credits: "
+              f"{credits['credits_remaining']}/{credits['credits_limit']} "
+              f"remaining")
+
+        domain = matches[0].get("domain") if matches else None
+        try:
+            result = detect_ats(company_normalized, domain=domain)
             build_detection_report([result], date_str)
+        except QuotaExhaustedException:
+            print(f"[WARNING] Serper credits exhausted")
+        return
+
+    # ── Batch detection ──
+    if batch:
+        credits = get_serper_credits()
+        remaining = credits["credits_remaining"]
+
+        if remaining <= 0:
+            print(f"[WARNING] Serper credits exhausted. "
+                  f"Buy more at serper.dev")
+            _print_detection_queue_status()
             return
 
-        # ── Detect all unknown or stale companies ──
-        to_detect = [c for c in companies
-                     if needs_redetection(c, JOB_MONITOR_REDETECT_DAYS)]
-
+        to_detect = get_detection_queue(batch_size=DETECT_ATS_BATCH_SIZE)
         if not to_detect:
-            print("[OK] All companies have ATS detected.")
-            browser.close()
+            print("[OK] No companies pending detection.")
+            _print_detection_queue_status()
             return
 
-        print(f"[INFO] Detecting ATS for {len(to_detect)} companies "
-              f"via Google + API...\n")
+        print(f"[INFO] Detecting {len(to_detect)} companies "
+              f"(Serper credits: {remaining} remaining)...\n")
 
-        results  = []
-        total    = len(to_detect)
+        results = []
+        total   = len(to_detect)
 
         for i, company_row in enumerate(to_detect, 1):
-            comp = company_row["company"]
-            print(f"[{i}/{total}] {comp}")
+            comp   = company_row["company"]
+            domain = company_row.get("domain")
+            prio   = company_row.get("priority", "?")
+            print(f"[{i}/{total}] {comp} (priority {prio})")
 
-            result = detect_ats(comp, page)
+            try:
+                result = detect_ats(comp, domain=domain)
+                results.append(result)
+            except QuotaExhaustedException:
+                print(f"\n[WARNING] Serper credits exhausted after "
+                      f"{i-1} companies.")
+                break
+
+        credits = get_serper_credits()
+        print(f"\n[INFO] Batch complete.")
+        print(f"[INFO] Serper credits: "
+              f"{credits['credits_used']} used, "
+              f"{credits['credits_remaining']} remaining")
+        _print_detection_queue_status()
+
+        if results:
+            print(f"\n[INFO] Sending detection summary email...")
+            build_detection_report(results, date_str)
+        return
+
+    # ── Full detection (no --batch flag) ──
+    to_detect = [c for c in companies if needs_redetection(c)]
+
+    if not to_detect:
+        print("[OK] All companies have ATS detected.")
+        _print_detection_queue_status()
+        return
+
+    credits = get_serper_credits()
+    print(f"[INFO] Detecting {len(to_detect)} companies "
+          f"(Serper credits: {credits['credits_remaining']} remaining)...\n")
+
+    results = []
+    for i, company_row in enumerate(to_detect, 1):
+        comp   = company_row["company"]
+        domain = company_row.get("domain")
+        print(f"[{i}/{len(to_detect)}] {comp}")
+        try:
+            result = detect_ats(comp, domain=domain)
             results.append(result)
+        except QuotaExhaustedException:
+            print(f"\n[WARNING] Serper credits exhausted after "
+                  f"{i-1} companies.")
+            print(f"[INFO] Buy more credits at serper.dev then retry.")
+            break
 
-            # Restart browser every 50 companies
-            # prevents memory buildup + reduces CAPTCHA risk
-            if i % 50 == 0 and i < total:
-                print(f"\n[INFO] Restarting browser "
-                      f"(memory cleanup)...\n")
-                browser.close()
-                p_new = p.chromium.launch(
-                    headless=True, slow_mo=100,
-                    args=["--no-sandbox",
-                          "--disable-blink-features=AutomationControlled"]
-                )
-                context = p_new.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/121.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 800},
-                )
-                page    = context.new_page()
-                browser = p_new
+    credits = get_serper_credits()
+    print(f"\n[INFO] Detection complete.")
+    print(f"[INFO] Serper: {credits['credits_used']} used, "
+          f"{credits['credits_remaining']} remaining")
+    _print_detection_queue_status()
 
-            human_delay(1.0, 2.0)
-
-        browser.close()
-
-    # ── Send summary email ──
-    print(f"\n[INFO] Detection complete. Sending summary email...")
-    build_detection_report(results, date_str)
+    if results:
+        print(f"\n[INFO] Sending detection summary email...")
+        build_detection_report(results, date_str)
 
 
 def run_monitor_status():

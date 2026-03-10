@@ -180,10 +180,11 @@ def send_report_email(subject, html_body):
         return False
 
     try:
+        from email.header import Header
         msg = MIMEMultipart("alternative")
         msg["From"]    = EMAIL
         msg["To"]      = EMAIL  # send to yourself
-        msg["Subject"] = subject
+        msg["Subject"] = Header(subject, "utf-8")
         # utf-8 charset handles emoji in subject on all platforms
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 

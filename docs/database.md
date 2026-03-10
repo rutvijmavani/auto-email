@@ -82,19 +82,19 @@ Email sequences per recruiter+application pair. Each stage gets its own row, bui
 **Retention:** Auto-deleted based on status (see Retention Policies below).
 
 **Status lifecycle:**
-```
+```text
 pending → sent       (email delivered successfully)
 pending → failed     (send attempt failed)
 pending → cancelled  (recruiter marked inactive before sending)
 sent    → bounced    (hard bounce detected on delivery)
-```
+```text
 
 **Outreach sequence per recruiter+application:**
-```
+```text
 Day 0:  initial   scheduled → sent → followup1 scheduled
 Day 7:  followup1 scheduled → sent → followup2 scheduled
 Day 14: followup2 scheduled → sent → sequence complete
-```
+```text
 
 ---
 
@@ -192,9 +192,10 @@ Target companies to monitor for job postings and pre-scrape recruiters for. Popu
 |---|---|---|
 | `id` | INTEGER PK | Auto-incremented |
 | `company` | TEXT UNIQUE | Company name |
+| `domain` | TEXT | Company domain (e.g. `capitalone.com`) used for Phase 3a HTML redirect scan |
 | `priority` | INTEGER | Higher = scraped first (default 0) |
 | `status` | TEXT | `pending` / `scraped` / `converted` / `exhausted` |
-| `ats_platform` | TEXT | Detected ATS: `greenhouse` / `lever` / `ashby` / `smartrecruiters` / `workday` / `oracle_hcm` / `unknown` |
+| `ats_platform` | TEXT | Detected ATS: `greenhouse` / `lever` / `ashby` / `smartrecruiters` / `workday` / `oracle_hcm` / `custom` / `unknown` / `unsupported` |
 | `ats_slug` | TEXT | ATS slug or JSON (e.g. `{"slug":"capitalone","wd":"wd12","path":"Capital_One"}`) |
 | `ats_detected_at` | TIMESTAMP | When ATS was last detected |
 | `first_scanned_at` | TIMESTAMP | When first `--monitor-jobs` scan completed |
@@ -205,18 +206,21 @@ Target companies to monitor for job postings and pre-scrape recruiters for. Popu
 | `created_at` | TIMESTAMP | When added to DB |
 
 **Status lifecycle:**
-```
+```text
 pending   → scraped    (recruiters found via CareerShift)
 pending   → exhausted  (CareerShift found no recruiters)
 scraped   → converted  (--add command used for this company)
-```
+```text
 
-**ATS detection methods:**
-```
-google  → detected via Google site: search (most reliable)
-api     → detected via direct API buffer scan
-manual  → manually set via --override flag (never auto-changed)
-```
+**ATS detection phases:**
+```text
+Phase 1: slug probe → top 3 slug variants against ATS APIs (fast, free)
+Phase 2: api      → boards-api.greenhouse.io/v1/boards/{slug} (free)
+Phase 3a: html    → company.com/careers redirect scan (free)
+Phase 3b: serper  → Google search via Serper API (2 credits)
+manual   → --override flag (never auto-changed)
+custom   → KNOWN_CUSTOM_ATS list (Amazon/Apple/Google etc.)
+```text
 
 **Retention:** Permanent — never auto-deleted.
 
@@ -241,26 +245,26 @@ Job postings discovered by `--monitor-jobs`. Only new postings appear in daily P
 | `created_at` | TIMESTAMP | When inserted |
 
 **Status lifecycle:**
-```
+```text
 new          → expired     (auto: after 7 days, description cleared)
 new          → dismissed   (manual: user dismissed from digest)
 new          → applied     (auto: when added via --add)
 pre_existing → (stays)     (first scan — not shown in digest)
-```
+```text
 
 **Indexes:**
-```
+```text
 UNIQUE idx_job_postings_hash  ON content_hash (WHERE NOT NULL)
        idx_job_postings_status_seen ON (status, first_seen)
-```
+```text
 
 **Retention:**
-```
+```text
 new     → expired after 7 days (description cleared, URL kept forever)
 dismissed → deleted after 30 days
 applied   → deleted immediately (already in applications table)
 expired   → kept forever (prevents re-showing same jobs)
-```
+```text
 
 ---
 
@@ -286,10 +290,136 @@ Daily performance metrics for `--monitor-jobs` runs. Used to track pipeline heal
 **Retention:** Permanent — used for long-term reliability tracking.
 
 **Key metrics derived from this table:**
-```
+```text
 Coverage rate:     companies_with_results / companies_monitored
 Filter match rate: jobs_matched_filters / total_jobs_fetched
 Pipeline reliability: runs with pdf_generated=1 / total_runs (7 days)
+```text
+
+
+---
+
+### `serper_quota`
+Tracks total Serper API credit usage. One row (id=1), never deleted.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Always 1 (single row) |
+| `credits_used` | INTEGER | Total credits consumed so far |
+| `credits_limit` | INTEGER | Total credits (default 2500) |
+| `low_credit_alert_sent` | INTEGER | `0` = not sent, `1` = alert sent |
+| `last_updated` | TIMESTAMP | When last incremented |
+
+**Retention:** Permanent — single row, never deleted.
+
+**Alert behavior:** When `credits_used` causes remaining to drop below
+`SERPER_LOW_CREDIT_THRESHOLD` (50), a one-time email alert is sent and
+`low_credit_alert_sent` is set to 1. Reset via `reset_low_credit_alert()`
+after purchasing more credits.
+
+---
+
+## `ats_discovery.db` — ATS Slug Discovery Database
+
+Separate SQLite database at `data/ats_discovery.db`. Completely independent from `recruiter_pipeline.db`. Safe to delete and rebuild at any time by re-running `build_ats_slug_list.py`.
+
+---
+
+### `ats_companies`
+Master list of known ATS company slugs. Populated monthly via AWS Athena queries against the Common Crawl columnar index. Self-populates from successful pipeline detections.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `platform` | TEXT | ATS platform: `greenhouse` / `lever` / `ashby` / `workday` / `oracle_hcm` / `icims` |
+| `slug` | TEXT | Company slug or JSON (Workday/Oracle) e.g. `stripe` or `{"slug":"capitalone","wd":"wd12","path":"Capital_One"}` |
+| `company_name` | TEXT | Human-readable company name (from enrichment) |
+| `website` | TEXT | Company website (from enrichment) |
+| `job_count` | INTEGER | Open jobs at last enrichment |
+| `crawl_source` | TEXT | First crawl that found this slug e.g. `CC-MAIN-2026-08` |
+| `first_seen` | TIMESTAMP | When first inserted |
+| `last_verified` | TIMESTAMP | When ATS API was last called for this slug |
+| `last_seen_crawl` | TEXT | Most recent Common Crawl crawl containing this slug |
+| `is_active` | INTEGER | `1` = active, `0` = inactive (404 on verify) |
+| `is_enriched` | INTEGER | `0` = company_name not fetched yet, `1` = enriched |
+| `source` | TEXT | `crawl` / `detection` / `manual` / `backfill` |
+| `created_at` | TIMESTAMP | When row created |
+
+**UNIQUE constraint:** `(platform, slug)`
+
+**Source types:**
+- `crawl` — discovered via Athena/Common Crawl. Subject to sliding window cleanup.
+- `detection` — found by pipeline Phase 2/3 detection. Never auto-deleted.
+- `manual` — manually added. Never auto-deleted.
+- `backfill` — one-time historical import (e.g. Lever pre-2025-47). Never auto-deleted.
+
+**Freshness strategy:**
+- Monthly Athena query adds new slugs (INSERT OR IGNORE)
+- Sliding window cleanup: slugs not seen in last 3 crawls → archived then deleted (source=crawl only)
+- Before deletion: rows archived to `data/ats_archive.csv.gz`
+- Phase 2 API probe catches stale slugs on cache hit (404 → `delete_company()`)
+
+**Retention:** Sliding window for `source='crawl'`. Permanent for detection/manual/backfill.
+
+---
+
+### `scanned_crawls`
+Tracks which Common Crawl crawls have already been processed by Athena. Prevents re-querying the same crawl on repeat runs. Normal monthly run = 1 new crawl = 1 Athena query.
+
+| Column | Type | Description |
+|---|---|---|
+| `crawl_id` | TEXT PK | e.g. `CC-MAIN-2026-08` or `backfill-CC-MAIN-2025-43` |
+| `scanned_at` | TIMESTAMP | When Athena query ran |
+| `slugs_found` | INTEGER | Total slugs returned by query |
+| `slugs_new` | INTEGER | Net new slugs inserted into DB |
+| `query_type` | TEXT | `athena` / `backfill` |
+
+**Retention:** Permanent — used to avoid re-querying Athena.
+
+---
+
+## `ats_discovery.db` Storage Estimates
+
+```text
+Table             Rows        Size
+──────────────────────────────────────
+ats_companies     ~43,000     ~8 MB
+scanned_crawls    ~12/year    ~0.01 MB
+──────────────────────────────────────
+Total DB size     ~8 MB
+
+data/ats_archive.csv.gz   ~800 KB/year (historical slugs)
+data/athena_*.csv         ~10 MB (deleted after 2 days)
+data/bing_quota.json      ~0.1 KB
+data/collinfo_cache.json  ~5 KB (cached crawl list)
+data/cdx_page_counts.json ~10 KB (deprecated — Athena replaces CDX)
+```
+
+---
+
+## ATS Discovery Workflow
+
+```text
+Monthly (1st of month):
+  python build_ats_slug_list.py
+    → get_recent_crawls() → [CC-MAIN-2026-08, ...]
+    → get_unscanned_crawls() → [CC-MAIN-2026-08]  ← only new
+    → Athena query for new crawl (~$0.00024)
+    → CSV saved locally → S3 result deleted immediately
+    → slugs inserted into ats_companies
+    → crawl marked in scanned_crawls
+    → stale slugs archived → deleted from DB
+    → Bing queries for Lever + Oracle fallback
+
+  python enrich_ats_companies.py
+    → ATS API call per unenriched slug
+    → 200 → company_name, website, job_count saved
+    → 404 → delete_company() (row deleted permanently)
+
+Cost: ~$0.00024/month Athena + ~$0 S3 = ~$0.003/year
+
+Recovery (if script crashed mid-insert):
+  python build_ats_slug_list.py --from-csv data/athena_2026-03-09.csv
 ```
 
 
@@ -317,12 +447,13 @@ All retention values are configured in `config.py` and enforced at startup via `
 | `model_usage` | 21 days | `date < now - 21 days` |
 | `careershift_quota` | 30 days | `date < now - 30 days` |
 | `quota_alerts` | 30 days | `created_at < now - 30 days` |
+| `serper_quota` | Permanent | Single row, never deleted |
 
 ---
 
 ## Relationships
 
-```
+```text
 applications (1)
     ↓
 application_recruiters (many)
@@ -345,13 +476,13 @@ job_postings (many) ← --monitor-jobs
 monitor_stats (1 per day) ← --monitor-jobs
     → pipeline health metrics
     → 7-day reliability score
-```
+```text
 
 ---
 
 ## Storage Estimates
 
-```
+```text
 Table                  Rows (6 months)    Size
 ─────────────────────────────────────────────────
 applications           ~200               ~0.1 MB
@@ -372,4 +503,4 @@ Total DB size          ~27 MB (6 months)
 Well within SQLite comfort zone.
 Monthly VACUUM + ANALYZE keeps DB lean.
 See deployment.md for maintenance schedule.
-```
+```text

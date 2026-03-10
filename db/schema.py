@@ -268,6 +268,25 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS google_api_quota (
+            date           DATE PRIMARY KEY,
+            queries_used   INTEGER DEFAULT 0,
+            queries_limit  INTEGER DEFAULT 100,
+            last_updated   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS serper_quota (
+            id                    INTEGER PRIMARY KEY DEFAULT 1,
+            credits_used          INTEGER DEFAULT 0,
+            credits_limit         INTEGER DEFAULT 2500,
+            low_credit_alert_sent INTEGER DEFAULT 0,
+            last_updated          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Migration: add ATS detection columns to prospective_companies
     for col, definition in [
         ("ats_platform",          "TEXT DEFAULT 'unknown'"),
@@ -276,6 +295,7 @@ def init_db():
         ("first_scanned_at",      "TIMESTAMP"),
         ("last_checked_at",       "TIMESTAMP"),
         ("consecutive_empty_days","INTEGER DEFAULT 0"),
+        ("domain",                "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE prospective_companies "

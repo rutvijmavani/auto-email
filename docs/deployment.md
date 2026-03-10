@@ -184,6 +184,10 @@ pip install -r requirements.txt
 
 # Install Playwright browsers
 playwright install chromium
+
+# Verify AWS + Athena access
+python -c "import boto3; print('[OK] boto3')"
+python -c "import pyathena; print('[OK] pyathena')"
 ```
 
 ### Step 5 — Configure environment
@@ -196,8 +200,20 @@ GMAIL_EMAIL=your@gmail.com
 GMAIL_APP_PASSWORD=your-app-password
 GOOGLE_SHEET_ID=your-sheet-id
 GEMINI_API_KEY=your-api-key
+SERPER_API_KEY=your-serper-key       # serper.dev (2500 free credits)
 
-# Create data directory
+# AWS Athena (ATS discovery)
+AWS_ACCESS_KEY_ID=your-key
+AWS_SECRET_ACCESS_KEY=your-secret
+AWS_REGION=us-east-1
+ATHENA_DATABASE=ccindex
+ATHENA_TABLE=ccindex
+ATHENA_S3_OUTPUT=s3://your-bucket/athena-results/
+
+# Brave Search API (ATS discovery fallback)
+BRAVE_API_KEY=your-key               # api.search.brave.com (1000 free/month)
+
+# Create data directories
 mkdir -p /home/ubuntu/mail/data
 mkdir -p /home/ubuntu/mail/data/backups
 mkdir -p /home/ubuntu/mail/logs
@@ -387,9 +403,12 @@ OS + Ubuntu base:              ~3.0 GB
 Python packages + Chromium:    ~0.8 GB
 Project code:                  ~0.005 GB
 SQLite DB (6 months):          ~0.023 GB
+ats_discovery.db:              ~0.008 GB
+ats_archive.csv.gz:            ~0.001 GB
 DB backups (28 daily × 23 MB): ~0.644 GB
 PDF digests (30 day retention):~0.008 GB
 Log files (30 day retention):  ~0.010 GB
+Athena CSV (2 day retention):  ~0.010 GB
 ─────────────────────────────────────────
 Total used:                    ~4.5 GB
 Available:                     ~42.5 GB (90% free)
@@ -482,6 +501,12 @@ Nightly jobs chain with && operator:
 0 9 * * * cd /home/ubuntu/mail &&   source venv/bin/activate &&   python pipeline.py --outreach-only   >> logs/outreach_6--.log 2>&1
 
 # ─────────────────────────────────────────
+# ATS DISCOVERY — 1st of every month at 1 AM
+# build slug list → enrich company names
+# ─────────────────────────────────────────
+0 1 1 * * cd /home/ubuntu/mail && source venv/bin/activate && python build_ats_slug_list.py >> logs/ats_discovery_$(date +\%Y-\%m).log 2>&1 && python enrich_ats_companies.py >> logs/ats_discovery_$(date +\%Y-\%m).log 2>&1
+
+# ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 days (Oracle idle protection)
 # ─────────────────────────────────────────
 0 12 */4 * * python3 -c "import hashlib;   [hashlib.sha256(str(i).encode()).hexdigest()   for i in range(100000)]" >> /dev/null 2>&1
@@ -544,7 +569,7 @@ Import prospective companies? → --import-prospects prospects.txt
 Check prospective status?     → --prospects-status
 Monitor jobs + send digest?   → --monitor-jobs (automated 8 AM)
 View digest in terminal?      → --jobs-digest
-Detect ATS for all companies? → --detect-ats
+Detect ATS for all companies? → --detect-ats --batch  (10/run, uses 4-phase detection)
 ```
 
 ---
@@ -559,6 +584,10 @@ Detect ATS for all companies? → --detect-ats
 □ Verify DB backup files exist
 □ Check Oracle Console for any warnings
 □ Run DB maintenance (VACUUM + ANALYZE)
+□ Run MSCK REPAIR TABLE (auto — handled by build_ats_slug_list.py)
+□ Check Athena cost log: cat data/athena_costs.json
+□ Check Brave quota: cat data/brave_quota.json
+□ Check ATS discovery DB: python pipeline.py --monitor-status
 ```
 
 **DB maintenance cron (runs 3 AM on 1st of every month):**
@@ -707,7 +736,36 @@ Add to weekly checklist:
 
 ---
 
-## Backup & Recovery
+## First Deployment Checklist
+
+```
+□ 1. Oracle VM created + SSH access working
+□ 2. Dependencies installed (pip install -r requirements.txt)
+□ 3. .env file created with all credentials
+□ 4. AWS Athena table created (one-time, already done)
+□ 5. Boto3 + pyathena working (python -c "import boto3, pyathena")
+□ 6. prospects.txt uploaded with domains
+□ 7. Import prospects:
+     python pipeline.py --import-prospects prospects.txt
+□ 8. Bootstrap ATS discovery:
+     python build_ats_slug_list.py --backfill  (Lever one-time)
+     python build_ats_slug_list.py             (all platforms)
+     python enrich_ats_companies.py --test     (verify enrichment)
+     python enrich_ats_companies.py            (full enrichment)
+□ 9. Run ATS detection:
+     python pipeline.py --detect-ats --batch
+□ 10. First job monitoring run:
+      python pipeline.py --monitor-jobs
+□ 11. Verify digest email received
+□ 12. Set up all cron jobs (Step 7)
+□ 13. Verify cron running:
+      crontab -l
+      grep CRON /var/log/syslog | tail -20
+```
+
+---
+
+## ## Backup & Recovery
 
 ### What to backup
 ```

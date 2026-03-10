@@ -1,24 +1,54 @@
-# jobs/ats_detector.py — ATS detection via Google search
+# jobs/ats_detector.py — ATS detection orchestrator
 #
-# Philosophy: Google already knows the correct ATS URL for every company.
-# We search site-specific queries, extract and validate the URL, then store.
-# If Google finds nothing → store as "custom" (out of scope for now).
+# Detection flow (4 phases):
 #
-# Simple. Reliable. No API guessing. No slug combinations.
+#   Phase 1: Sitemap lookup (FREE, instant)
+#     boards.greenhouse.io/sitemap.xml
+#     jobs.lever.co/sitemap.xml
+#     jobs.ashbyhq.com/sitemap.xml
+#     → Covers ~60% of companies
+#
+#   Phase 2: ATS API name probe (FREE, ~50ms)
+#     boards-api.greenhouse.io/v1/boards/{slug}
+#     api.lever.co/v0/postings/{slug}
+#     jobs.ashbyhq.com/api/posting-api/job-board/{slug}
+#     api.smartrecruiters.com/v1/companies/{slug}
+#     → Covers additional ~15%
+#
+#   Phase 3a: HTML + redirect scan (FREE, ~100ms)
+#     GET company.com/careers allow_redirects=True
+#     → Covers additional ~10%
+#
+#   Phase 3b: Serper API (2500 free credits)
+#     "{company} site:myworkdayjobs.com"
+#     "{company} site:fa.oraclecloud.com"
+#     → Covers remaining ~10%
+#
+#   Phase 4: Unknown → store as unknown
+#     Amazon/Apple/Google/Meta (custom ATS)
+#     → ~5%
 
 import json
 import re
 from db.connection import get_conn
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
-from jobs.ats import oracle_hcm
+from jobs.ats import oracle_hcm, icims
 from config import (
     ATS_STATUS_DETECTED,
+    ATS_STATUS_UNSUPPORTED,
     ATS_STATUS_UNKNOWN,
     ATS_STATUS_MANUAL,
     ATS_KEYWORD_STOP_WORDS,
     ATS_DATE_RELIABILITY,
     JOB_MONITOR_REDETECT_DAYS,
+    KNOWN_CUSTOM_ATS,
 )
+
+
+class QuotaExhaustedException(Exception):
+    """Raised when Serper API credits are exhausted."""
+    pass
+
 
 # Platform registry — used by job_monitor for fetching jobs
 ATS_REGISTRY = {
@@ -28,9 +58,9 @@ ATS_REGISTRY = {
     "smartrecruiters": smartrecruiters,
     "workday":         workday,
     "oracle_hcm":      oracle_hcm,
+    "icims":           icims,
 }
 
-# Status for companies using custom/unsupported ATS
 ATS_STATUS_CUSTOM = "custom"
 
 
@@ -45,9 +75,9 @@ def _get_keywords(company):
     "JPMorgan Chase"  -> ["jpmorgan", "chase"]
     "AT&T"            -> ["at"]
     """
-    name   = company.lower().strip()
-    name   = re.sub(r"[^a-z0-9\s]", " ", name)
-    tokens = name.split()
+    name     = company.lower().strip()
+    name     = re.sub(r"[^a-z0-9\s]", " ", name)
+    tokens   = name.split()
     keywords = [
         t for t in tokens
         if t not in ATS_KEYWORD_STOP_WORDS and len(t) >= 2
@@ -59,72 +89,151 @@ def _get_keywords(company):
 # MAIN DETECTION
 # ─────────────────────────────────────────
 
-def detect_ats(company, page):
+def detect_ats(company, domain=None, page=None, sb=None):
     """
-    Detect ATS for a company via Google search.
+    Detect ATS for a company using 4-phase approach.
 
     Args:
-        company: company name string
-        page:    Playwright page object (required)
+        company: company name (e.g. "Capital One")
+        domain:  company domain for Phase 3a (e.g. "capitalone.com")
+        page:    unused (kept for backward compatibility)
+        sb:      unused (kept for backward compatibility)
 
     Returns dict:
     {
-      company, status, platform, slug
+        company, status, platform, slug,
+        ats_platform, ats_slug  (legacy keys)
     }
-
-    status values:
-      "detected" — found via Google ✓
-      "custom"   — not found, uses custom ATS (out of scope)
     """
     print(f"   [INFO] Detecting ATS for {company}...")
 
-    from jobs.google_detector import detect_via_google
-    result = detect_via_google(company, page)
-
+    # Phase 1: Sitemap lookup
+    print(f"   [P1] Sitemap lookup...")
+    from jobs.ats_sitemap import detect_via_sitemap
+    result = detect_via_sitemap(company)
     if result:
-        platform = result["platform"]
-        slug     = result["slug"]
-        _store_detection(company, platform, slug)
+        print(f"   [P1 HIT] {company} -> "
+              f"{result['platform']} / {result['slug']}")
+        return _store_and_return(company, result)
 
-        print(
-            f"   [OK] {company} -> {platform} "
-            f"(slug: {slug})"
-        )
+    # Phase 2: ATS API name probe
+    print(f"   [P2] API name probe...")
+    from jobs.ats_verifier import detect_via_api
+    result = detect_via_api(company)
+    if result:
+        print(f"   [P2 HIT] {company} -> "
+              f"{result['platform']} / {result['slug']}")
+        return _store_and_return(company, result)
+
+    # Phase 3a: HTML + redirect scan
+    if domain:
+        print(f"   [P3a] HTML redirect scan ({domain})...")
+        from jobs.career_page import detect_via_career_page
+        result = detect_via_career_page(company, domain)
+        if result:
+            print(f"   [P3a HIT] {company} -> "
+                  f"{result['platform']} / {result['slug']}")
+            return _store_and_return(company, result)
+
+    # Phase 3b: Serper API (Workday + Oracle only)
+    # Skip for companies known to use fully custom ATS
+    if company in KNOWN_CUSTOM_ATS:
+        print(f"   [CUSTOM] {company} uses custom ATS — skipping Serper")
+        _store_detection(company, ATS_STATUS_CUSTOM, None)
         return {
-            "company":  company,
-            "status":   ATS_STATUS_DETECTED,
-            "platform": platform,
-            "slug":     slug,
+            "company":      company,
+            "status":       ATS_STATUS_CUSTOM,
+            "platform":     ATS_STATUS_CUSTOM,
+            "slug":         None,
+            "ats_platform": ATS_STATUS_CUSTOM,
+            "ats_slug":     None,
         }
 
-    # Not found on any supported ATS
-    _store_detection(company, ATS_STATUS_CUSTOM, None)
-    print(f"   [CUSTOM] {company} — not found on supported ATS platforms")
+    print(f"   [P3b] Serper API search...")
+    from jobs.serper import detect_via_serper, SERPER_EXHAUSTED
+    serper_result = detect_via_serper(company)
+
+    if serper_result is SERPER_EXHAUSTED:
+        print(f"   [WARNING] Serper credits exhausted — "
+              f"storing as unknown, retry when credits available")
+        raise QuotaExhaustedException("Serper credits exhausted")
+
+    if serper_result:
+        print(f"   [P3b HIT] {company} -> "
+              f"{serper_result['platform']} / {serper_result['slug']}")
+        return _store_and_return(company, serper_result)
+
+    # Phase 4: Unknown
+    print(f"   [UNKNOWN] {company} — no ATS found in any phase")
+    _store_detection(company, ATS_STATUS_UNKNOWN, None)
 
     return {
-        "company":  company,
-        "status":   ATS_STATUS_CUSTOM,
-        "platform": ATS_STATUS_CUSTOM,
-        "slug":     None,
+        "company":      company,
+        "status":       ATS_STATUS_UNKNOWN,
+        "platform":     ATS_STATUS_UNKNOWN,
+        "slug":         None,
+        "ats_platform": ATS_STATUS_UNKNOWN,
+        "ats_slug":     None,
+    }
+
+
+def _store_and_return(company, result):
+    """
+    Store detection result in:
+    1. prospective_companies table (main pipeline DB)
+    2. ats_discovery.db (self-populating reference data)
+    """
+    platform = result["platform"]
+    slug     = result["slug"]
+
+    if platform in ATS_REGISTRY:
+        status = ATS_STATUS_DETECTED
+        label  = "[OK]"
+    else:
+        status = ATS_STATUS_UNSUPPORTED
+        label  = "[UNSUPPORTED]"
+        print(f"   [INFO] {company} uses {platform} "
+              f"(not yet supported — stored for future use)")
+
+    # Store in main pipeline DB
+    _store_detection(company, platform, slug)
+
+    # Self-populate ats_discovery.db
+    # This makes future Phase 1 lookups instant
+    try:
+        from db.ats_companies import mark_from_detection
+        from db.schema_discovery import init_discovery_db
+        init_discovery_db()
+        mark_from_detection(
+            platform=platform,
+            slug=slug,
+            company_name=company,
+        )
+    except Exception:
+        pass  # DB self-population is best-effort, never blocks detection
+
+    print(f"   {label} {company} -> {platform} (slug: {slug})")
+
+    return {
+        "company":      company,
+        "status":       status,
+        "platform":     platform,
+        "slug":         slug,
+        "ats_platform": platform,
+        "ats_slug":     slug,
     }
 
 
 # ─────────────────────────────────────────
-# SCORING (used by API verification layer)
+# SCORING (kept for legacy API buffer tests)
 # ─────────────────────────────────────────
 
 def _score_response(jobs, company):
-    """
-    Score how well an API response matches the expected company.
-    Used by API verification after Google detection.
-
-    Formula: confidence% x log10(job_count + 1)
-    """
+    """Score API response confidence. Used by legacy tests."""
     import math
     from config import ATS_SAMPLE_SIZE
 
     job_count = len(jobs)
-
     if job_count == 0:
         return {"confidence": 40, "job_count": 0, "final_score": 0}
 
@@ -157,10 +266,6 @@ def _score_response(jobs, company):
     }
 
 
-# ─────────────────────────────────────────
-# CLASSIFY / TIE-BREAK (kept for API fallback)
-# ─────────────────────────────────────────
-
 def _tie_break(candidates):
     """Tie-break by date reliability."""
     def rank(e):
@@ -172,7 +277,7 @@ def _tie_break(candidates):
 
 
 def _classify(buffer):
-    """Classify buffer entries into detected/close_call/unknown."""
+    """Classify buffer entries. Kept for legacy tests."""
     from config import (
         ATS_MIN_CONFIDENCE, ATS_DETECTION_THRESHOLD,
         ATS_CLOSE_CALL_GAP, ATS_STATUS_CLOSE_CALL,
@@ -209,20 +314,22 @@ def _classify(buffer):
     winner    = viable_sorted[0]
     runner_up = viable_sorted[1] if len(viable_sorted) > 1 else None
 
-    if winner["job_count"] > 0 and        winner["final_score"] < ATS_DETECTION_THRESHOLD:
+    if (winner["job_count"] > 0 and
+            winner["final_score"] < ATS_DETECTION_THRESHOLD):
         best = max(buffer, key=lambda x: x["final_score"])
         return {
             "status": ATS_STATUS_UNKNOWN,
             "winner": None, "runner_up": None, "best_attempt": best,
         }
 
-    if runner_up and runner_up["final_score"] > 0        and winner["final_score"] > 0:
+    if (runner_up and runner_up["final_score"] > 0
+            and winner["final_score"] > 0):
         gap_pct = (
             (winner["final_score"] - runner_up["final_score"])
             / winner["final_score"]
         ) * 100
         if gap_pct <= ATS_CLOSE_CALL_GAP:
-            winner    = _tie_break([winner, runner_up])
+            winner = _tie_break([winner, runner_up])
             runner_up = next(
                 (e for e in viable_sorted if e != winner), None
             )
@@ -246,10 +353,7 @@ def _classify(buffer):
 # ─────────────────────────────────────────
 
 def _store_detection(company, platform, slug):
-    """
-    Store ATS detection result.
-    Resets consecutive_empty_days to 0 after any detection attempt.
-    """
+    """Store ATS detection result. Resets consecutive_empty_days."""
     conn = get_conn()
     try:
         conn.execute("""
@@ -268,9 +372,19 @@ def _store_detection(company, platform, slug):
 def override_ats(company, platform, slug):
     """
     Manually override ATS detection.
-    Called by --detect-ats "Company" --override platform slug.
     Manual overrides are never auto-re-detected.
     """
+    import json as _json
+    try:
+        slug_data = _json.loads(slug) if slug and slug.startswith("{") else {}
+        slug_data["_manual"]   = True
+        slug_data["_platform"] = platform
+        if not slug_data.get("slug"):
+            slug_data["slug"] = slug
+        slug_str = _json.dumps(slug_data)
+    except Exception:
+        slug_str = slug
+
     conn = get_conn()
     try:
         conn.execute("""
@@ -280,10 +394,10 @@ def override_ats(company, platform, slug):
                 ats_detected_at        = CURRENT_TIMESTAMP,
                 consecutive_empty_days = 0
             WHERE company = ?
-        """, (platform, slug, company))
+        """, (platform, slug_str, company))
         conn.commit()
         print(f"[OK] {company} -> manually set to {platform} "
-              f"(slug: {slug})")
+              f"(slug: {slug_str})")
     finally:
         conn.close()
 
@@ -292,14 +406,15 @@ def needs_redetection(company_row, redetect_days=14):
     """
     Check if company needs ATS re-detection.
 
-    Triggers:
-      1. ats_platform unknown/None/custom
-      2. ats_slug None/empty (unless custom)
-      3. ats_detected_at is None (never detected)
-      4. consecutive_empty_days >= redetect_days
-
     Never re-detects:
-      → ats_platform = "manual" (user override)
+      → platform = "manual" (user override)
+      → _manual flag in slug JSON
+      → platform = "unsupported" (we know the ATS)
+
+    Always re-detects:
+      → platform is None/unknown/custom
+      → ats_detected_at is None
+      → consecutive_empty_days >= redetect_days
     """
     platform    = company_row.get("ats_platform", ATS_STATUS_UNKNOWN)
     slug        = company_row.get("ats_slug")
@@ -309,15 +424,30 @@ def needs_redetection(company_row, redetect_days=14):
     # Manual overrides never re-detected
     if platform == ATS_STATUS_MANUAL:
         return False
-    # Custom ATS — retry after threshold (might have switched)
-    if not platform or platform in (ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM):
+    if slug:
+        try:
+            import json as _json
+            slug_data = _json.loads(slug)
+            if slug_data.get("_manual"):
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    # Unsupported but detected — never re-detect
+    if platform == ATS_STATUS_UNSUPPORTED:
+        return False
+
+    # Unknown or custom — always retry
+    if not platform or platform in (ATS_STATUS_UNKNOWN, "custom"):
         return True
+
     if not slug:
         return True
     if detected_at is None:
         return True
     if empty_days >= redetect_days:
         return True
+
     return False
 
 

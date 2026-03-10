@@ -23,9 +23,11 @@ Bulk imports a list of target companies to pre-scrape during quiet quota periods
 Recruiters found in advance so outreach begins immediately when you apply.
 
 **`--monitor-jobs`** — Job Monitoring
-Queries public ATS APIs (Greenhouse, Lever, Ashby, SmartRecruiters) and scrapes
-Workday/custom career pages to find newly posted jobs matching your profile.
-Sends a daily digest email with ranked results so you know exactly what to apply to.
+Queries public ATS APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday,
+Oracle HCM) to find newly posted jobs matching your profile. Uses a 4-phase
+ATS detection system (DB lookup → API probe → HTML redirect → Serper) to identify
+which platform each company uses. Slug database built monthly via AWS Athena
+queries against Common Crawl index (ats_discovery.db). Sends a daily digest email with ranked results.
 
 **`--verify-only`** — Recruiter Freshness Check
 Keeps recruiter data up to date independent of job search activity.
@@ -113,6 +115,12 @@ Email sent to recruiter
 | `jobs/job_fetcher.py` | Fetch and cache job descriptions |
 | `jobs/job_scraper.py` | Scrape JD from various ATS portals |
 | `jobs/form_sync.py` | Pull Google Form responses into DB |
+| `jobs/ats_sitemap.py` | Phase 1: ats_discovery.db lookup (Athena-built slug DB) |
+| `jobs/ats_verifier.py` | Phase 2: ATS API name probe + verification |
+| `jobs/career_page.py` | Phase 3a: HTML redirect + fingerprint scan |
+| `jobs/serper.py` | Phase 3b: Serper API for Workday + Oracle |
+| `jobs/ats_detector.py` | ATS detection orchestrator (4 phases) |
+| `jobs/job_monitor.py` | Daily job monitoring + digest email |
 | `db/db.py` | Single source of truth — all database operations |
 | `db/quota_manager.py` | Thin wrapper for Gemini quota functions |
 | `db/job_cache.py` | Thin wrapper for job cache functions |

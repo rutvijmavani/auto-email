@@ -132,6 +132,39 @@ SEND_INTERVAL_DAYS = 14 →  RETENTION_AI_CACHE >= 42
 
 ---
 
+## Serper API Settings (ATS Detection)
+
+```python
+SERPER_API_KEY               = os.getenv("SERPER_API_KEY", "")
+SERPER_API_URL               = "https://google.serper.dev/search"
+SERPER_TOTAL_LIMIT           = 2500   # free credits on signup
+SERPER_LOW_CREDIT_THRESHOLD  = 50     # email alert when below this
+```
+
+Used only for Phase 3b of ATS detection — searching for Workday and
+Oracle HCM tenants when all other phases fail.
+
+**Setup:**
+1. Sign up at [serper.dev](https://serper.dev) (2500 free credits)
+2. Copy your API key from the dashboard
+3. Add to `.env`:
+   ```
+   SERPER_API_KEY=your_key_here
+   ```
+
+**Credit usage:**
+- 2 queries per company (Workday + Oracle)
+- Most companies detected in Phase 1-3a (free) — Serper rarely needed
+- Email alert sent when fewer than 50 credits remain
+- 2500 free credits covers ~1250 companies at 2 queries each
+
+**Companies that skip Serper entirely:**
+Amazon, Apple, Google, Meta, Microsoft, Netflix, Uber, Lyft, X/Twitter.
+These use fully custom ATS platforms and will never appear on
+Workday/Oracle — stored as `custom` immediately.
+
+---
+
 ## Google Sheets Integration
 
 ```python
@@ -196,6 +229,22 @@ RETENTION_JOB_CACHE            = 21
 RETENTION_MODEL_USAGE          = 21
 RETENTION_CAREERSHIFT_QUOTA    = 30
 RETENTION_QUOTA_ALERTS         = 30
+
+# ─────────────────────────────────────────
+# SERPER API (ATS Detection — Phase 3b)
+# ─────────────────────────────────────────
+SERPER_API_KEY              = os.getenv("SERPER_API_KEY", "")
+SERPER_API_URL              = "https://google.serper.dev/search"
+SERPER_TOTAL_LIMIT          = 2500
+SERPER_LOW_CREDIT_THRESHOLD = 50
+
+# ─────────────────────────────────────────
+# KNOWN CUSTOM ATS COMPANIES
+# ─────────────────────────────────────────
+KNOWN_CUSTOM_ATS = {
+    "Amazon", "Apple", "Google", "Meta",
+    "Microsoft", "Netflix", "Uber", "Lyft", "X", "Twitter",
+}
 
 # ─────────────────────────────────────────
 # GOOGLE SHEETS INTEGRATION

@@ -43,6 +43,31 @@ RETENTION_CAREERSHIFT_QUOTA    = 30
 RETENTION_QUOTA_ALERTS         = 30
 
 # ─────────────────────────────────────────
+# Companies known to use fully custom ATS — skip Serper entirely
+# These will never appear on Workday/Oracle/Greenhouse/Lever/Ashby
+KNOWN_CUSTOM_ATS = {
+    "Amazon",           # jobs.amazon.com
+    "Apple",            # jobs.apple.com
+    "Google",           # careers.google.com
+    "Meta",             # metacareers.com
+    "Microsoft",        # careers.microsoft.com
+    "Netflix",          # jobs.netflix.com (custom)
+    "Uber",             # uber.com/careers (custom)
+    "Lyft",             # lyft.com/careers (custom)
+    "Twitter",          # careers.twitter.com
+    "X",                # same as Twitter
+}
+
+# SERPER.DEV SEARCH API (used for Workday + Oracle detection only)
+SERPER_API_KEY        = os.getenv("SERPER_API_KEY", "")
+SERPER_API_URL        = "https://google.serper.dev/search"
+SERPER_TOTAL_LIMIT    = 2500  # total free credits on signup
+SERPER_LOW_CREDIT_THRESHOLD = 50  # send email alert when below this
+DETECT_ATS_BATCH_SIZE = 10    # companies per --detect-ats --batch run
+
+# GOOGLE CUSTOM SEARCH ENGINE (PSE) — kept for CX reference
+GOOGLE_CX             = os.getenv("GOOGLE_CX", "")
+
 # GOOGLE SHEETS INTEGRATION
 # ─────────────────────────────────────────
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
@@ -143,14 +168,15 @@ ATS_DATE_RELIABILITY = [
 ]
 
 # ATS platforms that require Google detection (can't be slug-guessed)
-ATS_GOOGLE_ONLY = ["oracle_hcm", "icims", "successfactors"]
+ATS_GOOGLE_ONLY = ["oracle_hcm", "successfactors"]  # icims now supported
 
 # ATS detection status values
-ATS_STATUS_DETECTED       = "detected"   # found via Google ✓
-ATS_STATUS_CLOSE_CALL     = "close_call" # API buffer close call (legacy)
-ATS_STATUS_UNKNOWN        = "unknown"    # not found, needs manual review
-ATS_STATUS_CUSTOM         = "custom"     # uses custom ATS (out of scope)
-ATS_STATUS_MANUAL         = "manual"     # manually overridden, never re-detected
+ATS_STATUS_DETECTED       = "detected"     # found via Google, supported ✓
+ATS_STATUS_UNSUPPORTED    = "unsupported"  # found via Google, not yet supported
+ATS_STATUS_CLOSE_CALL     = "close_call"   # API buffer close call (legacy)
+ATS_STATUS_UNKNOWN        = "unknown"      # not found anywhere
+ATS_STATUS_CUSTOM         = "custom"       # uses fully custom ATS (no standard URL)
+ATS_STATUS_MANUAL         = "manual"       # manually overridden, never re-detected
 
 # Stop words excluded from company keyword extraction
 ATS_KEYWORD_STOP_WORDS = {
