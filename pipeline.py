@@ -308,11 +308,19 @@ def _generate_ai_content_for_all():
 def run_import_prospects(filepath="prospects.txt"):
     """
     Bulk import prospective companies from a text file.
-    One company name per line. Lines starting with # and blank lines ignored.
+
+    Formats supported:
+      One column:   "Stripe"
+      Two columns:  "Stripe,stripe.com"
+
+    Lines starting with # and blank lines ignored.
+    Domain column used for Phase 3a HTML redirect scan.
     """
     if not os.path.exists(filepath):
         print(f"[ERROR] File not found: {filepath}")
-        print(f"[INFO] Create a prospects.txt file with one company name per line.")
+        print(f"[INFO] Format: one company per line, optional domain:")
+        print(f"[INFO]   Stripe")
+        print(f"[INFO]   Capital One,capitalone.com")
         return
 
     print(f"\n[INFO] Importing prospective companies from {filepath}...")
@@ -321,17 +329,27 @@ def run_import_prospects(filepath="prospects.txt"):
     skipped = 0
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
-            company = line.strip()
-            if not company or company.startswith("#"):
+            line = line.strip()
+            if not line or line.startswith("#"):
                 continue
-            if add_prospective_company(company):
-                print(f"  [+] {company}")
+
+            # Support "Company,domain.com" format
+            parts  = line.split(",", 1)
+            company = parts[0].strip()
+            domain  = parts[1].strip() if len(parts) > 1 else None
+
+            if not company:
+                continue
+
+            if add_prospective_company(company, domain=domain):
+                domain_str = f" ({domain})" if domain else ""
+                print(f"  [+] {company}{domain_str}")
                 added += 1
             else:
-                skipped += 1
+                skipped += 1  # already exists, domain backfilled by add_prospective_company
 
     print(f"\n[OK] Import complete — Added: {added} | Already existed: {skipped}")
-    print(f"[INFO] Run --find-only to start pre-scraping during leftover quota.")
+    print(f"[INFO] Run --detect-ats --batch to start ATS detection.")
 
 
 def run_prospects_status():
@@ -630,14 +648,21 @@ def main():
     if "--detect-ats" in args:
         from jobs.job_monitor import run_detect_ats
         # Usage:
-        #   --detect-ats                          (all companies)
-        #   --detect-ats "Stripe"                 (single company)
+        #   --detect-ats                              (all pending)
+        #   --detect-ats --batch                      (next batch, respects quota)
+        #   --detect-ats "Stripe"                     (single company)
         #   --detect-ats "Capital One" --override workday capitalone
-        non_flag_args = [a for a in args if not a.startswith("--")]
+        non_flag_args     = [a for a in args if not a.startswith("--")]
         company           = non_flag_args[0] if len(non_flag_args) > 0 else None
         override_platform = non_flag_args[1] if len(non_flag_args) > 1 else None
         override_slug     = non_flag_args[2] if len(non_flag_args) > 2 else None
-        run_detect_ats(company, override_platform, override_slug)
+        batch             = "--batch" in args
+        run_detect_ats(
+            company=company,
+            override_platform=override_platform,
+            override_slug=override_slug,
+            batch=batch,
+        )
         return
 
     if "--monitor-status" in args:

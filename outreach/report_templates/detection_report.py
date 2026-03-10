@@ -8,7 +8,10 @@ from outreach.report_templates.base import (
     table_row, table_header_row, alert_box, info_box,
     send_report_email,
 )
-from config import ATS_STATUS_CLOSE_CALL, ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM
+from config import (
+    ATS_STATUS_CLOSE_CALL, ATS_STATUS_UNKNOWN,
+    ATS_STATUS_CUSTOM, ATS_STATUS_UNSUPPORTED
+)
 
 
 def build_detection_report(results, date_str):
@@ -22,17 +25,20 @@ def build_detection_report(results, date_str):
     Only sends email if there are close calls or unknowns.
     Silently skips if everything was cleanly detected.
     """
-    close_calls = [r for r in results if r["status"] == ATS_STATUS_CLOSE_CALL]
-    unknowns    = [r for r in results
-                   if r["status"] in (ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM)]
-    detected    = [r for r in results
-                   if r["status"] not in (ATS_STATUS_CLOSE_CALL,
-                                          ATS_STATUS_UNKNOWN,
-                                          ATS_STATUS_CUSTOM)]
+    close_calls  = [r for r in results if r["status"] == ATS_STATUS_CLOSE_CALL]
+    unknowns     = [r for r in results
+                    if r["status"] in (ATS_STATUS_UNKNOWN, ATS_STATUS_CUSTOM)]
+    unsupported  = [r for r in results if r["status"] == ATS_STATUS_UNSUPPORTED]
+    detected     = [r for r in results
+                    if r["status"] not in (ATS_STATUS_CLOSE_CALL,
+                                           ATS_STATUS_UNKNOWN,
+                                           ATS_STATUS_CUSTOM,
+                                           ATS_STATUS_UNSUPPORTED)]
 
     # Only send email if there's something to review
-    if not close_calls and not unknowns:
-        print(f"[OK] All {len(detected)} companies detected with high confidence — no email needed.")
+    if not close_calls and not unknowns and not unsupported:
+        print(f"[OK] All {len(detected)} companies detected with "
+              f"high confidence — no email needed.")
         return False
 
     # ── Subject ──
@@ -42,7 +48,7 @@ def build_detection_report(results, date_str):
     if unknowns:
         parts.append(f"❌ {len(unknowns)} unknown")
 
-    subject = f"🔍 ATS Detection Complete · {date_str} · {' | '.join(parts)}"
+    subject = f"[ATS] Detection Complete · {date_str} · {' | '.join(parts)}"
 
     # ── Summary stat cards ──
     summary_html = f"""
@@ -72,10 +78,20 @@ def build_detection_report(results, date_str):
         <td style="padding:12px;background:{COLORS['bg']};border-radius:8px;
                    border:1px solid {COLORS['border']};text-align:center;">
           <div style="font-size:28px;font-weight:800;
+                      color:#f59e0b;">{len(unsupported)}</div>
+          <div style="font-size:11px;color:{COLORS['subtext']};
+                      text-transform:uppercase;letter-spacing:0.5px;">
+            Unsupported ATS
+          </div>
+        </td>
+        <td style="width:12px;"></td>
+        <td style="padding:12px;background:{COLORS['bg']};border-radius:8px;
+                   border:1px solid {COLORS['border']};text-align:center;">
+          <div style="font-size:28px;font-weight:800;
                       color:{COLORS['danger']};">{len(unknowns)}</div>
           <div style="font-size:11px;color:{COLORS['subtext']};
                       text-transform:uppercase;letter-spacing:0.5px;">
-            Needs Review
+            Unknown
           </div>
         </td>
       </tr>
@@ -171,6 +187,48 @@ def build_detection_report(results, date_str):
           {rows}
         </table>"""
 
+    # ── Unsupported ATS section ──
+    unsupported_html = ""
+    if unsupported:
+        rows = ""
+        for i, r in enumerate(unsupported):
+            company  = html_lib.escape(r["company"])
+            platform = html_lib.escape(r["platform"] or "")
+            slug     = html_lib.escape(r["slug"] or "")
+            bg       = COLORS["row_alt"] if i % 2 else COLORS["card"]
+            rows += f"""
+            <tr style="background:{bg};">
+              <td style="padding:10px 12px;font-size:13px;font-weight:600;
+                         color:{COLORS['text']};
+                         border-bottom:1px solid {COLORS['border']};">
+                {company}
+              </td>
+              <td style="padding:10px 12px;font-size:12px;
+                         color:{COLORS['text']};
+                         border-bottom:1px solid {COLORS['border']};">
+                {platform}
+              </td>
+              <td style="padding:10px 12px;font-size:12px;
+                         color:{COLORS['subtext']};font-family:monospace;
+                         border-bottom:1px solid {COLORS['border']};">
+                {slug}
+              </td>
+            </tr>"""
+
+        unsupported_html = f"""
+        {section_header("Unsupported ATS — Detected but Not Yet Integrated")}
+        {info_box(
+            f"<strong>{len(unsupported)} company/companies</strong> use an ATS "
+            f"that was detected via Google but doesn't have a fetch module yet. "
+            f"These are stored in DB for future integration."
+        )}
+        <table width="100%" cellpadding="0" cellspacing="0" border="0"
+               style="border-radius:8px;overflow:hidden;
+                      border:1px solid {COLORS['border']};">
+          {table_header_row(["Company", "ATS Platform", "Slug"])}
+          {rows}
+        </table>"""
+
     # ── Unknowns section ──
     unknowns_html = ""
     if unknowns:
@@ -235,6 +293,7 @@ def build_detection_report(results, date_str):
     body = f"""
     {summary_html}
     {close_calls_html}
+    {unsupported_html}
     {unknowns_html}
     {info_box(
         "To override a detection: "

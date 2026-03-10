@@ -1,0 +1,213 @@
+PS C:\Downloads\mail> python build_ats_slug_list.py --test
+ATS Slug List Builder — Common Crawl CDX API
+==================================================
+Time: 2026-03-08 07:30:04
+[INFO] Sliding window: ['CC-MAIN-2026-08', 'CC-MAIN-2026-04', 'CC-MAIN-2025-51']
+Sliding window: last 3 crawls
+[TEST MODE] Only fetching first page per platform
+
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: GREENHOUSE
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['boards.greenhouse.io/*', 'job-boards.greenhouse.io/*']
+
+  Pattern: boards.greenhouse.io/*
+    CC-MAIN-2026-08: 500 URLs → 95 slugs (+95 new)
+    CC-MAIN-2026-04: 500 URLs → 57 slugs (+24 new)
+    CC-MAIN-2025-51: 500 URLs → 87 slugs (+32 new)
+  Subtotal: 151 slugs from pattern
+
+  Pattern: job-boards.greenhouse.io/*
+    CC-MAIN-2026-08: 500 URLs → 43 slugs (+43 new)
+    CC-MAIN-2026-04: 500 URLs → 46 slugs (+15 new)
+    CC-MAIN-2025-51: 500 URLs → 48 slugs (+15 new)
+  Subtotal: 73 slugs from pattern
+
+[DONE] greenhouse: 187 unique slugs across all crawls
+
+[MERGE] greenhouse:
+  Existing: 0
+  New:      187
+  Added:    187
+  Total:    187
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: greenhouse (187 slugs, 187 new)
+
+Sample greenhouse slugs:
+  0x
+  1047games
+  10alabs
+  10beauty
+  10up
+  10xgenomics
+  12twenty
+  143studiosinc
+  1456754456yhgbhfg
+  1800contacts
+  1848ventures
+  1906newhighs
+  1910genetics
+  1stdibscom
+  1uphealth
+  ... and 172 more
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: LEVER
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['jobs.lever.co/*']
+
+  Pattern: jobs.lever.co/*
+    CC-MAIN-2026-08: 81 URLs → 0 slugs (+0 new)
+    CC-MAIN-2026-04: 89 URLs → 0 slugs (+0 new)
+    CC-MAIN-2025-51: 82 URLs → 0 slugs (+0 new)
+  Subtotal: 0 slugs from pattern
+
+[DONE] lever: 0 unique slugs across all crawls
+
+[MERGE] lever:
+  Existing: 0
+  New:      0
+  Added:    0
+  Total:    0
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: lever (0 slugs, 0 new)
+
+Sample lever slugs:
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: ASHBY
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['jobs.ashbyhq.com/*']
+
+  Pattern: jobs.ashbyhq.com/*
+    CC-MAIN-2026-08: 500 URLs → 55 slugs (+55 new)
+    CC-MAIN-2026-04: 500 URLs → 154 slugs (+131 new)
+    CC-MAIN-2025-51: 500 URLs → 145 slugs (+62 new)
+  Subtotal: 248 slugs from pattern
+
+[DONE] ashby: 248 unique slugs across all crawls
+
+[MERGE] ashby:
+  Existing: 0
+  New:      248
+  Added:    248
+  Total:    248
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: ashby (248 slugs, 248 new)
+
+Sample ashby slugs:
+  0g
+  0x
+  11x
+  1mind
+  1password
+  1st-formations
+  3y-health
+  805title
+  8fleet-inc
+  9-mothers
+  9fin
+  a-place-for-mom
+  a-team
+  a1-garage-door-service
+  aaron-school
+  ... and 233 more
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: WORKDAY
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['*.myworkdayjobs.com/*']
+
+  Pattern: *.myworkdayjobs.com/*
+    CC-MAIN-2026-08: 500 URLs → 1 slugs (+1 new)
+    CC-MAIN-2026-04: 500 URLs → 1 slugs (+0 new)
+    CC-MAIN-2025-51: 500 URLs → 1 slugs (+0 new)
+  Subtotal: 1 slugs from pattern
+
+[DONE] workday: 1 unique slugs across all crawls
+
+[MERGE] workday:
+  Existing: 0
+  New:      1
+  Added:    1
+  Total:    1
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: workday (1 slugs, 1 new)
+
+Sample workday slugs:
+  slug----https
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: ORACLE_HCM
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['*.fa.oraclecloud.com/*']
+
+  Pattern: *.fa.oraclecloud.com/*
+    CC-MAIN-2026-08: 6 URLs → 0 slugs (+0 new)
+    CC-MAIN-2026-04: 4 URLs → 0 slugs (+0 new)
+    CC-MAIN-2025-51: 14 URLs → 0 slugs (+0 new)
+  Subtotal: 0 slugs from pattern
+
+[DONE] oracle_hcm: 0 unique slugs across all crawls
+
+[MERGE] oracle_hcm:
+  Existing: 0
+  New:      0
+  Added:    0
+  Total:    0
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: oracle_hcm (0 slugs, 0 new)
+
+Sample oracle_hcm slugs:
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+
+──────────────────────────────────────────────────
+Platform: ICIMS
+Crawls:   3 (CC-MAIN-2026-08 → CC-MAIN-2025-51)
+Patterns: ['*.icims.com/*']
+
+  Pattern: *.icims.com/*
+    CC-MAIN-2026-08: 500 URLs → 2 slugs (+2 new)
+    CC-MAIN-2026-04: 500 URLs → 2 slugs (+0 new)
+    CC-MAIN-2025-51: 500 URLs → 2 slugs (+0 new)
+  Subtotal: 2 slugs from pattern
+
+[DONE] icims: 2 unique slugs across all crawls
+
+[MERGE] icims:
+  Existing: 0
+  New:      2
+  Added:    2
+  Total:    2
+[OK] ats_discovery.db initialized: data\ats_discovery.db
+[SAVED] ats_discovery.db: icims (2 slugs, 2 new)
+
+Sample icims slugs:
+  http
+  https
+
+==================================================
+COMPLETE
+==================================================
+  greenhouse          187 companies
+  lever                 0 companies
+  ashby               248 companies
+  workday               1 companies
+  oracle_hcm            0 companies
+  icims                 2 companies
+
+  New slugs added: 438
+
+Saved to: data/ats_discovery.db
+
+Next steps:
+  1. Enrich company names:
+     python enrich_ats_companies.py
+  2. Run detection:
+     python pipeline.py --detect-ats --batch

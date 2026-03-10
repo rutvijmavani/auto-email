@@ -21,7 +21,7 @@ ATS_SITE_SEARCHES = [
     ("smartrecruiters", "site:jobs.smartrecruiters.com"),
     ("workday",         "site:myworkdayjobs.com"),
     ("oracle_hcm",      "site:oraclecloud.com"),
-    ("icims",           "site:icims.com"),
+    ("icims",           "site:icims.com careers"),  # careers-*.icims.com
     ("successfactors",  "site:successfactors.com"),
     ("successfactors",  "site:jobs2web.com"),
 ]
@@ -105,15 +105,17 @@ def _make_patterns():
         }),
     ))
 
-    # iCIMS — {company}.icims.com/jobs
-    # Also: careers.icims.com/jobs/{id}
+    # iCIMS — careers-{slug}.icims.com/jobs
+    # Also: {slug}.icims.com/jobs
+    # Note: "careers-" prefix stripped from slug
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.icims\.com/jobs",
+            r"(?:careers-)?([a-z0-9][a-z0-9\-]*[a-z0-9]|[a-z0-9]+)"
+            r"\.icims\.com(?:/jobs|$)",
             re.IGNORECASE
         ),
         "icims",
-        lambda m: m.group(1).lower(),
+        lambda m: re.sub(r"^careers-", "", m.group(1).lower()),
     ))
 
     # SAP SuccessFactors — {company}.jobs2web.com

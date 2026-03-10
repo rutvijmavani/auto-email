@@ -1,178 +1,174 @@
 # prospects.txt — H1B Sponsoring Companies for Software Developer/Engineer Roles
-# Source: h1bdata.info/topcompanies.php (2025 data)
-# Filtered: product/tech companies only — removed staffing firms, consulting, universities, hospitals
-# Format: one company name per line (use exactly as shown for CareerShift search)
+# Format: Company Name,domain.com
+# Domain used for Phase 3a HTML redirect scan during ATS detection
 # Last updated: March 2026
 
 # ─────────────────────────────────────────
 # FAANG / Big Tech
 # ─────────────────────────────────────────
-Google
-Amazon
-Microsoft
-Apple
-Meta
-Netflix
+Google,careers.google.com
+Amazon,amazon.jobs
+Microsoft,microsoft.com
+Apple,apple.com
+Meta,metacareers.com
+Netflix,jobs.netflix.com
 
 # ─────────────────────────────────────────
-# High-Growth Tech (high salaries, strong H1B)
+# High-Growth Tech
 # ─────────────────────────────────────────
-Nvidia
-Salesforce
-Adobe
-Uber
-Airbnb
-Stripe
-LinkedIn
-ByteDance
-TikTok
-Waymo
-Doordash
-Rivian
-Lucid
-Tesla
-Lyft
-Snap
-Pinterest
-Spotify
-Dropbox
-Block
-Databricks
-Snowflake
-Robinhood
-Instacart
-Roku
-Zillow
-Wayfair
-Chewy
+Nvidia,nvidia.com
+Salesforce,salesforce.com
+Adobe,adobe.com
+Uber,uber.com
+Airbnb,airbnb.com
+Stripe,stripe.com
+LinkedIn,linkedin.com
+ByteDance,bytedance.com
+TikTok,tiktok.com
+Waymo,waymo.com
+Doordash,doordash.com
+Rivian,rivian.com
+Lucid,lucidmotors.com
+Tesla,tesla.com
+Lyft,lyft.com
+Snap,snap.com
+Pinterest,pinterest.com
+Spotify,spotify.com
+Dropbox,dropbox.com
+Block,squareup.com
+Databricks,databricks.com
+Snowflake,snowflake.com
+Robinhood,robinhood.com
+Instacart,instacart.com
+Roku,roku.com
+Zillow,zillow.com
+Wayfair,wayfair.com
+Chewy,chewy.com
 
 # ─────────────────────────────────────────
 # Enterprise Software / Cloud
 # ─────────────────────────────────────────
-Workday
-ServiceNow
-Okta
-Palo Alto Networks
-Splunk
-Nutanix
-Autodesk
-Intuit
-PayPal
-eBay
-Twilio
-Docusign
-Pure Storage
-NetApp
-Informatica
-Akamai Technologies
-Citrix
-Fortinet
-Synopsys
-Cadence Design Systems
-Zoom
-VMware
-SAP America
-Red Hat
-MathWorks
+Workday,workday.com
+ServiceNow,servicenow.com
+Okta,okta.com
+Palo Alto Networks,paloaltonetworks.com
+Splunk,splunk.com
+Nutanix,nutanix.com
+Autodesk,autodesk.com
+Intuit,intuit.com
+PayPal,paypal.com
+eBay,ebay.com
+Twilio,twilio.com
+Docusign,docusign.com
+Pure Storage,purestorage.com
+NetApp,netapp.com
+Informatica,informatica.com
+Akamai Technologies,akamai.com
+Citrix,citrix.com
+Fortinet,fortinet.com
+Synopsys,synopsys.com
+Cadence Design Systems,cadence.com
+Zoom,zoom.us
+VMware,vmware.com
+SAP America,sap.com
+Red Hat,redhat.com
+MathWorks,mathworks.com
 
 # ─────────────────────────────────────────
 # Semiconductor / Hardware
 # ─────────────────────────────────────────
-Intel
-Qualcomm
-AMD
-Micron Technology
-Applied Materials
-Texas Instruments
-KLA Corporation
-Lam Research
-Marvell Semiconductor
-Western Digital
-NXP USA
-ASML
-Broadcom
-Xilinx
-Analog Devices
-Arm
-Samsung Electronics America
+Intel,intel.com
+Qualcomm,qualcomm.com
+AMD,amd.com
+Micron Technology,micron.com
+Applied Materials,appliedmaterials.com
+Texas Instruments,ti.com
+KLA Corporation,kla.com
+Lam Research,lamresearch.com
+Marvell Semiconductor,marvell.com
+Western Digital,westerndigital.com
+NXP USA,nxp.com
+ASML,asml.com
+Broadcom,broadcom.com
+Xilinx,xilinx.com
+Analog Devices,analog.com
+Arm,arm.com
+Samsung Electronics America,samsung.com
 
 # ─────────────────────────────────────────
 # Fintech / Finance Tech
 # ─────────────────────────────────────────
-JPMorgan Chase
-Goldman Sachs
-Morgan Stanley
-Visa
-Mastercard
-American Express
-Capital One
-BlackRock
-Fidelity
-Charles Schwab
-Bloomberg
-Coinbase
-Barclays
-Deutsche Bank
-Citibank
-Bank of America
-Wells Fargo
-US Bank
-State Street
+JPMorgan Chase,jpmorganchase.com
+Goldman Sachs,goldmansachs.com
+Morgan Stanley,morganstanley.com
+Visa,visa.com
+Mastercard,mastercard.com
+American Express,americanexpress.com
+Capital One,capitalone.com
+BlackRock,blackrock.com
+Fidelity,fidelity.com
+Charles Schwab,schwab.com
+Bloomberg,bloomberg.com
+Coinbase,coinbase.com
+Barclays,barclays.com
+Deutsche Bank,db.com
+Citibank,citi.com
+Bank of America,bankofamerica.com
+Wells Fargo,wellsfargo.com
+US Bank,usbank.com
+State Street,statestreet.com
 
 # ─────────────────────────────────────────
 # Automotive / EV / Autonomous
 # ─────────────────────────────────────────
-Ford Motor Company
-General Motors
-Waymo
-Rivian
-Lucid
-Zoox
-Cruise
-Aptiv
-Bosch
+Ford Motor Company,ford.com
+General Motors,gm.com
+Zoox,zoox.com
+Cruise,getcruise.com
+Aptiv,aptiv.com
+Bosch,bosch.com
 
 # ─────────────────────────────────────────
 # Telecom / Media / Entertainment
 # ─────────────────────────────────────────
-T-Mobile
-Comcast
-AT&T
-Charter Communications
-Sony Interactive Entertainment
-Electronic Arts
-Sirius XM
+T-Mobile,t-mobile.com
+Comcast,comcast.com
+AT&T,att.com
+Charter Communications,charter.com
+Sony Interactive Entertainment,sie.com
+Electronic Arts,ea.com
+Sirius XM,siriusxm.com
 
 # ─────────────────────────────────────────
 # Healthcare Tech
 # ─────────────────────────────────────────
-Optum
-Elevance Health
-Humana
-Cigna
+Optum,optum.com
+Elevance Health,elevancehealth.com
+Humana,humana.com
+Cigna,cigna.com
 
 # ─────────────────────────────────────────
 # Other Strong Tech Sponsors
 # ─────────────────────────────────────────
-Indeed
-GoDaddy
-Expedia
-Nike
-Nordstrom
-Target
-Walmart
-Best Buy
-Home Depot
-Starbucks
-FedEx
-Honeywell
-Caterpillar
-Siemens
-Nokia
-Ericsson
-Juniper Networks
-Motorola Solutions
-Cox Automotive
-Illumina
-Genentech
-Gilead Sciences
+Indeed,indeed.com
+GoDaddy,godaddy.com
+Expedia,expedia.com
+Nike,nike.com
+Nordstrom,nordstrom.com
+Target,target.com
+Walmart,walmart.com
+Best Buy,bestbuy.com
+Home Depot,homedepot.com
+Starbucks,starbucks.com
+FedEx,fedex.com
+Honeywell,honeywell.com
+Caterpillar,caterpillar.com
+Siemens,siemens.com
+Nokia,nokia.com
+Ericsson,ericsson.com
+Juniper Networks,juniper.net
+Motorola Solutions,motorolasolutions.com
+Cox Automotive,coxautomotive.com
+Illumina,illumina.com
+Genentech,gene.com
+Gilead Sciences,gilead.com

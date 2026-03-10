@@ -12,7 +12,7 @@ while the recruiter is actively reviewing applications.
 
 ## Why Early Application Matters
 
-```
+```text
 Job posted Day 0:
   → Recruiter actively hiring NOW
   → ATS queue is empty or near-empty
@@ -38,7 +38,7 @@ effectiveness. Maximum reliability is required.
 
 ### Data Flow
 
-```
+```text
 prospects.txt (137 companies)
          ↓
 --import-prospects
@@ -48,9 +48,10 @@ prospective_companies table (DB source of truth)
 --monitor-jobs (daily 8 AM)
          ↓
 ATS Detection (one-time per company, cached in DB)
-  Phase 1: Google search (primary)
-  Phase 2: API verification
-  Phase 3: API buffer fallback
+  Phase 1: ATS sitemap lookup (free, instant)
+  Phase 2: ATS API name probe (free, ~50ms)
+  Phase 3a: HTML + redirect scan (free, ~100ms)
+  Phase 3b: Serper API (Workday + Oracle only, 2500 free credits)
          ↓
 API calls (Greenhouse/Lever/Ashby/SmartRecruiters/Workday/OracleHCM)
          ↓
@@ -67,12 +68,148 @@ Email with PDF attachment (8 AM daily)
 
 ---
 
+## ATS Detection Architecture
+
+The pipeline uses a 4-phase detection approach to identify which ATS
+each company uses. Detection runs once per company and results are
+cached in the database indefinitely.
+
+### Phase 1 — Fast Slug Probe (Free, ~100ms)
+
+Generates the top 3 most likely slug variants from the company name
+and probes each ATS API directly. Stops immediately on first hit.
+
+```text
+Company: "Stripe"
+Candidates: ["stripe"]
+
+Try: boards-api.greenhouse.io/v1/boards/stripe
+→ 200 {"name": "Stripe"} → name matches → ACCEPT ✓
+
+Company: "Capital One"
+Candidates: ["capitalone", "capital-one", "capital"]
+
+Try: boards-api.greenhouse.io/v1/boards/capitalone → 404
+Try: boards-api.greenhouse.io/v1/boards/capital-one → 404
+Try: api.lever.co/v0/postings/capitalone → 404
+... → MISS → proceed to Phase 2
+```
+
+For Greenhouse, the API name is also verified against the company:
+```text
+boards-api.greenhouse.io/v1/boards/charles
+→ {"name": "Charles River Analytics"}
+→ "schwab" missing from name → REJECT ✓
+```
+
+Expected coverage: ~55% of companies.
+
+### Phase 2 — ATS API Name Probe (Free, ~50ms)
+
+For companies not found in sitemap, probe ATS APIs directly with
+slug variants and verify the returned company name.
+
+```text
+GET boards-api.greenhouse.io/v1/boards/{slug}
+→ {"name": "Stripe", "jobs": [...]}
+→ All company keywords present → ACCEPT ✓
+
+GET boards-api.greenhouse.io/v1/boards/charles
+→ {"name": "Charles River Analytics"}
+→ Missing keyword "schwab" → REJECT ✓
+```
+
+404 = definitively not on this platform.
+200 + name match = confirmed detection.
+
+No fuzzy matching — uses deterministic keyword presence check:
+all significant company keywords must appear in the API name.
+
+Expected coverage: additional ~15%.
+
+### Phase 3a — HTML + Redirect Scan (Free, ~100ms)
+
+Fetches the company career page and checks two signals:
+
+```text
+Signal 1 — Redirect URL:
+  GET capitalone.com/careers
+  → redirects to capitalone.wd12.myworkdayjobs.com/Capital_One
+  → Extract platform + slug from final URL ✓
+
+Signal 2 — HTML fingerprint:
+  Scan page source for ATS domain patterns:
+  "myworkdayjobs.com", "greenhouse.io", etc.
+  → Extract slug from embed URL ✓
+```
+
+Works for non-JavaScript-rendered pages (~30% of remaining companies).
+
+Expected coverage: additional ~10%.
+
+### Phase 3b — Serper API (2500 Free Credits)
+
+Only runs when Phases 1-3a all fail AND company is not in
+`KNOWN_CUSTOM_ATS`. Searches Google via Serper for Workday and
+Oracle HCM tenants — the two platforms that cannot be discovered
+through public APIs or sitemaps.
+
+```text
+Query 1: "capital one site:myworkdayjobs.com"
+→ capitalone.wd12.myworkdayjobs.com/Capital_One ✓
+
+Query 2: "jpmorgan site:fa.oraclecloud.com"
+→ jpmc.fa.oraclecloud.com/hcmUI/.../CX_1001 ✓
+```
+
+Cost: 2 queries per company. 2500 free credits on signup covers
+1250 companies. Email alert sent when fewer than 50 credits remain.
+
+Expected coverage: additional ~10%.
+
+### Phase 4 — Unknown / Custom ATS
+
+Companies known to use fully custom ATS platforms are stored
+immediately without consuming Serper credits:
+
+```text
+KNOWN_CUSTOM_ATS = {
+    Amazon, Apple, Google, Meta,
+    Microsoft, Netflix, Uber, Lyft
+}
+```
+
+Any remaining undetected companies stored as `unknown` and
+retried after 14 consecutive empty days.
+
+### Detection Accuracy
+
+| Approach | Coverage | Accuracy |
+|---|---|---|
+| Sitemap | ~60% | ~99% (ground truth) |
+| API probe | ~15% | ~97% (name verification) |
+| HTML redirect | ~10% | ~95% (URL pattern) |
+| Serper | ~10% | ~95% (slug validation) |
+| Unknown/Custom | ~5% | N/A |
+
+### Re-detection Triggers
+
+| Trigger | Action |
+|---|---|
+| `consecutive_empty_days >= 14` | Re-run all 4 phases |
+| `ats_platform = unknown` | Always re-run |
+| `ats_platform = custom` | Always re-run |
+| Manual override (`--override`) | Never re-detect |
+| `ats_platform = unsupported` | Never re-detect (iCIMS etc.) |
+
+---
+
 ## ATS Platform Support
 
 ### Free Public APIs (no authentication required)
 
 #### Greenhouse
-```
+```text
 Endpoint:   GET https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true
 Auth:       None
 Cost:       Free forever
@@ -89,7 +226,7 @@ Freshness:  first_seen + content_hash approach
 ```
 
 #### Lever
-```
+```text
 Endpoint:   GET https://api.lever.co/v0/postings/{slug}?mode=json
 Auth:       None
 Cost:       Free forever
@@ -102,7 +239,7 @@ Freshness:  createdAt used directly for date comparison ✓
 ```
 
 #### Ashby
-```
+```text
 Endpoint:   GET https://api.ashbyhq.com/posting-api/job-board/{slug}
 Auth:       None
 Cost:       Free forever
@@ -116,7 +253,7 @@ Freshness:  publishedAt used directly for date comparison ✓
 ```
 
 #### SmartRecruiters
-```
+```text
 Endpoint:   GET https://api.smartrecruiters.com/v1/companies/{slug}/postings
 Auth:       None for public jobs
 Cost:       Free
@@ -128,7 +265,7 @@ Freshness:  releasedDate used directly for date comparison ✓
 ```
 
 #### Workday (undocumented public API)
-```
+```text
 Endpoint:   GET https://{company}.{wd}.myworkdayjobs.com/wday/cxs/
                 {company}/{path}/jobs
 Auth:       None required (used by Workday career page frontend)
@@ -147,7 +284,7 @@ Freshness:  postedOn used directly for date comparison ✓
 ```
 
 #### Oracle HCM Cloud
-```
+```text
 Endpoint:   GET https://{slug}.fa.oraclecloud.com/hcmRestApi/resources/
                 latest/recruitingCEJobRequisitions?
                 finder=CandidateExperience&
@@ -165,7 +302,7 @@ Freshness:  PostedDate used directly for date comparison ✓
 ```
 
 ### Coverage Summary
-```
+```text
 Greenhouse:      ~40 companies  (100% confidence via Google ✓)
 Lever:           ~20 companies  (100% confidence via Google ✓)
 Ashby:           ~15 companies  (100% confidence via Google ✓)
@@ -185,7 +322,7 @@ Unknown (~2%):
 ## ATS Detection — Google Search + API Verification
 
 ### Philosophy
-```
+```text
 Google already knows the correct ATS URL for every company.
 "capital one site:myworkdayjobs.com" returns:
   capitalone.wd12.myworkdayjobs.com/Capital_One/jobs
@@ -198,7 +335,7 @@ accepts any slug and returns empty responses, causing
 ```
 
 ### How it works
-```
+```text
 For each company (e.g. "Capital One"):
 
 Phase 1 — Google search (PRIMARY):
@@ -217,11 +354,11 @@ Phase 1 — Google search (PRIMARY):
 
   First valid match → stop, move to Phase 2.
 
-Phase 2 — API verification (CONFIRM):
+Phase 2 — Validate and store:
   Take Google result: workday, capitalone, wd12, Capital_One
-  Make ONE targeted API call to Workday
-  → Confirms ATS is live and returns jobs
-  → Store with method="google"
+  → Check platform is in ATS_REGISTRY (supported)
+  → If supported → _store_detection(company, platform, slug)
+  → If unsupported (iCIMS, SuccessFactors etc.) → store as "custom"
 
 Phase 3 — API buffer fallback:
   Only runs if Google finds nothing
@@ -235,7 +372,7 @@ Phase 4 — Unknown:
 ```
 
 ### Google search queries
-```
+```text
 Platform        Query format
 ──────────────────────────────────────────────────
 Greenhouse:     "{company} site:boards.greenhouse.io"
@@ -245,14 +382,18 @@ Ashby:          "{company} site:jobs.ashbyhq.com"
 SmartRec:       "{company} site:jobs.smartrecruiters.com"
 Workday:        "{company} site:myworkdayjobs.com"
 Oracle HCM:     "{company} site:oraclecloud.com"
-iCIMS:          "{company} site:icims.com"
-SuccessFactors: "{company} site:successfactors.com"
+iCIMS:          "{company} site:icims.com"     → stored as "custom" (no fetch module)
+SuccessFactors: "{company} site:successfactors.com" → stored as "custom"
+
+Platforms not listed (e.g. Taleo, Jobvite, Workable):
+  → If found by Google → stored as "custom" (out of scope for now)
+  → Use --override to manually set if company is critical
 
 Autocorrect disabled: &nfpr=1
 ```
 
 ### URL slug validation (prevents false positives)
-```
+```text
 After Google returns URLs, validate slug belongs to company:
 
   "jp morgan site:boards.greenhouse.io"
@@ -273,7 +414,7 @@ Known aliases handled:
 ```
 
 ### Rate limiting and CAPTCHA handling
-```
+```text
 Playwright browser with realistic user agent.
 3-5 second human-like delay between searches.
 Browser restarted every 50 companies (memory cleanup).
@@ -282,7 +423,7 @@ Progress saved per company → auto-resume if interrupted.
 ```
 
 ### Scoring formula
-```
+```text
 confidence% × log10(job_count + 1)
 
 Why log10()?
@@ -300,7 +441,7 @@ Empty jobs (hiring freeze):
 ```
 
 ### Keyword extraction
-```
+```text
 Company name → significant keywords (ALL must match)
 
 "Capital One"        → ["capital", "one"]
@@ -319,7 +460,7 @@ This prevents partial matches (Capital Group ≠ Capital One).
 ```
 
 ### Detection status values
-```
+```text
 detected    → high confidence, auto-accepted silently
 close_call  → auto-selected by tie-break, email sent to verify
 unknown     → low confidence, email sent for manual review
@@ -327,7 +468,7 @@ manual      → manually overridden by user, never auto-re-detected
 ```
 
 ### Re-detection triggers
-```
+```text
 Automatic re-detection when:
   → ats_platform = 'unknown' or NULL
   → ats_slug = NULL or empty
@@ -347,7 +488,7 @@ Manual override:
 ```
 
 ### Empty day counter reset (critical behavior)
-```
+```text
 After EVERY detection attempt:
   → consecutive_empty_days reset to 0
   → Prevents infinite re-detection loops
@@ -370,7 +511,7 @@ Maximum job posting gap when ATS switches:
 ```
 
 ### Detection summary email
-```
+```text
 ONE email sent after --detect-ats completes.
 Only sent when there are close calls or unknowns.
 Silently skipped when everything detected cleanly.
@@ -391,7 +532,7 @@ NEEDS MANUAL REVIEW section:
 ```
 
 ### Monitorable companies
-```
+```text
 --monitor-jobs only processes companies with confirmed ATS:
   ats_platform NOT NULL
   ats_platform != 'unknown'
@@ -406,7 +547,7 @@ Unknown companies are SKIPPED in daily monitoring.
 ## Job Filtering
 
 ### Filter priority
-```
+```text
 All filtering is client-side (APIs return ALL jobs)
 
 Priority 1 — Title match (broad keyword):
@@ -450,7 +591,7 @@ score += 3  if posted yesterday
 score += 1  if posted 2-3 days ago
 
 # Jobs sorted by score DESC within each company group
-```
+```text
 
 ---
 
@@ -465,7 +606,7 @@ Greenhouse updated_at changes on every edit:
 
 Solution: Do NOT use updated_at for freshness
   → Use first_seen + content_hash instead
-```
+```text
 
 ### Two-layer deduplication
 ```
@@ -481,7 +622,7 @@ Layer 2 — Content hash check:
   → Handles: Greenhouse URL changes on edit
 
 Both layers must pass for job to be "new"
-```
+```text
 
 ### Date-based freshness (when reliable date available)
 ```
@@ -494,7 +635,7 @@ Greenhouse:
   updated_at unreliable
   → Rely on first_seen only
   → No date-based freshness check
-```
+```text
 
 ### First run per company
 ```
@@ -510,7 +651,7 @@ Solution:
   → Only jobs seen AFTER first scan = truly new
   → Track: prospective_companies.first_scanned_at
   → If first_scanned_at IS NULL → first run
-```
+```text
 
 ---
 
@@ -545,7 +686,7 @@ E3: Detection during hiring freeze (0 jobs, correct ATS)
 E4: Workday URL variant (wd1/wd2/wd3/wd5)
     → Try all 4 variants during detection
     → Store exact URL that worked
-```
+```text
 
 ### API Calls
 ```
@@ -576,7 +717,7 @@ E9: Partial run failure (VM crash mid-run)
     → On restart → only process companies
       where last_checked_at < today
     → Prevents duplicate processing
-```
+```text
 
 ### Job Data
 ```
@@ -607,7 +748,7 @@ E15: Location field variations
 E16: Special characters in title/description
      → Sanitize before PDF rendering
      → Replace problematic Unicode chars
-```
+```text
 
 ### PDF Generation
 ```
@@ -628,7 +769,7 @@ E19: Disk full during PDF write
 E20: Very large PDF (200+ jobs)
      → 200 jobs ≈ 20 pages ≈ 2-3 MB
      → Gmail limit 25 MB → no concern ✓
-```
+```text
 
 ---
 
@@ -642,7 +783,7 @@ This is the entry pipeline. If it fails silently:
   → Every downstream pipeline loses effectiveness
 
 Metrics catch silent failures before they compound.
-```
+```text
 
 ### Metrics tracked per run
 
@@ -654,7 +795,7 @@ Alert:   < 70% for 3 consecutive days
 Meaning: How many companies returned at least 1 job?
          Low value = ATS detection issues or
          widespread API failures
-```
+```text
 
 #### Metric 2 — ATS Known Rate
 ```
@@ -663,7 +804,7 @@ Target:  ≥ 80%
 Alert:   < 80%
 Meaning: What % of companies have confirmed ATS?
          Low value = many companies unmonitored
-```
+```text
 
 #### Metric 3 — Filter Match Rate
 ```
@@ -672,7 +813,7 @@ Target:  5% - 40%
 Alert:   < 5% (filters too strict)
          > 60% (filters too loose)
 Meaning: Are our title/skill filters calibrated?
-```
+```text
 
 #### Metric 4 — New Job Rate
 ```
@@ -681,7 +822,7 @@ Target:  varies by season
 Meaning: Hiring activity indicator
          Low in Nov-Dec (off-season) → normal
          Low in Jan-Mar (peak) → pipeline issue
-```
+```text
 
 #### Metric 5 — Pipeline Reliability
 ```
@@ -690,7 +831,7 @@ Target:  ≥ 90%
 Alert:   < 90%
 Meaning: How often does --monitor-jobs complete?
          Tracks VM stability and API availability
-```
+```text
 
 #### Metric 6 — API Failure Rate
 ```
@@ -698,7 +839,7 @@ Formula: api_failures / total_api_calls
 Target:  < 10%
 Alert:   > 10% for 3 consecutive days
 Meaning: Are APIs degrading or rate limiting us?
-```
+```text
 
 #### Metric 7 — Application Conversion Rate (future)
 ```
@@ -707,7 +848,7 @@ Target:  TBD after data collected
 Meaning: Quality of job recommendations
          Requires tracking which digest jobs
          you actually applied to
-```
+```text
 
 #### Metric 8 — Time to Apply (future)
 ```
@@ -716,7 +857,7 @@ Target:  < 24 hours
 Meaning: Are you applying fast enough?
          Measures effectiveness of early
          application strategy
-```
+```text
 
 ### DB schema for metrics
 ```sql
@@ -738,7 +879,7 @@ CREATE TABLE IF NOT EXISTS monitor_stats (
 ```
 
 ### Alert delivery
-```
+```text
 In PDF report header (every run):
   → Coverage rate
   → ATS known rate
@@ -778,7 +919,7 @@ WHERE content_hash IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_job_postings_status_seen
 ON job_postings(status, first_seen);
-```
+```text
 
 ### prospective_companies table (updated)
 ```sql
@@ -793,7 +934,7 @@ ALTER TABLE prospective_companies
 ```
 
 ### Retention policy
-```
+```text
 job_postings cleanup (runs in init_db()):
 
   Archive expired new postings:
@@ -883,7 +1024,7 @@ MONITOR_ATS_UNKNOWN_ALERT     = 0.20  # alert if > 20% unknown ATS
 MONITOR_RELIABILITY_ALERT     = 0.90  # alert if < 90% runs succeed
 MONITOR_MATCH_RATE_LOW_ALERT  = 0.05  # alert if < 5% jobs match
 MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% jobs match
-```
+```text
 
 ---
 
@@ -925,7 +1066,7 @@ Page 2+ — Grouped by company (score sorted within group)
   │  Skills: Python, AWS                  │
   │  https://careers.google.com/...       │
   └────────────────────────────────────────┘
-```
+```text
 
 ---
 
@@ -957,7 +1098,7 @@ python pipeline.py --monitor-status
 
 ## File Structure
 
-```
+```text
 jobs/
   ats/
     __init__.py
@@ -1002,7 +1143,7 @@ tests/
   source venv/bin/activate && \
   python pipeline.py --monitor-jobs \
   >> logs/monitor_$(date +\%Y-\%m-\%d).log 2>&1
-```
+```text
 
 ---
 
@@ -1079,7 +1220,7 @@ Phase 9 — Tests:
                           → DB retention cleanup
                           → Metrics calculation
                           → Edge case coverage
-```
+```text
 
 ---
 
@@ -1111,4 +1252,4 @@ Phase 9 — Tests:
 6. Application conversion tracking
    → Metrics 7 and 8 require future implementation
    → Need to track which digest jobs you applied to
-```
+```text

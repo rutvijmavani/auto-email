@@ -18,22 +18,31 @@ def _normalize_company(name):
     return normalized
 
 
-def add_prospective_company(company, priority=0):
+def add_prospective_company(company, priority=0, domain=None):
     """
     Add a company to the prospective list.
     Silently ignores duplicates (INSERT OR IGNORE).
     Returns True if newly inserted, False if already existed.
     Raises ValueError if company name is empty/whitespace.
+    Domain is used for Phase 3a HTML redirect scan during ATS detection.
     """
     company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT OR IGNORE INTO prospective_companies (company, priority, status)
-        VALUES (?, ?, 'pending')
-    """, (company, priority))
+        INSERT OR IGNORE INTO prospective_companies (company, priority, status, domain)
+        VALUES (?, ?, 'pending', ?)
+    """, (company, priority, domain))
     conn.commit()
     inserted = c.rowcount > 0
+    # Update domain if company already existed and domain provided
+    if not inserted and domain:
+        c.execute("""
+            UPDATE prospective_companies
+            SET domain = ?
+            WHERE company = ? AND (domain IS NULL OR domain = '')
+        """, (domain, company))
+        conn.commit()
     conn.close()
     return inserted
 

@@ -1,0 +1,440 @@
+"""
+enrich_ats_companies.py — Enrich ats_discovery.db with company names.
+
+Calls each ATS API to fill company_name, website, job_count
+for all unenriched slugs in ats_discovery.db.
+
+Run after build_ats_slug_list.py:
+  python enrich_ats_companies.py
+  python enrich_ats_companies.py --platform greenhouse
+  python enrich_ats_companies.py --limit 100
+  python enrich_ats_companies.py --test   (10 per platform)
+
+Rate: ~100ms delay between calls → ~5,000 slugs in ~8 minutes.
+Monthly incremental: only new unenriched slugs.
+"""
+
+import re
+import time
+import json
+import argparse
+import requests
+from datetime import datetime
+
+from db.schema_discovery import init_discovery_db
+from db.ats_companies import (
+    get_unenriched, upsert_company, delete_company
+)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    )
+}
+TIMEOUT     = 8
+CALL_DELAY  = 0.1   # seconds between API calls
+
+
+# ─────────────────────────────────────────
+# ENRICHMENT FUNCTIONS PER PLATFORM
+# ─────────────────────────────────────────
+
+def enrich_greenhouse(slug):
+    """
+    GET boards-api.greenhouse.io/v1/boards/{slug}
+    Returns {"name": "Stripe", "jobs": [...]}
+    """
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+        data = resp.json()
+        name     = data.get("name", "")
+        jobs     = data.get("jobs", [])
+        # Try to get website from jobs
+        website  = _extract_website_from_jobs(jobs)
+        return {
+            "company_name": name,
+            "website":      website,
+            "job_count":    len(jobs),
+        }, "ok"
+    except Exception:
+        return None, "error"
+
+
+def enrich_lever(slug):
+    """
+    GET api.lever.co/v0/postings/{slug}?mode=json
+    Returns list of job postings.
+    """
+    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+        data = resp.json()
+        if not isinstance(data, list):
+            return None, "error"
+        # Company name from first job's hostedUrl or categories
+        name    = _extract_lever_company_name(slug)
+        website = _extract_lever_website(data)
+        return {
+            "company_name": name,
+            "website":      website,
+            "job_count":    len(data),
+        }, "ok"
+    except Exception:
+        return None, "error"
+
+
+def enrich_ashby(slug):
+    """
+    GET api.ashbyhq.com/posting-api/job-board/{slug}
+    Returns {"jobBoard": {"name": "Linear", "websiteUrl": "..."}, "jobs": [...]}
+    """
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+        data  = resp.json()
+        board = data.get("jobBoard", {})
+        jobs  = data.get("jobs", [])
+        name    = board.get("name", "") or board.get("companyName", "")
+        website = board.get("websiteUrl", "") or board.get("url", "")
+        return {
+            "company_name": name,
+            "website":      website,
+            "job_count":    len(jobs),
+        }, "ok"
+    except Exception:
+        return None, "error"
+
+
+def enrich_smartrecruiters(slug):
+    """
+    GET api.smartrecruiters.com/v1/companies/{slug}
+    Returns {"name": "Adobe", "website": "..."}
+    """
+    url = f"https://api.smartrecruiters.com/v1/companies/{slug}"
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+        data = resp.json()
+        name    = data.get("name", "")
+        website = data.get("website", "")
+        return {
+            "company_name": name,
+            "website":      website,
+            "job_count":    0,  # would need separate call
+        }, "ok"
+    except Exception:
+        return None, "error"
+
+
+def enrich_workday(slug):
+    """
+    Workday has no simple name API.
+    slug is JSON: {"slug":"capitalone","wd":"wd12","path":"Capital_One"}
+    Try fetching the careers page title.
+    """
+    try:
+        if isinstance(slug, str) and slug.startswith("{"):
+            slug_data = json.loads(slug)
+        else:
+            return None, "skip"  # plain string — not valid workday slug
+
+        tenant  = slug_data.get("slug", "")
+        wd      = slug_data.get("wd", "")
+        path    = slug_data.get("path", "careers")
+
+        if not tenant or not wd:
+            return None, "skip"
+
+        # Try fetching careers page for title
+        url = f"https://{tenant}.{wd}.myworkdayjobs.com/{path}"
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                           allow_redirects=True)
+
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+
+        # Extract company name from page title
+        # Workday titles: "Jobs at Capital One | Workday"
+        name = _extract_title_name(resp.text)
+        return {
+            "company_name": name,
+            "website":      "",
+            "job_count":    0,
+        }, "ok"
+
+    except Exception:
+        return None, "error"
+
+
+def enrich_oracle_hcm(slug):
+    """
+    Oracle HCM slug: {"slug":"jpmc","site":"CX_1001"}
+    Try fetching careers page for company name.
+    """
+    try:
+        if isinstance(slug, str) and slug.startswith("{"):
+            slug_data = json.loads(slug)
+        else:
+            return None, "skip"
+
+        tenant  = slug_data.get("slug", "")
+        site_id = slug_data.get("site", "")
+
+        if not tenant or not site_id:
+            return None, "skip"
+
+        url = (f"https://{tenant}.fa.oraclecloud.com/hcmUI/"
+               f"CandidateExperience/en/sites/{site_id}/jobs")
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
+                           allow_redirects=True)
+
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+
+        name = _extract_title_name(resp.text)
+        return {
+            "company_name": name,
+            "website":      "",
+            "job_count":    0,
+        }, "ok"
+
+    except Exception:
+        return None, "error"
+
+
+def enrich_icims(slug):
+    """
+    iCIMS slug: e.g. "schwab"
+    Try fetching careers-{slug}.icims.com listing page.
+    """
+    url = (f"https://careers-{slug}.icims.com"
+           f"/jobs/search?in_iframe=1")
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return None, "inactive"
+        if resp.status_code != 200:
+            return None, "error"
+
+        if "iCIMS" not in resp.text and "icims" not in resp.text.lower():
+            return None, "inactive"
+
+        # Extract company name from page title
+        name = _extract_title_name(resp.text)
+        # Count job anchors
+        job_count = resp.text.count("iCIMS_Anchor")
+
+        return {
+            "company_name": name,
+            "website":      "",
+            "job_count":    job_count,
+        }, "ok"
+
+    except Exception:
+        return None, "error"
+
+
+# Registry
+ENRICHERS = {
+    "greenhouse":      enrich_greenhouse,
+    "lever":           enrich_lever,
+    "ashby":           enrich_ashby,
+    "smartrecruiters": enrich_smartrecruiters,
+    "workday":         enrich_workday,
+    "oracle_hcm":      enrich_oracle_hcm,
+    "icims":           enrich_icims,
+}
+
+
+# ─────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────
+
+def _extract_website_from_jobs(jobs):
+    """Try to extract company website from job URLs."""
+    for job in jobs[:3]:
+        url = job.get("absolute_url", "")
+        if url and "greenhouse" not in url.lower():
+            m = re.match(r"https?://([^/]+)", url)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def _extract_lever_company_name(slug):
+    """
+    Lever doesn't return company name directly.
+    Infer from slug or job URLs.
+    """
+    # Try page URL to get proper company name
+    # Slug is already the best we have
+    return slug.replace("-", " ").title()
+
+
+def _extract_lever_website(jobs):
+    """Extract company website from Lever job URLs."""
+    for job in jobs[:3]:
+        url = job.get("hostedUrl", "")
+        if url:
+            m = re.search(r"jobs\.lever\.co/([^/?]+)", url)
+            if not m:
+                # Check for company website in job description
+                desc = job.get("descriptionPlain", "")
+                m2 = re.search(r"https?://(?:www\.)?([a-z0-9-]+\.[a-z]{2,})",
+                               desc)
+                if m2:
+                    return m2.group(0)
+    return ""
+
+
+def _extract_title_name(html):
+    """
+    Extract company name from HTML page title.
+    Handles patterns like:
+      "Jobs at Capital One | Workday"
+      "Careers | JPMorgan Chase"
+      "Software Engineer in Dublin | Careers at Encyclis"
+    """
+    import re
+    title_m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
+    if not title_m:
+        return ""
+
+    title = title_m.group(1).strip()
+
+    # Remove common suffixes
+    patterns = [
+        r"\s*[|–-]\s*Workday\s*$",
+        r"\s*[|–-]\s*Jobs?\s*$",
+        r"\s*[|–-]\s*Careers?\s*$",
+        r"^Jobs?\s+at\s+",
+        r"^Careers?\s+at\s+",
+        r"^Careers?\s*[|–-]\s*",
+        r"\s*[|–-]\s*Career.*$",
+    ]
+    for p in patterns:
+        title = re.sub(p, "", title, flags=re.IGNORECASE).strip()
+
+    return title[:100] if title else ""
+
+
+# ─────────────────────────────────────────
+# MAIN ENRICHMENT RUNNER
+# ─────────────────────────────────────────
+
+def run_enrichment(platform=None, limit=500, test_mode=False):
+    """
+    Enrich all unenriched slugs in ats_discovery.db.
+
+    Args:
+        platform:  only enrich this platform (None = all)
+        limit:     max slugs per run
+        test_mode: only process 10 per platform
+    """
+    init_discovery_db()
+
+    if test_mode:
+        limit = 10
+
+    slugs = get_unenriched(platform=platform, limit=limit)
+
+    if not slugs:
+        print("[OK] No unenriched slugs found.")
+        return
+
+    print(f"\nEnriching {len(slugs)} slugs...")
+    print(f"{'Platform':<15} {'Slug':<30} {'Result':<10} {'Name'}")
+    print("─" * 80)
+
+    stats = {
+        "ok":       0,
+        "inactive": 0,
+        "error":    0,
+        "skip":     0,
+    }
+
+    for row in slugs:
+        plat = row["platform"]
+        slug = row["slug"]
+
+        enricher = ENRICHERS.get(plat)
+        if not enricher:
+            stats["skip"] += 1
+            continue
+
+        data, status = enricher(slug)
+
+        if status == "inactive":
+            delete_company(plat, slug)
+            stats["inactive"] += 1
+            print(f"  {plat:<13} {slug[:28]:<30} DELETED (404)")
+
+        elif status == "ok" and data:
+            upsert_company(
+                platform=plat,
+                slug=slug,
+                company_name=data.get("company_name"),
+                website=data.get("website"),
+                job_count=data.get("job_count"),
+            )
+            stats["ok"] += 1
+            name = data.get("company_name", "")[:30]
+            print(f"  {plat:<13} {slug[:28]:<30} OK         {name}")
+
+        elif status == "error":
+            stats["error"] += 1
+            # Don't mark as enriched — retry next time
+
+        elif status == "skip":
+            stats["skip"] += 1
+
+        time.sleep(CALL_DELAY)
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("ENRICHMENT COMPLETE")
+    print(f"  OK:       {stats['ok']:,}")
+    print(f"  Inactive: {stats['inactive']:,}")
+    print(f"  Errors:   {stats['error']:,}")
+    print(f"  Skipped:  {stats['skip']:,}")
+    print(f"  Total:    {len(slugs):,}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Enrich ats_discovery.db with company names"
+    )
+    parser.add_argument("--platform",
+                        choices=list(ENRICHERS.keys()),
+                        default=None)
+    parser.add_argument("--limit",   type=int, default=500)
+    parser.add_argument("--test",    action="store_true")
+    args = parser.parse_args()
+
+    run_enrichment(
+        platform=args.platform,
+        limit=args.limit,
+        test_mode=args.test,
+    )

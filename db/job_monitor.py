@@ -142,11 +142,109 @@ def get_all_monitored_companies():
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
-                   last_checked_at, consecutive_empty_days
+                   last_checked_at, consecutive_empty_days,
+                   domain
             FROM prospective_companies
             ORDER BY company ASC
         """).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_detection_queue(batch_size=10):
+    """
+    Get next batch of companies for ATS detection.
+    Ordered by priority:
+
+    Priority 1: Never detected (ats_detected_at IS NULL)
+                → Newly added companies
+                → Sorted by created_at ASC (oldest first)
+
+    Priority 2: Active companies gone quiet (14+ empty days)
+                → May have switched ATS
+                → Sorted by consecutive_empty_days DESC
+
+    Priority 3: Unknown for longest time
+                → ats_platform = 'unknown', tried before
+                → Sorted by ats_detected_at ASC
+
+    Priority 4: Custom (unsupported ATS, retry periodically)
+                → ats_platform = 'custom'
+                → Sorted by ats_detected_at ASC
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT company, ats_platform, ats_slug,
+                   ats_detected_at, consecutive_empty_days,
+                   created_at, domain,
+                   CASE
+                     WHEN ats_detected_at IS NULL THEN 1
+                     WHEN consecutive_empty_days >= 14 THEN 2
+                     WHEN ats_platform = 'unknown' THEN 3
+                     WHEN ats_platform = 'custom'  THEN 4
+                     ELSE 99
+                   END AS priority
+            FROM prospective_companies
+            WHERE (
+                ats_detected_at IS NULL
+                OR consecutive_empty_days >= 14
+                OR ats_platform IN ('unknown', 'custom')
+            )
+            ORDER BY
+                priority ASC,
+                CASE WHEN priority = 1
+                     THEN created_at END ASC,
+                CASE WHEN priority = 2
+                     THEN consecutive_empty_days END DESC,
+                CASE WHEN priority IN (3, 4)
+                     THEN ats_detected_at END ASC
+            LIMIT ?
+        """, (batch_size,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_detection_queue_stats():
+    """
+    Get counts for each priority bucket.
+    Uses same CASE expression as get_detection_queue()
+    to avoid double-counting — matches real selection logic.
+    Used by --monitor-status.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT
+                COALESCE(SUM(CASE WHEN priority = 1 THEN 1 ELSE 0 END), 0)
+                    AS priority1_new,
+                COALESCE(SUM(CASE WHEN priority = 2 THEN 1 ELSE 0 END), 0)
+                    AS priority2_quiet,
+                COALESCE(SUM(CASE WHEN priority = 3 THEN 1 ELSE 0 END), 0)
+                    AS priority3_unknown,
+                COALESCE(SUM(CASE WHEN priority = 4 THEN 1 ELSE 0 END), 0)
+                    AS priority4_custom
+            FROM (
+                SELECT
+                    CASE
+                        WHEN ats_detected_at IS NULL THEN 1
+                        WHEN consecutive_empty_days >= 14 THEN 2
+                        WHEN ats_platform = 'unknown' THEN 3
+                        WHEN ats_platform = 'custom'  THEN 4
+                        ELSE 99
+                    END AS priority
+                FROM prospective_companies
+                WHERE (
+                    ats_detected_at IS NULL
+                    OR consecutive_empty_days >= 14
+                    OR ats_platform IN ('unknown', 'custom')
+                )
+            ) sub
+            WHERE priority < 99
+        """).fetchone()
+        return dict(row) if row else {}
     finally:
         conn.close()
 
@@ -173,7 +271,7 @@ def get_monitorable_companies():
                    last_checked_at, consecutive_empty_days
             FROM prospective_companies
             WHERE ats_platform IS NOT NULL
-            AND ats_platform NOT IN ('unknown', 'custom')
+            AND ats_platform NOT IN ('unknown', 'custom', 'unsupported')
             AND ats_slug IS NOT NULL
             ORDER BY company ASC
         """).fetchall()

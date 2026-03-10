@@ -41,8 +41,6 @@ venv/
 env/
 .env/
 
-*.csv
-
 # ─────────────────────────────────────────
 # IDE & OS
 # ─────────────────────────────────────────
@@ -50,3 +48,6 @@ env/
 .idea/
 *.DS_Store
 Thumbs.db
+
+# Test artifacts with non-deterministic output
+results/build_ats_list_test.txt

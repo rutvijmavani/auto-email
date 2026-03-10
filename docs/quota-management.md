@@ -2,14 +2,17 @@
 
 ## Overview
 
-The pipeline manages two separate daily quotas:
+The pipeline manages three quotas:
 
 | Quota | Limit | Resets |
 |---|---|---|
 | CareerShift profile views | 50 new contacts/day | Daily |
 | Gemini AI calls | 40 calls/day (20 per model) | Daily |
+| Serper API credits | 2500 total (one-time) | Never |
+| Brave Search API calls | 1000/month (hard stop: 950) | Monthly |
+| AWS Athena queries | ~$0.00024/query | Pay-per-use |
 
-Both quotas are tracked locally in the database and synced with real values at runtime.
+All quotas are tracked locally in the database and synced with real values at runtime.
 
 ---
 
@@ -252,6 +255,201 @@ python pipeline.py --quota-report
 ```
 
 ---
+
+## Serper API Credits (ATS Detection)
+
+### How it works
+
+Serper.dev is used for Phase 3b of ATS detection — finding Workday
+and Oracle HCM tenants via Google search. Unlike CareerShift and
+Gemini, Serper uses a one-time credit pool (not daily resets).
+
+| Credit type | Amount | Resets |
+|---|---|---|
+| Serper free credits | 2500 (one-time signup) | Never |
+
+### Credit usage
+
+```text
+Per company (Phase 3b only):
+  Query 1: "{company} site:myworkdayjobs.com"  → 1 credit
+  Query 2: "{company} site:fa.oraclecloud.com" → 1 credit
+  Total:   2 credits per company
+```
+
+Most companies are detected in Phases 1-3a at zero cost.
+Serper credits are only spent when all free phases fail.
+
+**Expected lifetime usage:**
+```text
+Initial detection (134 companies):
+  ~25 reach Phase 3b (others caught by sitemap/API/redirect)
+  25 × 2 = 50 credits used
+
+Monthly re-detection:
+  ~3-5 companies trigger re-detection per month
+  5 × 2 = 10 credits/month
+
+2500 credits ÷ 50 initial ÷ 10/month = ~245 months
+Effectively free forever.
+```
+
+### Low credit alert
+
+An email alert is sent automatically when credits drop below 50:
+
+```text
+Subject: [Alert] Serper API — only 47 credits remaining
+
+Time to arrange alternative for Workday/Oracle detection.
+Options:
+  1. Buy more credits at serper.dev ($50 for 50k queries)
+  2. Switch to Brave Search API ($3-5 per 1000 queries)
+  3. Use SeleniumBase UC Mode (free, browser-based)
+```
+
+The alert is sent once and not repeated until credits are replenished
+and the alert flag is reset via `reset_low_credit_alert()`.
+
+### Companies that skip Serper entirely
+
+The following companies use fully custom ATS platforms and are
+stored as `custom` immediately — no Serper credits consumed:
+
+```text
+Amazon, Apple, Google, Meta, Microsoft,
+Netflix, Uber, Lyft, X, Twitter
+```
+
+### Checking credit balance
+
+```bash
+python pipeline.py --monitor-status
+```
+
+Output includes:
+```text
+Serper API credits: 2450/2500 remaining
+  Used: 50  │  Limit: 2500  │  Alert threshold: 50
+```
+
+---
+
+
+---
+
+## Brave Search API (ATS Discovery)
+
+> **Note:** Microsoft retired Bing Search API on August 11, 2025.
+> Replaced with Brave Search API (free tier: 1,000 queries/month).
+> Sign up: https://api.search.brave.com/
+
+### How it works
+
+Brave Search API fills gaps for ATS platforms that Common Crawl does not index well:
+
+| Platform | Reason CC misses it |
+|---|---|
+| Lever | Migrated to JS rendering after CC-MAIN-2025-47 |
+| Oracle HCM | Very sparse CC coverage |
+| iCIMS | JS-heavy job boards |
+
+Brave is used exclusively in `build_ats_slug_list.py` — not during daily job monitoring.
+
+### Quota tracking
+
+```text
+Monthly limit:   1000 calls (Brave free tier)
+Hard stop:        950 calls (50 call safety buffer)
+Resets:          1st of each month (auto-detected by month change)
+Stored in:       data/brave_quota.json
+Increments:      only on HTTP 200 success
+Checked:         before every page request
+```
+
+### Monthly budget breakdown
+
+```text
+Lever:     3 queries × 20 pages = 60 calls
+Oracle:    2 queries × 20 pages = 40 calls
+iCIMS:     2 queries × 20 pages = 40 calls
+─────────────────────────────────────────
+Total per run:                   140 calls
+Monthly runs:          1 (normal refresh)
+Safety buffer:                    50 calls
+─────────────────────────────────────────
+Monthly usage:    ~140/1000 (14% of limit)
+Well within free tier ✓
+```
+
+### Checking Brave quota
+
+```bash
+python build_ats_slug_list.py --test
+# Shows: [BRAVE] Quota: 140/950 used (2026-03), 810 remaining
+```
+
+---
+
+## AWS Athena (ATS Discovery)
+
+### How it works
+
+AWS Athena queries the Common Crawl columnar index (Parquet files on S3) to discover new ATS company slugs. Replaces the old CDX API approach which caused rate limit timeouts.
+
+### Cost model
+
+```text
+Pricing:         $5.00 per TB scanned
+Data scanned:    ~52 MB per query (6 ATS domains from 300 GB index)
+Cost per query:  ~$0.00026
+
+Monthly cost:    1 query × $0.00026 = $0.00026/month
+Annual cost:     $0.003/year
+```
+
+### Smart refresh — only queries new crawls
+
+```text
+Sliding window:  last 3 crawls e.g. [2026-08, 2026-04, 2025-51]
+scanned_crawls:  tracks which crawls already processed
+Unscanned:       [2026-08]  ← only this needs Athena
+
+Normal monthly run = 1 Athena query = $0.00026
+```
+
+### S3 result handling
+
+```text
+After Athena query:
+  1. CSV saved locally: data/athena_CC-MAIN-2026-08_2026-03-09.csv
+  2. S3 result deleted immediately (zero storage cost)
+  3. Old CSVs (>2 days) deleted on next run
+
+Recovery (if script crashed):
+  python build_ats_slug_list.py --from-csv data/athena_*.csv
+```
+
+### AWS setup (one-time)
+
+```bash
+# In AWS Athena console (us-east-1 region):
+CREATE DATABASE ccindex
+
+CREATE EXTERNAL TABLE IF NOT EXISTS ccindex (...)  # see docs
+STORED AS parquet
+LOCATION 's3://commoncrawl/cc-index/table/cc-main/warc/';
+
+MSCK REPAIR TABLE ccindex  # run monthly for new crawls
+
+# In .env:
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+ATHENA_DATABASE=ccindex
+ATHENA_TABLE=ccindex
+ATHENA_S3_OUTPUT=s3://your-bucket/athena-results/
+```
 
 ## `--verify-only` and Quota
 

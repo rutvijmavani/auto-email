@@ -466,7 +466,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         a["level"] in ("warning", "error") for a in alerts
     ) else ""
     subject = (
-        f"📋 Job Digest · {date_str} · "
+        f"[Digest] Job Digest · {date_str} · "
         f"{job_count} new jobs{alert_flag}"
     )
 
@@ -494,10 +494,11 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
     """
 
     try:
+        from email.header import Header
         msg = MIMEMultipart("mixed")
         msg["From"]    = EMAIL
         msg["To"]      = EMAIL
-        msg["Subject"] = subject
+        msg["Subject"] = Header(subject, "utf-8")
         msg.attach(MIMEText(body_html, "html", "utf-8"))
 
         # Attach PDF
