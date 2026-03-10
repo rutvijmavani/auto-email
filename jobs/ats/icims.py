@@ -55,20 +55,28 @@ def fetch_jobs(slug, company):
     if not slug:
         return []
 
-    base_url = f"https://careers-{slug}.icims.com"
+    # Handle both "schwab" and "careers-schwab" slug formats
+    # patterns.py strips "careers-" prefix so slug is always bare
+    # but guard against both forms for safety
+    if slug.startswith("careers-"):
+        base_url = f"https://{slug}.icims.com"
+    else:
+        base_url = f"https://careers-{slug}.icims.com"
     all_jobs  = []
     seen_ids  = set()
 
+    import time
     for page in range(MAX_PAGES):
         url  = f"{base_url}/jobs/search?pr={page}&in_iframe=1"
         jobs = _fetch_listing_page(url, base_url, company, seen_ids)
 
-        if not jobs:
-            break  # no more jobs
+        if jobs is None:
+            break  # network/HTTP error — stop pagination
+
+        if len(jobs) == 0:
+            break  # genuine end of results
 
         all_jobs.extend(jobs)
-
-        import time
         time.sleep(PAGE_DELAY)
 
     return all_jobs
@@ -77,18 +85,25 @@ def fetch_jobs(slug, company):
 def _fetch_listing_page(url, base_url, company, seen_ids):
     """
     Fetch one listing page and extract job stubs.
-    Returns list of job dicts with posted_at=None.
+
+    Returns:
+        list of job dicts  — page fetched (may be empty = end of results)
+        None               — network/HTTP error (caller should stop)
     """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+
+        # Non-200 = server error, not end of pages → return None
+        if resp.status_code == 404:
+            return []   # 404 = no jobs board exists
         if resp.status_code != 200:
-            return []
+            return None  # error — stop pagination
 
         soup = BeautifulSoup(resp.text, "html.parser")
         anchors = soup.select("a.iCIMS_Anchor")
 
         if not anchors:
-            return []
+            return []   # genuine empty page = end of results
 
         jobs = []
         for anchor in anchors:

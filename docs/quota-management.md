@@ -12,7 +12,7 @@ The pipeline manages three quotas:
 | Brave Search API calls | 1000/month (hard stop: 950) | Monthly |
 | AWS Athena queries | ~$0.00024/query | Pay-per-use |
 
-Both quotas are tracked locally in the database and synced with real values at runtime.
+All quotas are tracked locally in the database and synced with real values at runtime.
 
 ---
 
@@ -359,7 +359,7 @@ Brave is used exclusively in `build_ats_slug_list.py` — not during daily job m
 ### Quota tracking
 
 ```text
-Monthly limit:   1000 calls (Bing free tier)
+Monthly limit:   1000 calls (Brave free tier)
 Hard stop:        950 calls (50 call safety buffer)
 Resets:          1st of each month (auto-detected by month change)
 Stored in:       data/brave_quota.json
@@ -382,7 +382,7 @@ Monthly usage:    ~140/1000 (14% of limit)
 Well within free tier ✓
 ```
 
-### Checking Bing quota
+### Checking Brave quota
 
 ```bash
 python build_ats_slug_list.py --test

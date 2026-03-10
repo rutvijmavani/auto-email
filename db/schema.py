@@ -279,7 +279,8 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS serper_quota (
-            id                    INTEGER PRIMARY KEY DEFAULT 1,
+            id                    INTEGER PRIMARY KEY DEFAULT 1
+                                  CHECK (id = 1),
             credits_used          INTEGER DEFAULT 0,
             credits_limit         INTEGER DEFAULT 2500,
             low_credit_alert_sent INTEGER DEFAULT 0,

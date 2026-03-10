@@ -18,10 +18,11 @@ from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
 
 # Only search these platforms via Serper
 # (others handled by sitemap/API probe)
+# Only Workday + Oracle HCM via Serper (2 credits per company)
+# iCIMS removed — handled by Phase 2 API probe + Brave Search
 SERPER_SEARCHES = [
     ("workday",    "site:myworkdayjobs.com"),
     ("oracle_hcm", "site:fa.oraclecloud.com"),
-    ("icims",      "site:icims.com"),
 ]
 
 # Sentinel for exhausted credits
@@ -64,22 +65,23 @@ def detect_via_serper(company):
                 timeout=10
             )
 
-            # Track credit usage
-            increment_serper_credits(1)
-
             if resp.status_code == 429:
-                print(f"   [WARNING] Serper rate limited")
-                return SERPER_EXHAUSTED
+                print("   [WARNING] Serper rate limited — retry later")
+                # 429 = transient, not exhausted — don't charge credit
+                continue
 
             if resp.status_code in (401, 403):
                 print(f"   [WARNING] Serper auth error {resp.status_code} "
                       f"— check SERPER_API_KEY")
-                return None
+                return None  # no credit charged on auth failure
 
             if resp.status_code != 200:
                 print(f"   [WARNING] Serper error {resp.status_code} "
                       f"for {company}/{platform}")
-                continue
+                continue  # no credit charged on error
+
+            # Only charge credit on successful response
+            increment_serper_credits(1)
 
             items = resp.json().get("organic", [])
 

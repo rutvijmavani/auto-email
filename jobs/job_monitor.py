@@ -500,6 +500,33 @@ def run_detect_ats(company=None, override_platform=None,
         build_detection_report(results, date_str)
 
 
+
+def _print_detection_queue_status():
+    """Print detection queue status summary."""
+    try:
+        from db.db import get_detection_queue_stats
+        stats = get_detection_queue_stats()
+        p1 = stats.get("priority1_new", 0) or 0
+        p2 = stats.get("priority2_quiet", 0) or 0
+        p3 = stats.get("priority3_unknown", 0) or 0
+        p4 = stats.get("priority4_custom", 0) or 0
+        total = p1 + p2 + p3 + p4
+
+        if total > 0:
+            print(f"\n[INFO] Detection queue ({total} companies pending):")
+            if p1: print(f"  Priority 1 (new):          {p1}")
+            if p2: print(f"  Priority 2 (14+ empty):    {p2}")
+            if p3: print(f"  Priority 3 (unknown):      {p3}")
+            if p4: print(f"  Priority 4 (custom/retry): {p4}")
+            print(f"  Estimated days to complete: "
+                  f"{max(1, total // 10)} days at 10/day")
+        else:
+            print("[OK] Detection queue empty — all companies detected")
+    except Exception:
+        pass  # non-critical display function
+
+
+
 def run_monitor_status():
     """Show monitoring status summary. Called by --monitor-status."""
     init_db()

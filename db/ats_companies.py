@@ -166,6 +166,12 @@ def upsert_company(platform, slug, company_name=None,
             updates.append("last_seen_crawl = ?")
             params.append(crawl_source)
 
+        # Persist source so detection/backfill rows are never
+        # accidentally downgraded to 'crawl' by subsequent updates
+        if source is not None:
+            updates.append("source = ?")
+            params.append(source)
+
         updates.append("last_verified = ?")
         params.append(datetime.now().isoformat())
 

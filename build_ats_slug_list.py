@@ -391,30 +391,41 @@ def repair_athena_table():
 
 
 def _delete_s3_result(conn):
-    """Delete Athena result CSV from S3 immediately after use."""
+    """
+    Delete specific Athena result files from S3.
+    Uses query execution ID to target exact files only —
+    never deletes other results in the bucket.
+    """
     try:
-        # Extract bucket and key from S3 output path
+        # Get query execution ID from pyathena connection
+        query_id = getattr(conn, "query_id", None) or                    getattr(conn, "_query_id", None)
+
+        if not query_id:
+            print("  [WARNING] Could not get Athena query ID "
+                  "— skipping S3 cleanup")
+            return
+
+        # Build exact S3 keys for this query only
         s3_path = ATHENA_S3_OUTPUT.rstrip("/")
         bucket  = s3_path.replace("s3://", "").split("/")[0]
         prefix  = "/".join(
             s3_path.replace("s3://", "").split("/")[1:]
         )
+        prefix  = prefix.rstrip("/")
 
-        s3 = boto3.client("s3", region_name=AWS_REGION)
+        s3   = boto3.client("s3", region_name=AWS_REGION)
+        keys = [
+            f"{prefix}/{query_id}.csv",
+            f"{prefix}/{query_id}.csv.metadata",
+        ]
 
-        # List and delete recent result files
-        response = s3.list_objects_v2(
-            Bucket=bucket,
-            Prefix=prefix,
-            MaxKeys=10,
-        )
-
-        for obj in response.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith(".csv") or key.endswith(".metadata"):
+        for key in keys:
+            try:
                 s3.delete_object(Bucket=bucket, Key=key)
+            except Exception:
+                pass  # file may not exist — that's fine
 
-        print(f"  [S3] Result deleted from {ATHENA_S3_OUTPUT}")
+        print(f"  [S3] Result deleted: {query_id}.csv")
 
     except Exception as e:
         print(f"  [WARNING] Could not delete S3 result: {e}")
@@ -751,7 +762,8 @@ def _extract_slug_from_url(url, platform):
 
 def save_to_db(platform_slugs, crawl_id):
     """
-    Save all discovered slugs to ats_discovery.db.
+    Save Athena-discovered slugs to ats_discovery.db.
+    source='crawl' — subject to sliding window cleanup.
     Returns total new slugs inserted.
     """
     from db.schema_discovery import init_discovery_db
@@ -768,6 +780,44 @@ def save_to_db(platform_slugs, crawl_id):
         print(f"  [DB] {platform:<15} "
               f"{len(slugs):>6,} slugs  "
               f"{added:>5,} new")
+
+    return total_new
+
+
+def _save_brave_to_db(platform_slugs, crawl_id):
+    """
+    Save Brave Search-discovered slugs to ats_discovery.db.
+    source='brave' — NEVER deleted by sliding window cleanup.
+    Brave slugs are not crawl-sourced so they persist indefinitely.
+    """
+    from db.schema_discovery import init_discovery_db
+    from db.ats_companies import get_discovery_conn
+
+    init_discovery_db()
+    total_new = 0
+
+    conn = get_discovery_conn()
+    try:
+        for platform, slugs in platform_slugs.items():
+            if not slugs:
+                continue
+            added = 0
+            for slug in slugs:
+                result = conn.execute("""
+                    INSERT OR IGNORE INTO ats_companies
+                        (platform, slug, crawl_source,
+                         last_seen_crawl, source)
+                    VALUES (?, ?, ?, ?, 'brave')
+                """, (platform, str(slug), crawl_id, crawl_id))
+                if result.rowcount > 0:
+                    added += 1
+            conn.commit()
+            total_new += added
+            print(f"  [DB] {platform:<15} "
+                  f"{len(slugs):>6,} slugs  "
+                  f"{added:>5,} new  (source=brave)")
+    finally:
+        conn.close()
 
     return total_new
 
@@ -928,9 +978,11 @@ def main():
         )
 
         if brave_slugs:
-            print(f"\n  Saving Brave results to DB:")
-            latest_crawl = window[0] if window else "brave"
-            save_to_db(brave_slugs, f"brave-{latest_crawl}")
+            print("\n  Saving Brave results to DB:")
+            # Use source='brave' so sliding window cleanup never deletes
+            # these rows — they are not crawl-sourced
+            latest_crawl = window[0] if window else "unknown"
+            _save_brave_to_db(brave_slugs, latest_crawl)
 
     # ── CLEANUP: ARCHIVE + DELETE STALE ─────────────────
     if not args.test:

@@ -68,9 +68,9 @@ Requirements for wake-on-timer to work:
 ```
 Service:  Oracle Cloud Infrastructure (OCI)
 Tier:     Always Free (not just 12 months)
-Shape:    VM.Standard.E2.1.Micro (AMD)
-Specs:    1 GB RAM, 1 OCPU, 47 GB storage
-Count:    2 free VMs available
+Shape:    VM.Standard.A1.Flex (ARM/Ampere)
+Specs:    4 OCPUs, 24 GB RAM, 47 GB storage
+          (free allowance: 3,000 OCPU-hours/month)
 Cost:     $0 forever
 ```
 
@@ -123,8 +123,10 @@ OCI Console → Compute → Instances → Create Instance
 
 Settings:
   Name:    recruiter-pipeline
-  Image:   Ubuntu 22.04
-  Shape:   VM.Standard.E2.1.Micro (Always Free)
+  Image:   Ubuntu 22.04 (ARM-compatible)
+  Shape:   VM.Standard.A1.Flex (Always Free)
+  OCPUs:   2
+  RAM:     12 GB
   Storage: 47 GB boot volume
 
 Networking:
@@ -148,14 +150,7 @@ ssh -i /path/to/private-key.pem ubuntu@<your-vm-ip>
 # Update system
 sudo apt update && sudo apt upgrade -y
 
-# Add 1 GB swap file (CRITICAL for Playwright)
-# Without swap, Playwright may OOM kill on 1 GB RAM VM
-sudo fallocate -l 1G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-# Make permanent across reboots
-echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+# No swap needed — A1.Flex has 12 GB RAM (Playwright uses ~600 MB)
 
 # Install Python 3.11
 sudo apt install python3.11 python3.11-pip python3-venv -y
@@ -417,43 +412,36 @@ Available:                     ~42.5 GB (90% free)
 Storage is not a concern. The pipeline uses ~9.6%
 of available storage even after 6 months.
 
-### Compute (Oracle free tier: 1 OCPU + 1 GB RAM)
+### Compute (Oracle free tier: A1.Flex — 2 OCPU + 12 GB RAM)
 
 ```
 Pipeline         RAM Peak   Duration    Risk
 ─────────────────────────────────────────────────
---monitor-jobs   ~250 MB    5 min       Low ✓
---outreach-only  ~80 MB     5 min       Low ✓
---sync-forms     ~50 MB     30 sec      Low ✓
---find-only      ~600 MB    30-40 min   Medium*
---verify-only    ~600 MB    10-15 min   Medium*
-DB backup        ~80 MB     5 sec       Low ✓
-
-* Playwright (Chromium) is memory-intensive
-  Mitigated by 1 GB swap file (see below)
+--monitor-jobs   ~250 MB    5 min       None ✓
+--outreach-only  ~80 MB     5 min       None ✓
+--sync-forms     ~50 MB     30 sec      None ✓
+--find-only      ~600 MB    30-40 min   None ✓
+--verify-only    ~600 MB    10-15 min   None ✓
+DB backup        ~80 MB     5 sec       None ✓
+build_ats_slug   ~200 MB    5 min       None ✓
 ```
 
 All pipelines run sequentially — never in parallel.
-Peak RAM at any moment: ~600 MB (Playwright runs).
+Peak RAM: ~600 MB out of 12 GB available (5% usage).
+No swap file needed.
 
-### Critical: Swap File (Required)
+### No Swap Needed (A1.Flex)
 
 ```
-Without swap: Playwright may OOM kill on 1 GB RAM VM
-With 1 GB swap: effective 2 GB RAM → comfortable
+A1.Flex has 12 GB RAM → no swap file needed.
+Playwright uses ~600 MB → trivial on 12 GB.
 
-Setup (included in Step 4 above):
-  sudo fallocate -l 1G /swapfile
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile
-  sudo swapon /swapfile
-  echo '/swapfile none swap sw 0 0' >> /etc/fstab
-
-Effect:
-  Physical RAM:  1 GB
-  Swap:          1 GB
-  Effective:     2 GB
-  Playwright:    ~600 MB → plenty of headroom ✓
+Verify Playwright works on ARM after setup:
+  playwright install chromium
+  python -c "
+  from playwright.sync_api import sync_playwright
+  print('[OK] Playwright ARM working')
+  "
 ```
 
 ---
@@ -765,7 +753,7 @@ Add to weekly checklist:
 
 ---
 
-## ## Backup & Recovery
+## Backup & Recovery
 
 ### What to backup
 ```
