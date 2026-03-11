@@ -233,7 +233,8 @@ def run():
             email_sent = _send_text_fallback(new_postings)
     else:
         print(f"\n[INFO] No new matching jobs today.")
-        email_sent = _send_no_jobs_email()
+        alerts    = _build_alerts(stats, len(companies))
+        email_sent = _send_no_jobs_email(alerts=alerts)
 
     # ── Save stats ──
     final_stats = {
@@ -312,7 +313,7 @@ def _print_metric_alerts(stats, total_companies):
             print(f"  [{level}] {alert['message']}")
 
 
-def _send_no_jobs_email():
+def _send_no_jobs_email(alerts=None):
     """Send brief email when no new jobs found today. Returns bool."""
     from outreach.report_templates.base import send_report_email
     try:
@@ -320,7 +321,33 @@ def _send_no_jobs_email():
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    subject = f"[Digest] Job Digest · {date_str} · No new jobs today"
+    # Build alerts section if any warnings exist
+    alerts_html = ""
+    if alerts:
+        rows = ""
+        for a in alerts:
+            level   = a["level"]
+            msg     = a["message"]
+            colour  = ("#dc2626" if level == "error"
+                       else "#d97706" if level == "warning"
+                       else "#2563eb")
+            icon    = "🔴" if level == "error" else "⚠️" if level == "warning" else "ℹ️"
+            rows += (
+                f"<tr><td style='padding:6px 12px;color:{colour};'>"
+                f"{icon} {msg}</td></tr>"
+            )
+        alerts_html = f"""
+        <h3 style="color:#1e293b;margin-top:24px;">Pipeline Alerts</h3>
+        <table style="border-collapse:collapse;width:100%;
+                      background:#fef9f0;border-radius:6px;">
+          {rows}
+        </table>"""
+
+    alert_subject = " ⚠️" if alerts else ""
+    subject = (
+        f"[Digest] Job Digest · {date_str} · "
+        f"No new jobs today{alert_subject}"
+    )
     html = f"""
     <html><body style="font-family:sans-serif;padding:24px;">
       <h2>No New Jobs Today</h2>
@@ -330,6 +357,7 @@ def _send_no_jobs_email():
       <p style="color:#64748b;">
         This is normal — check again tomorrow.
       </p>
+      {alerts_html}
     </body></html>
     """
     return send_report_email(subject, html)

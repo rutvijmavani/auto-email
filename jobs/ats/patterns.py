@@ -79,17 +79,63 @@ def _make_patterns():
     # Workday — {slug}.{wd}.myworkdayjobs.com/{path}
     # Excludes: jobs.myworkdayjobs.com (aggregator)
     #           apply.myworkdayjobs.com (application portal)
+    # Note: URLs often have locale prefix before the career site name
+    #   e.g. /en-US/NVIDIAExternalCareerSite/job/...
+    #        /NVIDIAExternalCareerSite/job/...
+    # We always want the career site name, not the locale prefix.
+    _LOCALE_PATTERN = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
+
+    def _workday_slug(m):
+        raw_path = m.group(3).rstrip("/")
+        parts    = [p for p in raw_path.split("/") if p]
+        # Skip locale prefix (en-US, fr-FR, zh-CN, etc.)
+        path = next(
+            (p for p in parts if not _LOCALE_PATTERN.match(p)),
+            parts[0] if parts else "careers"
+        )
+        return json.dumps({
+            "slug": m.group(1).lower(),
+            "wd":   m.group(2).lower(),
+            "path": path or "careers",
+        })
+
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.(wd\d+)\.myworkdayjobs\.com/([^/?&#\s]*)",
+            r"([a-z0-9]+)\.(wd\d+)\.myworkdayjobs\.com/([^?&#\s]*)",
             re.IGNORECASE
         ),
         "workday",
-        lambda m: json.dumps({
-            "slug": m.group(1).lower(),
-            "wd":   m.group(2).lower(),
-            "path": m.group(3).rstrip("/") or "careers",
-        }),
+        _workday_slug,
+    ))
+
+    # Workday (alternate domain) — {wd}.myworkdaysite.com/recruiting/{tenant}/{career_site}
+    # e.g. wd1.myworkdaysite.com/recruiting/fmr/FidelityCareers/...
+    # API: wd1.myworkdaysite.com/wday/cxs/{tenant}/{career_site}/jobs
+    _LOCALE_PATTERN2 = re.compile(r'^[a-z]{2}[-_][A-Z]{2}$')
+
+    def _workdaysite_slug(m):
+        wd     = m.group(1).lower()
+        tenant = m.group(2).lower()
+        parts  = [p for p in m.group(3).strip("/").split("/") if p]
+        path   = next(
+            (p for p in parts if not _LOCALE_PATTERN2.match(p)),
+            parts[0] if parts else "careers"
+        )
+        return json.dumps({
+            "slug": tenant,
+            "wd":   wd,
+            "path": path,
+            "site": "myworkdaysite",  # flag different base URL
+        })
+
+    patterns.append((
+        re.compile(
+            r"(wd\d+)\.myworkdaysite\.com/(?:en-[A-Z]{2}/)?recruiting/"
+            r"([a-z0-9]+)/([^?&#\s]*)",
+            re.IGNORECASE
+        ),
+        "workday",
+        _workdaysite_slug,
     ))
 
     # Oracle HCM — {slug}.fa.oraclecloud.com/hcmUI/.../sites/{site_id}
