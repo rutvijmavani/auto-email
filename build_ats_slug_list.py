@@ -309,7 +309,7 @@ def run_athena_query(sql, crawl_id, csv_path):
         print(f"  [ATHENA] {len(df):,} rows → saved to {csv_path}")
 
         # Delete S3 result immediately
-        _delete_s3_result(conn)
+        _delete_s3_result(cursor)
 
         return df
 
@@ -490,8 +490,15 @@ def extract_slug(row):
         path_  = path.strip("/").split("/")[0]
         if not tenant or tenant in EXCLUDED_SLUGS:
             return None
-        if not re.match(r'^wd\d+$', wd, re.IGNORECASE):
+        if not re.match(r'^wd[0-9]+$', wd, re.IGNORECASE):
             return None  # skip non-WD subdomains
+        # Validate path_ — reject URL delimiters or scheme patterns
+        if (path_ and (
+            ":" in path_ or "//" in path_
+            or len(path_) <= 3
+            or not re.match(r'^[a-zA-Z0-9_-]+$', path_)
+        )):
+            path_ = ""  # store empty rather than invalid value
         return ("workday", json.dumps({
             "slug": tenant,
             "wd":   wd,
