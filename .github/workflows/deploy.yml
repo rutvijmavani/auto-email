@@ -45,17 +45,20 @@ jobs:
             set -e
             cd ${{ secrets.VM_PATH }}
 
-            echo "[1/4] Fetching latest code..."
+            echo "[1/5] Upgrading pip..."
+            source venv/bin/activate
+            pip install --upgrade pip --quiet
+
+            echo "[2/5] Fetching latest code..."
             git fetch --all
             git config advice.detachedHead false
 
-            echo "[2/4] Checking out exact validated commit..."
+            echo "[3/5] Checking out exact validated commit..."
             git checkout ${{ github.sha }}
 
-            echo "[3/4] Installing dependencies..."
-            source venv/bin/activate
+            echo "[4/5] Installing dependencies..."
             pip install -r requirements.txt --quiet
 
-            echo "[4/4] Deploy complete ✓"
+            echo "[5/5] Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"
