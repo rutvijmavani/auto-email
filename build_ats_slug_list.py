@@ -92,19 +92,21 @@ BRAVE_QUOTA_FILE   = os.path.join("data", "brave_quota.json")
 BRAVE_QUOTA_LIMIT  = 950   # hard stop at 950/1000 free tier
 
 # Brave search queries for platforms CC misses
+# Note: Brave free tier returns 422 for site: operator queries
+# Use plain domain-based queries instead
 BRAVE_QUERIES = {
     "lever": [
-        "site:jobs.lever.co",
-        "site:jobs.lever.co software engineer",
-        "site:jobs.lever.co engineering",
+        "jobs.lever.co software engineer jobs",
+        "jobs.lever.co engineering jobs",
+        "jobs.lever.co product manager careers",
     ],
     "oracle_hcm": [
-        "site:fa.oraclecloud.com/hcmUI/CandidateExperience",
-        "site:fa.oraclecloud.com jobs",
+        "fa.oraclecloud.com hcmUI CandidateExperience jobs",
+        "fa.oraclecloud.com careers apply jobs",
     ],
     "icims": [
-        "site:icims.com/jobs",
-        "site:icims.com careers software",
+        "careers icims.com jobs apply",
+        "icims.com jobs software engineer careers",
     ],
 }
 
@@ -359,8 +361,10 @@ def repair_athena_table():
     Idempotent — safe to run multiple times.
     Takes ~30-60 seconds on first run, faster after.
     """
-    sql = f"MSCK REPAIR TABLE \"{ATHENA_DATABASE}\".\"{ATHENA_TABLE}\""
-    print(f"  [ATHENA] Running MSCK REPAIR TABLE "
+    # Athena v3 (Trino engine) uses REFRESH — not MSCK REPAIR TABLE
+    sql = (f'REFRESH PARTITION METADATA '
+           f'\"{ATHENA_DATABASE}\".\"{ATHENA_TABLE}\"')
+    print(f"  [ATHENA] Running REFRESH PARTITION METADATA "
           f"(discovering new partitions)...")
 
     try:
