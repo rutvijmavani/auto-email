@@ -203,8 +203,6 @@ def _store_and_return(company, result):
     try:
         from db.ats_companies import mark_from_detection
         from db.schema_discovery import init_discovery_db
-        import json as _json
-
         init_discovery_db()
 
         # For Workday/Oracle: DB stores plain tenant slug not full JSON
@@ -213,7 +211,7 @@ def _store_and_return(company, result):
         discovery_slug = slug
         if platform in ("workday", "oracle_hcm") and slug:
             try:
-                parsed = _json.loads(slug)
+                parsed = json.loads(slug)
                 discovery_slug = parsed.get("slug", slug)
             except (ValueError, TypeError):
                 pass  # already plain string
@@ -392,14 +390,13 @@ def override_ats(company, platform, slug):
     Manually override ATS detection.
     Manual overrides are never auto-re-detected.
     """
-    import json as _json
     try:
-        slug_data = _json.loads(slug) if slug and slug.startswith("{") else {}
+        slug_data = json.loads(slug) if slug and slug.startswith("{") else {}
         slug_data["_manual"]   = True
         slug_data["_platform"] = platform
         if not slug_data.get("slug"):
             slug_data["slug"] = slug
-        slug_str = _json.dumps(slug_data)
+        slug_str = json.dumps(slug_data)
     except Exception:
         slug_str = slug
 
@@ -444,8 +441,7 @@ def needs_redetection(company_row, redetect_days=14):
         return False
     if slug:
         try:
-            import json as _json
-            slug_data = _json.loads(slug)
+            slug_data = json.loads(slug)
             if slug_data.get("_manual"):
                 return False
         except (ValueError, TypeError):

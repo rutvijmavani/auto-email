@@ -2,6 +2,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from jobs.ats_verifier import _name_matches
+
 # jobs/ats_sitemap.py — Phase 1: ats_discovery.db lookup
 #
 # Queries ats_discovery.db for known company slugs.
@@ -44,6 +46,10 @@ def _enrich_slug_on_demand(platform, slug):
             # 404 → slug genuinely doesn't exist → delete from DB
             from db.ats_companies import delete_company
             delete_company(platform, slug)
+            return None
+
+        if status == "skip":
+            # Enricher skipped — can't validate → reject
             return None
 
         if status == "ok" and data:
@@ -121,7 +127,6 @@ def detect_via_sitemap(company):
 
                 if is_enrich and db_name:
                     # Already enriched — validate name matches
-                    from jobs.ats_verifier import _name_matches
                     if not _name_matches(db_name, company, slug):
                         logger.debug(
                             "P1 slug match rejected (enriched): "
@@ -137,7 +142,6 @@ def detect_via_sitemap(company):
                         platform, slug
                     )
                     if enriched_name:
-                        from jobs.ats_verifier import _name_matches
                         if not _name_matches(enriched_name, company, slug):
                             logger.debug(
                                 "P1 slug match rejected (on-demand): "

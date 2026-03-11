@@ -3,7 +3,7 @@
 # One-time script to backfill Workday detection results
 # into ats_discovery.db so future P1 lookups work
 
-from db.ats_companies import get_discovery_conn, mark_from_detection
+from db.ats_companies import get_discovery_conn
 from db.schema_discovery import init_discovery_db
 
 init_discovery_db()
@@ -31,7 +31,7 @@ workday_slugs = [
     ("workday", "elevancehealth", "Elevance Health"),
     ("workday", "expedia", "Expedia"),
     ("workday", "fedex", "FedEx"),
-    ("workday", "fordfoundation", "Ford Motor Company"),
+    ("workday", "ford", "Ford Motor Company"),
     ("workday", "generalmotors", "General Motors"),
     ("workday", "gilead", "Gilead Sciences"),
     ("workday", "homedepot", "Home Depot"),
@@ -98,4 +98,4 @@ for platform, slug, company_name in workday_slugs:
 conn.commit()
 conn.close()
 print(f"[OK] Backfill complete: {added} added, {updated} updated")
-print(f"[OK] Future P1 detections will use DB instead of Serper")
+print("[OK] Future P1 detections will use DB instead of Serper")
