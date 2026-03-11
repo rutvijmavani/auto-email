@@ -193,3 +193,45 @@ MONITOR_ATS_UNKNOWN_ALERT     = 0.20  # alert if > 20% companies unknown ATS
 MONITOR_RELIABILITY_ALERT     = 0.90  # alert if < 90% runs succeed (7 days)
 MONITOR_MATCH_RATE_LOW_ALERT  = 0.05  # alert if < 5% fetched jobs match filters
 MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% fetched jobs match filters
+
+# ─────────────────────────────────────────
+# RATE LIMITING & API HEALTH
+# ─────────────────────────────────────────
+
+# Alert thresholds
+RATE_LIMIT_CRITICAL_THRESHOLD = 10   # % 429s in one run → immediate email
+RATE_LIMIT_WARNING_THRESHOLD  = 2    # % 429s → warning in daily digest
+SLOW_RESPONSE_THRESHOLD_MS    = 3000 # avg ms → warning in daily digest
+SERPER_CRITICAL_THRESHOLD     = 0    # credits remaining → immediate email
+SERPER_WARNING_THRESHOLD      = 50   # credits remaining → warning in digest
+
+# Per-platform delays (seconds) — minimal, evidence-based
+# Increase only if 429s appear in api_health table
+PLATFORM_DELAYS = {
+    "greenhouse":      {"base": 0.2, "jitter": 0.1},
+    "lever":           {"base": 0.3, "jitter": 0.1},
+    "ashby":           {"base": 0.2, "jitter": 0.1},
+    "smartrecruiters": {"base": 0.3, "jitter": 0.1},
+    "workday":         {"base": 1.0, "jitter": 0.3},
+    "oracle_hcm":      {"base": 0.5, "jitter": 0.2},
+    "icims":           {"base": 0.5, "jitter": 0.2},
+}
+
+# Delay between companies during --monitor-jobs
+MONITOR_BETWEEN_COMPANIES = {"base": 0.5, "jitter": 0.2}
+
+# Enrichment daily limits per platform
+# Increase only after 30 days of clean api_health data
+ENRICH_DAILY_LIMITS = {
+    "greenhouse":      300,
+    "ashby":           300,
+    "lever":           150,
+    "icims":           100,
+    "workday":          30,
+    "oracle_hcm":       30,
+    "smartrecruiters":  50,
+}
+ENRICH_WINDOW_HOURS = 18   # spread requests over this many hours
+
+# Alert deduplication window
+ALERT_DEDUP_HOURS = 24     # don't re-send same alert within N hours

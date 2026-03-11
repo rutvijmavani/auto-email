@@ -489,6 +489,17 @@ Nightly jobs chain with && operator:
 0 9 * * * cd /home/ubuntu/mail &&   source venv/bin/activate &&   python pipeline.py --outreach-only   >> logs/outreach_6--.log 2>&1
 
 # ─────────────────────────────────────────
+# WEEKLY SUMMARY — Monday 9 AM (separate from job digest)
+# ─────────────────────────────────────────
+0 9 * * 1 cd /home/ubuntu/mail && source venv/bin/activate && python pipeline.py --weekly-summary >> logs/weekly_$(date +\%Y-\%m-\%d).log 2>&1
+
+# ─────────────────────────────────────────
+# ENRICHMENT — Daily 3 AM (Phase B background enrichment)
+# Spreads ~910 requests over 18-hour window
+# ─────────────────────────────────────────
+0 3 * * * cd /home/ubuntu/mail && source venv/bin/activate && python enrich_ats_companies.py --daily >> logs/enrich_$(date +\%Y-\%m).log 2>&1
+
+# ─────────────────────────────────────────
 # ATS DISCOVERY — 1st of every month at 1 AM
 # build slug list → enrich company names
 # ─────────────────────────────────────────
@@ -557,7 +568,10 @@ Import prospective companies? → --import-prospects prospects.txt
 Check prospective status?     → --prospects-status
 Monitor jobs + send digest?   → --monitor-jobs (automated 8 AM)
 View digest in terminal?      → --jobs-digest
-Detect ATS for all companies? → --detect-ats --batch  (10/run, uses 4-phase detection)
+Detect ATS for all companies? → --detect-ats --batch
+Send weekly summary now?       → --weekly-summary
+Run priority enrichment?       → python enrich_ats_companies.py --priority
+Run daily enrichment?          → python enrich_ats_companies.py --daily  (10/run, uses 4-phase detection)
 ```
 
 ---

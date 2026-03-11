@@ -26,6 +26,7 @@ from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats,
     get_ats_module, QuotaExhaustedException
 )
+from jobs.ats.base import between_companies_delay
 from db.serper_quota import get_serper_credits
 from jobs.job_filter import filter_jobs, is_fresh
 from config import (
@@ -132,6 +133,10 @@ def run():
             continue
 
         stats["total_jobs_fetched"] += len(raw_jobs)
+
+        # Delay between companies — reduces per-IP concentration
+        # 0.5s ±0.2s — minimal but meaningful
+        between_companies_delay()
 
         if not raw_jobs:
             update_company_check(company, found_jobs=False)

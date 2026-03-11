@@ -771,7 +771,8 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.ok = True
         mock_response.status_code = 200
-        mock_response.text = f'<html><h1>SWE</h1><div id="content">  {"Line\n\n\n\nLine " * 50}  </div></html>'
+        _long_text = "Line\n\n\n\nLine " * 50
+        mock_response.text = f'<html><h1>SWE</h1><div id="content">  {_long_text}  </div></html>'
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
