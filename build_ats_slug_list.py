@@ -491,7 +491,19 @@ def extract_slug(row):
     if domain == "myworkdayjobs.com":
         tenant = fourth.lower()
         wd     = third.lower()
-        path_  = path.strip("/").split("/")[0]
+        # Extract path — skip locale prefix (en-US, en-GB, fr-FR etc.)
+        # URLs look like: /en-US/CareerSiteName/job/... OR /CareerSiteName/job/...
+        # We want the career site name, not the locale
+        _LOCALE_RE = re.compile(
+            r'^[a-z]{2}[-_][A-Z]{2}$'  # matches en-US, fr-FR, zh-CN etc.
+        )
+        parts = [p for p in path.strip("/").split("/") if p]
+        path_ = ""
+        for part in parts:
+            if not _LOCALE_RE.match(part):
+                path_ = part
+                break  # first non-locale segment is the career site name
+
         if not tenant or tenant in EXCLUDED_SLUGS:
             return None
         if not re.match(r'^wd[0-9]+$', wd, re.IGNORECASE):
@@ -503,11 +515,10 @@ def extract_slug(row):
             or not re.match(r'^[a-zA-Z0-9_-]+$', path_)
         )):
             path_ = ""  # store empty rather than invalid value
-        return ("workday", json.dumps({
-            "slug": tenant,
-            "wd":   wd,
-            "path": path_,
-        }))
+        slug_data = {"slug": tenant, "wd": wd}
+        if path_:  # omit key entirely when path is empty
+            slug_data["path"] = path_
+        return ("workday", json.dumps(slug_data))
 
     # ── Oracle HCM ───────────────────────────────────────
     if domain == "oraclecloud.com":
