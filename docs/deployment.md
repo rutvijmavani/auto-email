@@ -491,13 +491,13 @@ Nightly jobs chain with && operator:
 # ─────────────────────────────────────────
 # WEEKLY SUMMARY — Monday 9 AM (separate from job digest)
 # ─────────────────────────────────────────
-0 9 * * 1 cd /home/opc/mail && source venv/bin/activate && python pipeline.py --weekly-summary >> logs/weekly_$(date +\%Y-\%m-\%d).log 2>&1
+0 9 * * 1 cd /home/ubuntu/mail && source venv/bin/activate && python pipeline.py --weekly-summary >> logs/weekly_$(date +\%Y-\%m-\%d).log 2>&1
 
 # ─────────────────────────────────────────
 # ENRICHMENT — Daily 3 AM (Phase B background enrichment)
 # Spreads ~910 requests over 18-hour window
 # ─────────────────────────────────────────
-0 3 * * * cd /home/opc/mail && source venv/bin/activate && python enrich_ats_companies.py --daily >> logs/enrich_$(date +\%Y-\%m).log 2>&1
+0 3 * * * cd /home/ubuntu/mail && source venv/bin/activate && python enrich_ats_companies.py --daily >> logs/enrich_$(date +\%Y-\%m).log 2>&1
 
 # ─────────────────────────────────────────
 # ATS DISCOVERY — 1st of every month at 1 AM

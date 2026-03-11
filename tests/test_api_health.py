@@ -91,12 +91,12 @@ class TestApiHealthCRUD(unittest.TestCase):
         """UNIQUE(date, platform) enforced."""
         self._insert("greenhouse")
         # Second insert should fail
-        with self.assertRaises(Exception):
+        with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("""
                 INSERT INTO api_health (date, platform)
                 VALUES (?, 'greenhouse')
             """, (date.today().isoformat(),))
-            self.conn.commit()
+            self.conn.commit()  # IntegrityError raised here
 
     def test_seven_day_summary_aggregates(self):
         """7-day summary sums across all days."""

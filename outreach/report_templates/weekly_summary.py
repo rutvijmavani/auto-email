@@ -20,7 +20,7 @@ def build_weekly_summary():
     week_ago = today - timedelta(days=7)
     date_str = today.strftime("%B %d, %Y")
     period   = (
-        f"{week_ago.strftime('%b %d')} – "
+        f"{week_ago.strftime('%b %d')} - "
         f"{today.strftime('%b %d, %Y')}"
     )
 

@@ -120,7 +120,7 @@ def mark_warnings_sent(alert_ids):
             UPDATE pipeline_alerts
             SET notified = 1, notified_at = ?
             WHERE id IN ({placeholders})
-        """, [now] + list(alert_ids))
+        """, [now, *alert_ids])
         conn.commit()
     finally:
         conn.close()

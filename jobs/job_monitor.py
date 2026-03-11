@@ -135,7 +135,6 @@ def run():
 
         # Delay between companies — reduces per-IP concentration
         # 0.5s ±0.2s — minimal but meaningful
-        from jobs.ats.base import between_companies_delay
         between_companies_delay()
 
         if not raw_jobs:

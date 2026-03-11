@@ -410,19 +410,69 @@ def run_priority_enrichment():
     finally:
         disc_conn.close()
 
-    # Filter to prospect matches
+    # Build normalized prospect slug set for exact matching
+    import difflib
+    def _normalize(s):
+        import re
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    prospect_slugs_norm = {
+        _normalize(p) for p in prospect_names
+    }
+
+    # Filter to prospect matches — strict matching only
     priority_slugs = []
     for row in rows:
         name    = (row["company_name"] or "").lower()
         website = (row["website"] or "").lower().replace("www.", "")
         slug    = row["slug"].lower()
+        slug_norm = _normalize(slug)
 
-        # Match by name, website, or slug similarity
-        if (any(p in name or name in p
-                for p in prospect_names if len(p) > 4)
-                or website in prospect_domains
-                or any(slug in p or p in slug
-                       for p in prospect_names if len(p) > 4)):
+        matched = False
+
+        # 1. Exact normalized slug match
+        if slug_norm in prospect_slugs_norm:
+            matched = True
+
+        # 2. Website domain match
+        if not matched and website in prospect_domains:
+            matched = True
+
+        # 3. Word-boundary name match (avoid false positives)
+        if not matched and name:
+            for prospect in prospect_names:
+                if len(prospect) < 5:
+                    continue
+                # All significant words must appear as whole words
+                words = [
+                    w for w in prospect.split()
+                    if len(w) > 3
+                ]
+                if words and all(
+                    re.search(
+                        rf'(?<![a-z0-9]){re.escape(w)}(?![a-z0-9])',
+                        name
+                    )
+                    for w in words
+                ):
+                    matched = True
+                    break
+
+        # 4. Fuzzy fallback — only high confidence (>= 0.85)
+        if not matched and name:
+            for prospect in prospect_names:
+                if len(prospect) < 5:
+                    continue
+                ratio = difflib.SequenceMatcher(
+                    None,
+                    _normalize(name),
+                    _normalize(prospect)
+                ).ratio()
+                if ratio >= 0.85:
+                    matched = True
+                    break
+
+        if matched:
             priority_slugs.append(dict(row))
 
     if not priority_slugs:

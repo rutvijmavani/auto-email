@@ -246,7 +246,7 @@ def _send_critical_alert(alert_id, platform, rate, threshold):
         build_critical_rate_limit_alert(platform, rate, threshold)
         mark_notified(alert_id)
     except Exception as e:
-        logger.error("Failed to send critical alert: %s", e)
+        logger.exception("Failed to send critical alert")
 
 
 # ─────────────────────────────────────────

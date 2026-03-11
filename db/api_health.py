@@ -4,7 +4,6 @@
 # Used to detect rate limiting and performance issues.
 # Powers --monitor-status health table and alert emails.
 
-import json
 from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
@@ -190,15 +189,14 @@ def get_todays_stats():
         conn.close()
 
 
-def get_run_429_rate(platform, since_minutes=60):
+def get_run_429_rate(platform):
     """
-    Get 429 rate for a platform in the last N minutes.
-    Used to check if we're being rate limited RIGHT NOW.
-    Returns percentage (0-100).
+    Get today's aggregate 429 rate for a platform.
+    Returns percentage (0-100) based on daily counters.
+    Used to check if rate limiting is occurring today.
     """
     conn = get_conn()
     try:
-        # Use today's data as proxy
         today = date.today().isoformat()
         row   = conn.execute("""
             SELECT requests_made, requests_429
