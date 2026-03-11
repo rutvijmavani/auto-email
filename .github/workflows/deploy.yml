@@ -48,6 +48,7 @@ jobs:
             echo "[1/5] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
+            python --version
 
             echo "[2/5] Fetching latest code..."
             git fetch --all
