@@ -199,14 +199,28 @@ def _store_and_return(company, result):
     _store_detection(company, platform, slug)
 
     # Self-populate ats_discovery.db
-    # This makes future Phase 1 lookups instant
+    # This makes future Phase 1 lookups instant (no Serper needed)
     try:
         from db.ats_companies import mark_from_detection
         from db.schema_discovery import init_discovery_db
+        import json as _json
+
         init_discovery_db()
+
+        # For Workday/Oracle: DB stores plain tenant slug not full JSON
+        # e.g. {"slug":"nvidia","wd":"wd5"} → store as "nvidia"
+        # so P1 slug lookup finds it correctly
+        discovery_slug = slug
+        if platform in ("workday", "oracle_hcm") and slug:
+            try:
+                parsed = _json.loads(slug)
+                discovery_slug = parsed.get("slug", slug)
+            except (ValueError, TypeError):
+                pass  # already plain string
+
         mark_from_detection(
             platform=platform,
-            slug=slug,
+            slug=discovery_slug,
             company_name=company,
         )
     except Exception as e:
