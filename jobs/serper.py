@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 # jobs/serper.py — Phase 3b: Serper.dev API for Workday + Oracle detection
 #
 # Only used when Phase 1 (sitemap), Phase 2 (API probe),
@@ -113,6 +117,24 @@ def detect_via_serper(company):
                     slug_for_validation, company
                 ):
                     continue
+
+                # Additional validation: check page title/snippet
+                # contains the company name to avoid false positives
+                # e.g. "Ford Motor Company" → "fordfoundation" rejected
+                # because "Ford Foundation" != "Ford Motor Company"
+                page_title   = item.get("title", "")
+                page_snippet = item.get("snippet", "")
+                combined     = f"{page_title} {page_snippet}"
+
+                if combined.strip():
+                    from jobs.ats.base import validate_company_match
+                    if not validate_company_match(combined, company):
+                        logger.debug(
+                            "Serper result rejected: company=%s "
+                            "title=%s slug=%s",
+                            company, page_title, slug_for_validation
+                        )
+                        continue
 
                 print(f"   [SERPER] {company} -> {platform} "
                       f"(slug: {result['slug']})")

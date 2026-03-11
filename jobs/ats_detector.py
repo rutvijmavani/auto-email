@@ -199,14 +199,26 @@ def _store_and_return(company, result):
     _store_detection(company, platform, slug)
 
     # Self-populate ats_discovery.db
-    # This makes future Phase 1 lookups instant
+    # This makes future Phase 1 lookups instant (no Serper needed)
     try:
         from db.ats_companies import mark_from_detection
         from db.schema_discovery import init_discovery_db
         init_discovery_db()
+
+        # For Workday/Oracle: DB stores plain tenant slug not full JSON
+        # e.g. {"slug":"nvidia","wd":"wd5"} → store as "nvidia"
+        # so P1 slug lookup finds it correctly
+        discovery_slug = slug
+        if platform in ("workday", "oracle_hcm") and slug:
+            try:
+                parsed = json.loads(slug)
+                discovery_slug = parsed.get("slug", slug)
+            except (ValueError, TypeError):
+                pass  # already plain string
+
         mark_from_detection(
             platform=platform,
-            slug=slug,
+            slug=discovery_slug,
             company_name=company,
         )
     except Exception as e:
@@ -378,14 +390,13 @@ def override_ats(company, platform, slug):
     Manually override ATS detection.
     Manual overrides are never auto-re-detected.
     """
-    import json as _json
     try:
-        slug_data = _json.loads(slug) if slug and slug.startswith("{") else {}
+        slug_data = json.loads(slug) if slug and slug.startswith("{") else {}
         slug_data["_manual"]   = True
         slug_data["_platform"] = platform
         if not slug_data.get("slug"):
             slug_data["slug"] = slug
-        slug_str = _json.dumps(slug_data)
+        slug_str = json.dumps(slug_data)
     except Exception:
         slug_str = slug
 
@@ -430,8 +441,7 @@ def needs_redetection(company_row, redetect_days=14):
         return False
     if slug:
         try:
-            import json as _json
-            slug_data = _json.loads(slug)
+            slug_data = json.loads(slug)
             if slug_data.get("_manual"):
                 return False
         except (ValueError, TypeError):
