@@ -11,22 +11,39 @@ from jobs.ats.base import fetch_json
 
 
 # Oracle HCM REST API endpoint
-# site_id varies per company (e.g. CX_1001 for JPMorgan)
-BASE_URL = (
-    "https://{slug}.fa.oraclecloud.com/hcmRestApi/resources/latest/"
-    "recruitingCEJobRequisitions?"
-    "finder=CandidateExperience&"
-    "CandidateExperienceId={site_id}&"
-    "limit={limit}&offset={offset}&"
-    "expand=requisitionList.secondaryLocations,"
-    "requisitionList.otherWorkLocations"
-)
+# Correct finder format discovered from browser XHR inspection:
+#   finder=findReqs;siteNumber={site_id},limit={limit},offset={offset}
+# Parameters are semicolon-separated key=value pairs inside the finder value
+#
+# URL variants:
+#   Standard: {slug}.fa.oraclecloud.com          (JPMorgan)
+#   Regional: {slug}.fa.{region}.oraclecloud.com (Goldman Sachs → us2)
+def _build_oracle_url(slug, region, site_id, limit, offset):
+    """Build Oracle HCM API URL handling optional region subdomain."""
+    if region:
+        host = f"{slug}.fa.{region}.oraclecloud.com"
+    else:
+        host = f"{slug}.fa.oraclecloud.com"
+    return (
+        f"https://{host}/hcmRestApi/resources/latest/"
+        f"recruitingCEJobRequisitions?"
+        f"onlyData=true&"
+        f"expand=requisitionList.workLocation,"
+        f"requisitionList.otherWorkLocations,"
+        f"requisitionList.secondaryLocations,"
+        f"requisitionList.requisitionFlexFields&"
+        f"finder=findReqs%3BsiteNumber%3D{site_id}"
+        f"%2Climit%3D{limit}%2Coffset%3D{offset}"
+        f"%2CsortBy%3DPOSTING_DATES_DESC"
+    )
 
-# Careers page URL (used for verification)
-CAREERS_URL = (
-    "https://{slug}.fa.oraclecloud.com/hcmUI/CandidateExperience/"
-    "en/sites/{site_id}/jobs"
-)
+def _build_careers_url(slug, region, site_id):
+    """Build Oracle HCM careers page URL."""
+    if region:
+        host = f"{slug}.fa.{region}.oraclecloud.com"
+    else:
+        host = f"{slug}.fa.oraclecloud.com"
+    return f"https://{host}/hcmUI/CandidateExperience/en/sites/{site_id}/jobs"
 
 
 def fetch_jobs(slug_info, company):
@@ -43,6 +60,7 @@ def fetch_jobs(slug_info, company):
 
     slug    = slug_info.get("slug", "")
     site_id = slug_info.get("site", "")
+    region  = slug_info.get("region", "")
 
     if not slug or not site_id:
         return []
@@ -52,10 +70,7 @@ def fetch_jobs(slug_info, company):
     limit    = 25
 
     while True:
-        url  = BASE_URL.format(
-            slug=slug, site_id=site_id,
-            limit=limit, offset=offset
-        )
+        url = _build_oracle_url(slug, region, site_id, limit, offset)
         data = fetch_json(url)
         if not data:
             break
@@ -64,21 +79,23 @@ def fetch_jobs(slug_info, company):
         if not items:
             break
 
-        # Oracle wraps jobs in requisitionList
+        # Oracle wraps jobs in requisitionList inside each item
         for item in items:
             reqs = item.get("requisitionList", [])
-            all_jobs.extend(reqs)
+            if isinstance(reqs, list):
+                all_jobs.extend(reqs)
 
-        total = data.get("totalResults", 0)
+        # Oracle returns count not totalResults
+        total = data.get("count", 0) or data.get("totalResults", 0)
         offset += limit
-        if offset >= total:
+        if not data.get("hasMore", False) or offset >= total:
             break
 
-    return [_normalize(j, company, slug, site_id)
+    return [_normalize(j, company, slug_info, slug, site_id)
             for j in all_jobs if j.get("Title")]
 
 
-def _normalize(job, company, slug, site_id):
+def _normalize(job, company, slug_info, slug, site_id):
     """Normalize Oracle HCM job to standard format."""
     posted_at = None
     posted    = job.get("PostedDate")
@@ -97,12 +114,12 @@ def _normalize(job, company, slug, site_id):
     # Build job URL
     req_id  = job.get("ExternalJobId", "") or \
               job.get("RequisitionId", "")
+    region  = slug_info.get("region", "") if isinstance(slug_info, dict) else ""
     job_url = (
-        f"https://{slug}.fa.oraclecloud.com/hcmUI/"
-        f"CandidateExperience/en/sites/{site_id}/"
-        f"job/{req_id}"
+        f"{_build_careers_url(slug, region, site_id).rstrip('/jobs')}"
+        f"/job/{req_id}"
         if req_id else
-        CAREERS_URL.format(slug=slug, site_id=site_id)
+        _build_careers_url(slug, region, site_id)
     )
 
     return {

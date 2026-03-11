@@ -104,7 +104,9 @@ def fetch_jobs(slug_info, company):
     Returns list of normalized job dicts.
     slug_info = {"slug": "capitalone", "wd": "wd12", "path": "Capital_One"}
     """
-    url = _build_url(slug_info)
+    slug = slug_info.get("slug", "")
+    wd   = slug_info.get("wd", "")
+    url  = _build_url(slug_info)
 
     all_jobs = []
     offset   = 0
