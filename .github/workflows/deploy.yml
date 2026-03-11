@@ -35,8 +35,6 @@ jobs:
           PYTHONPATH: .
 
       # ── Deploy exact validated commit to Oracle VM ─
-      # Uses GITHUB_SHA to deploy the exact commit
-      # that passed tests — not the moving main ref
       - name: Deploy to Oracle VM
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -49,6 +47,7 @@ jobs:
 
             echo "[1/4] Fetching latest code..."
             git fetch --all
+            git config advice.detachedHead false
 
             echo "[2/4] Checking out exact validated commit..."
             git checkout ${{ github.sha }}
