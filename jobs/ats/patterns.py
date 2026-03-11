@@ -140,15 +140,20 @@ def _make_patterns():
     ))
 
     # Oracle HCM — {slug}.fa.oraclecloud.com/hcmUI/.../sites/{site_id}
+    # Also handles regional variants:
+    #   hdpc.fa.us2.oraclecloud.com  (Goldman Sachs)
+    #   jpmc.fa.oraclecloud.com      (JPMorgan — no region)
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.fa\.oraclecloud\.com/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
+            r"([a-z0-9]+)\.fa\.(?:(us\d+|eu\d+|ap\d+)\.)?"
+            r"oraclecloud\.com/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
             re.IGNORECASE
         ),
         "oracle_hcm",
         lambda m: json.dumps({
-            "slug": m.group(1).lower(),
-            "site": m.group(2).rstrip("/"),
+            "slug":   m.group(1).lower(),
+            "region": m.group(2).lower() if m.group(2) else "",
+            "site":   m.group(3).rstrip("/"),
         }),
     ))
 

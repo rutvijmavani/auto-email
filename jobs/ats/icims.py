@@ -99,6 +99,14 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         if resp.status_code != 200:
             return None  # error — stop pagination
 
+        # Detect JS redirect — company migrated away from iCIMS
+        # e.g. AMD: window.top.location.href = 'https://careers.amd.com/jobs'
+        # Page is tiny (<500 chars) and contains a redirect script
+        if (len(resp.text) < 500 and
+                "location.href" in resp.text and
+                "window.top" in resp.text):
+            return None  # company no longer on iCIMS — stop
+
         soup = BeautifulSoup(resp.text, "html.parser")
         anchors = soup.select("a.iCIMS_Anchor")
 
