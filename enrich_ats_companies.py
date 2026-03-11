@@ -98,7 +98,11 @@ def enrich_lever(slug):
 def enrich_ashby(slug):
     """
     GET api.ashbyhq.com/posting-api/job-board/{slug}
-    Returns {"jobBoard": {"name": "Linear", "websiteUrl": "..."}, "jobs": [...]}
+    Public API returns {"jobs": [...]} only — no jobBoard.name.
+    Extract company name from:
+      1. organizationName field on job postings (most reliable)
+      2. HTML page title of the job board page
+      3. Fall back to slug title-cased
     """
     url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
     try:
@@ -107,11 +111,68 @@ def enrich_ashby(slug):
             return None, "inactive"
         if resp.status_code != 200:
             return None, "error"
-        data  = resp.json()
-        board = data.get("jobBoard", {})
-        jobs  = data.get("jobs", [])
-        name    = board.get("name", "") or board.get("companyName", "")
-        website = board.get("websiteUrl", "") or board.get("url", "")
+        data = resp.json()
+        jobs = data.get("jobs", [])
+
+        name    = ""
+        website = ""
+
+        # 1. organizationName on job postings — most reliable
+        if jobs:
+            for job in jobs[:5]:  # check first 5 jobs
+                org_name = (
+                    job.get("organizationName", "") or
+                    job.get("companyName", "") or
+                    job.get("organization", {}).get("name", "")
+                    if isinstance(job.get("organization"), dict)
+                    else ""
+                )
+                if org_name:
+                    name = org_name
+                    break
+
+        # 2. Try job board HTML page title
+        if not name:
+            try:
+                page = requests.get(
+                    f"https://jobs.ashbyhq.com/{slug}",
+                    headers=HEADERS,
+                    timeout=TIMEOUT,
+                )
+                if page.status_code == 200:
+                    from bs4 import BeautifulSoup
+                    soup  = BeautifulSoup(page.text, "html.parser")
+                    title = soup.find("title")
+                    if title and title.text:
+                        # Title format: "Company Name - Jobs"
+                        # or "Jobs at Company Name"
+                        raw = title.text.strip()
+                        for suffix in [
+                            " - Jobs", " Jobs", " Careers",
+                            " | Jobs", " | Careers"
+                        ]:
+                            if raw.endswith(suffix):
+                                name = raw[:-len(suffix)].strip()
+                                break
+                        if not name:
+                            for prefix in ["Jobs at ", "Careers at "]:
+                                if raw.startswith(prefix):
+                                    name = raw[len(prefix):].strip()
+                                    break
+                    # Try og:site_name meta tag
+                    if not name:
+                        og = soup.find(
+                            "meta", property="og:site_name"
+                        )
+                        if og and og.get("content"):
+                            name = og["content"].strip()
+            except Exception:
+                pass
+
+        # 3. Fall back to slug title-cased
+        if not name:
+            name = slug.replace("-", " ").title()
+
         return {
             "company_name": name,
             "website":      website,

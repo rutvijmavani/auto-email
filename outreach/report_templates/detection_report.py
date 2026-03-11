@@ -290,16 +290,17 @@ def build_detection_report(results, date_str):
         </table>"""
 
     # ── Full body ──
+    _override_hint = info_box(
+        "To override a detection: "
+        "<code>python pipeline.py --detect-ats &quot;Company&quot; "
+        "--override &lt;platform&gt; &lt;slug&gt;</code>"
+    )
     body = f"""
     {summary_html}
     {close_calls_html}
     {unsupported_html}
     {unknowns_html}
-    {info_box(
-        "To override a detection: "
-        "<code>python pipeline.py --detect-ats \"Company\" "
-        "--override &lt;platform&gt; &lt;slug&gt;</code>"
-    )}
+    {_override_hint}
     """
 
     html = _base(
