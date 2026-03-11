@@ -515,11 +515,10 @@ def extract_slug(row):
             or not re.match(r'^[a-zA-Z0-9_-]+$', path_)
         )):
             path_ = ""  # store empty rather than invalid value
-        return ("workday", json.dumps({
-            "slug": tenant,
-            "wd":   wd,
-            "path": path_,
-        }))
+        slug_data = {"slug": tenant, "wd": wd}
+        if path_:  # omit key entirely when path is empty
+            slug_data["path"] = path_
+        return ("workday", json.dumps(slug_data))
 
     # ── Oracle HCM ───────────────────────────────────────
     if domain == "oraclecloud.com":

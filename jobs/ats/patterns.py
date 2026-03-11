@@ -130,8 +130,9 @@ def _make_patterns():
 
     patterns.append((
         re.compile(
-            r"(wd\d+)\.myworkdaysite\.com/(?:en-[A-Z]{2}/)?recruiting/"
-            r"([a-z0-9]+)/([^?&#\s]*)",
+            r"(wd\d+)\.myworkdaysite\.com/"
+            r"(?:[a-z]{2}[-_][A-Z]{2}/)?"   # optional locale: en-US, fr-FR, pt_BR
+            r"recruiting/([a-z0-9]+)/([^?&#\s]*)",
             re.IGNORECASE
         ),
         "workday",

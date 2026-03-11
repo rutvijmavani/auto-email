@@ -324,17 +324,19 @@ def _send_no_jobs_email(alerts=None):
     # Build alerts section if any warnings exist
     alerts_html = ""
     if alerts:
+        import html as _html
         rows = ""
         for a in alerts:
-            level   = a["level"]
-            msg     = a["message"]
+            level       = a["level"]
+            msg         = a["message"]
+            escaped_msg = _html.escape(msg, quote=True)
             colour  = ("#dc2626" if level == "error"
                        else "#d97706" if level == "warning"
                        else "#2563eb")
             icon    = "🔴" if level == "error" else "⚠️" if level == "warning" else "ℹ️"
             rows += (
                 f"<tr><td style='padding:6px 12px;color:{colour};'>"
-                f"{icon} {msg}</td></tr>"
+                f"{icon} {escaped_msg}</td></tr>"
             )
         alerts_html = f"""
         <h3 style="color:#1e293b;margin-top:24px;">Pipeline Alerts</h3>

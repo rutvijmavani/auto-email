@@ -52,7 +52,7 @@ def detect(company):
     for slug in slugify(company):
         for wd in WD_VARIANTS:
             for path in _get_path_variants(slug, company):
-                url = BASE_URL.format(slug=slug, wd=wd, path=path)
+                url = _build_url({"slug": slug, "wd": wd, "path": path})
                 data = fetch_json(url, params={"limit": 20, "offset": 0})
                 if data is None:
                     continue
@@ -143,14 +143,13 @@ def _normalize(job, company, slug, wd):
         except (ValueError, AttributeError):
             posted_at = None
 
-    # Build job URL
+    # Build job URL — use _build_url so myworkdaysite tenants get correct URL
     external_url = job.get("externalUrl", "")
     if not external_url:
-        job_id = job.get("bulletFields", [""])[0] if job.get("bulletFields") else ""
-        external_url = (
-            f"https://{slug}.{wd}.myworkdayjobs.com/"
-            f"careers/job/{job_id}"
-        )
+        job_id       = job.get("bulletFields", [""])[0] if job.get("bulletFields") else ""
+        slug_info_fb = {"slug": slug, "wd": wd, "path": "careers"}
+        base         = _build_url(slug_info_fb).replace("/jobs", "")
+        external_url = f"{base}/job/{job_id}" if job_id else base
 
     return {
         "company":     company,

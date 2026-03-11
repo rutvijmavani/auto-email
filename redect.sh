@@ -5,8 +5,10 @@
 #
 # Usage: bash redetect_workday.sh
 
-cd /home/opc/mail
-source venv/bin/activate
+set -euo pipefail
+
+cd /home/opc/mail || { echo "[ERROR] Could not cd to /home/opc/mail"; exit 1; }
+source venv/bin/activate || { echo "[ERROR] Could not activate venv"; exit 1; }
 
 echo "Step 1 — Clearing all Workday detections..."
 python3 -c "
