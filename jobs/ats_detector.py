@@ -129,21 +129,11 @@ def detect_ats(company, domain=None, page=None, sb=None):
         return _store_and_return(company, result)
 
     # Phase 3a: HTML + redirect scan
-    # Also runs Oracle HCM career page detection (documented pipeline)
+    # career_page.detect() handles ALL ATS including Oracle HCM
+    # It scans for fa.oraclecloud.com URLs in HTML — no separate
+    # oracle pass needed, avoids fetching same career page twice
     if domain:
         print(f"   [P3a] HTML redirect scan ({domain})...")
-
-        # Oracle HCM: follow career page → extract oraclecloud URL → verify
-        from jobs.ats.oracle_hcm import detect as oracle_detect
-        oracle_slug = oracle_detect(company, domain)
-        if oracle_slug:
-            result = {
-                "platform": "oracle_hcm",
-                "slug":     json.dumps(oracle_slug),
-            }
-            print(f"   [P3a HIT] {company} -> oracle_hcm / {result['slug']}")
-            return _store_and_return(company, result)
-
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
         if result:
@@ -221,20 +211,13 @@ def _store_and_return(company, result):
         from db.schema_discovery import init_discovery_db
         init_discovery_db()
 
-        # For Workday/Oracle: DB stores plain tenant slug not full JSON
-        # e.g. {"slug":"nvidia","wd":"wd5"} → store as "nvidia"
-        # so P1 slug lookup finds it correctly
-        discovery_slug = slug
-        if platform in ("workday", "oracle_hcm") and slug:
-            try:
-                parsed = json.loads(slug)
-                discovery_slug = parsed.get("slug", slug)
-            except (ValueError, TypeError):
-                pass  # already plain string
-
+        # Store FULL JSON slug in ats_discovery.db
+        # P1 returns this directly to fetch_jobs which needs wd+path
+        # e.g. {"slug":"nvidia","wd":"wd5","path":"NVIDIAExternalCareerSite"}
+        # Plain slugs ("nvidia") cause 0 jobs — missing wd/path info
         mark_from_detection(
             platform=platform,
-            slug=discovery_slug,
+            slug=slug,  # full JSON preserved
             company_name=company,
         )
     except Exception as e:

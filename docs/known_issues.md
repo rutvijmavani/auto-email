@@ -445,14 +445,23 @@ Our regex captured `en-US` as path → 404 on every API call
 `patterns.py` and `build_ats_slug_list.py`
 Also removed `en-US` from `WD_PATH_VARIANTS` in `workday.py`
 
-### ⚪ Workday self-population stored JSON slug instead of plain slug
-**Resolved:** 2026-03-11
-**Was:** `mark_from_detection()` called with full JSON
-`{"slug":"nvidia","wd":"wd5"}` instead of plain `"nvidia"`
-→ Discovery DB never matched on P1 lookup
-→ Serper used every re-detection instead of DB
-**Fix:** Extract plain slug before saving in `ats_detector.py`
-Backfill script: `backfill_workday_discovery.py`
+### ⚪ Workday self-population stored plain slug — SUPERSEDED
+**Status:** Superseded by Session 4 fix (see below).
+**Was:** `mark_from_detection()` called with plain slug
+`"nvidia"` instead of full JSON
+`{"slug":"nvidia","wd":"wd5","path":"NVIDIAExternalCareerSite"}`
+→ P1 lookup never matched (plain slug can't build URL)
+→ Serper used on every re-detection instead of DB
+**Session 2 fix applied:** Extract plain slug before saving
+in `ats_detector.py`. Backfill script:
+`backfill_workday_discovery.py`
+**Session 4 correction:** The Session 2 fix was reversed.
+`ats_detector.py` `_store_and_return()` now saves the FULL
+JSON slug to `ats_discovery.db` (not plain slug), because
+`fetch_jobs()` requires `wd` and `path` fields to build
+the correct Workday URL. A plain `"nvidia"` slug causes
+0 jobs — the full JSON `{"slug":"nvidia","wd":"wd5",
+"path":"NVIDIAExternalCareerSite"}` is required.
 
 ### ⚪ myworkdaysite.com not supported (Fidelity, Wells Fargo)
 **Resolved:** 2026-03-11
@@ -607,4 +616,90 @@ Needs manual override with spectrum slug
 
 ### 🟡 Ford Motor Company
 Detected via Oracle HCM — verify correct site ID
-Currently returning only 25 jobs (Oracle pagination now fixed)
+Oracle pagination fixed in Session 3 — now returns full job count
+
+---
+
+## Session 4 Decisions & Status (2026-03-12)
+
+### ✅ Workday GET→POST fix deployed
+All Workday companies now return full job counts.
+Pagination fix: total cached from first page (page 2+ returns total=0).
+
+### ✅ Serper Workday verification — 3-layer approach
+Layer 1: urlWID from career site HTML (e.g. "ASMLExternalCareerSite")
+  → Definitive only when source is live HTML (urlWID regex match).
+  → If HTML fetch fails or urlWID is generic, falls through to Layer 2.
+  → Never uses path/slug fallbacks as Layer 1 — those feed Layer 2/3
+    to avoid premature rejection on non-HTML values.
+Layer 2: path from Serper URL slug_info["path"] directly
+  (e.g. "qualcomm_careers" → contains "qualcomm" ✓)
+Layer 3: title_verified fallback (when urlWID+path both generic,
+  e.g. ms.wd5/External — only trusted if Serper also returned text)
+Result: ASML, Qualcomm, Morgan Stanley now correctly detected.
+
+### ✅ Oracle HCM removed from Serper permanently
+site:fa.oraclecloud.com returns JPMorgan for every company query.
+Oracle detection via P3a exclusively: `career_page.py` scans HTML
+for oraclecloud URLs during the company.com/careers redirect scan.
+`_verify_slug_via_api()` always returns False for oracle_hcm —
+no separate oracle_hcm.detect() pass is called anywhere.
+
+### ✅ Full JSON slug stored in ats_discovery.db
+`_store_and_return()` in `ats_detector.py` saves the complete JSON
+slug (e.g. `{"slug":"nvidia","wd":"wd5","path":"NVIDIAExternalCareerSite"}`)
+to `ats_discovery.db` via `mark_from_detection()`. Plain slugs cause
+0 jobs because `_build_url()` needs `wd` and `path` to construct the
+correct Workday URL. The Session 2 note about extracting a plain slug
+before saving is superseded — full JSON is the correct behaviour.
+
+### ✅ _slug_valid_for_company validation scope
+`_slug_valid_for_company` (in `jobs/ats/patterns.py` or equivalent)
+validates company name against slug for: Greenhouse, Lever, iCIMS.
+It is deliberately skipped for Workday and Oracle HCM because:
+  - Workday slugs are tenant identifiers (e.g. "wd5"), not company names
+  - Oracle HCM slugs are internal site codes, not company names
+  - Validation for these platforms uses urlWID/path (Workday) or
+    career_page HTML scan (Oracle HCM) instead
+Future debugging: if a Greenhouse/Lever/iCIMS slug passes API probe
+but fails company validation, check `_slug_valid_for_company`. For
+Workday/Oracle mismatches, check Layer 1 (urlWID HTML) and Layer 2
+(path) in `_verify_slug_via_api()` in `jobs/serper.py`.
+
+### ✅ Bridge fixes
+- Redundant oracle_hcm.detect() removed from P3a (career_page handles it)
+- career_page.py is the single source of truth for Oracle HCM detection
+- job_monitor.py run() now passes domain=company_row.get("domain") to
+  detect_ats() during re-detection, enabling P3a to run with correct
+  domain for Oracle HCM and other HTML-redirect-based platforms
+
+### ✅ form_sync.py integration
+Applied job URLs auto-extract ATS + add company to prospective pool
+status='applied' — not monitored until explicitly activated.
+
+### 🔴 Unknown companies — UNRESOLVED (by design)
+Decision: Use 2 Google Forms approach
+  Form 1 (existing): Job applications → extracts ATS from URL automatically
+  Form 2 (new):      Prospective companies → manual entry of company + URL
+                     when you find a company worth tracking
+
+Root causes of unknowns:
+  - JS-rendered career pages (Playwright needed or manual URL)
+  - Non-standard career page paths (/our-firm/careers etc.)
+  - Unsupported ATS (Taleo, SAP SuccessFactors, Brassring, Workday HCM)
+  - Custom ATS (Tesla, Netflix, Uber, Google, Apple, Meta, Amazon, Microsoft)
+  - Serper finds wrong company (Lam Research → silfex subsidiary slug)
+
+### 🔴 ats_discovery.db enrichment — needs more data
+Current P1 hit rate is limited because ats_discovery.db is sparse.
+More monitoring runs → more self-population → better P1 coverage.
+Decision: retain more than 3 crawls data in ats_companies DB
+to build a richer reference dataset over time.
+
+### 🟡 Detection failure classification — future work
+All UNKNOWN companies look the same in DB.
+Need detection_failure_reason column to categorise:
+  → JS-rendered → needs Google Sheet
+  → Unsupported ATS → mark permanently
+  → Wrong domain → fixable automatically
+  → Custom ATS → already handled separately
