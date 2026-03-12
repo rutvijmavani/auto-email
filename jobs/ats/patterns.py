@@ -240,6 +240,50 @@ COMPANY_ALIASES = {
     "Morgan Stanley":   ["morganstanley", "ms"],
     "Deutsche Bank":    ["deutschebank", "db"],
     "State Street":     ["statestreet", "ssga"],
+    # Financial firms with short/non-obvious slugs
+    "Wells Fargo":      ["wellsfargo", "wf"],
+    "Fidelity":         ["fidelity", "fmr"],
+    "Citibank":         ["citibank", "citi"],
+    "Goldman Sachs":    ["goldmansachs", "goldman", "gs"],
+    "American Express": ["americanexpress", "amex"],
+    "Capital One":      ["capitalone", "capital"],
+    # Tech companies
+    "ServiceNow":       ["servicenow", "snow"],
+    "Intuit":           ["intuit", "tbt"],
+    "Doordash":         ["doordash", "dd"],
+    "Wayfair":          ["wayfair", "wf2"],
+    "Fortinet":         ["fortinet", "ftnt"],
+    "Nutanix":          ["nutanix", "ntnx"],
+    "Splunk":           ["splunk"],
+    "Informatica":      ["informatica", "infa"],
+    "Docusign":         ["docusign", "docu"],
+    "Akamai Technologies": ["akamai"],
+    "Lam Research":     ["lamresearch", "lam", "lrcx"],
+    "Texas Instruments": ["texasinstruments", "ti"],
+    "NetApp":           ["netapp", "ntap"],
+    "Juniper Networks": ["junipernetworks", "juniper", "jnpr"],
+    "Synopsys":         ["synopsys", "snps"],
+    "Xilinx":           ["xilinx", "xlnx"],
+    # Other
+    "Starbucks":        ["starbucks", "sbux"],
+    "Caterpillar":      ["caterpillar", "cat"],
+    "Honeywell":        ["honeywell", "hol"],
+    "Siemens":          ["siemens"],
+    "Nokia":            ["nokia"],
+    "Ericsson":         ["ericsson"],
+    "Bosch":            ["bosch"],
+    "Genentech":        ["genentech", "gene"],
+    "Visa":             ["visa", "v"],
+    "VMware":           ["vmware"],
+    "Optum":            ["optum", "uhg"],
+    "Samsung Electronics America": ["samsungelectronicsamerica", "samsung", "sec"],
+    "Lucid":            ["lucid", "lcid"],
+    "MathWorks":        ["mathworks"],
+    "ByteDance":        ["bytedance"],
+    "TikTok":           ["tiktok"],
+    "SAP America":      ["sapamerica", "sap"],
+    "Cruise":           ["cruise", "getcruise"],
+    "Citrix":           ["citrix"],
 }
 
 
@@ -320,11 +364,26 @@ def validate_slug_for_company(slug, company):
         # Check 3: prefix match for all-lowercase compound slugs
         # "capitalone" starts with "capital" → match ✓
         # "hrblock" does NOT start with "block" → no match ✓
-        # Note: suffix match intentionally excluded to prevent
-        # "hrblock" matching "block"
         slug_lower = slug_text.lower()
         if slug_lower.startswith(kw.lower()):
             return True
+
+        # Check 4: substring match within path/career site name
+        # "WellsFargoJobs" contains "wells" and "fargo" ✓
+        # "wellsfargo" contains "wells" ✓
+        # Guard: keyword must not appear as a suffix of another word
+        # e.g. "block" in "hrblock" → rejected (suffix match)
+        # e.g. "wells" in "wellsfargo" → accepted (prefix match)
+        if len(kw) >= 4:
+            kw_lower   = kw.lower()
+            text_lower = slug_text.lower()
+            idx = text_lower.find(kw_lower)
+            while idx != -1:
+                # Check char before — must not be a letter (no suffix match)
+                before_ok = (idx == 0 or not text_lower[idx - 1].isalpha())
+                if before_ok:
+                    return True
+                idx = text_lower.find(kw_lower, idx + 1)
 
     return False
 
