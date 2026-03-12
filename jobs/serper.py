@@ -149,26 +149,27 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
 
             # Layer 1: urlWID from career site HTML
             # e.g. "ASMLExternalCareerSite" → contains "asml" ✓
-            # Some return generic: "careers", "External" → skip
+            # If non-generic and FAILS match → reject immediately
+            # (a specific identifier that doesn't match is definitive)
             site_title = _get_workday_site_title(slug_info)
-            if site_title and site_title.lower() not in GENERIC:
-                if _match_compact_identifier(site_title, company):
-                    return True
-                # False → don't stop, try next layer
+            site_title_specific = (
+                site_title and site_title.lower() not in GENERIC
+            )
+            if site_title_specific:
+                return _match_compact_identifier(site_title, company)
 
             # Layer 2: path from Serper URL
             # e.g. "qualcomm_careers" → contains "qualcomm" ✓
-            # More reliable than urlWID — comes directly from URL
+            # If non-generic and FAILS match → reject immediately
             path = slug_info.get("path", "")
-            if path and path.lower() not in GENERIC:
-                if _match_compact_identifier(path, company):
-                    return True
-                # False → don't stop, try layer 3
+            path_specific = path and path.lower() not in GENERIC
+            if path_specific:
+                return _match_compact_identifier(path, company)
 
             # Layer 3: title_verified fallback
-            # Both urlWID and path are generic (ms/External, qualcomm/careers)
+            # Only reached when BOTH urlWID and path are generic
+            # e.g. ms.wd5/External — no specific identifier available
             # Only trust if Serper returned meaningful title/snippet text
-            # Prevents false positives on empty Serper responses
             if title_verified and has_text:
                 return True
 

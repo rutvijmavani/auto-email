@@ -117,7 +117,10 @@ def run():
             rows_to_delete.append(sheet_row)
             continue
 
-        # Extract ATS from job URL if provided
+        # Extract ATS from job URL — no validation, user URL is ground truth
+        # match_ats_pattern extracts platform/slug from known ATS URL patterns
+        # If URL is not a known ATS URL (e.g. company careers page),
+        # domain is still stored so P3a can detect ATS automatically
         ats_result = None
         if job_url and _is_valid_url(job_url):
             ats_result = match_ats_pattern(job_url)
@@ -125,8 +128,8 @@ def run():
                 print(f"       [ATS] {ats_result['platform']} / "
                       f"{ats_result['slug'][:50]}")
             else:
-                print(f"       [INFO] No ATS pattern in URL — "
-                      f"will detect on next --detect-ats run")
+                print("       [INFO] URL stored — ATS will be detected "
+                      "automatically via career page scan")
 
         platform = ats_result["platform"] if ats_result else None
         slug     = ats_result["slug"]     if ats_result else None
@@ -161,9 +164,26 @@ def run():
                     rows_to_delete.append(sheet_row)
                     continue  # skip epilogue — already counted
                 else:
-                    print(f"       [SKIP] Already in pipeline "
-                          f"(status={existing['status']})")
-                    skipped += 1
+                    # Update domain/status/ATS even for existing rows
+                    # User may be providing a new URL or activating a company
+                    from urllib.parse import urlparse as _urlparse
+                    domain = _urlparse(job_url).hostname if job_url else None
+                    conn.execute(
+                        "UPDATE prospective_companies "
+                        "SET status='active', domain=COALESCE(?, domain)"
+                        + (", ats_platform=?, ats_slug=?, ats_detected_at=?"
+                           if ats_result else "") +
+                        " WHERE company=?",
+                        (
+                            (domain, platform, slug, datetime.utcnow(), company)
+                            if ats_result else
+                            (domain, company)
+                        )
+                    )
+                    conn.commit()
+                    print(f"       [OK] Updated existing company "
+                          f"(status→active)")
+                    imported += 1
                     rows_to_delete.append(sheet_row)
                     continue
             else:
