@@ -608,3 +608,58 @@ Needs manual override with spectrum slug
 ### 🟡 Ford Motor Company
 Detected via Oracle HCM — verify correct site ID
 Currently returning only 25 jobs (Oracle pagination now fixed)
+
+---
+
+## Session 4 Decisions & Status (2026-03-12)
+
+### ✅ Workday GET→POST fix deployed
+All Workday companies now return full job counts.
+Pagination fix: total cached from first page (page 2+ returns total=0).
+
+### ✅ Serper Workday verification — 3-layer approach
+Layer 1: urlWID from career site HTML (e.g. "ASMLExternalCareerSite")
+Layer 2: path from Serper URL (e.g. "qualcomm_careers")
+Layer 3: title_verified fallback (when urlWID+path both generic)
+Result: ASML, Qualcomm, Morgan Stanley now correctly detected.
+
+### ✅ Oracle HCM removed from Serper permanently
+site:fa.oraclecloud.com returns jpmc for every company.
+Oracle detection via P3a (career_page.py scans HTML for oraclecloud URLs).
+career_page.py handles ALL ATS platforms — no separate oracle pass needed.
+
+### ✅ Bridge fixes
+- Full JSON slug stored in ats_discovery.db (plain slug caused 0 jobs)
+- Redundant oracle_hcm.detect() removed from P3a (career_page handles it)
+- _slug_valid_for_company: validates Greenhouse/Lever/iCIMS, skips Workday/Oracle
+
+### ✅ form_sync.py integration
+Applied job URLs auto-extract ATS + add company to prospective pool
+status='applied' — not monitored until explicitly activated.
+
+### 🔴 Unknown companies — UNRESOLVED (by design)
+Decision: Use 2 Google Forms approach
+  Form 1 (existing): Job applications → extracts ATS from URL automatically
+  Form 2 (new):      Prospective companies → manual entry of company + URL
+                     when you find a company worth tracking
+
+Root causes of unknowns:
+  - JS-rendered career pages (Playwright needed or manual URL)
+  - Non-standard career page paths (/our-firm/careers etc.)
+  - Unsupported ATS (Taleo, SAP SuccessFactors, Brassring, Workday HCM)
+  - Custom ATS (Tesla, Netflix, Uber, Google, Apple, Meta, Amazon, Microsoft)
+  - Serper finds wrong company (Lam Research → silfex subsidiary slug)
+
+### 🔴 ats_discovery.db enrichment — needs more data
+Current P1 hit rate is limited because ats_discovery.db is sparse.
+More monitoring runs → more self-population → better P1 coverage.
+Decision: retain more than 3 crawls data in ats_companies DB
+to build a richer reference dataset over time.
+
+### 🟡 Detection failure classification — future work
+All UNKNOWN companies look the same in DB.
+Need detection_failure_reason column to categorise:
+  → JS-rendered → needs Google Sheet
+  → Unsupported ATS → mark permanently
+  → Wrong domain → fixable automatically
+  → Custom ATS → already handled separately

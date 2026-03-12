@@ -143,16 +143,29 @@ def _verify_slug_via_api(result, company, title_verified=False):
             slug_info.setdefault("wd",   "wd1")
             slug_info.setdefault("path", "careers")
 
-            # Primary: career site title contains company name
-            site_title = _get_workday_site_title(slug_info)
-            if site_title:
-                return validate_company_match(site_title, company)
+            # Generic urlWIDs/paths that carry no company signal
+            GENERIC = {"careers", "jobs", "external", "search",
+                       "career", "opportunities", "home", "ext"}
 
-            # Fallback: path often contains company name
-            # e.g. "WellsFargoJobs", "NVIDIAExternalCareerSite"
+            # Layer 1: urlWID from career site HTML
+            # e.g. "ASMLExternalCareerSite" → contains "asml" ✓
+            # Some return generic: "careers", "External" → skip
+            site_title = _get_workday_site_title(slug_info)
+            if site_title and site_title.lower() not in GENERIC:
+                return _match_compact_identifier(site_title, company)
+
+            # Layer 2: path from Serper URL
+            # e.g. "qualcomm_careers" → contains "qualcomm" ✓
+            # More reliable than urlWID — comes directly from URL
             path = slug_info.get("path", "")
-            if path and path not in ("careers", "jobs", "External"):
-                return validate_company_match(path, company)
+            if path and path.lower() not in GENERIC:
+                return _match_compact_identifier(path, company)
+
+            # Layer 3: title_verified fallback
+            # Both urlWID and path are generic (ms/External, qualcomm/careers)
+            # Serper title already confirmed company — trust it
+            if title_verified:
+                return True
 
             return False
 
