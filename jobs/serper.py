@@ -9,10 +9,9 @@ logger = logging.getLogger(__name__)
 # and Phase 3a (HTML redirect) all fail.
 #
 # Searches: "{company} site:myworkdayjobs.com"
-#           "{company} site:fa.oraclecloud.com"
 #
-# Uses 2 credits per company.
-# 2500 free credits on signup → covers 1250 companies.
+# Uses 1 credit per company.
+# 2500 free credits on signup → covers 2500 companies.
 # Sends email alert when < 50 credits remain.
 
 import json
@@ -25,7 +24,8 @@ from jobs.ats.patterns import match_ats_pattern
 # Oracle HCM removed — site:fa.oraclecloud.com returns JPMorgan results
 # for any company because Oracle job descriptions mention competitor names.
 # Oracle HCM is auto-detected via Phase 3a: ats_detector.py calls
-# oracle_hcm.detect() which follows company.com/careers → oraclecloud URL.
+# career_page.detect_via_career_page() which follows company.com/careers
+# and scans HTML for oraclecloud URLs.
 SERPER_SEARCHES = [
     ("workday", "site:myworkdayjobs.com"),
 ]
@@ -76,8 +76,20 @@ def _get_workday_site_title(slug_info):
         "WellsFargoJobs"           -> Wells Fargo
         "NVIDIAExternalCareerSite" -> Nvidia
         "ASMLExternalCareerSite"   -> ASML
+
+    Returns:
+        (title, source) tuple where source is one of:
+          "html"   — urlWID extracted from live HTML (definitive)
+          "path"   — path field from slug_info (fallback)
+          "slug"   — slug field from slug_info (last resort)
+          None     — no title available at all
+
+    Callers MUST check source before treating the title as definitive.
+    Only source=="html" should cause early rejection on mismatch.
+    source=="path" and source=="slug" should only be used as
+    supplementary signals (Layer 2/3), never as Layer 1 grounds for
+    rejection.
     """
-    import re
     import requests
     from jobs.ats.workday import _build_url
 
@@ -94,7 +106,7 @@ def _get_workday_site_title(slug_info):
             # e.g.  urlWID: "WellsFargoJobs"
             match = re.search(r'urlWID\s*:\s*"([^"]+)"', resp.text)
             if match:
-                return match.group(1).strip()
+                return match.group(1).strip(), "html"
             logger.debug("urlWID not found in Workday HTML for %s",
                          slug_info.get("slug", "?"))
         else:
@@ -104,13 +116,19 @@ def _get_workday_site_title(slug_info):
         logger.debug("Workday site title fetch failed for %s: %s",
                      slug_info.get("slug", "?"), e)
 
-    # Fallback: path often contains company name
+    # Fallback: path often contains company name.
+    # These are NOT returned as "html" — callers treat them as Layer 2/3
+    # signals and must not use them for definitive Layer 1 rejection.
     path = slug_info.get("path", "")
     if path and path not in ("careers", "jobs", "External", "Careers"):
-        return path
+        return path, "path"
 
     # Last resort: slug itself
-    return slug_info.get("slug", "")
+    slug_val = slug_info.get("slug", "")
+    if slug_val:
+        return slug_val, "slug"
+
+    return None, None
 
 
 def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
@@ -121,7 +139,7 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
     Workday:    fetches career site title ("Wells Fargo Jobs") → match
     Greenhouse: fetches board name ("Stripe") → match
     Ashby:      fetches jobBoard.name → match
-    Oracle:     confirms board exists (limited company data)
+    Oracle:     always returns False — Oracle not detected via Serper
     Lever:      falls back to slug validation (no company name in API)
     """
     from jobs.ats.base import validate_company_match
@@ -147,27 +165,36 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             GENERIC = {"careers", "jobs", "external", "search",
                        "career", "opportunities", "home", "ext"}
 
-            # Layer 1: urlWID from career site HTML
+            # Layer 1: urlWID from career site HTML (source == "html")
             # e.g. "ASMLExternalCareerSite" → contains "asml" ✓
-            # If non-generic and FAILS match → reject immediately
-            # (a specific identifier that doesn't match is definitive)
-            site_title = _get_workday_site_title(slug_info)
-            site_title_specific = (
-                site_title and site_title.lower() not in GENERIC
-            )
-            if site_title_specific:
-                return _match_compact_identifier(site_title, company)
+            #
+            # IMPORTANT: only treat as definitive when source == "html".
+            # Path/slug fallbacks from _get_workday_site_title are NOT
+            # definitive here — they feed Layer 2 below instead, so we
+            # never prematurely reject based on a non-HTML fallback value.
+            site_title, title_source = _get_workday_site_title(slug_info)
+            if title_source == "html":
+                site_title_specific = (
+                    site_title and site_title.lower() not in GENERIC
+                )
+                if site_title_specific:
+                    # HTML-derived and non-generic: definitive match/reject
+                    return _match_compact_identifier(site_title, company)
+                # HTML-derived but generic (e.g. urlWID == "External"):
+                # fall through to Layer 2 — don't reject yet
 
-            # Layer 2: path from Serper URL
+            # Layer 2: path from Serper URL slug_info
             # e.g. "qualcomm_careers" → contains "qualcomm" ✓
-            # If non-generic and FAILS match → reject immediately
+            # Only use slug_info["path"] directly here (not the fallback
+            # path returned by _get_workday_site_title) to avoid double-
+            # counting the same value as both Layer 1 and Layer 2.
             path = slug_info.get("path", "")
             path_specific = path and path.lower() not in GENERIC
             if path_specific:
                 return _match_compact_identifier(path, company)
 
             # Layer 3: title_verified fallback
-            # Only reached when BOTH urlWID and path are generic
+            # Only reached when BOTH urlWID (html) and path are generic
             # e.g. ms.wd5/External — no specific identifier available
             # Only trust if Serper returned meaningful title/snippet text
             if title_verified and has_text:
@@ -176,12 +203,10 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             return False
 
         elif platform == "oracle_hcm":
-            # Oracle HCM API does not expose company name in search results
-            # items[] is a search result object with internal dept codes,
-            # not job requisitions with organizationName
-            # Oracle detection must come from P3a (career page HTML)
-            # which is already the ground truth — return False here
-            # so Serper never accepts Oracle results
+            # Oracle HCM is never detected via Serper (removed in Session 4).
+            # site:fa.oraclecloud.com returns JPMorgan results for any company.
+            # Oracle detection comes exclusively from P3a (career_page.py HTML
+            # redirect scan for oraclecloud URLs). Always reject here.
             return False
 
         elif platform == "greenhouse":
@@ -192,7 +217,8 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             if not data:
                 return False
             board_name = data.get("name", "")
-            return validate_company_match(board_name, company)                    if board_name else False
+            return validate_company_match(board_name, company) \
+                   if board_name else False
 
         elif platform == "lever":
             from jobs.ats.base import fetch_json
@@ -211,7 +237,8 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             if not data:
                 return False
             board_name = data.get("jobBoard", {}).get("name", "")
-            return validate_company_match(board_name, company)                    if board_name else False
+            return validate_company_match(board_name, company) \
+                   if board_name else False
 
         elif platform == "icims":
             from jobs.ats.base import validate_company_match
@@ -263,7 +290,7 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
 
 def detect_via_serper(company):
     """
-    Phase 3b: Search Google via Serper API for Workday/Oracle ATS.
+    Phase 3b: Search Google via Serper API for Workday ATS.
 
     Args:
         company: company name (e.g. "Capital One")
@@ -321,11 +348,20 @@ def detect_via_serper(company):
                 continue
 
             # Step 1: Collect ALL unique slugs from all 10 results
-            # into a hashmap — deduplicates by slug value
-            # Also record whether Serper title confirmed company name
-            # (used as fallback signal in Oracle verification)
+            # into a hashmap keyed by slug value — deduplicates across hits.
+            #
+            # For each slug we track:
+            #   title_verified: Serper title/snippet contained company name
+            #   has_text:       Serper returned any title/snippet text at all
+            #
+            # When the same slug appears in multiple results we keep the
+            # STRONGEST signal: prefer title_verified=True over False,
+            # then prefer has_text=True over False.  This ensures a strong
+            # confirmation from a later hit is never discarded in favour of
+            # a weaker first hit.
             from jobs.ats.base import validate_company_match
-            slug_map = {}  # slug_str → (result, title_verified)
+            slug_map = {}  # slug_str → (result, title_verified, has_text)
+
             for item in items:
                 url    = item.get("link", "")
                 result = match_ats_pattern(url)
@@ -333,18 +369,34 @@ def detect_via_serper(company):
                     continue
                 if result["platform"] != platform:
                     continue
-                slug_key = result["slug"]
+
+                slug_key     = result["slug"]
+                page_title   = item.get("title", "")
+                page_snippet = item.get("snippet", "")
+                combined     = f"{page_title} {page_snippet}".strip()
+
+                has_text       = bool(combined)
+                title_verified = has_text and validate_company_match(
+                    combined, company
+                )
+
                 if slug_key not in slug_map:
-                    page_title   = item.get("title", "")
-                    page_snippet = item.get("snippet", "")
-                    combined     = f"{page_title} {page_snippet}".strip()
-                    # has_text: Serper returned meaningful content
-                    # prevents accepting title_verified on empty responses
-                    has_text       = bool(combined)
-                    title_verified = has_text and validate_company_match(
-                        combined, company
-                    )
+                    # First time seeing this slug — store unconditionally
                     slug_map[slug_key] = (result, title_verified, has_text)
+                else:
+                    # Slug already seen — keep the stronger signal.
+                    # Strength order: title_verified > has_text > neither.
+                    # Only replace when the new entry is strictly stronger
+                    # than the existing one to avoid losing good data.
+                    existing_result, existing_tv, existing_ht = (
+                        slug_map[slug_key]
+                    )
+                    new_is_stronger = (
+                        (title_verified and not existing_tv) or
+                        (has_text and not existing_ht and not existing_tv)
+                    )
+                    if new_is_stronger:
+                        slug_map[slug_key] = (result, title_verified, has_text)
 
             if not slug_map:
                 continue

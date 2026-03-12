@@ -90,7 +90,12 @@ def run():
 
         # ── ATS Detection ──
         if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
-            result = detect_ats(company)
+            # FIX: pass domain from the company row so Phase 3a
+            # (career_page.detect_via_career_page) can run during
+            # re-detection, enabling Oracle HCM and other HTML-redirect
+            # based ATS platforms to be found without Serper.
+            domain = company_row.get("domain")
+            result = detect_ats(company, domain=domain)
             platform = result["ats_platform"]
             slug     = result["ats_slug"]
 

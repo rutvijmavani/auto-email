@@ -181,8 +181,8 @@ def run():
                         )
                     )
                     conn.commit()
-                    print(f"       [OK] Updated existing company "
-                          f"(status→active)")
+                    # FIX: removed unnecessary f-prefix (Ruff F541 — no interpolation)
+                    print("       [OK] Updated existing company (status→active)")
                     imported += 1
                     rows_to_delete.append(sheet_row)
                     continue
