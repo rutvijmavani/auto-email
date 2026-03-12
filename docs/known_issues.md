@@ -328,7 +328,7 @@ Run override commands on VM to fix.
 |---|---|---|---|
 | Capital One | lever/capital | workday | `--detect-ats "Capital One" --override workday '{"slug":"capitalone","wd":"wd12","path":"Capital_One"}'` |
 | Applied Materials | ashby/applied | workday | `--detect-ats "Applied Materials" --override workday '{"slug":"appliedmaterials","wd":"wd1","path":"Applied_Materials"}'` |
-| Best Buy | workday/bestbuycanada | workday | `--detect-ats "Best Buy" --override workday '{"slug":"bestbuy","wd":"wd5","path":"en-US"}'` |
+| Best Buy | workday/bestbuycanada | workday | `--detect-ats "Best Buy" --override workday '{"slug":"bestbuy","wd":"wd5","path":"BestBuy"}'` |
 | Charter Communications | workday/chartermfg | workday | `--detect-ats "Charter Communications" --override workday '{"slug":"spectrum","wd":"wd5","path":"Charter_Careers"}'` |
 | FedEx | workday/FXE-LAC | workday | `--detect-ats "FedEx" --override workday '{"slug":"fedex","wd":"wd1","path":"FXE-US_External_Career_Site"}'` |
 | Ford Motor Company | workday/fordfoundation | workday | `--detect-ats "Ford Motor Company" --override workday '{"slug":"ford","wd":"wd12","path":"Ford_Careers"}'` |
@@ -430,3 +430,181 @@ icims:        ~3 companies  ✓ (some wrong)
 oracle_hcm:   ~2 companies  ✓
 custom:        7 companies  ✓
 ```
+
+
+---
+
+## Session 2 Fixes (2026-03-11)
+
+### ⚪ Workday en-US locale prefix extracted as path
+**Resolved:** 2026-03-11
+**Was:** Serper returns URLs like `nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite`
+Our regex captured `en-US` as path → 404 on every API call
+54 Workday companies returning 0 jobs (66% of monitored companies)
+**Fix:** Skip locale segments in path extraction in both
+`patterns.py` and `build_ats_slug_list.py`
+Also removed `en-US` from `WD_PATH_VARIANTS` in `workday.py`
+
+### ⚪ Workday self-population stored JSON slug instead of plain slug
+**Resolved:** 2026-03-11
+**Was:** `mark_from_detection()` called with full JSON
+`{"slug":"nvidia","wd":"wd5"}` instead of plain `"nvidia"`
+→ Discovery DB never matched on P1 lookup
+→ Serper used every re-detection instead of DB
+**Fix:** Extract plain slug before saving in `ats_detector.py`
+Backfill script: `backfill_workday_discovery.py`
+
+### ⚪ myworkdaysite.com not supported (Fidelity, Wells Fargo)
+**Resolved:** 2026-03-11
+**Was:** Pattern only matched `myworkdayjobs.com`
+`myworkdaysite.com` has different URL structure:
+`wd1.myworkdaysite.com/recruiting/{tenant}/{career_site}`
+**Fix:** New pattern added in `patterns.py`
+`_build_url()` in `workday.py` handles both domains
+
+### ⚪ Oracle HCM wrong API finder format
+**Resolved:** 2026-03-11
+**Was:** `finder=CandidateExperience&CandidateExperienceId=CX_1001`
+→ 400 Bad Request on every call
+**Fix:** Correct format discovered via browser XHR inspection:
+`finder=findReqs%3BsiteNumber%3DCX_1001%2Climit%3D25%2Coffset%3D0`
+Semicolon-separated params inside finder value
+
+### ⚪ Oracle HCM regional URLs not supported
+**Resolved:** 2026-03-11
+**Was:** Only `{slug}.fa.oraclecloud.com` supported
+Goldman Sachs uses `hdpc.fa.us2.oraclecloud.com` (us2 region)
+**Fix:** `patterns.py` captures optional region segment
+`_build_oracle_url()` handles both standard and regional URLs
+Goldman Sachs: slug=hdpc, region=us2, site=LateralHiring
+
+### ⚪ AMD/Arm/Rivian wrong iCIMS detection
+**Resolved:** 2026-03-11
+**Was:** All three detected as iCIMS but had migrated away
+AMD   → careers.amd.com (custom)
+Arm   → careers.arm.com (custom)
+Rivian → careers.rivian.com (custom)
+**Fix:** JS redirect detection in `icims.py` — page <500 chars
+with `window.top.location.href` → returns None → stops pagination
+Override script marks all three as custom
+
+### ⚪ iCIMS fetcher verified working
+**Verified:** 2026-03-11
+Tested against `careers-nyit.icims.com`:
+  200 status, 57KB page, 20 jobs found
+  `a.iCIMS_Anchor` selector works ✓
+  `?pr={page}&in_iframe=1` pagination works ✓
+  `_clean_title()` strips "Job Title\n" prefix ✓
+
+### ⚪ Coverage alert not emailed (only printed to CLI)
+**Resolved:** 2026-03-11
+**Was:** `_send_no_jobs_email()` had no alerts param
+→ Coverage warnings only appeared in CLI output
+**Fix:** `_send_no_jobs_email(alerts=alerts)` — renders
+alert table in email body, adds ⚠️ to subject line
+
+### ⚪ fetch_jobs NameError: slug/wd undefined
+**Resolved:** 2026-03-11
+**Was:** After `_build_url` refactor, `slug` and `wd`
+no longer defined before list comprehension in `fetch_jobs`
+→ 7 test failures, blocked deployment
+**Fix:** Extract `slug = slug_info.get("slug", "")` and
+`wd = slug_info.get("wd", "")` at top of `fetch_jobs`
+
+---
+
+## Session 3 Fixes & Decisions (2026-03-11)
+
+### ⚪ Workday API uses POST not GET (critical)
+**Resolved:** 2026-03-11
+**Was:** `fetch_json()` uses `requests.get()` with params
+Workday requires `requests.post()` with JSON body
+→ ALL Workday companies returning 0 jobs since day one
+→ GET returns 400, POST returns 200 with jobs
+**Verified:** salesforce.wd12: GET=0 jobs, POST=1,381 jobs
+**Fix:** Added `fetch_json_post()` to `base.py`
+Workday `fetch_jobs()` and `detect()` now use POST
+
+### ⚪ Oracle HCM pagination hardcoded at 25 jobs
+**Resolved:** 2026-03-11
+**Was:** limit/offset were URL params but Oracle requires
+them INSIDE the finder string value:
+`finder=findReqs;siteNumber=CX_1001,limit=25,offset=0`
+URL params ignored → always returned first 25 only
+JPMorgan has 1100+ jobs but only 25 fetched
+**Fix:** `_build_oracle_url()` now embeds limit+offset
+inside finder value using `urllib.parse.quote()`
+
+### ⚪ Plain slugs stored without wd/path (23 companies)
+**Status:** Pending fix on VM
+**Was:** `backfill_workday_discovery.py` inserted plain
+slugs e.g. "nvidia" instead of JSON
+`{"slug":"nvidia","wd":"wd5","path":"NVIDIAExternalCareerSite"}`
+→ P1 returns plain slug → `_build_url()` can't build URL
+→ 23 companies returning 0 jobs
+**Fix:** Clear those 23 from main DB → Serper re-detects
+with correct JSON slug (POST fix ensures jobs returned)
+
+---
+
+## Pending — Detection Phase 2 Manual Review
+
+### 🟡 45 unknown companies need manual ATS detection
+**Decision:** Use Google Sheet approach
+**Plan:**
+  1. Create Google Sheet with columns:
+     Company | Domain | Job URL | ATS Platform | ATS Slug | Status
+  2. Manually find one job URL per company (~2 min each)
+  3. Code reads sheet → runs match_ats_pattern(url)
+     → extracts platform + slug automatically
+  4. Stores in DB via --override
+**Timeline:** 45 companies × 2 min = ~90 min total
+**Priority companies to investigate first:**
+  - Citibank      (Oracle HCM likely)
+  - Goldman Sachs (Oracle HCM confirmed: hdpc/us2/LateralHiring)
+  - Wells Fargo   (myworkdaysite.com: wf/WellsFargoJobs)
+  - Fidelity      (myworkdaysite.com: fmr/FidelityCareers)
+  - Tesla         (custom ATS — Greenhouse or Lever)
+  - ServiceNow    (Workday likely)
+  - Intuit        (Workday likely)
+  - Doordash      (Greenhouse likely)
+  - Wayfair       (Greenhouse likely)
+  - Lam Research  (Workday likely)
+  - Texas Instruments (Workday likely)
+
+---
+
+## Job Monitor Pipeline — Known Bugs (Lower Priority)
+
+### 🔴 Workday fetch_jobs uses GET not POST
+**Now fixed** — see above
+
+### 🟡 redetect_workday.sh check script too strict
+The bad_paths check flags valid short paths like:
+  "Ext", "ANT", "Search", "jobs", "nke2"
+These may actually work — need to verify via POST test
+before blindly treating as bad
+
+### 🟡 FedEx detected as FXE-LAC (Latin America path)
+Correct US path: FXE-US_External_Career_Site
+Needs manual override after Workday POST fix deployed
+
+### 🟡 Best Buy detected as bestbuycanada (Canada)
+Correct US slug: bestbuy
+Needs manual override
+
+### 🟡 US Bank detected as Deutsche Bank slug (db)
+Both share same Workday tenant — wrong company match
+Needs manual override with correct usbank slug
+
+### 🟡 Bloomberg detected as Bloombergindustrygroup
+Bloomberg Industry Group is subsidiary not main Bloomberg LP
+May return different jobs than expected
+
+### 🟡 Charter Communications detected as chartermfg
+Charter Manufacturing ≠ Charter Communications (Spectrum)
+Needs manual override with spectrum slug
+
+### 🟡 Ford Motor Company
+Detected via Oracle HCM — verify correct site ID
+Currently returning only 25 jobs (Oracle pagination now fixed)

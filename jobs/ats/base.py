@@ -128,6 +128,65 @@ def fetch_json(url, params=None, retries=2,
     return None
 
 
+def fetch_json_post(url, body=None, retries=2,
+                    platform=None, track=True):
+    """
+    POST JSON to URL and return parsed response.
+    Used by Workday — requires POST with JSON body, not GET.
+    """
+    for attempt in range(retries + 1):
+        start_ms    = int(time.time() * 1000)
+        status_code = 0
+        backoff_s   = 0
+
+        try:
+            resp = requests.post(
+                url,
+                json=body or {},
+                timeout=JOB_MONITOR_API_TIMEOUT,
+                headers={
+                    "User-Agent":   "Mozilla/5.0",
+                    "Content-Type": "application/json",
+                },
+            )
+            status_code = resp.status_code
+            elapsed_ms  = int(time.time() * 1000) - start_ms
+
+            if platform and track:
+                _record(platform, status_code, elapsed_ms)
+
+            if status_code == 429:
+                backoff_s = 60
+                if attempt < retries:
+                    time.sleep(backoff_s)
+                    continue
+                return None
+
+            if 500 <= status_code < 600:
+                # Transient server error — retry with backoff
+                backoff_s = 2 ** attempt
+                if attempt < retries:
+                    time.sleep(backoff_s)
+                    continue
+                return None
+
+            if status_code != 200:
+                # Non-retryable 4xx error
+                return None
+
+            return resp.json()
+
+        except requests.exceptions.Timeout:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            return None
+        except Exception:
+            return None
+
+    return None
+
+
 def fetch_html(url, params=None, platform=None, track=True):
     """
     Fetch HTML from URL with tracking.
