@@ -113,7 +113,7 @@ def _get_workday_site_title(slug_info):
     return slug_info.get("slug", "")
 
 
-def _verify_slug_via_api(result, company, title_verified=False):
+def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
     """
     Verify detected slug by calling the ATS API and confirming
     the company name appears in the response.
@@ -163,8 +163,9 @@ def _verify_slug_via_api(result, company, title_verified=False):
 
             # Layer 3: title_verified fallback
             # Both urlWID and path are generic (ms/External, qualcomm/careers)
-            # Serper title already confirmed company — trust it
-            if title_verified:
+            # Only trust if Serper returned meaningful title/snippet text
+            # Prevents false positives on empty Serper responses
+            if title_verified and has_text:
                 return True
 
             return False
@@ -331,10 +332,14 @@ def detect_via_serper(company):
                 if slug_key not in slug_map:
                     page_title   = item.get("title", "")
                     page_snippet = item.get("snippet", "")
-                    title_verified = validate_company_match(
-                        f"{page_title} {page_snippet}", company
+                    combined     = f"{page_title} {page_snippet}".strip()
+                    # has_text: Serper returned meaningful content
+                    # prevents accepting title_verified on empty responses
+                    has_text       = bool(combined)
+                    title_verified = has_text and validate_company_match(
+                        combined, company
                     )
-                    slug_map[slug_key] = (result, title_verified)
+                    slug_map[slug_key] = (result, title_verified, has_text)
 
             if not slug_map:
                 continue
@@ -347,9 +352,10 @@ def detect_via_serper(company):
 
             # Step 2: API-verify each slug — check company name
             # appears in the actual API response (ground truth)
-            for slug_key, (result, title_verified) in slug_map.items():
+            for slug_key, (result, title_verified, has_text) in slug_map.items():
                 if _verify_slug_via_api(result, company,
-                                        title_verified=title_verified):
+                                        title_verified=title_verified,
+                                        has_text=has_text):
                     print(f"   [SERPER] {company} -> {platform} "
                           f"(slug: {result['slug']})")
                     return result

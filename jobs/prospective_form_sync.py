@@ -41,14 +41,25 @@ COL_NOTES     = 3
 
 
 def _get_sheet():
-    creds  = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+    try:
+        creds = Credentials.from_service_account_file(
+            CREDENTIALS_FILE, scopes=SCOPES
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"Credentials file not found: {CREDENTIALS_FILE}"
+        ) from None
+    except (ValueError, Exception) as e:
+        raise RuntimeError(
+            f"Invalid credentials in {CREDENTIALS_FILE}: {e}"
+        ) from e
     client = gspread.authorize(creds)
     sheet  = client.open_by_key(SHEET_ID)
     try:
         return sheet.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
         # Create the tab if it doesn't exist yet
-        ws = sheet.add_worksheet(SHEET_NAME, rows=200, cols=5)
+        ws = sheet.add_worksheet(SHEET_NAME, rows=200, cols=4)
         ws.update("A1:D1", [["Timestamp", "Company Name", "Job URL", "Notes"]])
         print(f"[OK] Created '{SHEET_NAME}' tab in Google Sheet")
         return ws
@@ -98,12 +109,10 @@ def run():
 
         company = row[COL_COMPANY].strip()
         job_url = row[COL_JOB_URL].strip()
-        notes   = row[COL_NOTES].strip()
-
         print(f"  [{i+1}] {company}")
 
         if not company:
-            print(f"       [SKIP] Missing company name")
+            print("       [SKIP] Missing company name")
             skipped += 1
             rows_to_delete.append(sheet_row)
             continue
@@ -131,8 +140,15 @@ def run():
             ).fetchone()
 
             if existing:
-                # Update ATS if we now have it
-                if ats_result and not existing["ats_platform"]:
+                # Update ATS if we now have it and didn't before
+                # Treat None and 'unknown' as equivalent to missing
+                needs_ats_update = (
+                    ats_result and (
+                        existing["ats_platform"] is None or
+                        existing["ats_platform"] == "unknown"
+                    )
+                )
+                if needs_ats_update:
                     conn.execute(
                         "UPDATE prospective_companies "
                         "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
@@ -140,7 +156,9 @@ def run():
                         (platform, slug, datetime.utcnow(), company)
                     )
                     conn.commit()
-                    print(f"       [OK] ATS updated for existing company")
+                    print("       [OK] ATS updated for existing company")
+                    imported += 1
+                    rows_to_delete.append(sheet_row)
                 else:
                     print(f"       [SKIP] Already in pipeline "
                           f"(status={existing['status']})")
@@ -160,7 +178,7 @@ def run():
                     )
                 )
                 conn.commit()
-                print(f"       [OK] Added to pipeline (status=active)")
+                print("       [OK] Added to pipeline (status=active)")
         finally:
             conn.close()
 
@@ -179,4 +197,4 @@ def run():
     print(f"\n{'='*55}")
     print(f"[OK] Sync complete — "
           f"Imported: {imported} | Skipped: {skipped}")
-    print(f"     New companies will be detected on next --detect-ats run")
+    print("     New companies will be detected on next --detect-ats run")
