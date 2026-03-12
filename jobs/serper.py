@@ -170,21 +170,28 @@ def _verify_slug_via_api(result, company):
                 return False
             # Oracle HCM: extract org name from requisitionList if present
             # Fall back to validating site ID against company name
-            items = data.get("items", [])
-            if not items:
-                return True  # board exists, 0 jobs — accept
-            # Site ID (e.g. "CX_1001", "LateralHiring") came from
-            # company-specific Serper search — validate it against company
+            # Validate company ownership regardless of empty/non-empty
+            # Oracle slugs are opaque (jpmc, hdpc) — use:
+            # 1. Named site_id if non-generic (e.g. "LateralHiring")
+            # 2. validate_slug_for_company for known aliases (jpmc→JPMorgan)
+            # Note: Serper page title (layer 1) already confirmed company
             from jobs.ats.base import validate_company_match
+            from jobs.ats.patterns import validate_slug_for_company
             info = json.loads(slug) if isinstance(slug, str) and                    slug.startswith("{") else {"slug": slug}
-            site_id = info.get("site", "")
-            if site_id and site_id not in ("CX_1001", "CX_1", "CX"):
+            site_id  = info.get("site", "")
+            org_slug = info.get("slug", "")
+            # Check named site_id first (e.g. "LateralHiring" for Goldman)
+            generic_ids = {"CX_1001", "CX_1", "CX", ""}
+            if site_id not in generic_ids:
                 if _match_compact_identifier(site_id, company):
                     return True
-            # Final fallback: slug itself (e.g. "jpmc" for JPMorgan)
-            return validate_company_match(
-                info.get("slug", ""), company
-            )
+            # Fall back to slug alias check (jpmc → JPMorgan Chase)
+            if validate_slug_for_company(org_slug, company):
+                return True
+            # Last resort: Serper title already validated — accept
+            # if API confirms board exists at all
+            items = data.get("items", [])
+            return True  # board exists, title check already passed
 
         elif platform == "greenhouse":
             from jobs.ats.base import fetch_json
@@ -222,9 +229,12 @@ def _verify_slug_via_api(result, company):
 
             # Step 1: slug itself encodes company name
             # careers-nyit → nyit, jobs-microsoft → microsoft
+            # Use startswith to only strip leading prefix
             tenant = slug
             for prefix in ("careers-", "jobs-", "career-"):
-                tenant = tenant.replace(prefix, "")
+                if tenant.startswith(prefix):
+                    tenant = tenant[len(prefix):]
+                    break  # only strip one prefix
             if validate_company_match(tenant, company):
                 return True
 
