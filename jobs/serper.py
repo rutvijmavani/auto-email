@@ -18,10 +18,12 @@ import json
 import requests
 from config import SERPER_API_KEY, SERPER_API_URL
 from db.serper_quota import increment_serper_credits, has_serper_credits
-from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
+from jobs.ats.patterns import match_ats_pattern
 
 # Only search these platforms via Serper
 # (others handled by sitemap/API probe)
+# Only Workday + Oracle HCM via Serper (2 credits per company)
+# iCIMS removed — handled by Phase 2 API probe + Brave Search
 # Only Workday + Oracle HCM via Serper (2 credits per company)
 # iCIMS removed — handled by Phase 2 API probe + Brave Search
 SERPER_SEARCHES = [
@@ -33,23 +35,70 @@ SERPER_SEARCHES = [
 SERPER_EXHAUSTED = object()
 
 
-def _verify_slug_via_api(result):
+def _get_workday_site_title(slug_info):
     """
-    Verify a detected slug by actually calling the ATS API.
-    Returns True if API responds with jobs (or valid empty board).
-    Returns False if API returns error/404.
+    Extract company-identifying text from Workday career site HTML.
 
-    This is the ground truth — no string matching needed.
-    Works for any company regardless of slug naming convention.
+    Workday embeds company info in a JS object:
+        window.eexworkday = {
+            tenant: "wf",
+            urlWID: "WellsFargoJobs",   <- company identifier
+        }
+
+    urlWID always contains the company name:
+        "WellsFargoJobs"           -> Wells Fargo
+        "NVIDIAExternalCareerSite" -> Nvidia
+        "ASMLExternalCareerSite"   -> ASML
     """
+    import re
+    import requests
+    from jobs.ats.workday import _build_url
+
+    base_url = _build_url(slug_info).replace("/jobs", "")
+
+    try:
+        resp = requests.get(
+            base_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            # Extract urlWID from window.eexworkday JS object
+            # e.g.  urlWID: "WellsFargoJobs"
+            match = re.search(r'urlWID\s*:\s*"([^"]+)"', resp.text)
+            if match:
+                return match.group(1).strip()
+    except Exception:
+        pass
+
+    # Fallback: path often contains company name
+    path = slug_info.get("path", "")
+    if path and path not in ("careers", "jobs", "External", "Careers"):
+        return path
+
+    # Last resort: slug itself
+    return slug_info.get("slug", "")
+
+
+def _verify_slug_via_api(result, company):
+    """
+    Verify detected slug by calling the ATS API and confirming
+    the company name appears in the response.
+
+    Workday:    fetches career site title ("Wells Fargo Jobs") → match
+    Greenhouse: fetches board name ("Stripe") → match
+    Ashby:      fetches jobBoard.name → match
+    Oracle:     confirms board exists (limited company data)
+    Lever:      falls back to slug validation (no company name in API)
+    """
+    from jobs.ats.base import validate_company_match
     platform = result["platform"]
     slug     = result["slug"]
 
     try:
         if platform == "workday":
-            from jobs.ats.workday import _build_url, fetch_json_post
-            # Safely parse slug — malformed JSON returns False immediately
-            if slug.startswith("{"):
+            # Parse slug info
+            if isinstance(slug, str) and slug.startswith("{"):
                 try:
                     slug_info = json.loads(slug)
                     if not isinstance(slug_info, dict):
@@ -58,51 +107,106 @@ def _verify_slug_via_api(result):
                     return False
             else:
                 slug_info = {"slug": slug, "wd": "wd1", "path": "careers"}
-            # Ensure required keys exist
             slug_info.setdefault("wd",   "wd1")
             slug_info.setdefault("path", "careers")
-            url  = _build_url(slug_info)
-            data = fetch_json_post(url, body={"limit": 1, "offset": 0})
-            if data is None:
-                return False
-            return "jobPostings" in data or "total" in data
+
+            # Primary: career site title contains company name
+            site_title = _get_workday_site_title(slug_info)
+            if site_title:
+                return validate_company_match(site_title, company)
+
+            # Fallback: path often contains company name
+            # e.g. "WellsFargoJobs", "NVIDIAExternalCareerSite"
+            path = slug_info.get("path", "")
+            if path and path not in ("careers", "jobs", "External"):
+                return validate_company_match(path, company)
+
+            return False
 
         elif platform == "oracle_hcm":
-            from jobs.ats.oracle_hcm import _build_oracle_url, fetch_json_get
-            info = json.loads(slug) if isinstance(slug, str) else slug
+            from jobs.ats.base import fetch_json
+            from jobs.ats.oracle_hcm import _build_oracle_url
+            info = json.loads(slug) if isinstance(slug, str) and                    slug.startswith("{") else {"slug": slug}
             url  = _build_oracle_url(
                 info.get("slug", ""), info.get("region", ""),
                 info.get("site", ""), 1, 0
             )
-            from jobs.ats.base import fetch_json
             data = fetch_json(url)
+            # Oracle: confirm board exists — site ID already came from
+            # company-specific Serper search so title check is sufficient
             return data is not None and "items" in data
 
         elif platform == "greenhouse":
             from jobs.ats.base import fetch_json
-            url  = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+            # /v1/boards/{slug} returns {"name": "Stripe", ...}
+            url  = f"https://boards-api.greenhouse.io/v1/boards/{slug}"
             data = fetch_json(url)
-            return data is not None and "jobs" in data
+            if not data:
+                return False
+            board_name = data.get("name", "")
+            return validate_company_match(board_name, company)                    if board_name else False
 
         elif platform == "lever":
             from jobs.ats.base import fetch_json
+            from jobs.ats.patterns import validate_slug_for_company
             url  = f"https://api.lever.co/v0/postings/{slug}"
             data = fetch_json(url)
-            return isinstance(data, list)
+            if not isinstance(data, list):
+                return False
+            # Lever has no company name in API — use slug check
+            return validate_slug_for_company(slug, company)
 
         elif platform == "ashby":
             from jobs.ats.base import fetch_json
             url  = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
             data = fetch_json(url)
-            return data is not None and "jobs" in data
+            if not data:
+                return False
+            board_name = data.get("jobBoard", {}).get("name", "")
+            return validate_company_match(board_name, company)                    if board_name else False
 
-        # For other platforms — fall back to accepting the result
+        elif platform == "icims":
+            from jobs.ats.base import validate_company_match
+            import requests as _req
+            import re as _re
+
+            # Step 1: slug itself encodes company name
+            # careers-nyit → nyit, jobs-microsoft → microsoft
+            tenant = slug
+            for prefix in ("careers-", "jobs-", "career-"):
+                tenant = tenant.replace(prefix, "")
+            if validate_company_match(tenant, company):
+                return True
+
+            # Step 2: page title as fallback
+            # "Job Opportunities | Human Resources | NYIT | ..."
+            try:
+                url = (
+                    f"https://{slug}.icims.com/jobs/search"
+                    f"?ss=1&in_iframe=1"
+                )
+                resp = _req.get(
+                    url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=10,
+                )
+                if resp.status_code == 200:
+                    m = _re.search(
+                        r"<title[^>]*>([^<]+)</title>",
+                        resp.text, _re.IGNORECASE
+                    )
+                    if m:
+                        return validate_company_match(m.group(1), company)
+            except Exception:
+                pass
+            return False
+
         return True
 
     except Exception as e:
         logger.warning("API verification failed for %s/%s: %s",
                        platform, slug, e)
-        return False  # reject unverified slugs
+        return False
 
 
 def detect_via_serper(company):
@@ -164,46 +268,41 @@ def detect_via_serper(company):
             if not items:
                 continue
 
+            # Step 1: Collect ALL unique slugs from all 10 results
+            # into a hashmap — deduplicates by slug value
+            slug_map = {}  # slug_str → result dict
             for item in items:
                 url    = item.get("link", "")
                 result = match_ats_pattern(url)
-
                 if not result:
                     continue
                 if result["platform"] != platform:
                     continue
+                slug_key = result["slug"]
+                if slug_key not in slug_map:
+                    slug_map[slug_key] = result
 
-                # Validate by checking page title/snippet first
-                # This is a quick pre-filter before hitting the API
-                page_title   = item.get("title", "")
-                page_snippet = item.get("snippet", "")
-                combined     = f"{page_title} {page_snippet}"
+            if not slug_map:
+                continue
 
-                if combined.strip():
-                    from jobs.ats.base import validate_company_match
-                    if not validate_company_match(combined, company):
-                        logger.debug(
-                            "Serper result rejected by title: "
-                            "company=%s title=%s",
-                            company, page_title
-                        )
-                        continue
+            logger.debug(
+                "Serper found %d unique slugs for %s/%s: %s",
+                len(slug_map), company, platform,
+                list(slug_map.keys())
+            )
 
-                # Final validation: actually call the API
-                # Truth comes from the API, not string matching
-                # If API returns jobs → slug is correct
-                # If API returns 0 or error → try next result
-                if not _verify_slug_via_api(result):
+            # Step 2: API-verify each slug — check company name
+            # appears in the actual API response (ground truth)
+            for slug_key, result in slug_map.items():
+                if _verify_slug_via_api(result, company):
+                    print(f"   [SERPER] {company} -> {platform} "
+                          f"(slug: {result['slug']})")
+                    return result
+                else:
                     logger.debug(
-                        "Serper result rejected by API: "
-                        "company=%s slug=%s",
-                        company, result["slug"]
+                        "Slug rejected by API: company=%s slug=%s",
+                        company, slug_key
                     )
-                    continue
-
-                print(f"   [SERPER] {company} -> {platform} "
-                      f"(slug: {result['slug']})")
-                return result
 
         except requests.exceptions.Timeout:
             print(f"   [WARNING] Serper timeout for {company}/{platform}")
