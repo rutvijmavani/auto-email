@@ -112,6 +112,7 @@ def fetch_jobs(slug_info, company):
     all_jobs = []
     offset   = 0
     limit    = 20  # Workday default page size
+    total    = None  # only populated on first page
 
     while True:
         data = fetch_json_post(url, body={"limit": limit, "offset": offset})
@@ -121,9 +122,13 @@ def fetch_jobs(slug_info, company):
         if not jobs:
             break
         all_jobs.extend(jobs)
-        total = data.get("total", 0)
-        offset += len(jobs)  # use actual jobs returned not limit
-        if len(jobs) < limit or offset >= total:
+        # total is only returned on first page — cache it
+        if total is None:
+            total = data.get("total", 0)
+        offset += len(jobs)
+        # Stop if: fewer jobs than limit (last page)
+        # or we have fetched everything
+        if len(jobs) < limit or (total and offset >= total):
             break
 
     return [_normalize(j, company, slug, wd)

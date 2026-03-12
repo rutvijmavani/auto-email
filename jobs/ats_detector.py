@@ -29,8 +29,11 @@
 #     → ~5%
 
 import json
+import logging
 import re
 from db.connection import get_conn
+logger = logging.getLogger(__name__)
+
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
 from jobs.ats import oracle_hcm, icims
 from config import (
@@ -134,10 +137,9 @@ def detect_ats(company, domain=None, page=None, sb=None):
         from jobs.ats.oracle_hcm import detect as oracle_detect
         oracle_slug = oracle_detect(company, domain)
         if oracle_slug:
-            import json as _json
             result = {
                 "platform": "oracle_hcm",
-                "slug":     _json.dumps(oracle_slug),
+                "slug":     json.dumps(oracle_slug),
             }
             print(f"   [P3a HIT] {company} -> oracle_hcm / {result['slug']}")
             return _store_and_return(company, result)

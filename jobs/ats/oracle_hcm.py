@@ -6,6 +6,7 @@
 #             en/sites/{site_id}/jobs
 
 import json
+import logging
 from datetime import datetime
 from jobs.ats.base import fetch_json
 
@@ -78,6 +79,9 @@ def detect(company, domain):
         return None
 
     domain = re.sub(r"^https?://", "", domain).rstrip("/")
+    # company is used for logging context
+    logger = logging.getLogger(__name__)
+    logger.debug("Oracle detect: company=%s domain=%s", company, domain)
 
     # Steps 1+2: Visit career pages, find oraclecloud URL in HTML
     oracle_url = None
@@ -100,7 +104,9 @@ def detect(company, domain):
             if match:
                 oracle_url = match.group(0)
                 break
-        except Exception:
+        except Exception as e:
+            logger.debug("Oracle career page fetch failed %s%s: %s",
+                         domain, path, e)
             continue
 
     if not oracle_url:
@@ -112,9 +118,8 @@ def detect(company, domain):
     if not result or result["platform"] != "oracle_hcm":
         return None
 
-    import json as _json
     try:
-        slug_info = _json.loads(result["slug"])
+        slug_info = json.loads(result["slug"])
     except (ValueError, TypeError):
         return None
 

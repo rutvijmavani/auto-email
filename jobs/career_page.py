@@ -53,13 +53,7 @@ ATS_FINGERPRINTS = [
     "successfactors.com",
 ]
 
-# Oracle HCM tenant extraction patterns
-# Docs say: window.__INITIAL_STATE__.tenant = "company"
-# Also: og:site_name, <title> contain company name
-ORACLE_TENANT_PATTERNS = [
-    r'([a-z0-9]+)\.fa(?:\.[a-z0-9]+)?\.oraclecloud\.com',
-    r'tenant["\'\s]*[:=]["\'\s]*([a-z0-9]+)',
-]
+
 
 
 def detect_via_career_page(company, domain):
@@ -168,15 +162,3 @@ def _scan_html(html, company):
         return result
 
     return None
-
-
-def _extract_plain_slug(result):
-    """Extract plain text slug for validation (handles JSON slugs)."""
-    import json
-    slug = result.get("slug", "")
-    if result.get("platform") in ("workday", "oracle_hcm"):
-        try:
-            return json.loads(slug).get("slug", slug)
-        except (ValueError, TypeError):
-            pass
-    return slug
