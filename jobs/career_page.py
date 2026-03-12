@@ -10,7 +10,7 @@
 
 import re
 import requests
-from jobs.ats.patterns import match_ats_pattern
+from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
 
 HEADERS = {
     "User-Agent": (
@@ -54,6 +54,22 @@ ATS_FINGERPRINTS = [
 ]
 
 
+
+
+def _slug_valid_for_company(result, company):
+    """
+    Validate ATS slug against company name.
+    Only validates platforms where slug encodes company name
+    (Greenhouse, Lever, Ashby, iCIMS).
+    Skips validation for Workday/Oracle where slugs are opaque
+    (e.g. "wf" for Wells Fargo, "jpmc" for JPMorgan).
+    """
+    platform = result.get("platform", "")
+    # Opaque slug platforms — trust URL found on company site
+    if platform in ("workday", "oracle_hcm"):
+        return True
+    slug = result.get("slug", "")
+    return validate_slug_for_company(slug, company)
 
 
 def detect_via_career_page(company, domain):
@@ -104,8 +120,10 @@ def _scan_url(url, company):
         if final_url != url:
             result = match_ats_pattern(final_url)
             if result:
-                # URL came from company's own redirect — trust it
-                return result
+                # Validate slug for platforms where slug = company name
+                # Skip for Workday/Oracle — slugs are opaque (wf, jpmc)
+                if _slug_valid_for_company(result, company):
+                    return result
 
         if resp.status_code != 200:
             return None
@@ -127,8 +145,7 @@ def _scan_url(url, company):
             final_url = resp.url
             if final_url != http_url:
                 result = match_ats_pattern(final_url)
-                if result:
-                    # URL from company's own domain — trust it
+                if result and _slug_valid_for_company(result, company):
                     return result
             if resp.status_code == 200:
                 return _scan_html(resp.text, company)
@@ -158,7 +175,7 @@ def _scan_html(html, company):
         if not result:
             continue
 
-        # URL found in company's own HTML — trust it
-        return result
+        if _slug_valid_for_company(result, company):
+            return result
 
     return None

@@ -21,14 +21,11 @@ from config import SERPER_API_KEY, SERPER_API_URL
 from db.serper_quota import increment_serper_credits, has_serper_credits
 from jobs.ats.patterns import match_ats_pattern
 
-# Only search these platforms via Serper
-# (others handled by sitemap/API probe)
-# Only Workday + Oracle HCM via Serper (2 credits per company)
-# iCIMS removed — handled by Phase 2 API probe + Brave Search
-# Only Workday via Serper (1 credit per company)
+# Workday only via Serper (1 credit per company)
 # Oracle HCM removed — site:fa.oraclecloud.com returns JPMorgan results
-# for unrelated companies (job descriptions mention company names)
-# Oracle HCM companies need manual detection via Google Sheet
+# for any company because Oracle job descriptions mention competitor names.
+# Oracle HCM is auto-detected via Phase 3a: ats_detector.py calls
+# oracle_hcm.detect() which follows company.com/careers → oraclecloud URL.
 SERPER_SEARCHES = [
     ("workday", "site:myworkdayjobs.com"),
 ]

@@ -126,9 +126,13 @@ def fetch_jobs(slug_info, company):
         if total is None:
             total = data.get("total", 0)
         offset += len(jobs)
-        # Stop if: fewer jobs than limit (last page)
-        # or we have fetched everything
-        if len(jobs) < limit or (total and offset >= total):
+        # When total is known → rely on total exclusively
+        # (short page can occur mid-pagination due to filtering)
+        # When total unknown → short page is our only stop signal
+        if total is not None:
+            if offset >= total:
+                break
+        elif len(jobs) < limit:
             break
 
     return [_normalize(j, company, slug, wd)

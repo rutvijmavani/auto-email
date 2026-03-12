@@ -75,6 +75,59 @@ def _is_valid_url(url):
     return bool(re.match(r"https?://", url.strip()))
 
 
+def _sync_to_pipeline(company, job_url):
+    """
+    Add company to prospective_companies with status='applied'.
+    Extracts ATS from job URL if possible.
+    Does nothing if company already exists in pipeline.
+    """
+    try:
+        from jobs.ats.patterns import match_ats_pattern
+        from db.connection import get_conn
+        from datetime import datetime as _dt
+
+        ats    = match_ats_pattern(job_url)
+        conn   = get_conn()
+
+        existing = conn.execute(
+            "SELECT id FROM prospective_companies WHERE company=?",
+            (company,)
+        ).fetchone()
+
+        if not existing:
+            conn.execute(
+                "INSERT INTO prospective_companies "
+                "(company, ats_platform, ats_slug, ats_detected_at, "
+                "priority, status, created_at) "
+                "VALUES (?, ?, ?, ?, 3, 'applied', ?)",
+                (
+                    company,
+                    ats["platform"] if ats else None,
+                    ats["slug"]     if ats else None,
+                    _dt.utcnow()    if ats else None,
+                    _dt.utcnow(),
+                )
+            )
+            conn.commit()
+            ats_info = ats["platform"] if ats else "unknown ATS"
+            print(f"       [PIPELINE] Added to prospective pool "
+                  f"(status=applied, {ats_info})")
+        else:
+            # Update ATS if we didn't have it before
+            if ats:
+                conn.execute(
+                    "UPDATE prospective_companies "
+                    "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
+                    "WHERE company=? AND ats_platform IS NULL",
+                    (ats["platform"], ats["slug"], _dt.utcnow(), company)
+                )
+                conn.commit()
+
+        conn.close()
+    except Exception as e:
+        print(f"       [WARNING] Pipeline sync failed: {e}")
+
+
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
     from pipeline import extract_expected_domain  # local import avoids circular dependency
@@ -139,6 +192,9 @@ def run():
             skipped += 1
             rows_to_delete.append(sheet_row_index)
             continue
+
+        # Extract ATS from job URL and add to prospective_companies
+        _sync_to_pipeline(company, job_url)
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)

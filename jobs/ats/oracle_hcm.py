@@ -70,8 +70,19 @@ def detect(company, domain):
     import requests
 
     CAREER_PATHS = [
-        "/careers", "/jobs", "/about/careers",
-        "/company/careers", "/en/careers", "/join-us",
+        "/careers",
+        "/careers/",
+        "/jobs",
+        "/about/careers",
+        "/company/careers",
+        "/en/careers",
+        "/global/careers",
+        "/us/careers",
+        "/about-us/careers",
+        "/join-us",
+        "/work-with-us",
+        "/opportunities",
+        "/career",
     ]
     HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -100,6 +111,12 @@ def detect(company, domain):
             )
             if resp.status_code != 200:
                 continue
+            # Check 1: final redirect URL points directly to Oracle
+            if oracle_pattern.search(resp.url):
+                m = oracle_pattern.search(resp.url)
+                oracle_url = m.group(0)
+                break
+            # Check 2: Oracle URL embedded in page HTML
             match = oracle_pattern.search(resp.text)
             if match:
                 oracle_url = match.group(0)
