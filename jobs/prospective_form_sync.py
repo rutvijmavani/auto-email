@@ -143,6 +143,10 @@ def run():
             ).fetchone()
 
             if existing:
+                # Derive domain here so both update branches can use it
+                from urllib.parse import urlparse as _urlparse
+                domain = _urlparse(job_url).hostname if job_url else None
+
                 # Update ATS if we now have it and didn't before
                 # Treat None and 'unknown' as equivalent to missing
                 needs_ats_update = (
@@ -154,9 +158,10 @@ def run():
                 if needs_ats_update:
                     conn.execute(
                         "UPDATE prospective_companies "
-                        "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
+                        "SET status='active', domain=COALESCE(?, domain), "
+                        "ats_platform=?, ats_slug=?, ats_detected_at=? "
                         "WHERE company=?",
-                        (platform, slug, datetime.utcnow(), company)
+                        (domain, platform, slug, datetime.utcnow(), company)
                     )
                     conn.commit()
                     print("       [OK] ATS updated for existing company")
@@ -166,8 +171,6 @@ def run():
                 else:
                     # Update domain/status/ATS even for existing rows
                     # User may be providing a new URL or activating a company
-                    from urllib.parse import urlparse as _urlparse
-                    domain = _urlparse(job_url).hostname if job_url else None
                     conn.execute(
                         "UPDATE prospective_companies "
                         "SET status='active', domain=COALESCE(?, domain)"
