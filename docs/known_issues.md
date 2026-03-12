@@ -607,7 +607,7 @@ Needs manual override with spectrum slug
 
 ### 🟡 Ford Motor Company
 Detected via Oracle HCM — verify correct site ID
-Currently returning only 25 jobs (Oracle pagination now fixed)
+Oracle pagination fixed in Session 3 — now returns full job count
 
 ---
 

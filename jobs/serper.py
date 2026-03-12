@@ -152,14 +152,18 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             # Some return generic: "careers", "External" → skip
             site_title = _get_workday_site_title(slug_info)
             if site_title and site_title.lower() not in GENERIC:
-                return _match_compact_identifier(site_title, company)
+                if _match_compact_identifier(site_title, company):
+                    return True
+                # False → don't stop, try next layer
 
             # Layer 2: path from Serper URL
             # e.g. "qualcomm_careers" → contains "qualcomm" ✓
             # More reliable than urlWID — comes directly from URL
             path = slug_info.get("path", "")
             if path and path.lower() not in GENERIC:
-                return _match_compact_identifier(path, company)
+                if _match_compact_identifier(path, company):
+                    return True
+                # False → don't stop, try layer 3
 
             # Layer 3: title_verified fallback
             # Both urlWID and path are generic (ms/External, qualcomm/careers)

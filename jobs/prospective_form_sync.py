@@ -159,6 +159,7 @@ def run():
                     print("       [OK] ATS updated for existing company")
                     imported += 1
                     rows_to_delete.append(sheet_row)
+                    continue  # skip epilogue — already counted
                 else:
                     print(f"       [SKIP] Already in pipeline "
                           f"(status={existing['status']})")
@@ -166,13 +167,16 @@ def run():
                     rows_to_delete.append(sheet_row)
                     continue
             else:
+                # Extract domain from job URL for P3a career page detection
+                from urllib.parse import urlparse as _urlparse
+                domain = _urlparse(job_url).hostname if job_url else None
                 conn.execute(
                     "INSERT INTO prospective_companies "
-                    "(company, ats_platform, ats_slug, ats_detected_at, "
+                    "(company, domain, ats_platform, ats_slug, ats_detected_at, "
                     "priority, status, created_at) "
-                    "VALUES (?, ?, ?, ?, 2, 'active', ?)",
+                    "VALUES (?, ?, ?, ?, ?, 2, 'active', ?)",
                     (
-                        company, platform, slug,
+                        company, domain, platform, slug,
                         datetime.utcnow() if ats_result else None,
                         datetime.utcnow(),
                     )
