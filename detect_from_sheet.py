@@ -76,7 +76,7 @@ def get_sheet():
             print(f"[OK] Created '{SHEET_NAME}' sheet with {_count_unknowns()} companies")
         return ws
     except Exception as e:
-        raise RuntimeError(f"Cannot open sheet: {e}")
+        raise RuntimeError(f"Cannot open sheet: {e}") from e
 
 
 def _count_unknowns():
@@ -92,8 +92,12 @@ def _count_unknowns():
     return count
 
 
-def _populate_unknown_companies(ws):
-    """Pre-fill sheet with unknown companies from DB."""
+def _populate_unknown_companies(ws, force=False):
+    """Pre-fill sheet with unknown companies from DB.
+
+    Only appends new companies — never overwrites existing user edits.
+    Use force=True to overwrite existing data.
+    """
     from db.connection import get_conn
     conn = get_conn()
     rows = conn.execute("""
@@ -108,9 +112,27 @@ def _populate_unknown_companies(ws):
     if not rows:
         return
 
+    # Check existing sheet data — don't overwrite user edits
+    existing = ws.get_all_values()
+    if len(existing) > HEADER_ROW and not force:
+        # Find existing company names
+        existing_companies = {
+            r[COL_COMPANY].strip()
+            for r in existing[HEADER_ROW:]
+            if len(r) > COL_COMPANY and r[COL_COMPANY].strip()
+        }
+        # Only add companies not already in sheet
+        rows = [r for r in rows if r["company"] not in existing_companies]
+        if not rows:
+            return
+        # Append after last used row
+        start_row = len(existing) + 1
+    else:
+        start_row = HEADER_ROW + 1
+
     data = [[r["company"], r["domain"] or "", "", "", "", "pending", ""]
             for r in rows]
-    ws.update(f"A2:G{len(data)+1}", data)
+    ws.update(f"A{start_row}:G{start_row + len(data) - 1}", data)
 
 
 def process_sheet(dry_run=False, apply_db=False):
@@ -126,7 +148,7 @@ def process_sheet(dry_run=False, apply_db=False):
     if len(all_rows) <= HEADER_ROW:
         print("[INFO] Sheet is empty — populate with unknown companies first")
         _populate_unknown_companies(ws)
-        print(f"[OK] Populated sheet with unknown companies")
+        print("[OK] Populated sheet with unknown companies")
         return
 
     processed = 0
@@ -192,13 +214,17 @@ def process_sheet(dry_run=False, apply_db=False):
                     "notes":    "Pattern not recognized — check URL format",
                 })
 
-    # Batch write back to sheet
+    # Batch write back to sheet — single API call
     if updates and not dry_run:
-        for u in updates:
-            row_n = u["row"]
-            ws.update(f"D{row_n}:G{row_n}", [[
-                u["platform"], u["slug"], u["status"], u["notes"]
-            ]])
+        batch = [
+            {
+                "range":  f"D{u['row']}:G{u['row']}",
+                "values": [[u["platform"], u["slug"],
+                             u["status"], u["notes"]]]
+            }
+            for u in updates
+        ]
+        ws.batch_update(batch)
 
     print()
     print(f"=== RESULTS ===")
@@ -255,13 +281,15 @@ if __name__ == "__main__":
                         help="List companies still needing a URL")
     parser.add_argument("--populate",  action="store_true",
                         help="Re-populate sheet with unknown companies")
+    parser.add_argument("--force",     action="store_true",
+                        help="Force overwrite existing sheet data")
     args = parser.parse_args()
 
     if args.list:
         list_pending()
     elif args.populate:
         ws = get_sheet()
-        _populate_unknown_companies(ws)
+        _populate_unknown_companies(ws, force=args.force)
         print("[OK] Sheet populated")
     else:
         process_sheet(dry_run=args.dry_run, apply_db=args.apply_db)

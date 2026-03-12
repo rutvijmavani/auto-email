@@ -48,12 +48,23 @@ def _verify_slug_via_api(result):
     try:
         if platform == "workday":
             from jobs.ats.workday import _build_url, fetch_json_post
-            url  = _build_url(json.loads(slug) if slug.startswith("{") else
-                              {"slug": slug, "wd": "wd1", "path": "careers"})
+            # Safely parse slug — malformed JSON returns False immediately
+            if slug.startswith("{"):
+                try:
+                    slug_info = json.loads(slug)
+                    if not isinstance(slug_info, dict):
+                        return False
+                except (ValueError, TypeError):
+                    return False
+            else:
+                slug_info = {"slug": slug, "wd": "wd1", "path": "careers"}
+            # Ensure required keys exist
+            slug_info.setdefault("wd",   "wd1")
+            slug_info.setdefault("path", "careers")
+            url  = _build_url(slug_info)
             data = fetch_json_post(url, body={"limit": 1, "offset": 0})
             if data is None:
                 return False
-            # Valid if API responds — even 0 jobs means board exists
             return "jobPostings" in data or "total" in data
 
         elif platform == "oracle_hcm":
@@ -89,9 +100,9 @@ def _verify_slug_via_api(result):
         return True
 
     except Exception as e:
-        logger.debug("API verification failed for %s/%s: %s",
-                     platform, slug, e)
-        return True  # conservative — accept on error
+        logger.warning("API verification failed for %s/%s: %s",
+                       platform, slug, e)
+        return False  # reject unverified slugs
 
 
 def detect_via_serper(company):
