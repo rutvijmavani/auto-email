@@ -35,6 +35,34 @@ SERPER_SEARCHES = [
 SERPER_EXHAUSTED = object()
 
 
+def _match_compact_identifier(identifier, company):
+    """
+    Match company name against a compact ATS identifier.
+    validate_company_match uses word boundaries which fail on CamelCase.
+
+    Handles:
+      "WellsFargoJobs"           → splits → "Wells Fargo Jobs" ✓
+      "NVIDIAExternalCareerSite" → splits → "NVIDIA External Career Site" ✓
+      "ASMLExternalCareerSite"   → splits → "ASML External Career Site" ✓
+      "BlackRock_Professional"   → splits → "Black Rock Professional" ✓
+    """
+    from jobs.ats.base import validate_company_match
+    # Replace underscores/hyphens with spaces
+    s = identifier.replace("_", " ").replace("-", " ")
+    # Split CamelCase: lowercase→Uppercase
+    s = re.sub(r"([a-z])([A-Z])", r"\1 \2", s)
+    # Split ALL_CAPS→Capital: "NVIDIAExternal" → "NVIDIA External"
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", s)
+    if validate_company_match(s, company):
+        return True
+    # Fallback: direct prefix match for short all-caps names (e.g. ASML, NXP)
+    company_clean    = re.sub(r"[^a-z0-9]", "", company.lower())
+    identifier_clean = re.sub(r"[^a-z0-9]", "", identifier.lower())
+    if company_clean and identifier_clean.startswith(company_clean):
+        return True
+    return False
+
+
 def _get_workday_site_title(slug_info):
     """
     Extract company-identifying text from Workday career site HTML.
@@ -68,8 +96,14 @@ def _get_workday_site_title(slug_info):
             match = re.search(r'urlWID\s*:\s*"([^"]+)"', resp.text)
             if match:
                 return match.group(1).strip()
-    except Exception:
-        pass
+            logger.debug("urlWID not found in Workday HTML for %s",
+                         slug_info.get("slug", "?"))
+        else:
+            logger.debug("Workday site fetch returned %s for %s",
+                         resp.status_code, slug_info.get("slug", "?"))
+    except Exception as e:
+        logger.debug("Workday site title fetch failed for %s: %s",
+                     slug_info.get("slug", "?"), e)
 
     # Fallback: path often contains company name
     path = slug_info.get("path", "")
@@ -132,9 +166,25 @@ def _verify_slug_via_api(result, company):
                 info.get("site", ""), 1, 0
             )
             data = fetch_json(url)
-            # Oracle: confirm board exists — site ID already came from
-            # company-specific Serper search so title check is sufficient
-            return data is not None and "items" in data
+            if not data or "items" not in data:
+                return False
+            # Oracle HCM: extract org name from requisitionList if present
+            # Fall back to validating site ID against company name
+            items = data.get("items", [])
+            if not items:
+                return True  # board exists, 0 jobs — accept
+            # Site ID (e.g. "CX_1001", "LateralHiring") came from
+            # company-specific Serper search — validate it against company
+            from jobs.ats.base import validate_company_match
+            info = json.loads(slug) if isinstance(slug, str) and                    slug.startswith("{") else {"slug": slug}
+            site_id = info.get("site", "")
+            if site_id and site_id not in ("CX_1001", "CX_1", "CX"):
+                if _match_compact_identifier(site_id, company):
+                    return True
+            # Final fallback: slug itself (e.g. "jpmc" for JPMorgan)
+            return validate_company_match(
+                info.get("slug", ""), company
+            )
 
         elif platform == "greenhouse":
             from jobs.ats.base import fetch_json
@@ -197,8 +247,9 @@ def _verify_slug_via_api(result, company):
                     )
                     if m:
                         return validate_company_match(m.group(1), company)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("iCIMS title fetch failed for %s: %s",
+                             slug, e)
             return False
 
         return True
