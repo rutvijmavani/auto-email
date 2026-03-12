@@ -1,4 +1,5 @@
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ def _get_workday_site_title(slug_info):
     return slug_info.get("slug", "")
 
 
-def _verify_slug_via_api(result, company):
+def _verify_slug_via_api(result, company, title_verified=False):
     """
     Verify detected slug by calling the ATS API and confirming
     the company name appears in the response.
@@ -188,10 +189,12 @@ def _verify_slug_via_api(result, company):
             # Fall back to slug alias check (jpmc → JPMorgan Chase)
             if validate_slug_for_company(org_slug, company):
                 return True
-            # Last resort: Serper title already validated — accept
-            # if API confirms board exists at all
+            # Last resort: gate on Serper title verification
+            # Oracle slugs are opaque — only accept if title confirmed company
             items = data.get("items", [])
-            return True  # board exists, title check already passed
+            if items or title_verified:
+                return title_verified
+            return False
 
         elif platform == "greenhouse":
             from jobs.ats.base import fetch_json
@@ -331,7 +334,10 @@ def detect_via_serper(company):
 
             # Step 1: Collect ALL unique slugs from all 10 results
             # into a hashmap — deduplicates by slug value
-            slug_map = {}  # slug_str → result dict
+            # Also record whether Serper title confirmed company name
+            # (used as fallback signal in Oracle verification)
+            from jobs.ats.base import validate_company_match
+            slug_map = {}  # slug_str → (result, title_verified)
             for item in items:
                 url    = item.get("link", "")
                 result = match_ats_pattern(url)
@@ -341,7 +347,12 @@ def detect_via_serper(company):
                     continue
                 slug_key = result["slug"]
                 if slug_key not in slug_map:
-                    slug_map[slug_key] = result
+                    page_title   = item.get("title", "")
+                    page_snippet = item.get("snippet", "")
+                    title_verified = validate_company_match(
+                        f"{page_title} {page_snippet}", company
+                    )
+                    slug_map[slug_key] = (result, title_verified)
 
             if not slug_map:
                 continue
@@ -354,15 +365,17 @@ def detect_via_serper(company):
 
             # Step 2: API-verify each slug — check company name
             # appears in the actual API response (ground truth)
-            for slug_key, result in slug_map.items():
-                if _verify_slug_via_api(result, company):
+            for slug_key, (result, title_verified) in slug_map.items():
+                if _verify_slug_via_api(result, company,
+                                        title_verified=title_verified):
                     print(f"   [SERPER] {company} -> {platform} "
                           f"(slug: {result['slug']})")
                     return result
                 else:
                     logger.debug(
-                        "Slug rejected by API: company=%s slug=%s",
-                        company, slug_key
+                        "Slug rejected by API: company=%s slug=%s "
+                        "title_verified=%s",
+                        company, slug_key, title_verified
                     )
 
         except requests.exceptions.Timeout:
