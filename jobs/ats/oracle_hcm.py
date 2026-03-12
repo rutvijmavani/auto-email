@@ -19,11 +19,24 @@ from jobs.ats.base import fetch_json
 #   Standard: {slug}.fa.oraclecloud.com          (JPMorgan)
 #   Regional: {slug}.fa.{region}.oraclecloud.com (Goldman Sachs → us2)
 def _build_oracle_url(slug, region, site_id, limit, offset):
-    """Build Oracle HCM API URL handling optional region subdomain."""
+    """Build Oracle HCM API URL handling optional region subdomain.
+
+    IMPORTANT: limit and offset must be inside the finder value
+    as semicolon-separated params, NOT as separate URL params.
+    Verified via browser XHR inspection on jpmc.fa.oraclecloud.com
+    """
     if region:
         host = f"{slug}.fa.{region}.oraclecloud.com"
     else:
         host = f"{slug}.fa.oraclecloud.com"
+    # Build finder value with limit+offset embedded
+    from urllib.parse import quote
+    finder = (
+        f"findReqs;siteNumber={site_id},"
+        f"limit={limit},"
+        f"offset={offset},"
+        f"sortBy=POSTING_DATES_DESC"
+    )
     return (
         f"https://{host}/hcmRestApi/resources/latest/"
         f"recruitingCEJobRequisitions?"
@@ -32,9 +45,7 @@ def _build_oracle_url(slug, region, site_id, limit, offset):
         f"requisitionList.otherWorkLocations,"
         f"requisitionList.secondaryLocations,"
         f"requisitionList.requisitionFlexFields&"
-        f"finder=findReqs%3BsiteNumber%3D{site_id}"
-        f"%2Climit%3D{limit}%2Coffset%3D{offset}"
-        f"%2CsortBy%3DPOSTING_DATES_DESC"
+        f"finder={quote(finder)}"
     )
 
 def _build_careers_url(slug, region, site_id):

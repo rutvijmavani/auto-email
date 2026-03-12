@@ -430,3 +430,83 @@ icims:        ~3 companies  ✓ (some wrong)
 oracle_hcm:   ~2 companies  ✓
 custom:        7 companies  ✓
 ```
+
+
+---
+
+## Session 2 Fixes (2026-03-11)
+
+### ⚪ Workday en-US locale prefix extracted as path
+**Resolved:** 2026-03-11
+**Was:** Serper returns URLs like `nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite`
+Our regex captured `en-US` as path → 404 on every API call
+54 Workday companies returning 0 jobs (66% of monitored companies)
+**Fix:** Skip locale segments in path extraction in both
+`patterns.py` and `build_ats_slug_list.py`
+Also removed `en-US` from `WD_PATH_VARIANTS` in `workday.py`
+
+### ⚪ Workday self-population stored JSON slug instead of plain slug
+**Resolved:** 2026-03-11
+**Was:** `mark_from_detection()` called with full JSON
+`{"slug":"nvidia","wd":"wd5"}` instead of plain `"nvidia"`
+→ Discovery DB never matched on P1 lookup
+→ Serper used every re-detection instead of DB
+**Fix:** Extract plain slug before saving in `ats_detector.py`
+Backfill script: `backfill_workday_discovery.py`
+
+### ⚪ myworkdaysite.com not supported (Fidelity, Wells Fargo)
+**Resolved:** 2026-03-11
+**Was:** Pattern only matched `myworkdayjobs.com`
+`myworkdaysite.com` has different URL structure:
+`wd1.myworkdaysite.com/recruiting/{tenant}/{career_site}`
+**Fix:** New pattern added in `patterns.py`
+`_build_url()` in `workday.py` handles both domains
+
+### ⚪ Oracle HCM wrong API finder format
+**Resolved:** 2026-03-11
+**Was:** `finder=CandidateExperience&CandidateExperienceId=CX_1001`
+→ 400 Bad Request on every call
+**Fix:** Correct format discovered via browser XHR inspection:
+`finder=findReqs%3BsiteNumber%3DCX_1001%2Climit%3D25%2Coffset%3D0`
+Semicolon-separated params inside finder value
+
+### ⚪ Oracle HCM regional URLs not supported
+**Resolved:** 2026-03-11
+**Was:** Only `{slug}.fa.oraclecloud.com` supported
+Goldman Sachs uses `hdpc.fa.us2.oraclecloud.com` (us2 region)
+**Fix:** `patterns.py` captures optional region segment
+`_build_oracle_url()` handles both standard and regional URLs
+Goldman Sachs: slug=hdpc, region=us2, site=LateralHiring
+
+### ⚪ AMD/Arm/Rivian wrong iCIMS detection
+**Resolved:** 2026-03-11
+**Was:** All three detected as iCIMS but had migrated away
+AMD   → careers.amd.com (custom)
+Arm   → careers.arm.com (custom)
+Rivian → careers.rivian.com (custom)
+**Fix:** JS redirect detection in `icims.py` — page <500 chars
+with `window.top.location.href` → returns None → stops pagination
+Override script marks all three as custom
+
+### ⚪ iCIMS fetcher verified working
+**Verified:** 2026-03-11
+Tested against `careers-nyit.icims.com`:
+  200 status, 57KB page, 20 jobs found
+  `a.iCIMS_Anchor` selector works ✓
+  `?pr={page}&in_iframe=1` pagination works ✓
+  `_clean_title()` strips "Job Title\n" prefix ✓
+
+### ⚪ Coverage alert not emailed (only printed to CLI)
+**Resolved:** 2026-03-11
+**Was:** `_send_no_jobs_email()` had no alerts param
+→ Coverage warnings only appeared in CLI output
+**Fix:** `_send_no_jobs_email(alerts=alerts)` — renders
+alert table in email body, adds ⚠️ to subject line
+
+### ⚪ fetch_jobs NameError: slug/wd undefined
+**Resolved:** 2026-03-11
+**Was:** After `_build_url` refactor, `slug` and `wd`
+no longer defined before list comprehension in `fetch_jobs`
+→ 7 test failures, blocked deployment
+**Fix:** Extract `slug = slug_info.get("slug", "")` and
+`wd = slug_info.get("wd", "")` at top of `fetch_jobs`

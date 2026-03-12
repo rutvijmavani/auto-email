@@ -3,7 +3,7 @@
 # Risk: undocumented — monitor for structural changes
 
 from datetime import datetime
-from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 
 
 # Workday uses different instance numbers
@@ -53,7 +53,7 @@ def detect(company):
         for wd in WD_VARIANTS:
             for path in _get_path_variants(slug, company):
                 url = _build_url({"slug": slug, "wd": wd, "path": path})
-                data = fetch_json(url, params={"limit": 20, "offset": 0})
+                data = fetch_json_post(url, body={"limit": 20, "offset": 0})
                 if data is None:
                     continue
                 jobs = data.get("jobPostings", [])
@@ -113,7 +113,7 @@ def fetch_jobs(slug_info, company):
     limit    = 20  # Workday default page size
 
     while True:
-        data = fetch_json(url, params={"limit": limit, "offset": offset})
+        data = fetch_json_post(url, body={"limit": limit, "offset": offset})
         if not data:
             break
         jobs = data.get("jobPostings", [])
