@@ -21,15 +21,13 @@ from config import SERPER_API_KEY, SERPER_API_URL
 from db.serper_quota import increment_serper_credits, has_serper_credits
 from jobs.ats.patterns import match_ats_pattern
 
-# Only search these platforms via Serper
-# (others handled by sitemap/API probe)
-# Only Workday + Oracle HCM via Serper (2 credits per company)
-# iCIMS removed — handled by Phase 2 API probe + Brave Search
-# Only Workday + Oracle HCM via Serper (2 credits per company)
-# iCIMS removed — handled by Phase 2 API probe + Brave Search
+# Workday only via Serper (1 credit per company)
+# Oracle HCM removed — site:fa.oraclecloud.com returns JPMorgan results
+# for any company because Oracle job descriptions mention competitor names.
+# Oracle HCM is auto-detected via Phase 3a: ats_detector.py calls
+# oracle_hcm.detect() which follows company.com/careers → oraclecloud URL.
 SERPER_SEARCHES = [
-    ("workday",    "site:myworkdayjobs.com"),
-    ("oracle_hcm", "site:fa.oraclecloud.com"),
+    ("workday", "site:myworkdayjobs.com"),
 ]
 
 # Sentinel for exhausted credits
@@ -159,41 +157,12 @@ def _verify_slug_via_api(result, company, title_verified=False):
             return False
 
         elif platform == "oracle_hcm":
-            from jobs.ats.base import fetch_json
-            from jobs.ats.oracle_hcm import _build_oracle_url
-            info = json.loads(slug) if isinstance(slug, str) and                    slug.startswith("{") else {"slug": slug}
-            url  = _build_oracle_url(
-                info.get("slug", ""), info.get("region", ""),
-                info.get("site", ""), 1, 0
-            )
-            data = fetch_json(url)
-            if not data or "items" not in data:
-                return False
-            # Oracle HCM: extract org name from requisitionList if present
-            # Fall back to validating site ID against company name
-            # Validate company ownership regardless of empty/non-empty
-            # Oracle slugs are opaque (jpmc, hdpc) — use:
-            # 1. Named site_id if non-generic (e.g. "LateralHiring")
-            # 2. validate_slug_for_company for known aliases (jpmc→JPMorgan)
-            # Note: Serper page title (layer 1) already confirmed company
-            from jobs.ats.base import validate_company_match
-            from jobs.ats.patterns import validate_slug_for_company
-            info = json.loads(slug) if isinstance(slug, str) and                    slug.startswith("{") else {"slug": slug}
-            site_id  = info.get("site", "")
-            org_slug = info.get("slug", "")
-            # Check named site_id first (e.g. "LateralHiring" for Goldman)
-            generic_ids = {"CX_1001", "CX_1", "CX", ""}
-            if site_id not in generic_ids:
-                if _match_compact_identifier(site_id, company):
-                    return True
-            # Fall back to slug alias check (jpmc → JPMorgan Chase)
-            if validate_slug_for_company(org_slug, company):
-                return True
-            # Last resort: gate on Serper title verification
-            # Oracle slugs are opaque — only accept if title confirmed company
-            items = data.get("items", [])
-            if items or title_verified:
-                return title_verified
+            # Oracle HCM API does not expose company name in search results
+            # items[] is a search result object with internal dept codes,
+            # not job requisitions with organizationName
+            # Oracle detection must come from P3a (career page HTML)
+            # which is already the ground truth — return False here
+            # so Serper never accepts Oracle results
             return False
 
         elif platform == "greenhouse":

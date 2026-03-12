@@ -6,6 +6,7 @@
 #             en/sites/{site_id}/jobs
 
 import json
+import logging
 from datetime import datetime
 from jobs.ats.base import fetch_json
 
@@ -55,6 +56,93 @@ def _build_careers_url(slug, region, site_id):
     else:
         host = f"{slug}.fa.oraclecloud.com"
     return f"https://{host}/hcmUI/CandidateExperience/en/sites/{site_id}/jobs"
+
+
+def detect(company, domain):
+    """
+    Detect Oracle HCM tenant from company career page.
+    Follows documented pipeline:
+      company.com/careers -> oraclecloud URL -> tenant -> organizationName
+
+    Returns slug_info dict or None.
+    """
+    import re
+    import requests
+
+    CAREER_PATHS = [
+        "/careers",
+        "/careers/",
+        "/jobs",
+        "/about/careers",
+        "/company/careers",
+        "/en/careers",
+        "/global/careers",
+        "/us/careers",
+        "/about-us/careers",
+        "/join-us",
+        "/work-with-us",
+        "/opportunities",
+        "/career",
+    ]
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    if not domain:
+        return None
+
+    domain = re.sub(r"^https?://", "", domain).rstrip("/")
+    # company is used for logging context
+    logger = logging.getLogger(__name__)
+    logger.debug("Oracle detect: company=%s domain=%s", company, domain)
+
+    # Steps 1+2: Visit career pages, find oraclecloud URL in HTML
+    oracle_url = None
+    # Match: {tenant}.fa.oraclecloud.com or {tenant}.fa.{region}.oraclecloud.com
+    oracle_pattern = re.compile(
+        r"https://[a-zA-Z0-9-]+\.fa(?:\.[a-z0-9]+)?\.oraclecloud\.com"
+        r"/hcmUI/CandidateExperience[^\s\"'<>]*"
+    )
+
+    for path in CAREER_PATHS:
+        try:
+            resp = requests.get(
+                f"https://{domain}{path}",
+                headers=HEADERS, timeout=8,
+                allow_redirects=True
+            )
+            if resp.status_code != 200:
+                continue
+            # Check 1: final redirect URL points directly to Oracle
+            if oracle_pattern.search(resp.url):
+                m = oracle_pattern.search(resp.url)
+                oracle_url = m.group(0)
+                break
+            # Check 2: Oracle URL embedded in page HTML
+            match = oracle_pattern.search(resp.text)
+            if match:
+                oracle_url = match.group(0)
+                break
+        except Exception as e:
+            logger.debug("Oracle career page fetch failed %s%s: %s",
+                         domain, path, e)
+            continue
+
+    if not oracle_url:
+        return None
+
+    # Step 3: Extract tenant/region/site_id from URL
+    from jobs.ats.patterns import match_ats_pattern
+    result = match_ats_pattern(oracle_url)
+    if not result or result["platform"] != "oracle_hcm":
+        return None
+
+    try:
+        slug_info = json.loads(result["slug"])
+    except (ValueError, TypeError):
+        return None
+
+    # URL was found on company's own career page — it IS their tenant
+    # No further API validation needed (company domain = ground truth)
+    return slug_info
 
 
 def fetch_jobs(slug_info, company):

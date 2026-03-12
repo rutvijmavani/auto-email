@@ -6,6 +6,7 @@ from datetime import datetime
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 
 
+
 # Workday uses different instance numbers
 WD_VARIANTS = [
     "wd5", "wd1", "wd2", "wd3", "wd4",
@@ -111,6 +112,7 @@ def fetch_jobs(slug_info, company):
     all_jobs = []
     offset   = 0
     limit    = 20  # Workday default page size
+    total    = None  # only populated on first page
 
     while True:
         data = fetch_json_post(url, body={"limit": limit, "offset": offset})
@@ -120,9 +122,17 @@ def fetch_jobs(slug_info, company):
         if not jobs:
             break
         all_jobs.extend(jobs)
-        total = data.get("total", 0)
-        offset += len(jobs)  # use actual jobs returned not limit
-        if len(jobs) < limit or offset >= total:
+        # total is only returned on first page — cache it
+        if total is None:
+            total = data.get("total", 0)
+        offset += len(jobs)
+        # When total is known → rely on total exclusively
+        # (short page can occur mid-pagination due to filtering)
+        # When total unknown → short page is our only stop signal
+        if total is not None:
+            if offset >= total:
+                break
+        elif len(jobs) < limit:
             break
 
     return [_normalize(j, company, slug, wd)
