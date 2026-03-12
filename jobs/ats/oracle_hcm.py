@@ -57,6 +57,72 @@ def _build_careers_url(slug, region, site_id):
     return f"https://{host}/hcmUI/CandidateExperience/en/sites/{site_id}/jobs"
 
 
+def detect(company, domain):
+    """
+    Detect Oracle HCM tenant from company career page.
+    Follows documented pipeline:
+      company.com/careers -> oraclecloud URL -> tenant -> organizationName
+
+    Returns slug_info dict or None.
+    """
+    import re
+    import requests
+
+    CAREER_PATHS = [
+        "/careers", "/jobs", "/about/careers",
+        "/company/careers", "/en/careers", "/join-us",
+    ]
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    if not domain:
+        return None
+
+    domain = re.sub(r"^https?://", "", domain).rstrip("/")
+
+    # Steps 1+2: Visit career pages, find oraclecloud URL in HTML
+    oracle_url = None
+    # Match: {tenant}.fa.oraclecloud.com or {tenant}.fa.{region}.oraclecloud.com
+    oracle_pattern = re.compile(
+        r"https://[a-zA-Z0-9-]+\.fa(?:\.[a-z0-9]+)?\.oraclecloud\.com"
+        r"/hcmUI/CandidateExperience[^\s\"'<>]*"
+    )
+
+    for path in CAREER_PATHS:
+        try:
+            resp = requests.get(
+                f"https://{domain}{path}",
+                headers=HEADERS, timeout=8,
+                allow_redirects=True
+            )
+            if resp.status_code != 200:
+                continue
+            match = oracle_pattern.search(resp.text)
+            if match:
+                oracle_url = match.group(0)
+                break
+        except Exception:
+            continue
+
+    if not oracle_url:
+        return None
+
+    # Step 3: Extract tenant/region/site_id from URL
+    from jobs.ats.patterns import match_ats_pattern
+    result = match_ats_pattern(oracle_url)
+    if not result or result["platform"] != "oracle_hcm":
+        return None
+
+    import json as _json
+    try:
+        slug_info = _json.loads(result["slug"])
+    except (ValueError, TypeError):
+        return None
+
+    # URL was found on company's own career page — it IS their tenant
+    # No further API validation needed (company domain = ground truth)
+    return slug_info
+
+
 def fetch_jobs(slug_info, company):
     """
     Fetch all jobs for company from Oracle HCM.

@@ -6,6 +6,7 @@ from datetime import datetime
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 
 
+
 # Workday uses different instance numbers
 WD_VARIANTS = [
     "wd5", "wd1", "wd2", "wd3", "wd4",

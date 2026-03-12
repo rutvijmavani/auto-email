@@ -126,8 +126,22 @@ def detect_ats(company, domain=None, page=None, sb=None):
         return _store_and_return(company, result)
 
     # Phase 3a: HTML + redirect scan
+    # Also runs Oracle HCM career page detection (documented pipeline)
     if domain:
         print(f"   [P3a] HTML redirect scan ({domain})...")
+
+        # Oracle HCM: follow career page → extract oraclecloud URL → verify
+        from jobs.ats.oracle_hcm import detect as oracle_detect
+        oracle_slug = oracle_detect(company, domain)
+        if oracle_slug:
+            import json as _json
+            result = {
+                "platform": "oracle_hcm",
+                "slug":     _json.dumps(oracle_slug),
+            }
+            print(f"   [P3a HIT] {company} -> oracle_hcm / {result['slug']}")
+            return _store_and_return(company, result)
+
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
         if result:

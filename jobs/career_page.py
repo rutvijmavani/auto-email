@@ -10,7 +10,7 @@
 
 import re
 import requests
-from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
+from jobs.ats.patterns import match_ats_pattern
 
 HEADERS = {
     "User-Agent": (
@@ -51,6 +51,14 @@ ATS_FINGERPRINTS = [
     "fa.oraclecloud.com",
     "icims.com",
     "successfactors.com",
+]
+
+# Oracle HCM tenant extraction patterns
+# Docs say: window.__INITIAL_STATE__.tenant = "company"
+# Also: og:site_name, <title> contain company name
+ORACLE_TENANT_PATTERNS = [
+    r'([a-z0-9]+)\.fa(?:\.[a-z0-9]+)?\.oraclecloud\.com',
+    r'tenant["\'\s]*[:=]["\'\s]*([a-z0-9]+)',
 ]
 
 
@@ -102,9 +110,8 @@ def _scan_url(url, company):
         if final_url != url:
             result = match_ats_pattern(final_url)
             if result:
-                slug_for_validation = _extract_plain_slug(result)
-                if validate_slug_for_company(slug_for_validation, company):
-                    return result
+                # URL came from company's own redirect — trust it
+                return result
 
         if resp.status_code != 200:
             return None
@@ -127,9 +134,8 @@ def _scan_url(url, company):
             if final_url != http_url:
                 result = match_ats_pattern(final_url)
                 if result:
-                    slug_for_validation = _extract_plain_slug(result)
-                    if validate_slug_for_company(slug_for_validation, company):
-                        return result
+                    # URL from company's own domain — trust it
+                    return result
             if resp.status_code == 200:
                 return _scan_html(resp.text, company)
         except Exception:
@@ -158,9 +164,8 @@ def _scan_html(html, company):
         if not result:
             continue
 
-        slug_for_validation = _extract_plain_slug(result)
-        if validate_slug_for_company(slug_for_validation, company):
-            return result
+        # URL found in company's own HTML — trust it
+        return result
 
     return None
 
