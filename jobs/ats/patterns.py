@@ -202,44 +202,84 @@ ATS_URL_PATTERNS = _make_patterns()
 # ─────────────────────────────────────────
 
 COMPANY_ALIASES = {
-    "Meta":             ["meta", "facebook"],
-    "X":                ["x", "twitter"],
-    "Alphabet":         ["alphabet", "google"],
-    "Google":           ["google", "alphabet"],
-    "Waymo":            ["waymo", "alphabet"],
-    "Block":            ["block", "squareup", "square"],
-    "Docusign":         ["docusign", "docu"],
-    "T-Mobile":         ["tmobile", "t-mobile"],
-    "AT&T":             ["att", "at&t"],
-    "NXP USA":          ["nxpusa", "nxp"],
-    "SAP America":      ["sapamerica", "sap"],
-    "Sirius XM":        ["siriusxm", "sirius"],
-    "JPMorgan Chase":   ["jpmc", "jpmorganchase", "jpmorgan"],
-    "Goldman Sachs":    ["goldmansachs", "goldman"],
-    "Bank of America":  ["bankofamerica", "bofa"],
-    "General Motors":   ["generalmotors", "gm"],
-    "Ford Motor Company": ["fordmotor", "ford"],
-    "Samsung Electronics America": ["samsungelectronicsamerica", "samsung"],
-    "Sony Interactive Entertainment": ["sonyinteractiveentertainment", "sony", "sie"],
-    "Electronic Arts":  ["electronicarts", "ea"],
-    "Palo Alto Networks": ["paloaltonetworks", "paloalto"],
-    "Cadence Design Systems": ["cadencedesign", "cadence"],
-    "KLA Corporation":  ["klacorporation", "kla"],
-    "Lam Research":     ["lamresearch", "lam"],
-    "Marvell Semiconductor": ["marvellsemiconductor", "marvell"],
-    "Micron Technology": ["microntechnology", "micron"],
-    "Western Digital":  ["westerndigital", "wd"],
-    "Applied Materials": ["appliedmaterials", "amat"],
-    "Texas Instruments": ["texasinstruments", "ti"],
-    "Analog Devices":   ["analogdevices", "adi"],
-    "Charter Communications": ["chartercommunications", "charter"],
-    "Cox Automotive":   ["coxautomotive", "cox"],
-    "Elevance Health":  ["elevancehealth", "elevance", "anthem"],
-    "Gilead Sciences":  ["gileadsciences", "gilead"],
-    "Charles Schwab":   ["charlesschwab", "schwab"],
-    "Morgan Stanley":   ["morganstanley", "ms"],
-    "Deutsche Bank":    ["deutschebank", "db"],
-    "State Street":     ["statestreet", "ssga"],
+    # Maps display name → list of slug variants
+    # RULE: only include full normalized names, no abbreviations
+    # Abbreviations like 'wf', 'ms', 'gs' cause false positives
+    # with unrelated companies (e.g. 'ms' matches Microsoft AND Morgan Stanley)
+    # Truth comes from API verification, not slug string matching
+    "Meta":                          ["meta", "facebook"],
+    "X":                             ["x", "twitter"],
+    "Alphabet":                      ["alphabet", "google"],
+    "Google":                        ["google", "alphabet"],
+    "Waymo":                         ["waymo", "alphabet"],
+    "Block":                         ["block", "squareup", "square"],
+    "Docusign":                      ["docusign"],
+    "T-Mobile":                      ["tmobile", "t-mobile"],
+    "AT&T":                          ["att", "at&t"],
+    "NXP USA":                       ["nxpusa", "nxp"],
+    "SAP America":                   ["sapamerica", "sap"],
+    "Sirius XM":                     ["siriusxm", "sirius"],
+    "JPMorgan Chase":                ["jpmc", "jpmorganchase", "jpmorgan"],
+    "Goldman Sachs":                 ["goldmansachs", "goldman"],
+    "Bank of America":               ["bankofamerica", "bofa"],
+    "General Motors":                ["generalmotors", "gm"],
+    "Ford Motor Company":            ["fordmotor", "ford"],
+    "Samsung Electronics America":   ["samsungelectronicsamerica", "samsung"],
+    "Sony Interactive Entertainment":["sonyinteractiveentertainment", "sony", "sie"],
+    "Electronic Arts":               ["electronicarts", "ea"],
+    "Palo Alto Networks":            ["paloaltonetworks", "paloalto"],
+    "Cadence Design Systems":        ["cadencedesign", "cadence"],
+    "KLA Corporation":               ["klacorporation", "kla"],
+    "Lam Research":                  ["lamresearch", "lam"],
+    "Marvell Semiconductor":         ["marvellsemiconductor", "marvell"],
+    "Micron Technology":             ["microntechnology", "micron"],
+    "Western Digital":               ["westerndigital"],
+    "Applied Materials":             ["appliedmaterials", "amat"],
+    "Texas Instruments":             ["texasinstruments"],
+    "Analog Devices":                ["analogdevices"],
+    "Charter Communications":        ["chartercommunications", "charter"],
+    "Cox Automotive":                ["coxautomotive", "cox"],
+    "Elevance Health":               ["elevancehealth", "elevance", "anthem"],
+    "Gilead Sciences":               ["gileadsciences", "gilead"],
+    "Charles Schwab":                ["charlesschwab", "schwab"],
+    "Morgan Stanley":                ["morganstanley"],
+    "Deutsche Bank":                 ["deutschebank"],
+    "State Street":                  ["statestreet"],
+    "Wells Fargo":                   ["wellsfargo"],
+    "Fidelity":                      ["fidelity"],
+    "Citibank":                      ["citibank", "citi"],
+    "American Express":              ["americanexpress", "amex"],
+    "Capital One":                   ["capitalone"],
+    "ServiceNow":                    ["servicenow"],
+    "Intuit":                        ["intuit"],
+    "Doordash":                      ["doordash"],
+    "Wayfair":                       ["wayfair"],
+    "Fortinet":                      ["fortinet"],
+    "Nutanix":                       ["nutanix"],
+    "Splunk":                        ["splunk"],
+    "Informatica":                   ["informatica"],
+    "Akamai Technologies":           ["akamai"],
+    "NetApp":                        ["netapp"],
+    "Juniper Networks":              ["junipernetworks", "juniper"],
+    "Synopsys":                      ["synopsys"],
+    "Xilinx":                        ["xilinx"],
+    "Starbucks":                     ["starbucks"],
+    "Caterpillar":                   ["caterpillar"],
+    "Honeywell":                     ["honeywell"],
+    "Siemens":                       ["siemens"],
+    "Nokia":                         ["nokia"],
+    "Ericsson":                      ["ericsson"],
+    "Bosch":                         ["bosch"],
+    "Genentech":                     ["genentech"],
+    "Visa":                          ["visa"],
+    "VMware":                        ["vmware"],
+    "Optum":                         ["optum"],
+    "Lucid":                         ["lucid"],
+    "MathWorks":                     ["mathworks"],
+    "ByteDance":                     ["bytedance"],
+    "TikTok":                        ["tiktok"],
+    "Cruise":                        ["cruise", "getcruise"],
+    "Citrix":                        ["citrix"],
 }
 
 
@@ -320,11 +360,26 @@ def validate_slug_for_company(slug, company):
         # Check 3: prefix match for all-lowercase compound slugs
         # "capitalone" starts with "capital" → match ✓
         # "hrblock" does NOT start with "block" → no match ✓
-        # Note: suffix match intentionally excluded to prevent
-        # "hrblock" matching "block"
         slug_lower = slug_text.lower()
         if slug_lower.startswith(kw.lower()):
             return True
+
+        # Check 4: substring match within path/career site name
+        # "WellsFargoJobs" contains "wells" and "fargo" ✓
+        # "wellsfargo" contains "wells" ✓
+        # Guard: keyword must not appear as a suffix of another word
+        # e.g. "block" in "hrblock" → rejected (suffix match)
+        # e.g. "wells" in "wellsfargo" → accepted (prefix match)
+        if len(kw) >= 4:
+            kw_lower   = kw.lower()
+            text_lower = slug_text.lower()
+            idx = text_lower.find(kw_lower)
+            while idx != -1:
+                # Check char before — must not be a letter (no suffix match)
+                before_ok = (idx == 0 or not text_lower[idx - 1].isalpha())
+                if before_ok:
+                    return True
+                idx = text_lower.find(kw_lower, idx + 1)
 
     return False
 
