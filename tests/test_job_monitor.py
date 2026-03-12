@@ -546,7 +546,7 @@ class TestWorkdayClient(unittest.TestCase):
     def _slug_info(self):
         return {"slug": "jpmorgan", "wd": "wd5"}
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_detect_returns_slug_info(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job()], "total": 1
@@ -556,19 +556,19 @@ class TestWorkdayClient(unittest.TestCase):
         self.assertIn("slug", slug_info)
         self.assertIn("wd", slug_info)
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_detect_none_on_all_fail(self, mock_fetch):
         mock_fetch.return_value = None
         slug_info, _ = self.wd.detect("Unknown Corp")
         self.assertIsNone(slug_info)
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_detect_rejects_non_list_postings(self, mock_fetch):
         mock_fetch.return_value = {"jobPostings": "invalid", "total": 0}
         slug_info, _ = self.wd.detect("JPMorgan Chase")
         self.assertIsNone(slug_info)
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_parses_mm_dd_yyyy(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job(posted="03/04/2026")], "total": 1
@@ -578,7 +578,7 @@ class TestWorkdayClient(unittest.TestCase):
         self.assertEqual(jobs[0]["posted_at"].month, 3)
         self.assertEqual(jobs[0]["posted_at"].day, 4)
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_parses_iso_date(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job(posted="2026-03-04T08:00:00Z")],
@@ -587,7 +587,7 @@ class TestWorkdayClient(unittest.TestCase):
         jobs = self.wd.fetch_jobs(self._slug_info(), "JPMorgan")
         self.assertIsNotNone(jobs[0]["posted_at"])
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_handles_invalid_date(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job(posted="not-a-date")], "total": 1
@@ -595,7 +595,7 @@ class TestWorkdayClient(unittest.TestCase):
         jobs = self.wd.fetch_jobs(self._slug_info(), "JPMorgan")
         self.assertIsNone(jobs[0]["posted_at"])
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_handles_missing_posted_on(self, mock_fetch):
         job = self._job()
         del job["postedOn"]
@@ -603,14 +603,14 @@ class TestWorkdayClient(unittest.TestCase):
         jobs = self.wd.fetch_jobs(self._slug_info(), "JPMorgan")
         self.assertIsNone(jobs[0]["posted_at"])
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_handles_missing_external_url(self, mock_fetch):
         job = self._job(url="")
         mock_fetch.return_value = {"jobPostings": [job], "total": 1}
         jobs = self.wd.fetch_jobs(self._slug_info(), "JPMorgan")
         self.assertTrue(len(jobs[0]["job_url"]) > 0)
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_skips_empty_title(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job(title="")], "total": 1
@@ -619,7 +619,7 @@ class TestWorkdayClient(unittest.TestCase):
             self.wd.fetch_jobs(self._slug_info(), "JPMorgan"), []
         )
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_handles_pagination(self, mock_fetch):
         # total=40, limit=20 → two pages needed
         # Page 1: 20 jobs, offset becomes 20
@@ -633,14 +633,14 @@ class TestWorkdayClient(unittest.TestCase):
             len(self.wd.fetch_jobs(self._slug_info(), "JPMorgan")), 40
         )
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_returns_empty_on_failure(self, mock_fetch):
         mock_fetch.return_value = None
         self.assertEqual(
             self.wd.fetch_jobs(self._slug_info(), "JPMorgan"), []
         )
 
-    @patch("jobs.ats.workday.fetch_json")
+    @patch("jobs.ats.workday.fetch_json_post")
     def test_bullet_fields_as_description(self, mock_fetch):
         mock_fetch.return_value = {
             "jobPostings": [self._job()], "total": 1

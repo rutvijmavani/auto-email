@@ -162,7 +162,16 @@ def fetch_json_post(url, body=None, retries=2,
                     continue
                 return None
 
+            if 500 <= status_code < 600:
+                # Transient server error — retry with backoff
+                backoff_s = 2 ** attempt
+                if attempt < retries:
+                    time.sleep(backoff_s)
+                    continue
+                return None
+
             if status_code != 200:
+                # Non-retryable 4xx error
                 return None
 
             return resp.json()
