@@ -21,11 +21,11 @@ def platform_delay(platform):
     Mimics human browsing patterns.
     Start minimal — increase only if 429s appear.
     """
-    cfg   = PLATFORM_DELAYS.get(platform, {"base": 0.3, "jitter": 0.1})
-    base  = cfg["base"]
+    cfg    = PLATFORM_DELAYS.get(platform, {"base": 0.3, "jitter": 0.1})
+    base   = cfg["base"]
     jitter = cfg["jitter"]
-    delay = base + random.uniform(-jitter, jitter)
-    delay = max(0.05, delay)  # never less than 50ms
+    delay  = base + random.uniform(-jitter, jitter)
+    delay  = max(0.05, delay)  # never less than 50ms
     time.sleep(delay)
 
 
@@ -69,7 +69,6 @@ def fetch_json(url, params=None, retries=2,
             status_code  = resp.status_code
             elapsed_ms   = int(time.time() * 1000) - start_ms
 
-            # Record to api_health
             if platform and track:
                 _record(platform, status_code, elapsed_ms)
 
@@ -129,11 +128,19 @@ def fetch_json(url, params=None, retries=2,
 
 
 def fetch_json_post(url, body=None, retries=2,
-                    platform=None, track=True):
+                    platform=None, track=True, headers=None):
     """
     POST JSON to URL and return parsed response.
     Used by Workday — requires POST with JSON body, not GET.
+    Optional headers param allows callers to override default headers
+    (e.g. Workday requires full browser headers for pagination to work).
     """
+    default_headers = {
+        "User-Agent":   "Mozilla/5.0",
+        "Content-Type": "application/json",
+    }
+    request_headers = headers if headers is not None else default_headers
+
     for attempt in range(retries + 1):
         start_ms    = int(time.time() * 1000)
         status_code = 0
@@ -144,10 +151,7 @@ def fetch_json_post(url, body=None, retries=2,
                 url,
                 json=body or {},
                 timeout=JOB_MONITOR_API_TIMEOUT,
-                headers={
-                    "User-Agent":   "Mozilla/5.0",
-                    "Content-Type": "application/json",
-                },
+                headers=request_headers,
             )
             status_code = resp.status_code
             elapsed_ms  = int(time.time() * 1000) - start_ms
@@ -230,13 +234,11 @@ def fetch_html(url, params=None, platform=None, track=True):
 # INTERNAL HELPERS
 # ─────────────────────────────────────────
 
-def _record(platform, status_code, elapsed_ms,
-            backoff_s=0):
+def _record(platform, status_code, elapsed_ms, backoff_s=0):
     """Record request to api_health table. Best-effort."""
     try:
         from db.api_health import record_request
-        record_request(platform, status_code,
-                       elapsed_ms, backoff_s)
+        record_request(platform, status_code, elapsed_ms, backoff_s)
     except Exception:
         pass  # never block on tracking failure
 
@@ -309,7 +311,7 @@ def _send_critical_alert(alert_id, platform, rate, threshold):
 
 
 # ─────────────────────────────────────────
-# EXISTING HELPERS (unchanged)
+# SLUG + VALIDATION HELPERS
 # ─────────────────────────────────────────
 
 def slugify(company):

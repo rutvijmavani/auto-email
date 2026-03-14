@@ -24,6 +24,7 @@ CLI flags:
   --weekly-summary      send Monday weekly summary email
   --outreach-only       schedule + send outreach emails
   --quota-report        check quota health and send alert email if needed
+  --sync-prospective    
 """
 
 import os
@@ -176,6 +177,13 @@ def run_sync_forms():
     from jobs.form_sync import run as sync_run
     sync_run()
 
+def run_sync_prospective():
+    """Pull Google Form responses, insert into DB, scrape JDs, clean up sheet."""
+    print("\n" + "=" * 55)
+    print("[INFO] Syncing Google Form responses")
+    print("=" * 55)
+    from jobs.prospective_form_sync import run as sync_prospective
+    sync_prospective()
 
 def run_find_emails():
     """Scrape CareerShift for recruiters + generate AI content + quota health check."""
@@ -620,6 +628,10 @@ def main():
 
     if "--sync-forms" in args:
         run_sync_forms()
+        return
+
+    if "--sync-prospective" in args:
+        run_sync_prospective()
         return
 
     if "--add" in args:

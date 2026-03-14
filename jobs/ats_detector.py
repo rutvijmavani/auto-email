@@ -3,36 +3,18 @@
 # Detection flow (4 phases):
 #
 #   Phase 1: Sitemap lookup (FREE, instant)
-#     boards.greenhouse.io/sitemap.xml
-#     jobs.lever.co/sitemap.xml
-#     jobs.ashbyhq.com/sitemap.xml
-#     → Covers ~60% of companies
-#
 #   Phase 2: ATS API name probe (FREE, ~50ms)
-#     boards-api.greenhouse.io/v1/boards/{slug}
-#     api.lever.co/v0/postings/{slug}
-#     jobs.ashbyhq.com/api/posting-api/job-board/{slug}
-#     api.smartrecruiters.com/v1/companies/{slug}
-#     → Covers additional ~15%
-#
 #   Phase 3a: HTML + redirect scan (FREE, ~100ms)
-#     GET company.com/careers allow_redirects=True
-#     → Covers additional ~10%
-#
 #   Phase 3b: Serper API (2500 free credits)
-#     "{company} site:myworkdayjobs.com"
-#     "{company} site:fa.oraclecloud.com"
-#     → Covers remaining ~10%
-#
 #   Phase 4: Unknown → store as unknown
-#     Amazon/Apple/Google/Meta (custom ATS)
-#     → ~5%
 
 import json
 import logging
 import re
 from db.connection import get_conn
-logger = logging.getLogger(__name__)
+
+from logger import get_logger
+logger = get_logger(__name__)
 
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
 from jobs.ats import oracle_hcm, icims
@@ -95,55 +77,58 @@ def _get_keywords(company):
 def detect_ats(company, domain=None, page=None, sb=None):
     """
     Detect ATS for a company using 4-phase approach.
-
-    Args:
-        company: company name (e.g. "Capital One")
-        domain:  company domain for Phase 3a (e.g. "capitalone.com")
-        page:    unused (kept for backward compatibility)
-        sb:      unused (kept for backward compatibility)
-
-    Returns dict:
-    {
-        company, status, platform, slug,
-        ats_platform, ats_slug  (legacy keys)
-    }
     """
+    logger.info("━━━ ATS detection: company=%r domain=%r", company, domain)
     print(f"   [INFO] Detecting ATS for {company}...")
 
     # Phase 1: Sitemap lookup
+    logger.debug("[P1] Sitemap lookup for %r", company)
     print("   [P1] Sitemap lookup...")
     from jobs.ats_sitemap import detect_via_sitemap
     result = detect_via_sitemap(company)
     if result:
+        logger.info("[P1 HIT] %r → platform=%s slug=%s",
+                    company, result["platform"], result["slug"])
         print(f"   [P1 HIT] {company} -> "
               f"{result['platform']} / {result['slug']}")
         return _store_and_return(company, result)
+    logger.debug("[P1 MISS] %r", company)
 
     # Phase 2: ATS API name probe
+    logger.debug("[P2] API name probe for %r", company)
     print("   [P2] API name probe...")
     from jobs.ats_verifier import detect_via_api
     result = detect_via_api(company)
     if result:
+        logger.info("[P2 HIT] %r → platform=%s slug=%s",
+                    company, result["platform"], result["slug"])
         print(f"   [P2 HIT] {company} -> "
               f"{result['platform']} / {result['slug']}")
         return _store_and_return(company, result)
+    logger.debug("[P2 MISS] %r", company)
 
     # Phase 3a: HTML + redirect scan
-    # career_page.detect() handles ALL ATS including Oracle HCM
-    # It scans for fa.oraclecloud.com URLs in HTML — no separate
-    # oracle pass needed, avoids fetching same career page twice
     if domain:
+        logger.debug("[P3a] HTML redirect scan for %r (domain=%s)",
+                     company, domain)
         print(f"   [P3a] HTML redirect scan ({domain})...")
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
         if result:
+            logger.info("[P3a HIT] %r → platform=%s slug=%s",
+                        company, result["platform"], result["slug"])
             print(f"   [P3a HIT] {company} -> "
                   f"{result['platform']} / {result['slug']}")
             return _store_and_return(company, result)
+        logger.debug("[P3a MISS] %r", company)
+    else:
+        logger.warning("[P3a SKIP] No domain for %r — "
+                       "Oracle HCM and redirect-based ATS will not be detected",
+                       company)
 
-    # Phase 3b: Serper API (Workday + Oracle only)
-    # Skip for companies known to use fully custom ATS
+    # Phase 3b: Serper API
     if company in KNOWN_CUSTOM_ATS:
+        logger.info("[CUSTOM] %r uses custom ATS — skipping Serper", company)
         print(f"   [CUSTOM] {company} uses custom ATS — skipping Serper")
         _store_detection(company, ATS_STATUS_CUSTOM, None)
         return {
@@ -155,21 +140,27 @@ def detect_ats(company, domain=None, page=None, sb=None):
             "ats_slug":     None,
         }
 
+    logger.debug("[P3b] Serper search for %r", company)
     print("   [P3b] Serper API search...")
     from jobs.serper import detect_via_serper, SERPER_EXHAUSTED
     serper_result = detect_via_serper(company)
 
     if serper_result is SERPER_EXHAUSTED:
+        logger.warning("[P3b] Serper credits exhausted for %r", company)
         print(f"   [WARNING] Serper credits exhausted — "
               f"storing as unknown, retry when credits available")
         raise QuotaExhaustedException("Serper credits exhausted")
 
     if serper_result:
+        logger.info("[P3b HIT] %r → platform=%s slug=%s",
+                    company, serper_result["platform"], serper_result["slug"])
         print(f"   [P3b HIT] {company} -> "
               f"{serper_result['platform']} / {serper_result['slug']}")
         return _store_and_return(company, serper_result)
+    logger.debug("[P3b MISS] %r", company)
 
     # Phase 4: Unknown
+    logger.warning("[UNKNOWN] %r — no ATS found in any phase", company)
     print(f"   [UNKNOWN] {company} — no ATS found in any phase")
     _store_detection(company, ATS_STATUS_UNKNOWN, None)
 
@@ -198,35 +189,32 @@ def _store_and_return(company, result):
     else:
         status = ATS_STATUS_UNSUPPORTED
         label  = "[UNSUPPORTED]"
+        logger.info("%r uses unsupported platform=%s — stored for future use",
+                    company, platform)
         print(f"   [INFO] {company} uses {platform} "
               f"(not yet supported — stored for future use)")
 
-    # Store in main pipeline DB
     _store_detection(company, platform, slug)
 
-    # Self-populate ats_discovery.db
-    # This makes future Phase 1 lookups instant (no Serper needed)
     try:
         from db.ats_companies import mark_from_detection
         from db.schema_discovery import init_discovery_db
         init_discovery_db()
-
-        # Store FULL JSON slug in ats_discovery.db
-        # P1 returns this directly to fetch_jobs which needs wd+path
-        # e.g. {"slug":"nvidia","wd":"wd5","path":"NVIDIAExternalCareerSite"}
-        # Plain slugs ("nvidia") cause 0 jobs — missing wd/path info
         mark_from_detection(
             platform=platform,
-            slug=slug,  # full JSON preserved
+            slug=slug,
             company_name=company,
         )
+        logger.debug("Self-populated ats_discovery.db: platform=%s slug=%s company=%r",
+                     platform, slug, company)
     except Exception as e:
         logger.error(
             "Failed to self-populate ats_discovery.db "
             "for %s/%s (%s): %s",
             platform, slug, company, e, exc_info=True
-        )  # best-effort — never blocks detection
+        )
 
+    logger.info("%s %r → %s (slug: %s)", label, company, platform, slug)
     print(f"   {label} {company} -> {platform} (slug: {slug})")
 
     return {
@@ -369,6 +357,7 @@ def _classify(buffer):
 
 def _store_detection(company, platform, slug):
     """Store ATS detection result. Resets consecutive_empty_days."""
+    logger.debug("DB write: company=%r platform=%s slug=%s", company, platform, slug)
     conn = get_conn()
     try:
         conn.execute("""
@@ -389,6 +378,8 @@ def override_ats(company, platform, slug):
     Manually override ATS detection.
     Manual overrides are never auto-re-detected.
     """
+    logger.info("Manual override: company=%r platform=%s slug=%s",
+                company, platform, slug)
     try:
         slug_data = json.loads(slug) if slug and slug.startswith("{") else {}
         slug_data["_manual"]   = True
@@ -410,6 +401,8 @@ def override_ats(company, platform, slug):
             WHERE company = ?
         """, (platform, slug_str, company))
         conn.commit()
+        logger.info("Override stored: company=%r platform=%s slug=%s",
+                    company, platform, slug_str)
         print(f"[OK] {company} -> manually set to {platform} "
               f"(slug: {slug_str})")
     finally:
@@ -419,51 +412,51 @@ def override_ats(company, platform, slug):
 def needs_redetection(company_row, redetect_days=14):
     """
     Check if company needs ATS re-detection.
-
-    Never re-detects:
-      → platform = "manual" (user override)
-      → _manual flag in slug JSON
-      → platform = "unsupported" (we know the ATS)
-
-    Always re-detects:
-      → platform is None/unknown/custom
-      → ats_detected_at is None
-      → consecutive_empty_days >= redetect_days
     """
     platform    = company_row.get("ats_platform", ATS_STATUS_UNKNOWN)
     slug        = company_row.get("ats_slug")
     empty_days  = company_row.get("consecutive_empty_days", 0) or 0
     detected_at = company_row.get("ats_detected_at")
+    company     = company_row.get("company", "?")
 
-    # Manual overrides never re-detected
     if platform == ATS_STATUS_MANUAL:
+        logger.debug("needs_redetection: %r → False (manual override)", company)
         return False
     if slug:
         try:
             slug_data = json.loads(slug)
             if slug_data.get("_manual"):
+                logger.debug("needs_redetection: %r → False (_manual flag)", company)
                 return False
         except (ValueError, TypeError):
             pass
 
-    # Unsupported but detected — never re-detect
     if platform == ATS_STATUS_UNSUPPORTED:
+        logger.debug("needs_redetection: %r → False (unsupported)", company)
         return False
 
-    # Unknown or custom — always retry
     if not platform or platform in (ATS_STATUS_UNKNOWN, "custom"):
+        logger.debug("needs_redetection: %r → True (platform=%s)", company, platform)
         return True
 
     if not slug:
+        logger.debug("needs_redetection: %r → True (no slug)", company)
         return True
     if detected_at is None:
+        logger.debug("needs_redetection: %r → True (never detected)", company)
         return True
     if empty_days >= redetect_days:
+        logger.debug("needs_redetection: %r → True (empty_days=%d)", company, empty_days)
         return True
 
+    logger.debug("needs_redetection: %r → False (platform=%s empty_days=%d)",
+                 company, platform, empty_days)
     return False
 
 
 def get_ats_module(platform):
     """Return ATS module for given platform name."""
-    return ATS_REGISTRY.get(platform)
+    module = ATS_REGISTRY.get(platform)
+    if not module:
+        logger.warning("No ATS module for platform=%s", platform)
+    return module

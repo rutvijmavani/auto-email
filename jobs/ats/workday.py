@@ -6,18 +6,34 @@ from datetime import datetime
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 
 
-
-# Workday uses different instance numbers
 WD_VARIANTS = [
     "wd5", "wd1", "wd2", "wd3", "wd4",
-    "wd6", "wd7", "wd8", "wd10", "wd12",  # extended variants
+    "wd6", "wd7", "wd8", "wd10", "wd12",
 ]
 
-# Base URL templates — two domains used by Workday
-# myworkdayjobs: {tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{path}/jobs
-# myworkdaysite: {wd}.myworkdaysite.com/wday/cxs/{tenant}/{path}/jobs
 BASE_URL      = "https://{slug}.{wd}.myworkdayjobs.com/wday/cxs/{slug}/{path}/jobs"
 BASE_URL_SITE = "https://{wd}.myworkdaysite.com/wday/cxs/{slug}/{path}/jobs"
+
+# Base domain — used to construct full job URLs
+BASE_DOMAIN      = "https://{slug}.{wd}.myworkdayjobs.com"
+BASE_DOMAIN_SITE = "https://{wd}.myworkdaysite.com"
+
+WD_PATH_VARIANTS = [
+    "careers",
+    "External",
+    "jobs",
+    "Careers",
+    "career",
+]
+
+# Workday requires full browser headers — plain User-Agent causes total=0 on page 2+
+WORKDAY_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept":          "application/json",
+    "Content-Type":    "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://www.myworkdayjobs.com/",
+}
 
 
 def _build_url(slug_info):
@@ -29,68 +45,52 @@ def _build_url(slug_info):
         return BASE_URL_SITE.format(slug=slug, wd=wd, path=path)
     return BASE_URL.format(slug=slug, wd=wd, path=path)
 
-# Common path variants to try per company
-# Ordered by frequency of use
-WD_PATH_VARIANTS = [
-    "careers",
-    "External",
-    "jobs",
-    "Careers",
-    "career",
-    # Note: "en-US" removed — it is a locale prefix, never a career site name
-    # e.g. nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/...
-    #      the API path needs "NVIDIAExternalCareerSite" not "en-US"
-]
+
+def _build_domain(slug_info):
+    """Build base domain for constructing full job URLs."""
+    slug = slug_info["slug"]
+    wd   = slug_info["wd"]
+    if slug_info.get("site") == "myworkdaysite":
+        return BASE_DOMAIN_SITE.format(wd=wd)
+    return BASE_DOMAIN.format(slug=slug, wd=wd)
 
 
 def detect(company):
     """
     Try to detect if company uses Workday.
-    Tries all slug variants × WD instance variants × path variants.
     Returns (slug_info, sample_jobs) or (None, None).
-    slug_info = {"slug": "capitalone", "wd": "wd12", "path": "Capital_One"}
     """
     for slug in slugify(company):
         for wd in WD_VARIANTS:
             for path in _get_path_variants(slug, company):
-                url = _build_url({"slug": slug, "wd": wd, "path": path})
-                data = fetch_json_post(url, body={"limit": 20, "offset": 0})
+                url  = _build_url({"slug": slug, "wd": wd, "path": path})
+                data = fetch_json_post(url, body={"limit": 20, "offset": 0},
+                                       headers=WORKDAY_HEADERS)
                 if data is None:
                     continue
                 jobs = data.get("jobPostings", [])
                 if not isinstance(jobs, list):
                     continue
                 if len(jobs) == 0:
-                    # Valid Workday structure confirmed
                     if "total" in data:
                         return {"slug": slug, "wd": wd, "path": path}, []
                     continue
-                # Validate company match
                 first_title = jobs[0].get("title", "")
-                first_url   = jobs[0].get("externalUrl", "")
-                if not validate_company_match(
-                    first_url + first_title, company
-                ):
+                first_path  = jobs[0].get("externalPath", "")
+                if not validate_company_match(first_path + first_title, company):
                     continue
                 return {"slug": slug, "wd": wd, "path": path}, jobs
     return None, None
 
 
 def _get_path_variants(slug, company):
-    """
-    Generate path variants to try for a given company.
-    Includes common paths + company-name-derived paths.
-    """
     import re
-    # Company name → CamelCase path (e.g. "Capital One" → "Capital_One")
     words   = re.sub(r"[^a-zA-Z0-9\s]", "", company).split()
     camel   = "_".join(w.capitalize() for w in words if w)
     camel2  = "".join(w.capitalize() for w in words if w)
     slug_up = slug.capitalize()
 
-    # Deduplicate preserving order
-    seen     = set()
-    variants = []
+    seen, variants = set(), []
     for v in WD_PATH_VARIANTS + [camel, camel2, slug_up, slug]:
         if v and v not in seen:
             seen.add(v)
@@ -103,70 +103,86 @@ def fetch_jobs(slug_info, company):
     Fetch all jobs for company from Workday.
     Handles pagination.
     Returns list of normalized job dicts.
-    slug_info = {"slug": "capitalone", "wd": "wd12", "path": "Capital_One"}
+    slug_info = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
     """
-    slug = slug_info.get("slug", "")
-    wd   = slug_info.get("wd", "")
-    url  = _build_url(slug_info)
+    url    = _build_url(slug_info)
+    domain = _build_domain(slug_info)
+    path   = slug_info.get("path", "careers")  # e.g. "ATTGeneral"
 
     all_jobs = []
     offset   = 0
-    limit    = 20  # Workday default page size
-    total    = None  # only populated on first page
+    limit    = 20
+    total    = None
 
     while True:
-        data = fetch_json_post(url, body={"limit": limit, "offset": offset})
+        data = fetch_json_post(url, body={"limit": limit, "offset": offset},
+                               headers=WORKDAY_HEADERS)
         if not data:
             break
         jobs = data.get("jobPostings", [])
         if not jobs:
             break
         all_jobs.extend(jobs)
-        # total is only returned on first page — cache it
+        # total only comes back reliably on page 1 — cache once, never overwrite
         if total is None:
             total = data.get("total", 0)
         offset += len(jobs)
-        # When total is known → rely on total exclusively
-        # (short page can occur mid-pagination due to filtering)
-        # When total unknown → short page is our only stop signal
         if total is not None:
             if offset >= total:
                 break
         elif len(jobs) < limit:
             break
 
-    return [_normalize(j, company, slug, wd)
-            for j in all_jobs if j.get("title")]
+    results = []
+    for j in all_jobs:
+        if not j.get("title"):
+            continue
+        norm = _normalize(j, company, domain, path)
+        if norm is not None:
+            results.append(norm)
+    return results
 
 
-def _normalize(job, company, slug, wd):
-    """Normalize Workday job to standard format."""
+def _normalize(job, company, domain, path):
+    """
+    Normalize Workday job to standard format.
+
+    externalPath from API: /job/Reynoldsburg-Ohio/Sr-B2B-Sales_R-104046
+    Full URL:  https://{domain}/{path}/job/Reynoldsburg-Ohio/Sr-B2B-Sales_R-104046
+    e.g.:      https://att.wd1.myworkdayjobs.com/ATTGeneral/job/Reynoldsburg-Ohio/...
+    """
     posted_at = None
-    posted = job.get("postedOn")
+    posted = job.get("postedOn", "")
     if posted:
         try:
-            # Format: "03/04/2026" or ISO format
             if "/" in posted:
                 posted_at = datetime.strptime(posted, "%m/%d/%Y")
-            else:
-                posted_at = datetime.fromisoformat(
-                    posted.replace("Z", "+00:00")
-                )
+            elif "T" in posted or posted.endswith("Z"):
+                posted_at = datetime.fromisoformat(posted.replace("Z", "+00:00"))
+            elif "today" in posted.lower():
+                posted_at = datetime.utcnow()
+            elif "day" in posted.lower():
+                import re as _re
+                from datetime import timedelta
+                m = _re.search(r"(\d+)", posted)
+                if m:
+                    posted_at = datetime.utcnow() - timedelta(days=int(m.group(1)))
         except (ValueError, AttributeError):
-            posted_at = None
+            pass
 
-    # Build job URL — use _build_url so myworkdaysite tenants get correct URL
-    external_url = job.get("externalUrl", "")
-    if not external_url:
-        job_id       = job.get("bulletFields", [""])[0] if job.get("bulletFields") else ""
-        slug_info_fb = {"slug": slug, "wd": wd, "path": "careers"}
-        base         = _build_url(slug_info_fb).replace("/jobs", "")
-        external_url = f"{base}/job/{job_id}" if job_id else base
+    external_path = job.get("externalPath", "").strip()
+    if not external_path:
+        return None
+
+    # externalPath is already the clean relative path e.g.
+    # /job/Reynoldsburg-Ohio/Sr-B2B-Sales-Account-Executive_R-104046
+    # Prepend domain + career site path name to build the full URL
+    job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
 
     return {
         "company":     company,
         "title":       job.get("title", ""),
-        "job_url":     external_url,
+        "job_url":     job_url,
         "location":    job.get("locationsText", ""),
         "posted_at":   posted_at,
         "description": " ".join(job.get("bulletFields", [])),

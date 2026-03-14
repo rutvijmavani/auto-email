@@ -5,6 +5,7 @@ import time
 import os
 from datetime import datetime
 
+from logger import get_logger, init_logging
 from db.db import (
     init_db,
     get_all_monitored_companies,
@@ -38,6 +39,8 @@ from config import (
     MONITOR_MATCH_RATE_HIGH_ALERT,
 )
 
+logger = get_logger(__name__)
+
 
 def run():
     """
@@ -45,11 +48,16 @@ def run():
     Scans all companies, finds new jobs, generates PDF digest.
     Returns stats dict.
     """
+    init_logging("monitor")
     start_time = time.time()
+    logger.info("════════════════════════════════════════")
+    logger.info("--monitor-jobs starting")
+
     init_db()
 
     companies = get_monitorable_companies()
     if not companies:
+        logger.warning("No monitorable companies found")
         print("[INFO] No monitorable companies found.")
         print("[INFO] Run: python pipeline.py --import-prospects prospects.txt")
         print("[INFO] Then: python pipeline.py --detect-ats")
@@ -58,8 +66,12 @@ def run():
     all_companies = get_all_monitored_companies()
     skipped = len(all_companies) - len(companies)
     if skipped > 0:
+        logger.warning("%d companies skipped (unknown/unverified ATS)", skipped)
         print(f"[INFO] Skipping {skipped} company/companies with "
               f"unknown/unverified ATS — run --detect-ats to fix")
+
+    logger.info("Loaded %d monitorable companies (%d total in DB)",
+                len(companies), len(all_companies))
 
     print(f"\n{'='*55}")
     print(f"[INFO] Job Monitor — {datetime.now().strftime('%B %d, %Y')}")
@@ -84,22 +96,24 @@ def run():
         platform = company_row.get("ats_platform", "unknown")
         slug     = company_row.get("ats_slug")
 
+        logger.info("── [%d/%d] %r  platform=%s  slug=%s",
+                    i, len(companies), company, platform, slug)
         print(f"[{i}/{len(companies)}] {company}")
 
         stats["companies_monitored"] += 1
 
         # ── ATS Detection ──
         if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
-            # FIX: pass domain from the company row so Phase 3a
-            # (career_page.detect_via_career_page) can run during
-            # re-detection, enabling Oracle HCM and other HTML-redirect
-            # based ATS platforms to be found without Serper.
             domain = company_row.get("domain")
-            result = detect_ats(company, domain=domain)
+            logger.info("Re-detection triggered for %r (domain=%s)", company, domain)
+            result   = detect_ats(company, domain=domain)
             platform = result["ats_platform"]
             slug     = result["ats_slug"]
+            logger.info("Re-detection result: %r → platform=%s slug=%s",
+                        company, platform, slug)
 
         if platform == "unknown" or not slug:
+            logger.warning("Skipping %r — ATS unknown or slug missing", company)
             stats["companies_unknown_ats"] += 1
             print("   [SKIP] Unknown ATS — skipping")
             continue
@@ -107,43 +121,47 @@ def run():
         # ── Fetch jobs ──
         ats_module = get_ats_module(platform)
         if not ats_module:
+            logger.error("No ATS module for platform=%s (company=%r)", platform, company)
             stats["api_failures"] += 1
             stats["api_failure_list"].append(company)
             continue
 
         try:
-            # Parse slug_info for Workday
             if platform == "workday":
                 try:
                     slug_info = json.loads(slug)
-                    # Ensure path key exists — default to "careers"
                     if "path" not in slug_info:
                         slug_info["path"] = "careers"
                 except (json.JSONDecodeError, TypeError):
                     slug_info = {"slug": slug, "wd": "wd5", "path": "careers"}
+                logger.debug("Workday fetch: company=%r slug_info=%s", company, slug_info)
                 raw_jobs = ats_module.fetch_jobs(slug_info, company)
             elif platform == "oracle_hcm":
                 try:
                     slug_info = json.loads(slug)
                 except (json.JSONDecodeError, TypeError):
                     slug_info = {"slug": slug, "site": ""}
+                logger.debug("Oracle HCM fetch: company=%r slug_info=%s", company, slug_info)
                 raw_jobs = ats_module.fetch_jobs(slug_info, company)
             else:
+                logger.debug("%s fetch: company=%r slug=%s", platform, company, slug)
                 raw_jobs = ats_module.fetch_jobs(slug, company)
 
         except Exception as e:
+            logger.error("API fetch failed for %r (platform=%s): %s",
+                         company, platform, e, exc_info=True)
             print(f"   [ERROR] API fetch failed: {e}")
             stats["api_failures"] += 1
             stats["api_failure_list"].append(company)
             continue
 
+        logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
         stats["total_jobs_fetched"] += len(raw_jobs)
 
-        # Delay between companies — reduces per-IP concentration
-        # 0.5s ±0.2s — minimal but meaningful
         between_companies_delay()
 
         if not raw_jobs:
+            logger.info("No jobs returned for %r", company)
             update_company_check(company, found_jobs=False)
             print("   [INFO] No jobs returned")
             continue
@@ -153,35 +171,37 @@ def run():
 
         # ── Filter jobs ──
         matched = filter_jobs(raw_jobs)
+        logger.debug("Filter: %d raw → %d matched for %r",
+                     len(raw_jobs), len(matched), company)
         stats["jobs_matched_filters"] += len(matched)
 
         # ── First scan handling ──
         is_first_scan = company_row.get("first_scanned_at") is None
+        if is_first_scan:
+            logger.info("First scan for %r — all jobs marked pre_existing", company)
 
         # ── Freshness check + save ──
         new_count = 0
         for job in matched:
-            # Layer 1: URL deduplication
             if job_url_exists(job["job_url"]):
+                logger.debug("Duplicate URL skipped: %s", job["job_url"])
                 continue
 
-            # Layer 2: Content hash deduplication
             if job.get("content_hash") and \
                job_hash_exists(job["content_hash"]):
+                logger.debug("Duplicate content_hash skipped for %r", company)
                 continue
 
-            # Layer 3: Date-based freshness
-            # (only for reliable ATS — not Greenhouse)
             if platform != "greenhouse" and not is_fresh(job, platform):
+                logger.debug("Pre-existing (stale): %r title=%s posted=%s",
+                             company, job.get("title"), job.get("posted_at"))
                 save_job_posting(job, status="pre_existing")
                 continue
 
-            # First scan: all jobs are pre_existing
             if is_first_scan:
                 save_job_posting(job, status="pre_existing")
                 continue
 
-            # iCIMS Option C: fetch detail page for new jobs only
             if platform == "icims" and job.get("_base_url"):
                 try:
                     job = ats_module.fetch_job_detail(job)
@@ -189,28 +209,42 @@ def run():
                     logger.error(
                         "iCIMS fetch_job_detail failed for %s/%s: %s",
                         company, job.get("job_id"), e, exc_info=True
-                    )  # save with partial data
+                    )
 
-            # Genuinely new job
             if save_job_posting(job, status="new"):
                 new_count += 1
+                logger.info("NEW JOB: %r | %s | %s",
+                            company, job.get("title"), job.get("location"))
 
+        logger.info("Done %r: fetched=%d matched=%d new=%d",
+                    company, len(raw_jobs), len(matched), new_count)
         stats["new_jobs_found"] += new_count
         print(f"   [OK] {len(raw_jobs)} fetched -> "
               f"{len(matched)} matched -> {new_count} new")
 
-        # Mark first scan complete
         if is_first_scan:
             mark_first_scan_complete(company)
+            logger.info("First scan complete for %r", company)
             print(f"   [INFO] First scan complete — "
                   f"existing jobs marked as pre_existing")
 
     # ── Generate PDF digest ──
-    new_postings = get_new_postings_for_digest()
+    new_postings  = get_new_postings_for_digest()
     pdf_generated = False
     email_sent    = False
+    duration      = int(time.time() - start_time)
 
-    duration = int(time.time() - start_time)
+    logger.info(
+        "Run complete in %ds | companies=%d unknown_ats=%d failures=%d | "
+        "fetched=%d matched=%d new=%d",
+        duration,
+        stats["companies_monitored"],
+        stats["companies_unknown_ats"],
+        stats["api_failures"],
+        stats["total_jobs_fetched"],
+        stats["jobs_matched_filters"],
+        stats["new_jobs_found"],
+    )
 
     print(f"\n{'='*55}")
     print(f"[INFO] Run complete in {duration}s")
@@ -222,23 +256,28 @@ def run():
           f"{stats['new_jobs_found']} new")
 
     if new_postings:
+        logger.info("Generating PDF digest (%d new jobs)", len(new_postings))
         print(f"\n[INFO] Generating PDF digest "
               f"({len(new_postings)} new jobs)...")
         try:
             from outreach.report_templates.monitor_report import (
                 build_monitor_report
             )
-            alerts = _build_alerts(stats, len(companies))
-            result = build_monitor_report(new_postings, stats, alerts)
+            alerts        = _build_alerts(stats, len(companies))
+            result        = build_monitor_report(new_postings, stats, alerts)
             pdf_generated = result.get("pdf_generated", False)
             email_sent    = result.get("email_sent", False)
+            logger.info("PDF digest sent: pdf=%s email=%s",
+                        pdf_generated, email_sent)
         except Exception as e:
+            logger.error("PDF generation failed: %s", e, exc_info=True)
             print(f"[ERROR] PDF generation failed: {e}")
             print("[INFO] Sending plain text digest instead...")
             email_sent = _send_text_fallback(new_postings)
     else:
+        logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")
-        alerts    = _build_alerts(stats, len(companies))
+        alerts     = _build_alerts(stats, len(companies))
         email_sent = _send_no_jobs_email(alerts=alerts)
 
     # ── Save stats ──
@@ -253,6 +292,7 @@ def run():
     # ── Print metric alerts ──
     _print_metric_alerts(stats, len(companies))
 
+    logger.info("════ --monitor-jobs finished ════")
     return final_stats
 
 
@@ -264,6 +304,8 @@ def _build_alerts(stats, total_companies):
         coverage = stats["companies_with_results"] / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)
+            logger.warning("Coverage alert: %d%% (threshold %d%%)",
+                           pct, int(MONITOR_COVERAGE_ALERT * 100))
             alerts.append({
                 "level":   "warning",
                 "message": f"Coverage {pct}% — only "
@@ -273,6 +315,8 @@ def _build_alerts(stats, total_companies):
 
         unknown_rate = stats["companies_unknown_ats"] / total_companies
         if unknown_rate > MONITOR_ATS_UNKNOWN_ALERT:
+            logger.warning("Unknown ATS alert: %d companies",
+                           stats["companies_unknown_ats"])
             alerts.append({
                 "level":   "warning",
                 "message": f"{stats['companies_unknown_ats']} companies "
@@ -280,6 +324,7 @@ def _build_alerts(stats, total_companies):
             })
 
     if stats["api_failures"] > 0:
+        logger.warning("API failures: %s", stats["api_failure_list"])
         names = ", ".join(stats["api_failure_list"][:5])
         extra = (f" (+{len(stats['api_failure_list'])-5} more)"
                  if len(stats["api_failure_list"]) > 5 else "")
@@ -292,12 +337,14 @@ def _build_alerts(stats, total_companies):
         match_rate = (stats["jobs_matched_filters"] /
                       stats["total_jobs_fetched"])
         if match_rate < MONITOR_MATCH_RATE_LOW_ALERT:
+            logger.warning("Match rate low: %.1f%%", match_rate * 100)
             alerts.append({
                 "level":   "warning",
                 "message": f"Filter match rate {int(match_rate*100)}% "
                            f"— filters may be too strict",
             })
         elif match_rate > MONITOR_MATCH_RATE_HIGH_ALERT:
+            logger.info("Match rate high: %.1f%%", match_rate * 100)
             alerts.append({
                 "level":   "info",
                 "message": f"Filter match rate {int(match_rate*100)}% "
@@ -326,7 +373,6 @@ def _send_no_jobs_email(alerts=None):
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    # Build alerts section if any warnings exist
     alerts_html = ""
     if alerts:
         import html as _html
@@ -388,9 +434,8 @@ def _send_text_fallback(postings):
         title    = html_lib.escape(str(job.get("title", "")))
         location = html_lib.escape(str(job.get("location", "")))
         raw_url  = str(job.get("job_url", ""))
-        # Only allow safe URL schemes
         from urllib.parse import urlparse
-        parsed = urlparse(raw_url)
+        parsed   = urlparse(raw_url)
         safe_url = html_lib.escape(raw_url) if parsed.scheme in ("http", "https") else "#"
         lines.append(
             f"<li><strong>{company}</strong> — "
@@ -414,6 +459,11 @@ def run_detect_ats(company=None, override_platform=None,
       --detect-ats "Company"          detect single company
       --detect-ats "Co" --override p s manually set ATS
     """
+    init_logging("detect")
+    logger.info("════════════════════════════════════════")
+    logger.info("--detect-ats starting: company=%r batch=%s override=%s/%s",
+                company, batch, override_platform, override_slug)
+
     from datetime import datetime
     from outreach.report_templates.detection_report import build_detection_report
     from config import DETECT_ATS_BATCH_SIZE
@@ -422,6 +472,7 @@ def run_detect_ats(company=None, override_platform=None,
     companies = get_all_monitored_companies()
 
     if not companies:
+        logger.warning("No companies in DB — run --import-prospects first")
         print("[INFO] No companies found. Run --import-prospects first.")
         return
 
@@ -441,28 +492,37 @@ def run_detect_ats(company=None, override_platform=None,
         matches = [c for c in companies
                    if c["company"] == company_normalized]
         if not matches:
+            logger.error("Company not found in DB: %r", company_normalized)
             print(f"[ERROR] '{company}' not found.")
             return
 
         credits = get_serper_credits()
+        logger.info("Serper credits: %d/%d remaining",
+                    credits["credits_remaining"], credits["credits_limit"])
         print(f"[INFO] Serper credits: "
               f"{credits['credits_remaining']}/{credits['credits_limit']} "
               f"remaining")
 
         domain = matches[0].get("domain") if matches else None
+        logger.info("Single detection: %r domain=%s", company_normalized, domain)
         try:
             result = detect_ats(company_normalized, domain=domain)
+            logger.info("Result: %s", result)
             build_detection_report([result], date_str)
         except QuotaExhaustedException:
+            logger.warning("Serper exhausted during detection of %r",
+                           company_normalized)
             print("[WARNING] Serper credits exhausted")
         return
 
     # ── Batch detection ──
     if batch:
-        credits = get_serper_credits()
+        credits   = get_serper_credits()
         remaining = credits["credits_remaining"]
+        logger.info("Batch detection: Serper remaining=%d", remaining)
 
         if remaining <= 0:
+            logger.warning("Serper credits exhausted")
             print(f"[WARNING] Serper credits exhausted. "
                   f"Buy more at serper.dev")
             _print_detection_queue_status()
@@ -470,10 +530,12 @@ def run_detect_ats(company=None, override_platform=None,
 
         to_detect = get_detection_queue(batch_size=DETECT_ATS_BATCH_SIZE)
         if not to_detect:
+            logger.info("Detection queue empty")
             print("[OK] No companies pending detection.")
             _print_detection_queue_status()
             return
 
+        logger.info("Batch: %d companies queued", len(to_detect))
         print(f"[INFO] Detecting {len(to_detect)} companies "
               f"(Serper credits: {remaining} remaining)...\n")
 
@@ -484,17 +546,24 @@ def run_detect_ats(company=None, override_platform=None,
             comp   = company_row["company"]
             domain = company_row.get("domain")
             prio   = company_row.get("priority", "?")
+            logger.info("[%d/%d] %r domain=%s priority=%s",
+                        i, total, comp, domain, prio)
             print(f"[{i}/{total}] {comp} (priority {prio})")
 
             try:
                 result = detect_ats(comp, domain=domain)
                 results.append(result)
+                logger.info("Detected %r → %s", comp, result.get("platform"))
             except QuotaExhaustedException:
+                logger.warning("Serper exhausted after %d/%d companies",
+                               i - 1, total)
                 print(f"\n[WARNING] Serper credits exhausted after "
                       f"{i-1} companies.")
                 break
 
         credits = get_serper_credits()
+        logger.info("Batch complete: %d results, remaining=%d",
+                    len(results), credits["credits_remaining"])
         print(f"\n[INFO] Batch complete.")
         print(f"[INFO] Serper credits: "
               f"{credits['credits_used']} used, "
@@ -504,12 +573,16 @@ def run_detect_ats(company=None, override_platform=None,
         if results:
             print(f"\n[INFO] Sending detection summary email...")
             build_detection_report(results, date_str)
+        logger.info("════ --detect-ats (batch) finished ════")
         return
 
     # ── Full detection (no --batch flag) ──
     to_detect = [c for c in companies if needs_redetection(c)]
+    logger.info("Full detection: %d/%d companies need detection",
+                len(to_detect), len(companies))
 
     if not to_detect:
+        logger.info("All companies detected — nothing to do")
         print("[OK] All companies have ATS detected.")
         _print_detection_queue_status()
         return
@@ -522,17 +595,22 @@ def run_detect_ats(company=None, override_platform=None,
     for i, company_row in enumerate(to_detect, 1):
         comp   = company_row["company"]
         domain = company_row.get("domain")
+        logger.info("[%d/%d] %r domain=%s", i, len(to_detect), comp, domain)
         print(f"[{i}/{len(to_detect)}] {comp}")
         try:
             result = detect_ats(comp, domain=domain)
             results.append(result)
         except QuotaExhaustedException:
+            logger.warning("Serper exhausted after %d/%d companies",
+                           i - 1, len(to_detect))
             print(f"\n[WARNING] Serper credits exhausted after "
                   f"{i-1} companies.")
             print("[INFO] Buy more credits at serper.dev then retry.")
             break
 
     credits = get_serper_credits()
+    logger.info("Full detection complete: %d results, remaining=%d",
+                len(results), credits["credits_remaining"])
     print(f"\n[INFO] Detection complete.")
     print(f"[INFO] Serper: {credits['credits_used']} used, "
           f"{credits['credits_remaining']} remaining")
@@ -542,6 +620,7 @@ def run_detect_ats(company=None, override_platform=None,
         print(f"\n[INFO] Sending detection summary email...")
         build_detection_report(results, date_str)
 
+    logger.info("════ --detect-ats finished ════")
 
 
 def _print_detection_queue_status():
@@ -555,6 +634,9 @@ def _print_detection_queue_status():
         p4 = stats.get("priority4_custom", 0) or 0
         total = p1 + p2 + p3 + p4
 
+        logger.debug("Detection queue: total=%d p1=%d p2=%d p3=%d p4=%d",
+                     total, p1, p2, p3, p4)
+
         if total > 0:
             print(f"\n[INFO] Detection queue ({total} companies pending):")
             if p1: print(f"  Priority 1 (new):          {p1}")
@@ -566,35 +648,37 @@ def _print_detection_queue_status():
         else:
             print("[OK] Detection queue empty — all companies detected")
     except Exception:
-        pass  # non-critical display function
-
+        pass
 
 
 def run_monitor_status():
     """Show monitoring status summary. Called by --monitor-status."""
+    init_logging("monitor")
     init_db()
-    companies = get_all_monitored_companies()
+    companies     = get_all_monitored_companies()
     stats_history = get_monitor_stats(7)
-    reliability = get_pipeline_reliability(7)
+    reliability   = get_pipeline_reliability(7)
+
+    total         = len(companies)
+    known         = sum(1 for c in companies
+                        if c.get("ats_platform") not in ("unknown", None))
+    unknown       = total - known
+    never_scanned = sum(1 for c in companies
+                        if not c.get("first_scanned_at"))
+
+    logger.info("Monitor status: total=%d known=%d unknown=%d "
+                "never_scanned=%d reliability=%.0f%%",
+                total, known, unknown, never_scanned, reliability * 100)
 
     print(f"\n{'='*55}")
     print("[INFO] Job Monitor Status")
     print(f"{'='*55}")
-
-    # ATS detection summary
-    total     = len(companies)
-    known     = sum(1 for c in companies
-                    if c.get("ats_platform") not in ("unknown", None))
-    unknown   = total - known
-    never_scanned = sum(1 for c in companies
-                        if not c.get("first_scanned_at"))
 
     print(f"\nCompanies:     {total}")
     print(f"ATS detected:  {known} ({int(known/total*100) if total else 0}%)")
     print(f"ATS unknown:   {unknown}")
     print(f"Never scanned: {never_scanned}")
 
-    # Recent run stats
     if stats_history:
         latest = stats_history[0]
         print(f"\nLast run ({latest['date']}):")
