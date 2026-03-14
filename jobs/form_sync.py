@@ -88,6 +88,7 @@ def _sync_to_pipeline(company, job_url):
     Does nothing if company already exists in pipeline.
     """
     conn = None
+    ats = None
     try:
         from jobs.ats.patterns import match_ats_pattern
         from db.connection import get_conn
@@ -137,10 +138,11 @@ def _sync_to_pipeline(company, job_url):
     except Exception as e:
         logger.error("Pipeline sync failed for %r: %s", company, e, exc_info=True)
         print(f"       [WARNING] Pipeline sync failed: {e}")
+        return {}
     finally:
         if conn is not None:
             conn.close()
-
+    return ats or {}
 
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
@@ -224,7 +226,8 @@ def run():
             continue
 
         # Extract ATS from job URL and add to prospective_companies
-        _sync_to_pipeline(company, job_url)
+        ats = _sync_to_pipeline(company, job_url) or {}
+        platform = ats.get("platform")
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)
@@ -234,7 +237,7 @@ def run():
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
-            expected_domain=expected_domain,
+            expected_domain=expected_domain if platform != "oracle_hcm" else "".join(company.split()).lower(),
         )
 
         if not app_id:
