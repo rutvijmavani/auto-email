@@ -224,7 +224,7 @@ def run():
             continue
 
         # Extract ATS from job URL and add to prospective_companies
-        _sync_to_pipeline(company, job_url)
+        a = _sync_to_pipeline(company, job_url)
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)
@@ -234,7 +234,7 @@ def run():
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
-            expected_domain=expected_domain,
+            expected_domain=expected_domain if a["platform"] != "oracle_hcm" else company,
         )
 
         if not app_id:

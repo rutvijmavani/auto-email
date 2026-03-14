@@ -38,6 +38,7 @@ from careershift.utils import human_delay
 from careershift.verification import run_tiered_verification
 from config import MIN_RECRUITERS_PER_COMPANY
 
+from logger import get_logger
 from db.db import (
     init_db, add_application, get_remaining_quota,
     update_application_expected_domain, get_application_by_id,
@@ -47,6 +48,8 @@ from db.db import (
     get_all_active_applications, get_unique_companies_needing_scraping,
     get_recruiters_by_company,
 )
+
+logger = get_logger(__name__)
 
 
 def extract_expected_domain(job_url):
@@ -154,6 +157,7 @@ def add_job_interactively():
     company_normalized = company.strip()
     if is_prospective(company_normalized):
         print(f"[INFO] '{company_normalized}' found in prospective pipeline — recruiters already pre-scraped!")
+        logger.info("Prospective conversion: %r found in pipeline", company_normalized)
         converted_id = convert_prospective_to_active(
             company=company_normalized,
             real_job_url=job_url,
@@ -162,11 +166,15 @@ def add_job_interactively():
         )
         if converted_id:
             mark_prospective_converted(company_normalized)
+            logger.info("Converted prospective → active: %r (id=%s)",
+                        company_normalized, converted_id)
             print(f"[OK] Converted prospective → active (id={converted_id})")
             print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
             return
         # Conversion failed (e.g. placeholder URL mismatch) → fall through to normal --add
 
+    logger.info("Adding application: company=%r url=%r title=%r date=%s",
+                company, job_url, job_title, applied_date)
     app_id, created = add_application(
         company=company,
         job_url=job_url,
@@ -176,6 +184,7 @@ def add_job_interactively():
     )
 
     if not app_id:
+        logger.error("Failed to insert application for %r", company)
         print("[ERROR] Failed to add application.")
         return
 
@@ -185,25 +194,32 @@ def add_job_interactively():
             existing = get_application_by_id(app_id)
             if existing and not existing.get("expected_domain"):
                 update_application_expected_domain(app_id, expected_domain)
+        logger.warning("Job URL already exists in DB for %r (id=%s)", company, app_id)
         print("[WARNING] Job URL already exists in DB.")
         return
 
+    logger.info("Application added: %r (id=%s)", company, app_id)
     print(f"[OK] Added: {company} | {job_url} (id={app_id})")
 
     print(f"[INFO] Scraping job description from {job_url}...")
+    logger.debug("Scraping JD for %r from %s", company, job_url)
     try:
         from jobs.job_fetcher import fetch_job_description
         result = fetch_job_description(job_url)
         if result:
+            logger.info("JD cached for %r", company)
             print(f"[OK] Job description cached for {company}")
         else:
+            logger.warning("Could not scrape JD for %r — will retry during --find-only", company)
             print(f"[WARNING] Could not scrape job description. Will retry during --find-only.")
     except Exception as e:
+        logger.error("JD scraping failed for %r: %s", company, e, exc_info=True)
         print(f"[WARNING] JD scraping failed: {e}. Will retry during --find-only.")
 
 
 def run_sync_forms():
     """Pull Google Form responses, insert into DB, scrape JDs, clean up sheet."""
+    logger.info("run_sync_forms called")
     print("\n" + "=" * 55)
     print("[INFO] Syncing Google Form responses")
     print("=" * 55)
@@ -212,6 +228,7 @@ def run_sync_forms():
 
 def run_sync_prospective():
     """Pull Google Form responses, insert into DB, scrape JDs, clean up sheet."""
+    logger.info("run_sync_prospective called")
     print("\n" + "=" * 55)
     print("[INFO] Syncing Google Form responses")
     print("=" * 55)
@@ -223,6 +240,7 @@ def run_find_emails():
     from datetime import datetime
     from outreach.report_templates.find_report import build_find_report
 
+    logger.info("run_find_emails starting")
     print("\n" + "=" * 55)
     print("[INFO] STEP 1: Finding recruiter emails via CareerShift")
     print("=" * 55)
@@ -256,6 +274,9 @@ def run_find_emails():
         "ai_cached":            ai_stats.get("skipped", 0) if ai_stats else 0,
         "ai_failed":            ai_stats.get("failed", 0) if ai_stats else 0,
     }
+    logger.info("run_find_emails complete: quota_used=%d ai_generated=%d ai_failed=%d",
+                report_stats["quota_used"], report_stats["ai_generated"],
+                report_stats["ai_failed"])
     build_find_report(report_stats)
 
 
@@ -275,6 +296,7 @@ def _generate_ai_content_for_all():
     apps = get_all_active_applications()
 
     if not apps:
+        logger.info("No active applications found for AI content generation")
         print("[INFO] No active applications found.")
         return
 
@@ -288,6 +310,7 @@ def _generate_ai_content_for_all():
         job_title = app["job_title"] or "Software Engineer"
 
         print(f"\n  [INFO] {company} | {job_title}")
+        logger.debug("Generating AI content for %r | %s", company, job_title)
 
         job_data = fetch_job_description(job_url)
 
@@ -308,9 +331,11 @@ def _generate_ai_content_for_all():
                 result = generate_all_content(company, job_title, job_text)
 
         if result:
+            logger.info("AI content generated for %r", company)
             print(f"  [OK] AI content ready for {company}")
             generated += 1
         else:
+            logger.warning("AI generation failed for %r (quota exhausted?)", company)
             print(f"  [WARNING] AI generation failed for {company} (quota exhausted?)")
             failed += 1
 
@@ -318,6 +343,8 @@ def _generate_ai_content_for_all():
     if not all_models_exhausted():
         missing = get_applications_missing_ai_cache()
         if missing:
+            logger.info("Using leftover Gemini quota for %d application(s) missing cache",
+                        len(missing))
             print(f"\n[INFO] Using leftover Gemini quota for {len(missing)} application(s) missing cache...")
             for app in missing:
                 if all_models_exhausted():
@@ -340,9 +367,12 @@ def _generate_ai_content_for_all():
                     else generate_all_content_without_jd(company, job_title)
                 )
                 if result:
+                    logger.info("Leftover quota used for: %r", company)
                     print(f"  [OK] Leftover quota used for: {company}")
                     generated += 1
 
+    logger.info("AI content complete: generated=%d skipped=%d failed=%d",
+                generated, skipped, failed)
     print(f"\n[OK] AI content — Generated: {generated} | Skipped (cached): {skipped} | Failed: {failed}")
     return {"generated": generated, "skipped": skipped, "failed": failed}
 
@@ -359,15 +389,17 @@ def run_import_prospects(filepath="prospects.txt"):
     Domain column used for Phase 3a HTML redirect scan.
     """
     if not os.path.exists(filepath):
+        logger.error("Prospects file not found: %s", filepath)
         print(f"[ERROR] File not found: {filepath}")
         print(f"[INFO] Format: one company per line, optional domain:")
         print(f"[INFO]   Stripe")
         print(f"[INFO]   Capital One,capitalone.com")
         return
 
+    logger.info("Importing prospective companies from: %s", filepath)
     print(f"\n[INFO] Importing prospective companies from {filepath}...")
 
-    added = 0
+    added   = 0
     skipped = 0
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
@@ -376,7 +408,7 @@ def run_import_prospects(filepath="prospects.txt"):
                 continue
 
             # Support "Company,domain.com" format
-            parts  = line.split(",", 1)
+            parts   = line.split(",", 1)
             company = parts[0].strip()
             domain  = parts[1].strip() if len(parts) > 1 else None
 
@@ -385,11 +417,13 @@ def run_import_prospects(filepath="prospects.txt"):
 
             if add_prospective_company(company, domain=domain):
                 domain_str = f" ({domain})" if domain else ""
+                logger.debug("Imported prospective: %r domain=%s", company, domain)
                 print(f"  [+] {company}{domain_str}")
                 added += 1
             else:
                 skipped += 1  # already exists, domain backfilled by add_prospective_company
 
+    logger.info("Import complete: added=%d skipped=%d", added, skipped)
     print(f"\n[OK] Import complete — Added: {added} | Already existed: {skipped}")
     print(f"[INFO] Run --detect-ats --batch to start ATS detection.")
 
@@ -446,6 +480,7 @@ def run_verify_only():
     load_dotenv()
 
     if not os.path.exists(SESSION_FILE):
+        logger.error("Session file not found: %s", SESSION_FILE)
         print("[ERROR] Session file not found. Run careershift/auth.py first.")
         return
 
@@ -455,8 +490,11 @@ def run_verify_only():
 
     applications = get_all_active_applications()
     if not applications:
+        logger.info("No active applications found for verification")
         print("[INFO] No active applications found.")
         return
+
+    logger.info("run_verify_only: %d applications", len(applications))
 
     USER_AGENTS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -480,6 +518,7 @@ def run_verify_only():
         human_delay(2.0, 4.0)
 
         if "login" in page.url.lower() or "signin" in page.url.lower():
+            logger.error("CareerShift session expired")
             print("[ERROR] Session expired. Run careershift/auth.py again.")
             browser.close()
             return
@@ -499,11 +538,14 @@ def run_verify_only():
     under_stocked = get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY)
 
     if not under_stocked:
+        logger.info("All companies have enough active recruiters")
         print("[OK] All companies have enough active recruiters.")
     else:
+        logger.warning("%d company/companies under-stocked after verification: %s",
+                       len(under_stocked), under_stocked)
         print(f"\n[WARNING] {len(under_stocked)} company/companies under-stocked after verification:")
         for company in under_stocked:
-            recruiters = get_recruiters_by_company(company)
+            recruiters   = get_recruiters_by_company(company)
             active_count = len(recruiters)
             print(f"  - {company}: {active_count} active recruiter(s) "
                   f"(needs {MIN_RECRUITERS_PER_COMPANY - active_count} more)")
@@ -523,13 +565,19 @@ def run_verify_only():
 
     under_stocked_detail = []
     for company in under_stocked:
-        recruiters = get_recruiters_by_company(company)
+        recruiters   = get_recruiters_by_company(company)
         active_count = len(recruiters)
         under_stocked_detail.append({
             "company":      company,
             "active_count": active_count,
             "needed":       max(0, MIN_RECRUITERS_PER_COMPANY - active_count),
         })
+
+    logger.info("Verification report: t2_verified=%d t3_verified=%d t3_inactive=%d under_stocked=%d",
+                verify_stats.get("tier2_verified", 0),
+                verify_stats.get("tier3_verified", 0),
+                verify_stats.get("tier3_inactive", 0),
+                len(under_stocked_detail))
 
     build_verify_report({
         "date":           date_str,
@@ -546,6 +594,7 @@ def run_verify_only():
 
 def run_outreach():
     """Schedule and send outreach emails within the send window."""
+    logger.info("run_outreach starting")
     print("\n" + "=" * 55)
     print("[INFO] Sending outreach emails")
     print("=" * 55)
@@ -562,6 +611,7 @@ def run_outreach():
             stats["date"] = datetime.now().strftime("%B %-d, %Y")
         except ValueError:
             stats["date"] = datetime.now().strftime("%B %d, %Y")
+        logger.info("run_outreach complete: %s", stats)
         build_outreach_report(stats)
 
 
@@ -579,11 +629,14 @@ def run_quota_report(silent_if_healthy=False):
 
     if not alerts:
         if not silent_if_healthy:
+            logger.info("Quota health: no issues detected")
             print("[OK] Quota health: no issues detected.")
         return
 
+    logger.warning("Quota alerts detected: %d issue(s)", len(alerts))
+
     # Build combined alert email
-    subject = "Quota Alert - Action Required"
+    subject    = "Quota Alert - Action Required"
     body_parts = []
 
     for alert in alerts:
@@ -636,11 +689,13 @@ def run_quota_report(silent_if_healthy=False):
     try:
         from config import EMAIL
         send_email(to_email=EMAIL, body=body, company="Pipeline", subject=subject)
+        logger.info("Quota alert email sent: %s", subject)
         print(f"[INFO] Quota alert email sent: {subject}")
         # Only mark as notified after successful send
         for alert in alerts:
             save_quota_alert(alert)
     except Exception as e:
+        logger.error("Could not send quota alert email: %s", e, exc_info=True)
         print(f"[WARNING] Could not send quota alert email: {e}")
         print(f"[INFO] Alert details:\n{body}")
         # Save without notified flag so future runs still attempt to send
@@ -651,6 +706,8 @@ def run_quota_report(silent_if_healthy=False):
 def main():
     init_db()
     args = sys.argv[1:]
+
+    logger.info("pipeline.py invoked with args: %s", args)
 
     if "--weekly-summary" in args:
         from outreach.report_templates.weekly_summary import (
@@ -728,6 +785,7 @@ def main():
         return
 
     # Full pipeline
+    logger.info("Full pipeline run starting")
     print("[INFO] Starting Recruiter Outreach Pipeline")
     print(f"[INFO] {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     print(f"[INFO] CareerShift quota remaining: {get_remaining_quota()}/50")
@@ -739,6 +797,7 @@ def main():
     print("\n" + "=" * 55)
     print("[DONE] Pipeline complete!")
     print(f"[INFO] CareerShift quota remaining: {get_remaining_quota()}/50")
+    logger.info("Full pipeline run complete")
 
 
 if __name__ == "__main__":
