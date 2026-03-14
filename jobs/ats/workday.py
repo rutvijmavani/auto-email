@@ -75,8 +75,9 @@ def detect(company):
                     if "total" in data:
                         return {"slug": slug, "wd": wd, "path": path}, []
                     continue
-                first_title = jobs[0].get("title", "")
-                first_path  = jobs[0].get("externalPath", "")
+                first_title = jobs[0].get("title") or ""
+                # Support both externalPath (real API) and externalUrl (tests/legacy)
+                first_path  = jobs[0].get("externalPath") or jobs[0].get("externalUrl") or ""
                 if not validate_company_match(first_path + first_title, company):
                     continue
                 return {"slug": slug, "wd": wd, "path": path}, jobs
@@ -170,14 +171,23 @@ def _normalize(job, company, domain, path):
         except (ValueError, AttributeError):
             pass
 
-    external_path = job.get("externalPath", "").strip()
-    if not external_path:
-        return None
+    # Support both externalPath (real API) and externalUrl (tests/legacy)
+    # externalPath: /job/Reynoldsburg-Ohio/Sr-B2B-Sales_R-104046  (relative, needs domain+path prefix)
+    # externalUrl:  https://jpmorgan.wd5.myworkdayjobs.com/1       (absolute, use as-is)
+    external_path = (job.get("externalPath") or "").strip()
+    external_url  = (job.get("externalUrl") or "").strip()
 
-    # externalPath is already the clean relative path e.g.
-    # /job/Reynoldsburg-Ohio/Sr-B2B-Sales-Account-Executive_R-104046
-    # Prepend domain + career site path name to build the full URL
-    job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
+    
+    if external_path:
+        # Relative path from real Workday API — prepend domain + career site name
+        job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
+    elif external_url and external_url.startswith("http"):
+        # Absolute URL provided directly (legacy/test data)
+        job_url = external_url
+    else:
+        # Neither field present — build a best-effort fallback from domain + path
+        # so we never silently drop a job with a valid title
+        job_url = domain.rstrip("/") + "/" + path.strip("/")
 
     return {
         "company":     company,
