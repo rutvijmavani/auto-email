@@ -1,6 +1,7 @@
 import logging
 
-logger = logging.getLogger(__name__)
+from logger import get_logger
+logger = get_logger(__name__)
 
 # jobs/ats_verifier.py — Phase 2: ATS detection via API name probe
 #
@@ -44,7 +45,9 @@ def detect_via_api(company):
         {platform, slug} if found
         None             if not found
     """
+    logger.debug("[P2] detect_via_api: company=%r", company)
     candidates = slugify(company)
+    logger.debug("[P2] slug candidates: %s", candidates)
 
     # Try each platform in reliability order
     for probe_fn in [
@@ -56,8 +59,11 @@ def detect_via_api(company):
     ]:
         result = probe_fn(company, candidates)
         if result:
+            logger.info("[P2 HIT] company=%r → platform=%s slug=%s",
+                        company, result["platform"], result["slug"])
             return result
 
+    logger.debug("[P2 MISS] No API match for %r", company)
     return None
 
 
@@ -101,11 +107,13 @@ def _probe_lever(company, candidates):
             if isinstance(data, list):
                 # Verify via slug validation
                 if validate_slug_for_company(slug, company):
+                    logger.debug("[P2] Lever slug match: slug=%s company=%r", slug, company)
                     return {"platform": "lever", "slug": slug}
                 # Also check job URLs for company name
                 if data:
                     job_url = data[0].get("hostedUrl", "")
                     if company.lower().replace(" ", "") in job_url.lower():
+                        logger.debug("[P2] Lever URL match: slug=%s company=%r", slug, company)
                         return {"platform": "lever", "slug": slug}
 
         except Exception as e:
@@ -133,16 +141,20 @@ def _probe_ashby(company, candidates):
 
             data = resp.json()
             # Ashby returns {"jobBoard": {"name": "Linear"}, "jobs": [...]}
-            board = data.get("jobBoard", {})
+            board    = data.get("jobBoard", {})
             api_name = board.get("name", "")
 
             if not api_name:
                 # No name — verify via slug only
                 if validate_slug_for_company(slug, company):
+                    logger.debug("[P2] Ashby slug match (no name): slug=%s company=%r",
+                                 slug, company)
                     return {"platform": "ashby", "slug": slug}
                 continue
 
             if _name_matches(api_name, company, slug):
+                logger.debug("[P2] Ashby name match: slug=%s api_name=%r company=%r",
+                             slug, api_name, company)
                 return {"platform": "ashby", "slug": slug}
 
         except Exception as e:
@@ -186,6 +198,7 @@ def _probe_icims(company, candidates):
                 if not anchors:
                     continue
 
+            logger.debug("[P2] iCIMS match: slug=%s company=%r", slug, company)
             return {"platform": "icims", "slug": slug}
 
         except Exception as e:
@@ -240,17 +253,24 @@ def _probe(url, company, platform, slug, name_key="name"):
 
         if api_name:
             if _name_matches(api_name, company, slug):
+                logger.debug("[P2] _probe match: platform=%s slug=%s api_name=%r company=%r",
+                             platform, slug, api_name, company)
                 return {"platform": platform, "slug": slug}
             else:
+                logger.debug("[P2] _probe name mismatch: platform=%s slug=%s "
+                             "api_name=%r company=%r", platform, slug, api_name, company)
                 return None  # name mismatch — wrong company
 
         # No name in response — fall back to slug validation
         if validate_slug_for_company(slug, company):
+            logger.debug("[P2] _probe slug fallback match: platform=%s slug=%s company=%r",
+                         platform, slug, company)
             return {"platform": platform, "slug": slug}
 
         return None
 
     except requests.exceptions.Timeout:
+        logger.debug("[P2] _probe timeout: url=%s", url)
         return None
     except Exception:
         return None

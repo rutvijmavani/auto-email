@@ -1,6 +1,7 @@
 import logging
 
-logger = logging.getLogger(__name__)
+from logger import get_logger
+logger = get_logger(__name__)
 
 from jobs.ats_verifier import _name_matches
 
@@ -44,16 +45,21 @@ def _enrich_slug_on_demand(platform, slug):
 
         if status == "inactive":
             # 404 → slug genuinely doesn't exist → delete from DB
+            logger.debug("Enrichment: slug=%s platform=%s is inactive — deleting from DB",
+                         slug, platform)
             from db.ats_companies import delete_company
             delete_company(platform, slug)
             return None
 
         if status == "skip":
             # Enricher skipped — can't validate → reject
+            logger.debug("Enrichment skipped for slug=%s platform=%s", slug, platform)
             return None
 
         if status == "ok" and data:
             name = data.get("company_name", "")
+            logger.debug("Enrichment OK: slug=%s platform=%s name=%r",
+                         slug, platform, name)
             # Save enrichment to DB regardless of whether name matches
             # The slug IS valid — just for a different company
             from db.ats_companies import upsert_company
@@ -90,8 +96,11 @@ def detect_via_sitemap(company):
         {platform, slug} if found
         None             if not found or DB empty
     """
+    logger.debug("[P1] detect_via_sitemap: company=%r", company)
+
     # Check if discovery DB exists
     if not _db_exists():
+        logger.debug("[P1] ats_discovery.db missing or empty — skipping")
         return None
 
     try:
@@ -100,10 +109,14 @@ def detect_via_sitemap(company):
         # Strategy 1: Name-based lookup (most accurate)
         result = find_company(company)
         if result:
+            logger.info("[P1 HIT] Name match: company=%r → platform=%s slug=%s",
+                        company, result["platform"], result["slug"])
             return {
                 "platform": result["platform"],
                 "slug":     result["slug"],
             }
+
+        logger.debug("[P1] No name match for %r — trying slug variants", company)
 
         # Strategy 2: Slug-based lookup with company name validation
         candidates = slugify(company)
@@ -119,6 +132,8 @@ def detect_via_sitemap(company):
 
                 # Validate slug matches our target company
                 if not validate_slug_for_company(slug, company):
+                    logger.debug("[P1] Slug rejected by validate_slug_for_company: "
+                                 "slug=%s platform=%s company=%r", slug, platform, company)
                     continue
 
                 # Validate company name before accepting slug match
@@ -160,11 +175,14 @@ def detect_via_sitemap(company):
                     # enriched_name == "" means API returned no name
                     # → fall through and accept (can't validate)
 
+                logger.info("[P1 HIT] Slug match: company=%r → platform=%s slug=%s",
+                            company, platform, slug)
                 return {
                     "platform": platform,
                     "slug":     slug,
                 }
 
+        logger.debug("[P1 MISS] No match found for %r", company)
         return None
 
     except Exception as e:
@@ -184,11 +202,14 @@ def _db_exists():
     """Check if ats_discovery.db exists and has data."""
     from db.schema_discovery import DISCOVERY_DB
     if not os.path.exists(DISCOVERY_DB):
+        logger.debug("ats_discovery.db not found at %s", DISCOVERY_DB)
         return False
     # Check it has at least one row
     try:
         from db.ats_companies import get_total_count
-        return get_total_count() > 0
+        count = get_total_count()
+        logger.debug("ats_discovery.db exists with %d rows", count)
+        return count > 0
     except Exception as e:
         logger.error(
             "Failed to check discovery DB in _db_exists: %s",

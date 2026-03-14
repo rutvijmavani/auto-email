@@ -177,12 +177,13 @@ def _normalize(job, company, domain, path):
     external_path = job.get("externalPath", "").strip()
     external_url  = job.get("externalUrl",  "").strip()
 
-    if external_url and external_url.startswith("http"):
-        # Absolute URL provided directly (legacy/test data)
-        job_url = external_url
-    elif external_path:
+    
+    if external_path:
         # Relative path from real Workday API — prepend domain + career site name
         job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
+    elif external_url and external_url.startswith("http"):
+        # Absolute URL provided directly (legacy/test data)
+        job_url = external_url
     else:
         # Neither field present — build a best-effort fallback from domain + path
         # so we never silently drop a job with a valid title

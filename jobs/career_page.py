@@ -10,7 +10,10 @@
 
 import re
 import requests
+from logger import get_logger
 from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
+
+logger = get_logger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -54,8 +57,6 @@ ATS_FINGERPRINTS = [
 ]
 
 
-
-
 def _slug_valid_for_company(result, company):
     """
     Validate ATS slug against company name.
@@ -85,6 +86,7 @@ def detect_via_career_page(company, domain):
         None             if not found
     """
     if not domain:
+        logger.debug("[P3a] No domain for %r — skipping", company)
         return None
 
     # Clean domain
@@ -92,13 +94,18 @@ def detect_via_career_page(company, domain):
     if domain.startswith("http"):
         domain = re.sub(r'^https?://', '', domain).rstrip('/')
 
+    logger.debug("[P3a] Scanning career page: company=%r domain=%s", company, domain)
+
     # Try career paths
     for path in CAREER_PATHS:
         url = f"https://{domain}{path}"
         result = _scan_url(url, company)
         if result:
+            logger.info("[P3a HIT] company=%r → platform=%s slug=%s via %s",
+                        company, result["platform"], result["slug"], url)
             return result
 
+    logger.debug("[P3a MISS] No ATS found for %r (domain=%s)", company, domain)
     return None
 
 
@@ -118,14 +125,18 @@ def _scan_url(url, company):
         # e.g. capitalone.com/careers → capitalone.wd12.myworkdayjobs.com
         final_url = resp.url
         if final_url != url:
+            logger.debug("[P3a] Redirect detected: %s → %s", url, final_url)
             result = match_ats_pattern(final_url)
             if result:
                 # Validate slug for platforms where slug = company name
                 # Skip for Workday/Oracle — slugs are opaque (wf, jpmc)
                 if _slug_valid_for_company(result, company):
+                    logger.debug("[P3a] Redirect match: platform=%s slug=%s",
+                                 result["platform"], result["slug"])
                     return result
 
         if resp.status_code != 200:
+            logger.debug("[P3a] Non-200 response: url=%s status=%d", url, resp.status_code)
             return None
 
         # Check 2: Scan HTML for ATS domain fingerprints
@@ -133,9 +144,11 @@ def _scan_url(url, company):
         return _scan_html(html, company)
 
     except requests.exceptions.Timeout:
+        logger.debug("[P3a] Timeout: url=%s", url)
         return None
     except requests.exceptions.SSLError:
         # Try http fallback
+        logger.debug("[P3a] SSL error — trying http fallback: %s", url)
         try:
             http_url = url.replace("https://", "http://")
             resp = requests.get(
@@ -146,13 +159,16 @@ def _scan_url(url, company):
             if final_url != http_url:
                 result = match_ats_pattern(final_url)
                 if result and _slug_valid_for_company(result, company):
+                    logger.debug("[P3a] HTTP fallback redirect match: platform=%s slug=%s",
+                                 result["platform"], result["slug"])
                     return result
             if resp.status_code == 200:
                 return _scan_html(resp.text, company)
         except Exception:
             pass
         return None
-    except Exception:
+    except Exception as e:
+        logger.debug("[P3a] Scan error for %s: %s", url, e)
         return None
 
 
@@ -176,6 +192,8 @@ def _scan_html(html, company):
             continue
 
         if _slug_valid_for_company(result, company):
+            logger.debug("[P3a] HTML fingerprint match: url=%s platform=%s slug=%s",
+                         url, result["platform"], result["slug"])
             return result
 
     return None
