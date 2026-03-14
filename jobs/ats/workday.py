@@ -75,9 +75,9 @@ def detect(company):
                     if "total" in data:
                         return {"slug": slug, "wd": wd, "path": path}, []
                     continue
-                first_title = jobs[0].get("title", "")
+                first_title = jobs[0].get("title") or ""
                 # Support both externalPath (real API) and externalUrl (tests/legacy)
-                first_path  = jobs[0].get("externalPath", "") or jobs[0].get("externalUrl", "")
+                first_path  = jobs[0].get("externalPath") or jobs[0].get("externalUrl") or ""
                 if not validate_company_match(first_path + first_title, company):
                     continue
                 return {"slug": slug, "wd": wd, "path": path}, jobs
@@ -174,8 +174,8 @@ def _normalize(job, company, domain, path):
     # Support both externalPath (real API) and externalUrl (tests/legacy)
     # externalPath: /job/Reynoldsburg-Ohio/Sr-B2B-Sales_R-104046  (relative, needs domain+path prefix)
     # externalUrl:  https://jpmorgan.wd5.myworkdayjobs.com/1       (absolute, use as-is)
-    external_path = job.get("externalPath", "").strip()
-    external_url  = job.get("externalUrl",  "").strip()
+    external_path = (job.get("externalPath") or "").strip()
+    external_url  = (job.get("externalUrl") or "").strip()
 
     
     if external_path:
