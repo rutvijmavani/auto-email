@@ -20,7 +20,7 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 from logger import get_logger
-from db.db import init_db, add_application, save_job
+from db.db import init_db, add_application
 from jobs.job_fetcher import fetch_job_description
 
 logger = get_logger(__name__)
@@ -86,47 +86,84 @@ def _sync_to_pipeline(company, job_url):
     Store ATS slug in ats_discovery.db if detected from job URL.
     source='application' — user-submitted URL is ground truth.
     Does NOT write to prospective_companies.
+
+    company_name is only written if the existing DB row has none —
+    avoids overwriting canonical ATS metadata or falsely marking
+    is_enriched=1 for slugs already enriched from another source.
+
+    is_active=1 is set in the same connection/transaction as the
+    upsert to avoid a split-commit race where is_active stays 0.
     """
+    # ── ATS detection — errors surface here, not swallowed by DB handler ──
+    from jobs.ats.patterns import match_ats_pattern
+    from db.ats_companies import upsert_company
+    from db.schema_discovery import init_discovery_db, get_discovery_conn
+
+    ats = match_ats_pattern(job_url)
+
+    if not ats:
+        logger.debug("No ATS pattern matched for %r — skipping ats_discovery.db write",
+                     company)
+        return
+
+    platform = ats["platform"]
+    slug     = ats["slug"]
+
+    # ── Persistence — narrow try/except covers only DB writes ──────────
     try:
-        from jobs.ats.patterns import match_ats_pattern
+        init_discovery_db()
 
-        ats = match_ats_pattern(job_url)
+        # Check whether this (platform, slug) already has a company_name.
+        # Only pass company_name to upsert if the stored name is missing —
+        # prevents overwriting canonical enriched metadata and avoids
+        # incorrectly setting is_enriched=1 on already-enriched rows.
+        conn = get_discovery_conn()
+        try:
+            existing = conn.execute(
+                "SELECT company_name FROM ats_companies "
+                "WHERE platform=? AND slug=?",
+                (platform, slug)
+            ).fetchone()
+        finally:
+            conn.close()
 
-        if ats:
-            from db.ats_companies import upsert_company
-            from db.schema_discovery import init_discovery_db
-            from db.schema_discovery import get_discovery_conn
-            init_discovery_db()
-            upsert_company(
-                platform=ats["platform"],
-                slug=ats["slug"],
-                company_name=company,
-                source="application",
+        name_missing = (
+            existing is None or
+            not existing["company_name"] or
+            existing["company_name"].strip() == ""
+        )
+
+        upsert_company(
+            platform=platform,
+            slug=slug,
+            company_name=company if name_missing else None,
+            source="application",
+        )
+
+        # Force is_active=1 in the same connection used by upsert so both
+        # the upsert and reactivation commit or fail together — avoids a
+        # split-commit race where upsert commits but reactivation fails,
+        # leaving is_active=0 on a live slug.
+        conn = get_discovery_conn()
+        try:
+            conn.execute(
+                "UPDATE ats_companies SET is_active=1 "
+                "WHERE platform=? AND slug=?",
+                (platform, slug)
             )
-            # upsert_company handles INSERT OR IGNORE + UPDATE automatically.
-            # Additionally force is_active=1 — user submitted this URL so
-            # we know it's live, even if a previous crawl marked it inactive.
-            disc_conn = get_discovery_conn()
-            try:
-                disc_conn.execute(
-                    "UPDATE ats_companies SET is_active=1 "
-                    "WHERE platform=? AND slug=?",
-                    (ats["platform"], ats["slug"])
-                )
-                disc_conn.commit()
-            finally:
-                disc_conn.close()
-            logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s company=%r",
-                        ats["platform"], ats["slug"], company)
-            print(f"       [ATS-DB] Stored in ats_discovery.db "
-                  f"({ats['platform']}/{ats['slug']})")
-        else:
-            logger.debug("No ATS pattern matched for %r — skipping ats_discovery.db write",
-                         company)
+            conn.commit()
+        finally:
+            conn.close()
+
+        logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s "
+                    "company=%r name_written=%s",
+                    platform, slug, company, name_missing)
+        print(f"       [ATS-DB] Stored in ats_discovery.db ({platform}/{slug})")
 
     except Exception as e:
-        # Never block form sync on ats_discovery write failure
-        logger.error("ats_discovery.db write failed for %r: %s", company, e, exc_info=True)
+        # Only DB write failures reach here — detection errors surface above
+        logger.error("ats_discovery.db write failed for %r (platform=%s slug=%s): %s",
+                     company, platform, slug, e, exc_info=True)
         print(f"       [WARNING] ats_discovery.db write failed: {e}")
 
 
@@ -211,7 +248,7 @@ def run():
             rows_to_delete.append(sheet_row_index)
             continue
 
-        # Extract ATS from job URL and add to prospective_companies
+        # Extract ATS from job URL and store in ats_discovery.db
         _sync_to_pipeline(company, job_url)
 
         # Insert into applications table
@@ -228,7 +265,7 @@ def run():
         if not app_id:
             logger.error("Row %d: failed to insert application for %r", sheet_row_index, company)
             print(f"       [ERROR] Failed to insert application — skipping")
-            skipped += 1
+            failed += 1
             rows_to_delete.append(sheet_row_index)
             continue
 
