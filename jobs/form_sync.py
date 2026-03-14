@@ -237,7 +237,7 @@ def run():
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
-            expected_domain=expected_domain if platform != "oracle_hcm" else company,
+            expected_domain=expected_domain if platform != "oracle_hcm" else "".join(company.split()).lower(),
         )
 
         if not app_id:
