@@ -1,0 +1,8 @@
+2026-03-14 11:14:59.871 | INFO     | logger | Logging initialised — command=monitor level=DEBUG file=monitor_2026-03-14.log
+2026-03-14 11:14:59.872 | INFO     | jobs.job_monitor | ════════════════════════════════════════
+2026-03-14 11:14:59.872 | INFO     | jobs.job_monitor | --monitor-jobs starting
+2026-03-14 11:14:59.881 | WARNING  | jobs.job_monitor | 65 companies skipped (unknown/unverified ATS)
+2026-03-14 11:14:59.882 | INFO     | jobs.job_monitor | Loaded 76 monitorable companies (141 total in DB)
+2026-03-14 11:14:59.883 | INFO     | jobs.job_monitor | ── [1/76] 'AT&T'  platform=workday  slug={"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
+2026-03-14 11:14:59.886 | DEBUG    | jobs.ats_detector | needs_redetection: 'AT&T' → False (platform=workday empty_days=0)
+2026-03-14 11:14:59.886 | DEBUG    | jobs.job_monitor | Workday fetch: company='AT&T' slug_info={'slug': 'att', 'wd': 'wd1', 'path': 'ATTGeneral'}

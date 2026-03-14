@@ -19,8 +19,11 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
+from logger import get_logger
 from db.db import init_db, add_application, save_job
 from jobs.job_fetcher import fetch_job_description
+
+logger = get_logger(__name__)
 
 load_dotenv()
 
@@ -45,9 +48,11 @@ COL_APPLIED_DATE = 4
 
 def _get_sheet():
     """Authenticate and return the Google Sheet worksheet."""
-    creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+    logger.debug("Loading credentials from: %s", CREDENTIALS_FILE)
+    creds  = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(SHEET_ID)
+    logger.debug("Opening sheet ID: %s  worksheet: %s", SHEET_ID, SHEET_NAME)
+    sheet  = client.open_by_key(SHEET_ID)
     return sheet.worksheet(SHEET_NAME)
 
 
@@ -67,6 +72,7 @@ def _parse_date(date_str):
             datetime.strptime(date_str.strip(), "%Y-%m-%d")
             return date_str.strip()
         except ValueError:
+            logger.debug("Unrecognised date format %r — defaulting to today", date_str)
             return datetime.now().strftime("%Y-%m-%d")
 
 
@@ -81,13 +87,14 @@ def _sync_to_pipeline(company, job_url):
     Extracts ATS from job URL if possible.
     Does nothing if company already exists in pipeline.
     """
+    conn = None
     try:
         from jobs.ats.patterns import match_ats_pattern
         from db.connection import get_conn
         from datetime import datetime as _dt
 
-        ats    = match_ats_pattern(job_url)
-        conn   = get_conn()
+        ats  = match_ats_pattern(job_url)
+        conn = get_conn()
 
         existing = conn.execute(
             "SELECT id FROM prospective_companies WHERE company=?",
@@ -95,6 +102,8 @@ def _sync_to_pipeline(company, job_url):
         ).fetchone()
 
         if not existing:
+            logger.info("Adding %r to prospective_companies (status=applied, ats=%s)",
+                        company, ats["platform"] if ats else "unknown")
             conn.execute(
                 "INSERT INTO prospective_companies "
                 "(company, ats_platform, ats_slug, ats_detected_at, "
@@ -115,6 +124,8 @@ def _sync_to_pipeline(company, job_url):
         else:
             # Update ATS if we didn't have it before
             if ats:
+                logger.debug("Updating ATS for existing company %r → platform=%s",
+                             company, ats["platform"])
                 conn.execute(
                     "UPDATE prospective_companies "
                     "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
@@ -123,19 +134,28 @@ def _sync_to_pipeline(company, job_url):
                 )
                 conn.commit()
 
-        conn.close()
     except Exception as e:
+        logger.error("Pipeline sync failed for %r: %s", company, e, exc_info=True)
         print(f"       [WARNING] Pipeline sync failed: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
     from pipeline import extract_expected_domain  # local import avoids circular dependency
+
+    logger.info("════════════════════════════════════════")
+    logger.info("--sync-forms starting")
+
     if not SHEET_ID:
+        logger.error("GOOGLE_SHEET_ID not set in .env — aborting")
         print("[ERROR] GOOGLE_SHEET_ID not set in .env")
         return
 
     if not os.path.exists(CREDENTIALS_FILE):
+        logger.error("credentials.json not found at %s", CREDENTIALS_FILE)
         print(f"[ERROR] credentials.json not found at {CREDENTIALS_FILE}")
         return
 
@@ -144,25 +164,30 @@ def run():
     print("[INFO] Connecting to Google Sheets...")
     try:
         worksheet = _get_sheet()
+        logger.debug("Connected to Google Sheets OK")
     except Exception as e:
+        logger.error("Could not connect to Google Sheets: %s", e, exc_info=True)
         print(f"[ERROR] Could not connect to Google Sheets: {e}")
         return
 
     # Get all rows including header
     all_rows = worksheet.get_all_values()
+    logger.debug("Total rows in sheet (including header): %d", len(all_rows))
 
     if len(all_rows) <= 1:
+        logger.info("No data rows found — sheet is empty or header-only")
         print("[INFO] No new form responses to process.")
         return
 
-    header = all_rows[0]
+    header    = all_rows[0]
     data_rows = all_rows[1:]  # skip header row
 
+    logger.info("Found %d form response(s) to process", len(data_rows))
     print(f"[INFO] Found {len(data_rows)} form response(s) to process.\n")
 
-    imported   = 0
-    skipped    = 0
-    failed     = 0
+    imported       = 0
+    skipped        = 0
+    failed         = 0
     # Track which sheet rows to delete (1-based, accounting for header)
     rows_to_delete = []
 
@@ -178,16 +203,21 @@ def run():
         job_title    = row[COL_JOB_TITLE].strip() or None
         applied_date = _parse_date(row[COL_APPLIED_DATE])
 
+        logger.info("── Row %d: company=%r  url=%r  title=%r  date=%s",
+                    sheet_row_index, company, job_url, job_title, applied_date)
         print(f"  [{i+1}] {company} | {job_url[:50]}...")
 
         # Validate required fields
         if not company:
+            logger.warning("Row %d: missing company name — skipping", sheet_row_index)
             print(f"       [WARNING]  Missing company name — skipping")
             skipped += 1
             rows_to_delete.append(sheet_row_index)
             continue
 
         if not job_url or not _is_valid_url(job_url):
+            logger.warning("Row %d: missing or invalid job URL %r — skipping",
+                           sheet_row_index, job_url)
             print(f"       [WARNING]  Missing or invalid job URL — skipping")
             skipped += 1
             rows_to_delete.append(sheet_row_index)
@@ -198,6 +228,7 @@ def run():
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)
+        logger.debug("Row %d: expected_domain=%s", sheet_row_index, expected_domain)
         app_id, created = add_application(
             company=company,
             job_url=job_url,
@@ -207,28 +238,38 @@ def run():
         )
 
         if not app_id:
+            logger.error("Row %d: failed to insert application for %r", sheet_row_index, company)
             print(f"       [ERROR] Failed to insert application — skipping")
             skipped += 1
             rows_to_delete.append(sheet_row_index)
             continue
 
         if not created:
+            logger.info("Row %d: %r already exists in DB (id=%s) — skipping",
+                        sheet_row_index, company, app_id)
             print(f"       [SKIP] Already exists in DB — skipping")
             skipped += 1
             rows_to_delete.append(sheet_row_index)
             continue
 
+        logger.info("Row %d: inserted application for %r (id=%s)", sheet_row_index, company, app_id)
         print(f"       [OK] Added to DB (id={app_id})")
 
         # Scrape job description
         print(f"       [INFO] Scraping job description...")
+        logger.debug("Row %d: scraping JD from %s", sheet_row_index, job_url)
         try:
             result = fetch_job_description(job_url)
             if result:
+                logger.info("Row %d: JD cached for %r", sheet_row_index, company)
                 print(f"       [OK] JD cached")
             else:
+                logger.warning("Row %d: could not scrape JD for %r — will retry during --find-only",
+                               sheet_row_index, company)
                 print(f"       [WARNING]  Could not scrape JD — will retry during --find-only")
         except Exception as e:
+            logger.error("Row %d: JD scraping failed for %r: %s",
+                         sheet_row_index, company, e, exc_info=True)
             print(f"       [WARNING]  JD scraping failed: {e}")
 
         imported += 1
@@ -237,13 +278,20 @@ def run():
     # Delete processed rows from sheet in reverse order
     # (reverse so row indices stay correct as we delete)
     if rows_to_delete:
+        logger.info("Deleting %d processed row(s) from sheet: %s",
+                    len(rows_to_delete), rows_to_delete)
         print(f"\n[INFO]️  Deleting {len(rows_to_delete)} processed row(s) from sheet...")
         for row_index in sorted(rows_to_delete, reverse=True):
             try:
                 worksheet.delete_rows(row_index)
+                logger.debug("Deleted sheet row %d", row_index)
             except Exception as e:
+                logger.error("Could not delete sheet row %d: %s", row_index, e)
                 print(f"   [WARNING]  Could not delete row {row_index}: {e}")
         print(f"[OK] Sheet cleaned up")
 
+    logger.info("Sync complete — imported=%d  skipped=%d  failed=%d",
+                imported, skipped, failed)
     print(f"\n{'='*55}")
     print(f"[OK] Sync complete — Imported: {imported} | Skipped: {skipped} | Failed: {failed}")
+    logger.info("════ --sync-forms finished ════")
