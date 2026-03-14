@@ -87,6 +87,7 @@ def _sync_to_pipeline(company, job_url):
     Extracts ATS from job URL if possible.
     Does nothing if company already exists in pipeline.
     """
+    conn = None
     try:
         from jobs.ats.patterns import match_ats_pattern
         from db.connection import get_conn
@@ -133,10 +134,12 @@ def _sync_to_pipeline(company, job_url):
                 )
                 conn.commit()
 
-        conn.close()
     except Exception as e:
         logger.error("Pipeline sync failed for %r: %s", company, e, exc_info=True)
         print(f"       [WARNING] Pipeline sync failed: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def run():

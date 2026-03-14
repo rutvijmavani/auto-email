@@ -74,25 +74,30 @@ def extract_expected_domain(job_url):
         # ── iCIMS — slug is in subdomain ──────────────────────────
         # careers-schwab.icims.com → "schwab"
         # schwab.icims.com         → "schwab"
-        if "icims.com" in hostname:
-            subdomain = hostname.split(".icims.com")[0]   # "careers-schwab" or "schwab"
-            slug = re.sub(r'^careers-', '', subdomain)    # strip "careers-" prefix if present
-            # Guard against bare "careers" subdomain with no company
-            if slug and slug not in ("careers", "jobs", "www"):
+
+        if hostname.endswith(".icims.com"):
+            subdomain = hostname[: -len(".icims.com")]
+            slug = re.sub(r"^careers-", "", subdomain)
+            if slug and "." not in slug and slug not in {"careers", "jobs", "www"}:
                 return slug.lower()
             return None
 
         # ── Oracle HCM — slug is first subdomain ──────────────────
         # jpmc.fa.oraclecloud.com → "jpmc"
-        if "oraclecloud.com" in hostname:
-            slug = hostname.split(".")[0]  # "jpmc"
-            return slug.lower() or None
+        if hostname.endswith(".fa.oraclecloud.com"):
+            slug = hostname[: -len(".fa.oraclecloud.com")]
+            if slug and "." not in slug and slug not in {"fa", "www"}:
+                return slug.lower()
+            return None
 
         # ── Workday — slug is first subdomain before .wd{N} ───────
         # capitalone.wd12.myworkdayjobs.com → "capitalone"
-        if "myworkdayjobs.com" in hostname or "myworkdaysite.com" in hostname:
-            slug = hostname.split(".")[0]  # "capitalone"
-            return slug.lower() or None
+        for suffix in (".myworkdayjobs.com", ".myworkdaysite.com"):
+            if hostname.endswith(suffix):
+                slug = hostname[: -len(suffix)].split(".")[0]
+                if slug and slug not in {"www", "jobs", "careers"}:
+                    return slug.lower()
+                return None
 
         # ── ATS platforms — extract company slug from path ─────────
         ats_hosts = [

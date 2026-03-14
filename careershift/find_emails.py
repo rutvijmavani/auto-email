@@ -68,7 +68,8 @@ def _save_contacts(contacts, company, applications):
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
             recruiter_id = existing_id
-            logger.debug("Recruiter already in DB: %s (id=%s)", contact["email"], recruiter_id)
+            #logger.debug("Recruiter already in DB: %s (id=%s)", contact["email"], recruiter_id)
+            logger.debug("Recruiter already in DB: id=%s company=%r", recruiter_id, company)
             print(f"   [SKIP] Already in DB: {contact['email']} (id={recruiter_id})")
         else:
             recruiter_id = add_recruiter(
@@ -78,8 +79,9 @@ def _save_contacts(contacts, company, applications):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            logger.info("Saved recruiter: %s | %s (company=%r)",
-                        contact["name"], contact["email"], company)
+            #logger.info("Saved recruiter: %s | %s (company=%r)",
+            #            contact["name"], contact["email"], company)
+            logger.info("Saved recruiter id=%s for company=%r", recruiter_id, company)
             print(f"   [DB] Saved: {contact['name']} | {contact['email']}")
 
         for app in matching_apps:
