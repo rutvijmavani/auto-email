@@ -83,66 +83,52 @@ def _is_valid_url(url):
 
 def _sync_to_pipeline(company, job_url):
     """
-    Add company to prospective_companies with status='applied'.
-    Extracts ATS from job URL if possible.
-    Does nothing if company already exists in pipeline.
+    Store ATS slug in ats_discovery.db if detected from job URL.
+    source='application' — user-submitted URL is ground truth.
+    Does NOT write to prospective_companies.
     """
-    conn = None
-    ats = None
     try:
         from jobs.ats.patterns import match_ats_pattern
-        from db.connection import get_conn
-        from datetime import datetime as _dt
 
-        ats  = match_ats_pattern(job_url)
-        conn = get_conn()
+        ats = match_ats_pattern(job_url)
 
-        existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company=?",
-            (company,)
-        ).fetchone()
-
-        if not existing:
-            logger.info("Adding %r to prospective_companies (status=applied, ats=%s)",
-                        company, ats["platform"] if ats else "unknown")
-            conn.execute(
-                "INSERT INTO prospective_companies "
-                "(company, ats_platform, ats_slug, ats_detected_at, "
-                "priority, status, created_at) "
-                "VALUES (?, ?, ?, ?, 3, 'applied', ?)",
-                (
-                    company,
-                    ats["platform"] if ats else None,
-                    ats["slug"]     if ats else None,
-                    _dt.utcnow()    if ats else None,
-                    _dt.utcnow(),
-                )
+        if ats:
+            from db.ats_companies import upsert_company
+            from db.schema_discovery import init_discovery_db
+            from db.schema_discovery import get_discovery_conn
+            init_discovery_db()
+            upsert_company(
+                platform=ats["platform"],
+                slug=ats["slug"],
+                company_name=company,
+                source="application",
             )
-            conn.commit()
-            ats_info = ats["platform"] if ats else "unknown ATS"
-            print(f"       [PIPELINE] Added to prospective pool "
-                  f"(status=applied, {ats_info})")
-        else:
-            # Update ATS if we didn't have it before
-            if ats:
-                logger.debug("Updating ATS for existing company %r → platform=%s",
-                             company, ats["platform"])
-                conn.execute(
-                    "UPDATE prospective_companies "
-                    "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
-                    "WHERE company=? AND ats_platform IS NULL",
-                    (ats["platform"], ats["slug"], _dt.utcnow(), company)
+            # upsert_company handles INSERT OR IGNORE + UPDATE automatically.
+            # Additionally force is_active=1 — user submitted this URL so
+            # we know it's live, even if a previous crawl marked it inactive.
+            disc_conn = get_discovery_conn()
+            try:
+                disc_conn.execute(
+                    "UPDATE ats_companies SET is_active=1 "
+                    "WHERE platform=? AND slug=?",
+                    (ats["platform"], ats["slug"])
                 )
-                conn.commit()
+                disc_conn.commit()
+            finally:
+                disc_conn.close()
+            logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s company=%r",
+                        ats["platform"], ats["slug"], company)
+            print(f"       [ATS-DB] Stored in ats_discovery.db "
+                  f"({ats['platform']}/{ats['slug']})")
+        else:
+            logger.debug("No ATS pattern matched for %r — skipping ats_discovery.db write",
+                         company)
 
     except Exception as e:
-        logger.error("Pipeline sync failed for %r: %s", company, e, exc_info=True)
-        print(f"       [WARNING] Pipeline sync failed: {e}")
-        return {}
-    finally:
-        if conn is not None:
-            conn.close()
-    return ats or {}
+        # Never block form sync on ats_discovery write failure
+        logger.error("ats_discovery.db write failed for %r: %s", company, e, exc_info=True)
+        print(f"       [WARNING] ats_discovery.db write failed: {e}")
+
 
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
@@ -226,8 +212,7 @@ def run():
             continue
 
         # Extract ATS from job URL and add to prospective_companies
-        ats = _sync_to_pipeline(company, job_url) or {}
-        platform = ats.get("platform")
+        _sync_to_pipeline(company, job_url)
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)
@@ -237,7 +222,7 @@ def run():
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
-            expected_domain=expected_domain if platform != "oracle_hcm" else "".join(company.split()).lower(),
+            expected_domain=expected_domain,
         )
 
         if not app_id:
