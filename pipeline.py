@@ -58,14 +58,43 @@ def extract_expected_domain(job_url):
       https://boards.greenhouse.io/collectiveinc/   → "collectiveinc"
       https://collective.com/careers/engineer       → "collective"
       https://jobs.lever.co/stripe/abc123           → "stripe"
+      https://careers-schwab.icims.com/jobs/123     → "schwab"
+      https://schwab.icims.com/jobs/123             → "schwab"
+      https://jpmc.fa.oraclecloud.com/hcmUI/...     → "jpmc"
+      https://capitalone.wd12.myworkdayjobs.com/... → "capitalone"
     """
     try:
         from urllib.parse import urlparse
-        parsed = urlparse(job_url)
+        import re
+
+        parsed   = urlparse(job_url)
         hostname = parsed.hostname or ""           # "jobs.ashbyhq.com"
         path     = parsed.path.strip("/")          # "collective/54259edc"
 
-        # ATS platforms — extract company slug from path
+        # ── iCIMS — slug is in subdomain ──────────────────────────
+        # careers-schwab.icims.com → "schwab"
+        # schwab.icims.com         → "schwab"
+        if "icims.com" in hostname:
+            subdomain = hostname.split(".icims.com")[0]   # "careers-schwab" or "schwab"
+            slug = re.sub(r'^careers-', '', subdomain)    # strip "careers-" prefix if present
+            # Guard against bare "careers" subdomain with no company
+            if slug and slug not in ("careers", "jobs", "www"):
+                return slug.lower()
+            return None
+
+        # ── Oracle HCM — slug is first subdomain ──────────────────
+        # jpmc.fa.oraclecloud.com → "jpmc"
+        if "oraclecloud.com" in hostname:
+            slug = hostname.split(".")[0]  # "jpmc"
+            return slug.lower() or None
+
+        # ── Workday — slug is first subdomain before .wd{N} ───────
+        # capitalone.wd12.myworkdayjobs.com → "capitalone"
+        if "myworkdayjobs.com" in hostname or "myworkdaysite.com" in hostname:
+            slug = hostname.split(".")[0]  # "capitalone"
+            return slug.lower() or None
+
+        # ── ATS platforms — extract company slug from path ─────────
         ats_hosts = [
             "jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io",
             "jobs.lever.co", "boards.eu.greenhouse.io", "jobs.jobvite.com",
@@ -76,11 +105,10 @@ def extract_expected_domain(job_url):
                 slug = path.split("/")[0].lower()
                 if slug:
                     # Remove common suffixes from slug
-                    import re
                     slug = re.sub(r'(jobs?|careers?|hiring)$', '', slug)
                     return slug.strip("-_") or None
 
-        # Direct company domain — extract root
+        # ── Direct company domain — extract root ───────────────────
         # e.g. "collective.com" → "collective"
         # e.g. "careers.stripe.com" → "stripe"
         parts = hostname.split(".")

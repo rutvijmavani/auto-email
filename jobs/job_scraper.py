@@ -21,8 +21,10 @@ from urllib.parse import urlparse , urlunparse
 import requests
 from bs4 import BeautifulSoup
 
+from logger import get_logger
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────
@@ -132,7 +134,7 @@ class GreenhouseScraper:
                     )
                     return job
             except Exception as e:
-                logger.warning(f"Greenhouse API failed, falling back to HTML: {e}")
+                logger.warning("Greenhouse API failed, falling back to HTML: %s", e)
 
         # HTML fallback
         job.title = _text(soup, ["h1.app-title", "h1", ".job-title"])
@@ -177,7 +179,7 @@ class LeverScraper:
                 ).get_text(separator="\n", strip=True)
                 return job
         except Exception as e:
-            logger.warning(f"Lever JSON API failed: {e}")
+            logger.warning("Lever JSON API failed: %s", e)
 
         # HTML fallback
         job.title = _text(soup, [".posting-headline h2", "h2", "h1"])
@@ -475,7 +477,7 @@ class JobScraper:
             url:             Direct link to the job posting.
             use_playwright:  Set True for JS-heavy pages (Workday, some LinkedIn, etc.)
         """
-        logger.info(f"Scraping: {url}")
+        logger.info("Scraping: %s", url)
 
         try:
             if use_playwright:
@@ -488,7 +490,7 @@ class JobScraper:
 
             soup = BeautifulSoup(html, "lxml")
             portal = detect_portal(url, html)
-            logger.info(f"Detected portal: {portal}")
+            logger.info("Detected portal: %s", portal)
 
             scraper_class = PORTAL_SCRAPER_MAP.get(portal, GenericScraper)
             job = scraper_class.scrape(url, soup, html)
@@ -498,12 +500,14 @@ class JobScraper:
             job.title = job.title.strip()
             job.location = job.location.strip()
 
+            logger.debug("Scraped: title=%r company=%r location=%r",
+                         job.title, job.company, job.location)
             return job
 
         except requests.HTTPError as e:
-            logger.error(f"HTTP error for {url}: {e}")
+            logger.error("HTTP error for %s: %s", url, e)
         except Exception as e:
-            logger.error(f"Failed to scrape {url}: {e}")
+            logger.error("Failed to scrape %s: %s", url, e)
 
         return None
 

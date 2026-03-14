@@ -1,7 +1,8 @@
 import logging
 import re
 
-logger = logging.getLogger(__name__)
+from logger import get_logger
+logger = get_logger(__name__)
 
 # jobs/serper.py — Phase 3b: Serper.dev API for Workday + Oracle detection
 #
@@ -94,6 +95,7 @@ def _get_workday_site_title(slug_info):
     from jobs.ats.workday import _build_url
 
     base_url = _build_url(slug_info).replace("/jobs", "")
+    logger.debug("Fetching Workday site title: %s", base_url)
 
     try:
         resp = requests.get(
@@ -106,7 +108,9 @@ def _get_workday_site_title(slug_info):
             # e.g.  urlWID: "WellsFargoJobs"
             match = re.search(r'urlWID\s*:\s*"([^"]+)"', resp.text)
             if match:
-                return match.group(1).strip(), "html"
+                title = match.group(1).strip()
+                logger.debug("urlWID found: %r (source=html)", title)
+                return title, "html"
             logger.debug("urlWID not found in Workday HTML for %s",
                          slug_info.get("slug", "?"))
         else:
@@ -121,11 +125,13 @@ def _get_workday_site_title(slug_info):
     # signals and must not use them for definitive Layer 1 rejection.
     path = slug_info.get("path", "")
     if path and path not in ("careers", "jobs", "External", "Careers"):
+        logger.debug("Using path fallback: %r (source=path)", path)
         return path, "path"
 
     # Last resort: slug itself
     slug_val = slug_info.get("slug", "")
     if slug_val:
+        logger.debug("Using slug fallback: %r (source=slug)", slug_val)
         return slug_val, "slug"
 
     return None, None
@@ -145,6 +151,10 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
     from jobs.ats.base import validate_company_match
     platform = result["platform"]
     slug     = result["slug"]
+
+    logger.debug("Verifying slug: company=%r platform=%s slug=%s "
+                 "title_verified=%s has_text=%s",
+                 company, platform, slug, title_verified, has_text)
 
     try:
         if platform == "workday":
@@ -179,9 +189,14 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
                 )
                 if site_title_specific:
                     # HTML-derived and non-generic: definitive match/reject
-                    return _match_compact_identifier(site_title, company)
+                    match_result = _match_compact_identifier(site_title, company)
+                    logger.debug("Layer 1 (html urlWID): site_title=%r match=%s",
+                                 site_title, match_result)
+                    return match_result
                 # HTML-derived but generic (e.g. urlWID == "External"):
                 # fall through to Layer 2 — don't reject yet
+                logger.debug("Layer 1: urlWID=%r is generic — falling through to Layer 2",
+                             site_title)
 
             # Layer 2: path from Serper URL slug_info
             # e.g. "qualcomm_careers" → contains "qualcomm" ✓
@@ -191,15 +206,19 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             path = slug_info.get("path", "")
             path_specific = path and path.lower() not in GENERIC
             if path_specific:
-                return _match_compact_identifier(path, company)
+                match_result = _match_compact_identifier(path, company)
+                logger.debug("Layer 2 (path): path=%r match=%s", path, match_result)
+                return match_result
 
             # Layer 3: title_verified fallback
             # Only reached when BOTH urlWID (html) and path are generic
             # e.g. ms.wd5/External — no specific identifier available
             # Only trust if Serper returned meaningful title/snippet text
             if title_verified and has_text:
+                logger.debug("Layer 3 (title_verified fallback): accepted")
                 return True
 
+            logger.debug("All layers exhausted — rejecting slug=%s for %r", slug, company)
             return False
 
         elif platform == "oracle_hcm":
@@ -207,6 +226,7 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             # site:fa.oraclecloud.com returns JPMorgan results for any company.
             # Oracle detection comes exclusively from P3a (career_page.py HTML
             # redirect scan for oraclecloud URLs). Always reject here.
+            logger.debug("Oracle HCM rejected — not detected via Serper")
             return False
 
         elif platform == "greenhouse":
@@ -217,8 +237,10 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             if not data:
                 return False
             board_name = data.get("name", "")
-            return validate_company_match(board_name, company) \
-                   if board_name else False
+            match_result = validate_company_match(board_name, company) \
+                           if board_name else False
+            logger.debug("Greenhouse verify: board_name=%r match=%s", board_name, match_result)
+            return match_result
 
         elif platform == "lever":
             from jobs.ats.base import fetch_json
@@ -228,7 +250,9 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             if not isinstance(data, list):
                 return False
             # Lever has no company name in API — use slug check
-            return validate_slug_for_company(slug, company)
+            match_result = validate_slug_for_company(slug, company)
+            logger.debug("Lever verify: slug=%r match=%s", slug, match_result)
+            return match_result
 
         elif platform == "ashby":
             from jobs.ats.base import fetch_json
@@ -237,8 +261,10 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
             if not data:
                 return False
             board_name = data.get("jobBoard", {}).get("name", "")
-            return validate_company_match(board_name, company) \
-                   if board_name else False
+            match_result = validate_company_match(board_name, company) \
+                           if board_name else False
+            logger.debug("Ashby verify: board_name=%r match=%s", board_name, match_result)
+            return match_result
 
         elif platform == "icims":
             from jobs.ats.base import validate_company_match
@@ -254,6 +280,7 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
                     tenant = tenant[len(prefix):]
                     break  # only strip one prefix
             if validate_company_match(tenant, company):
+                logger.debug("iCIMS verify: tenant=%r matched company=%r", tenant, company)
                 return True
 
             # Step 2: page title as fallback
@@ -274,10 +301,12 @@ def _verify_slug_via_api(result, company, title_verified=False, has_text=False):
                         resp.text, _re.IGNORECASE
                     )
                     if m:
-                        return validate_company_match(m.group(1), company)
+                        match_result = validate_company_match(m.group(1), company)
+                        logger.debug("iCIMS verify (page title): title=%r match=%s",
+                                     m.group(1), match_result)
+                        return match_result
             except Exception as e:
-                logger.debug("iCIMS title fetch failed for %s: %s",
-                             slug, e)
+                logger.debug("iCIMS title fetch failed for %s: %s", slug, e)
             return False
 
         return True
@@ -300,7 +329,10 @@ def detect_via_serper(company):
         None              — not found
         SERPER_EXHAUSTED  — credits exhausted
     """
+    logger.debug("[P3b] detect_via_serper: company=%r", company)
+
     if not SERPER_API_KEY:
+        logger.error("SERPER_API_KEY not set in .env")
         print("   [ERROR] SERPER_API_KEY not set in .env")
         return None
 
@@ -308,10 +340,12 @@ def detect_via_serper(company):
 
         # Check credits before each search
         if not has_serper_credits(needed=1):
+            logger.warning("[P3b] Serper credits exhausted for %r", company)
             print(f"   [WARNING] Serper credits exhausted")
             return SERPER_EXHAUSTED
 
         query = f"{company} {site_filter}"
+        logger.debug("[P3b] Serper query: %r", query)
 
         try:
             resp = requests.post(
@@ -325,16 +359,21 @@ def detect_via_serper(company):
             )
 
             if resp.status_code == 429:
+                logger.warning("[P3b] Serper rate limited — retry later")
                 print("   [WARNING] Serper rate limited — retry later")
                 # 429 = transient, not exhausted — don't charge credit
                 continue
 
             if resp.status_code in (401, 403):
+                logger.error("[P3b] Serper auth error %d — check SERPER_API_KEY",
+                             resp.status_code)
                 print(f"   [WARNING] Serper auth error {resp.status_code} "
                       f"— check SERPER_API_KEY")
                 return None  # no credit charged on auth failure
 
             if resp.status_code != 200:
+                logger.warning("[P3b] Serper error %d for %r/%s",
+                               resp.status_code, company, platform)
                 print(f"   [WARNING] Serper error {resp.status_code} "
                       f"for {company}/{platform}")
                 continue  # no credit charged on error
@@ -343,6 +382,8 @@ def detect_via_serper(company):
             increment_serper_credits(1)
 
             items = resp.json().get("organic", [])
+            logger.debug("[P3b] Serper returned %d organic results for %r",
+                         len(items), company)
 
             if not items:
                 continue
@@ -399,10 +440,11 @@ def detect_via_serper(company):
                         slug_map[slug_key] = (result, title_verified, has_text)
 
             if not slug_map:
+                logger.debug("[P3b] No valid slugs found for %r/%s", company, platform)
                 continue
 
             logger.debug(
-                "Serper found %d unique slugs for %s/%s: %s",
+                "[P3b] %d unique slug(s) found for %r/%s: %s",
                 len(slug_map), company, platform,
                 list(slug_map.keys())
             )
@@ -413,21 +455,26 @@ def detect_via_serper(company):
                 if _verify_slug_via_api(result, company,
                                         title_verified=title_verified,
                                         has_text=has_text):
+                    logger.info("[P3b HIT] company=%r → platform=%s slug=%s",
+                                company, platform, result["slug"])
                     print(f"   [SERPER] {company} -> {platform} "
                           f"(slug: {result['slug']})")
                     return result
                 else:
                     logger.debug(
-                        "Slug rejected by API: company=%s slug=%s "
+                        "[P3b] Slug rejected by API: company=%r slug=%s "
                         "title_verified=%s",
                         company, slug_key, title_verified
                     )
 
         except requests.exceptions.Timeout:
+            logger.warning("[P3b] Serper timeout for %r/%s", company, platform)
             print(f"   [WARNING] Serper timeout for {company}/{platform}")
             continue
         except Exception as e:
+            logger.error("[P3b] Serper error for %r/%s: %s", company, platform, e)
             print(f"   [WARNING] Serper error for {company}/{platform}: {e}")
             continue
 
+    logger.debug("[P3b MISS] No Workday found for %r via Serper", company)
     return None
