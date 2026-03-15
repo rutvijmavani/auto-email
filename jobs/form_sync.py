@@ -20,7 +20,7 @@ from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 from logger import get_logger
-from db.db import init_db, add_application, save_job
+from db.db import init_db, add_application
 from jobs.job_fetcher import fetch_job_description
 
 logger = get_logger(__name__)
@@ -83,66 +83,59 @@ def _is_valid_url(url):
 
 def _sync_to_pipeline(company, job_url):
     """
-    Add company to prospective_companies with status='applied'.
-    Extracts ATS from job URL if possible.
-    Does nothing if company already exists in pipeline.
+    Store ATS slug in ats_discovery.db if detected from job URL.
+    source='application' — user-submitted URL is ground truth.
+    Does NOT write to prospective_companies.
+
+    company_name is only written if the existing DB row has none —
+    avoids overwriting canonical ATS metadata or falsely marking
+    is_enriched=1 for slugs already enriched from another source.
+
+    Delegates to upsert_company(only_set_name_if_missing=True, is_active=True)
+    which opens a single BEGIN IMMEDIATE transaction covering the name check,
+    INSERT OR IGNORE, and UPDATE — no split-commit race possible.
     """
-    conn = None
-    ats = None
+    # ── ATS detection — wrapped separately so failures don't abort the sync ──
+    from jobs.ats.patterns import match_ats_pattern
+    from db.ats_companies import upsert_company
+    from db.schema_discovery import init_discovery_db
+
     try:
-        from jobs.ats.patterns import match_ats_pattern
-        from db.connection import get_conn
-        from datetime import datetime as _dt
+        ats = match_ats_pattern(job_url)
+    except Exception as e:
+        logger.error("ATS pattern match failed for %r (url=%s): %s",
+                     company, job_url, e, exc_info=True)
+        return
 
-        ats  = match_ats_pattern(job_url)
-        conn = get_conn()
+    if not ats:
+        logger.debug("No ATS pattern matched for %r — skipping ats_discovery.db write",
+                     company)
+        return
 
-        existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company=?",
-            (company,)
-        ).fetchone()
+    platform = ats["platform"]
+    slug     = ats["slug"]
 
-        if not existing:
-            logger.info("Adding %r to prospective_companies (status=applied, ats=%s)",
-                        company, ats["platform"] if ats else "unknown")
-            conn.execute(
-                "INSERT INTO prospective_companies "
-                "(company, ats_platform, ats_slug, ats_detected_at, "
-                "priority, status, created_at) "
-                "VALUES (?, ?, ?, ?, 3, 'applied', ?)",
-                (
-                    company,
-                    ats["platform"] if ats else None,
-                    ats["slug"]     if ats else None,
-                    _dt.utcnow()    if ats else None,
-                    _dt.utcnow(),
-                )
-            )
-            conn.commit()
-            ats_info = ats["platform"] if ats else "unknown ATS"
-            print(f"       [PIPELINE] Added to prospective pool "
-                  f"(status=applied, {ats_info})")
-        else:
-            # Update ATS if we didn't have it before
-            if ats:
-                logger.debug("Updating ATS for existing company %r → platform=%s",
-                             company, ats["platform"])
-                conn.execute(
-                    "UPDATE prospective_companies "
-                    "SET ats_platform=?, ats_slug=?, ats_detected_at=? "
-                    "WHERE company=? AND ats_platform IS NULL",
-                    (ats["platform"], ats["slug"], _dt.utcnow(), company)
-                )
-                conn.commit()
+    # ── Persistence — narrow try/except covers only DB writes ──────────
+    try:
+        init_discovery_db()
+        upsert_company(
+            platform=platform,
+            slug=slug,
+            company_name=company,
+            source="application",
+            is_active=True,
+            only_set_name_if_missing=True,
+        )
+        logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s company=%r",
+                    platform, slug, company)
+        print(f"       [ATS-DB] Stored in ats_discovery.db ({platform}/{slug})")
 
     except Exception as e:
-        logger.error("Pipeline sync failed for %r: %s", company, e, exc_info=True)
-        print(f"       [WARNING] Pipeline sync failed: {e}")
-        return {}
-    finally:
-        if conn is not None:
-            conn.close()
-    return ats or {}
+        # Only DB write failures reach here — detection errors surface above
+        logger.error("ats_discovery.db write failed for %r (platform=%s slug=%s): %s",
+                     company, platform, slug, e, exc_info=True)
+        print(f"       [WARNING] ats_discovery.db write failed: {e}")
+
 
 def run():
     """Main sync function — reads sheet, imports to DB, deletes processed rows."""
@@ -225,9 +218,8 @@ def run():
             rows_to_delete.append(sheet_row_index)
             continue
 
-        # Extract ATS from job URL and add to prospective_companies
-        ats = _sync_to_pipeline(company, job_url) or {}
-        platform = ats.get("platform")
+        # Extract ATS from job URL and store in ats_discovery.db
+        _sync_to_pipeline(company, job_url)
 
         # Insert into applications table
         expected_domain = extract_expected_domain(job_url)
@@ -237,14 +229,14 @@ def run():
             job_url=job_url,
             job_title=job_title,
             applied_date=applied_date,
-            expected_domain=expected_domain if platform != "oracle_hcm" else "".join(company.split()).lower(),
+            expected_domain=expected_domain,
         )
 
         if not app_id:
             logger.error("Row %d: failed to insert application for %r", sheet_row_index, company)
-            print(f"       [ERROR] Failed to insert application — skipping")
-            skipped += 1
-            rows_to_delete.append(sheet_row_index)
+            print("       [ERROR] Failed to insert application — skipping")
+            failed += 1
+            # Do NOT append to rows_to_delete — leave row in sheet for retry
             continue
 
         if not created:
