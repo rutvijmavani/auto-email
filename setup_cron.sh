@@ -85,9 +85,17 @@ cat > "$PROJECT_DIR/run_nightly.sh" << 'EOF'
 #   sync → backup → find-only
 # Each step only runs if the previous succeeded (&&).
 # Backup failure stops the chain — DB stays safe.
+# Guard: exits on the 1st of the month — run_monthly.sh handles it.
 PROJECT_DIR="/home/opc/mail"
 LOG_DIR="$PROJECT_DIR/logs"
 LOG_FILE="$LOG_DIR/nightly_$(date +%Y-%m-%d).log"
+
+# Early exit on 1st — cron ORs day-of-month and day-of-week
+# so this guard is the only reliable way to skip the 1st
+if [ "$(date +%d)" = "01" ]; then
+  echo "[SKIP] 1st of month — run_monthly.sh handles today" >> "$LOG_FILE"
+  exit 0
+fi
 
 cd "$PROJECT_DIR" || exit 1
 echo "" >> "$LOG_FILE"
@@ -119,9 +127,17 @@ cat > "$PROJECT_DIR/run_monday.sh" << 'EOF'
 # run_monday.sh — Monday 1 AM nightly chain:
 #   sync → backup → verify-only → find-only
 # Each step only runs if the previous succeeded (&&).
+# Guard: exits on the 1st of the month — run_monthly.sh handles it.
 PROJECT_DIR="/home/opc/mail"
 LOG_DIR="$PROJECT_DIR/logs"
 LOG_FILE="$LOG_DIR/monday_$(date +%Y-%m-%d).log"
+
+# Early exit on 1st — cron ORs day-of-month and day-of-week
+# so this guard is the only reliable way to skip the 1st
+if [ "$(date +%d)" = "01" ]; then
+  echo "[SKIP] 1st of month — run_monthly.sh handles today" >> "$LOG_FILE"
+  exit 0
+fi
 
 cd "$PROJECT_DIR" || exit 1
 echo "" >> "$LOG_FILE"
@@ -390,18 +406,18 @@ NEW_CRON=$(cat << 'CRONTAB'
 0 9 * * 1 /home/opc/mail/run_weekly_summary.sh
 
 # ─────────────────────────────────────────
-# NIGHTLY CHAIN — Tuesday to Sunday 1 AM (except 1st of month)
+# NIGHTLY CHAIN — Tuesday to Sunday 1 AM
 # sync → backup → find-only (sequential, stops on failure)
-# Day 1 excluded — run_monthly.sh handles it instead
+# Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
-0 1 2-31 * 2-7 /home/opc/mail/run_nightly.sh
+0 1 * * 2-7 /home/opc/mail/run_nightly.sh
 
 # ─────────────────────────────────────────
-# MONDAY NIGHTLY CHAIN — Monday 1 AM (except 1st of month)
+# MONDAY NIGHTLY CHAIN — Monday 1 AM
 # sync → backup → verify-only → find-only (sequential)
-# Day 1 excluded — run_monthly.sh handles it instead
+# Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
-0 1 2-31 * 1 /home/opc/mail/run_monday.sh
+0 1 * * 1 /home/opc/mail/run_monday.sh
 
 # ─────────────────────────────────────────
 # MONTHLY CHAIN — 1st of every month at 1 AM

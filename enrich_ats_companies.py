@@ -72,7 +72,10 @@ def enrich_greenhouse(slug):
         }, "ok"
     except (requests.RequestException, ValueError) as e:
         logger.debug("Greenhouse exception: slug=%s error=%s", slug, e)
-        return None, "error"(slug):
+        return None, "error"
+
+
+def enrich_lever(slug):
     """
     GET api.lever.co/v0/postings/{slug}?mode=json
     Returns list of job postings.
