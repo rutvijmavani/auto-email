@@ -21,10 +21,13 @@ import argparse
 import requests
 from datetime import datetime
 
+from logger import get_logger, init_logging
 from db.schema_discovery import init_discovery_db
 from db.ats_companies import (
     get_unenriched, upsert_company, delete_company
 )
+
+logger = get_logger(__name__)
 
 HEADERS = {
     "User-Agent": (
@@ -51,20 +54,24 @@ def enrich_greenhouse(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 404:
+            logger.debug("Greenhouse 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("Greenhouse error %d: slug=%s", resp.status_code, slug)
             return None, "error"
         data = resp.json()
         name     = data.get("name", "")
         jobs     = data.get("jobs", [])
         # Try to get website from jobs
         website  = _extract_website_from_jobs(jobs)
+        logger.debug("Greenhouse OK: slug=%s name=%r jobs=%d", slug, name, len(jobs))
         return {
             "company_name": name,
             "website":      website,
             "job_count":    len(jobs),
         }, "ok"
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("Greenhouse exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -77,8 +84,10 @@ def enrich_lever(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 404:
+            logger.debug("Lever 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("Lever error %d: slug=%s", resp.status_code, slug)
             return None, "error"
         data = resp.json()
         if not isinstance(data, list):
@@ -86,12 +95,14 @@ def enrich_lever(slug):
         # Company name from first job's hostedUrl or categories
         name    = _extract_lever_company_name(slug)
         website = _extract_lever_website(data)
+        logger.debug("Lever OK: slug=%s name=%r jobs=%d", slug, name, len(data))
         return {
             "company_name": name,
             "website":      website,
             "job_count":    len(data),
         }, "ok"
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("Lever exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -108,8 +119,10 @@ def enrich_ashby(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 404:
+            logger.debug("Ashby 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("Ashby error %d: slug=%s", resp.status_code, slug)
             return None, "error"
         data = resp.json()
         jobs = data.get("jobs", [])
@@ -173,12 +186,14 @@ def enrich_ashby(slug):
         if not name:
             name = slug.replace("-", " ").title()
 
+        logger.debug("Ashby OK: slug=%s name=%r jobs=%d", slug, name, len(jobs))
         return {
             "company_name": name,
             "website":      website,
             "job_count":    len(jobs),
         }, "ok"
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("Ashby exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -191,18 +206,22 @@ def enrich_smartrecruiters(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 404:
+            logger.debug("SmartRecruiters 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("SmartRecruiters error %d: slug=%s", resp.status_code, slug)
             return None, "error"
         data = resp.json()
         name    = data.get("name", "")
         website = data.get("website", "")
+        logger.debug("SmartRecruiters OK: slug=%s name=%r", slug, name)
         return {
             "company_name": name,
             "website":      website,
             "job_count":    0,  # would need separate call
         }, "ok"
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("SmartRecruiters exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -231,20 +250,24 @@ def enrich_workday(slug):
                            allow_redirects=True)
 
         if resp.status_code == 404:
+            logger.debug("Workday 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("Workday error %d: slug=%s", resp.status_code, slug)
             return None, "error"
 
         # Extract company name from page title
         # Workday titles: "Jobs at Capital One | Workday"
         name = _extract_title_name(resp.text)
+        logger.debug("Workday OK: slug=%s name=%r", slug, name)
         return {
             "company_name": name,
             "website":      "",
             "job_count":    0,
         }, "ok"
 
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("Workday exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -271,18 +294,22 @@ def enrich_oracle_hcm(slug):
                            allow_redirects=True)
 
         if resp.status_code == 404:
+            logger.debug("Oracle HCM 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("Oracle HCM error %d: slug=%s", resp.status_code, slug)
             return None, "error"
 
         name = _extract_title_name(resp.text)
+        logger.debug("Oracle HCM OK: slug=%s name=%r", slug, name)
         return {
             "company_name": name,
             "website":      "",
             "job_count":    0,
         }, "ok"
 
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("Oracle HCM exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -296,8 +323,10 @@ def enrich_icims(slug):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 404:
+            logger.debug("iCIMS 404: slug=%s", slug)
             return None, "inactive"
         if resp.status_code != 200:
+            logger.debug("iCIMS error %d: slug=%s", resp.status_code, slug)
             return None, "error"
 
         if "iCIMS" not in resp.text and "icims" not in resp.text.lower():
@@ -308,13 +337,15 @@ def enrich_icims(slug):
         # Count job anchors
         job_count = resp.text.count("iCIMS_Anchor")
 
+        logger.debug("iCIMS OK: slug=%s name=%r jobs=%d", slug, name, job_count)
         return {
             "company_name": name,
             "website":      "",
             "job_count":    job_count,
         }, "ok"
 
-    except Exception:
+    except (requests.RequestException, ValueError) as e:
+        logger.debug("iCIMS exception: slug=%s error=%s", slug, e)
         return None, "error"
 
 
@@ -431,6 +462,7 @@ def run_priority_enrichment():
     from db.connection import get_conn
     from db.ats_companies import get_discovery_conn
 
+    logger.info("Phase A: priority enrichment starting")
     init_discovery_db()
 
     # Get all prospect company domains
@@ -448,12 +480,17 @@ def run_priority_enrichment():
             r["domain"].lower().replace("www.", "")
             for r in prospects if r["domain"]
         }
-    except Exception:
+        logger.info("Phase A: loaded %d prospects, %d domains",
+                    len(prospect_names), len(prospect_domains))
+    except Exception as e:
+        logger.warning("Phase A: could not load prospects: %s — "
+                       "running standard enrichment", e)
         print("[WARNING] Could not load prospects — "
               "running standard enrichment")
         return run_enrichment(limit=200)
 
     if not prospect_names:
+        logger.info("Phase A: no prospects found — running standard enrichment")
         print("[INFO] No prospects found — "
               "running standard enrichment")
         return run_enrichment(limit=200)
@@ -470,6 +507,9 @@ def run_priority_enrichment():
         """).fetchall()
     finally:
         disc_conn.close()
+
+    logger.info("Phase A: %d unenriched slugs to check against prospects",
+                len(rows))
 
     # Build normalized prospect slug set for exact matching
     import difflib
@@ -536,7 +576,10 @@ def run_priority_enrichment():
         if matched:
             priority_slugs.append(dict(row))
 
+    logger.info("Phase A: %d prospect-matching slugs found", len(priority_slugs))
+
     if not priority_slugs:
+        logger.info("Phase A: no prospect matches in discovery DB yet")
         print("[INFO] No prospect matches in discovery DB yet. "
               "Run build_ats_slug_list.py first.")
         return
@@ -557,6 +600,7 @@ def run_priority_enrichment():
         if status == "inactive":
             delete_company(plat, slug)
             stats["inactive"] += 1
+            logger.info("Phase A: deleted inactive slug platform=%s slug=%s", plat, slug)
             print(f"  {plat:<13} {slug[:28]:<30} DELETED (404)")
         elif status == "ok" and data:
             upsert_company(
@@ -567,11 +611,15 @@ def run_priority_enrichment():
             )
             stats["ok"] += 1
             name = data.get("company_name", "")[:30]
+            logger.debug("Phase A: enriched platform=%s slug=%s name=%r", plat, slug, name)
             print(f"  {plat:<13} {slug[:28]:<30} OK         {name}")
         elif status == "error":
             stats["error"] += 1
+            logger.debug("Phase A: error platform=%s slug=%s", plat, slug)
         _enrich_delay(plat)
 
+    logger.info("Phase A complete: ok=%d inactive=%d errors=%d",
+                stats["ok"], stats["inactive"], stats["error"])
     print(f"\n[Phase A] Complete — "
           f"OK: {stats['ok']} | "
           f"Inactive: {stats['inactive']} | "
@@ -594,6 +642,8 @@ def run_platform_aware_enrichment(test_mode=False):
     """
     from config import ENRICH_DAILY_LIMITS
 
+    logger.info("Phase B: platform-aware daily enrichment starting "
+                "(test_mode=%s)", test_mode)
     init_discovery_db()
 
     print("\n[Phase B] Platform-aware daily enrichment")
@@ -612,9 +662,12 @@ def run_platform_aware_enrichment(test_mode=False):
         )
 
         if not slugs:
+            logger.debug("Phase B: no unenriched slugs for platform=%s", platform)
             print(f"  {platform:<15} — no unenriched slugs")
             continue
 
+        logger.info("Phase B: enriching %d slugs for platform=%s",
+                    len(slugs), platform)
         print(f"  {platform:<15} {len(slugs):>4} slugs to enrich")
 
         for row in slugs:
@@ -628,6 +681,8 @@ def run_platform_aware_enrichment(test_mode=False):
             if status == "inactive":
                 delete_company(platform, slug)
                 total_stats["inactive"] += 1
+                logger.debug("Phase B: deleted inactive platform=%s slug=%s",
+                             platform, slug)
             elif status == "ok" and data:
                 upsert_company(
                     platform=platform,
@@ -637,11 +692,16 @@ def run_platform_aware_enrichment(test_mode=False):
                     job_count=data.get("job_count"),
                 )
                 total_stats["ok"] += 1
+                logger.debug("Phase B: enriched platform=%s slug=%s name=%r",
+                             platform, slug, data.get("company_name"))
             elif status == "error":
                 total_stats["error"] += 1
+                logger.debug("Phase B: error platform=%s slug=%s", platform, slug)
 
             _enrich_delay(platform)
 
+    logger.info("Phase B complete: ok=%d inactive=%d errors=%d",
+                total_stats["ok"], total_stats["inactive"], total_stats["error"])
     print(f"\n[Phase B] Complete — "
           f"OK: {total_stats['ok']} | "
           f"Inactive: {total_stats['inactive']} | "
@@ -658,6 +718,8 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
         limit:     max slugs per run
         test_mode: only process 10 per platform
     """
+    logger.info("run_enrichment starting: platform=%s limit=%d test_mode=%s",
+                platform, limit, test_mode)
     init_discovery_db()
 
     if test_mode:
@@ -666,9 +728,11 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
     slugs = get_unenriched(platform=platform, limit=limit)
 
     if not slugs:
+        logger.info("No unenriched slugs found")
         print("[OK] No unenriched slugs found.")
         return
 
+    logger.info("Enriching %d slugs", len(slugs))
     print(f"\nEnriching {len(slugs)} slugs...")
     print(f"{'Platform':<15} {'Slug':<30} {'Result':<10} {'Name'}")
     print("─" * 80)
@@ -694,6 +758,7 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
         if status == "inactive":
             delete_company(plat, slug)
             stats["inactive"] += 1
+            logger.debug("Deleted inactive: platform=%s slug=%s", plat, slug)
             print(f"  {plat:<13} {slug[:28]:<30} DELETED (404)")
 
         elif status == "ok" and data:
@@ -706,16 +771,22 @@ def run_enrichment(platform=None, limit=500, test_mode=False):
             )
             stats["ok"] += 1
             name = data.get("company_name", "")[:30]
+            logger.debug("Enriched: platform=%s slug=%s name=%r", plat, slug, name)
             print(f"  {plat:<13} {slug[:28]:<30} OK         {name}")
 
         elif status == "error":
             stats["error"] += 1
+            logger.debug("Error: platform=%s slug=%s", plat, slug)
             # Don't mark as enriched — retry next time
 
         elif status == "skip":
             stats["skip"] += 1
+            logger.debug("Skipped: platform=%s slug=%s", plat, slug)
 
         _enrich_delay(plat)
+
+    logger.info("run_enrichment complete: ok=%d inactive=%d errors=%d skipped=%d",
+                stats["ok"], stats["inactive"], stats["error"], stats["skip"])
 
     # Summary
     print(f"\n{'='*60}")
@@ -747,6 +818,13 @@ if __name__ == "__main__":
         help="Phase B: platform-aware daily enrichment"
     )
     args = parser.parse_args()
+
+    init_logging("enrich_ats_companies")
+
+    logger.info("enrich_ats_companies invoked: priority=%s daily=%s "
+                "platform=%s limit=%d test=%s",
+                args.priority, args.daily,
+                args.platform, args.limit, args.test)
 
     if args.priority:
         run_priority_enrichment()

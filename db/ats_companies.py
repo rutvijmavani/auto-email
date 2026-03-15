@@ -134,10 +134,28 @@ def find_by_slug(platform, slug):
 
 def upsert_company(platform, slug, company_name=None,
                    website=None, job_count=None,
-                   crawl_source=None, source="crawl"):
+                   crawl_source=None, source="crawl",
+                   is_active=None,
+                   only_set_name_if_missing=False):
     """Insert or update a company slug."""
     conn = get_discovery_conn()
     try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # name_missing check — only when only_set_name_if_missing is True
+        name_missing = True
+        if only_set_name_if_missing and company_name is not None:
+            row = conn.execute(
+                "SELECT company_name FROM ats_companies "
+                "WHERE platform=? AND slug=?",
+                (platform, slug)
+            ).fetchone()
+            name_missing = (
+                row is None or
+                not row["company_name"] or
+                row["company_name"].strip() == ""
+            )
+
         conn.execute("""
             INSERT OR IGNORE INTO ats_companies
                 (platform, slug, crawl_source,
@@ -150,9 +168,15 @@ def upsert_company(platform, slug, company_name=None,
         params  = []
 
         if company_name is not None:
-            updates.append("company_name = ?")
-            params.append(company_name)
-            updates.append("is_enriched = 1")
+            write_name = (not only_set_name_if_missing) or name_missing
+            if write_name:
+                updates.append("company_name = ?")
+                params.append(company_name)
+                # Only mark enriched if name is non-empty/non-whitespace
+                # — empty names must not flip is_enriched or rows
+                # become invisible to get_unenriched()
+                if company_name.strip():
+                    updates.append("is_enriched = 1")
 
         if website is not None:
             updates.append("website = ?")
@@ -172,6 +196,12 @@ def upsert_company(platform, slug, company_name=None,
             updates.append("source = ?")
             params.append(source)
 
+        # is_active — only touch when explicitly requested
+        if is_active is True:
+            updates.append("is_active = 1")
+        elif is_active is False:
+            updates.append("is_active = 0")
+
         updates.append("last_verified = ?")
         params.append(datetime.now().isoformat())
 
@@ -186,6 +216,9 @@ def upsert_company(platform, slug, company_name=None,
 
         conn.commit()
 
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
