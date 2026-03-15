@@ -54,6 +54,9 @@ try:
 except ImportError:
     pass
 
+from logger import get_logger
+logger = get_logger(__name__)
+
 
 # ─────────────────────────────────────────
 # CONFIG — AWS / ATHENA
@@ -151,6 +154,7 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
             with open(COLLINFO_CACHE) as f:
                 data = json.load(f)
             crawls = data["crawls"][:n]
+            logger.debug("Crawl list from cache: %s", crawls)
             print(f"[INFO] Crawl list from cache: {crawls}")
             return crawls
 
@@ -168,12 +172,15 @@ def get_recent_crawls(n=CRAWLS_TO_USE):
                            "fetched_at": datetime.now().isoformat()
                            }, f)
             crawls = ids[:n]
+            logger.info("Fetched crawl list: %s", crawls)
             print(f"[INFO] Sliding window: {crawls}")
             return crawls
     except Exception as e:
+        logger.warning("Could not fetch collinfo.json: %s", e)
         print(f"[WARNING] Could not fetch collinfo.json: {e}")
 
     # Fallback
+    logger.warning("Using hardcoded fallback crawls")
     print("[WARNING] Using hardcoded fallback crawls")
     return [
         "CC-MAIN-2026-08",
@@ -270,9 +277,11 @@ def run_athena_query(sql, crawl_id, csv_path):
         pandas DataFrame or None on failure
     """
     if not ATHENA_S3_OUTPUT:
+        logger.error("ATHENA_S3_OUTPUT not set in .env")
         print("[ERROR] ATHENA_S3_OUTPUT not set in .env")
         return None
 
+    logger.info("Running Athena query for crawl=%s", crawl_id)
     print(f"  [ATHENA] Running query for {crawl_id}...")
 
     try:
@@ -298,6 +307,8 @@ def run_athena_query(sql, crawl_id, csv_path):
             scanned_mb   = scanned_bytes / (1024 * 1024)
             scanned_tb   = scanned_bytes / (1024 ** 4)
             cost_usd     = scanned_tb * 5.0  # $5 per TB
+            logger.info("Athena crawl=%s scanned=%.2fMB cost=$%.6f",
+                        crawl_id, scanned_mb, cost_usd)
             print(f"  [ATHENA] Data scanned: "
                   f"{scanned_mb:.2f} MB")
             print(f"  [ATHENA] Estimated cost: "
@@ -308,6 +319,8 @@ def run_athena_query(sql, crawl_id, csv_path):
         # Save locally for recovery
         os.makedirs("data", exist_ok=True)
         df.to_csv(csv_path, index=False)
+        logger.info("Athena result: crawl=%s rows=%d saved=%s",
+                    crawl_id, len(df), csv_path)
         print(f"  [ATHENA] {len(df):,} rows → saved to {csv_path}")
 
         # Delete S3 result immediately
@@ -316,6 +329,8 @@ def run_athena_query(sql, crawl_id, csv_path):
         return df
 
     except Exception as e:
+        logger.error("Athena query failed for crawl=%s: %s",
+                     crawl_id, e, exc_info=True)
         print(f"  [ERROR] Athena query failed: {e}")
         return None
 
@@ -349,6 +364,8 @@ def _log_athena_cost(crawl_id, scanned_mb, cost_usd):
     with open(cost_file, "w") as f:
         json.dump(log, f, indent=2)
 
+    logger.debug("Athena cost log updated: total=$%.6f queries=%d",
+                 log["total_usd"], len(log["queries"]))
     print(f"  [ATHENA] Running total: "
           f"${log['total_usd']:.6f} USD "
           f"({len(log['queries'])} queries)")
@@ -364,6 +381,7 @@ def repair_athena_table():
     # Athena v3 (Trino engine) uses REFRESH — not MSCK REPAIR TABLE
     sql = (f'REFRESH PARTITION METADATA '
            f'\"{ATHENA_DATABASE}\".\"{ATHENA_TABLE}\"')
+    logger.info("Running REFRESH PARTITION METADATA")
     print(f"  [ATHENA] Running REFRESH PARTITION METADATA "
           f"(discovering new partitions)...")
 
@@ -380,16 +398,20 @@ def repair_athena_table():
         new_partitions = [r for r in result if r] if result else []
 
         if new_partitions:
+            logger.info("REFRESH: %d new partition(s) discovered",
+                        len(new_partitions))
             print(f"  [ATHENA] {len(new_partitions)} new partition(s) "
                   f"discovered")
             for p in new_partitions[:5]:
                 print(f"    {p}")
         else:
+            logger.debug("REFRESH: table partitions up to date")
             print(f"  [ATHENA] Table partitions up to date")
 
         return True
 
     except Exception as e:
+        logger.warning("REFRESH PARTITION METADATA failed: %s", e)
         print(f"  [WARNING] MSCK REPAIR TABLE failed: {e}")
         print(f"  [WARNING] Proceeding anyway — "
               f"new crawl may not be visible in Athena")
@@ -404,9 +426,11 @@ def _delete_s3_result(conn):
     """
     try:
         # Get query execution ID from pyathena connection
-        query_id = getattr(conn, "query_id", None) or                    getattr(conn, "_query_id", None)
+        query_id = getattr(conn, "query_id", None) or \
+                   getattr(conn, "_query_id", None)
 
         if not query_id:
+            logger.debug("Could not get Athena query ID — skipping S3 cleanup")
             print("  [WARNING] Could not get Athena query ID "
                   "— skipping S3 cleanup")
             return
@@ -431,9 +455,11 @@ def _delete_s3_result(conn):
             except Exception:
                 pass  # file may not exist — that's fine
 
+        logger.debug("S3 result deleted: %s.csv", query_id)
         print(f"  [S3] Result deleted: {query_id}.csv")
 
     except Exception as e:
+        logger.warning("Could not delete S3 result: %s", e)
         print(f"  [WARNING] Could not delete S3 result: {e}")
 
 
@@ -444,6 +470,7 @@ def _cleanup_old_csvs():
         mtime = datetime.fromtimestamp(os.path.getmtime(path))
         if mtime < cutoff:
             os.remove(path)
+            logger.debug("Deleted old CSV: %s", path)
             print(f"  [CLEANUP] Deleted old CSV: {path}")
 
 
@@ -564,11 +591,15 @@ def process_dataframe(df, crawl_id):
             skipped += 1
 
     total = sum(len(s) for s in results.values())
+    logger.info("crawl=%s parsed: rows=%d valid_slugs=%d skipped=%d",
+                crawl_id, len(df), total, skipped)
     print(f"  [PARSE] {len(df):,} rows → "
           f"{total:,} valid slugs "
           f"({skipped:,} skipped)")
 
     for platform, slugs in sorted(results.items()):
+        logger.debug("crawl=%s platform=%s slugs=%d",
+                     crawl_id, platform, len(slugs))
         print(f"    {platform:<15} {len(slugs):>6,} slugs")
 
     return results
@@ -629,18 +660,23 @@ def brave_search(query, offset=0):
         )
 
         if resp.status_code == 401:
+            logger.error("Brave API: invalid API key")
             print("  [BRAVE] Invalid API key — "
                   "check BRAVE_API_KEY in .env")
             return []
         if resp.status_code == 429:
+            logger.warning("Brave API: rate limited — waiting 60s")
             print("  [BRAVE] Rate limited — "
                   "waiting 60s")
             time.sleep(60)
             return []
         if resp.status_code == 422:
+            logger.debug("Brave API: invalid query=%r", query)
             print(f"  [BRAVE] Invalid query: {query}")
             return []
         if resp.status_code != 200:
+            logger.warning("Brave API: HTTP %d for query=%r",
+                           resp.status_code, query)
             print(f"  [BRAVE] HTTP {resp.status_code}")
             return []
 
@@ -652,9 +688,13 @@ def brave_search(query, offset=0):
         # Brave response: results.web.results[].url
         web     = resp.json().get("web", {})
         results = web.get("results", [])
+        logger.debug("Brave: query=%r offset=%d results=%d",
+                     query, offset, len(results))
         return [r["url"] for r in results if "url" in r]
 
     except Exception as e:
+        logger.warning("Brave search exception: query=%r error=%s",
+                       query, e)
         print(f"  [BRAVE] Error: {e}")
         return []
 
@@ -665,10 +705,13 @@ def fetch_from_brave(platforms, test_mode=False):
     Lever, Oracle HCM, iCIMS — not well indexed by CC.
     Returns dict: {platform: set(slugs)}
     """
+    logger.info("Brave search starting: platforms=%s test_mode=%s",
+                platforms, test_mode)
     print(f"\n{'─'*50}")
     print("SOURCE 2: Brave Search API")
 
     if not BRAVE_API_KEY:
+        logger.info("BRAVE_API_KEY not set — skipping Brave search")
         print("  [BRAVE] BRAVE_API_KEY not set — skipping")
         print("  [BRAVE] Sign up free: "
               "https://api.search.brave.com/")
@@ -676,10 +719,14 @@ def fetch_from_brave(platforms, test_mode=False):
 
     remaining = _brave_remaining()
     quota     = _load_brave_quota()
+    logger.info("Brave quota: %d/%d used (%s) %d remaining",
+                quota["calls"], BRAVE_QUOTA_LIMIT,
+                quota["month"], remaining)
     print(f"  [BRAVE] Quota: {quota['calls']}/{BRAVE_QUOTA_LIMIT} "
           f"used ({quota['month']}), {remaining} remaining")
 
     if remaining <= 0:
+        logger.warning("Brave monthly quota exhausted — skipping")
         print("  [BRAVE] Monthly quota exhausted — skipping")
         return {}
 
@@ -695,6 +742,7 @@ def fetch_from_brave(platforms, test_mode=False):
 
         for query in queries:
             if _brave_remaining() <= 0:
+                logger.warning("Brave quota exhausted mid-run")
                 print("  [BRAVE] Quota exhausted")
                 break
 
@@ -728,11 +776,15 @@ def fetch_from_brave(platforms, test_mode=False):
 
             new = query_slugs - platform_slugs
             platform_slugs.update(query_slugs)
+            logger.debug("Brave: platform=%s query=%r slugs=%d new=%d",
+                         platform, query, len(query_slugs), len(new))
             print(f"    {len(query_slugs):,} slugs "
                   f"(+{len(new):,} new)")
 
         if platform_slugs:
             results[platform] = platform_slugs
+            logger.info("Brave: platform=%s total_slugs=%d",
+                        platform, len(platform_slugs))
             print(f"  [BRAVE] {platform}: "
                   f"{len(platform_slugs):,} total slugs")
 
@@ -801,6 +853,8 @@ def save_to_db(platform_slugs, crawl_id):
             continue
         added = bulk_insert_slugs(platform, slugs, crawl_id)
         total_new += added
+        logger.info("DB save: crawl=%s platform=%s slugs=%d new=%d",
+                    crawl_id, platform, len(slugs), added)
         print(f"  [DB] {platform:<15} "
               f"{len(slugs):>6,} slugs  "
               f"{added:>5,} new")
@@ -837,6 +891,8 @@ def _save_brave_to_db(platform_slugs, crawl_id):
                     added += 1
             conn.commit()
             total_new += added
+            logger.info("Brave DB save: platform=%s slugs=%d new=%d",
+                        platform, len(slugs), added)
             print(f"  [DB] {platform:<15} "
                   f"{len(slugs):>6,} slugs  "
                   f"{added:>5,} new  (source=brave)")
@@ -853,6 +909,7 @@ def run_cleanup(window_crawls):
     """
     from db.ats_companies import remove_stale_crawls
 
+    logger.info("Running cleanup: window=%s", window_crawls)
     result = remove_stale_crawls(keep_crawls=window_crawls)
     if isinstance(result, tuple):
         deleted, archived = result
@@ -860,11 +917,14 @@ def run_cleanup(window_crawls):
         deleted, archived = result, 0
 
     if deleted:
+        logger.info("Cleanup: archived=%d deleted=%d stale slugs",
+                    archived, deleted)
         print(f"\n[CLEANUP] Archived {archived:,} slugs → "
               f"data/ats_archive.csv.gz")
         print(f"[CLEANUP] Deleted {deleted:,} stale slugs "
               f"from DB (not in last {CRAWLS_TO_USE} crawls)")
     else:
+        logger.info("Cleanup: no stale slugs to remove")
         print(f"\n[CLEANUP] No stale slugs to remove")
 
 
@@ -899,6 +959,10 @@ def main():
     )
     args = parser.parse_args()
 
+    logger.info("build_ats_slug_list starting: backfill=%s test=%s "
+                "from_csv=%s skip_brave=%s",
+                args.backfill, args.test, args.from_csv, args.skip_brave)
+
     print("ATS Slug List Builder")
     print("=" * 50)
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -919,17 +983,20 @@ def main():
 
     # ── GET SLIDING WINDOW ───────────────────────────────
     window = get_recent_crawls(n=CRAWLS_TO_USE)
+    logger.info("Sliding window: %s", window)
     print(f"Sliding window: {window}")
 
     # ── FIND UNSCANNED CRAWLS ────────────────────────────
     unscanned = get_unscanned_crawls(window)
 
     if not unscanned:
+        logger.info("All crawls already scanned: %s", window)
         print(f"\n[OK] All crawls already scanned: {window}")
         print("[OK] Nothing to do — DB is up to date")
         _print_stats()
         return
 
+    logger.info("New crawls to scan: %s", unscanned)
     print(f"\nNew crawls to scan: {unscanned}")
     print(f"Already scanned:    "
           f"{[c for c in window if c not in unscanned]}")
@@ -953,12 +1020,15 @@ def main():
 
         # Use local CSV if --from-csv or file exists
         if args.from_csv and os.path.exists(args.from_csv):
+            logger.info("Loading from CSV: %s", args.from_csv)
             print(f"  [CSV] Loading from {args.from_csv}")
             df = pd.read_csv(args.from_csv)
         elif os.path.exists(csv_path) and not args.test:
+            logger.info("Found existing CSV: %s", csv_path)
             print(f"  [CSV] Found existing: {csv_path}")
             df = pd.read_csv(csv_path)
         elif args.test:
+            logger.info("Test mode: skipping Athena for %s", crawl_id)
             print(f"  [TEST] Skipping Athena for {crawl_id}")
             continue
         else:
@@ -969,6 +1039,7 @@ def main():
             )
             df = run_athena_query(sql, crawl_id, csv_path)
             if df is None:
+                logger.error("Query failed for crawl=%s", crawl_id)
                 print(f"  [ERROR] Query failed for {crawl_id}")
                 continue
 
@@ -990,6 +1061,8 @@ def main():
             slugs_found=total_found,
             slugs_new=total_new,
         )
+        logger.info("Crawl %s complete: found=%d new=%d",
+                    crawl_id, total_found, total_new)
         print(f"  [OK] {crawl_id} marked as scanned "
               f"({total_found:,} slugs, {total_new:,} new)")
 
@@ -1014,6 +1087,7 @@ def main():
 
     # ── FINAL STATS ──────────────────────────────────────
     _print_stats()
+    logger.info("build_ats_slug_list complete")
 
 
 def _run_backfill(args):
@@ -1028,6 +1102,7 @@ def _run_backfill(args):
         get_scanned_crawls,
     )
 
+    logger.info("Lever backfill starting: crawl=%s", LEVER_BACKFILL_CRAWL)
     print(f"\nLever Backfill from {LEVER_BACKFILL_CRAWL}")
     print("─" * 50)
 
@@ -1035,6 +1110,7 @@ def _run_backfill(args):
     scanned = get_scanned_crawls()
     backfill_key = f"backfill-{LEVER_BACKFILL_CRAWL}"
     if backfill_key in scanned:
+        logger.info("Lever backfill already completed — skipping")
         print("[OK] Lever backfill already completed — skipping")
         return
 
@@ -1042,9 +1118,11 @@ def _run_backfill(args):
 
     # Use existing CSV if available
     if os.path.exists(csv_path):
+        logger.info("Loading backfill from CSV: %s", csv_path)
         print(f"[CSV] Loading from {csv_path}")
         df = pd.read_csv(csv_path)
     elif args.test:
+        logger.info("Test mode: skipping Athena backfill")
         print("[TEST] Skipping Athena backfill")
         return
     else:
@@ -1055,6 +1133,7 @@ def _run_backfill(args):
         )
         df = run_athena_query(sql, LEVER_BACKFILL_CRAWL, csv_path)
         if df is None:
+            logger.error("Backfill Athena query failed")
             print("[ERROR] Backfill query failed")
             return
 
@@ -1065,6 +1144,7 @@ def _run_backfill(args):
         if result and result[0] == "lever":
             slugs.add(result[1])
 
+    logger.info("Backfill: %d Lever slugs found", len(slugs))
     print(f"[BACKFILL] {len(slugs):,} Lever slugs found")
 
     # Insert with source='backfill'
@@ -1095,6 +1175,8 @@ def _run_backfill(args):
         query_type="backfill",
     )
 
+    logger.info("Backfill complete: inserted=%d total=%d",
+                added, len(slugs))
     print(f"[BACKFILL] {added:,} new Lever slugs inserted "
           f"(source=backfill, never deleted)")
     print(f"[BACKFILL] Done — run once only")
@@ -1110,12 +1192,19 @@ def _print_stats():
 
     stats = get_stats()
     for row in stats:
+        logger.debug("DB stats: platform=%s total=%d enriched=%d detected=%d",
+                     row["platform"], row["total"],
+                     row["enriched"], row["detected"])
         print(f"  {row['platform']:<15} "
               f"{row['total']:>6,} total  "
               f"{row['enriched']:>5,} enriched  "
               f"{row['detected']:>4,} detected")
 
     hit_stats = get_cache_hit_stats()
+    logger.info("Final stats: total_active=%d enriched=%d enriched_pct=%s "
+                "crawls_scanned=%s",
+                hit_stats["total"], hit_stats["enriched"],
+                hit_stats["enriched_pct"], hit_stats["crawls_scanned"])
     print(f"\n  Total active:    {hit_stats['total']:,}")
     print(f"  Enriched:        {hit_stats['enriched']:,} "
           f"({hit_stats['enriched_pct']}%)")

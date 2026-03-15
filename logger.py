@@ -92,7 +92,7 @@ def init_logging(command: str = "pipeline") -> None:
     file_handler = logging.handlers.TimedRotatingFileHandler(
         filename    = command_file,
         when        = "midnight",
-        backupCount = 14,           # keep 2 weeks of daily logs
+        backupCount = 14,           # keep 14 days of daily logs
         encoding    = "utf-8",
     )
     file_handler.setLevel(LOG_LEVEL)
@@ -105,7 +105,7 @@ def init_logging(command: str = "pipeline") -> None:
     catchall = logging.handlers.TimedRotatingFileHandler(
         filename    = LOG_DIR / "pipeline.log",
         when        = "midnight",
-        backupCount = 30,
+        backupCount = 14,
         encoding    = "utf-8",
     )
     catchall.setLevel(LOG_LEVEL)
