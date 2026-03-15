@@ -101,11 +101,13 @@ def init_logging(command: str = "pipeline") -> None:
 
     # ── 3. Catch-all pipeline.log ───────────────────────────────────
     # Always-on single file — useful for grepping across all commands.
-    # Rotates at midnight, keeps 30 days.
+    # Rotates at midnight, keeps 30 days so monthly scripts (e.g.
+    # build_ats_slug_list.py, enrich_ats_companies.py) whose logs
+    # fall through here are retained beyond the 14-day window.
     catchall = logging.handlers.TimedRotatingFileHandler(
         filename    = LOG_DIR / "pipeline.log",
         when        = "midnight",
-        backupCount = 14,
+        backupCount = 30,
         encoding    = "utf-8",
     )
     catchall.setLevel(LOG_LEVEL)

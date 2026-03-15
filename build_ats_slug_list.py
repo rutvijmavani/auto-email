@@ -1010,7 +1010,7 @@ def main():
     # Register new crawl partitions in Glue catalog
     # Ensures new crawl partitions are visible to Athena
     if unscanned and not args.test and not args.from_csv:
-        repair_athena_table(crawl_ids=unscanned)
+        repair_athena_table()
 
     for crawl_id in unscanned:
         csv_path = (f"data/athena_"
