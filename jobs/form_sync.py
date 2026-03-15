@@ -94,12 +94,17 @@ def _sync_to_pipeline(company, job_url):
     is_active=1 is set in the same connection/transaction as the
     upsert to avoid a split-commit race where is_active stays 0.
     """
-    # ── ATS detection — errors surface here, not swallowed by DB handler ──
+    # ── ATS detection — wrapped separately so failures don't abort the sync ──
     from jobs.ats.patterns import match_ats_pattern
     from db.ats_companies import upsert_company
     from db.schema_discovery import init_discovery_db, get_discovery_conn
 
-    ats = match_ats_pattern(job_url)
+    try:
+        ats = match_ats_pattern(job_url)
+    except Exception as e:
+        logger.error("ATS pattern match failed for %r (url=%s): %s",
+                     company, job_url, e, exc_info=True)
+        return
 
     if not ats:
         logger.debug("No ATS pattern matched for %r — skipping ats_discovery.db write",
@@ -113,44 +118,52 @@ def _sync_to_pipeline(company, job_url):
     try:
         init_discovery_db()
 
-        # Check whether this (platform, slug) already has a company_name.
-        # Only pass company_name to upsert if the stored name is missing —
-        # prevents overwriting canonical enriched metadata and avoids
-        # incorrectly setting is_enriched=1 on already-enriched rows.
+        # Open a single connection — both the upsert and the is_active
+        # reactivation commit together so they can never split-commit.
         conn = get_discovery_conn()
         try:
+            # Check whether this (platform, slug) already has a company_name.
+            # Only write company_name if missing — avoids overwriting canonical
+            # enriched metadata and incorrectly setting is_enriched=1.
             existing = conn.execute(
                 "SELECT company_name FROM ats_companies "
                 "WHERE platform=? AND slug=?",
                 (platform, slug)
             ).fetchone()
-        finally:
-            conn.close()
 
-        name_missing = (
-            existing is None or
-            not existing["company_name"] or
-            existing["company_name"].strip() == ""
-        )
-
-        upsert_company(
-            platform=platform,
-            slug=slug,
-            company_name=company if name_missing else None,
-            source="application",
-        )
-
-        # Force is_active=1 in the same connection used by upsert so both
-        # the upsert and reactivation commit or fail together — avoids a
-        # split-commit race where upsert commits but reactivation fails,
-        # leaving is_active=0 on a live slug.
-        conn = get_discovery_conn()
-        try:
-            conn.execute(
-                "UPDATE ats_companies SET is_active=1 "
-                "WHERE platform=? AND slug=?",
-                (platform, slug)
+            name_missing = (
+                existing is None or
+                not existing["company_name"] or
+                existing["company_name"].strip() == ""
             )
+
+            # INSERT OR IGNORE — only inserts if row doesn't exist yet
+            conn.execute("""
+                INSERT OR IGNORE INTO ats_companies
+                    (platform, slug, source)
+                VALUES (?, ?, ?)
+            """, (platform, slug, "application"))
+
+            # UPDATE — always refreshes last_verified, source, is_active,
+            # and conditionally company_name + is_enriched
+            updates = [
+                "source = 'application'",
+                "is_active = 1",
+                "last_verified = datetime('now')",
+            ]
+            params = []
+            if name_missing:
+                updates.append("company_name = ?")
+                updates.append("is_enriched = 1")
+                params.append(company)
+
+            params.extend([platform, slug])
+            conn.execute(
+                f"UPDATE ats_companies SET {', '.join(updates)} "
+                f"WHERE platform = ? AND slug = ?",
+                params
+            )
+
             conn.commit()
         finally:
             conn.close()
@@ -264,9 +277,9 @@ def run():
 
         if not app_id:
             logger.error("Row %d: failed to insert application for %r", sheet_row_index, company)
-            print(f"       [ERROR] Failed to insert application — skipping")
+            print("       [ERROR] Failed to insert application — skipping")
             failed += 1
-            rows_to_delete.append(sheet_row_index)
+            # Do NOT append to rows_to_delete — leave row in sheet for retry
             continue
 
         if not created:
