@@ -54,7 +54,7 @@ try:
 except ImportError:
     pass
 
-from logger import get_logger
+from logger import get_logger, init_logging
 logger = get_logger(__name__)
 
 
@@ -958,6 +958,8 @@ def main():
         help="Skip Brave search"
     )
     args = parser.parse_args()
+
+    init_logging("build_ats_slug_list")
 
     logger.info("build_ats_slug_list starting: backfill=%s test=%s "
                 "from_csv=%s skip_brave=%s",

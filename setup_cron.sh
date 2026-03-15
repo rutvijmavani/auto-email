@@ -69,7 +69,7 @@ echo "[CRON] sync started at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
 echo "══════════════════════════════════════════════" >> "$LOG_FILE"
 
 source venv/bin/activate
-python pipeline.py --sync-forms       >> "$LOG_FILE" 2>&1
+python pipeline.py --sync-forms       >> "$LOG_FILE" 2>&1 && \
 python pipeline.py --sync-prospective >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 
@@ -390,16 +390,18 @@ NEW_CRON=$(cat << 'CRONTAB'
 0 9 * * 1 /home/opc/mail/run_weekly_summary.sh
 
 # ─────────────────────────────────────────
-# NIGHTLY CHAIN — Tuesday to Sunday 1 AM
+# NIGHTLY CHAIN — Tuesday to Sunday 1 AM (except 1st of month)
 # sync → backup → find-only (sequential, stops on failure)
+# Day 1 excluded — run_monthly.sh handles it instead
 # ─────────────────────────────────────────
-0 1 * * 2-7 /home/opc/mail/run_nightly.sh
+0 1 2-31 * 2-7 /home/opc/mail/run_nightly.sh
 
 # ─────────────────────────────────────────
-# MONDAY NIGHTLY CHAIN — Monday 1 AM
+# MONDAY NIGHTLY CHAIN — Monday 1 AM (except 1st of month)
 # sync → backup → verify-only → find-only (sequential)
+# Day 1 excluded — run_monthly.sh handles it instead
 # ─────────────────────────────────────────
-0 1 * * 1 /home/opc/mail/run_monday.sh
+0 1 2-31 * 1 /home/opc/mail/run_monday.sh
 
 # ─────────────────────────────────────────
 # MONTHLY CHAIN — 1st of every month at 1 AM
@@ -435,7 +437,7 @@ NEW_CRON=$(cat << 'CRONTAB'
 CRONTAB
 )
 
-echo "$CLEAN_CRON$NEW_CRON" | crontab -
+printf "%s\n%s\n" "$CLEAN_CRON" "$NEW_CRON" | crontab -
 echo "[OK] Crontab installed"
 
 # ── Verify ────────────────────────────────────────────────────

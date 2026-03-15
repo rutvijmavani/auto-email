@@ -21,7 +21,7 @@ import argparse
 import requests
 from datetime import datetime
 
-from logger import get_logger
+from logger import get_logger, init_logging
 from db.schema_discovery import init_discovery_db
 from db.ats_companies import (
     get_unenriched, upsert_company, delete_company
@@ -70,12 +70,9 @@ def enrich_greenhouse(slug):
             "website":      website,
             "job_count":    len(jobs),
         }, "ok"
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("Greenhouse exception: slug=%s error=%s", slug, e)
-        return None, "error"
-
-
-def enrich_lever(slug):
+        return None, "error"(slug):
     """
     GET api.lever.co/v0/postings/{slug}?mode=json
     Returns list of job postings.
@@ -101,7 +98,7 @@ def enrich_lever(slug):
             "website":      website,
             "job_count":    len(data),
         }, "ok"
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("Lever exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -192,7 +189,7 @@ def enrich_ashby(slug):
             "website":      website,
             "job_count":    len(jobs),
         }, "ok"
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("Ashby exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -220,7 +217,7 @@ def enrich_smartrecruiters(slug):
             "website":      website,
             "job_count":    0,  # would need separate call
         }, "ok"
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("SmartRecruiters exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -266,7 +263,7 @@ def enrich_workday(slug):
             "job_count":    0,
         }, "ok"
 
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("Workday exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -308,7 +305,7 @@ def enrich_oracle_hcm(slug):
             "job_count":    0,
         }, "ok"
 
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("Oracle HCM exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -344,7 +341,7 @@ def enrich_icims(slug):
             "job_count":    job_count,
         }, "ok"
 
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         logger.debug("iCIMS exception: slug=%s error=%s", slug, e)
         return None, "error"
 
@@ -818,6 +815,8 @@ if __name__ == "__main__":
         help="Phase B: platform-aware daily enrichment"
     )
     args = parser.parse_args()
+
+    init_logging("enrich_ats_companies")
 
     logger.info("enrich_ats_companies invoked: priority=%s daily=%s "
                 "platform=%s limit=%d test=%s",
