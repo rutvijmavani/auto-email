@@ -329,6 +329,13 @@ echo "[CRON] enrichment started at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
 echo "══════════════════════════════════════════════" >> "$LOG_FILE"
 
 source venv/bin/activate
+
+# Skip on the 1st — run_monthly.sh runs enrich as part of its chain
+if [ "$(date +%d)" = "01" ]; then
+  echo "[SKIP] 1st of month — run_monthly.sh handles enrichment today" >> "$LOG_FILE"
+  exit 0
+fi
+
 python enrich_ats_companies.py --daily >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 

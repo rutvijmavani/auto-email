@@ -172,7 +172,11 @@ def upsert_company(platform, slug, company_name=None,
             if write_name:
                 updates.append("company_name = ?")
                 params.append(company_name)
-                updates.append("is_enriched = 1")
+                # Only mark enriched if name is non-empty/non-whitespace
+                # — empty names must not flip is_enriched or rows
+                # become invisible to get_unenriched()
+                if company_name.strip():
+                    updates.append("is_enriched = 1")
 
         if website is not None:
             updates.append("website = ?")
