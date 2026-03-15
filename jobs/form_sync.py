@@ -91,13 +91,14 @@ def _sync_to_pipeline(company, job_url):
     avoids overwriting canonical ATS metadata or falsely marking
     is_enriched=1 for slugs already enriched from another source.
 
-    is_active=1 is set in the same connection/transaction as the
-    upsert to avoid a split-commit race where is_active stays 0.
+    Delegates to upsert_company(only_set_name_if_missing=True, is_active=True)
+    which opens a single BEGIN IMMEDIATE transaction covering the name check,
+    INSERT OR IGNORE, and UPDATE — no split-commit race possible.
     """
     # ── ATS detection — wrapped separately so failures don't abort the sync ──
     from jobs.ats.patterns import match_ats_pattern
     from db.ats_companies import upsert_company
-    from db.schema_discovery import init_discovery_db, get_discovery_conn
+    from db.schema_discovery import init_discovery_db
 
     try:
         ats = match_ats_pattern(job_url)
@@ -117,60 +118,16 @@ def _sync_to_pipeline(company, job_url):
     # ── Persistence — narrow try/except covers only DB writes ──────────
     try:
         init_discovery_db()
-
-        # Open a single connection — both the upsert and the is_active
-        # reactivation commit together so they can never split-commit.
-        conn = get_discovery_conn()
-        try:
-            # Check whether this (platform, slug) already has a company_name.
-            # Only write company_name if missing — avoids overwriting canonical
-            # enriched metadata and incorrectly setting is_enriched=1.
-            existing = conn.execute(
-                "SELECT company_name FROM ats_companies "
-                "WHERE platform=? AND slug=?",
-                (platform, slug)
-            ).fetchone()
-
-            name_missing = (
-                existing is None or
-                not existing["company_name"] or
-                existing["company_name"].strip() == ""
-            )
-
-            # INSERT OR IGNORE — only inserts if row doesn't exist yet
-            conn.execute("""
-                INSERT OR IGNORE INTO ats_companies
-                    (platform, slug, source)
-                VALUES (?, ?, ?)
-            """, (platform, slug, "application"))
-
-            # UPDATE — always refreshes last_verified, source, is_active,
-            # and conditionally company_name + is_enriched
-            updates = [
-                "source = 'application'",
-                "is_active = 1",
-                "last_verified = datetime('now')",
-            ]
-            params = []
-            if name_missing:
-                updates.append("company_name = ?")
-                updates.append("is_enriched = 1")
-                params.append(company)
-
-            params.extend([platform, slug])
-            conn.execute(
-                f"UPDATE ats_companies SET {', '.join(updates)} "
-                f"WHERE platform = ? AND slug = ?",
-                params
-            )
-
-            conn.commit()
-        finally:
-            conn.close()
-
-        logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s "
-                    "company=%r name_written=%s",
-                    platform, slug, company, name_missing)
+        upsert_company(
+            platform=platform,
+            slug=slug,
+            company_name=company,
+            source="application",
+            is_active=True,
+            only_set_name_if_missing=True,
+        )
+        logger.info("Stored/updated in ats_discovery.db: platform=%s slug=%s company=%r",
+                    platform, slug, company)
         print(f"       [ATS-DB] Stored in ats_discovery.db ({platform}/{slug})")
 
     except Exception as e:
