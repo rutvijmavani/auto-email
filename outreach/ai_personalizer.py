@@ -43,6 +43,7 @@ Directly include 3 statements in the body of the email.
 Do not include greetings to the recruiter/hiring manager.
 Be confident and specific.
 Limit to under 120 words.
+Do not include any placeholder like [Dear Hiring manager].
 """
 
     try:
@@ -71,6 +72,7 @@ Keep it under 120 words.
 No emojis.
 Professional tone.
 Return only the email body.
+Do not include any placeholder like [Dear Hiring manager].
 """
 
     response = client.models.generate_content(
@@ -103,6 +105,7 @@ Requirements:
 - No emojis
 - Do not use Software Engineer in subject if job title is different.
 - Only use Software Engineer if job title is empty or Software Engineer.
+- Do not include any placeholder like [Your Name].
 
 Company: {company}
 Job Title: {job_title}

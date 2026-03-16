@@ -183,3 +183,19 @@ def get_prospective_company(company):
     row = c.fetchone()
     conn.close()
     return dict(row) if row else None
+
+def get_domain_for_prospective(company):
+    """Return the domain root for a prospective company, or '' if not set.
+    e.g. 'lucidmotors.com' → 'lucidmotors', 'snap.com' → 'snap'
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT domain FROM prospective_companies WHERE company = ?",
+        (company,)
+    )
+    row = c.fetchone()
+    conn.close()
+    if row and row["domain"]:
+        return row["domain"].split(".")[0]
+    return ""

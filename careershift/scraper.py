@@ -11,6 +11,7 @@ from db.db import (
     mark_search_term_used,
     update_company_last_scraped,
     get_existing_domain_for_company,
+    get_existing_emails_for_company,
 )
 from careershift.utils import human_delay
 from careershift.search import (
@@ -151,7 +152,7 @@ def visit_and_extract(page, detail_url, name, position, confidence):
         human_delay(4.0, 8.0)
         page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
         human_delay(3.0, 6.0)
-        increment_quota_used(1)
+        # increment_quota_used(1)
 
         email = extract_email(page)
         if email:
@@ -292,17 +293,21 @@ def scrape_company(page, company, max_contacts, expected_domain):
     # ── Step 2: Visit profiles ──
     # Respect quota allocation — never visit more than max_contacts
     visit_limit      = min(max_contacts, CAREERSHIFT_MAX_PROFILES)
-    profiles_to_visit = all_exact_profiles[:visit_limit]
+    new_found        = 0
+    buffer           = []
+    existing_emails  = get_existing_emails_for_company(company)
 
-    logger.info("Visiting %d profile(s) for %r (limit=%d)",
-                len(profiles_to_visit), company, visit_limit)
-    print(f"   [INFO] Visiting {len(profiles_to_visit)} profile(s) "
-          f"(limit={visit_limit})")
+    logger.info("Visiting profiles for %r (need %d new, %d existing in DB, %d candidates)",
+                company, visit_limit, len(existing_emails), len(all_exact_profiles))
+    print(f"   [INFO] Need {visit_limit} new contact(s) — "
+        f"{len(existing_emails)} already in DB, "
+        f"{len(all_exact_profiles)} candidate profile(s)")
 
-    buffer = []
+    for profile in all_exact_profiles:
+        if new_found >= visit_limit:
+            logger.debug("Reached new contact target (%d) for %r — stopping", visit_limit, company)
+            break
 
-    for profile in profiles_to_visit:
-        # Stop if quota exhausted during visits
         if get_remaining_quota() == 0:
             logger.warning("Quota exhausted during profile visits for %r", company)
             print(f"   [INFO] Quota exhausted — stopping profile visits early")
@@ -319,6 +324,18 @@ def scrape_company(page, company, max_contacts, expected_domain):
 
         if not detail:
             continue
+
+        if detail["email"] in existing_emails:
+            # Revisit — no quota charge, don't count toward visit_limit
+            logger.debug("Revisited already-known email %s for %r — skipping",
+                        detail["email"], company)
+            print(f"         [SKIP] Already in DB — no quota charged")
+            continue
+
+        # New email — charge quota now
+        increment_quota_used(1)
+        existing_emails.add(detail["email"])  # guard against duplicates within same run
+        new_found += 1
 
         buffer.append({
             "name":       detail["name"],

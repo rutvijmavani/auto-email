@@ -54,6 +54,7 @@ from db.recruiters import (
     get_used_search_terms,
     mark_search_term_used,
     update_company_last_scraped,
+    get_existing_emails_for_company,
 )
 
 # ─────────────────────────────────────────
@@ -130,6 +131,7 @@ from db.prospective import (
     is_prospective,
     get_prospective_status_summary,
     get_prospective_company,
+    get_domain_for_prospective,
 )
 
 # ─────────────────────────────────────────
