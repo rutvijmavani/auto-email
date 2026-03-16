@@ -198,3 +198,15 @@ def update_company_last_scraped(company):
     """, (company,))
     conn.commit()
     conn.close()
+
+def get_existing_emails_for_company(company):
+    """Return set of all emails already in DB for a company (any status)."""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT email FROM recruiters WHERE company = ?",
+        (company,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return {row["email"] for row in rows}

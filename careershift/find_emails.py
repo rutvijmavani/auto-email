@@ -27,6 +27,7 @@ from db.db import (
     get_pending_prospective,
     mark_prospective_scraped,
     mark_prospective_exhausted,
+    get_domain_for_prospective
 )
 from careershift.constants import SESSION_FILE, MIN_RECRUITERS_PER_COMPANY
 from careershift.utils import human_delay
@@ -342,8 +343,8 @@ def run():
                     logger.info("Prospective scrape: %r (max_extra=%d)", company, max_extra)
                     print(f"\n[INFO] Prospective: {company} (max {max_extra})")
 
-                    contacts = scrape_company(page, company, max_extra, "")
-
+                    prospective_domain = get_domain_for_prospective(company)
+                    contacts = scrape_company(page, company, max_extra, prospective_domain)
                     if contacts is None:
                         logger.info("Prospective %r — weak signal, skipping", company)
                         print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
