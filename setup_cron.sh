@@ -455,7 +455,7 @@ NEW_CRON=$(cat << 'CRONTAB'
 # CLEANUP — delete DB backups older than 28 days
 # Runs every Sunday 1:35 AM
 # ─────────────────────────────────────────
-35 1 * * 0 find /home/opc/mail/data/backups/ -name "*.db" -mtime +28 -delete
+# 35 1 * * 0 find /home/opc/mail/data/backups/ -name "*.db" -mtime +28 -delete
 
 CRONTAB
 )
