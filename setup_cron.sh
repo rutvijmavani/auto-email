@@ -380,8 +380,8 @@ CLEAN_CRON=$(echo "$EXISTING_CRON" \
   | grep -v "keep-alive" \
   | grep -v "hashlib" \
   | grep -v "backups.*mtime" \
-  | grep -v "RECRUITER PIPELINE" \      
-  | grep -v "All times UTC" \          
+  | grep -v "RECRUITER PIPELINE" \
+  | grep -v "All times UTC" \     
   || true)
 
 NEW_CRON=$(cat << 'CRONTAB'
