@@ -69,8 +69,9 @@ Requirements for wake-on-timer to work:
 Service:  Oracle Cloud Infrastructure (OCI)
 Tier:     Always Free (not just 12 months)
 Shape:    VM.Standard.A1.Flex (ARM/Ampere)
-Specs:    4 OCPUs, 24 GB RAM, 47 GB storage
+Specs:    4 OCPUs, 24 GB RAM, 47 GB boot storage
           (free allowance: 3,000 OCPU-hours/month)
+Block:    Up to 200 GB block storage (Always Free)
 Cost:     $0 forever
 ```
 
@@ -164,8 +165,8 @@ sudo apt install -y \
   libgbm1 libasound2
 
 # Create project directory
-mkdir -p /home/ubuntu/mail
-cd /home/ubuntu/mail
+mkdir -p /home/opc/mail
+cd /home/opc/mail
 
 # Clone your repo
 git clone https://github.com/yourusername/auto-email.git .
@@ -188,7 +189,7 @@ python -c "import pyathena; print('[OK] pyathena')"
 ### Step 5 — Configure environment
 ```bash
 # Create .env file
-nano /home/ubuntu/mail/.env
+nano /home/opc/mail/.env
 
 # Add your credentials:
 GMAIL_EMAIL=your@gmail.com
@@ -208,16 +209,59 @@ ATHENA_S3_OUTPUT=s3://your-bucket/athena-results/
 # Brave Search API (ATS discovery fallback)
 BRAVE_API_KEY=your-key               # api.search.brave.com (1000 free/month)
 
-# Create data directories
-mkdir -p /home/ubuntu/mail/data
-mkdir -p /home/ubuntu/mail/data/backups
-mkdir -p /home/ubuntu/mail/logs
+# Create data and log directories
+mkdir -p /home/opc/mail/data
+mkdir -p /home/opc/mail/logs
+mkdir -p /home/opc/mail/scripts
 ```
 
-### Step 6 — CareerShift session
+### Step 6 — Attach and mount block storage (50 GB)
+
+Oracle Always Free includes up to 200 GB of block storage. We use a 50 GB volume
+mounted at `/mnt/backups` exclusively for DB backups.
+
+```
+OCI Console → Storage → Block Volumes → Create Block Volume
+  Name:        pipeline-backups
+  Size:        50 GB
+  Compartment: same as your VM
+
+OCI Console → Compute → Instances → your VM
+  → Attached Block Volumes → Attach Volume
+  → Select pipeline-backups
+  → Access: Read/Write
+  → Note the device path shown (typically /dev/sdb)
+```
+
+Then on the VM (run once only — formatting destroys existing data):
+
+```bash
+# Confirm device name matches what OCI console showed
+lsblk
+
+# Format (one-time only)
+sudo mkfs.ext4 /dev/sdb
+
+# Create mount point
+sudo mkdir -p /mnt/backups
+
+# Mount
+sudo mount /dev/sdb /mnt/backups
+
+# Persist across reboots
+echo "/dev/sdb /mnt/backups ext4 defaults,_netdev 0 2" | sudo tee -a /etc/fstab
+
+# Set permissions
+sudo chown opc:opc /mnt/backups
+
+# Verify
+df -h /mnt/backups
+```
+
+### Step 7 — CareerShift session
 ```bash
 # Run auth once interactively to create session file
-cd /home/ubuntu/mail
+cd /home/opc/mail
 source venv/bin/activate
 python careershift/auth.py
 
@@ -225,37 +269,14 @@ python careershift/auth.py
 # Valid for ~30 days — re-run auth.py when it expires
 ```
 
-### Step 7 — Set up cron jobs
+### Step 8 — Set up cron jobs
 ```bash
-# Open crontab editor
-crontab -e
-
-# Add these lines:
-
-# Daily 9:00 AM — send outreach emails
-0 9 * * * cd /home/ubuntu/mail && source venv/bin/activate && python pipeline.py --outreach-only >> logs/outreach_$(date +\%Y-\%m-\%d).log 2>&1
-
-# Weekly Monday 10:00 PM — verify recruiters
-0 22 * * 1 cd /home/ubuntu/mail && source venv/bin/activate && python pipeline.py --verify-only >> logs/verify_$(date +\%Y-\%m-\%d).log 2>&1
-
-# Keep-alive every 4 days (prevents Oracle idle reclamation)
-0 12 */4 * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
-
-# Weekly Sunday midnight — backup SQLite DB
-0 0 * * 0 cp /home/ubuntu/mail/data/recruiter_pipeline.db /home/ubuntu/mail/data/backups/recruiter_pipeline_$(date +\%Y\%m\%d).db
-
-# Delete DB backups older than 28 days
-5 0 * * 0 find /home/ubuntu/mail/data/backups/ -name "*.db" -mtime +28 -delete
+cd /home/opc/mail
+chmod +x setup_cron.sh && ./setup_cron.sh
 ```
 
-### Step 8 — Deploy code updates
-```bash
-# When you push new code to GitHub, pull on VM:
-cd /home/ubuntu/mail
-git pull origin main
-
-# Restart any running processes if needed
-```
+This creates all wrapper scripts and installs the full crontab automatically.
+See the **Recommended Deployment Schedule** section for the complete timeline.
 
 ---
 
@@ -284,8 +305,8 @@ Risk of reclamation: LOW
 
 ### Protection measures
 ```
-1. Keep-alive cron (already in Step 7 above)
-   → Runs every 4 days
+1. Keep-alive cron (already installed by setup_cron.sh)
+   → Runs every 4 days at 12 PM
    → Generates CPU activity
    → Belt-and-suspenders protection
 
@@ -294,13 +315,13 @@ Risk of reclamation: LOW
    → Get warned before any termination
    → Gives you time to react
 
-3. Weekly DB backup (already in Step 7 above)
-   → Even if VM terminated → data recoverable
-   → Keep last 4 weekly backups
+3. Nightly DB backup to block storage (already configured)
+   → Even if VM terminated → data recoverable from /mnt/backups
+   → 7 daily backups retained (both DBs)
 
 4. Code always on GitHub (you're already doing this ✓)
    → VM terminated → git clone → 30 min to restore
-   → Only SQLite DB needs separate backup
+   → Only SQLite DBs need separate backup
 ```
 
 ---
@@ -358,9 +379,15 @@ Python logging module routes output to both:
   → Log file (for cron job runs)
 
 Log files:
-  logs/outreach_2026-03-04.log
-  logs/find_2026-03-04.log
-  logs/verify_2026-03-04.log
+  logs/nightly_YYYY-MM-DD.log
+  logs/monday_YYYY-MM-DD.log
+  logs/monthly_YYYY-MM.log
+  logs/outreach_YYYY-MM-DD.log
+  logs/monitor_YYYY-MM-DD.log
+  logs/sync_YYYY-MM-DD.log
+  logs/weekly_YYYY-MM-DD.log
+  logs/enrich_YYYY-MM.log
+  logs/detect_YYYY-MM-DD.log
 
 Log levels:
   INFO     → normal operations
@@ -368,7 +395,7 @@ Log levels:
   ERROR    → failures (SMTP failed, session expired)
   CRITICAL → pipeline cannot continue
 
-Retention: 30 days (auto-delete older files)
+Retention: 14 days (auto-delete older files, per wrapper scripts)
 ```
 
 ### Why both are needed
@@ -391,26 +418,34 @@ Log aggregation if needed
 
 ## Storage & Compute Requirements
 
-### Storage (Oracle free tier: 47 GB)
+### Storage
+
+#### Boot volume (Oracle free tier: ~47 GB)
 
 ```
 OS + Ubuntu base:              ~3.0 GB
 Python packages + Chromium:    ~0.8 GB
 Project code:                  ~0.005 GB
-SQLite DB (6 months):          ~0.023 GB
-ats_discovery.db:              ~0.008 GB
-ats_archive.csv.gz:            ~0.001 GB
-DB backups (28 daily × 23 MB): ~0.644 GB
+SQLite DBs (6 months):         ~0.050 GB
 PDF digests (30 day retention):~0.008 GB
-Log files (30 day retention):  ~0.010 GB
+Log files (14 day retention):  ~0.010 GB
 Athena CSV (2 day retention):  ~0.010 GB
 ─────────────────────────────────────────
-Total used:                    ~4.5 GB
-Available:                     ~42.5 GB (90% free)
+Total used:                    ~3.9 GB
+Available:                     ~43.1 GB (91% free)
 ```
 
-Storage is not a concern. The pipeline uses ~9.6%
-of available storage even after 6 months.
+#### Block volume (50 GB at /mnt/backups)
+
+```
+Both DBs currently:            ~12 MB combined
+7 daily backups × 12 MB:       ~85 MB
+─────────────────────────────────────────
+Total used:                    <0.1 GB
+Available:                     ~49.9 GB (99.8% free)
+```
+
+Storage is not a concern on either volume.
 
 ### Compute (Oracle free tier: A1.Flex — 2 OCPU + 12 GB RAM)
 
@@ -430,112 +465,119 @@ All pipelines run sequentially — never in parallel.
 Peak RAM: ~600 MB out of 12 GB available (5% usage).
 No swap file needed.
 
-### No Swap Needed (A1.Flex)
-
-```
-A1.Flex has 12 GB RAM → no swap file needed.
-Playwright uses ~600 MB → trivial on 12 GB.
-
-Verify Playwright works on ARM after setup:
-  playwright install chromium
-  python -c "
-  from playwright.sync_api import sync_playwright
-  print('[OK] Playwright ARM working')
-  "
-```
-
 ---
 
 ## Recommended Deployment Schedule
 
 ### Key rules
 ```
---sync-forms and --add: run only between 12 AM and 10 PM
-  → No form syncing after 10 PM
-  → DB is quiet after 10 PM
-  → Safe for overnight backup and processing
+--sync-forms and --add: run only between 9 AM and 9 PM
+  → Five syncs per day at 9AM 12PM 3PM 6PM 9PM
+  → DB is quiet after 9 PM
+  → Safe for overnight backup and nightly chain
 
-Nightly jobs chain with && operator:
+Nightly chains use && operator:
   → Each step only runs if previous step succeeded
   → Backup always runs FIRST (clean pre-run snapshot)
   → If backup fails → nothing else runs → data safe
-  → If verify-only fails → find-only does not run
+  → If verify-only fails (Monday) → find-only does not run
+
+Guard on 1st of month:
+  → run_nightly.sh and run_monday.sh exit early on the 1st
+  → run_monthly.sh handles the 1st exclusively
 ```
 
-### Complete cron schedule
+### Wrapper scripts (created by setup_cron.sh)
+
+```
+/home/opc/mail/
+  run_sync.sh            ← --sync-forms + --sync-prospective (9AM 12PM 3PM 6PM 9PM)
+  run_nightly.sh         ← sync → backup → find-only (Tue-Sun 1AM)
+  run_monday.sh          ← sync → backup → verify-only → find-only (Mon 1AM)
+  run_monthly.sh         ← sync → backup → find-only → build-slugs → enrich → VACUUM (1st 1AM)
+  run_outreach.sh        ← --outreach-only (Mon-Fri 9AM)
+  run_monitor.sh         ← --monitor-jobs (daily 7AM)
+  run_weekly_summary.sh  ← --weekly-summary (Mon 9AM)
+  run_enrich.sh          ← enrichment Phase B (daily 3AM, skips 1st)
+  run_detect.sh          ← --detect-ats --batch (disabled — run manually)
+```
+
+### Complete cron schedule (installed by setup_cron.sh)
+
 ```bash
 # ─────────────────────────────────────────
-# SYNC — every 3 hours, stops at 10 PM
-# Runs at: 12AM 3AM 6AM 9AM 12PM 3PM 6PM 9PM
+# DAYTIME SYNC — 9AM 12PM 3PM 6PM 9PM daily
+# Safe standalone: read+insert only, no backup needed
 # ─────────────────────────────────────────
-0 0,3,6,9,12,15,18,21 * * * cd /home/ubuntu/mail &&   source venv/bin/activate &&   python pipeline.py --sync-forms   >> logs/sync_6--.log 2>&1
+0 9,12,15,18,21 * * * /home/opc/mail/run_sync.sh
 
 # ─────────────────────────────────────────
-# NIGHTLY — Tuesday to Sunday 2 AM
-# backup → find-only
+# MONITOR JOBS — Daily 7 AM
 # ─────────────────────────────────────────
-0 2 * * 2-7 cd /home/ubuntu/mail &&   source venv/bin/activate &&   python scripts/backup_db.py &&   python pipeline.py --find-only   >> logs/nightly_6--.log 2>&1
+0 7 * * * /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
-# MONDAY NIGHTLY — 10 PM
-# backup → verify-only → find-only
-# Starts right after last sync-forms of the day
+# OUTREACH — Mon-Fri 9 AM only
 # ─────────────────────────────────────────
-0 22 * * 1 cd /home/ubuntu/mail &&   source venv/bin/activate &&   python scripts/backup_db.py &&   python pipeline.py --verify-only &&   python pipeline.py --find-only   >> logs/monday_6--.log 2>&1
+0 9 * * 1-5 /home/opc/mail/run_outreach.sh
 
 # ─────────────────────────────────────────
-# OUTREACH — Daily 9 AM
+# WEEKLY SUMMARY — Monday 9 AM
 # ─────────────────────────────────────────
-0 9 * * * cd /home/ubuntu/mail &&   source venv/bin/activate &&   python pipeline.py --outreach-only   >> logs/outreach_6--.log 2>&1
+0 9 * * 1 /home/opc/mail/run_weekly_summary.sh
 
 # ─────────────────────────────────────────
-# WEEKLY SUMMARY — Monday 9 AM (separate from job digest)
+# NIGHTLY CHAIN — Tuesday to Sunday 1 AM
+# sync → backup → find-only
+# Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
-0 9 * * 1 cd /home/ubuntu/mail && source venv/bin/activate && python pipeline.py --weekly-summary >> logs/weekly_$(date +\%Y-\%m-\%d).log 2>&1
+0 1 * * 2-7 /home/opc/mail/run_nightly.sh
 
 # ─────────────────────────────────────────
-# ENRICHMENT — Daily 3 AM (Phase B background enrichment)
-# Spreads ~910 requests over 18-hour window
+# MONDAY NIGHTLY CHAIN — Monday 1 AM
+# sync → backup → verify-only → find-only
+# Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
-0 3 * * * cd /home/ubuntu/mail && source venv/bin/activate && python enrich_ats_companies.py --daily >> logs/enrich_$(date +\%Y-\%m).log 2>&1
+0 1 * * 1 /home/opc/mail/run_monday.sh
 
 # ─────────────────────────────────────────
-# ATS DISCOVERY — 1st of every month at 1 AM
-# build slug list → enrich company names
+# MONTHLY CHAIN — 1st of every month at 1 AM
+# sync → backup → find-only → build-slugs → enrich → VACUUM
 # ─────────────────────────────────────────
-0 1 1 * * cd /home/ubuntu/mail && source venv/bin/activate && python build_ats_slug_list.py >> logs/ats_discovery_$(date +\%Y-\%m).log 2>&1 && python enrich_ats_companies.py >> logs/ats_discovery_$(date +\%Y-\%m).log 2>&1
+0 1 1 * * /home/opc/mail/run_monthly.sh
+
+# ─────────────────────────────────────────
+# DAILY ENRICHMENT — 3 AM (skips 1st — run_monthly.sh handles it)
+# ─────────────────────────────────────────
+0 3 * * * /home/opc/mail/run_enrich.sh
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 days (Oracle idle protection)
 # ─────────────────────────────────────────
-0 12 */4 * * python3 -c "import hashlib;   [hashlib.sha256(str(i).encode()).hexdigest()   for i in range(100000)]" >> /dev/null 2>&1
+0 12 */4 * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
 # ─────────────────────────────────────────
-# CLEANUP — delete backups older than 28 days
-# Runs every Sunday 1:35 AM
+# DETECT ATS — currently disabled
+# Uncomment in setup_cron.sh when needed:
+# 30 8 * * * /home/opc/mail/run_detect.sh
 # ─────────────────────────────────────────
-35 1 * * 0 find /home/ubuntu/mail/data/backups/   -name "*.db" -mtime +28 -delete
 ```
 
 ### Full daily timeline
 ```
-12:00 AM: --sync-forms
- 3:00 AM: --sync-forms
- 6:00 AM: --sync-forms
- 9:00 AM: --sync-forms + --outreach-only
-12:00 PM: --sync-forms
- 3:00 PM: --sync-forms
- 6:00 PM: --sync-forms
- 9:00 PM: --sync-forms  ← last sync of the day (DB quiet after this)
+ 7:00 AM: --monitor-jobs
+ 9:00 AM: --sync-forms + --sync-prospective
+ 9:00 AM: --outreach-only (Mon-Fri only)
+ 9:00 AM: --weekly-summary (Mon only)
+12:00 PM: --sync-forms + --sync-prospective
+ 3:00 AM: enrichment Phase B
+ 3:00 PM: --sync-forms + --sync-prospective
+ 6:00 PM: --sync-forms + --sync-prospective
+ 9:00 PM: --sync-forms + --sync-prospective  ← last sync of the day
 
-Monday only:
-10:00 PM: backup → verify-only → find-only (chained)
-          ← starts right after last sync
-
-Tuesday-Sunday:
- 2:00 AM: backup → find-only (chained)
-
- 9:00 AM: --outreach-only ← emails sent with overnight fresh data
+ 1:00 AM (Tue-Sun): sync → backup → find-only (chained)
+ 1:00 AM (Mon):     sync → backup → verify-only → find-only (chained)
+ 1:00 AM (1st):     sync → backup → find-only → build-slugs → enrich → VACUUM
 ```
 
 ### Safety with && chaining
@@ -543,35 +585,137 @@ Tuesday-Sunday:
 backup_db.py fails:
   → verify-only and find-only do NOT run
   → DB unchanged and safe
-  → Email report notifies you
 
 verify-only fails (Monday):
   → find-only does NOT run
   → Backup already completed safely
-  → Investigate before next run
 
 find-only fails:
   → Backup already completed safely
   → Outreach still runs at 9 AM with existing data
-  → Email report notifies you
+
+1st of month:
+  → run_nightly.sh and run_monday.sh detect date and exit early
+  → run_monthly.sh takes over exclusively
 ```
 
 ### Quick reference
 ```
 Just applied to new jobs?     → fill Google Form (sync runs automatically)
 Regular morning sending?      → --outreach-only (automated 9 AM)
-Overnight processing?         → backup + --find-only (automated 2 AM)
-Weekly freshness check?       → backup + --verify-only + --find-only (Mon 10 PM)
+Overnight processing?         → backup + --find-only (automated 1 AM)
+Weekly freshness check?       → backup + --verify-only + --find-only (Mon 1 AM)
 Check quota health manually?  → --quota-report
 Reactivate exhausted company? → --reactivate "CompanyName"
 Import prospective companies? → --import-prospects prospects.txt
 Check prospective status?     → --prospects-status
-Monitor jobs + send digest?   → --monitor-jobs (automated 8 AM)
+Monitor jobs + send digest?   → --monitor-jobs (automated 7 AM)
 View digest in terminal?      → --jobs-digest
 Detect ATS for all companies? → --detect-ats --batch
-Send weekly summary now?       → --weekly-summary
-Run priority enrichment?       → python enrich_ats_companies.py --priority
-Run daily enrichment?          → python enrich_ats_companies.py --daily  (10/run, uses 4-phase detection)
+Send weekly summary now?      → --weekly-summary
+Run priority enrichment?      → python enrich_ats_companies.py --priority
+Run daily enrichment?         → python enrich_ats_companies.py --daily
+```
+
+---
+
+## Backup & Recovery
+
+### What to backup
+```
+Critical (must backup):
+  data/recruiter_pipeline.db    → all pipeline data
+  data/ats_discovery.db         → ATS enrichment data
+  data/careershift_session.json → CareerShift login session
+  .env                          → all credentials
+
+Safe on GitHub (no backup needed):
+  All .py files
+  All docs
+  config.py
+  requirements.txt
+```
+
+### Backup script — scripts/backup_db.py
+
+Both DBs are backed up using SQLite's native backup API which guarantees
+a consistent snapshot even if a write is in progress.
+
+```
+Source DBs:
+  /home/opc/mail/data/recruiter_pipeline.db
+  /home/opc/mail/data/ats_discovery.db
+
+Destination:
+  /mnt/backups/recruiter_pipeline_YYYY-MM-DD_HH-MM.db
+  /mnt/backups/ats_discovery_YYYY-MM-DD_HH-MM.db
+
+Retention: 7 days (enforced automatically on every backup run)
+```
+
+**Why SQLite backup API instead of cp:**
+```
+Plain cp on live SQLite DB:
+  → Copies file mid-write → corrupted backup
+  → NEVER use cp on a live SQLite DB
+
+sqlite3.backup():
+  → Uses SQLite built-in online backup API
+  → Atomic and consistent snapshot
+  → Safe while DB is being written to
+  → Even if --sync-forms ran seconds before
+```
+
+**Why block storage instead of local data/backups/:**
+```
+Boot volume failure → local backups lost too
+Block volume is independent storage:
+  → Survives boot volume failure
+  → Survives VM termination (volume persists)
+  → 50 GB dedicated — no competition with OS/logs
+  → Re-attachable to a new VM on recovery
+```
+
+**Retention:**
+```
+Handled inside backup_db.py on every run — no separate cron needed.
+7 days × 2 DBs × ~12 MB = ~170 MB total (negligible on 50 GB volume)
+```
+
+### Backup cadence
+```
+Runs: nightly as first step in each chained job
+  Mon 1:00 AM:  before --verify-only and --find-only
+  Tue-Sun 1 AM: before --find-only
+  1st of month: before --find-only (monthly chain)
+
+DB is always quiet at backup time:
+  → Last --sync-forms runs at 9 PM
+  → 4-hour gap before any nightly backup at 1 AM
+  → Zero conflict risk
+```
+
+### Recovery procedure (VM terminated)
+```
+1. Create new Oracle VM (Step 2 above)
+2. Attach existing block volume (pipeline-backups) to new VM
+   OCI Console → Storage → Block Volumes → pipeline-backups
+   → Attach to new instance
+3. Mount block volume:
+   sudo mkdir -p /mnt/backups
+   sudo mount /dev/sdb /mnt/backups
+4. Install dependencies (Step 4 above)
+5. Clone repo: git clone https://github.com/you/auto-email.git
+6. Restore .env file (keep a local copy on your laptop)
+7. Copy latest DB backup from block volume:
+   cp /mnt/backups/recruiter_pipeline_<latest>.db /home/opc/mail/data/recruiter_pipeline.db
+   cp /mnt/backups/ats_discovery_<latest>.db /home/opc/mail/data/ats_discovery.db
+8. Run: python careershift/auth.py (re-authenticate)
+9. Run: chmod +x setup_cron.sh && ./setup_cron.sh
+10. Resume normal operation
+
+Total recovery time: ~30-45 minutes
+Max data loss:       24 hours (daily backup cadence)
 ```
 
 ---
@@ -583,41 +727,14 @@ Run daily enrichment?          → python enrich_ats_companies.py --daily  (10/r
 □ Re-run careershift/auth.py if session expired
   (session valid ~30 days)
 □ Check log files for recurring errors
-□ Verify DB backup files exist
+□ Verify DB backup files exist on block storage:
+  ls -lh /mnt/backups/
 □ Check Oracle Console for any warnings
-□ Run DB maintenance (VACUUM + ANALYZE)
+□ VACUUM + ANALYZE runs automatically on 1st via run_monthly.sh
 □ Run MSCK REPAIR TABLE (auto — handled by build_ats_slug_list.py)
 □ Check Athena cost log: cat data/athena_costs.json
 □ Check Brave quota: cat data/brave_quota.json
 □ Check ATS discovery DB: python pipeline.py --monitor-status
-```
-
-**DB maintenance cron (runs 3 AM on 1st of every month):**
-```bash
-# Add to crontab
-0 3 1 * * cd /home/ubuntu/mail &&   source venv/bin/activate &&   python -c "
-import sqlite3
-conn = sqlite3.connect('data/recruiter_pipeline.db')
-conn.execute('VACUUM')
-conn.execute('ANALYZE')
-conn.close()
-print('[OK] DB maintenance complete')
-" >> logs/maintenance_$(date +\%Y-\%m).log 2>&1
-```
-
-What each does:
-```
-VACUUM:
-  → Reclaims disk space from deleted/archived rows
-  → Defragments DB file
-  → Keeps DB size lean over time
-  → Safe to run anytime (read-only during VACUUM)
-
-ANALYZE:
-  → Updates query planner statistics
-  → Ensures indexes are used efficiently
-  → Critical as job_postings table grows
-  → Takes < 1 second on our DB size
 ```
 
 ### Quarterly
@@ -626,6 +743,7 @@ ANALYZE:
 □ Check pipeline metrics (Metric 1 + Metric 2)
 □ Update CareerShift credentials if changed
 □ Pull latest code from GitHub: git pull origin main
+□ Check block volume usage: df -h /mnt/backups
 ```
 
 ### When things go wrong
@@ -640,11 +758,18 @@ CareerShift session expired:
   → python careershift/auth.py
   → Re-authenticate interactively
 
+Backup failed (nightly chain stopped):
+  → Check if block volume is mounted: df -h /mnt/backups
+  → If not mounted: sudo mount /dev/sdb /mnt/backups
+  → Re-run manually: python scripts/backup_db.py
+  → Check /etc/fstab entry is correct for auto-mount on reboot
+
 VM not responding:
   → Oracle Console → Compute → Instances
   → Check instance state
   → Reboot if needed
-  → Restore from DB backup if terminated
+  → Block volume (pipeline-backups) persists independently
+  → Restore from /mnt/backups after reattaching volume
 ```
 
 ---
@@ -669,7 +794,7 @@ Query performance with proper indexes:
   200,000 job_postings rows:
     Without index: ~200ms (table scan)
     With index:    ~1ms (index scan) ✓
-  
+
   All critical queries use indexed columns:
     → status + first_seen (job monitoring)
     → content_hash (deduplication)
@@ -686,7 +811,7 @@ Retention policies (automatic):
   → Old AI cache deleted after 21 days
   → PDF digests deleted after 30 days
 
-Monthly VACUUM:
+Monthly VACUUM (run_monthly.sh — 1st of every month):
   → Reclaims space from deleted rows
   → Prevents DB file from growing stale
   → Keeps file size proportional to active data
@@ -718,7 +843,7 @@ Migration is straightforward when needed:
 ```
 Add to weekly checklist:
   □ Check DB file size:
-    ls -lh data/recruiter_pipeline.db
+    ls -lh data/recruiter_pipeline.db data/ats_discovery.db
 
   □ Check largest tables:
     python -c "
@@ -733,6 +858,10 @@ Add to weekly checklist:
     conn.close()
     "
 
+  □ Check backup volume usage:
+    df -h /mnt/backups
+    ls -lh /mnt/backups/
+
   □ Alert if DB > 500 MB (early warning)
 ```
 
@@ -741,119 +870,31 @@ Add to weekly checklist:
 ## First Deployment Checklist
 
 ```
-□ 1. Oracle VM created + SSH access working
-□ 2. Dependencies installed (pip install -r requirements.txt)
-□ 3. .env file created with all credentials
-□ 4. AWS Athena table created (one-time, already done)
-□ 5. Boto3 + pyathena working (python -c "import boto3, pyathena")
-□ 6. prospects.txt uploaded with domains
-□ 7. Import prospects:
-     python pipeline.py --import-prospects prospects.txt
-□ 8. Bootstrap ATS discovery:
-     python build_ats_slug_list.py --backfill  (Lever one-time)
-     python build_ats_slug_list.py             (all platforms)
-     python enrich_ats_companies.py --test     (verify enrichment)
-     python enrich_ats_companies.py            (full enrichment)
-□ 9. Run ATS detection:
-     python pipeline.py --detect-ats --batch
-□ 10. First job monitoring run:
-      python pipeline.py --monitor-jobs
-□ 11. Verify digest email received
-□ 12. Set up all cron jobs (Step 7)
-□ 13. Verify cron running:
-      crontab -l
-      grep CRON /var/log/syslog | tail -20
-```
-
----
-
-## Backup & Recovery
-
-### What to backup
-```
-Critical (must backup):
-  data/recruiter_pipeline.db    → all your pipeline data
-  data/careershift_session.json → CareerShift login session
-  .env                          → all credentials
-
-Safe on GitHub (no backup needed):
-  All .py files
-  All docs
-  config.py
-  requirements.txt
-```
-
-### Backup script — scripts/backup_db.py
-```python
-import sqlite3
-import os
-from datetime import datetime
-
-SRC_DB     = "/home/ubuntu/mail/data/recruiter_pipeline.db"
-BACKUP_DIR = "/home/ubuntu/mail/data/backups"
-
-def backup():
-    os.makedirs(BACKUP_DIR, exist_ok=True)
-    date_str  = datetime.now().strftime("%Y%m%d_%H%M")
-    dest      = os.path.join(BACKUP_DIR,
-                             f"recruiter_pipeline_{date_str}.db")
-
-    src_conn  = sqlite3.connect(SRC_DB)
-    dest_conn = sqlite3.connect(dest)
-
-    # SQLite online backup API
-    # Safe even while DB is being written to
-    src_conn.backup(dest_conn)
-
-    src_conn.close()
-    dest_conn.close()
-
-    size_kb = os.path.getsize(dest) // 1024
-    print(f"[OK] Backup saved: {dest} ({size_kb} KB)")
-
-if __name__ == "__main__":
-    backup()
-```
-
-**Why SQLite online backup API instead of cp:**
-```
-Plain cp on live SQLite DB:
-  → Copies file mid-write → corrupted backup
-  → NEVER use cp on a live SQLite DB
-
-sqlite3.backup():
-  → Uses SQLite built-in online backup API
-  → Atomic and consistent snapshot
-  → Safe while DB is being written to
-  → Even if --sync-forms ran seconds before
-```
-
-### Backup cadence
-```
-Runs: nightly as first step in chained job
-  Tue-Sun 2:00 AM:  before --find-only
-  Monday 10:00 PM:  before --verify-only and --find-only
-
-DB is always quiet at backup time:
-  → --sync-forms stops at 10 PM
-  → 4+ hour gap before any nightly backup
-  → Zero conflict risk
-
-Retention: 28 days (daily backups = 28 files kept)
-Location:  data/backups/recruiter_pipeline_YYYYMMDD_HHMM.db
-```
-
-### Recovery procedure (VM terminated)
-```
-1. Create new Oracle VM (Step 2 above)
-2. Install dependencies (Step 4 above)
-3. Clone repo: git clone https://github.com/you/auto-email.git
-4. Restore .env file (keep a local copy on your laptop)
-5. Copy latest DB backup → data/recruiter_pipeline.db
-6. Run: python careershift/auth.py (re-authenticate)
-7. Set up cron jobs (Step 7 above)
-8. Resume normal operation
-
-Total recovery time: ~30-45 minutes
-Max data loss:       24 hours (daily backup cadence)
+□ 1.  Oracle VM created + SSH access working
+□ 2.  Block volume (50 GB) created, attached, formatted, and mounted at /mnt/backups
+□ 3.  Dependencies installed (pip install -r requirements.txt)
+□ 4.  .env file created with all credentials
+□ 5.  AWS Athena table created (one-time, already done)
+□ 6.  Boto3 + pyathena working (python -c "import boto3, pyathena")
+□ 7.  prospects.txt uploaded with domains
+□ 8.  Import prospects:
+       python pipeline.py --import-prospects prospects.txt
+□ 9.  Bootstrap ATS discovery:
+       python build_ats_slug_list.py --backfill  (Lever one-time)
+       python build_ats_slug_list.py             (all platforms)
+       python enrich_ats_companies.py --test     (verify enrichment)
+       python enrich_ats_companies.py            (full enrichment)
+□ 10. Run ATS detection:
+       python pipeline.py --detect-ats --batch
+□ 11. First job monitoring run:
+       python pipeline.py --monitor-jobs
+□ 12. Verify digest email received
+□ 13. Set up all cron jobs:
+       chmod +x setup_cron.sh && ./setup_cron.sh
+□ 14. Verify cron running:
+       crontab -l
+       grep CRON /var/log/syslog | tail -20
+□ 15. Test backup manually:
+       python scripts/backup_db.py
+       ls -lh /mnt/backups/
 ```
