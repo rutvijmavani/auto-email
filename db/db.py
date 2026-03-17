@@ -65,6 +65,7 @@ from db.application_recruiters import (
     get_recruiters_for_application,
     get_unique_companies_needing_scraping,
     get_companies_needing_more_recruiters,
+    link_top_recruiters_for_company,
 )
 
 # ─────────────────────────────────────────
@@ -173,6 +174,9 @@ from db.schema import (
     _cleanup_expired_jobs,
     _cleanup_old_model_usage,
     _cleanup_job_postings,
+    _cleanup_closed_application_recruiters,
+    _cleanup_auto_close_applications,
+    _cleanup_monitor_stats,
 )
 
 

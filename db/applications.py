@@ -120,10 +120,18 @@ def reactivate_application(company):
 def convert_prospective_to_active(company, real_job_url, job_title=None,
                                    expected_domain=None):
     """
+    DEPRECATED — no longer used by main pipeline.
+    Prospective → active conversion now handled directly in pipeline.py
+    via add_application() + link_top_recruiters_for_company().
+    Kept for backward compatibility only.
+    """
+
+    """
     Convert a prospective placeholder application to active when user applies.
     Updates the placeholder URL to the real job URL and marks status active.
     Returns app_id if converted, None if no prospective found or URL conflict.
     """
+    
     conn = get_conn()
     c = conn.cursor()
     company = company.strip()

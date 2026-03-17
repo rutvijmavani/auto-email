@@ -94,31 +94,16 @@ def _save_contacts(contacts, company, applications):
 
 def _save_prospective_contacts(contacts, company):
     """
-    Save prospective recruiter contacts to DB under a placeholder application.
-    When user later applies (--add), the placeholder converts to real application.
-    Returns True if contacts were saved successfully, False otherwise.
+    Save prospective recruiter contacts to DB at company level only.
+    No placeholder application created — recruiters are stored in the
+    recruiters table and linked to a real application only when user
+    applies via --add.
+    Returns True if at least one contact was saved, False otherwise.
     """
-    from db.db import add_application
-
-    # Create placeholder application for this prospective company
-    placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
-    logger.debug("Creating placeholder application for prospective company %r", company)
-    app_id, _ = add_application(
-        company=company,
-        job_url=placeholder_url,
-        job_title=None,
-        status_override="prospective",
-    )
-
-    if not app_id:
-        logger.warning("Could not create placeholder application for %r", company)
-        print(f"   [WARNING] Could not create placeholder for {company}")
-        return False
-
+    saved = 0
     for contact in contacts:
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
-            recruiter_id = existing_id
             logger.debug("Prospective recruiter already in DB: %s", contact["email"])
             print(f"   [SKIP] Already in DB: {contact['email']}")
         else:
@@ -129,11 +114,15 @@ def _save_prospective_contacts(contacts, company):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            logger.info("Saved prospective recruiter: %s | %s (company=%r)",
-                        contact["name"], contact["email"], company)
-            print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
+            if recruiter_id:
+                logger.info("Saved prospective recruiter: %s | %s (company=%r)",
+                            contact["name"], contact["email"], company)
+                print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
+                saved += 1
 
-        link_recruiter_to_application(app_id, recruiter_id)
+    if not saved and not any(recruiter_email_exists(c["email"]) for c in contacts):
+        logger.warning("_save_prospective_contacts: no contacts saved for %r", company)
+        return False
 
     return True
 

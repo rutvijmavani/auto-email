@@ -101,6 +101,7 @@ Notion
 
 # Two columns — company name + domain (recommended)
 # Domain enables Phase 3a HTML redirect scan for ATS detection
+# and is used as the reference domain for recruiter email validation
 Stripe,stripe.com
 Capital One,capitalone.com
 JPMorgan Chase,jpmorganchase.com
@@ -108,9 +109,10 @@ Palo Alto Networks,paloaltonetworks.com
 Block,squareup.com
 ```
 
-Adding domains significantly improves ATS detection speed — the
-pipeline can scan career page redirects without spending Serper
-credits. Takes 30 minutes to add domains for 134 companies.
+Adding domains significantly improves both ATS detection speed and
+recruiter email validation accuracy. The domain is used to filter out
+recruiters with mismatched email domains during scraping — only recruiters
+whose email domain root matches the company's domain are saved.
 
 ### Automatic scraping during --find-only
 
@@ -125,6 +127,8 @@ Step 3 in --find-only (leftover quota utilization):
     → Only runs if quota remains after Priority 1
     → Sorted by priority score (set at import time)
     → Max 3 recruiters per company
+    → Domain from prospective_companies.domain used for
+      email validation (filters mismatched domains)
     → Stops when quota = 0
 ```
 
@@ -136,9 +140,12 @@ You apply to a prospective company:
     Company: Google
     Job URL: https://careers.google.com/jobs/123
 
-  System detects Google already in prospective DB:
-    → Recruiters already scraped ✓
-    → Status: prospective → active
+  System detects Google already in prospective DB (status = 'scraped'):
+    → Creates real application with actual job URL
+    → Finds existing recruiters for Google in recruiters table
+    → Links best MAX_RECRUITERS_PER_APPLICATION (3) recruiters
+      (auto confidence first, then oldest)
+    → status: scraped → converted
     → Outreach scheduled immediately
     → Zero CareerShift quota used ✓
     → No waiting for overnight --find-only run
@@ -172,8 +179,9 @@ Examples:
   Netflix   → @netflix.com     ✓ clean
 ```
 
-No `expected_domain` needed for prospective companies — buffer
-consistency check alone is sufficient for big tech.
+For smaller or less well-known companies, always provide the domain
+in prospects.txt — the pipeline uses it to filter out recruiters with
+mismatched email domains before saving.
 
 ---
 
@@ -181,8 +189,8 @@ consistency check alone is sufficient for big tech.
 
 ```
 'pending'   → added to prospective list, not yet scraped
-'scraped'   → recruiters found and stored in DB
-'converted' → you applied → status moved to active application
+'scraped'   → recruiters found and stored in recruiters table
+'converted' → you applied → real application created, recruiters linked
 'exhausted' → CareerShift couldn't find recruiters
               (rare for big tech)
 ```
@@ -239,37 +247,42 @@ BUT 8 of those 30 companies were already prospective:
 
 ```sql
 CREATE TABLE IF NOT EXISTS prospective_companies (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    company     TEXT NOT NULL UNIQUE,
-    priority    INTEGER DEFAULT 0,
-    status      TEXT DEFAULT 'pending',
-    scraped_at  TIMESTAMP,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    company      TEXT NOT NULL UNIQUE,
+    domain       TEXT,                        -- used for email validation + ATS detection
+    priority     INTEGER DEFAULT 0,
+    status       TEXT DEFAULT 'pending',
+    scraped_at   TIMESTAMP,
     converted_at TIMESTAMP,
-    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
-### Recruiter storage
+### Recruiter storage (decoupled from applications)
 
 ```
-Prospective recruiters stored in existing recruiters table
-with a placeholder application linked:
-
-applications table:
-  company:  "Google"
-  job_url:  "prospective://google"  (placeholder)
-  status:   'prospective'
+Prospective recruiters are stored in the recruiters table only.
+No placeholder application is created — recruiters are linked
+to a real application only when you apply via --add.
 
 recruiters table:
-  company:  "Google"
-  email:    "john@google.com"
-  confidence: "auto"
+  company:          "Google"
+  email:            "john@google.com"
+  confidence:       "auto"
   recruiter_status: "active"
+  (no application link until --add is called)
 
-When converted:
-  → Real job URL replaces placeholder
-  → status: 'prospective' → 'active'
-  → expected_domain extracted from real URL
+prospective_companies table:
+  company:   "Google"
+  domain:    "google.com"   ← used for email domain validation
+  status:    "scraped"
+
+When you apply via --add:
+  → Real application created with actual job URL
+  → Best MAX_RECRUITERS_PER_APPLICATION recruiters selected
+    (auto confidence first, then oldest created_at)
+  → Linked via application_recruiters
+  → prospective_companies.status → 'converted'
   → Outreach scheduled immediately
 ```
 
@@ -283,10 +296,11 @@ When converted:
 # ─────────────────────────────────────────
 # RECRUITER THRESHOLDS
 # ─────────────────────────────────────────
-MIN_RECRUITERS_PER_COMPANY = 1   # minimum to start outreach
-                                  # flagged as under-stocked below this
-MAX_CONTACTS_HARD_CAP      = 3   # target ceiling per company
-                                  # prospective companies scraped to this target
+MIN_RECRUITERS_PER_COMPANY     = 1   # minimum to start outreach
+                                      # flagged as under-stocked below this
+MAX_CONTACTS_HARD_CAP          = 3   # target ceiling per company (scraping)
+MAX_RECRUITERS_PER_APPLICATION = 3   # max recruiters linked per application
+                                      # enforced at DB level universally
 ```
 
 ### Threshold design
@@ -296,9 +310,16 @@ MIN = 1: ensures outreach starts as soon as 1 recruiter found
          critical on heavy application days (40 companies, 50 quota)
          all companies get ≥ 1 recruiter from distribution
 
-MAX = 3: prospective companies pre-scraped to this target
+MAX_CONTACTS_HARD_CAP = 3:
+         prospective companies pre-scraped to this target
          active companies topped up to this over time via leftover quota
          never visit more than MAX profiles per company per run
+
+MAX_RECRUITERS_PER_APPLICATION = 3:
+         even if more than 3 recruiters exist for a company,
+         only the best 3 are linked to each application
+         prevents outreach spam if you manually add extra recruiters
+         enforced inside link_recruiter_to_application() at DB level
 ```
 
 ---
@@ -332,27 +353,28 @@ python pipeline.py --prospects-status
 # One company name per line
 # Lines starting with # are comments
 # Blank lines ignored
+# Optional domain column improves email validation + ATS detection
 
 # Big Tech
-Google
-Meta
-Apple
-Microsoft
-Amazon
-Netflix
+Google,google.com
+Meta,meta.com
+Apple,apple.com
+Microsoft,microsoft.com
+Amazon,amazon.com
+Netflix,netflix.com
 
 # Fintech
-Stripe
-Plaid
-Robinhood
-Coinbase
+Stripe,stripe.com
+Plaid,plaid.com
+Robinhood,robinhood.com
+Coinbase,coinbase.com
 
 # SaaS / Dev Tools
-Figma
-Notion
-Vercel
-Linear
-Datadog
+Figma,figma.com
+Notion,notion.so
+Vercel,vercel.com
+Linear,linear.app
+Datadog,datadoghq.com
 ```
 
 ---
@@ -371,6 +393,9 @@ Quiet period (building reserve):
     Step 3: Priority 1 → top up active companies
             Priority 2 → scrape pending prospective companies
                          using remaining quota
+                         domain from prospective_companies.domain
+                         used to validate recruiter emails
+    → Recruiters saved to recruiters table only (no placeholder apps)
     → Gradually builds recruiter reserve
 
 Heavy application period:
@@ -378,7 +403,9 @@ Heavy application period:
   You apply to Google:
     python pipeline.py --add
       → Detects Google already prospective + scraped
-      → status: prospective → active
+      → Creates real application with actual job URL
+      → Links best 3 recruiters from recruiters table
+      → status: scraped → converted
       → Outreach scheduled immediately
       → 0 CareerShift quota used
 
