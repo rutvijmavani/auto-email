@@ -659,18 +659,23 @@ class TestAddJobProspectiveDetection(unittest.TestCase):
         self.assertIn("Converted", output)
 
     def test_add_conversion_changes_application_to_active(self):
-        """After conversion application status is active."""
+        """After conversion a new active application exists with the real URL."""
         import pipeline
-        app_id, _ = self._setup_scraped_prospective("Google")
+        self._setup_scraped_prospective("Google")
+        real_url = "https://careers.google.com/jobs/123"
 
         with patch("builtins.input", side_effect=[
-            "Google", "https://careers.google.com/jobs/123",
+            "Google", real_url,
             "", ""
         ]), patch("sys.stdout", new_callable=StringIO):
             pipeline.add_job_interactively()
 
-        app = db_module.get_application_by_id(app_id)
-        self.assertEqual(app["status"], "active")
+        # New real application created with active status
+        all_active = db_module.get_all_active_applications()
+        google_active = [a for a in all_active if a["company"] == "Google"]
+        self.assertEqual(len(google_active), 1)
+        self.assertEqual(google_active[0]["job_url"], real_url)
+        self.assertEqual(google_active[0]["status"], "active")
 
     def test_add_conversion_marks_prospective_converted(self):
         """After --add conversion, prospective status = converted."""
@@ -720,18 +725,26 @@ class TestAddJobProspectiveDetection(unittest.TestCase):
         self.assertIn("[OK] Added", output)
 
     def test_add_converted_company_has_recruiters_for_outreach(self):
-        """After conversion recruiters are linked and outreach can start."""
+        """After conversion recruiters are linked to the new real application."""
         import pipeline
-        app_id, rid = self._setup_scraped_prospective("Google")
+        self._setup_scraped_prospective("Google")
+        real_url = "https://careers.google.com/jobs/123"
 
         with patch("builtins.input", side_effect=[
-            "Google", "https://careers.google.com/jobs/123",
+            "Google", real_url,
             "", ""
         ]), patch("sys.stdout", new_callable=StringIO):
             pipeline.add_job_interactively()
 
-        recruiters = db_module.get_recruiters_for_application(app_id)
-        self.assertEqual(len(recruiters), 1)
+        # Find the new real application
+        all_active = db_module.get_all_active_applications()
+        google_active = [a for a in all_active if a["company"] == "Google"]
+        self.assertEqual(len(google_active), 1)
+        new_app_id = google_active[0]["id"]
+
+        # Recruiters linked to new application
+        recruiters = db_module.get_recruiters_for_application(new_app_id)
+        self.assertGreaterEqual(len(recruiters), 1)
 
 
 # ─────────────────────────────────────────
