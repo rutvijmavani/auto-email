@@ -62,17 +62,20 @@ SEND_TIMEZONE      = "America/New_York"
 ## CareerShift Quota Settings
 
 ```python
-MAX_CONTACTS_HARD_CAP = 3  # maximum recruiters to find per company
+MAX_CONTACTS_HARD_CAP        = 3  # maximum recruiters to scrape per company
+MAX_RECRUITERS_PER_APPLICATION = 3  # maximum recruiters linked per application
 ```
 
-This is the primary lever for quota utilization. Adjust based on quota health alerts:
+`MAX_CONTACTS_HARD_CAP` controls how many profiles CareerShift visits per company per run. Adjust based on quota health alerts.
+
+`MAX_RECRUITERS_PER_APPLICATION` caps how many recruiters are linked to a single application via `application_recruiters`. Enforced at DB level — applies universally to scraping, manual imports, sync form, and prospective conversion. Even if more recruiters exist for a company, only the best N (auto confidence first, then oldest) are linked to each new application.
 
 | Situation | Action |
 |---|---|
-| Quota underutilized for 3 days | Increase (e.g. 3 → 5) |
-| Quota exhausted for 3 days | Decrease (e.g. 3 → 2) |
-| Applying to many companies | Decrease |
-| Applying to few companies | Increase |
+| Quota underutilized for 3 days | Increase MAX_CONTACTS_HARD_CAP (e.g. 3 → 5) |
+| Quota exhausted for 3 days | Decrease MAX_CONTACTS_HARD_CAP (e.g. 3 → 2) |
+| Applying to many companies | Decrease MAX_CONTACTS_HARD_CAP |
+| Applying to few companies | Increase MAX_CONTACTS_HARD_CAP |
 
 **Recommended range:** 2-5. Below 2 gives insufficient coverage. Above 5 rarely improves response rates significantly.
 
@@ -102,8 +105,13 @@ Prevents false alarms from one-off unusual days. 3 days of consistent pattern is
 All values in days. Change here and all cleanup functions automatically use the new values.
 
 ```python
+# Application lifecycle
+APPLICATION_AUTO_CLOSE_DAYS = 60  # auto-close active applications after 60 days
+                                   # assumes no response within 60 days = closed
+                                   # triggers cascade cleanup of application_recruiters
+
 # Outreach table — status-aware cleanup
-RETENTION_OUTREACH_SENT     = 90  # keep sent email history for 90 days
+RETENTION_OUTREACH_SENT     = 30  # keep sent email history for 30 days
 RETENTION_OUTREACH_PENDING  = 30  # delete stale pending emails after 30 days
 RETENTION_OUTREACH_FAILED   = 30  # delete failed/bounced/cancelled after 30 days
 
@@ -115,6 +123,7 @@ RETENTION_JOB_CACHE         = 21  # keep job descriptions for 21 days
 RETENTION_MODEL_USAGE       = 21  # gemini usage history
 RETENTION_CAREERSHIFT_QUOTA = 30  # daily quota records
 RETENTION_QUOTA_ALERTS      = 30  # alert history
+RETENTION_MONITOR_STATS     = 60  # job monitoring daily stats
 ```
 
 **Important constraint:**
@@ -128,6 +137,14 @@ Example:
 SEND_INTERVAL_DAYS = 7  →  RETENTION_AI_CACHE >= 21  (default)
 SEND_INTERVAL_DAYS = 10 →  RETENTION_AI_CACHE >= 30
 SEND_INTERVAL_DAYS = 14 →  RETENTION_AI_CACHE >= 42
+```
+
+**Application auto-close cascade:**
+```
+APPLICATION_AUTO_CLOSE_DAYS = 60
+  → applications.status set to 'closed' after 60 days from applied_date
+  → application_recruiters rows deleted for closed applications
+  → Both run in same init_db() call, in order
 ```
 
 ---
@@ -209,7 +226,8 @@ SEND_TIMEZONE      = "America/New_York"
 # ─────────────────────────────────────────
 # CAREERSHIFT QUOTA SETTINGS
 # ─────────────────────────────────────────
-MAX_CONTACTS_HARD_CAP = 3
+MAX_CONTACTS_HARD_CAP          = 3  # max recruiters to scrape per company
+MAX_RECRUITERS_PER_APPLICATION = 3  # max recruiters linked per application
 
 # ─────────────────────────────────────────
 # QUOTA HEALTH MONITOR SETTINGS
@@ -221,14 +239,16 @@ QUOTA_ALERT_CONSECUTIVE_DAYS  = 3
 # ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
 # ─────────────────────────────────────────
-RETENTION_OUTREACH_SENT        = 90
-RETENTION_OUTREACH_PENDING     = 30
-RETENTION_OUTREACH_FAILED      = 30
-RETENTION_AI_CACHE             = 21
-RETENTION_JOB_CACHE            = 21
-RETENTION_MODEL_USAGE          = 21
-RETENTION_CAREERSHIFT_QUOTA    = 30
-RETENTION_QUOTA_ALERTS         = 30
+APPLICATION_AUTO_CLOSE_DAYS    = 60  # auto-close active applications
+RETENTION_OUTREACH_SENT        = 30  # sent email history
+RETENTION_OUTREACH_PENDING     = 30  # stale pending emails
+RETENTION_OUTREACH_FAILED      = 30  # failed/bounced/cancelled
+RETENTION_AI_CACHE             = 21  # must be >= SEND_INTERVAL_DAYS × 3
+RETENTION_JOB_CACHE            = 21  # cached job descriptions
+RETENTION_MODEL_USAGE          = 21  # gemini usage history
+RETENTION_CAREERSHIFT_QUOTA    = 30  # daily quota records
+RETENTION_QUOTA_ALERTS         = 30  # alert history
+RETENTION_MONITOR_STATS        = 60  # job monitoring daily stats
 
 # ─────────────────────────────────────────
 # SERPER API (ATS Detection — Phase 3b)

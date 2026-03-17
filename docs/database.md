@@ -18,10 +18,10 @@ Jobs you applied to. This is the entry point for the entire pipeline.
 | `job_url` | TEXT UNIQUE | Job posting URL |
 | `job_title` | TEXT | Role title |
 | `applied_date` | DATE | Date you applied |
-| `status` | TEXT | `active` / `closed` |
+| `status` | TEXT | `active` / `closed` / `exhausted` |
 | `created_at` | TIMESTAMP | When added to DB |
 
-**Retention:** Permanent — never auto-deleted.
+**Retention:** Auto-closed after `APPLICATION_AUTO_CLOSE_DAYS` (60 days) from `applied_date`. Applications are never deleted — only their status changes to `closed`. This assumes no response within 60 days means the application is no longer active. Configurable in `config.py`.
 
 ---
 
@@ -60,7 +60,9 @@ Many-to-many join table linking recruiters to applications. Allows the same recr
 | `recruiter_id` | INTEGER FK | References `recruiters.id` |
 | `created_at` | TIMESTAMP | When linked |
 
-**Retention:** Permanent — never auto-deleted. Deleting rows here would cause the pipeline to re-scrape companies unnecessarily.
+**Cap:** At most `MAX_RECRUITERS_PER_APPLICATION` (3) recruiters can be linked per application. Enforced at DB level inside `link_recruiter_to_application()` — applies universally regardless of entry point (scraping, manual import, prospective conversion, sync form). Configurable in `config.py`.
+
+**Retention:** Auto-deleted when the linked application is closed. Runs after `_cleanup_auto_close_applications` in `init_db()` so newly auto-closed applications are cleaned up in the same run.
 
 ---
 
@@ -87,14 +89,14 @@ pending → sent       (email delivered successfully)
 pending → failed     (send attempt failed)
 pending → cancelled  (recruiter marked inactive before sending)
 sent    → bounced    (hard bounce detected on delivery)
-```text
+```
 
 **Outreach sequence per recruiter+application:**
 ```text
 Day 0:  initial   scheduled → sent → followup1 scheduled
 Day 7:  followup1 scheduled → sent → followup2 scheduled
 Day 14: followup2 scheduled → sent → sequence complete
-```text
+```
 
 ---
 
@@ -182,7 +184,6 @@ Records quota health alerts sent by email. Prevents duplicate alerts from being 
 
 **Retention:** Auto-deleted after 30 days.
 
-
 ---
 
 ### `prospective_companies`
@@ -192,7 +193,7 @@ Target companies to monitor for job postings and pre-scrape recruiters for. Popu
 |---|---|---|
 | `id` | INTEGER PK | Auto-incremented |
 | `company` | TEXT UNIQUE | Company name |
-| `domain` | TEXT | Company domain (e.g. `capitalone.com`) used for Phase 3a HTML redirect scan |
+| `domain` | TEXT | Company domain (e.g. `capitalone.com`) used for domain validation during scraping and Phase 3a HTML redirect scan |
 | `priority` | INTEGER | Higher = scraped first (default 0) |
 | `status` | TEXT | `pending` / `scraped` / `converted` / `exhausted` |
 | `ats_platform` | TEXT | Detected ATS: `greenhouse` / `lever` / `ashby` / `smartrecruiters` / `workday` / `oracle_hcm` / `custom` / `unknown` / `unsupported` |
@@ -210,7 +211,7 @@ Target companies to monitor for job postings and pre-scrape recruiters for. Popu
 pending   → scraped    (recruiters found via CareerShift)
 pending   → exhausted  (CareerShift found no recruiters)
 scraped   → converted  (--add command used for this company)
-```text
+```
 
 **ATS detection phases:**
 ```text
@@ -220,7 +221,7 @@ Phase 3a: html    → company.com/careers redirect scan (free)
 Phase 3b: serper  → Google search via Serper API (2 credits)
 manual   → --override flag (never auto-changed)
 custom   → KNOWN_CUSTOM_ATS list (Amazon/Apple/Google etc.)
-```text
+```
 
 **Retention:** Permanent — never auto-deleted.
 
@@ -250,21 +251,21 @@ new          → expired     (auto: after 7 days, description cleared)
 new          → dismissed   (manual: user dismissed from digest)
 new          → applied     (auto: when added via --add)
 pre_existing → (stays)     (first scan — not shown in digest)
-```text
+```
 
 **Indexes:**
 ```text
-UNIQUE idx_job_postings_hash  ON content_hash (WHERE NOT NULL)
+UNIQUE idx_job_postings_hash      ON content_hash (WHERE NOT NULL)
        idx_job_postings_status_seen ON (status, first_seen)
-```text
+```
 
 **Retention:**
 ```text
-new     → expired after 7 days (description cleared, URL kept forever)
+new       → expired after 7 days (description cleared, URL kept forever)
 dismissed → deleted after 30 days
 applied   → deleted immediately (already in applications table)
 expired   → kept forever (prevents re-showing same jobs)
-```text
+```
 
 ---
 
@@ -287,15 +288,14 @@ Daily performance metrics for `--monitor-jobs` runs. Used to track pipeline heal
 | `email_sent` | INTEGER | `1` = email sent, `0` = failed |
 | `created_at` | TIMESTAMP | When row created |
 
-**Retention:** Permanent — used for long-term reliability tracking.
+**Retention:** Auto-deleted after `RETENTION_MONITOR_STATS` (60 days). Configurable in `config.py`.
 
 **Key metrics derived from this table:**
 ```text
-Coverage rate:     companies_with_results / companies_monitored
-Filter match rate: jobs_matched_filters / total_jobs_fetched
+Coverage rate:        companies_with_results / companies_monitored
+Filter match rate:    jobs_matched_filters / total_jobs_fetched
 Pipeline reliability: runs with pdf_generated=1 / total_runs (7 days)
-```text
-
+```
 
 ---
 
@@ -422,7 +422,6 @@ Recovery (if script crashed mid-insert):
   python build_ats_slug_list.py --from-csv data/athena_2026-03-09.csv
 ```
 
-
 ---
 
 ## Retention Policies
@@ -431,13 +430,13 @@ All retention values are configured in `config.py` and enforced at startup via `
 
 | Table | Retention | Condition |
 |---|---|---|
-| `applications` | Permanent | Never deleted |
+| `applications` | Never deleted | Status auto-set to `closed` after 60 days (`APPLICATION_AUTO_CLOSE_DAYS`) |
 | `recruiters` | Permanent | Never deleted (soft delete only) |
-| `application_recruiters` | Permanent | Never deleted |
+| `application_recruiters` | Deleted when application closes | Cascades from `_cleanup_auto_close_applications` in same `init_db()` run |
 | `prospective_companies` | Permanent | Never deleted |
-| `monitor_stats` | Permanent | Never deleted |
+| `monitor_stats` | 60 days | `date < now - 60 days` (`RETENTION_MONITOR_STATS`) |
 | `job_postings` (expired URLs) | Permanent | URL kept to prevent re-showing |
-| `outreach` (sent) | 90 days | `sent_at < now - 90 days` |
+| `outreach` (sent) | 30 days | `sent_at < now - 30 days` (`RETENTION_OUTREACH_SENT`) |
 | `outreach` (pending) | 30 days | `scheduled_for < now - 30 days` |
 | `outreach` (failed/bounced/cancelled) | 30 days | `created_at < now - 30 days` |
 | `job_postings` (new→expired) | 7 days | `first_seen < now - 7 days` (description cleared) |
@@ -449,6 +448,14 @@ All retention values are configured in `config.py` and enforced at startup via `
 | `quota_alerts` | 30 days | `created_at < now - 30 days` |
 | `serper_quota` | Permanent | Single row, never deleted |
 
+**Cleanup execution order in `init_db()`:**
+```text
+1. _cleanup_auto_close_applications     ← mark applications closed first
+2. _cleanup_closed_application_recruiters ← then clean up their recruiter links
+3. _cleanup_monitor_stats               ← independent, order doesn't matter
+4. (all other existing cleanup functions)
+```
+
 ---
 
 ## Relationships
@@ -456,10 +463,10 @@ All retention values are configured in `config.py` and enforced at startup via `
 ```text
 applications (1)
     ↓
-application_recruiters (many)
+application_recruiters (many) — capped at MAX_RECRUITERS_PER_APPLICATION (3)
     ↓
 recruiters (1) ←→ outreach (many)
-    
+
 applications (1) ←→ outreach (many)
 applications (1) ←→ ai_cache (1)
 applications (1) ←→ jobs (1)
@@ -467,7 +474,8 @@ applications (1) ←→ jobs (1)
 prospective_companies (1)
     → job monitoring (daily --monitor-jobs)
     → recruiter scraping (--find-only leftover quota)
-    → converted to applications (--add)
+    → recruiters stored at company level (recruiters table only)
+    → converted to applications (--add) → top recruiters linked then
 
 job_postings (many) ← --monitor-jobs
     → PDF digest (daily 8 AM email)
@@ -476,7 +484,7 @@ job_postings (many) ← --monitor-jobs
 monitor_stats (1 per day) ← --monitor-jobs
     → pipeline health metrics
     → 7-day reliability score
-```text
+```
 
 ---
 
@@ -487,8 +495,8 @@ Table                  Rows (6 months)    Size
 ─────────────────────────────────────────────────
 applications           ~200               ~0.1 MB
 recruiters             ~1,000             ~0.5 MB
-application_recruiters ~3,000             ~0.2 MB
-outreach               ~15,000            ~5 MB
+application_recruiters ~600 (rolling)     ~0.05 MB
+outreach               ~5,000 (rolling)   ~1.5 MB
 ai_cache               ~200 (rolling)     ~1 MB
 jobs                   ~200 (rolling)     ~1 MB
 careershift_quota      ~30 (rolling)      ~0.01 MB
@@ -496,11 +504,11 @@ quota_alerts           ~10 (rolling)      ~0.01 MB
 prospective_companies  ~137               ~0.1 MB
 job_postings (active)  ~2,000             ~6 MB
 job_postings (expired) ~50,000            ~12 MB
-monitor_stats          ~180               ~0.1 MB
+monitor_stats          ~60 (rolling)      ~0.05 MB
 ─────────────────────────────────────────────────
-Total DB size          ~27 MB (6 months)
+Total DB size          ~22 MB (6 months)
 
 Well within SQLite comfort zone.
 Monthly VACUUM + ANALYZE keeps DB lean.
 See deployment.md for maintenance schedule.
-```text
+```

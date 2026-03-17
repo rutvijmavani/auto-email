@@ -1,18 +1,30 @@
 # db/application_recruiters.py — Application-Recruiter join table helpers
 
 from db.connection import get_conn, DAILY_LIMITS
-from config import MAX_CONTACTS_HARD_CAP
+from config import MAX_CONTACTS_HARD_CAP, MAX_RECRUITERS_PER_APPLICATION
 
 
 def link_recruiter_to_application(application_id, recruiter_id):
+    """
+    Link a recruiter to an application.
+    Enforces MAX_RECRUITERS_PER_APPLICATION cap at DB level.
+    Returns True if linked, False if cap already reached.
+    """
     conn = get_conn()
     c = conn.cursor()
     try:
+        c.execute("""
+            SELECT COUNT(*) as cnt FROM application_recruiters
+            WHERE application_id = ?
+        """, (application_id,))
+        if c.fetchone()["cnt"] >= MAX_RECRUITERS_PER_APPLICATION:
+            return False  # cap reached — silent skip
         c.execute("""
             INSERT OR IGNORE INTO application_recruiters (application_id, recruiter_id)
             VALUES (?, ?)
         """, (application_id, recruiter_id))
         conn.commit()
+        return True
     finally:
         conn.close()
 
@@ -81,3 +93,31 @@ def get_companies_needing_more_recruiters():
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
+
+
+def link_top_recruiters_for_company(application_id, company):
+    """
+    Link best recruiters for a company to an application.
+    Picks up to MAX_RECRUITERS_PER_APPLICATION recruiters,
+    ordered by confidence (auto first) then oldest (created_at ASC).
+    Used during prospective → active conversion in --add flow.
+    Returns count of recruiters linked.
+    """
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT id FROM recruiters
+        WHERE company = ? AND recruiter_status = 'active'
+        ORDER BY
+            CASE confidence WHEN 'auto' THEN 0 ELSE 1 END ASC,
+            created_at ASC
+        LIMIT ?
+    """, (company, MAX_RECRUITERS_PER_APPLICATION))
+    recruiters = [row["id"] for row in c.fetchall()]
+    conn.close()
+
+    linked = 0
+    for recruiter_id in recruiters:
+        if link_recruiter_to_application(application_id, recruiter_id):
+            linked += 1
+    return linked

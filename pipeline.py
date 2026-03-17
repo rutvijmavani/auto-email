@@ -158,20 +158,39 @@ def add_job_interactively():
     if is_prospective(company_normalized):
         print(f"[INFO] '{company_normalized}' found in prospective pipeline — recruiters already pre-scraped!")
         logger.info("Prospective conversion: %r found in pipeline", company_normalized)
-        converted_id = convert_prospective_to_active(
+
+        # Create real application directly — no placeholder to convert
+        app_id, created = add_application(
             company=company_normalized,
-            real_job_url=job_url,
+            job_url=job_url,
             job_title=job_title,
+            applied_date=applied_date,
             expected_domain=expected_domain,
         )
-        if converted_id:
-            mark_prospective_converted(company_normalized)
-            logger.info("Converted prospective → active: %r (id=%s)",
-                        company_normalized, converted_id)
-            print(f"[OK] Converted prospective → active (id={converted_id})")
-            print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
+
+        if not app_id:
+            logger.error("Prospective conversion: failed to create application for %r", company_normalized)
+            print(f"[ERROR] Failed to create application for {company_normalized}.")
             return
-        # Conversion failed (e.g. placeholder URL mismatch) → fall through to normal --add
+
+        if not created:
+            logger.warning("Prospective conversion: job URL already exists for %r (id=%s)",
+                           company_normalized, app_id)
+            print(f"[WARNING] Job URL already exists in DB (id={app_id}).")
+            return
+
+        # Link best recruiters (cap enforced inside link_top_recruiters_for_company)
+        from db.db import link_top_recruiters_for_company
+        linked = link_top_recruiters_for_company(app_id, company_normalized)
+
+        mark_prospective_converted(company_normalized)
+        logger.info("Prospective → active: %r (id=%s) linked=%d",
+                    company_normalized, app_id, linked)
+        print(f"[OK] Converted prospective → active (id={app_id})")
+        print(f"[INFO] Linked {linked} recruiter(s) for {company_normalized}")
+        print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
+        return
+        # Note: no fall-through needed — real application created directly
 
     logger.info("Adding application: company=%r url=%r title=%r date=%s",
                 company, job_url, job_title, applied_date)

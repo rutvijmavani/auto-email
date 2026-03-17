@@ -22,6 +22,7 @@ SEND_INTERVAL_DAYS   = 7
 # CAREERSHIFT QUOTA SETTINGS
 # ─────────────────────────────────────────
 MAX_CONTACTS_HARD_CAP = 3    # maximum recruiters to find per company
+MAX_RECRUITERS_PER_APPLICATION = 3  # max recruiters linked per application
 
 # ─────────────────────────────────────────
 # QUOTA HEALTH MONITOR SETTINGS
@@ -33,7 +34,7 @@ QUOTA_ALERT_CONSECUTIVE_DAYS  = 3      # consecutive days to trigger alert
 # ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
 # ─────────────────────────────────────────
-RETENTION_OUTREACH_SENT        = 90
+RETENTION_OUTREACH_SENT        = 30
 RETENTION_OUTREACH_PENDING     = 30
 RETENTION_OUTREACH_FAILED      = 30
 RETENTION_AI_CACHE             = 21
@@ -41,6 +42,8 @@ RETENTION_JOB_CACHE            = 21
 RETENTION_MODEL_USAGE          = 21
 RETENTION_CAREERSHIFT_QUOTA    = 30
 RETENTION_QUOTA_ALERTS         = 30
+RETENTION_MONITOR_STATS        = 60
+APPLICATION_AUTO_CLOSE_DAYS    = 60
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely

@@ -13,8 +13,36 @@ from config import (
     RETENTION_MODEL_USAGE,
     RETENTION_CAREERSHIFT_QUOTA,
     RETENTION_QUOTA_ALERTS,
+    RETENTION_MONITOR_STATS,
+    APPLICATION_AUTO_CLOSE_DAYS,
 )
 
+def _cleanup_monitor_stats(c):
+    cutoff = (datetime.now() - timedelta(days=RETENTION_MONITOR_STATS)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM monitor_stats WHERE date < ?", (cutoff,))
+
+
+def _cleanup_auto_close_applications(c):
+    """Auto-close active applications older than APPLICATION_AUTO_CLOSE_DAYS."""
+    c.execute("""
+        UPDATE applications
+        SET status = 'closed'
+        WHERE status = 'active'
+        AND applied_date < DATE('now', ?)
+    """, (f"-{APPLICATION_AUTO_CLOSE_DAYS} days",))
+
+def _cleanup_closed_application_recruiters(c):
+    """
+    Delete application_recruiters rows for closed applications.
+    Runs after _cleanup_auto_close_applications to catch newly closed ones.
+    """
+    c.execute("""
+        DELETE FROM application_recruiters
+        WHERE application_id IN (
+            SELECT id FROM applications
+            WHERE status = 'closed'
+        )
+    """)
 
 def _cleanup_expired_ai_cache(c):
     c.execute("DELETE FROM ai_cache WHERE expires_at <= CURRENT_TIMESTAMP")
@@ -384,7 +412,8 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
         ON coverage_stats(date)
     """)
-
+    _cleanup_auto_close_applications(c) 
+    _cleanup_closed_application_recruiters(c)
     _cleanup_expired_ai_cache(c)
     _cleanup_expired_jobs(c)
     _cleanup_old_model_usage(c)
@@ -392,6 +421,7 @@ def init_db():
     _cleanup_job_postings(c)
     _cleanup_careershift_quota(c)
     _cleanup_quota_alerts(c)
+    _cleanup_monitor_stats(c)
     conn.commit()
     conn.close()
     print("[OK] Database initialized: data/recruiter_pipeline.db")
