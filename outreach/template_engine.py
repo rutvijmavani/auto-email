@@ -1,5 +1,5 @@
 from jobs.job_fetcher import fetch_job_description
-from outreach.ai_full_personalizer import generate_all_content
+from outreach.ai_full_personalizer import generate_all_content , generate_all_content_without_jd
 
 
 def get_template(stage, name, company, job_url):
@@ -30,6 +30,10 @@ def get_template(stage, name, company, job_url):
 
     if job_text:
         ai_content = generate_all_content(company, job_title, job_text)
+    else:
+        ai_content = generate_all_content_without_jd(company, job_title)
+    
+    if ai_content:
         personalized_intro = ai_content.get("intro")
 
         if stage == "followup1":
