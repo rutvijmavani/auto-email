@@ -358,7 +358,7 @@ echo "[OK] All wrapper scripts created"
 
 # ═══════════════════════════════════════════════════════════════
 # INSTALL CRONTAB
-# All times UTC. Oracle Cloud VMs default to UTC.
+# All times America/New_York (EDT, -0400).
 # To verify: date && timedatectl
 # ═══════════════════════════════════════════════════════════════
 
@@ -462,7 +462,8 @@ NEW_CRON=$(cat << 'CRONTAB'
 CRONTAB
 )
 
-printf "%s\n%s\n" "$CLEAN_CRON" "$NEW_CRON" | crontab -
+# printf "%s\n%s\n" "$CLEAN_CRON" "$NEW_CRON" | crontab -
+echo "$NEW_CRON" | crontab -
 echo "[OK] Crontab installed"
 
 # ── Verify ────────────────────────────────────────────────────
