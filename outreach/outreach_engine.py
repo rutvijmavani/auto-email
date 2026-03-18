@@ -179,6 +179,7 @@ def process_outreach():
         stage           = row["stage"]
         outreach_id     = row["id"]
         recruiter_id    = row["recruiter_id"]
+        job_title       = row.get("job_title") or "Software Engineer"
         application_id  = row["application_id"]
 
         print(f"[INFO] [{stage}] {recruiter_name} @ {company} -> {recruiter_email}")
@@ -192,6 +193,7 @@ def process_outreach():
                 name=recruiter_name,
                 company=company,
                 job_url=job_url,
+                job_title=job_title,
             )
 
             if not template:

@@ -2,14 +2,14 @@ from jobs.job_fetcher import fetch_job_description
 from outreach.ai_full_personalizer import generate_all_content , generate_all_content_without_jd
 
 
-def get_template(stage, name, company, job_url):
+def get_template(stage, name, company, job_url, job_title="Software Engineer"):
 
     stage = stage or "initial"
 
     job_text = None
     personalized_intro = None
     follow_up_body = None
-    job_title = "Software Engineer"
+    # job_title = "Software Engineer"
 
     if job_url:
         job_data = fetch_job_description(job_url)
