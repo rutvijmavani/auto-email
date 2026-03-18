@@ -53,8 +53,7 @@ def get_template(stage, name, company, job_url):
             body = f"""
 Hi {name},
 
-I recently came across the Backend Engineer role at {company}:
-{job_url}
+I recently came across the Backend Engineer role at {company}{f":\n{job_url}" if job_url else "."}
 
 {personalized_intro if personalized_intro else ""}
 
