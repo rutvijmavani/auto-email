@@ -1,5 +1,5 @@
 from jobs.job_fetcher import fetch_job_description
-from outreach.ai_full_personalizer import generate_all_content
+from outreach.ai_full_personalizer import generate_all_content , generate_all_content_without_jd
 
 
 def get_template(stage, name, company, job_url):
@@ -30,6 +30,10 @@ def get_template(stage, name, company, job_url):
 
     if job_text:
         ai_content = generate_all_content(company, job_title, job_text)
+    else:
+        ai_content = generate_all_content_without_jd(company, job_title)
+    
+    if ai_content:
         personalized_intro = ai_content.get("intro")
 
         if stage == "followup1":
@@ -45,12 +49,11 @@ def get_template(stage, name, company, job_url):
         subject = f"{company} – Software Engineer Interest"
 
     if stage == "initial":
-        if job_text and personalized_intro:
+        if personalized_intro:
             body = f"""
 Hi {name},
 
-I recently came across the Backend Engineer role at {company}:
-{job_url}
+I recently came across the Backend Engineer role at {company}{f":\n{job_url}" if job_url else "."}
 
 {personalized_intro if personalized_intro else ""}
 
@@ -83,7 +86,7 @@ Rutvij Mavani
         return body, subject
 
     elif stage == "followup1":
-        if job_text and personalized_intro and follow_up_body:
+        if personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
@@ -112,7 +115,7 @@ Rutvij
         return body, subject
 
     elif stage == "followup2":
-        if job_text and personalized_intro and follow_up_body:
+        if personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
