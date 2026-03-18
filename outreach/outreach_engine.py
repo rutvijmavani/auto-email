@@ -192,6 +192,7 @@ def process_outreach():
                 name=recruiter_name,
                 company=company,
                 job_url=job_url,
+                job_title=job_title,
             )
 
             if not template:
