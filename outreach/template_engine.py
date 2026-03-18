@@ -50,10 +50,11 @@ def get_template(stage, name, company, job_url):
 
     if stage == "initial":
         if personalized_intro:
+            job_url_line = f":\n{job_url}" if job_url else "."
             body = f"""
 Hi {name},
 
-I recently came across the Backend Engineer role at {company}{f":\n{job_url}" if job_url else "."}
+I recently came across the Backend Engineer role at {company}{job_url_line}
 
 {personalized_intro if personalized_intro else ""}
 
