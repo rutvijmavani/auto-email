@@ -7,6 +7,7 @@ import re
 from google import genai
 from dotenv import load_dotenv
 from db.quota_manager import can_call, increment_usage, all_models_exhausted
+from db.quota import within_rpm
 from db.db import get_ai_cache, save_ai_cache
 
 load_dotenv()
@@ -71,8 +72,15 @@ def _call_model(prompt, cache_key, company, job_title):
 
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
         if not can_call(model):
-            print(f"{model} daily limit reached (local guard).")
-            continue
+            if not within_rpm(model):
+                print(f"{model} RPM limit hit — waiting 60s...")
+                time.sleep(60)
+                if not can_call(model):
+                    print(f"{model} still unavailable after wait — trying next model.")
+                    continue
+            else:
+                print(f"{model} daily limit reached (local guard).")
+                continue
 
         try:
             response = client.models.generate_content(
