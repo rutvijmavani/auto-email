@@ -49,7 +49,7 @@ def get_template(stage, name, company, job_url):
         subject = f"{company} – Software Engineer Interest"
 
     if stage == "initial":
-        if job_text and personalized_intro:
+        if personalized_intro:
             body = f"""
 Hi {name},
 
@@ -87,7 +87,7 @@ Rutvij Mavani
         return body, subject
 
     elif stage == "followup1":
-        if job_text and personalized_intro and follow_up_body:
+        if personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
@@ -116,7 +116,7 @@ Rutvij
         return body, subject
 
     elif stage == "followup2":
-        if job_text and personalized_intro and follow_up_body:
+        if personalized_intro and follow_up_body:
             body = f"""
 Hi {name},
 
