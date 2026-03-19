@@ -1,7 +1,35 @@
 # db/quota.py — CareerShift and Gemini quota helpers
 
+import time
 from datetime import datetime
-from db.connection import get_conn, DAILY_LIMITS
+from db.connection import get_conn, DAILY_LIMITS ,RPM_LIMITS
+from collections import defaultdict
+
+
+# ─────────────────────────────────────────
+# RPM TRACKING (in-memory sliding window)
+# ─────────────────────────────────────────
+
+# { model: [timestamp, ...] } — resets on process restart (fine for 60s windows)
+_rpm_timestamps = defaultdict(list)
+
+
+def within_rpm(model):
+    """Return True if model is within RPM limit using 60s sliding window."""
+    limit = RPM_LIMITS.get(model)
+    if not limit:
+        return True
+    now = time.time()
+    _rpm_timestamps[model] = [
+        t for t in _rpm_timestamps[model] if t > now - 60
+    ]
+    return len(_rpm_timestamps[model]) < limit
+
+
+def _record_rpm(model):
+    """Record a call timestamp for RPM tracking."""
+    _rpm_timestamps[model].append(time.time())
+
 
 
 # ─────────────────────────────────────────
@@ -61,6 +89,7 @@ def _get_today():
 
 
 def can_call(model):
+    """Return True if model is within both daily and RPM limits."""
     conn = get_conn()
     c = conn.cursor()
     today = _get_today()
@@ -72,10 +101,19 @@ def can_call(model):
     current = row["count"] if row else 0
     limit = DAILY_LIMITS.get(model, 0)
     conn.close()
-    return current < limit
+
+    if current >= limit:
+        return False
+
+    if not within_rpm(model):
+        return False
+
+    return True
 
 
 def increment_usage(model):
+    """Record call — updates RPM sliding window and daily DB count."""
+    _record_rpm(model)
     conn = get_conn()
     c = conn.cursor()
     today = _get_today()

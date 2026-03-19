@@ -10,6 +10,11 @@ DAILY_LIMITS = {
     "gemini-2.5-flash": 20
 }
 
+RPM_LIMITS = {
+    "gemini-2.5-flash-lite": 10,
+    "gemini-2.5-flash":       5,
+}
+
 
 def get_conn():
     """Returns a connection using current DB_FILE value (supports test overrides)."""
