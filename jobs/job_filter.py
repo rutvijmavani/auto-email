@@ -132,7 +132,8 @@ def make_content_hash(company, title, location):
     normalized = (
         normalize_text(company) + "|" +
         normalize_text(title) + "|" +
-        normalize_text(location or "")
+        normalize_text(location or "")+ "|" +
+        normalize_text(job_id or "")
     )
     return hashlib.sha256(normalized.encode()).hexdigest()
 
@@ -163,7 +164,7 @@ def filter_jobs(jobs):
         # Augment with score and hash
         job["skill_score"]   = score_job(job)
         job["content_hash"]  = make_content_hash(
-            job.get("company", ""), title, location
+            job.get("company", ""), title, location, job.get("job_id", "")
         )
 
         results.append(job)

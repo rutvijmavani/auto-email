@@ -82,6 +82,7 @@ def get_new_postings_for_digest():
         rows = conn.execute("""
             SELECT * FROM job_postings
             WHERE status = 'new'
+            AND first_seen = DATE('now')
             ORDER BY company ASC, skill_score DESC
         """).fetchall()
         return [dict(r) for r in rows]

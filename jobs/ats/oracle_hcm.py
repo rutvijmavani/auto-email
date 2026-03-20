@@ -166,7 +166,7 @@ def fetch_jobs(slug_info, company):
 
     all_jobs = []
     offset   = 0
-    limit    = 25
+    limit    = 200
 
     while True:
         url = _build_oracle_url(slug, region, site_id, limit, offset)
@@ -178,17 +178,18 @@ def fetch_jobs(slug_info, company):
         if not items:
             break
 
-        # Oracle wraps jobs in requisitionList inside each item
-        for item in items:
-            reqs = item.get("requisitionList", [])
-            if isinstance(reqs, list):
-                all_jobs.extend(reqs)
-
-        # Oracle returns count not totalResults
-        total = data.get("count", 0) or data.get("totalResults", 0)
-        offset += limit
-        if not data.get("hasMore", False) or offset >= total:
+        # Oracle always returns 1 item wrapper — jobs are in requisitionList
+        reqs = items[0].get("requisitionList", [])
+        if not reqs:
             break
+
+        all_jobs.extend(reqs)
+
+        # Paginate by job count — stop when fewer than limit returned
+        if len(reqs) < limit:
+            break
+
+        offset += limit
 
     return [_normalize(j, company, slug_info, slug, site_id)
             for j in all_jobs if j.get("Title")]
@@ -211,8 +212,9 @@ def _normalize(job, company, slug_info, slug, site_id):
     location = primary if primary else ""
 
     # Build job URL
-    req_id  = job.get("ExternalJobId", "") or \
-              job.get("RequisitionId", "")
+    req_id  = job.get("Id", "") or \
+            job.get("ExternalJobId", "") or \
+            job.get("RequisitionId", "")
     region  = slug_info.get("region", "") if isinstance(slug_info, dict) else ""
     job_url = (
         f"{_build_careers_url(slug, region, site_id).rstrip('/jobs')}"
@@ -227,6 +229,7 @@ def _normalize(job, company, slug_info, slug, site_id):
         "job_url":     job_url,
         "location":    location,
         "posted_at":   posted_at,
+        "job_id":      str(req_id) if req_id else "",
         "description": job.get("ShortDescriptionStr", ""),
         "ats":         "oracle_hcm",
     }

@@ -63,6 +63,7 @@ def _normalize(job, company):
         "job_url":     job.get("jobUrl", ""),
         "location":    location,
         "posted_at":   posted_at,
+        "job_id":      str(job.get("id", "")),
         "description": _strip_html(job.get("descriptionHtml", "")),
         "ats":         "ashby",
     }
