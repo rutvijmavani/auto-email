@@ -30,7 +30,7 @@ from jobs.ats_detector import (
 )
 from jobs.ats.base import between_companies_delay
 from db.serper_quota import get_serper_credits
-from jobs.job_filter import filter_jobs, is_fresh
+from jobs.job_filter import filter_jobs, is_fresh, make_legacy_content_hash
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
     MONITOR_COVERAGE_ALERT,
@@ -189,7 +189,8 @@ def run():
                 continue
 
             if job.get("content_hash") and \
-               job_hash_exists(job["content_hash"]):
+               job_hash_exists(job["content_hash"],
+                               job.get("content_hash_legacy")):
                 logger.debug("Duplicate content_hash skipped for %r", company)
                 continue
 
