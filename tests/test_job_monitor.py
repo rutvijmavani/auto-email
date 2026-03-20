@@ -1004,9 +1004,14 @@ class TestFreshnessDetection(unittest.TestCase):
     def _j(self, posted):
         return {"posted_at": posted}
 
-    def test_greenhouse_always_fresh(self):
-        old = datetime.now(timezone.utc) - timedelta(days=365)
-        self.assertTrue(self.is_fresh(self._j(old), "greenhouse"))
+    def test_greenhouse_respects_freshness_window(self):
+        # Greenhouse now uses first_published — applies normal freshness check
+        recent = datetime.now(timezone.utc) - timedelta(days=2)
+        old    = datetime.now(timezone.utc) - timedelta(days=365)
+        self.assertTrue(self.is_fresh(self._j(recent), "greenhouse", 3))
+        self.assertFalse(self.is_fresh(self._j(old), "greenhouse", 3))
+        # No posted_at → always fresh (fallback behavior)
+        self.assertTrue(self.is_fresh({"posted_at": None}, "greenhouse", 3))
 
     def test_lever_fresh_within_window(self):
         r = datetime.now(timezone.utc) - timedelta(days=2)
