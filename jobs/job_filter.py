@@ -199,10 +199,6 @@ def is_fresh(job, ats_platform, days_fresh=None):
     Greenhouse updated_at is unreliable — always returns True.
     Returns True if job is within freshness window.
     """
-    # Greenhouse date unreliable — always treat as fresh
-    # Freshness handled by first_seen + content_hash instead
-    if ats_platform == "greenhouse":
-        return True
 
     if days_fresh is None:
         days_fresh = JOB_MONITOR_DAYS_FRESH

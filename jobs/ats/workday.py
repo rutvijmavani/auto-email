@@ -154,15 +154,24 @@ def _normalize(job, company, domain, path):
     """
     posted_at = None
     posted = job.get("postedOn", "")
+    posted_at = None
+    posted = job.get("postedOn", "")
     if posted:
         try:
+            posted_lower = posted.lower().strip()
             if "/" in posted:
                 posted_at = datetime.strptime(posted, "%m/%d/%Y")
             elif "T" in posted or posted.endswith("Z"):
                 posted_at = datetime.fromisoformat(posted.replace("Z", "+00:00"))
-            elif "today" in posted.lower():
+            elif "today" in posted_lower:
                 posted_at = datetime.utcnow()
-            elif "day" in posted.lower():
+            elif "yesterday" in posted_lower:
+                from datetime import timedelta
+                posted_at = datetime.utcnow() - timedelta(days=1)
+            elif "30+" in posted:
+                from datetime import timedelta
+                posted_at = datetime.utcnow() - timedelta(days=30)
+            elif "day" in posted_lower:
                 import re as _re
                 from datetime import timedelta
                 m = _re.search(r"(\d+)", posted)
