@@ -17,19 +17,26 @@ def job_url_exists(job_url):
         conn.close()
 
 
-def job_hash_exists(content_hash):
+def job_hash_exists(content_hash, legacy_hash=None):
     """
     Check if content hash already exists.
-    Handles same job reposted with different URL.
+    Checks both new and legacy hash during rollout period
+    so existing rows aren't missed after hash format change.
     """
     if not content_hash:
         return False
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT id FROM job_postings WHERE content_hash = ?",
-            (content_hash,)
-        ).fetchone()
+        if legacy_hash and legacy_hash != content_hash:
+            row = conn.execute(
+                "SELECT id FROM job_postings WHERE content_hash IN (?, ?)",
+                (content_hash, legacy_hash)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id FROM job_postings WHERE content_hash = ?",
+                (content_hash,)
+            ).fetchone()
         return row is not None
     finally:
         conn.close()
@@ -83,10 +90,27 @@ def get_new_postings_for_digest():
         rows = conn.execute("""
             SELECT * FROM job_postings
             WHERE status = 'new'
-            AND first_seen = ?
             ORDER BY company ASC, skill_score DESC
-        """, (today,)).fetchall()
+        """).fetchall()
         return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_postings_digested():
+    """
+    Mark all current 'new' postings as 'digested' after
+    successful email send. Prevents re-showing in future digests
+    while keeping rows in DB until 7-day expiry.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("""
+            UPDATE job_postings
+            SET status = 'digested'
+            WHERE status = 'new'
+        """)
+        conn.commit()
     finally:
         conn.close()
 
