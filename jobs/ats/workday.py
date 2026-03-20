@@ -189,6 +189,10 @@ def _normalize(job, company, domain, path):
         # so we never silently drop a job with a valid title
         job_url = domain.rstrip("/") + "/" + path.strip("/")
 
+    import re as _re
+    _wd_match  = _re.search(r'_((?:JR|R)-\d+(?:-\d+)?)', job_url)
+    _wd_job_id = _wd_match.group(1) if _wd_match else ""
+
     return {
         "company":     company,
         "title":       job.get("title", ""),
@@ -197,4 +201,5 @@ def _normalize(job, company, domain, path):
         "posted_at":   posted_at,
         "description": " ".join(job.get("bulletFields", [])),
         "ats":         "workday",
+        "job_id":      _wd_job_id,  
     }

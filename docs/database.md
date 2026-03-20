@@ -248,6 +248,7 @@ Job postings discovered by `--monitor-jobs`. Only new postings appear in daily P
 **Status lifecycle:**
 ```text
 new          → expired     (auto: after 7 days, description cleared)
+new          → digested    (auto: after digest email sent successfully)
 new          → dismissed   (manual: user dismissed from digest)
 new          → applied     (auto: when added via --add)
 pre_existing → (stays)     (first scan — not shown in digest)

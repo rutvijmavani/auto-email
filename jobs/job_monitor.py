@@ -22,6 +22,7 @@ from db.db import (
     save_monitor_stats,
     get_monitor_stats,
     get_pipeline_reliability,
+    mark_postings_digested,
 )
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats,
@@ -269,11 +270,20 @@ def run():
             email_sent    = result.get("email_sent", False)
             logger.info("PDF digest sent: pdf=%s email=%s",
                         pdf_generated, email_sent)
+            # Mark as digested only after confirmed email sent
+            if email_sent:
+                mark_postings_digested()
+                logger.info("Marked %d posting(s) as digested",
+                            len(new_postings))
         except Exception as e:
             logger.error("PDF generation failed: %s", e, exc_info=True)
             print(f"[ERROR] PDF generation failed: {e}")
             print("[INFO] Sending plain text digest instead...")
             email_sent = _send_text_fallback(new_postings)
+            if email_sent:
+                mark_postings_digested()
+                logger.info("Marked %d posting(s) as digested (text fallback)",
+                            len(new_postings))
     else:
         logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")

@@ -99,6 +99,7 @@ def _normalize(job, company, company_slug=""):
         "job_url":     job_url,
         "location":    loc_str,
         "posted_at":   posted_at,
+        "job_id":      str(job_id), 
         "description": (job.get("jobAd") or {}).get("sections", {})
                            .get("jobDescription", {}).get("text", ""),
         "ats":         "smartrecruiters",

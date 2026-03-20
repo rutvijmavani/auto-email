@@ -67,6 +67,13 @@ def _cleanup_job_postings(c):
         WHERE status = 'new'
         AND first_seen < DATE('now', '-7 days')
     """)
+    # Archive digested postings older than 7 days
+    c.execute("""
+        UPDATE job_postings
+        SET status = 'expired', description = NULL
+        WHERE status = 'digested'
+        AND first_seen < DATE('now', '-7 days')
+    """)
     # Delete dismissed postings older than 30 days
     c.execute("""
         DELETE FROM job_postings

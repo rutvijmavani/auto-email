@@ -121,21 +121,33 @@ def score_job(job):
     return score
 
 
-def make_content_hash(company, title, location):
+def make_content_hash(company, title, location, job_id=""):
     """
-    Create SHA256 hash of company + normalized_title + location.
-    Used as secondary deduplication key.
-    Handles same job reposted with different URL.
+    Create SHA256 hash for deduplication.
+    Uses job_id from ATS API when available for uniqueness.
+    Returns (new_hash, legacy_hash) tuple so callers can
+    check both during rollout period.
+    legacy_hash: company|title|location        (old format)
+    new_hash:    company|title|location|job_id (new format)
     """
     if not company or not title:
-        return None
-    normalized = (
+        return None, None
+
+    base = (
         normalize_text(company) + "|" +
         normalize_text(title) + "|" +
         normalize_text(location or "")
     )
-    return hashlib.sha256(normalized.encode()).hexdigest()
+    legacy_hash = hashlib.sha256(base.encode()).hexdigest()
 
+    if job_id:
+        new_normalized = base + "|" + normalize_text(job_id)
+        new_hash = hashlib.sha256(new_normalized.encode()).hexdigest()
+    else:
+        # No job_id available — new hash same as legacy
+        new_hash = legacy_hash
+
+    return new_hash, legacy_hash
 
 def filter_jobs(jobs):
     """
@@ -162,9 +174,12 @@ def filter_jobs(jobs):
 
         # Augment with score and hash
         job["skill_score"]   = score_job(job)
-        job["content_hash"]  = make_content_hash(
-            job.get("company", ""), title, location
+        new_hash, legacy_hash = make_content_hash(
+            job.get("company", ""), title, location,
+            job.get("job_id", "")
         )
+        job["content_hash"]        = new_hash
+        job["content_hash_legacy"] = legacy_hash
 
         results.append(job)
 

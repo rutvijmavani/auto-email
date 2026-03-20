@@ -66,6 +66,7 @@ def _normalize(job, company):
         "job_url":     job.get("absolute_url", ""),
         "location":    job.get("location", {}).get("name", ""),
         "posted_at":   None,  # updated_at unreliable — not used
+        "job_id":      str(job.get("id", "")), 
         "description": job.get("content", ""),
         "ats":         "greenhouse",
     }

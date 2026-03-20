@@ -161,6 +161,7 @@ from db.job_monitor import (
     save_monitor_stats,
     get_monitor_stats,
     get_pipeline_reliability,
+    mark_postings_digested, 
 )
 
 # ─────────────────────────────────────────
