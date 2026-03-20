@@ -34,7 +34,7 @@ def job_hash_exists(content_hash, legacy_hash=None):
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT id FROM job_postons WHERE content_hash = ?",
+                "SELECT id FROM job_postings WHERE content_hash = ?",
                 (content_hash,)
             ).fetchone()
         return row is not None
