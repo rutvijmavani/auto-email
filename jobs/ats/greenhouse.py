@@ -1,11 +1,22 @@
 # jobs/ats/greenhouse.py — Greenhouse public API client
-# Date field: updated_at (UNRELIABLE — changes on edit)
+# Date field: first_published (RELIABLE — original publish date)
 # Freshness: first_seen + content_hash approach
 
 from jobs.ats.base import fetch_json, slugify, validate_company_match
 
 
 BASE_URL = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+
+
+def _parse_date(date_str):
+    """Parse ISO date string to datetime or None."""
+    if not date_str:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def detect(company):
@@ -65,7 +76,7 @@ def _normalize(job, company):
         "title":       job.get("title", ""),
         "job_url":     job.get("absolute_url", ""),
         "location":    job.get("location", {}).get("name", ""),
-        "posted_at":   None,  # updated_at unreliable — not used
+        "posted_at":   _parse_date(job.get("first_published")),  # updated_at unreliable — not used
         "job_id":      str(job.get("id", "")), 
         "description": job.get("content", ""),
         "ats":         "greenhouse",
