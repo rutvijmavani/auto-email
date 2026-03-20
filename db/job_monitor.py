@@ -79,12 +79,13 @@ def get_new_postings_for_digest():
     """
     conn = get_conn()
     try:
+        today = datetime.now().strftime("%Y-%m-%d")
         rows = conn.execute("""
             SELECT * FROM job_postings
             WHERE status = 'new'
-            AND first_seen = DATE('now')
+            AND first_seen = ?
             ORDER BY company ASC, skill_score DESC
-        """).fetchall()
+        """, (today,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

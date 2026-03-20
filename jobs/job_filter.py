@@ -121,9 +121,9 @@ def score_job(job):
     return score
 
 
-def make_content_hash(company, title, location):
+def make_content_hash(company, title, location , job_id = ""):
     """
-    Create SHA256 hash of company + normalized_title + location.
+    Create SHA256 hash of company + normalized_title + location + job_id.
     Used as secondary deduplication key.
     Handles same job reposted with different URL.
     """
@@ -132,7 +132,7 @@ def make_content_hash(company, title, location):
     normalized = (
         normalize_text(company) + "|" +
         normalize_text(title) + "|" +
-        normalize_text(location or "")+ "|" +
+        normalize_text(location or "") + "|" +
         normalize_text(job_id or "")
     )
     return hashlib.sha256(normalized.encode()).hexdigest()

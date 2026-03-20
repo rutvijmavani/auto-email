@@ -190,7 +190,7 @@ def _normalize(job, company, domain, path):
         job_url = domain.rstrip("/") + "/" + path.strip("/")
 
     import re as _re
-    _wd_match  = _re.search(r'_((?:JR-|R)\d+)', job_url)
+    _wd_match  = _re.search(r'_((?:JR|R)-\d+(?:-\d+)?)', job_url)
     _wd_job_id = _wd_match.group(1) if _wd_match else ""
 
     return {
