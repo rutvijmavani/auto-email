@@ -5,14 +5,49 @@ from db.connection import get_conn
 
 
 def job_url_exists(job_url):
-    """Check if job URL already exists in job_postings (any status)."""
+    """
+    Check if job URL already exists in job_postings (any status).
+    Returns (exists, is_filled) tuple to support reactivation.
+    """
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT id FROM job_postings WHERE job_url = ?",
+            "SELECT id, status FROM job_postings WHERE job_url = ?",
             (job_url,)
         ).fetchone()
-        return row is not None
+        if row is None:
+            return False, False
+        return True, row["status"] == "filled"
+    finally:
+        conn.close()
+
+
+def reactivate_job(job_url, job):
+    """
+    Reactivate a previously filled job that has reappeared in scan.
+    Resets status to pre_existing, clears stale/filled fields.
+    """
+    conn = get_conn()
+    try:
+        posted_at = job.get("posted_at")
+        if isinstance(posted_at, datetime):
+            posted_at = posted_at.isoformat()
+        conn.execute("""
+            UPDATE job_postings
+            SET status                   = 'pre_existing',
+                consecutive_missing_days = 0,
+                stale_since              = NULL,
+                description              = ?,
+                posted_at                = ?,
+                skill_score              = ?
+            WHERE job_url = ?
+        """, (
+            job.get("description", ""),
+            posted_at,
+            job.get("skill_score", 0),
+            job_url,
+        ))
+        conn.commit()
     finally:
         conn.close()
 
@@ -370,3 +405,97 @@ def get_pipeline_reliability(days=7):
         or s.get("companies_monitored", 0) == 0
     )
     return successful / len(stats)
+
+
+def get_stale_jobs(min_missing_days):
+    """
+    Return jobs missing from API for min_missing_days+ consecutive days.
+    Ordered by consecutive_missing_days DESC for priority processing.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT id, company, job_url, title,
+                   consecutive_missing_days, stale_since
+            FROM job_postings
+            WHERE status NOT IN ('filled', 'expired', 'dismissed', 'applied')
+            AND consecutive_missing_days >= ?
+            ORDER BY consecutive_missing_days DESC
+        """, (min_missing_days,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def increment_missing_days(job_ids):
+    """Increment consecutive_missing_days for jobs absent from today's scan."""
+    if not job_ids:
+        return
+    conn = get_conn()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn.execute(f"""
+            UPDATE job_postings
+            SET consecutive_missing_days = consecutive_missing_days + 1,
+                stale_since = CASE
+                    WHEN stale_since IS NULL THEN ?
+                    ELSE stale_since
+                END
+            WHERE id IN ({','.join('?' * len(job_ids))})
+        """, [today] + list(job_ids))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reset_missing_days(job_ids):
+    """Reset consecutive_missing_days for jobs present in today's scan."""
+    if not job_ids:
+        return
+    conn = get_conn()
+    try:
+        conn.execute(f"""
+            UPDATE job_postings
+            SET consecutive_missing_days = 0,
+                stale_since = NULL
+            WHERE id IN ({','.join('?' * len(job_ids))})
+        """, list(job_ids))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_job_filled(job_id):
+    """Mark job as filled — confirmed gone via API verification."""
+    conn = get_conn()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn.execute("""
+            UPDATE job_postings
+            SET status      = 'filled',
+                description = NULL,
+                stale_since = ?
+            WHERE id = ?
+        """, (today, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_tracked_urls_for_company(company):
+    """
+    Return dict of {job_url: id} for all tracked jobs for a company.
+    Includes 'filled' rows so they participate in missing-days tracking
+    and can be reactivated if job reappears.
+    Excludes permanently terminal statuses only.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT id, job_url FROM job_postings
+            WHERE company = ?
+            AND status NOT IN ('expired', 'dismissed', 'applied')
+        """, (company,)).fetchall()
+        return {r["job_url"]: r["id"] for r in rows}
+    finally:
+        conn.close()

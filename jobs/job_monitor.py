@@ -12,7 +12,6 @@ from db.db import (
     get_monitorable_companies,
     get_detection_queue,
     get_detection_queue_stats,
-
     job_url_exists,
     job_hash_exists,
     save_job_posting,
@@ -23,6 +22,10 @@ from db.db import (
     get_monitor_stats,
     get_pipeline_reliability,
     mark_postings_digested,
+    get_tracked_urls_for_company,
+    increment_missing_days,
+    reset_missing_days,
+    reactivate_job,
 )
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats,
@@ -161,6 +164,19 @@ def run():
 
         between_companies_delay()
 
+        # Track URL presence BEFORE early return on empty results
+        fetched_urls = {job["job_url"] for job in raw_jobs}
+        tracked      = get_tracked_urls_for_company(company)
+        present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
+        missing_ids  = [tracked[url] for url in tracked if url not in fetched_urls]
+        if present_ids:
+            reset_missing_days(present_ids)
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
+
+
         if not raw_jobs:
             logger.info("No jobs returned for %r", company)
             update_company_check(company, found_jobs=False)
@@ -184,8 +200,15 @@ def run():
         # ── Freshness check + save ──
         new_count = 0
         for job in matched:
-            if job_url_exists(job["job_url"]):
-                logger.debug("Duplicate URL skipped: %s", job["job_url"])
+            exists, is_filled = job_url_exists(job["job_url"])
+            if exists:
+                if is_filled:
+                    # Job reappeared after being marked filled — reactivate
+                    reactivate_job(job["job_url"], job)
+                    logger.info("REACTIVATED: %r | %s",
+                                company, job.get("title"))
+                else:
+                    logger.debug("Duplicate URL skipped: %s", job["job_url"])
                 continue
 
             if job.get("content_hash") and \
@@ -217,6 +240,7 @@ def run():
                 new_count += 1
                 logger.info("NEW JOB: %r | %s | %s",
                             company, job.get("title"), job.get("location"))
+
 
         logger.info("Done %r: fetched=%d matched=%d new=%d",
                     company, len(raw_jobs), len(matched), new_count)

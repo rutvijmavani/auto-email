@@ -15,6 +15,7 @@ from config import (
     RETENTION_QUOTA_ALERTS,
     RETENTION_MONITOR_STATS,
     APPLICATION_AUTO_CLOSE_DAYS,
+    VERIFY_FILLED_RETENTION,
 )
 
 def _cleanup_monitor_stats(c):
@@ -82,6 +83,12 @@ def _cleanup_job_postings(c):
     """)
     # Delete applied postings (already in applications table)
     c.execute("DELETE FROM job_postings WHERE status = 'applied'")
+    # Delete filled postings older than retention period
+    c.execute("""
+        DELETE FROM job_postings
+        WHERE status = 'filled'
+        AND stale_since < DATE('now', ?)
+    """, (f"-{VERIFY_FILLED_RETENTION} days",))
 
 
 def _cleanup_outreach(c):
@@ -261,20 +268,23 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS job_postings (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            company      TEXT NOT NULL,
-            title        TEXT NOT NULL,
-            job_url      TEXT NOT NULL UNIQUE,
-            content_hash TEXT,
-            location     TEXT,
-            posted_at    TIMESTAMP,
-            description  TEXT,
-            skill_score  INTEGER DEFAULT 0,
-            status       TEXT DEFAULT 'new',
-            first_seen   DATE NOT NULL,
-            created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            company                  TEXT NOT NULL,
+            title                    TEXT NOT NULL,
+            job_url                  TEXT UNIQUE NOT NULL,
+            content_hash             TEXT,
+            location                 TEXT,
+            posted_at                TIMESTAMP,
+            description              TEXT,
+            skill_score              INTEGER DEFAULT 0,
+            status                   TEXT DEFAULT 'new',
+            first_seen               DATE NOT NULL,
+            consecutive_missing_days INTEGER DEFAULT 0,
+            stale_since              DATE,
+            created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_job_postings_hash
         ON job_postings(content_hash)
@@ -403,6 +413,16 @@ def init_db():
             raise
     try:
         c.execute("ALTER TABLE applications ADD COLUMN exhausted_at TIMESTAMP")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+    try:
+        c.execute("ALTER TABLE job_postings ADD COLUMN consecutive_missing_days INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+    try:
+        c.execute("ALTER TABLE job_postings ADD COLUMN stale_since DATE;")
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             raise

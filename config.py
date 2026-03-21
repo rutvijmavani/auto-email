@@ -150,6 +150,12 @@ JOB_MONITOR_PDF_RETENTION     = 30   # days to keep PDF digest files
 JOB_MONITOR_MAX_JOBS          = 0    # 0 = no cap (show ALL matching jobs)
 JOB_MONITOR_API_TIMEOUT       = 10   # seconds per API request
 
+
+# Job filled variables
+VERIFY_FILLED_BATCH_SIZE   = 200  # max verifications per run
+VERIFY_FILLED_MISSING_DAYS = 3    # days missing before verification
+VERIFY_FILLED_RETENTION    = 7    # days to keep 'filled' before delete
+
 # ATS detection
 ATS_PLATFORMS = ["greenhouse", "lever", "ashby",
                  "smartrecruiters", "workday"]
