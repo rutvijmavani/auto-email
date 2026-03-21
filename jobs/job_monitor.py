@@ -12,7 +12,6 @@ from db.db import (
     get_monitorable_companies,
     get_detection_queue,
     get_detection_queue_stats,
-
     job_url_exists,
     job_hash_exists,
     save_job_posting,
@@ -23,6 +22,9 @@ from db.db import (
     get_monitor_stats,
     get_pipeline_reliability,
     mark_postings_digested,
+    get_tracked_urls_for_company,
+    increment_missing_days,
+    reset_missing_days,
 )
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats,
@@ -217,6 +219,25 @@ def run():
                 new_count += 1
                 logger.info("NEW JOB: %r | %s | %s",
                             company, job.get("title"), job.get("location"))
+
+        fetched_urls = {job["job_url"] for job in matched}
+        tracked      = get_tracked_urls_for_company(company)
+
+        present_ids = [
+            tracked[url] for url in fetched_urls
+            if url in tracked
+        ]
+        missing_ids = [
+            tracked[url] for url in tracked
+            if url not in fetched_urls
+        ]
+
+        if present_ids:
+            reset_missing_days(present_ids)
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
 
         logger.info("Done %r: fetched=%d matched=%d new=%d",
                     company, len(raw_jobs), len(matched), new_count)

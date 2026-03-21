@@ -803,6 +803,11 @@ def main():
         run_quota_report()
         return
 
+    if "--verify-filled" in args:
+        from jobs.fill_verifier import run as verify_filled_run
+        verify_filled_run()
+        return
+
     # Full pipeline
     logger.info("Full pipeline run starting")
     print("[INFO] Starting Recruiter Outreach Pipeline")

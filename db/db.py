@@ -161,7 +161,12 @@ from db.job_monitor import (
     save_monitor_stats,
     get_monitor_stats,
     get_pipeline_reliability,
-    mark_postings_digested, 
+    mark_postings_digested,
+    get_stale_jobs,
+    increment_missing_days,
+    reset_missing_days,
+    mark_job_filled,
+    get_tracked_urls_for_company,
 )
 
 # ─────────────────────────────────────────
