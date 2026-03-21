@@ -34,6 +34,16 @@ ATS_SITE_SEARCHES = [
 def _make_patterns():
     patterns = []
 
+
+    # Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
+    patterns.append((
+        re.compile(
+            r"(?:boards|job-boards)\.greenhouse\.io/embed/job_board\?(?:.*&)?for=([^&\s]+)",
+            re.IGNORECASE
+        ),
+        "greenhouse",
+        lambda m: m.group(1).lower(),
+    ))
     # Greenhouse — boards.greenhouse.io/{slug}/jobs
     # Also: job-boards.greenhouse.io/{slug}/jobs
     patterns.append((
@@ -43,15 +53,6 @@ def _make_patterns():
         ),
         "greenhouse",
         lambda m: m.group(1).lower().rstrip("/"),
-    ))
-    # Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
-    patterns.append((
-        re.compile(
-            r"(?:boards|job-boards)\.greenhouse\.io/embed/job_board\?(?:.*&)?for=([^&\s]+)",
-            re.IGNORECASE
-        ),
-        "greenhouse",
-        lambda m: m.group(1).lower(),
     ))
 
     # Lever — jobs.lever.co/{slug}
