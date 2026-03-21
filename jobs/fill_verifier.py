@@ -94,7 +94,7 @@ def _is_job_gone(url):
             return False
 
         # Other codes → inconclusive
-        return None
+        return f"status_{r.status_code}"
 
     except requests.exceptions.Timeout:
         return "timeout"
@@ -104,8 +104,6 @@ def _is_job_gone(url):
         logger.debug("Error verifying %s: %s", url, e)
         return "exception"
 
-    # Other status codes → inconclusive
-    return f"status_{r.status_code}"
 
 
 def run():
@@ -127,7 +125,18 @@ def run():
     if not stale_jobs:
         logger.info("No stale jobs to verify")
         print("[INFO] No stale jobs to verify.")
-        return {"verified": 0, "filled": 0, "active": 0, "inconclusive": 0}
+        return {
+            "verified":                  0,
+            "filled":                    0,
+            "active":                    0,
+            "inconclusive":              0,
+            "inconclusive_timeout":      0,
+            "inconclusive_conn_error":   0,
+            "inconclusive_other_status": 0,
+            "inconclusive_exception":    0,
+            "remaining":                 0,
+            "run_duration_secs":         0,
+        }
 
     # Process up to VERIFY_FILLED_BATCH_SIZE jobs
     batch = stale_jobs[:VERIFY_FILLED_BATCH_SIZE]
@@ -141,6 +150,7 @@ def run():
     verified     = 0
     filled_count = 0
     active_count = 0
+    inconclusive              = 0
     inconclusive_timeout      = 0
     inconclusive_conn_error   = 0
     inconclusive_other_status = 0

@@ -394,7 +394,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS verify_filled_stats (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            date                DATE NOT NULL,
+            date                DATE NOT NULL UNIQUE,
             verified            INTEGER DEFAULT 0,
             filled              INTEGER DEFAULT 0,
             active              INTEGER DEFAULT 0,
