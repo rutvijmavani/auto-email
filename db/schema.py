@@ -417,12 +417,12 @@ def init_db():
         if "duplicate column name" not in str(e).lower():
             raise
     try:
-        c.execute("ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS consecutive_missing_days INTEGER DEFAULT 0;")
+        c.execute("ALTER TABLE job_postings ADD COLUMN consecutive_missing_days INTEGER DEFAULT 0;")
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             raise
     try:
-        c.execute("ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS stale_since DATE;")
+        c.execute("ALTER TABLE job_postings ADD COLUMN stale_since DATE;")
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             raise
