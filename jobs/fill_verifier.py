@@ -125,7 +125,8 @@ def run():
     if not stale_jobs:
         logger.info("No stale jobs to verify")
         print("[INFO] No stale jobs to verify.")
-        return {
+        duration = int(time.time() - start_time)
+        final_stats = {
             "verified":                  0,
             "filled":                    0,
             "active":                    0,
@@ -135,8 +136,15 @@ def run():
             "inconclusive_other_status": 0,
             "inconclusive_exception":    0,
             "remaining":                 0,
-            "run_duration_secs":         0,
+            "run_duration_secs":         duration,
         }
+        save_verify_filled_stats(final_stats)
+        logger.info(
+            "--verify-filled complete: verified=0 filled=0 active=0 "
+            "inconclusive=0 remaining=0 duration=%ds",
+            duration,
+        )
+        return final_stats
 
     # Process up to VERIFY_FILLED_BATCH_SIZE jobs
     batch = stale_jobs[:VERIFY_FILLED_BATCH_SIZE]
