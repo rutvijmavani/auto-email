@@ -27,7 +27,15 @@ Queries public ATS APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday,
 Oracle HCM) to find newly posted jobs matching your profile. Uses a 4-phase
 ATS detection system (DB lookup → API probe → HTML redirect → Serper) to identify
 which platform each company uses. Slug database built monthly via AWS Athena
-queries against Common Crawl index (ats_discovery.db). Sends a daily digest email with ranked results.
+queries against Common Crawl index (ats_discovery.db). Sends a daily digest email with ranked results. Also tracks URL presence per company — each day a tracked job URL is missing from the API response, its `consecutive_missing_days` counter increments.
+
+**`--verify-filled`** — Filled Position Cleanup
+Runs nightly after `--find-only` as part of the nightly chain. Picks up job postings that have been absent from the API for `VERIFY_FILLED_MISSING_DAYS` (3) or more consecutive days and verifies them via direct HTTP request:
+- **404/410 response** → position confirmed filled → `status='filled'`, description cleared
+- **200 response** → job still live (was a false positive) → `consecutive_missing_days` reset to 0
+- **Timeout/error** → inconclusive → retried the next nightly run
+
+After `VERIFY_FILLED_RETENTION` (7) days as `filled`, the row is deleted entirely to keep the database clean. If a filled job reappears within that 7-day window, it is automatically reactivated to `pre_existing`. Saves detailed run stats to `verify_filled_stats` table including a breakdown of why verifications were inconclusive (timeout vs connection error vs unexpected status code vs exception).
 
 **`--verify-only`** — Recruiter Freshness Check
 Keeps recruiter data up to date independent of job search activity.
@@ -56,6 +64,11 @@ Weekly (Monday — automated)
         → marks departed recruiters as inactive
         → cancels their pending outreach
         → reports under-stocked companies
+
+Nightly (1 AM — automated chain):
+  Tue-Sun: sync → backup → find-only → verify-filled
+  Monday:  sync → backup → verify-only → find-only → verify-filled
+  1st:     sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
 
 As needed (when applying to new jobs)
   └── python pipeline.py --add
@@ -98,6 +111,14 @@ ai_cache table (Gemini generated content)
 outreach table (email sequence)
     ↓
 Email sent to recruiter
+
+prospective_companies table
+    ↓ --monitor-jobs (daily 7 AM)
+job_postings table
+    ↓ URL presence tracked per company per day
+    ↓ --verify-filled (nightly 1 AM, after find-only)
+    ↓ 404 confirmed → status='filled' → deleted after 7 days
+verify_filled_stats table (daily run metrics)
 ```
 
 ---
@@ -109,8 +130,8 @@ Email sent to recruiter
 | `careershift/auth.py` | Login to CareerShift via Symplicity portal, save session |
 | `careershift/find_emails.py` | Scrape recruiters, tiered verification, quota management |
 | `outreach/outreach_engine.py` | Schedule and send emails, bounce detection |
-| `outreach/template_engine.py` | Build email body and subject from AI cache |
-| `outreach/ai_full_personalizer.py` | Generate email content via Gemini AI |
+| `outreach/template_engine.py` | Build email body and subject from AI cache (uses job_title from applications table) |
+| `outreach/ai_full_personalizer.py` | Generate email content via Gemini AI (enforces RPM + daily limits) |
 | `outreach/email_sender.py` | SMTP sending with resume attachment |
 | `jobs/job_fetcher.py` | Fetch and cache job descriptions |
 | `jobs/job_scraper.py` | Scrape JD from various ATS portals |
@@ -120,10 +141,22 @@ Email sent to recruiter
 | `jobs/career_page.py` | Phase 3a: HTML redirect + fingerprint scan |
 | `jobs/serper.py` | Phase 3b: Serper API for Workday + Oracle |
 | `jobs/ats_detector.py` | ATS detection orchestrator (4 phases) |
-| `jobs/job_monitor.py` | Daily job monitoring + digest email |
+| `jobs/ats/patterns.py` | ATS URL pattern matching including Greenhouse embed format |
+| `jobs/ats/greenhouse.py` | Greenhouse API client (uses first_published date) |
+| `jobs/ats/lever.py` | Lever API client |
+| `jobs/ats/ashby.py` | Ashby API client |
+| `jobs/ats/smartrecruiters.py` | SmartRecruiters API client |
+| `jobs/ats/workday.py` | Workday undocumented API (human-readable date parsing, pagination) |
+| `jobs/ats/oracle_hcm.py` | Oracle HCM API client (uses Id field, pagination fixed) |
+| `jobs/ats/icims.py` | iCIMS HTML scraping client |
+| `jobs/job_filter.py` | Filter + score jobs, content hash generation (includes job_id) |
+| `jobs/job_monitor.py` | Daily job monitoring + digest email + URL presence tracking |
+| `jobs/fill_verifier.py` | Nightly filled position verification via HTTP |
 | `db/db.py` | Single source of truth — all database operations |
+| `db/quota.py` | Gemini daily + RPM quota tracking (in-memory sliding window) |
 | `db/quota_manager.py` | Thin wrapper for Gemini quota functions |
 | `db/job_cache.py` | Thin wrapper for job cache functions |
+| `db/job_monitor.py` | DB ops for job_postings, monitor_stats, verify_filled_stats |
 | `pipeline.py` | Orchestrator with CLI flags |
 | `config.py` | All configuration in one place |
 
@@ -153,6 +186,25 @@ Outside send window                 → reschedule for tomorrow
 AI cache missing                    → warn and skip, run --find-only first
 ```
 
+**Verify-filled HTTP request fails:**
+```
+404/410           → confirmed filled → mark status='filled', clear description
+200               → still live → reset consecutive_missing_days to 0
+Timeout           → inconclusive → logged as inconclusive_timeout, retry tomorrow
+Connection error  → inconclusive → logged as inconclusive_conn_error, retry tomorrow
+403/500           → inconclusive → logged as inconclusive_other_status, retry tomorrow
+Exception         → inconclusive → logged as inconclusive_exception, check logs
+```
+
+**Gemini RPM limit hit:**
+```
+calls_in_last_60s >= RPM_LIMITS[model]
+  → wait 60 seconds
+  → retry same model
+  → if still over limit → try next model
+  → never silently drops content generation
+```
+
 ---
 
 ## Key Design Decisions
@@ -166,3 +218,17 @@ AI cache missing                    → warn and skip, run --find-only first
 **Cached profiles are free** — CareerShift's daily limit (50 new contacts) only applies to first-time profile views. Re-visiting cached profiles is free, which is why tiered recruiter verification costs zero quota.
 
 **AI content pre-generated** — Email content is generated during `--find-only` (night) not during `--outreach-only` (morning). This ensures the morning send window is purely a sending step with no external API dependencies.
+
+**job_title passed from applications table to template engine** — `outreach_engine.py` reads `job_title` from the applications table row and passes it explicitly to `template_engine.py`. This ensures the correct AI cache key is built and avoids falling back to the generic default "Software Engineer" title which would cause a cache miss.
+
+**Content hash includes job_id** — The deduplication hash is now `SHA256(company|title|location|job_id)` where `job_id` comes directly from the ATS API. This prevents false duplicate suppression when the same job title exists in multiple locations at the same company (e.g. Workday multi-location postings). Legacy hash (without job_id) is checked alongside the new hash during the rollout period.
+
+**Digest accumulates until email confirmed sent** — `get_new_postings_for_digest()` returns all `status='new'` rows with no date filter. Only after the email is confirmed sent does `mark_postings_digested()` flip those rows to `status='digested'`. If the email fails to send, the jobs remain `new` and are automatically included in the next run — nothing is silently lost.
+
+**verify-filled uses raw_jobs for URL tracking** — URL presence tracking during `--monitor-jobs` is built from `raw_jobs` (the full unfiltered API response) not `matched` (jobs that passed title/location filters). This prevents jobs that don't match your profile from being incorrectly counted as "missing" just because they were filtered out of your digest.
+
+**Gemini RPM enforced via in-memory sliding window** — A 60-second sliding window in `db/quota.py` tracks call timestamps per model. When the RPM limit is hit, the pipeline waits 60 seconds and retries rather than silently switching to a lower-quality model. This makes the pipeline self-throttling without sacrificing email quality.
+
+**Greenhouse now uses first_published** — Greenhouse's `updated_at` field changes whenever a job is edited (even minor updates), making it unreliable for freshness detection. The pipeline now uses `first_published` instead — the date the job was originally posted, which never changes.
+
+**Greenhouse embed URL format handled** — Companies like Databricks use the embed URL format (`job-boards.greenhouse.io/embed/job_board?for=Databricks`) on their careers page instead of the standard format. The ATS URL pattern matcher now extracts the slug from the `?for=` query parameter, so detection works correctly for these companies too.

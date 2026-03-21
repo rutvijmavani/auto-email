@@ -44,6 +44,15 @@ def _make_patterns():
         "greenhouse",
         lambda m: m.group(1).lower().rstrip("/"),
     ))
+    # Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
+    patterns.append((
+        re.compile(
+            r"(?:boards|job-boards)\.greenhouse\.io/embed/job_board\?(?:.*&)?for=([^&\s]+)",
+            re.IGNORECASE
+        ),
+        "greenhouse",
+        lambda m: m.group(1).lower(),
+    ))
 
     # Lever — jobs.lever.co/{slug}
     # Also: hire.lever.co/{slug}

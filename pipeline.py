@@ -102,6 +102,18 @@ def extract_expected_domain(job_url):
                     return slug.lower()
                 return None
 
+        # ── Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
+        if hostname in ("job-boards.greenhouse.io", "boards.greenhouse.io"):
+            from urllib.parse import parse_qs
+            qs = parse_qs(parsed.query)
+            if "for" in qs:
+                return qs["for"][0].lower()
+            # Fall through to normal path extraction
+            slug = path.split("/")[0].lower()
+            if slug and slug not in {"embed", "jobs", "careers"}:
+                return slug
+            return None
+
         # ── ATS platforms — extract company slug from path ─────────
         ats_hosts = [
             "jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io",
