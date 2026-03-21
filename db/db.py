@@ -167,6 +167,7 @@ from db.job_monitor import (
     reset_missing_days,
     mark_job_filled,
     get_tracked_urls_for_company,
+    reactivate_job,
 )
 
 # ─────────────────────────────────────────

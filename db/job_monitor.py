@@ -5,14 +5,49 @@ from db.connection import get_conn
 
 
 def job_url_exists(job_url):
-    """Check if job URL already exists in job_postings (any status)."""
+    """
+    Check if job URL already exists in job_postings (any status).
+    Returns (exists, is_filled) tuple to support reactivation.
+    """
     conn = get_conn()
     try:
         row = conn.execute(
-            "SELECT id FROM job_postings WHERE job_url = ?",
+            "SELECT id, status FROM job_postings WHERE job_url = ?",
             (job_url,)
         ).fetchone()
-        return row is not None
+        if row is None:
+            return False, False
+        return True, row["status"] == "filled"
+    finally:
+        conn.close()
+
+
+def reactivate_job(job_url, job):
+    """
+    Reactivate a previously filled job that has reappeared in scan.
+    Resets status to pre_existing, clears stale/filled fields.
+    """
+    conn = get_conn()
+    try:
+        posted_at = job.get("posted_at")
+        if isinstance(posted_at, datetime):
+            posted_at = posted_at.isoformat()
+        conn.execute("""
+            UPDATE job_postings
+            SET status                   = 'pre_existing',
+                consecutive_missing_days = 0,
+                stale_since              = NULL,
+                description              = ?,
+                posted_at                = ?,
+                skill_score              = ?
+            WHERE job_url = ?
+        """, (
+            job.get("description", ""),
+            posted_at,
+            job.get("skill_score", 0),
+            job_url,
+        ))
+        conn.commit()
     finally:
         conn.close()
 
@@ -437,27 +472,29 @@ def mark_job_filled(job_id):
         today = datetime.now().strftime("%Y-%m-%d")
         conn.execute("""
             UPDATE job_postings
-            SET status = 'filled',
+            SET status      = 'filled',
                 description = NULL,
                 stale_since = ?
             WHERE id = ?
         """, (today, job_id))
         conn.commit()
     finally:
-        conn.close()
+        conn.close())
 
 
 def get_tracked_urls_for_company(company):
     """
-    Return dict of {job_url: id} for all active tracked jobs for a company.
-    Used during scan to detect missing jobs.
+    Return dict of {job_url: id} for all tracked jobs for a company.
+    Includes 'filled' rows so they participate in missing-days tracking
+    and can be reactivated if job reappears.
+    Excludes permanently terminal statuses only.
     """
     conn = get_conn()
     try:
         rows = conn.execute("""
             SELECT id, job_url FROM job_postings
             WHERE company = ?
-            AND status NOT IN ('filled', 'expired', 'dismissed', 'applied')
+            AND status NOT IN ('expired', 'dismissed', 'applied')
         """, (company,)).fetchall()
         return {r["job_url"]: r["id"] for r in rows}
     finally:
