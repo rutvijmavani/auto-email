@@ -1078,7 +1078,7 @@ class TestJobMonitorDB(unittest.TestCase):
     def test_url_exists_after_insert(self):
         db_module.save_job_posting(_make_job())
         exists, _ = db_module.job_url_exists("https://stripe.com/jobs/1")
-        self.assertTrue(db_module.job_url_exists(exists))
+        self.assertTrue(exists)
 
     def test_url_exists_for_pre_existing(self):
         db_module.save_job_posting(_make_job(), status="pre_existing")
