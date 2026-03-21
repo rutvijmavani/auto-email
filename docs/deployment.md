@@ -388,6 +388,7 @@ Log files:
   logs/weekly_YYYY-MM-DD.log
   logs/enrich_YYYY-MM.log
   logs/detect_YYYY-MM-DD.log
+  logs/verify_filled_YYYY-MM-DD.log
 
 Log levels:
   INFO     → normal operations
@@ -450,15 +451,16 @@ Storage is not a concern on either volume.
 ### Compute (Oracle free tier: A1.Flex — 2 OCPU + 12 GB RAM)
 
 ```
-Pipeline         RAM Peak   Duration    Risk
-─────────────────────────────────────────────────
---monitor-jobs   ~250 MB    5 min       None ✓
---outreach-only  ~80 MB     5 min       None ✓
---sync-forms     ~50 MB     30 sec      None ✓
---find-only      ~600 MB    30-40 min   None ✓
---verify-only    ~600 MB    10-15 min   None ✓
-DB backup        ~80 MB     5 sec       None ✓
-build_ats_slug   ~200 MB    5 min       None ✓
+Pipeline           RAM Peak   Duration      Risk
+───────────────────────────────────────────────────
+--monitor-jobs     ~250 MB    20-30 min     None ✓
+--verify-filled    ~80 MB     3-5 min       None ✓
+--outreach-only    ~80 MB     5 min         None ✓
+--sync-forms       ~50 MB     30 sec        None ✓
+--find-only        ~600 MB    30-40 min     None ✓
+--verify-only      ~600 MB    10-15 min     None ✓
+DB backup          ~80 MB     5 sec         None ✓
+build_ats_slug     ~200 MB    5 min         None ✓
 ```
 
 All pipelines run sequentially — never in parallel.
@@ -481,10 +483,17 @@ Nightly chains use && operator:
   → Backup always runs FIRST (clean pre-run snapshot)
   → If backup fails → nothing else runs → data safe
   → If verify-only fails (Monday) → find-only does not run
+  → If find-only fails → verify-filled does not run
 
 Guard on 1st of month:
   → run_nightly.sh and run_monday.sh exit early on the 1st
   → run_monthly.sh handles the 1st exclusively
+
+Enrichment runs independently:
+  → run_enrich.sh fires at 3 AM separately
+  → Writes to ats_discovery.db only — no conflict with
+    recruiter_pipeline.db nightly chain (finishes by ~2 AM)
+  → Takes 18+ hours — designed as a long-running background job
 ```
 
 ### Wrapper scripts (created by setup_cron.sh)
@@ -492,19 +501,22 @@ Guard on 1st of month:
 ```
 /home/opc/mail/
   run_sync.sh            ← --sync-forms + --sync-prospective (9AM 12PM 3PM 6PM 9PM)
-  run_nightly.sh         ← sync → backup → find-only (Tue-Sun 1AM)
-  run_monday.sh          ← sync → backup → verify-only → find-only (Mon 1AM)
-  run_monthly.sh         ← sync → backup → find-only → build-slugs → enrich → VACUUM (1st 1AM)
+  run_nightly.sh         ← sync → backup → find-only → verify-filled (Tue-Sun 1AM)
+  run_monday.sh          ← sync → backup → verify-only → find-only → verify-filled (Mon 1AM)
+  run_monthly.sh         ← sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled (1st 1AM)
   run_outreach.sh        ← --outreach-only (Mon-Fri 9AM)
   run_monitor.sh         ← --monitor-jobs (daily 7AM)
   run_weekly_summary.sh  ← --weekly-summary (Mon 9AM)
-  run_enrich.sh          ← enrichment Phase B (daily 3AM, skips 1st)
+  run_enrich.sh          ← enrichment Phase B (daily 3AM, standalone 18hr job, skips 1st)
   run_detect.sh          ← --detect-ats --batch (disabled — run manually)
+  run_verify_filled.sh   ← --verify-filled (manual use only — runs automatically in nightly chains)
 ```
 
 ### Complete cron schedule (installed by setup_cron.sh)
 
 ```bash
+CRON_TZ=America/New_York
+
 # ─────────────────────────────────────────
 # DAYTIME SYNC — 9AM 12PM 3PM 6PM 9PM daily
 # Safe standalone: read+insert only, no backup needed
@@ -518,6 +530,7 @@ Guard on 1st of month:
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
+# Skips Saturday and Sunday automatically
 # ─────────────────────────────────────────
 0 9 * * 1-5 /home/opc/mail/run_outreach.sh
 
@@ -528,26 +541,29 @@ Guard on 1st of month:
 
 # ─────────────────────────────────────────
 # NIGHTLY CHAIN — Tuesday to Sunday 1 AM
-# sync → backup → find-only
+# sync → backup → find-only → verify-filled
 # Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
 0 1 * * 2-7 /home/opc/mail/run_nightly.sh
 
 # ─────────────────────────────────────────
 # MONDAY NIGHTLY CHAIN — Monday 1 AM
-# sync → backup → verify-only → find-only
+# sync → backup → verify-only → find-only → verify-filled
 # Guard inside script exits early on the 1st of month
 # ─────────────────────────────────────────
 0 1 * * 1 /home/opc/mail/run_monday.sh
 
 # ─────────────────────────────────────────
 # MONTHLY CHAIN — 1st of every month at 1 AM
-# sync → backup → find-only → build-slugs → enrich → VACUUM
+# sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
+# Replaces nightly chain on the 1st
 # ─────────────────────────────────────────
 0 1 1 * * /home/opc/mail/run_monthly.sh
 
 # ─────────────────────────────────────────
-# DAILY ENRICHMENT — 3 AM (skips 1st — run_monthly.sh handles it)
+# DAILY ENRICHMENT — 3 AM (standalone, 18hr background job)
+# Writes to ats_discovery.db only — no conflict with nightly chain
+# Skips 1st of month — run_monthly.sh handles enrichment that day
 # ─────────────────────────────────────────
 0 3 * * * /home/opc/mail/run_enrich.sh
 
@@ -563,36 +579,45 @@ Guard on 1st of month:
 # ─────────────────────────────────────────
 ```
 
-### Full daily timeline
+**Note on `CRON_TZ=America/New_York`:** This line at the top of the crontab tells cron to interpret all times as Eastern Time regardless of the server's system timezone. Oracle Cloud VMs default to UTC — without this setting, "1 AM" would actually fire at 1 AM UTC (which is 9 PM or 10 PM Eastern depending on DST). `setup_cron.sh` sets this automatically so you never need to think about it.
+
+### Full daily timeline (America/New_York)
 ```
- 7:00 AM: --monitor-jobs
+ 7:00 AM: --monitor-jobs (tracks URL presence, increments missing counters)
  9:00 AM: --sync-forms + --sync-prospective
  9:00 AM: --outreach-only (Mon-Fri only)
  9:00 AM: --weekly-summary (Mon only)
 12:00 PM: --sync-forms + --sync-prospective
- 3:00 AM: enrichment Phase B
+ 3:00 AM: enrichment Phase B (standalone, runs all day in background)
  3:00 PM: --sync-forms + --sync-prospective
  6:00 PM: --sync-forms + --sync-prospective
  9:00 PM: --sync-forms + --sync-prospective  ← last sync of the day
 
- 1:00 AM (Tue-Sun): sync → backup → find-only (chained)
- 1:00 AM (Mon):     sync → backup → verify-only → find-only (chained)
- 1:00 AM (1st):     sync → backup → find-only → build-slugs → enrich → VACUUM
+ 1:00 AM (Tue-Sun): sync → backup → find-only → verify-filled (chained)
+ 1:00 AM (Mon):     sync → backup → verify-only → find-only → verify-filled (chained)
+ 1:00 AM (1st):     sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
 ```
 
 ### Safety with && chaining
 ```
 backup_db.py fails:
-  → verify-only and find-only do NOT run
+  → verify-only, find-only, and verify-filled do NOT run
   → DB unchanged and safe
 
 verify-only fails (Monday):
   → find-only does NOT run
+  → verify-filled does NOT run
   → Backup already completed safely
 
 find-only fails:
+  → verify-filled does NOT run
   → Backup already completed safely
   → Outreach still runs at 9 AM with existing data
+
+verify-filled fails:
+  → Backup and find-only already completed safely
+  → Stale jobs will be retried the next nightly run
+  → No data loss — only cleanup is delayed by one day
 
 1st of month:
   → run_nightly.sh and run_monday.sh detect date and exit early
@@ -601,20 +626,21 @@ find-only fails:
 
 ### Quick reference
 ```
-Just applied to new jobs?     → fill Google Form (sync runs automatically)
-Regular morning sending?      → --outreach-only (automated 9 AM)
-Overnight processing?         → backup + --find-only (automated 1 AM)
-Weekly freshness check?       → backup + --verify-only + --find-only (Mon 1 AM)
-Check quota health manually?  → --quota-report
-Reactivate exhausted company? → --reactivate "CompanyName"
-Import prospective companies? → --import-prospects prospects.txt
-Check prospective status?     → --prospects-status
-Monitor jobs + send digest?   → --monitor-jobs (automated 7 AM)
-View digest in terminal?      → --jobs-digest
-Detect ATS for all companies? → --detect-ats --batch
-Send weekly summary now?      → --weekly-summary
-Run priority enrichment?      → python enrich_ats_companies.py --priority
-Run daily enrichment?         → python enrich_ats_companies.py --daily
+Just applied to new jobs?          → fill Google Form (sync runs automatically)
+Regular morning sending?           → --outreach-only (automated 9 AM)
+Overnight processing?              → backup + --find-only → verify-filled (automated 1 AM)
+Weekly freshness check?            → backup + --verify-only + --find-only (Mon 1 AM)
+Check quota health manually?       → --quota-report
+Reactivate exhausted company?      → --reactivate "CompanyName"
+Import prospective companies?      → --import-prospects prospects.txt
+Check prospective status?          → --prospects-status
+Monitor jobs + send digest?        → --monitor-jobs (automated 7 AM)
+View digest in terminal?           → --jobs-digest
+Detect ATS for all companies?      → --detect-ats --batch
+Send weekly summary now?           → --weekly-summary
+Run verify-filled manually?        → python pipeline.py --verify-filled
+Run priority enrichment?           → python enrich_ats_companies.py --priority
+Run daily enrichment?              → python enrich_ats_companies.py --daily
 ```
 
 ---
@@ -735,6 +761,10 @@ Max data loss:       24 hours (daily backup cadence)
 □ Check Athena cost log: cat data/athena_costs.json
 □ Check Brave quota: cat data/brave_quota.json
 □ Check ATS discovery DB: python pipeline.py --monitor-status
+□ Review verify_filled_stats for high inconclusive rates:
+  SELECT date, verified, filled, active, inconclusive,
+         inconclusive_timeout, inconclusive_other_status, remaining
+  FROM verify_filled_stats ORDER BY date DESC LIMIT 7;
 ```
 
 ### Quarterly
@@ -763,6 +793,20 @@ Backup failed (nightly chain stopped):
   → If not mounted: sudo mount /dev/sdb /mnt/backups
   → Re-run manually: python scripts/backup_db.py
   → Check /etc/fstab entry is correct for auto-mount on reboot
+
+Verify-filled not cleaning up stale jobs:
+  → Check logs/verify_filled_YYYY-MM-DD.log
+  → High inconclusive_timeout → ATS may be blocking requests
+  → High inconclusive_other_status (403) → ATS bot detection triggered
+  → High remaining → increase VERIFY_FILLED_BATCH_SIZE in config.py
+  → Check stale job count manually:
+    SELECT COUNT(*) FROM job_postings WHERE consecutive_missing_days >= 3;
+
+Cron jobs not firing at expected times:
+  → Verify CRON_TZ is set: crontab -l | head -3
+  → Should show: CRON_TZ=America/New_York
+  → If missing: re-run bash setup_cron.sh
+  → Verify system timezone: timedatectl | grep "Time zone"
 
 VM not responding:
   → Oracle Console → Compute → Instances
@@ -805,7 +849,8 @@ Query performance with proper indexes:
 
 ```
 Retention policies (automatic):
-  → job descriptions cleared on expiry
+  → job descriptions cleared on expiry or when position filled
+  → filled job rows deleted after 7 days (verify-filled pipeline)
   → Old dismissed jobs deleted after 30 days
   → Old outreach records deleted per retention config
   → Old AI cache deleted after 21 days
@@ -862,6 +907,20 @@ Add to weekly checklist:
     df -h /mnt/backups
     ls -lh /mnt/backups/
 
+  □ Check verify-filled stats:
+    python -c "
+    import sqlite3
+    conn = sqlite3.connect('data/recruiter_pipeline.db')
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        'SELECT date, verified, filled, active, inconclusive, remaining '
+        'FROM verify_filled_stats ORDER BY date DESC LIMIT 7'
+    ).fetchall()
+    for r in rows:
+        print(dict(r))
+    conn.close()
+    "
+
   □ Alert if DB > 500 MB (early warning)
 ```
 
@@ -891,10 +950,12 @@ Add to weekly checklist:
 □ 12. Verify digest email received
 □ 13. Set up all cron jobs:
        chmod +x setup_cron.sh && ./setup_cron.sh
-□ 14. Verify cron running:
-       crontab -l
+□ 14. Verify crontab has CRON_TZ and correct schedule:
+       crontab -l | head -5
        grep CRON /var/log/syslog | tail -20
 □ 15. Test backup manually:
        python scripts/backup_db.py
        ls -lh /mnt/backups/
+□ 16. Test verify-filled manually (after first monitor run):
+       python pipeline.py --verify-filled
 ```

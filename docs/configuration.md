@@ -100,6 +100,38 @@ Prevents false alarms from one-off unusual days. 3 days of consistent pattern is
 
 ---
 
+## Gemini AI Rate Limit Settings
+
+```python
+DAILY_LIMITS = {
+    "gemini-2.5-flash-lite": 20,
+    "gemini-2.5-flash":      20,
+}
+
+RPM_LIMITS = {
+    "gemini-2.5-flash-lite": 10,   # max requests per minute
+    "gemini-2.5-flash":       5,   # max requests per minute
+}
+```
+
+These settings enforce two independent rate limits on every Gemini API call:
+
+1. **Daily limit** — tracked in the `model_usage` database table, persists across process restarts. If today's count for a model reaches its daily limit, that model is skipped for the rest of the day.
+
+2. **RPM limit** — tracked in-memory using a 60-second sliding window. If more than `RPM_LIMITS[model]` calls have been made in the last 60 seconds, the pipeline pauses for 60 seconds and retries rather than switching to a less capable model. This prevents hitting Google's per-minute quotas which became strictly enforced in early 2026.
+
+**Why RPM matters:**
+Even if you have daily quota remaining, sending too many requests in a single minute triggers API errors. The RPM enforcement makes the pipeline self-throttling — it slows down naturally when generating content for many companies at once rather than crashing with a quota error.
+
+**Current free tier limits (Google AI Studio as of 2026):**
+```
+gemini-2.5-flash-lite:  10 RPM,  250K TPM,  20 RPD
+gemini-2.5-flash:        5 RPM,  250K TPM,  20 RPD
+```
+If you upgrade to a paid Gemini plan with higher limits, increase these constants accordingly.
+
+---
+
 ## Data Retention Settings
 
 All values in days. Change here and all cleanup functions automatically use the new values.
@@ -124,6 +156,7 @@ RETENTION_MODEL_USAGE       = 21  # gemini usage history
 RETENTION_CAREERSHIFT_QUOTA = 30  # daily quota records
 RETENTION_QUOTA_ALERTS      = 30  # alert history
 RETENTION_MONITOR_STATS     = 60  # job monitoring daily stats
+RETENTION_VERIFY_FILLED_STATS = 60  # verify-filled daily stats
 ```
 
 **Important constraint:**
@@ -146,6 +179,35 @@ APPLICATION_AUTO_CLOSE_DAYS = 60
   → application_recruiters rows deleted for closed applications
   → Both run in same init_db() call, in order
 ```
+
+---
+
+## Verify Filled Settings
+
+Controls the `--verify-filled` pipeline that detects and removes job postings for positions that have been filled. This pipeline runs automatically at the end of every nightly chain (after `--find-only`) so you don't need to run it manually.
+
+```python
+VERIFY_FILLED_BATCH_SIZE   = 200  # max HTTP verifications per nightly run
+VERIFY_FILLED_MISSING_DAYS = 3    # days URL must be missing before verification
+VERIFY_FILLED_RETENTION    = 7    # days to keep confirmed-filled rows before deleting
+```
+
+**How this works in plain terms:**
+
+Every day during `--monitor-jobs`, the pipeline compares the list of jobs returned by each company's ATS API against the list of jobs already in the database. If a job URL that was in the database is no longer being returned by the API, it increments a counter (`consecutive_missing_days`) for that job.
+
+After 3 consecutive days of a URL being absent, `--verify-filled` picks up that job and makes a direct HTTP request to its URL:
+- If the URL returns a 404 error → the position is confirmed filled → row marked `filled`, description cleared
+- If the URL still loads → it was a temporary API glitch → counter reset to 0, job kept active
+- If the request times out or errors → inconclusive → retried the next night
+
+After 7 days as `filled`, the row is deleted entirely to keep the database clean.
+
+**Tuning `VERIFY_FILLED_BATCH_SIZE`:**
+At 200 jobs per run with a 1-second delay between requests, the verify step takes ~3-4 minutes. If your `remaining` count in `verify_filled_stats` is consistently high (many jobs waiting to be verified), increase this to 400-500. At 1000+ companies this may need to be 1000+.
+
+**Tuning `VERIFY_FILLED_MISSING_DAYS`:**
+3 days is conservative — avoids false positives from temporary API pagination gaps or rate limit responses that cause some jobs to be omitted from a single day's scan. Decrease to 2 for faster cleanup, increase to 5 if you're seeing too many false positives.
 
 ---
 
@@ -230,6 +292,18 @@ MAX_CONTACTS_HARD_CAP          = 3  # max recruiters to scrape per company
 MAX_RECRUITERS_PER_APPLICATION = 3  # max recruiters linked per application
 
 # ─────────────────────────────────────────
+# GEMINI AI RATE LIMIT SETTINGS
+# ─────────────────────────────────────────
+DAILY_LIMITS = {
+    "gemini-2.5-flash-lite": 20,
+    "gemini-2.5-flash":      20,
+}
+RPM_LIMITS = {
+    "gemini-2.5-flash-lite": 10,   # requests per minute
+    "gemini-2.5-flash":       5,   # requests per minute
+}
+
+# ─────────────────────────────────────────
 # QUOTA HEALTH MONITOR SETTINGS
 # ─────────────────────────────────────────
 QUOTA_UNDERUTILIZED_THRESHOLD = 0.40
@@ -249,6 +323,14 @@ RETENTION_MODEL_USAGE          = 21  # gemini usage history
 RETENTION_CAREERSHIFT_QUOTA    = 30  # daily quota records
 RETENTION_QUOTA_ALERTS         = 30  # alert history
 RETENTION_MONITOR_STATS        = 60  # job monitoring daily stats
+RETENTION_VERIFY_FILLED_STATS  = 60  # verify-filled daily stats
+
+# ─────────────────────────────────────────
+# VERIFY FILLED SETTINGS
+# ─────────────────────────────────────────
+VERIFY_FILLED_BATCH_SIZE   = 200  # max HTTP verifications per nightly run
+VERIFY_FILLED_MISSING_DAYS = 3    # days URL must be absent before verification
+VERIFY_FILLED_RETENTION    = 7    # days to keep confirmed-filled rows before delete
 
 # ─────────────────────────────────────────
 # SERPER API (ATS Detection — Phase 3b)

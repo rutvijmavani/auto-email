@@ -137,7 +137,7 @@ Cached job descriptions scraped from job posting URLs. Content stored compressed
 ---
 
 ### `model_usage`
-Tracks daily Gemini API call counts per model. Used to enforce daily limits locally before hitting the API.
+Tracks daily Gemini API call counts per model. Used to enforce daily limits locally before hitting the API. Works in combination with an in-memory RPM (requests-per-minute) sliding window to enforce both daily and per-minute limits simultaneously.
 
 | Column | Type | Description |
 |---|---|---|
@@ -148,6 +148,19 @@ Tracks daily Gemini API call counts per model. Used to enforce daily limits loca
 **Primary key:** `(model, date)`
 
 **Retention:** Auto-deleted after 21 days.
+
+**How daily + RPM limits work together:**
+Before every Gemini API call, the pipeline checks two things:
+1. **Daily limit** — reads `count` from this table. If today's count >= `DAILY_LIMITS[model]`, the model is skipped.
+2. **RPM limit** — checks an in-memory sliding window (last 60 seconds). If the number of calls in the last 60 seconds >= `RPM_LIMITS[model]`, the pipeline waits 60 seconds before retrying rather than silently skipping to a worse model.
+
+Both checks must pass before any API call is made. Current limits enforced:
+```text
+gemini-2.5-flash-lite:  20 calls/day,  10 calls/minute
+gemini-2.5-flash:       20 calls/day,   5 calls/minute
+```
+
+The RPM window is in-memory and resets on process restart — acceptable since RPM windows are 60 seconds, much shorter than any nightly run.
 
 ---
 
@@ -236,22 +249,69 @@ Job postings discovered by `--monitor-jobs`. Only new postings appear in daily P
 | `company` | TEXT | Company name |
 | `title` | TEXT | Job title |
 | `job_url` | TEXT UNIQUE | Job posting URL |
-| `content_hash` | TEXT | SHA256 of company+title+location (dedup key) |
+| `content_hash` | TEXT | SHA256 of company+title+location+job_id (dedup key) |
 | `location` | TEXT | Job location |
 | `posted_at` | TIMESTAMP | Original posting date (from ATS API) |
-| `description` | TEXT | Job description (cleared on expiry) |
+| `description` | TEXT | Job description (cleared on expiry or when filled) |
 | `skill_score` | INTEGER | Relevance score (0-100+) |
-| `status` | TEXT | `new` / `pre_existing` / `expired` / `dismissed` / `applied` |
-| `first_seen` | DATE | Date first detected by pipeline |
+| `status` | TEXT | `new` / `pre_existing` / `digested` / `expired` / `dismissed` / `applied` / `filled` |
+| `first_seen` | DATE NOT NULL | Date first detected by pipeline |
+| `consecutive_missing_days` | INTEGER | Days URL has been absent from API scan |
+| `stale_since` | DATE | Date when job first went missing from API scan |
 | `created_at` | TIMESTAMP | When inserted |
 
 **Status lifecycle:**
 ```text
-new          → expired     (auto: after 7 days, description cleared)
 new          → digested    (auto: after digest email sent successfully)
+new          → expired     (auto: after 7 days, description cleared)
 new          → dismissed   (manual: user dismissed from digest)
 new          → applied     (auto: when added via --add)
-pre_existing → (stays)     (first scan — not shown in digest)
+digested     → expired     (auto: after 7 days from first_seen, description cleared)
+pre_existing → (stays)     (first scan or stale date — not shown in digest)
+any active   → filled      (auto: URL confirmed 404/gone via --verify-filled)
+filled       → pre_existing (auto: URL reappears in API scan within 7-day window — reactivated)
+filled       → DELETE       (auto: after VERIFY_FILLED_RETENTION days from stale_since)
+```
+
+**Understanding `digested` vs `new`:**
+The pipeline accumulates all `status='new'` rows into the digest email. Only after the email is confirmed sent does it flip those rows to `status='digested'`. This means if the email send fails (e.g. SMTP error), the jobs stay `new` and will automatically be included in the next run's digest — nothing is lost. Once `digested`, rows age out the same as `new` (7 days → expired).
+
+**Understanding `filled` and reactivation:**
+When `--verify-filled` confirms a job URL returns 404, the row is marked `filled` and its description is cleared. The URL is kept for 7 days (`VERIFY_FILLED_RETENTION`) in case the job reappears — if it does within that window, the row is automatically reactivated to `pre_existing` with all counters reset. After 7 days as `filled` the row is deleted entirely, and if the same URL ever reappears after that it will be treated as a brand new posting and shown in the digest.
+
+**Content hash format (updated):**
+The content hash now includes the ATS job ID to prevent false duplicate matches. For example, Workday sometimes lists the same job title in multiple locations with identical `locationsText` but different internal job IDs — the old hash (company+title+location only) would incorrectly suppress the second posting. The new hash is:
+```text
+SHA256(company | title | location | job_id)
+```
+Where `job_id` comes directly from the ATS API response:
+- Greenhouse, Lever, Ashby, SmartRecruiters: `job.get("id")`
+- Oracle HCM: `job.get("Id")`
+- Workday: extracted from URL suffix (`_R164560` or `_JR-0104946`)
+- iCIMS: extracted from HTML href
+
+For backwards compatibility during rollout, `job_hash_exists()` checks both the new hash AND the old legacy hash (without job_id) so existing DB rows are still matched correctly and no duplicates are created.
+
+**`posted_at` reliability by platform (updated):**
+```text
+Greenhouse:      first_published  — RELIABLE ✓ (previously None — now fixed)
+Lever:           createdAt        — RELIABLE ✓ (Unix ms timestamp)
+Ashby:           publishedAt      — RELIABLE ✓
+SmartRecruiters: releasedDate     — RELIABLE ✓
+Workday:         postedOn         — RELIABLE ✓ (parsed from human-readable strings)
+Oracle HCM:      PostedDate       — RELIABLE ✓
+iCIMS:           HTML / JSON-LD   — RELIABLE ✓ (populated after fetch_job_detail call)
+```
+
+**Workday `postedOn` human-readable parsing:**
+Workday returns date strings in plain English rather than ISO format. The parser handles all known formats. Critically, human-readable strings are checked BEFORE the ISO format check — this is important because the capital "T" in "Posted Today" would incorrectly trigger the ISO datetime parser if checked in the wrong order:
+```text
+"Posted Today"         → today's date
+"Posted Yesterday"     → yesterday's date
+"Posted 3 Days Ago"    → 3 days ago
+"Posted 30+ Days Ago"  → 30 days ago (conservative estimate)
+"MM/DD/YYYY"           → parsed as date
+ISO format string      → parsed as datetime (checked last)
 ```
 
 **Indexes:**
@@ -262,10 +322,11 @@ UNIQUE idx_job_postings_hash      ON content_hash (WHERE NOT NULL)
 
 **Retention:**
 ```text
-new       → expired after 7 days (description cleared, URL kept forever)
-dismissed → deleted after 30 days
-applied   → deleted immediately (already in applications table)
-expired   → kept forever (prevents re-showing same jobs)
+new/digested  → expired after 7 days (description cleared, URL kept forever)
+filled        → deleted after VERIFY_FILLED_RETENTION (7) days from stale_since
+dismissed     → deleted after 30 days
+applied       → deleted immediately (already in applications table)
+expired       → kept forever (prevents re-showing same jobs)
 ```
 
 ---
@@ -297,6 +358,36 @@ Coverage rate:        companies_with_results / companies_monitored
 Filter match rate:    jobs_matched_filters / total_jobs_fetched
 Pipeline reliability: runs with pdf_generated=1 / total_runs (7 days)
 ```
+
+---
+
+### `verify_filled_stats`
+Daily performance metrics for `--verify-filled` runs. Tracks how many stale job URLs were verified and what happened to each one. Useful for diagnosing whether filled position cleanup is working correctly and whether any ATS platforms are blocking verification requests.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `date` | DATE NOT NULL UNIQUE | YYYY-MM-DD |
+| `verified` | INTEGER | Total jobs verified this run |
+| `filled` | INTEGER | Confirmed gone (404 or terminal redirect) |
+| `active` | INTEGER | Still live — counter reset (false positive) |
+| `inconclusive` | INTEGER | Total inconclusive (all reasons combined) |
+| `inconclusive_timeout` | INTEGER | HTTP request timed out |
+| `inconclusive_conn_error` | INTEGER | Connection error (DNS failure, server down) |
+| `inconclusive_other_status` | INTEGER | Unexpected HTTP status (e.g. 403, 500) |
+| `inconclusive_exception` | INTEGER | Unexpected exception during request |
+| `remaining` | INTEGER | Stale jobs not processed this run (backlog) |
+| `run_duration_secs` | INTEGER | Total run time in seconds |
+| `created_at` | TIMESTAMP | When row created |
+
+**Retention:** Auto-deleted after `RETENTION_VERIFY_FILLED_STATS` (60 days). Configurable in `config.py`.
+
+**Reading the inconclusive breakdown:**
+- High `inconclusive_timeout` → ATS servers are slow or blocking direct requests with timeouts
+- High `inconclusive_conn_error` → network issues on the VM, or ATS blocks by IP
+- High `inconclusive_other_status` → common if ATS returns 403 (bot detection) or 500 (server error)
+- High `inconclusive_exception` → unexpected code error, check logs for details
+- High `remaining` → batch size (200) is too small for current stale job volume; increase `VERIFY_FILLED_BATCH_SIZE` in config.py
 
 ---
 
@@ -436,11 +527,13 @@ All retention values are configured in `config.py` and enforced at startup via `
 | `application_recruiters` | Deleted when application closes | Cascades from `_cleanup_auto_close_applications` in same `init_db()` run |
 | `prospective_companies` | Permanent | Never deleted |
 | `monitor_stats` | 60 days | `date < now - 60 days` (`RETENTION_MONITOR_STATS`) |
+| `verify_filled_stats` | 60 days | `date < now - 60 days` (`RETENTION_VERIFY_FILLED_STATS`) |
 | `job_postings` (expired URLs) | Permanent | URL kept to prevent re-showing |
 | `outreach` (sent) | 30 days | `sent_at < now - 30 days` (`RETENTION_OUTREACH_SENT`) |
 | `outreach` (pending) | 30 days | `scheduled_for < now - 30 days` |
 | `outreach` (failed/bounced/cancelled) | 30 days | `created_at < now - 30 days` |
-| `job_postings` (new→expired) | 7 days | `first_seen < now - 7 days` (description cleared) |
+| `job_postings` (new/digested→expired) | 7 days | `first_seen < now - 7 days` (description cleared) |
+| `job_postings` (filled→deleted) | 7 days | `stale_since < now - VERIFY_FILLED_RETENTION days` (row deleted entirely) |
 | `job_postings` (dismissed) | 30 days | `first_seen < now - 30 days` |
 | `ai_cache` | 21 days | `expires_at <= now` |
 | `jobs` | 21 days | `created_at < now - 21 days` |
@@ -451,10 +544,12 @@ All retention values are configured in `config.py` and enforced at startup via `
 
 **Cleanup execution order in `init_db()`:**
 ```text
-1. _cleanup_auto_close_applications     ← mark applications closed first
+1. _cleanup_auto_close_applications       ← mark applications closed first
 2. _cleanup_closed_application_recruiters ← then clean up their recruiter links
-3. _cleanup_monitor_stats               ← independent, order doesn't matter
-4. (all other existing cleanup functions)
+3. _cleanup_monitor_stats                 ← independent, order doesn't matter
+4. _cleanup_verify_filled_stats           ← independent, order doesn't matter
+5. _cleanup_job_postings                  ← handles new→expired, digested→expired, filled→delete, dismissed→delete
+6. (all other existing cleanup functions)
 ```
 
 ---
@@ -479,12 +574,17 @@ prospective_companies (1)
     → converted to applications (--add) → top recruiters linked then
 
 job_postings (many) ← --monitor-jobs
-    → PDF digest (daily 8 AM email)
+    → PDF digest (daily 7 AM email) → mark_postings_digested()
     → applied: moves to applications table
+    → filled: confirmed gone via --verify-filled → deleted after 7 days
 
 monitor_stats (1 per day) ← --monitor-jobs
     → pipeline health metrics
     → 7-day reliability score
+
+verify_filled_stats (1 per day) ← --verify-filled
+    → filled position cleanup metrics
+    → inconclusive breakdown for diagnosing ATS blocks
 ```
 
 ---
@@ -506,6 +606,7 @@ prospective_companies  ~137               ~0.1 MB
 job_postings (active)  ~2,000             ~6 MB
 job_postings (expired) ~50,000            ~12 MB
 monitor_stats          ~60 (rolling)      ~0.05 MB
+verify_filled_stats    ~60 (rolling)      ~0.01 MB
 ─────────────────────────────────────────────────
 Total DB size          ~22 MB (6 months)
 

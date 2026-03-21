@@ -4,7 +4,7 @@
 
 The job monitoring pipeline automatically scans career pages of all companies
 in your target list daily, finds newly posted jobs matching your profile, and
-delivers a PDF digest to your inbox every morning at 8 AM. The goal is to
+delivers a PDF digest to your inbox every morning at 7 AM. The goal is to
 apply to positions within hours of posting — before competition builds up and
 while the recruiter is actively reviewing applications.
 
@@ -45,7 +45,7 @@ prospects.txt (137 companies)
          ↓
 prospective_companies table (DB source of truth)
          ↓
---monitor-jobs (daily 8 AM)
+--monitor-jobs (daily 7 AM)
          ↓
 ATS Detection (one-time per company, cached in DB)
   Phase 1: ATS sitemap lookup (free, instant)
@@ -59,11 +59,17 @@ Client-side filtering (title → seniority → skills → USA)
          ↓
 Freshness check (URL + content hash)
          ↓
+URL presence tracking (increment/reset consecutive_missing_days)
+         ↓
 job_postings table
          ↓
 PDF generation (grouped by company)
          ↓
-Email with PDF attachment (8 AM daily)
+Email with PDF attachment (7 AM daily) → mark_postings_digested()
+         ↓
+--verify-filled (nightly 1 AM, after find-only)
+         ↓
+HTTP verification of stale URLs → 404 → status='filled' → deleted after 7 days
 ```
 
 ---
@@ -141,6 +147,10 @@ Signal 2 — HTML fingerprint:
   Scan page source for ATS domain patterns:
   "myworkdayjobs.com", "greenhouse.io", etc.
   → Extract slug from embed URL ✓
+
+  Also handles Greenhouse embed format:
+  job-boards.greenhouse.io/embed/job_board?for=Databricks
+  → slug extracted from ?for= query parameter → "databricks" ✓
 ```
 
 Works for non-JavaScript-rendered pages (~30% of remaining companies).
@@ -214,15 +224,25 @@ Endpoint:   GET https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=t
 Auth:       None
 Cost:       Free forever
 Rate limit: None documented
-Date field: updated_at — UNRELIABLE (changes on every edit)
-Response:   id, title, updated_at, location, absolute_url, content
+Date field: first_published — RELIABLE (original publish date, never changes)
+            (previously used updated_at which is UNRELIABLE — changes on every edit)
+job_id:     job.get("id") — integer
+Response:   id, title, first_published, location, absolute_url, content
 Companies:  Stripe, Doordash, Coinbase, Robinhood, Databricks,
             Snowflake, Pinterest, Okta, Palo Alto Networks,
             Nutanix, DocuSign, Pure Storage, Twilio, Block,
             Figma, Notion, Dropbox, Instacart and more
 
-Freshness:  first_seen + content_hash approach
-            (updated_at not used for freshness — unreliable)
+URL formats:
+  Standard:  boards.greenhouse.io/{slug}
+             job-boards.greenhouse.io/{slug}
+  Embed:     job-boards.greenhouse.io/embed/job_board?for=Databricks
+             → slug extracted from ?for= query parameter
+
+Freshness:  first_published used for date comparison ✓
+            (Greenhouse jobs now get the same 3-day freshness window
+             as other platforms — previously all Greenhouse jobs were
+             treated as always-fresh due to unreliable updated_at)
 ```
 
 #### Lever
@@ -232,6 +252,7 @@ Auth:       None
 Cost:       Free forever
 Rate limit: None documented
 Date field: createdAt — RELIABLE (Unix timestamp, never changes)
+job_id:     job.get("id") — UUID string
 Response:   id, text, createdAt, categories, descriptionPlain, hostedUrl
 Companies:  Netflix, Waymo, Cruise, Lyft, Spotify, Airtable and more
 
@@ -245,6 +266,7 @@ Auth:       None
 Cost:       Free forever
 Rate limit: None documented
 Date field: publishedAt — RELIABLE (original publish date)
+job_id:     job.get("id") — UUID string
 Response:   id, title, publishedAt, location, descriptionHtml, jobUrl
 Companies:  Linear, Vercel, Loom, Retool, Ramp, Brex,
             Modern Treasury and more
@@ -258,6 +280,7 @@ Endpoint:   GET https://api.smartrecruiters.com/v1/companies/{slug}/postings
 Auth:       None for public jobs
 Cost:       Free
 Date field: releasedDate — RELIABLE
+job_id:     job.get("id") — integer string
 Response:   id, title, location, releasedDate, department, description
 Companies:  Starbucks, Visa, Bosch and more
 
@@ -266,19 +289,36 @@ Freshness:  releasedDate used directly for date comparison ✓
 
 #### Workday (undocumented public API)
 ```text
-Endpoint:   GET https://{company}.{wd}.myworkdayjobs.com/wday/cxs/
+Endpoint:   POST https://{company}.{wd}.myworkdayjobs.com/wday/cxs/
                 {company}/{path}/jobs
 Auth:       None required (used by Workday career page frontend)
+            Requires full browser headers — plain User-Agent causes
+            empty results on page 2+ (pagination breaks)
 Cost:       Free
 Risk:       Undocumented — could change without notice
-Date field: postedOn — RELIABLE (original posting date)
-Response:   title, postedOn, locationsText, externalUrl, bulletFields
+Date field: postedOn — RELIABLE (human-readable strings)
+job_id:     extracted from URL suffix (_R164560 or _JR-0104946)
+Response:   title, postedOn, locationsText, externalPath, bulletFields
 Companies:  Capital One (wd12), Goldman Sachs, Citibank, BlackRock,
             Mastercard, American Express, Morgan Stanley, Visa,
-            Wells Fargo, Bank of America, Charles Schwab, State Street
+            Wells Fargo, Bank of America, Charles Schwab, State Street,
+            JPMorgan Chase (via Workday), Target, Walmart, Zoom, Zillow
 Variants:   wd1-wd8, wd10, wd12 tried during detection
 Path:       Varies per company — discovered via Google search
             e.g. Capital One → /Capital_One (not /careers)
+
+postedOn string formats parsed (in order — human-readable checked FIRST):
+  "Posted Today"         → today's date
+  "Posted Yesterday"     → yesterday's date
+  "Posted 3 Days Ago"    → 3 days ago
+  "Posted 30+ Days Ago"  → 30 days ago (conservative estimate)
+  "MM/DD/YYYY"           → exact date
+  ISO format             → parsed as datetime (checked LAST to avoid
+                           false match on "T" in "Posted Today")
+
+Pagination: driven by job count comparison (stop when len(page) < limit)
+  Oracle HCM response structure: items[0].requisitionList contains all jobs
+  hasMore field is always False — do NOT use for pagination
 
 Freshness:  postedOn used directly for date comparison ✓
 ```
@@ -287,16 +327,27 @@ Freshness:  postedOn used directly for date comparison ✓
 ```text
 Endpoint:   GET https://{slug}.fa.oraclecloud.com/hcmRestApi/resources/
                 latest/recruitingCEJobRequisitions?
-                finder=CandidateExperience&
-                CandidateExperienceId={site_id}
+                finder=findReqs;siteNumber={site_id},limit={limit},
+                offset={offset},sortBy=POSTING_DATES_DESC
 Auth:       None required (public job postings API)
 Cost:       Free
 Date field: PostedDate — RELIABLE (original posting date) ✓✓✓
-Response:   Title, PostedDate, PrimaryLocation, ExternalJobId
+job_id:     job.get("Id") — integer (public-facing URL ID)
+            Note: "Id" (capital I) is the correct field — ExternalJobId
+            and RequisitionId are NULL for most tenants including JPMorgan
+Response:   Id, Title, PostedDate, PrimaryLocation
 Companies:  JPMorgan Chase (jpmc/CX_1001), Goldman Sachs,
             and other enterprise/financial companies
 Discovery:  slug + site_id extracted from Google search result
             Cannot be guessed — requires Google detection
+
+URL format: /hcmUI/CandidateExperience/en/sites/{site_id}/job/{Id}
+  Oracle job URLs use /job/{Id} (not /jobs/preview/{Id})
+  Both redirect to the same page, but /job/ is canonical
+
+Pagination: Oracle wraps all jobs in items[0].requisitionList
+  hasMore is always False — use job count comparison instead
+  limit=100 per page for efficiency (was 25 — changed to reduce API calls)
 
 Freshness:  PostedDate used directly for date comparison ✓
 ```
@@ -576,9 +627,12 @@ Priority 4 — Location (USA only):
   Accept: "united states", "usa", "u.s.",
           "remote", any US city/state,
           2-letter state abbreviations (NY, CA etc.)
-  Reject: "canada", "uk", "india", "germany",
-          "australia", "singapore" etc.
-  Default: include if location unclear
+          ATS prefixes: US-CA-Menlo Park, USA-TX-Plano
+  Reject: known non-US ATS prefixes (DE-, CA-, PL-, CR- etc.)
+          country names in string (india, canada, united kingdom etc.)
+  Default: INCLUDE if location is unclear
+           (e.g. "2 Locations", "Stockholm", "Virtual")
+           Better to show a false positive than miss a US job
 ```
 
 ### Relevance scoring
@@ -591,54 +645,105 @@ score += 3  if posted yesterday
 score += 1  if posted 2-3 days ago
 
 # Jobs sorted by score DESC within each company group
-```text
+```
 
 ---
 
 ## Freshness Detection
 
-### The Greenhouse problem
-```
+### The Greenhouse problem (now fixed)
+```text
 Greenhouse updated_at changes on every edit:
   → Job posted 6 months ago, edited yesterday
   → updated_at = yesterday
   → Looks fresh but is actually old
 
-Solution: Do NOT use updated_at for freshness
-  → Use first_seen + content_hash instead
-```text
+Old solution: Do NOT use updated_at for freshness
+  → Relied on first_seen + content_hash instead
+  → All Greenhouse jobs always treated as "fresh"
+
+New solution: Use first_published instead
+  → first_published is set once when job is created
+  → Never changes on edit
+  → Greenhouse jobs now get proper 3-day freshness window
+  → A job posted 6 months ago will correctly be saved
+     as 'pre_existing' instead of flooding the digest
+```
 
 ### Two-layer deduplication
-```
-Layer 1 — URL check:
-  Job URL already in job_postings table
-  (any status including 'expired') → SKIP
-  → Handles: same job seen before
+```text
+Layer 1 — URL check (job_url_exists):
+  Job URL already in job_postings table (any status) → SKIP or REACTIVATE
+  Specifically:
+    exists=True, is_filled=False → duplicate, skip silently
+    exists=True, is_filled=True  → job reappeared after being filled
+                                   → REACTIVATE to pre_existing
+    exists=False                 → new URL, proceed
 
-Layer 2 — Content hash check:
-  hash = SHA256(company + normalized_title + location)
+Layer 2 — Content hash check (job_hash_exists):
   Hash already in job_postings table → SKIP
-  → Handles: same job reposted with new URL
-  → Handles: Greenhouse URL changes on edit
+  → Handles: same job reposted with new URL but same job_id
+  → Checks BOTH new hash (with job_id) AND legacy hash (without job_id)
+    for backwards compatibility during rollout
 
 Both layers must pass for job to be "new"
+```
+
+### Content hash (updated)
 ```text
+Old hash: SHA256(company + normalized_title + location)
+  Problem: Same job title at same company in two different locations
+           would produce the same hash → second posting suppressed
+
+New hash: SHA256(company + normalized_title + location + job_id)
+  job_id comes from ATS API directly:
+    Greenhouse/Lever/Ashby/SmartRec: job.get("id")
+    Oracle HCM:                      job.get("Id")
+    Workday:                         extracted from URL (_R164560)
+    iCIMS:                           extracted from HTML href
+
+  This means two genuinely different job openings for the same
+  role in the same city (e.g. two "Software Engineer" openings
+  in New York) will have different hashes and both appear in your
+  digest — as intended.
+```
 
 ### Date-based freshness (when reliable date available)
-```
-Lever, Ashby, SmartRecruiters, Workday:
+```text
+Greenhouse, Lever, Ashby, SmartRecruiters, Workday, Oracle HCM:
   posted_at available and reliable
-  → If (today - posted_at) > JOB_MONITOR_DAYS_FRESH
+  → If (today - posted_at) > JOB_MONITOR_DAYS_FRESH (3 days)
     → Store as 'pre_existing', don't show in digest
 
-Greenhouse:
-  updated_at unreliable
+iCIMS:
+  posted_at populated after fetch_job_detail() call
+  → If fetch_job_detail succeeds → same freshness check applies
+  → If fetch_job_detail fails → posted_at = None → treat as fresh
+
+No date available (posted_at = None):
   → Rely on first_seen only
-  → No date-based freshness check
+  → Treat as fresh (trust that URL deduplication handles repeats)
+```
+
+### Digest lifecycle
 ```text
+Jobs accumulate as status='new' throughout the day.
+
+get_new_postings_for_digest():
+  Returns ALL status='new' rows (no date filter).
+  If the previous night's email failed to send, those jobs
+  remain 'new' and will be included tonight — nothing is lost.
+
+After email confirmed sent:
+  mark_postings_digested() → status='new' → status='digested'
+
+After 7 days (whether new or digested):
+  _cleanup_job_postings() → status='expired', description=NULL
+  URL kept forever to prevent re-showing the same job later.
+```
 
 ### First run per company
-```
+```text
 CRITICAL edge case:
   First time we scan a company →
   All 50-200 existing jobs appear as "new"
@@ -651,14 +756,38 @@ Solution:
   → Only jobs seen AFTER first scan = truly new
   → Track: prospective_companies.first_scanned_at
   → If first_scanned_at IS NULL → first run
+```
+
+### URL presence tracking (new)
 ```text
+During every --monitor-jobs run, for each company:
+  1. Build fetched_urls = {job["job_url"] for job in raw_jobs}
+     (raw_jobs = full API response BEFORE title/location filtering)
+  2. tracked = get_tracked_urls_for_company(company)
+     (all non-expired, non-dismissed job_postings for this company)
+  3. present_ids = URLs in both fetched and tracked
+     → reset_missing_days(present_ids) → consecutive_missing_days = 0
+  4. missing_ids = URLs in tracked but NOT in fetched
+     → increment_missing_days(missing_ids) → consecutive_missing_days += 1
+
+  IMPORTANT: raw_jobs used (not matched/filtered jobs) so a US job
+  that doesn't match your title filter doesn't get incorrectly
+  counted as "missing from API" — it was fetched, just not relevant.
+
+  This also runs when raw_jobs is empty (company returned 0 jobs)
+  so all tracked jobs for that company get their missing counter
+  incremented correctly.
+
+After 3 consecutive missing days:
+  --verify-filled picks up the job for HTTP verification.
+```
 
 ---
 
 ## Edge Cases
 
 ### ATS Detection
-```
+```text
 E1: Wrong slug matches wrong company (e.g. "capital" → Capital Group)
     → Confidence scoring catches this:
       "capital" on Lever → 0% confidence for "Capital One"
@@ -686,178 +815,212 @@ E3: Detection during hiring freeze (0 jobs, correct ATS)
 E4: Workday URL variant (wd1/wd2/wd3/wd5)
     → Try all 4 variants during detection
     → Store exact URL that worked
-```text
+
+E5: Greenhouse embed URL format
+    → job-boards.greenhouse.io/embed/job_board?for=Databricks
+    → Slug extracted from ?for= query parameter
+    → Resolves to same API endpoint as standard format ✓
+```
 
 ### API Calls
-```
-E5: API pagination
+```text
+E6: API pagination
     → Greenhouse/Lever may paginate for large companies
     → Always fetch all pages before filtering
     → Critical: missing page 2+ = missing jobs
+    → Oracle HCM: uses job count comparison, not hasMore field
+    → Workday: requires full browser headers for stable pagination
 
-E6: API rate limiting (429)
+E7: API rate limiting (429)
     → Exponential backoff: wait 60s, retry once
     → If still fails → skip company today
     → Log: company skipped due to rate limit
     → Do NOT mark as ATS failure
 
-E7: API timeout
+E8: API timeout
     → 10 second timeout per request
     → If timeout → skip company today
     → Do NOT mark as ATS failure
 
-E8: Malformed JSON response
+E9: Malformed JSON response
     → Log parsing error
     → Skip company today
     → If 3 consecutive parse failures
       → mark ats_platform = 'needs_redetection'
 
-E9: Partial run failure (VM crash mid-run)
+E10: Partial run failure (VM crash mid-run)
     → Track last_checked_at per company
     → On restart → only process companies
       where last_checked_at < today
     → Prevents duplicate processing
-```text
+```
 
 ### Job Data
-```
-E10: Empty job title
+```text
+E11: Empty job title
      → Skip — can't filter without title
 
-E11: Empty job description
+E12: Empty job description
      → Title filter still works
      → Skill score = 0
      → Include with lower score
 
-E12: Job posted and removed same day
+E13: Job posted and removed same day
      → We detect and show → user applies
      → Position may already be cancelled
      → Can't prevent → document as known limitation
+     → verify-filled will detect the 404 within 3 days
 
-E13: Duplicate job across ATS platforms
+E14: Duplicate job across ATS platforms
      → content_hash deduplication handles this ✓
 
-E14: Non-English job title
+E15: Non-English job title
      → Normalize: lowercase + strip accents
        before keyword matching
 
-E15: Location field variations
+E16: Location field variations
      → "Remote, USA" / "United States" / "Anywhere"
      → All normalized to US location ✓
+     → "2 Locations" / "Stockholm" → included by default
+       (false positives accepted over missing US jobs)
 
-E16: Special characters in title/description
+E17: Special characters in title/description
      → Sanitize before PDF rendering
      → Replace problematic Unicode chars
-```text
+
+E18: Job reappears after being marked filled
+     → Within 7-day retention window:
+       job_url_exists() returns (True, is_filled=True)
+       → reactivate to pre_existing, reset counters
+       → Not shown in digest (not a new posting)
+     → After 7-day deletion:
+       job_url_exists() returns (False, False)
+       → treated as brand new → shown in digest as new
+```
 
 ### PDF Generation
-```
-E17: 0 jobs match filters
+```text
+E19: 0 jobs match filters
      → Don't generate PDF
      → Send brief email: "No matching jobs today"
 
-E18: PDF generation fails (reportlab error)
+E20: PDF generation fails (reportlab error)
      → Catch exception
      → Send plain text email with job list
      → Log error
+     → Jobs stay status='new' → included in next digest
 
-E19: Disk full during PDF write
+E21: Disk full during PDF write
      → Catch IOError
      → Log error + send text email
      → Check disk space before generation
 
-E20: Very large PDF (200+ jobs)
+E22: Very large PDF (200+ jobs)
      → 200 jobs ≈ 20 pages ≈ 2-3 MB
      → Gmail limit 25 MB → no concern ✓
-```text
+```
 
 ---
 
 ## Performance Metrics
 
 ### Why metrics are critical
-```
+```text
 This is the entry pipeline. If it fails silently:
   → You never see relevant job postings
   → You apply late → lower response rate
   → Every downstream pipeline loses effectiveness
 
 Metrics catch silent failures before they compound.
-```text
+```
 
 ### Metrics tracked per run
 
 #### Metric 1 — Detection Coverage
-```
+```text
 Formula: companies_with_results / total_monitored
 Target:  ≥ 70%
 Alert:   < 70% for 3 consecutive days
 Meaning: How many companies returned at least 1 job?
          Low value = ATS detection issues or
          widespread API failures
-```text
+```
 
 #### Metric 2 — ATS Known Rate
-```
+```text
 Formula: companies_with_known_ats / total_companies
 Target:  ≥ 80%
 Alert:   < 80%
 Meaning: What % of companies have confirmed ATS?
          Low value = many companies unmonitored
-```text
+```
 
 #### Metric 3 — Filter Match Rate
-```
+```text
 Formula: jobs_matched_filters / total_jobs_fetched
 Target:  5% - 40%
 Alert:   < 5% (filters too strict)
          > 60% (filters too loose)
 Meaning: Are our title/skill filters calibrated?
-```text
+```
 
 #### Metric 4 — New Job Rate
-```
+```text
 Formula: new_jobs_found / total_jobs_fetched
 Target:  varies by season
 Meaning: Hiring activity indicator
          Low in Nov-Dec (off-season) → normal
          Low in Jan-Mar (peak) → pipeline issue
-```text
+```
 
 #### Metric 5 — Pipeline Reliability
-```
+```text
 Formula: successful_runs / total_runs (last 7 days)
 Target:  ≥ 90%
 Alert:   < 90%
 Meaning: How often does --monitor-jobs complete?
          Tracks VM stability and API availability
-```text
+```
 
 #### Metric 6 — API Failure Rate
-```
+```text
 Formula: api_failures / total_api_calls
 Target:  < 10%
 Alert:   > 10% for 3 consecutive days
 Meaning: Are APIs degrading or rate limiting us?
-```text
+```
 
 #### Metric 7 — Application Conversion Rate (future)
-```
+```text
 Formula: jobs_applied / jobs_shown_in_digest
 Target:  TBD after data collected
 Meaning: Quality of job recommendations
          Requires tracking which digest jobs
          you actually applied to
-```text
+```
 
 #### Metric 8 — Time to Apply (future)
-```
+```text
 Formula: avg(applied_date - posted_date) in hours
 Target:  < 24 hours
 Meaning: Are you applying fast enough?
          Measures effectiveness of early
          application strategy
+```
+
+#### Metric 9 — Verify Filled Effectiveness (new)
 ```text
+Formula: filled / verified (from verify_filled_stats)
+Target:  varies — depends on hiring market activity
+Meaning: What % of verified stale jobs are actually gone?
+         High value (>50%) → many positions being filled → active market
+         Low value (<10%)  → mostly false positives → consider increasing
+                             VERIFY_FILLED_MISSING_DAYS to reduce noise
+
+Also track: inconclusive / verified
+  High inconclusive rate → ATS platforms may be blocking verification
+  requests. Check inconclusive_other_status for 403 responses.
+```
 
 ### DB schema for metrics
 ```sql
@@ -875,6 +1038,22 @@ CREATE TABLE IF NOT EXISTS monitor_stats (
     pdf_generated          INTEGER DEFAULT 0,
     email_sent             INTEGER DEFAULT 0,
     created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS verify_filled_stats (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                      DATE NOT NULL UNIQUE,
+    verified                  INTEGER DEFAULT 0,
+    filled                    INTEGER DEFAULT 0,
+    active                    INTEGER DEFAULT 0,
+    inconclusive              INTEGER DEFAULT 0,
+    inconclusive_timeout      INTEGER DEFAULT 0,
+    inconclusive_conn_error   INTEGER DEFAULT 0,
+    inconclusive_other_status INTEGER DEFAULT 0,
+    inconclusive_exception    INTEGER DEFAULT 0,
+    remaining                 INTEGER DEFAULT 0,
+    run_duration_secs         INTEGER DEFAULT 0,
+    created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
@@ -896,21 +1075,23 @@ Weekly summary email (Mondays):
 
 ## DB Schema
 
-### job_postings table
+### job_postings table (updated)
 ```sql
 CREATE TABLE IF NOT EXISTS job_postings (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    company      TEXT NOT NULL,
-    title        TEXT NOT NULL,
-    job_url      TEXT NOT NULL UNIQUE,
-    content_hash TEXT,
-    location     TEXT,
-    posted_at    TIMESTAMP,
-    description  TEXT,
-    skill_score  INTEGER DEFAULT 0,
-    status       TEXT DEFAULT 'new',
-    first_seen   DATE NOT NULL,
-    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    company                  TEXT NOT NULL,
+    title                    TEXT NOT NULL,
+    job_url                  TEXT NOT NULL UNIQUE,
+    content_hash             TEXT,
+    location                 TEXT,
+    posted_at                TIMESTAMP,
+    description              TEXT,
+    skill_score              INTEGER DEFAULT 0,
+    status                   TEXT DEFAULT 'new',
+    first_seen               DATE NOT NULL,
+    consecutive_missing_days INTEGER DEFAULT 0,
+    stale_since              DATE,
+    created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_job_postings_hash
@@ -919,7 +1100,11 @@ WHERE content_hash IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_job_postings_status_seen
 ON job_postings(status, first_seen);
-```text
+```
+
+New columns added:
+- `consecutive_missing_days` — incremented each day the URL is absent from API scan, reset when URL reappears
+- `stale_since` — date when job first went missing; used as the clock start for the 7-day filled retention window
 
 ### prospective_companies table (updated)
 ```sql
@@ -933,7 +1118,7 @@ ALTER TABLE prospective_companies
   ADD COLUMN consecutive_empty_days INTEGER DEFAULT 0;
 ```
 
-### Retention policy
+### Retention policy (updated)
 ```text
 job_postings cleanup (runs in init_db()):
 
@@ -942,6 +1127,17 @@ job_postings cleanup (runs in init_db()):
     SET status = 'expired', description = NULL
     WHERE status = 'new'
     AND first_seen < DATE('now', '-7 days')
+
+  Archive expired digested postings (same 7-day window):
+    UPDATE job_postings
+    SET status = 'expired', description = NULL
+    WHERE status = 'digested'
+    AND first_seen < DATE('now', '-7 days')
+
+  Delete confirmed-filled positions:
+    DELETE FROM job_postings
+    WHERE status = 'filled'
+    AND stale_since < DATE('now', '-7 days')
 
   Delete old dismissed:
     DELETE FROM job_postings
@@ -1024,7 +1220,12 @@ MONITOR_ATS_UNKNOWN_ALERT     = 0.20  # alert if > 20% unknown ATS
 MONITOR_RELIABILITY_ALERT     = 0.90  # alert if < 90% runs succeed
 MONITOR_MATCH_RATE_LOW_ALERT  = 0.05  # alert if < 5% jobs match
 MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% jobs match
-```text
+
+# Verify filled settings
+VERIFY_FILLED_BATCH_SIZE   = 200  # max HTTP verifications per nightly run
+VERIFY_FILLED_MISSING_DAYS = 3    # days URL must be absent before verification
+VERIFY_FILLED_RETENTION    = 7    # days to keep confirmed-filled rows before delete
+```
 
 ---
 
@@ -1066,7 +1267,7 @@ Page 2+ — Grouped by company (score sorted within group)
   │  Skills: Python, AWS                  │
   │  https://careers.google.com/...       │
   └────────────────────────────────────────┘
-```text
+```
 
 ---
 
@@ -1075,6 +1276,9 @@ Page 2+ — Grouped by company (score sorted within group)
 ```bash
 # Run job monitoring + send PDF digest
 python pipeline.py --monitor-jobs
+
+# Verify stale job URLs and mark filled positions
+python pipeline.py --verify-filled
 
 # Detect ATS for all undetected/stale companies
 python pipeline.py --detect-ats
@@ -1103,23 +1307,26 @@ jobs/
   ats/
     __init__.py
     base.py              → shared HTTP logic, retry, timeout
-    patterns.py          → ATS URL patterns + slug validation
-    greenhouse.py        → Greenhouse API client
+    patterns.py          → ATS URL patterns + slug validation (incl. Greenhouse embed)
+    greenhouse.py        → Greenhouse API client (uses first_published)
     lever.py             → Lever API client
     ashby.py             → Ashby API client
     smartrecruiters.py   → SmartRecruiters API client
-    workday.py           → Workday API client
-    oracle_hcm.py        → Oracle HCM API client (JPMorgan etc.)
+    workday.py           → Workday API client (human-readable date parsing)
+    oracle_hcm.py        → Oracle HCM API client (uses Id field, pagination fixed)
+    icims.py             → iCIMS HTML scraping client
   google_detector.py     → Google search + URL extraction
   ats_detector.py        → detection orchestrator (Google+API)
-  job_filter.py          → filter + score jobs
-  job_monitor.py         → run() entry point
+  job_filter.py          → filter + score jobs, content hash (includes job_id)
+  job_monitor.py         → run() entry point + URL presence tracking
+  fill_verifier.py       → --verify-filled entry point, HTTP verification
   job_fetcher.py         → existing (unchanged)
   form_sync.py           → existing (unchanged)
 
 db/
   job_monitor.py         → DB ops for job_postings +
-                           monitor_stats tables
+                           monitor_stats + verify_filled_stats tables
+  quota.py               → Gemini daily + RPM quota tracking
 
 outreach/
   report_templates/
@@ -1138,12 +1345,20 @@ tests/
 ## Cron Schedule (updated)
 
 ```bash
-# Daily 8 AM — monitor jobs + send PDF digest
-0 8 * * * cd /home/ubuntu/mail && \
-  source venv/bin/activate && \
-  python pipeline.py --monitor-jobs \
-  >> logs/monitor_$(date +\%Y-\%m-\%d).log 2>&1
-```text
+CRON_TZ=America/New_York
+
+# Daily 7 AM — monitor jobs + send PDF digest + track URL presence
+0 7 * * * /home/opc/mail/run_monitor.sh
+
+# Nightly 1 AM Tue-Sun — sync → backup → find-only → verify-filled
+0 1 * * 2-7 /home/opc/mail/run_nightly.sh
+
+# Nightly 1 AM Mon — sync → backup → verify-only → find-only → verify-filled
+0 1 * * 1 /home/opc/mail/run_monday.sh
+
+# Monthly 1 AM 1st — sync → backup → find → slugs → enrich → VACUUM → verify-filled
+0 1 1 * * /home/opc/mail/run_monthly.sh
+```
 
 ---
 
@@ -1151,82 +1366,97 @@ tests/
 
 ```
 Phase 1 — DB + Config:
-  db/schema.py        → add job_postings + monitor_stats tables
+  db/schema.py        → add job_postings + monitor_stats + verify_filled_stats tables
                       → add columns to prospective_companies
-  config.py           → add all monitoring config constants
+                      → add consecutive_missing_days + stale_since to job_postings
+  config.py           → add all monitoring + verify-filled config constants
 
 Phase 2 — ATS clients:
   jobs/ats/base.py        → shared HTTP logic, retry, timeout
-  jobs/ats/greenhouse.py  → Greenhouse API client
+  jobs/ats/greenhouse.py  → Greenhouse API client (first_published date)
   jobs/ats/lever.py       → Lever API client
   jobs/ats/ashby.py       → Ashby API client
   jobs/ats/smartrecruiters.py
-  jobs/ats/workday.py     → Workday undocumented API
+  jobs/ats/workday.py     → Workday undocumented API (human-readable date parsing)
+  jobs/ats/oracle_hcm.py  → Oracle HCM (Id field, pagination fix)
 
 Phase 3 — ATS detection:
+  jobs/ats/patterns.py    → add Greenhouse embed URL pattern (?for= format)
   jobs/ats_detector.py    → confidence scoring buffer
-                          → try ALL platforms x ALL slugs
-                          → score: confidence% x log10(jobs+1)
                           → classify: detected/close_call/unknown
-                          → tie-break by date reliability
                           → re-detection logic
                           → manual override support
 
   outreach/report_templates/detection_report.py
                           → detection summary email
-                          → close calls + unknowns batched
-                          → verify URLs + override commands
 
 Phase 4 — Job filtering:
   jobs/job_filter.py      → title/seniority/skills/location
                           → relevance scoring
-                          → content hash generation
-                          → US location detection
+                          → content hash generation (includes job_id)
+                          → legacy hash for backwards compatibility
 
 Phase 5 — DB operations:
   db/job_monitor.py       → save_job_posting()
-                          → get_new_postings()
-                          → mark_pre_existing()
-                          → cleanup_expired_postings()
+                          → get_new_postings_for_digest()
+                          → mark_postings_digested()
+                          → get_tracked_urls_for_company()
+                          → increment_missing_days()
+                          → reset_missing_days()
+                          → mark_job_filled()
+                          → reactivate_job()
+                          → get_stale_jobs()
                           → save_monitor_stats()
-                          → get_monitor_stats()
+                          → save_verify_filled_stats()
 
 Phase 6 — Orchestrator:
   jobs/job_monitor.py     → run() entry point
+                          → URL presence tracking per company
                           → coordinate all above
                           → track metrics
                           → handle all edge cases
 
-Phase 7 — PDF + Email:
+Phase 7 — Verify Filled:
+  jobs/fill_verifier.py   → HTTP verification of stale URLs
+                          → 404 → mark_job_filled()
+                          → 200 → reset_missing_days()
+                          → inconclusive breakdown stats
+                          → save_verify_filled_stats()
+
+Phase 8 — PDF + Email:
   outreach/report_templates/monitor_report.py
-                          → PDF generation (reportlab)
+                          → PDF digest generation (reportlab)
                           → grouped by company
                           → pipeline health section
                           → email with attachment
 
-Phase 8 — Pipeline integration:
+Phase 9 — Pipeline integration:
   pipeline.py             → --monitor-jobs flag
+                          → --verify-filled flag
                           → --detect-ats flag
                           → --monitor-status flag
 
-Phase 9 — Tests:
+Phase 10 — Tests:
   tests/test_job_monitor.py
                           → ATS client tests (mocked HTTP)
                           → ATS detection logic
                           → Job filtering + scoring
-                          → Freshness detection
-                          → Content hash deduplication
+                          → Freshness detection (including Greenhouse fix)
+                          → Content hash deduplication (new + legacy)
                           → First run pre_existing logic
+                          → URL presence tracking
+                          → Verify-filled HTTP verification
+                          → Job reactivation
                           → DB retention cleanup
                           → Metrics calculation
                           → Edge case coverage
-```text
+```
 
 ---
 
 ## Known Limitations
 
-```
+```text
 1. Big tech custom pages not monitored
    (Google, Apple, Microsoft, Amazon, Meta)
    → Add custom scrapers as future enhancement
@@ -1234,11 +1464,12 @@ Phase 9 — Tests:
 2. API cache delay (2-4 hours)
    Some APIs cache responses
    → Job posted at 8 AM may not appear until 10 AM
-   → We see it next day at 8 AM (24 hour delay max)
+   → We see it next day at 7 AM (24 hour delay max)
 
 3. Job posted and immediately removed
    → We show it, you apply, position cancelled
    → Can't prevent — rare occurrence
+   → verify-filled will detect the 404 within 3 days
 
 4. Workday API undocumented
    → Could change without notice
@@ -1247,9 +1478,24 @@ Phase 9 — Tests:
 5. No duplicate detection across ATS platforms
    → Same role posted on multiple platforms
    → Content hash handles same-platform duplicates
-   → Cross-platform handled by company+title+location hash
+   → Cross-platform: company+title+location+job_id hash
+     (job_id differs per platform so cross-platform dedup
+      falls back to URL check only)
 
 6. Application conversion tracking
    → Metrics 7 and 8 require future implementation
    → Need to track which digest jobs you applied to
-```text
+
+7. verify-filled may miss some filled positions
+   → ATS platforms sometimes return 403 (bot detection)
+     for direct URL verification requests
+   → These show as inconclusive_other_status
+   → Jobs stay in stale state until ATS allows verification
+   → Eventually deleted after VERIFY_FILLED_RETENTION days
+     regardless of whether 404 was confirmed
+
+8. Location filter accepts ambiguous locations
+   → "2 Locations", "Stockholm", "Virtual" included by default
+   → Filter manually if non-US jobs appear in digest
+   → Preference: show false positives over missing US jobs
+```
