@@ -21,6 +21,7 @@ from db.db import (
     increment_missing_days,
     reset_missing_days,
     mark_job_filled,
+    save_verify_filled_stats,
 )
 from config import (
     VERIFY_FILLED_BATCH_SIZE,
@@ -93,17 +94,16 @@ def _is_job_gone(url):
             return False
 
         # Other codes → inconclusive
-        return None
+        return f"status_{r.status_code}"
 
     except requests.exceptions.Timeout:
-        logger.debug("Timeout verifying %s", url)
-        return None
+        return "timeout"
     except requests.exceptions.ConnectionError:
-        logger.debug("Connection error verifying %s", url)
-        return None
+        return "conn_error"
     except Exception as e:
         logger.debug("Error verifying %s: %s", url, e)
-        return None
+        return "exception"
+
 
 
 def run():
@@ -116,6 +116,8 @@ def run():
     logger.info("════════════════════════════════════════")
     logger.info("--verify-filled starting")
 
+    start_time = time.time() 
+
     init_db()
 
     stale_jobs = get_stale_jobs(VERIFY_FILLED_MISSING_DAYS)
@@ -123,7 +125,26 @@ def run():
     if not stale_jobs:
         logger.info("No stale jobs to verify")
         print("[INFO] No stale jobs to verify.")
-        return {"verified": 0, "filled": 0, "active": 0, "inconclusive": 0}
+        duration = int(time.time() - start_time)
+        final_stats = {
+            "verified":                  0,
+            "filled":                    0,
+            "active":                    0,
+            "inconclusive":              0,
+            "inconclusive_timeout":      0,
+            "inconclusive_conn_error":   0,
+            "inconclusive_other_status": 0,
+            "inconclusive_exception":    0,
+            "remaining":                 0,
+            "run_duration_secs":         duration,
+        }
+        save_verify_filled_stats(final_stats)
+        logger.info(
+            "--verify-filled complete: verified=0 filled=0 active=0 "
+            "inconclusive=0 remaining=0 duration=%ds",
+            duration,
+        )
+        return final_stats
 
     # Process up to VERIFY_FILLED_BATCH_SIZE jobs
     batch = stale_jobs[:VERIFY_FILLED_BATCH_SIZE]
@@ -137,7 +158,11 @@ def run():
     verified     = 0
     filled_count = 0
     active_count = 0
-    inconclusive = 0
+    inconclusive              = 0
+    inconclusive_timeout      = 0
+    inconclusive_conn_error   = 0
+    inconclusive_other_status = 0
+    inconclusive_exception    = 0
 
     for i, job in enumerate(batch, 1):
         job_id  = job["id"]
@@ -155,17 +180,26 @@ def run():
         if result is True:
             mark_job_filled(job_id)
             filled_count += 1
-            logger.info("FILLED: %r | %s | %s", company, title, url)
             print(f"   [FILLED] Confirmed gone")
         elif result is False:
             reset_missing_days([job_id])
             active_count += 1
-            logger.info("ACTIVE: %r | %s", company, title)
             print(f"   [ACTIVE] Still live — reset counter")
         else:
+            # Breakdown by reason
+            if result == "timeout":
+                inconclusive_timeout += 1
+                print(f"   [SKIP] Timeout")
+            elif result == "conn_error":
+                inconclusive_conn_error += 1
+                print(f"   [SKIP] Connection error")
+            elif result and result.startswith("status_"):
+                inconclusive_other_status += 1
+                print(f"   [SKIP] Unexpected status: {result.replace('status_', '')}")
+            else:
+                inconclusive_exception += 1
+                print(f"   [SKIP] Exception")
             inconclusive += 1
-            logger.debug("INCONCLUSIVE: %r | %s", company, url)
-            print(f"   [SKIP] Inconclusive — keeping stale")
 
         # Polite delay between requests
         time.sleep(1)
@@ -182,16 +216,27 @@ def run():
               f"will process in future runs")
     print(f"{'='*55}")
 
+    duration = int(time.time() - start_time)
+
+    final_stats = {
+        "verified":                  verified,
+        "filled":                    filled_count,
+        "active":                    active_count,
+        "inconclusive":              inconclusive,
+        "inconclusive_timeout":      inconclusive_timeout,
+        "inconclusive_conn_error":   inconclusive_conn_error,
+        "inconclusive_other_status": inconclusive_other_status,
+        "inconclusive_exception":    inconclusive_exception,
+        "remaining":                 remaining,
+        "run_duration_secs":         duration,
+    }
+
+    save_verify_filled_stats(final_stats)
     logger.info(
         "--verify-filled complete: verified=%d filled=%d "
-        "active=%d inconclusive=%d remaining=%d",
-        verified, filled_count, active_count, inconclusive, remaining
+        "active=%d inconclusive=%d remaining=%d duration=%ds",
+        verified, filled_count, active_count,
+        inconclusive, remaining, duration,
     )
 
-    return {
-        "verified":     verified,
-        "filled":       filled_count,
-        "active":       active_count,
-        "inconclusive": inconclusive,
-        "remaining":    remaining,
-    }
+    return final_stats

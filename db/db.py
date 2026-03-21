@@ -168,6 +168,7 @@ from db.job_monitor import (
     mark_job_filled,
     get_tracked_urls_for_company,
     reactivate_job,
+    save_verify_filled_stats,
 )
 
 # ─────────────────────────────────────────
