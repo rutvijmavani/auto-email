@@ -439,7 +439,7 @@ def mark_job_filled(job_id):
             UPDATE job_postings
             SET status = 'filled',
                 description = NULL,
-                stale_since = COALESCE(stale_since, ?)
+                stale_since = ?
             WHERE id = ?
         """, (today, job_id))
         conn.commit()

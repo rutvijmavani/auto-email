@@ -161,6 +161,18 @@ def run():
         logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
         stats["total_jobs_fetched"] += len(raw_jobs)
 
+        # Track URL presence BEFORE early return on empty results
+        fetched_urls = {job["job_url"] for job in raw_jobs}
+        tracked      = get_tracked_urls_for_company(company)
+        present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
+        missing_ids  = [tracked[url] for url in tracked if url not in fetched_urls]
+        if present_ids:
+            reset_missing_days(present_ids)
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
+
         between_companies_delay()
 
         if not raw_jobs:
@@ -220,7 +232,9 @@ def run():
                 logger.info("NEW JOB: %r | %s | %s",
                             company, job.get("title"), job.get("location"))
 
-        fetched_urls = {job["job_url"] for job in matched}
+        # Track URL presence — build from raw_jobs not matched
+        # so filtering doesn't cause false "missing" increments
+        fetched_urls = {job["job_url"] for job in raw_jobs}
         tracked      = get_tracked_urls_for_company(company)
 
         present_ids = [

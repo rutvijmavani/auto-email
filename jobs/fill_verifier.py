@@ -68,8 +68,24 @@ def _is_job_gone(url):
 
         # Redirected to a generic page → likely gone
         if r.url != url:
-            final_url = r.url.lower()
-            if any(pattern in final_url for pattern in GONE_PATTERNS):
+            from urllib.parse import urlparse
+
+            original = urlparse(url)
+            final = urlparse(r.url)
+            original_path = original.path.rstrip("/").lower()
+            final_path = final.path.rstrip("/").lower()
+            final_query = final.query.lower()
+
+            redirected_to_terminal_page = (
+                final_path in {"/jobs", "/careers"}
+                or "not-found" in final_path
+                or "expired" in final_path
+                or final_query in {"error=true", "error=1", "error=404"}
+            )
+
+            if redirected_to_terminal_page and (
+                final.netloc != original.netloc or final_path != original_path
+            ):
                 return True
 
         # 200 with content → still active
