@@ -278,7 +278,7 @@ def init_db():
             description              TEXT,
             skill_score              INTEGER DEFAULT 0,
             status                   TEXT DEFAULT 'new',
-            first_seen               DATE,
+            first_seen               DATE NOT NULL,
             consecutive_missing_days INTEGER DEFAULT 0,
             stale_since              DATE,
             created_at               TIMESTAMP DEFAULT CURRENT_TIMESTAMP

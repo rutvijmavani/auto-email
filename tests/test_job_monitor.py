@@ -1072,15 +1072,19 @@ class TestJobMonitorDB(unittest.TestCase):
         cleanup_db(TEST_DB)
 
     def test_url_not_exists_initially(self):
-        self.assertFalse(db_module.job_url_exists("https://nonexistent.com/1"))
+        exists, _ = db_module.job_url_exists("https://nonexistent.com/1")
+        self.assertFalse(exists)
 
     def test_url_exists_after_insert(self):
         db_module.save_job_posting(_make_job())
-        self.assertTrue(db_module.job_url_exists("https://stripe.com/jobs/1"))
+        exists, _ = db_module.job_url_exists("https://stripe.com/jobs/1")
+        self.assertTrue(db_module.job_url_exists(exists))
 
     def test_url_exists_for_pre_existing(self):
         db_module.save_job_posting(_make_job(), status="pre_existing")
-        self.assertTrue(db_module.job_url_exists("https://stripe.com/jobs/1"))
+        exists, is_filled = db_module.job_url_exists("https://stripe.com/jobs/1")
+        self.assertTrue(exists)
+        self.assertFalse(is_filled)
 
     def test_url_exists_for_expired(self):
         db_module.save_job_posting(_make_job())
@@ -1088,7 +1092,9 @@ class TestJobMonitorDB(unittest.TestCase):
         conn.execute("UPDATE job_postings SET status='expired'")
         conn.commit()
         conn.close()
-        self.assertTrue(db_module.job_url_exists("https://stripe.com/jobs/1"))
+        exists, is_filled = db_module.job_url_exists("https://stripe.com/jobs/1")
+        self.assertTrue(exists)
+        self.assertFalse(is_filled)
 
     def test_hash_not_exists_initially(self):
         self.assertFalse(db_module.job_hash_exists("abc123"))
