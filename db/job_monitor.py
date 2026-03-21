@@ -479,7 +479,7 @@ def mark_job_filled(job_id):
         """, (today, job_id))
         conn.commit()
     finally:
-        conn.close())
+        conn.close()
 
 
 def get_tracked_urls_for_company(company):
