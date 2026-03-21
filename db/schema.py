@@ -16,6 +16,7 @@ from config import (
     RETENTION_MONITOR_STATS,
     APPLICATION_AUTO_CLOSE_DAYS,
     VERIFY_FILLED_RETENTION,
+    RETENTION_VERIFY_FILLED_STATS,
 )
 
 def _cleanup_monitor_stats(c):
@@ -89,6 +90,14 @@ def _cleanup_job_postings(c):
         WHERE status = 'filled'
         AND stale_since < DATE('now', ?)
     """, (f"-{VERIFY_FILLED_RETENTION} days",))
+
+
+def _cleanup_verify_filled_stats(c):
+    """Delete verify_filled_stats older than retention period."""
+    c.execute("""
+        DELETE FROM verify_filled_stats
+        WHERE date < DATE('now', ?)
+    """, (f"-{RETENTION_VERIFY_FILLED_STATS} days",))
 
 
 def _cleanup_outreach(c):
@@ -383,6 +392,24 @@ def init_db():
     """)
 
     c.execute("""
+        CREATE TABLE IF NOT EXISTS verify_filled_stats (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            date                DATE NOT NULL,
+            verified            INTEGER DEFAULT 0,
+            filled              INTEGER DEFAULT 0,
+            active              INTEGER DEFAULT 0,
+            inconclusive        INTEGER DEFAULT 0,
+            inconclusive_timeout      INTEGER DEFAULT 0,
+            inconclusive_conn_error   INTEGER DEFAULT 0,
+            inconclusive_other_status INTEGER DEFAULT 0,
+            inconclusive_exception    INTEGER DEFAULT 0,
+            remaining           INTEGER DEFAULT 0,
+            run_duration_secs   INTEGER DEFAULT 0,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    c.execute("""
         CREATE INDEX IF NOT EXISTS
         idx_pipeline_alerts_type_platform
         ON pipeline_alerts(alert_type, platform, created_at)
@@ -449,6 +476,7 @@ def init_db():
     _cleanup_careershift_quota(c)
     _cleanup_quota_alerts(c)
     _cleanup_monitor_stats(c)
+    _cleanup_verify_filled_stats(c)
     conn.commit()
     conn.close()
     print("[OK] Database initialized: data/recruiter_pipeline.db")

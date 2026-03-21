@@ -375,6 +375,42 @@ def save_monitor_stats(stats):
         conn.close()
 
 
+def save_verify_filled_stats(stats):
+    """
+    Save --verify-filled run stats.
+    Uses INSERT OR REPLACE to handle re-runs on same day.
+    """
+    conn = get_conn()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        conn.execute("""
+            INSERT OR REPLACE INTO verify_filled_stats
+              (date, verified, filled, active,
+               inconclusive,
+               inconclusive_timeout,
+               inconclusive_conn_error,
+               inconclusive_other_status,
+               inconclusive_exception,
+               remaining, run_duration_secs)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            today,
+            stats.get("verified",                  0),
+            stats.get("filled",                    0),
+            stats.get("active",                    0),
+            stats.get("inconclusive",              0),
+            stats.get("inconclusive_timeout",      0),
+            stats.get("inconclusive_conn_error",   0),
+            stats.get("inconclusive_other_status", 0),
+            stats.get("inconclusive_exception",    0),
+            stats.get("remaining",                 0),
+            stats.get("run_duration_secs",         0),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_monitor_stats(days=7):
     """Return last N days of monitor stats."""
     conn = get_conn()
