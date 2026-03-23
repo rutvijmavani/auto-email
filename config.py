@@ -45,6 +45,9 @@ RETENTION_QUOTA_ALERTS         = 30
 RETENTION_MONITOR_STATS        = 60
 RETENTION_VERIFY_FILLED_STATS  = 60
 APPLICATION_AUTO_CLOSE_DAYS    = 60
+RETENTION_COVERAGE_STATS       = 60
+RETENTION_API_HEALTH           = 60
+RETENTION_PIPELINE_ALERTS      = 30
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
@@ -94,6 +97,8 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 METRIC1_ALERT_THRESHOLD       = 50   # find-only performance % (Red)
 METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
 METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires
+API_FAILURE_RATE_THRESHOLD     = 0.10 # api_failures / requests_made
+API_FAILURE_CONSECUTIVE_DAYS   = 3
 
 # ─────────────────────────────────────────
 # JOB MONITORING SETTINGS

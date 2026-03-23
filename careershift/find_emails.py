@@ -27,7 +27,6 @@ from db.db import (
     get_pending_prospective,
     mark_prospective_scraped,
     mark_prospective_exhausted,
-    get_domain_for_prospective
 )
 from careershift.constants import SESSION_FILE, MIN_RECRUITERS_PER_COMPANY
 from careershift.utils import human_delay
@@ -69,8 +68,7 @@ def _save_contacts(contacts, company, applications):
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
             recruiter_id = existing_id
-            #logger.debug("Recruiter already in DB: %s (id=%s)", contact["email"], recruiter_id)
-            logger.debug("Recruiter already in DB: id=%s company=%r", recruiter_id, company)
+            logger.debug("Recruiter already in DB: %s (id=%s)", contact["email"], recruiter_id)
             print(f"   [SKIP] Already in DB: {contact['email']} (id={recruiter_id})")
         else:
             recruiter_id = add_recruiter(
@@ -80,9 +78,8 @@ def _save_contacts(contacts, company, applications):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            #logger.info("Saved recruiter: %s | %s (company=%r)",
-            #            contact["name"], contact["email"], company)
-            logger.info("Saved recruiter id=%s for company=%r", recruiter_id, company)
+            logger.info("Saved recruiter: %s | %s (company=%r)",
+                        contact["name"], contact["email"], company)
             print(f"   [DB] Saved: {contact['name']} | {contact['email']}")
 
         for app in matching_apps:
@@ -94,16 +91,31 @@ def _save_contacts(contacts, company, applications):
 
 def _save_prospective_contacts(contacts, company):
     """
-    Save prospective recruiter contacts to DB at company level only.
-    No placeholder application created — recruiters are stored in the
-    recruiters table and linked to a real application only when user
-    applies via --add.
-    Returns True if at least one contact was saved, False otherwise.
+    Save prospective recruiter contacts to DB under a placeholder application.
+    When user later applies (--add), the placeholder converts to real application.
+    Returns True if contacts were saved successfully, False otherwise.
     """
-    saved = 0
+    from db.db import add_application
+
+    # Create placeholder application for this prospective company
+    placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
+    logger.debug("Creating placeholder application for prospective company %r", company)
+    app_id, _ = add_application(
+        company=company,
+        job_url=placeholder_url,
+        job_title=None,
+        status_override="prospective",
+    )
+
+    if not app_id:
+        logger.warning("Could not create placeholder application for %r", company)
+        print(f"   [WARNING] Could not create placeholder for {company}")
+        return False
+
     for contact in contacts:
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
+            recruiter_id = existing_id
             logger.debug("Prospective recruiter already in DB: %s", contact["email"])
             print(f"   [SKIP] Already in DB: {contact['email']}")
         else:
@@ -114,15 +126,11 @@ def _save_prospective_contacts(contacts, company):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            if recruiter_id:
-                logger.info("Saved prospective recruiter: %s | %s (company=%r)",
-                            contact["name"], contact["email"], company)
-                print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
-                saved += 1
+            logger.info("Saved prospective recruiter: %s | %s (company=%r)",
+                        contact["name"], contact["email"], company)
+            print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
 
-    if not saved and not any(recruiter_email_exists(c["email"]) for c in contacts):
-        logger.warning("_save_prospective_contacts: no contacts saved for %r", company)
-        return False
+        link_recruiter_to_application(app_id, recruiter_id)
 
     return True
 
@@ -332,8 +340,8 @@ def run():
                     logger.info("Prospective scrape: %r (max_extra=%d)", company, max_extra)
                     print(f"\n[INFO] Prospective: {company} (max {max_extra})")
 
-                    prospective_domain = get_domain_for_prospective(company)
-                    contacts = scrape_company(page, company, max_extra, prospective_domain)
+                    contacts = scrape_company(page, company, max_extra, "")
+
                     if contacts is None:
                         logger.info("Prospective %r — weak signal, skipping", company)
                         print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
@@ -371,6 +379,65 @@ def run():
                 _prospective_stats.get("exhausted", 0))
     print(f"\n{'='*55}")
     print(f"[OK] Done! Quota used: {quota_used}/50 | Remaining: {remaining_after}/50")
+
+    # ─────────────────────────────────────────
+    # COVERAGE STATS — metric1 + metric2
+    # Both metrics are computed for yesterday's applications only.
+    # find-only runs at 1 AM EST so "yesterday" is the previous calendar day.
+    # ─────────────────────────────────────────
+    try:
+        from datetime import date, timedelta
+        from db.applications import get_applications_by_date
+        from db.application_recruiters import get_sendable_count_for_date
+        from db.alerts import save_coverage_stats
+
+        yesterday     = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday_apps = get_applications_by_date(yesterday)
+        total_apps    = len(yesterday_apps)
+
+        # metric1 — find-only performance (Step 2 companies only)
+        companies_attempted = len(companies_to_scrape)
+        auto_found   = sum(1 for s in _scrape_stats if s["status"] == "found")
+        exhausted_count = sum(1 for s in _scrape_stats if s["status"] == "exhausted")
+        rejected_count  = 0  # reserved for future implementation
+
+        metric1 = (
+            round((auto_found / companies_attempted) * 100, 1)
+            if companies_attempted > 0 else None
+        )
+
+        # metric2 — outreach coverage (yesterday's applications with
+        # at least one active recruiter linked)
+        sendable = get_sendable_count_for_date(yesterday)
+        metric2  = (
+            round((sendable / total_apps) * 100, 1)
+            if total_apps > 0 else None
+        )
+
+        coverage_stats = {
+            "total_applications":  total_apps,
+            "companies_attempted": companies_attempted,
+            "auto_found":          auto_found,
+            "rejected_count":      rejected_count,
+            "exhausted_count":     exhausted_count,
+            "metric1":             metric1,
+            "metric2":             metric2,
+        }
+
+        save_coverage_stats(coverage_stats)
+        logger.info(
+            "Coverage stats saved: date=today yesterday=%s "
+            "total_apps=%d attempted=%d auto_found=%d "
+            "exhausted=%d metric1=%s metric2=%s",
+            yesterday, total_apps, companies_attempted,
+            auto_found, exhausted_count, metric1, metric2,
+        )
+        print(f"[INFO] Coverage stats: metric1={metric1}% metric2={metric2}%")
+
+    except Exception as e:
+        # Never block the main pipeline on stats failure
+        logger.error("Coverage stats save failed: %s", e, exc_info=True)
+
     logger.info("════ --find-only finished ════")
 
     return {

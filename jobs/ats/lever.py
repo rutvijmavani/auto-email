@@ -15,7 +15,8 @@ def detect(company):
     """
     for slug in slugify(company):
         data = fetch_json(BASE_URL.format(slug=slug),
-                          params={"mode": "json"})
+                          params={"mode": "json"},
+                          platform="lever", track=False)  # detection — don't track
         if data is None:
             continue
         if not isinstance(data, list):
@@ -36,7 +37,8 @@ def fetch_jobs(slug, company):
     Returns list of normalized job dicts.
     """
     data = fetch_json(BASE_URL.format(slug=slug),
-                      params={"mode": "json"})
+                      params={"mode": "json"},
+                      platform="lever")  # tracked for api_health
     if not data or not isinstance(data, list):
         return []
     return [_normalize(j, company) for j in data if j.get("text")]

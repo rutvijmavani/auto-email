@@ -490,28 +490,147 @@ Before exhausting — check metrics:
 ## New DB Tables Required
 
 ### coverage_stats
+
+Tracks daily recruiter pipeline performance. Written by `--find-only` and read by `--performance-report` and the alert system. One row per day (UNIQUE on date).
+
 ```sql
 CREATE TABLE IF NOT EXISTS coverage_stats (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     date                DATE NOT NULL UNIQUE,
-    total_applications  INTEGER,
-    companies_attempted INTEGER,
-    auto_found          INTEGER,
-    rejected_count      INTEGER,
-    exhausted_count     INTEGER,
-    metric1             REAL,
-    metric2             REAL,
+    total_applications  INTEGER,   -- active applications that day
+    companies_attempted INTEGER,   -- companies where scraping was tried
+    auto_found          INTEGER,   -- companies where auto-confidence recruiters found
+    rejected_count      INTEGER,   -- companies where buffer discarded (domain mismatch etc.)
+    exhausted_count     INTEGER,   -- companies marked exhausted (no CareerShift data)
+    metric1             REAL,      -- find-only performance %
+    metric2             REAL,      -- outreach coverage %
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
 ON coverage_stats(date);
 ```
 
-### applications table — new columns
+**Implementation status:** Schema created and deployed. `metric1` and `metric2` are currently always NULL — the writer in `careershift/find_emails.py` has not been implemented yet. When implemented, this table will be populated at the end of every `--find-only` run.
+
+**Retention:** No cleanup function yet. Add `RETENTION_COVERAGE_STATS` to `config.py` and `_cleanup_coverage_stats()` in `db/schema.py` when the writer is added. Suggested value: 60 days (same as `monitor_stats`).
+
+---
+
+### api_health
+
+Tracks per-platform ATS API reliability during `--monitor-jobs` runs. One row per platform per day (UNIQUE on date+platform). Designed to surface degrading APIs — e.g. a platform returning 429s all morning would show up here immediately rather than silently causing an empty digest.
+
 ```sql
-ALTER TABLE applications ADD COLUMN expected_domain TEXT;
-ALTER TABLE applications ADD COLUMN exhausted_at TIMESTAMP;
+CREATE TABLE IF NOT EXISTS api_health (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    date            DATE    NOT NULL,
+    platform        TEXT    NOT NULL,   -- e.g. 'greenhouse', 'workday', 'lever'
+
+    -- Request counts
+    requests_made   INTEGER DEFAULT 0,  -- total API calls attempted
+    requests_ok     INTEGER DEFAULT 0,  -- 200 responses
+    requests_429    INTEGER DEFAULT 0,  -- rate limit responses
+    requests_404    INTEGER DEFAULT 0,  -- not found (detection miss)
+    requests_error  INTEGER DEFAULT 0,  -- timeouts, connection errors, malformed JSON
+
+    -- Timing (milliseconds)
+    avg_response_ms INTEGER DEFAULT 0,
+    max_response_ms INTEGER DEFAULT 0,
+    total_ms        INTEGER DEFAULT 0,
+
+    -- Rate limit details
+    first_429_at    TIMESTAMP,          -- when first rate limit hit occurred
+    backoff_total_s INTEGER DEFAULT 0,  -- total seconds spent in backoff/retry
+
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, platform)
+);
+CREATE INDEX IF NOT EXISTS idx_api_health_date_platform
+ON api_health(date, platform);
 ```
+
+**Key derived metrics:**
+```text
+Success rate:    requests_ok / requests_made        (target > 90%)
+Rate limit rate: requests_429 / requests_made       (target < 5%)
+Error rate:      requests_error / requests_made     (target < 10%)
+Avg backoff/req: backoff_total_s / requests_made
+```
+
+**Why this matters in practice:**
+```text
+Without api_health — Greenhouse API returns 429 all morning:
+  You see: 0 new jobs from 40 Greenhouse companies
+  You think: nobody posted today
+  Reality: you missed all of them silently
+
+With api_health — same event:
+  You see: requests_made=40, requests_ok=0,
+           requests_429=40, backoff_total_s=2400
+  → Shown in PDF digest health section
+  → pipeline_alerts row created → email alert sent
+```
+
+**Implementation status:** Schema created and deployed. All columns are currently 0 — the writer in `jobs/job_monitor.py` has not been implemented yet. When implemented, a row will be upserted per platform at the end of each `--monitor-jobs` run.
+
+**Retention:** No cleanup function yet. Add `RETENTION_API_HEALTH` to `config.py` and `_cleanup_api_health()` in `db/schema.py` when the writer is added. Suggested value: 60 days (same as `monitor_stats`).
+
+---
+
+### pipeline_alerts
+
+Unified alert table for all pipeline-level threshold breaches. Designed as a single place where any automated alert is recorded and tracked before being emailed. More flexible than the recruiter-specific `quota_alerts` table — covers job monitoring failures, ATS API degradation, recruiter pipeline performance drops, and any other configurable threshold.
+
+```sql
+CREATE TABLE IF NOT EXISTS pipeline_alerts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_type   TEXT    NOT NULL,   -- e.g. 'metric1_low', 'api_failure_rate'
+    severity     TEXT    NOT NULL,   -- 'warning' or 'critical'
+    platform     TEXT,               -- ATS platform if platform-specific, else NULL
+    value        REAL,               -- actual metric value that triggered alert
+    threshold    REAL,               -- threshold that was breached
+    message      TEXT,               -- human-readable description
+    notified     INTEGER DEFAULT 0,  -- 0 = email not sent, 1 = email sent
+    notified_at  TIMESTAMP,          -- when email was sent
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Planned alert types:**
+```text
+metric1_low      → find-only performance < 50% for 3 consecutive days
+metric2_low      → outreach coverage < 60% for 3 consecutive days
+api_failure_rate → platform error rate > 10% for 3 consecutive days
+api_rate_limited → platform 429 rate causing backoff > threshold
+coverage_drop    → --monitor-jobs companies_with_results / companies_monitored < 70%
+```
+
+**Alert email format:**
+```
+Subject: Pipeline Performance Alert - Action Required
+
+FIND-ONLY PERFORMANCE (Metric 1) - DEGRADED
+  2026-02-26: 3/6 companies found (50%)
+  2026-02-27: 2/6 companies found (33%)
+  2026-02-28: 2/5 companies found (40%)
+
+  Average: 41% - below 50% threshold
+
+Most exhausted companies (last 7 days):
+  - Collective: buffer domain mismatch
+  - Stripe: no exact match found
+  - Linear: low confidence, 0 exact matches
+
+Recommendation:
+  Review CAREERSHIFT_HIGH_CONFIDENCE (currently 90)
+  Review CAREERSHIFT_MEDIUM_CONFIDENCE (currently 70)
+  Or manually reactivate exhausted applications:
+    python pipeline.py --reactivate "Collective"
+```
+
+**Implementation status:** Schema created and deployed. Nothing writes to this table yet. Will be populated by `--find-only`, `--monitor-jobs`, and a future `--performance-report` command once `coverage_stats` and `api_health` writers are in place.
+
+**Retention:** No cleanup function yet. Add `RETENTION_PIPELINE_ALERTS` to `config.py` and `_cleanup_pipeline_alerts()` in `db/schema.py` when implemented. Suggested value: 30 days (same as `quota_alerts`).
 
 ---
 
@@ -536,6 +655,13 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 METRIC1_ALERT_THRESHOLD       = 50   # find-only performance % (Red)
 METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
 METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires
+
+# ─────────────────────────────────────────
+# DATA RETENTION (add when writers implemented)
+# ─────────────────────────────────────────
+# RETENTION_COVERAGE_STATS    = 60   # days (pending writer implementation)
+# RETENTION_API_HEALTH        = 60   # days (pending writer implementation)
+# RETENTION_PIPELINE_ALERTS   = 30   # days (pending writer implementation)
 ```
 
 ---
@@ -548,32 +674,6 @@ python pipeline.py --performance-report
 
 # Reactivate exhausted application
 python pipeline.py --reactivate "CompanyName"
-```
-
----
-
-## Alert Email Format
-
-```
-Subject: Pipeline Performance Alert - Action Required
-
-FIND-ONLY PERFORMANCE (Metric 1) - DEGRADED
-  2026-02-26: 3/6 companies found (50%)
-  2026-02-27: 2/6 companies found (33%)
-  2026-02-28: 2/5 companies found (40%)
-
-  Average: 41% - below 50% threshold
-
-Most exhausted companies (last 7 days):
-  - Collective: buffer domain mismatch
-  - Stripe: no exact match found
-  - Linear: low confidence, 0 exact matches
-
-Recommendation:
-  Review CAREERSHIFT_HIGH_CONFIDENCE (currently 90)
-  Review CAREERSHIFT_MEDIUM_CONFIDENCE (currently 70)
-  Or manually reactivate exhausted applications:
-    python pipeline.py --reactivate "Collective"
 ```
 
 ---
@@ -635,6 +735,10 @@ Recommendation:
 
           Empty result → exhaust or skip based on metrics
 
-  Coverage stats recorded daily
-  Metrics checked → alert if below threshold for 3 consecutive days
+  At end of run:
+    Record coverage_stats row (writer pending implementation)
+    Check metric1 + metric2 against thresholds
+    If below threshold for 3 consecutive days:
+      → Create pipeline_alerts row
+      → Send alert email
 ```

@@ -20,6 +20,7 @@
 
 import re
 import json
+import time
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -37,6 +38,15 @@ HEADERS = {
 TIMEOUT       = 12
 MAX_PAGES     = 20    # safety cap on pagination
 PAGE_DELAY    = 0.3   # seconds between page requests
+
+
+def _track(status_code, elapsed_ms, backoff_s=0):
+    """Record request to api_health. Best-effort — never raises."""
+    try:
+        from db.api_health import record_request
+        record_request("icims", status_code, elapsed_ms, backoff_s)
+    except Exception:
+        pass
 
 
 def fetch_jobs(slug, company):
@@ -65,7 +75,6 @@ def fetch_jobs(slug, company):
     all_jobs  = []
     seen_ids  = set()
 
-    import time
     for page in range(MAX_PAGES):
         url  = f"{base_url}/jobs/search?pr={page}&in_iframe=1"
         jobs = _fetch_listing_page(url, base_url, company, seen_ids)
@@ -90,14 +99,20 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         list of job dicts  — page fetched (may be empty = end of results)
         None               — network/HTTP error (caller should stop)
     """
+    start_ms = int(time.time() * 1000)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        elapsed_ms = int(time.time() * 1000) - start_ms
 
         # Non-200 = server error, not end of pages → return None
         if resp.status_code == 404:
+            _track(404, elapsed_ms)
             return []   # 404 = no jobs board exists
         if resp.status_code != 200:
+            _track(resp.status_code, elapsed_ms)
             return None  # error — stop pagination
+
+        _track(200, elapsed_ms)
 
         # Detect JS redirect — company migrated away from iCIMS
         # e.g. AMD: window.top.location.href = 'https://careers.amd.com/jobs'
@@ -150,8 +165,12 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         return jobs
 
     except requests.exceptions.Timeout:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(0, elapsed_ms)
         return []
     except Exception:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(0, elapsed_ms)
         return []
 
 
@@ -180,8 +199,12 @@ def fetch_job_detail(job):
         sep = "&" if "?" in detail_url else "?"
         detail_url = f"{detail_url}{sep}in_iframe=1"
 
+    start_ms = int(time.time() * 1000)
     try:
         resp = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(resp.status_code, elapsed_ms)
+
         if resp.status_code != 200:
             return job
 
@@ -221,8 +244,12 @@ def fetch_job_detail(job):
         return job
 
     except requests.exceptions.Timeout:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(0, elapsed_ms)
         return job
     except Exception:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(0, elapsed_ms)
         return job
 
 

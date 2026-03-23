@@ -14,6 +14,8 @@ Submodules:
     db.cache                  → ai_cache and job cache helpers
     db.quota                  → careershift and gemini quota helpers
     db.alerts                 → quota health alerts and coverage stats
+    db.api_health             → per-platform ATS API health tracking
+    db.pipeline_alerts        → pipeline threshold breach alerts
 """
 
 # ─────────────────────────────────────────
@@ -39,6 +41,7 @@ from db.applications import (
     update_application_expected_domain,
     get_existing_domain_for_company,
     convert_prospective_to_active,
+    get_applications_by_date,
 )
 
 # ─────────────────────────────────────────
@@ -66,6 +69,7 @@ from db.application_recruiters import (
     get_unique_companies_needing_scraping,
     get_companies_needing_more_recruiters,
     link_top_recruiters_for_company,
+    get_sendable_count_for_date,
 )
 
 # ─────────────────────────────────────────
@@ -120,6 +124,43 @@ from db.alerts import (
 )
 
 # ─────────────────────────────────────────
+# API HEALTH
+# ─────────────────────────────────────────
+from db.api_health import (
+    record_request,
+    get_platform_stats,
+    get_health_summary,
+    get_todays_stats,
+    get_run_429_rate,
+)
+
+# ─────────────────────────────────────────
+# PIPELINE ALERTS
+# ─────────────────────────────────────────
+from db.pipeline_alerts import (
+    create_alert,
+    has_recent_alert,
+    mark_notified,
+    mark_warnings_sent,
+    get_pending_warnings,
+    get_unnotified_alerts,
+    check_pipeline_health,
+    check_api_health,
+    ALERT_RATE_LIMIT,
+    ALERT_UNREACHABLE,
+    ALERT_SLOW,
+    ALERT_SERPER_LOW,
+    ALERT_SERPER_DONE,
+    ALERT_CRASH,
+    ALERT_METRIC1_LOW,
+    ALERT_METRIC2_LOW,
+    ALERT_API_FAILURE,
+    ALERT_COVERAGE_DROP,
+    CRITICAL,
+    WARNING,
+)
+
+# ─────────────────────────────────────────
 # PROSPECTIVE COMPANIES
 # ─────────────────────────────────────────
 from db.prospective import (
@@ -138,8 +179,6 @@ from db.prospective import (
 # ─────────────────────────────────────────
 # JOB MONITORING
 # ─────────────────────────────────────────
-
-
 from db.serper_quota import (
     get_serper_credits,
     increment_serper_credits,
@@ -169,6 +208,10 @@ from db.job_monitor import (
     get_tracked_urls_for_company,
     reactivate_job,
     save_verify_filled_stats,
+    # NOTE: save_coverage_stats, get_coverage_stats, save_pipeline_alert,
+    # save_api_health, get_unnotified_alerts, mark_alert_notified
+    # have been removed from db.job_monitor — they now live in
+    # db.alerts, db.pipeline_alerts, and db.api_health respectively.
 )
 
 # ─────────────────────────────────────────

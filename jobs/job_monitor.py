@@ -12,6 +12,7 @@ from db.db import (
     get_monitorable_companies,
     get_detection_queue,
     get_detection_queue_stats,
+
     job_url_exists,
     job_hash_exists,
     save_job_posting,
@@ -21,11 +22,6 @@ from db.db import (
     save_monitor_stats,
     get_monitor_stats,
     get_pipeline_reliability,
-    mark_postings_digested,
-    get_tracked_urls_for_company,
-    increment_missing_days,
-    reset_missing_days,
-    reactivate_job,
 )
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats,
@@ -33,7 +29,7 @@ from jobs.ats_detector import (
 )
 from jobs.ats.base import between_companies_delay
 from db.serper_quota import get_serper_credits
-from jobs.job_filter import filter_jobs, is_fresh, make_legacy_content_hash
+from jobs.job_filter import filter_jobs, is_fresh
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
     MONITOR_COVERAGE_ALERT,
@@ -164,19 +160,6 @@ def run():
 
         between_companies_delay()
 
-        # Track URL presence BEFORE early return on empty results
-        fetched_urls = {job["job_url"] for job in raw_jobs}
-        tracked      = get_tracked_urls_for_company(company)
-        present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
-        missing_ids  = [tracked[url] for url in tracked if url not in fetched_urls]
-        if present_ids:
-            reset_missing_days(present_ids)
-        if missing_ids:
-            increment_missing_days(missing_ids)
-            logger.debug("Missing from scan: %d jobs for %r",
-                         len(missing_ids), company)
-
-
         if not raw_jobs:
             logger.info("No jobs returned for %r", company)
             update_company_check(company, found_jobs=False)
@@ -200,20 +183,12 @@ def run():
         # ── Freshness check + save ──
         new_count = 0
         for job in matched:
-            exists, is_filled = job_url_exists(job["job_url"])
-            if exists:
-                if is_filled:
-                    # Job reappeared after being marked filled — reactivate
-                    reactivate_job(job["job_url"], job)
-                    logger.info("REACTIVATED: %r | %s",
-                                company, job.get("title"))
-                else:
-                    logger.debug("Duplicate URL skipped: %s", job["job_url"])
+            if job_url_exists(job["job_url"]):
+                logger.debug("Duplicate URL skipped: %s", job["job_url"])
                 continue
 
             if job.get("content_hash") and \
-               job_hash_exists(job["content_hash"],
-                               job.get("content_hash_legacy")):
+               job_hash_exists(job["content_hash"]):
                 logger.debug("Duplicate content_hash skipped for %r", company)
                 continue
 
@@ -240,7 +215,6 @@ def run():
                 new_count += 1
                 logger.info("NEW JOB: %r | %s | %s",
                             company, job.get("title"), job.get("location"))
-
 
         logger.info("Done %r: fetched=%d matched=%d new=%d",
                     company, len(raw_jobs), len(matched), new_count)
@@ -295,20 +269,11 @@ def run():
             email_sent    = result.get("email_sent", False)
             logger.info("PDF digest sent: pdf=%s email=%s",
                         pdf_generated, email_sent)
-            # Mark as digested only after confirmed email sent
-            if email_sent:
-                mark_postings_digested()
-                logger.info("Marked %d posting(s) as digested",
-                            len(new_postings))
         except Exception as e:
             logger.error("PDF generation failed: %s", e, exc_info=True)
             print(f"[ERROR] PDF generation failed: {e}")
             print("[INFO] Sending plain text digest instead...")
             email_sent = _send_text_fallback(new_postings)
-            if email_sent:
-                mark_postings_digested()
-                logger.info("Marked %d posting(s) as digested (text fallback)",
-                            len(new_postings))
     else:
         logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")

@@ -17,6 +17,9 @@ from config import (
     APPLICATION_AUTO_CLOSE_DAYS,
     VERIFY_FILLED_RETENTION,
     RETENTION_VERIFY_FILLED_STATS,
+    RETENTION_COVERAGE_STATS,
+    RETENTION_API_HEALTH,
+    RETENTION_PIPELINE_ALERTS,
 )
 
 def _cleanup_monitor_stats(c):
@@ -128,6 +131,26 @@ def _cleanup_quota_alerts(c):
         DELETE FROM quota_alerts
         WHERE created_at < DATE('now', ?)
     """, (f"-{RETENTION_QUOTA_ALERTS} days",))
+
+    
+def _cleanup_coverage_stats(c):
+    c.execute("""
+        DELETE FROM coverage_stats
+        WHERE date < DATE('now', ?)
+    """, (f"-{RETENTION_COVERAGE_STATS} days",))
+
+def _cleanup_api_health(c):
+    c.execute("""
+        DELETE FROM api_health
+        WHERE date < DATE('now', ?)
+    """, (f"-{RETENTION_API_HEALTH} days",))
+
+def _cleanup_pipeline_alerts(c):
+    c.execute("""
+        DELETE FROM pipeline_alerts
+        WHERE notified = 1
+        AND created_at < DATE('now', ?)
+    """, (f"-{RETENTION_PIPELINE_ALERTS} days",))
 
 
 def init_db():
@@ -477,6 +500,9 @@ def init_db():
     _cleanup_quota_alerts(c)
     _cleanup_monitor_stats(c)
     _cleanup_verify_filled_stats(c)
+    _cleanup_coverage_stats(c)
+    _cleanup_api_health(c)
+    _cleanup_pipeline_alerts(c)
     conn.commit()
     conn.close()
     print("[OK] Database initialized: data/recruiter_pipeline.db")

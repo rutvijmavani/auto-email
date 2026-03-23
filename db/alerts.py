@@ -168,27 +168,42 @@ def save_quota_alert(alert):
 # COVERAGE STATS
 # ─────────────────────────────────────────
 
-def save_coverage_stats(date, total_applications, companies_attempted,
-                        auto_found, rejected_count, exhausted_count,
-                        metric1, metric2):
-    """Save daily pipeline performance metrics."""
+def save_coverage_stats(stats: dict):
+    """
+    Save daily pipeline performance metrics.
+    Takes a dict — same pattern as save_monitor_stats().
+    Uses INSERT OR REPLACE to handle re-runs on same day.
+
+    Expected keys:
+      total_applications, companies_attempted,
+      auto_found, rejected_count, exhausted_count,
+      metric1, metric2
+    """
     conn = get_conn()
     c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
     c.execute("""
         INSERT OR REPLACE INTO coverage_stats (
             date, total_applications, companies_attempted,
             auto_found, rejected_count, exhausted_count,
             metric1, metric2
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (date, total_applications, companies_attempted,
-          auto_found, rejected_count, exhausted_count,
-          metric1, metric2))
+    """, (
+        today,
+        stats.get("total_applications",  0),
+        stats.get("companies_attempted", 0),
+        stats.get("auto_found",          0),
+        stats.get("rejected_count",      0),
+        stats.get("exhausted_count",     0),
+        stats.get("metric1"),
+        stats.get("metric2"),
+    ))
     conn.commit()
     conn.close()
 
 
-def get_coverage_stats(days=3):
-    """Return last N days of coverage stats."""
+def get_coverage_stats(days: int = 3) -> list:
+    """Return last N days of coverage stats, newest first."""
     conn = get_conn()
     c = conn.cursor()
     c.execute("""

@@ -169,8 +169,8 @@ def fetch_jobs(slug_info, company):
     limit    = 200
 
     while True:
-        url = _build_oracle_url(slug, region, site_id, limit, offset)
-        data = fetch_json(url)
+        url  = _build_oracle_url(slug, region, site_id, limit, offset)
+        data = fetch_json(url, platform="oracle_hcm")  # tracked for api_health
         if not data:
             break
 

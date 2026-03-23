@@ -121,3 +121,33 @@ def link_top_recruiters_for_company(application_id, company):
         if link_recruiter_to_application(application_id, recruiter_id):
             linked += 1
     return linked
+
+# ─────────────────────────────────────────
+# ADD to db/application_recruiters.py
+# ─────────────────────────────────────────
+
+def get_sendable_count_for_date(date: str) -> int:
+    """
+    Count applications with applied_date=date that have
+    at least one active recruiter linked via application_recruiters.
+
+    'Sendable' = application has ≥1 recruiter with
+    recruiter_status='active' linked to it.
+
+    Used by find_emails.py to compute metric2.
+    date format: 'YYYY-MM-DD'
+    """
+    from db.connection import get_conn
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT COUNT(DISTINCT a.id) AS sendable
+            FROM applications a
+            JOIN application_recruiters ar ON ar.application_id = a.id
+            JOIN recruiters r              ON r.id = ar.recruiter_id
+            WHERE a.applied_date = ?
+            AND   r.recruiter_status = 'active'
+        """, (date,)).fetchone()
+        return row["sendable"] if row else 0
+    finally:
+        conn.close()
