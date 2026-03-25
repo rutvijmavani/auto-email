@@ -27,6 +27,7 @@ from db.db import (
     get_pending_prospective,
     mark_prospective_scraped,
     mark_prospective_exhausted,
+    get_domain_for_prospective,
 )
 from careershift.constants import SESSION_FILE, MIN_RECRUITERS_PER_COMPANY
 from careershift.utils import human_delay
@@ -91,31 +92,16 @@ def _save_contacts(contacts, company, applications):
 
 def _save_prospective_contacts(contacts, company):
     """
-    Save prospective recruiter contacts to DB under a placeholder application.
-    When user later applies (--add), the placeholder converts to real application.
-    Returns True if contacts were saved successfully, False otherwise.
+    Save prospective recruiter contacts to DB at company level only.
+    No placeholder application created — recruiters are stored in the
+    recruiters table and linked to a real application only when user
+    applies via --add.
+    Returns True if at least one contact was saved, False otherwise.
     """
-    from db.db import add_application
-
-    # Create placeholder application for this prospective company
-    placeholder_url = f"prospective://{company.lower().replace(' ', '-')}"
-    logger.debug("Creating placeholder application for prospective company %r", company)
-    app_id, _ = add_application(
-        company=company,
-        job_url=placeholder_url,
-        job_title=None,
-        status_override="prospective",
-    )
-
-    if not app_id:
-        logger.warning("Could not create placeholder application for %r", company)
-        print(f"   [WARNING] Could not create placeholder for {company}")
-        return False
-
+    saved = 0
     for contact in contacts:
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
-            recruiter_id = existing_id
             logger.debug("Prospective recruiter already in DB: %s", contact["email"])
             print(f"   [SKIP] Already in DB: {contact['email']}")
         else:
@@ -126,11 +112,15 @@ def _save_prospective_contacts(contacts, company):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            logger.info("Saved prospective recruiter: %s | %s (company=%r)",
-                        contact["name"], contact["email"], company)
-            print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
+            if recruiter_id:
+                logger.info("Saved prospective recruiter: %s | %s (company=%r)",
+                            contact["name"], contact["email"], company)
+                print(f"   [DB] Prospective saved: {contact['name']} | {contact['email']}")
+                saved += 1
 
-        link_recruiter_to_application(app_id, recruiter_id)
+    if not saved and not any(recruiter_email_exists(c["email"]) for c in contacts):
+        logger.warning("_save_prospective_contacts: no contacts saved for %r", company)
+        return False
 
     return True
 
@@ -237,7 +227,6 @@ def run():
                 logger.info("Step 2 [%d/%d]: scraping %r (max_contacts=%d)",
                             i + 1, len(companies_to_scrape), company, max_contacts)
 
-                # Get all matching applications and expected_domain for this company
                 matching_apps, expected_domain = _get_apps_and_domain(
                     applications, company
                 )
@@ -246,11 +235,9 @@ def run():
                                           expected_domain)
 
                 if contacts is None:
-                    # None = skip (weak signal, retry tomorrow) — not exhausted
                     logger.info("Step 2: %r — weak signal, skipping (retry tomorrow)", company)
                     print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
                 elif not contacts:
-                    # [] = exhaust — mark ALL matching applications exhausted atomically
                     logger.info("Step 2: %r — no valid recruiters found, exhausting", company)
                     print(f"   [INFO] Exhausting {company} — no valid recruiters found")
                     mark_applications_exhausted([app["id"] for app in matching_apps])
@@ -340,8 +327,8 @@ def run():
                     logger.info("Prospective scrape: %r (max_extra=%d)", company, max_extra)
                     print(f"\n[INFO] Prospective: {company} (max {max_extra})")
 
-                    contacts = scrape_company(page, company, max_extra, "")
-
+                    prospective_domain = get_domain_for_prospective(company)
+                    contacts = scrape_company(page, company, max_extra, prospective_domain)
                     if contacts is None:
                         logger.info("Prospective %r — weak signal, skipping", company)
                         print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
@@ -350,7 +337,6 @@ def run():
                         print(f"   [INFO] Exhausting prospective {company}")
                         mark_prospective_exhausted(company)
                     else:
-                        # Save recruiters — only mark scraped if persistence succeeded
                         logger.info("Prospective %r — found %d contact(s), saving",
                                     company, len(contacts))
                         saved = _save_prospective_contacts(contacts, company)
@@ -391,15 +377,17 @@ def run():
         from db.application_recruiters import get_sendable_count_for_date
         from db.alerts import save_coverage_stats
 
-        yesterday     = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        yesterday      = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
         yesterday_apps = get_applications_by_date(yesterday)
-        total_apps    = len(yesterday_apps)
+        total_apps     = len(yesterday_apps)
 
-        # metric1 — find-only performance (Step 2 companies only)
-        companies_attempted = len(companies_to_scrape)
-        auto_found   = sum(1 for s in _scrape_stats if s["status"] == "found")
-        exhausted_count = sum(1 for s in _scrape_stats if s["status"] == "exhausted")
-        rejected_count  = 0  # reserved for future implementation
+        # metric1 — find-only performance
+        # Use _scrape_stats length (companies actually attempted in Step 2)
+        # not companies_to_scrape (which includes skipped due to max_contacts==0)
+        companies_attempted = len(_scrape_stats)
+        auto_found          = sum(1 for s in _scrape_stats if s["status"] == "found")
+        exhausted_count     = sum(1 for s in _scrape_stats if s["status"] == "exhausted")
+        rejected_count      = 0  # reserved for future implementation
 
         metric1 = (
             round((auto_found / companies_attempted) * 100, 1)

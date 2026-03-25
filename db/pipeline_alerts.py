@@ -62,8 +62,10 @@ def create_alert(alert_type, severity, platform=None,
 
 def has_recent_alert(alert_type, platform=None, hours=None):
     """
-    Check if same alert was sent recently.
-    Prevents duplicate emails within dedup window.
+    Check if same alert was created recently (any notified status).
+    Prevents duplicate alert records within dedup window.
+    Checks ALL rows regardless of notified flag — a pending unnotified
+    alert should still prevent a duplicate from being inserted.
     """
     hours  = hours or ALERT_DEDUP_HOURS
     cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
@@ -74,15 +76,13 @@ def has_recent_alert(alert_type, platform=None, hours=None):
                 SELECT id FROM pipeline_alerts
                 WHERE alert_type = ?
                 AND platform = ?
-                AND notified = 1
-                AND notified_at > ?
+                AND created_at > ?
             """, (alert_type, platform, cutoff)).fetchone()
         else:
             row = conn.execute("""
                 SELECT id FROM pipeline_alerts
                 WHERE alert_type = ?
-                AND notified = 1
-                AND notified_at > ?
+                AND created_at > ?
             """, (alert_type, cutoff)).fetchone()
         return row is not None
     finally:
@@ -174,9 +174,7 @@ def check_pipeline_health():
     Check if metric1 or metric2 have been below threshold
     for METRIC_ALERT_CONSECUTIVE_DAYS consecutive days.
 
-    Returns list of alert dicts (same shape as check_quota_health).
-    Empty list = healthy.
-
+    Returns list of alert dicts. Empty list = healthy.
     Called by pipeline.py after --find-only completes,
     same pattern as run_quota_report().
     """
@@ -193,7 +191,6 @@ def check_pipeline_health():
     days   = METRIC_ALERT_CONSECUTIVE_DAYS
     stats  = get_coverage_stats(days=days)
 
-    # Need exactly N days of data to check streak
     if len(stats) < days:
         logger.debug(
             "check_pipeline_health: only %d/%d days of data — skipping",
@@ -207,10 +204,9 @@ def check_pipeline_health():
         if s.get("metric1") is not None
     ]
     if len(metric1_values) == days:
-        all_below = all(v < METRIC1_ALERT_THRESHOLD
-                        for v in metric1_values)
+        all_below = all(v < METRIC1_ALERT_THRESHOLD for v in metric1_values)
         if all_below:
-            avg      = sum(metric1_values) / len(metric1_values)
+            avg = sum(metric1_values) / len(metric1_values)
             logger.warning(
                 "check_pipeline_health: metric1 below %.0f%% "
                 "for %d days (avg=%.1f%%)",
@@ -248,10 +244,9 @@ def check_pipeline_health():
         if s.get("metric2") is not None
     ]
     if len(metric2_values) == days:
-        all_below = all(v < METRIC2_ALERT_THRESHOLD
-                        for v in metric2_values)
+        all_below = all(v < METRIC2_ALERT_THRESHOLD for v in metric2_values)
         if all_below:
-            avg      = sum(metric2_values) / len(metric2_values)
+            avg = sum(metric2_values) / len(metric2_values)
             logger.warning(
                 "check_pipeline_health: metric2 below %.0f%% "
                 "for %d days (avg=%.1f%%)",
@@ -290,15 +285,18 @@ def check_pipeline_health():
 # API HEALTH CHECK — per-platform failure rate
 # ─────────────────────────────────────────
 
-def check_api_health() -> list:
+def check_api_health():
     """
     Check if any platform's error rate has exceeded
     API_FAILURE_RATE_THRESHOLD for API_FAILURE_CONSECUTIVE_DAYS
     consecutive days.
 
+    Checks per-day rows — not a blended aggregate — so a platform
+    must breach the threshold on N consecutive individual days
+    before an alert fires.
+
     Returns list of alert dicts. Empty list = healthy.
-    Called by pipeline.py after --monitor-jobs completes,
-    same pattern as check_pipeline_health().
+    Called by pipeline.py after --monitor-jobs completes.
     """
     from config import (
         API_FAILURE_RATE_THRESHOLD,
@@ -308,37 +306,71 @@ def check_api_health() -> list:
     import logging
     logger = logging.getLogger(__name__)
 
-    alerts  = []
-    days    = API_FAILURE_CONSECUTIVE_DAYS
-    summary = get_health_summary(days=days)
+    alerts    = []
+    days      = API_FAILURE_CONSECUTIVE_DAYS
+    threshold = API_FAILURE_RATE_THRESHOLD * 100  # convert to percentage
 
-    for row in summary:
-        platform   = row["platform"]
-        error_pct  = row.get("error_pct", 0) or 0
-        total_reqs = row.get("total_requests", 0) or 0
+    # get_health_summary returns one row per platform aggregated over the window.
+    # We need per-day rows to check the consecutive streak requirement.
+    # Query per-day data directly.
+    conn = get_conn()
+    try:
+        from datetime import date, timedelta
+        since = (date.today() - timedelta(days=days)).isoformat()
+        rows  = conn.execute("""
+            SELECT date, platform,
+                   requests_made, requests_error,
+                   CASE
+                       WHEN requests_made > 0
+                       THEN ROUND(100.0 * requests_error / requests_made, 1)
+                       ELSE 0
+                   END AS error_pct
+            FROM api_health
+            WHERE date >= ?
+            ORDER BY platform ASC, date DESC
+        """, (since,)).fetchall()
+    finally:
+        conn.close()
 
-        # Skip platforms with too few requests to be meaningful
-        if total_reqs < days:
+    if not rows:
+        return []
+
+    # Group by platform
+    from itertools import groupby
+    rows_by_platform = {}
+    for row in rows:
+        p = row["platform"]
+        if p not in rows_by_platform:
+            rows_by_platform[p] = []
+        rows_by_platform[p].append(dict(row))
+
+    for platform, platform_rows in rows_by_platform.items():
+        # Need at least N days of data
+        if len(platform_rows) < days:
             continue
 
-        threshold_pct = API_FAILURE_RATE_THRESHOLD * 100
+        # Check if the most recent N days are all above threshold
+        # platform_rows already ordered date DESC
+        recent = platform_rows[:days]
+        all_above = all(r["error_pct"] >= threshold for r in recent)
 
-        if error_pct >= threshold_pct:
+        if all_above:
+            avg_error = sum(r["error_pct"] for r in recent) / len(recent)
             logger.warning(
                 "check_api_health: platform=%s error_rate=%.1f%% "
-                "threshold=%.1f%% over %d days",
-                platform, error_pct, threshold_pct, days
+                "above %.1f%% for %d consecutive days",
+                platform, avg_error, threshold, days
             )
             alert_id = create_alert(
                 alert_type=ALERT_API_FAILURE,
                 severity=CRITICAL,
                 platform=platform,
-                value=round(error_pct, 1),
-                threshold=threshold_pct,
+                value=round(avg_error, 1),
+                threshold=threshold,
                 message=(
-                    f"{platform} API error rate {error_pct:.1f}% "
-                    f"over last {days} days "
-                    f"(threshold {threshold_pct:.0f}%)"
+                    f"{platform} API error rate {avg_error:.1f}% "
+                    f"for {days} consecutive days "
+                    f"(threshold {threshold:.0f}%)"
                 ),
             )
             if alert_id:
@@ -347,12 +379,12 @@ def check_api_health() -> list:
                     "alert_type": ALERT_API_FAILURE,
                     "severity":   CRITICAL,
                     "platform":   platform,
-                    "value":      round(error_pct, 1),
-                    "threshold":  threshold_pct,
+                    "value":      round(avg_error, 1),
+                    "threshold":  threshold,
                     "message": (
-                        f"{platform} API error rate {error_pct:.1f}% "
-                        f"over last {days} days "
-                        f"(threshold {threshold_pct:.0f}%)"
+                        f"{platform} API error rate {avg_error:.1f}% "
+                        f"for {days} consecutive days "
+                        f"(threshold {threshold:.0f}%)"
                     ),
                 })
 

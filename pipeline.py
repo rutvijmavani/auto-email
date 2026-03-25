@@ -24,6 +24,8 @@ CLI flags:
   --weekly-summary      send Monday weekly summary email
   --outreach-only       schedule + send outreach emails
   --quota-report        check quota health and send alert email if needed
+  --performance-report  check pipeline performance metrics + send alert if needed
+  --reactivate "Name"   reactivate an exhausted application
   --sync-prospective    
 """
 
@@ -102,6 +104,18 @@ def extract_expected_domain(job_url):
                     return slug.lower()
                 return None
 
+        # ── Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
+        if hostname in ("job-boards.greenhouse.io", "boards.greenhouse.io"):
+            from urllib.parse import parse_qs
+            qs = parse_qs(parsed.query)
+            if "for" in qs:
+                return qs["for"][0].lower()
+            # Fall through to normal path extraction
+            slug = path.split("/")[0].lower()
+            if slug and slug not in {"embed", "jobs", "careers"}:
+                return slug
+            return None
+
         # ── ATS platforms — extract company slug from path ─────────
         ats_hosts = [
             "jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io",
@@ -158,20 +172,39 @@ def add_job_interactively():
     if is_prospective(company_normalized):
         print(f"[INFO] '{company_normalized}' found in prospective pipeline — recruiters already pre-scraped!")
         logger.info("Prospective conversion: %r found in pipeline", company_normalized)
-        converted_id = convert_prospective_to_active(
+
+        # Create real application directly — no placeholder to convert
+        app_id, created = add_application(
             company=company_normalized,
-            real_job_url=job_url,
+            job_url=job_url,
             job_title=job_title,
+            applied_date=applied_date,
             expected_domain=expected_domain,
         )
-        if converted_id:
-            mark_prospective_converted(company_normalized)
-            logger.info("Converted prospective → active: %r (id=%s)",
-                        company_normalized, converted_id)
-            print(f"[OK] Converted prospective → active (id={converted_id})")
-            print(f"[INFO] Outreach will be scheduled on next --outreach-only run.")
+
+        if not app_id:
+            logger.error("Prospective conversion: failed to create application for %r", company_normalized)
+            print(f"[ERROR] Failed to create application for {company_normalized}.")
             return
-        # Conversion failed (e.g. placeholder URL mismatch) → fall through to normal --add
+
+        if not created:
+            logger.warning("Prospective conversion: job URL already exists for %r (id=%s)",
+                           company_normalized, app_id)
+            print(f"[WARNING] Job URL already exists in DB (id={app_id}).")
+            return
+
+        # Link best recruiters (cap enforced inside link_top_recruiters_for_company)
+        from db.db import link_top_recruiters_for_company
+        linked = link_top_recruiters_for_company(app_id, company_normalized)
+
+        mark_prospective_converted(company_normalized)
+        logger.info("Prospective → active: %r (id=%s) linked=%d",
+                    company_normalized, app_id, linked)
+        print(f"[OK] Converted prospective → active (id={app_id})")
+        print(f"[INFO] Linked {linked} recruiter(s) for {company_normalized}")
+        print("[INFO] Outreach will be scheduled on next --outreach-only run.")
+        return
+        # Note: no fall-through needed — real application created directly
 
     logger.info("Adding application: company=%r url=%r title=%r date=%s",
                 company, job_url, job_title, applied_date)
@@ -663,7 +696,6 @@ def run_performance_report():
           f"metric2 >= {METRIC2_ALERT_THRESHOLD}%")
     print("=" * 55)
 
-    # Check for 3-day streak breaches and send alert email if needed
     alerts = check_pipeline_health()
 
     if not alerts:
@@ -673,7 +705,6 @@ def run_performance_report():
 
     logger.warning("Performance report: %d alert(s) detected", len(alerts))
 
-    # Build alert email — same style as quota alert
     body_parts = []
     for alert in alerts:
         label = (
@@ -689,23 +720,22 @@ def run_performance_report():
             val = f"{m:.1f}%" if m is not None else "N/A"
             body_parts.append(f"  {row['date']}: {val}")
         body_parts.append("")
-        body_parts.append(f"Average: {alert['value']:.1f}% — "
-                          f"below {alert['threshold']:.0f}% threshold")
+        body_parts.append(
+            f"Average: {alert['value']:.1f}% — "
+            f"below {alert['threshold']:.0f}% threshold"
+        )
         body_parts.append("")
         body_parts.append(
             "Recommendation: Review CareerShift search terms or "
             "manually reactivate exhausted applications:"
         )
-        body_parts.append(
-            "  python pipeline.py --reactivate \"CompanyName\""
-        )
+        body_parts.append('  python pipeline.py --reactivate "CompanyName"')
         body_parts.append("")
         body_parts.append("-" * 40)
         body_parts.append("")
 
     body    = "\n".join(body_parts)
-    subject = (f"Pipeline Performance Alert — "
-               f"{len(alerts)} issue(s) detected")
+    subject = f"Pipeline Performance Alert — {len(alerts)} issue(s) detected"
 
     try:
         send_email(to_email=EMAIL, body=body,
@@ -721,7 +751,7 @@ def run_performance_report():
         print(f"[INFO] Alert details:\n{body}")
 
 
-def run_reactivate(company_name: str):
+def run_reactivate(company_name):
     """
     Reactivate an exhausted application by company name.
     Resets status to 'active' and clears exhausted_at.
@@ -730,7 +760,7 @@ def run_reactivate(company_name: str):
 
     if not company_name:
         print("[ERROR] Company name required.")
-        print("[INFO] Usage: python pipeline.py --reactivate \"CompanyName\"")
+        print('[INFO] Usage: python pipeline.py --reactivate "CompanyName"')
         return
 
     logger.info("run_reactivate: company=%r", company_name)
@@ -739,13 +769,12 @@ def run_reactivate(company_name: str):
     if result:
         logger.info("Reactivated application for %r", company_name)
         print(f"[OK] Reactivated: {company_name}")
-        print(f"[INFO] Application will be included in next --find-only run.")
+        print("[INFO] Application will be included in next --find-only run.")
     else:
         logger.warning("Reactivate: no exhausted application found for %r",
                        company_name)
         print(f"[WARNING] No exhausted application found for '{company_name}'.")
-        print(f"[INFO] Check company name spelling or use --add to add a new application.")
-
+        print("[INFO] Check company name spelling or use --add to add a new application.")
 
 
 def run_pipeline_alert_report():
@@ -768,7 +797,6 @@ def run_pipeline_alert_report():
     logger.warning("run_pipeline_alert_report: %d unnotified alert(s)",
                    len(alerts))
 
-    # Group by severity — send one email per severity level
     critical = [a for a in alerts if a["severity"] == "critical"]
     warnings = [a for a in alerts if a["severity"] == "warning"]
 
@@ -779,19 +807,15 @@ def run_pipeline_alert_report():
         body_parts = [f"Pipeline Alert — {label}\n"]
         for alert in group:
             platform = f" [{alert['platform']}]" if alert.get("platform") else ""
-            body_parts.append(
-                f"  {alert['alert_type'].upper()}{platform}"
-            )
+            body_parts.append(f"  {alert['alert_type'].upper()}{platform}")
             body_parts.append(f"  {alert['message']}")
             body_parts.append(
-                f"  Value: {alert['value']}  "
-                f"Threshold: {alert['threshold']}"
+                f"  Value: {alert['value']}  Threshold: {alert['threshold']}"
             )
             body_parts.append("")
 
         body    = "\n".join(body_parts)
-        subject = (f"Pipeline {label} Alert — "
-                   f"{len(group)} issue(s) detected")
+        subject = f"Pipeline {label} Alert — {len(group)} issue(s) detected"
 
         try:
             send_email(to_email=EMAIL, body=body,
@@ -873,7 +897,6 @@ def run_quota_report(silent_if_healthy=False):
 
     body = "\n".join(body_parts)
 
-    # Multiple alerts in one email
     if len(alerts) > 1:
         subject = f"Quota Alert - Action Required ({len(alerts)} issues)"
 
@@ -882,14 +905,12 @@ def run_quota_report(silent_if_healthy=False):
         send_email(to_email=EMAIL, body=body, company="Pipeline", subject=subject)
         logger.info("Quota alert email sent: %s", subject)
         print(f"[INFO] Quota alert email sent: {subject}")
-        # Only mark as notified after successful send
         for alert in alerts:
             save_quota_alert(alert)
     except Exception as e:
         logger.error("Could not send quota alert email: %s", e, exc_info=True)
         print(f"[WARNING] Could not send quota alert email: {e}")
         print(f"[INFO] Alert details:\n{body}")
-        # Save without notified flag so future runs still attempt to send
         for alert in alerts:
             save_quota_alert({**alert, "notified": False})
 
@@ -932,7 +953,6 @@ def main():
         return
 
     if "--import-prospects" in args:
-        # Optional custom filepath: python pipeline.py --import-prospects mylist.txt
         filepath = next((a for a in args if not a.startswith("--")), "prospects.txt")
         run_import_prospects(filepath)
         return
@@ -952,11 +972,6 @@ def main():
 
     if "--detect-ats" in args:
         from jobs.job_monitor import run_detect_ats
-        # Usage:
-        #   --detect-ats                              (all pending)
-        #   --detect-ats --batch                      (next batch, respects quota)
-        #   --detect-ats "Stripe"                     (single company)
-        #   --detect-ats "Capital One" --override workday capitalone
         non_flag_args     = [a for a in args if not a.startswith("--")]
         company           = non_flag_args[0] if len(non_flag_args) > 0 else None
         override_platform = non_flag_args[1] if len(non_flag_args) > 1 else None
@@ -987,6 +1002,11 @@ def main():
         non_flag_args = [a for a in args if not a.startswith("--")]
         company_name  = non_flag_args[0] if non_flag_args else ""
         run_reactivate(company_name)
+        return
+
+    if "--verify-filled" in args:
+        from jobs.fill_verifier import run as verify_filled_run
+        verify_filled_run()
         return
 
     # Full pipeline

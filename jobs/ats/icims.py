@@ -166,10 +166,12 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
 
     except requests.exceptions.Timeout:
         elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
         return []
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
         return []
 
@@ -245,10 +247,12 @@ def fetch_job_detail(job):
 
     except requests.exceptions.Timeout:
         elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
         return job
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
         return job
 

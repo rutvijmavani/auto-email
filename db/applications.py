@@ -216,7 +216,6 @@ def get_applications_by_date(date: str) -> list:
     Used by find_emails.py to compute metric1/metric2
     for yesterday's applications.
     """
-    from db.connection import get_conn
     conn = get_conn()
     try:
         rows = conn.execute("""
@@ -228,3 +227,4 @@ def get_applications_by_date(date: str) -> list:
         return [dict(r) for r in rows]
     finally:
         conn.close()
+ 
