@@ -536,6 +536,7 @@ def get_tracked_urls_for_company(company):
     finally:
         conn.close()
 
+"""
 
 def save_coverage_stats(stats):
     """
@@ -682,3 +683,5 @@ def mark_alert_notified(alert_id):
         conn.commit()
     finally:
         conn.close()
+
+"""

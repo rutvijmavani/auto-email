@@ -41,12 +41,22 @@ PAGE_DELAY    = 0.3   # seconds between page requests
 
 
 def _track(status_code, elapsed_ms, backoff_s=0):
-    """Record request to api_health. Best-effort — never raises."""
+    """
+    Record request to api_health. Best-effort — never raises.
+    status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+    Logs failures at debug level so tracking errors are visible without blocking callers.
+    """
     try:
         from db.api_health import record_request
         record_request("icims", status_code, elapsed_ms, backoff_s)
     except Exception:
-        pass
+        import logging
+        logging.getLogger(__name__).debug(
+            "_track: failed to record icims request "
+            "(status=%s elapsed_ms=%s)",
+            status_code, elapsed_ms,
+            exc_info=True,
+        )
 
 
 def fetch_jobs(slug, company):

@@ -125,6 +125,67 @@ def _save_prospective_contacts(contacts, company):
     return True
 
 
+def _check_pipeline_degraded():
+    """
+    Check if pipeline has been consistently unhealthy over last
+    METRIC_ALERT_CONSECUTIVE_DAYS days using coverage_stats.
+
+    Returns True if degraded (exhaustions should be blocked),
+    False if healthy or insufficient history.
+    Called once before Step 2 loop.
+    """
+    try:
+        from db.alerts import get_coverage_stats
+        from config import (
+            METRIC1_ALERT_THRESHOLD,
+            METRIC2_ALERT_THRESHOLD,
+            METRIC_ALERT_CONSECUTIVE_DAYS,
+        )
+
+        recent = get_coverage_stats(days=METRIC_ALERT_CONSECUTIVE_DAYS)
+
+        # Not enough history — allow exhaustions (safe default)
+        if len(recent) < METRIC_ALERT_CONSECUTIVE_DAYS:
+            logger.debug(
+                "_check_pipeline_degraded: only %d/%d days history — allowing exhaustions",
+                len(recent), METRIC_ALERT_CONSECUTIVE_DAYS,
+            )
+            return False
+
+        m1_vals = [s["metric1"] for s in recent if s.get("metric1") is not None]
+        m2_vals = [s["metric2"] for s in recent if s.get("metric2") is not None]
+        avg_m1  = sum(m1_vals) / len(m1_vals) if m1_vals else None
+        avg_m2  = sum(m2_vals) / len(m2_vals) if m2_vals else None
+
+        degraded = (
+            (avg_m1 is not None and avg_m1 < METRIC1_ALERT_THRESHOLD) or
+            (avg_m2 is not None and avg_m2 < METRIC2_ALERT_THRESHOLD)
+        )
+
+        if degraded:
+            logger.warning(
+                "_check_pipeline_degraded: pipeline degraded over last %d days "
+                "(avg metric1=%s avg metric2=%s) — exhaustions will be blocked",
+                METRIC_ALERT_CONSECUTIVE_DAYS,
+                f"{avg_m1:.1f}%" if avg_m1 is not None else "N/A",
+                f"{avg_m2:.1f}%" if avg_m2 is not None else "N/A",
+            )
+        else:
+            logger.debug(
+                "_check_pipeline_degraded: pipeline healthy "
+                "(avg metric1=%s avg metric2=%s)",
+                f"{avg_m1:.1f}%" if avg_m1 is not None else "N/A",
+                f"{avg_m2:.1f}%" if avg_m2 is not None else "N/A",
+            )
+
+        return degraded
+
+    except Exception as e:
+        # On error — allow exhaustions (safe default, never block on check failure)
+        logger.error("_check_pipeline_degraded check failed: %s", e, exc_info=True)
+        return False
+
+
 def run():
     logger.info("════════════════════════════════════════")
     logger.info("--find-only starting")
@@ -199,6 +260,12 @@ def run():
         companies_to_scrape = get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY) if applications else []
         logger.info("Step 2: %d companies need scraping", len(companies_to_scrape))
 
+        # Check pipeline health BEFORE loop — gate exhaustions if degraded
+        pipeline_is_degraded = _check_pipeline_degraded()
+        if pipeline_is_degraded:
+            print(f"[WARNING] Pipeline degraded over last N days — "
+                  f"exhaustions blocked (human review required)")
+
         if not companies_to_scrape:
             print("\n[OK] All applications have enough recruiters. No scraping needed.")
         elif remaining == 0:
@@ -235,12 +302,40 @@ def run():
                                           expected_domain)
 
                 if contacts is None:
+                    # None = weak signal → skip, retry tomorrow
                     logger.info("Step 2: %r — weak signal, skipping (retry tomorrow)", company)
                     print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
                 elif not contacts:
-                    logger.info("Step 2: %r — no valid recruiters found, exhausting", company)
-                    print(f"   [INFO] Exhausting {company} — no valid recruiters found")
-                    mark_applications_exhausted([app["id"] for app in matching_apps])
+                    # [] = no recruiters found (CareerShift has no data or
+                    # domain mismatch) — treat both as exhausted.
+                    # Guard: if pipeline is degraded, block exhaustion and alert.
+                    if pipeline_is_degraded:
+                        logger.warning(
+                            "Step 2: %r — no recruiters found but pipeline degraded "
+                            "— blocking exhaustion, creating alert",
+                            company,
+                        )
+                        print(f"   [WARNING] {company} — no recruiters found but "
+                              f"pipeline degraded — NOT exhausting (human review needed)")
+                        try:
+                            from db.pipeline_alerts import (
+                                create_alert, ALERT_METRIC1_LOW, CRITICAL,
+                            )
+                            create_alert(
+                                alert_type=ALERT_METRIC1_LOW,
+                                severity=CRITICAL,
+                                message=(
+                                    f"Exhaustion blocked for '{company}': "
+                                    f"no recruiters found but pipeline metrics "
+                                    f"are below threshold — manual review required"
+                                ),
+                            )
+                        except Exception as _ae:
+                            logger.error("Failed to create exhaustion-blocked alert: %s", _ae)
+                    else:
+                        logger.info("Step 2: %r — no valid recruiters found, exhausting", company)
+                        print(f"   [INFO] Exhausting {company} — no valid recruiters found")
+                        mark_applications_exhausted([app["id"] for app in matching_apps])
                 else:
                     logger.info("Step 2: %r — found %d contact(s)", company, len(contacts))
                     _save_contacts(contacts, company, applications)
@@ -368,7 +463,8 @@ def run():
 
     # ─────────────────────────────────────────
     # COVERAGE STATS — metric1 + metric2
-    # Both metrics are computed for yesterday's applications only.
+    # metric1: all scraped companies in Step 2 (pipeline run performance)
+    # metric2: yesterday's applications with active recruiters (outreach coverage)
     # find-only runs at 1 AM EST so "yesterday" is the previous calendar day.
     # ─────────────────────────────────────────
     try:
@@ -381,9 +477,7 @@ def run():
         yesterday_apps = get_applications_by_date(yesterday)
         total_apps     = len(yesterday_apps)
 
-        # metric1 — find-only performance
-        # Use _scrape_stats length (companies actually attempted in Step 2)
-        # not companies_to_scrape (which includes skipped due to max_contacts==0)
+        # metric1 — find-only pipeline performance (all Step 2 companies)
         companies_attempted = len(_scrape_stats)
         auto_found          = sum(1 for s in _scrape_stats if s["status"] == "found")
         exhausted_count     = sum(1 for s in _scrape_stats if s["status"] == "exhausted")
@@ -394,8 +488,7 @@ def run():
             if companies_attempted > 0 else None
         )
 
-        # metric2 — outreach coverage (yesterday's applications with
-        # at least one active recruiter linked)
+        # metric2 — outreach coverage for yesterday's applications only
         sendable = get_sendable_count_for_date(yesterday)
         metric2  = (
             round((sendable / total_apps) * 100, 1)

@@ -996,6 +996,7 @@ def main():
 
     if "--performance-report" in args:
         run_performance_report()
+        run_pipeline_alert_report()
         return
 
     if "--reactivate" in args:

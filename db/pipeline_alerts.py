@@ -66,9 +66,12 @@ def has_recent_alert(alert_type, platform=None, hours=None):
     Prevents duplicate alert records within dedup window.
     Checks ALL rows regardless of notified flag — a pending unnotified
     alert should still prevent a duplicate from being inserted.
+
+    Uses strftime('%Y-%m-%d %H:%M:%S') to match SQLite CURRENT_TIMESTAMP
+    format — isoformat() produces a 'T' separator that breaks string comparison.
     """
     hours  = hours or ALERT_DEDUP_HOURS
-    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+    cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn   = get_conn()
     try:
         if platform:
@@ -196,6 +199,23 @@ def check_pipeline_health():
             "check_pipeline_health: only %d/%d days of data — skipping",
             len(stats), days
         )
+        return []
+
+    # Verify the N most recent rows are on contiguous days (no gaps).
+    # stats is ordered newest first from get_coverage_stats().
+    # If pipeline skipped a day, rows may not be consecutive — don't fire alert.
+    from datetime import date as date_type, timedelta as td
+    recent = stats[:days]
+    try:
+        dates = [date_type.fromisoformat(s["date"]) for s in recent]
+        for i in range(len(dates) - 1):
+            if (dates[i] - dates[i + 1]).days != 1:
+                logger.debug(
+                    "check_pipeline_health: non-contiguous dates %s → %s, skipping",
+                    dates[i], dates[i + 1]
+                )
+                return []
+    except (ValueError, KeyError):
         return []
 
     # ── Metric 1 streak check ──
@@ -349,9 +369,26 @@ def check_api_health():
         if len(platform_rows) < days:
             continue
 
-        # Check if the most recent N days are all above threshold
-        # platform_rows already ordered date DESC
+        # Check if the most recent N days are contiguous (no gaps).
+        # platform_rows already ordered date DESC.
         recent = platform_rows[:days]
+        try:
+            from datetime import date as date_type
+            dates = [date_type.fromisoformat(r["date"]) for r in recent]
+            contiguous = all(
+                (dates[i] - dates[i + 1]).days == 1
+                for i in range(len(dates) - 1)
+            )
+            if not contiguous:
+                logger.debug(
+                    "check_api_health: platform=%s non-contiguous dates, skipping",
+                    platform
+                )
+                continue
+        except (ValueError, KeyError):
+            continue
+
+        # Check if all N consecutive days are above threshold
         all_above = all(r["error_pct"] >= threshold for r in recent)
 
         if all_above:
