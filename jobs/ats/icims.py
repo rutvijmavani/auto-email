@@ -212,14 +212,29 @@ def fetch_job_detail(job):
         detail_url = f"{detail_url}{sep}in_iframe=1"
 
     start_ms = int(time.time() * 1000)
+
+    # ── Block 1: Network I/O — track once based on HTTP status ──
     try:
-        resp = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
+        resp       = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
         elapsed_ms = int(time.time() * 1000) - start_ms
         _track(resp.status_code, elapsed_ms)
 
         if resp.status_code != 200:
             return job
 
+    except requests.exceptions.Timeout:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
+        return job
+    except Exception:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
+        return job
+
+    # ── Block 2: Parsing — no _track calls here (request already recorded) ──
+    try:
         soup = BeautifulSoup(resp.text, "html.parser")
         text = soup.get_text(separator=" ", strip=True)
 
@@ -255,15 +270,9 @@ def fetch_job_detail(job):
 
         return job
 
-    except requests.exceptions.Timeout:
-        elapsed_ms = int(time.time() * 1000) - start_ms
-        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
-        _track(0, elapsed_ms)
-        return job
     except Exception:
-        elapsed_ms = int(time.time() * 1000) - start_ms
-        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
-        _track(0, elapsed_ms)
+        # Parsing failed — return job as-is without re-tracking
+        # (the network request was already recorded above)
         return job
 
 

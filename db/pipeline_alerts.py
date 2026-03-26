@@ -220,7 +220,7 @@ def check_pipeline_health():
 
     # ── Metric 1 streak check ──
     metric1_values = [
-        s["metric1"] for s in stats
+        s["metric1"] for s in recent
         if s.get("metric1") is not None
     ]
     if len(metric1_values) == days:
@@ -250,7 +250,7 @@ def check_pipeline_health():
                     "severity":   CRITICAL,
                     "value":      round(avg, 1),
                     "threshold":  METRIC1_ALERT_THRESHOLD,
-                    "history":    stats,
+                    "history":    recent,
                     "message": (
                         f"Find-only performance below "
                         f"{METRIC1_ALERT_THRESHOLD}% for {days} "
@@ -260,7 +260,7 @@ def check_pipeline_health():
 
     # ── Metric 2 streak check ──
     metric2_values = [
-        s["metric2"] for s in stats
+        s["metric2"] for s in recent
         if s.get("metric2") is not None
     ]
     if len(metric2_values) == days:
@@ -290,7 +290,7 @@ def check_pipeline_health():
                     "severity":   CRITICAL,
                     "value":      round(avg, 1),
                     "threshold":  METRIC2_ALERT_THRESHOLD,
-                    "history":    stats,
+                    "history":    recent,
                     "message": (
                         f"Outreach coverage below "
                         f"{METRIC2_ALERT_THRESHOLD}% for {days} "
