@@ -152,6 +152,22 @@ def _check_pipeline_degraded():
             )
             return False
 
+        # Verify dates are contiguous — same logic as check_pipeline_health.
+        # If pipeline skipped a day, gaps should not trigger the guard.
+        from datetime import date as _date_type
+        try:
+            dates = [_date_type.fromisoformat(s["date"]) for s in recent]
+            for i in range(len(dates) - 1):
+                if (dates[i] - dates[i + 1]).days != 1:
+                    logger.debug(
+                        "_check_pipeline_degraded: non-contiguous dates "
+                        "%s to %s — allowing exhaustions",
+                        dates[i], dates[i + 1],
+                    )
+                    return False
+        except (ValueError, KeyError):
+            return False
+
         m1_vals = [s["metric1"] for s in recent if s.get("metric1") is not None]
         m2_vals = [s["metric2"] for s in recent if s.get("metric2") is not None]
         avg_m1  = sum(m1_vals) / len(m1_vals) if m1_vals else None
@@ -319,10 +335,10 @@ def run():
                               f"pipeline degraded — NOT exhausting (human review needed)")
                         try:
                             from db.pipeline_alerts import (
-                                create_alert, ALERT_METRIC1_LOW, CRITICAL,
+                                create_alert, ALERT_EXHAUSTION_BLOCKED, CRITICAL,
                             )
                             create_alert(
-                                alert_type=ALERT_METRIC1_LOW,
+                                alert_type=ALERT_EXHAUSTION_BLOCKED,
                                 severity=CRITICAL,
                                 message=(
                                     f"Exhaustion blocked for '{company}': "
@@ -348,7 +364,11 @@ def run():
                 if contacts is None:
                     _scrape_stats.append({"name": company, "status": "skipped", "count": 0})
                 elif contacts == []:
-                    _scrape_stats.append({"name": company, "status": "exhausted", "count": 0})
+                    if pipeline_is_degraded:
+                        # Record as blocked — not exhausted — so metrics are accurate
+                        _scrape_stats.append({"name": company, "status": "blocked", "count": 0})
+                    else:
+                        _scrape_stats.append({"name": company, "status": "exhausted", "count": 0})
 
                 human_delay(3.0, 7.0)
 

@@ -743,7 +743,7 @@ def run_performance_report():
         logger.info("Performance alert email sent: %s", subject)
         print(f"[INFO] Alert email sent: {subject}")
         for alert in alerts:
-            mark_notified(alert["alert_id"])
+            mark_notified(alert.get("alert_id") or alert.get("id"))
     except Exception as e:
         logger.error("Could not send performance alert email: %s",
                      e, exc_info=True)

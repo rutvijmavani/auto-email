@@ -22,8 +22,9 @@ ALERT_SERPER_DONE = "serper_exhausted"
 ALERT_CRASH       = "crash"
 
 # Pipeline performance alert types — used by check_pipeline_health()
-ALERT_METRIC1_LOW   = "metric1_low"
-ALERT_METRIC2_LOW   = "metric2_low"
+ALERT_METRIC1_LOW        = "metric1_low"
+ALERT_METRIC2_LOW        = "metric2_low"
+ALERT_EXHAUSTION_BLOCKED = "exhaustion_blocked"  # fired when exhaustion is blocked due to pipeline degradation
 ALERT_API_FAILURE   = "api_failure_rate"
 ALERT_COVERAGE_DROP = "coverage_drop"
 
@@ -71,7 +72,7 @@ def has_recent_alert(alert_type, platform=None, hours=None):
     format — isoformat() produces a 'T' separator that breaks string comparison.
     """
     hours  = hours or ALERT_DEDUP_HOURS
-    cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn   = get_conn()
     try:
         if platform:
