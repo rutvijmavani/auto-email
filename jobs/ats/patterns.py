@@ -155,7 +155,7 @@ def _make_patterns():
     #   jpmc.fa.oraclecloud.com      (JPMorgan — no region)
     patterns.append((
         re.compile(
-            r"([a-z0-9]+)\.fa\.(?:(us\d+|eu\d+|ap\d+)\.)?"
+            r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.fa\.(?:ocs\.)?(?:(us\d+|eu\d+|ap\d+)\.)?"
             r"oraclecloud\.com/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
             re.IGNORECASE
         ),
@@ -177,7 +177,14 @@ def _make_patterns():
             re.IGNORECASE
         ),
         "icims",
-        lambda m: re.sub(r"^careers-", "", m.group(1).lower()),
+        lambda m: m.group(1).lower(),
+    ))
+
+    # Jobvite — jobs.jobvite.com/{slug}/job/{id}
+    patterns.append((
+        re.compile(r"jobs\.jobvite\.com/([^/?&#\s]+)/job/", re.IGNORECASE),
+        "jobvite",
+        lambda m: m.group(1).lower(),
     ))
 
     # SAP SuccessFactors — {company}.jobs2web.com

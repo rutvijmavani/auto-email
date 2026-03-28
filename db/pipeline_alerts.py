@@ -244,20 +244,21 @@ def check_pipeline_health():
                     f"consecutive days (avg {avg:.1f}%)"
                 ),
             )
-            if alert_id:
-                alerts.append({
-                    "alert_id":   alert_id,
-                    "alert_type": ALERT_METRIC1_LOW,
-                    "severity":   CRITICAL,
-                    "value":      round(avg, 1),
-                    "threshold":  METRIC1_ALERT_THRESHOLD,
-                    "history":    recent,
-                    "message": (
-                        f"Find-only performance below "
-                        f"{METRIC1_ALERT_THRESHOLD}% for {days} "
-                        f"consecutive days (avg {avg:.1f}%)"
-                    ),
-                })
+            # Always append breach — alert_id may be None if deduped.
+            # Caller decides whether to notify; breach info is always present.
+            alerts.append({
+                "alert_id":   alert_id,
+                "alert_type": ALERT_METRIC1_LOW,
+                "severity":   CRITICAL,
+                "value":      round(avg, 1),
+                "threshold":  METRIC1_ALERT_THRESHOLD,
+                "history":    recent,
+                "message": (
+                    f"Find-only performance below "
+                    f"{METRIC1_ALERT_THRESHOLD}% for {days} "
+                    f"consecutive days (avg {avg:.1f}%)"
+                ),
+            })
 
     # ── Metric 2 streak check ──
     metric2_values = [
@@ -284,20 +285,21 @@ def check_pipeline_health():
                     f"consecutive days (avg {avg:.1f}%)"
                 ),
             )
-            if alert_id:
-                alerts.append({
-                    "alert_id":   alert_id,
-                    "alert_type": ALERT_METRIC2_LOW,
-                    "severity":   CRITICAL,
-                    "value":      round(avg, 1),
-                    "threshold":  METRIC2_ALERT_THRESHOLD,
-                    "history":    recent,
-                    "message": (
-                        f"Outreach coverage below "
-                        f"{METRIC2_ALERT_THRESHOLD}% for {days} "
-                        f"consecutive days (avg {avg:.1f}%)"
-                    ),
-                })
+            # Always append breach — alert_id may be None if deduped.
+            # Caller decides whether to notify; breach info is always present.
+            alerts.append({
+                "alert_id":   alert_id,
+                "alert_type": ALERT_METRIC2_LOW,
+                "severity":   CRITICAL,
+                "value":      round(avg, 1),
+                "threshold":  METRIC2_ALERT_THRESHOLD,
+                "history":    recent,
+                "message": (
+                    f"Outreach coverage below "
+                    f"{METRIC2_ALERT_THRESHOLD}% for {days} "
+                    f"consecutive days (avg {avg:.1f}%)"
+                ),
+            })
 
     return alerts
 
@@ -337,7 +339,7 @@ def check_api_health():
     conn = get_conn()
     try:
         from datetime import date, timedelta
-        since = (date.today() - timedelta(days=days)).isoformat()
+        since = (date.today() - timedelta(days=days - 1)).isoformat()
         rows  = conn.execute("""
             SELECT date, platform,
                    requests_made, requests_error,

@@ -69,7 +69,7 @@ def _save_contacts(contacts, company, applications):
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
             recruiter_id = existing_id
-            logger.debug("Recruiter already in DB: %s (id=%s)", contact["email"], recruiter_id)
+            logger.debug("Recruiter already in DB: id=%s company=%r", recruiter_id, company)
             print(f"   [SKIP] Already in DB: {contact['email']} (id={recruiter_id})")
         else:
             recruiter_id = add_recruiter(
@@ -79,8 +79,7 @@ def _save_contacts(contacts, company, applications):
                 email=contact["email"],
                 confidence=contact["confidence"],
             )
-            logger.info("Saved recruiter: %s | %s (company=%r)",
-                        contact["name"], contact["email"], company)
+            logger.info("Saved recruiter: id=%s company=%r", recruiter_id, company)
             print(f"   [DB] Saved: {contact['name']} | {contact['email']}")
 
         for app in matching_apps:
@@ -102,7 +101,7 @@ def _save_prospective_contacts(contacts, company):
     for contact in contacts:
         existing_id = recruiter_email_exists(contact["email"])
         if existing_id:
-            logger.debug("Prospective recruiter already in DB: %s", contact["email"])
+            logger.debug("Prospective recruiter already in DB: company=%r", company)
             print(f"   [SKIP] Already in DB: {contact['email']}")
         else:
             recruiter_id = add_recruiter(
@@ -168,30 +167,31 @@ def _check_pipeline_degraded():
         except (ValueError, KeyError):
             return False
 
-        m1_vals = [s["metric1"] for s in recent if s.get("metric1") is not None]
-        m2_vals = [s["metric2"] for s in recent if s.get("metric2") is not None]
-        avg_m1  = sum(m1_vals) / len(m1_vals) if m1_vals else None
-        avg_m2  = sum(m2_vals) / len(m2_vals) if m2_vals else None
-
-        degraded = (
-            (avg_m1 is not None and avg_m1 < METRIC1_ALERT_THRESHOLD) or
-            (avg_m2 is not None and avg_m2 < METRIC2_ALERT_THRESHOLD)
+        # All-breach check — matches check_pipeline_health() logic exactly.
+        # Pipeline is degraded only if EVERY day in the window breached threshold.
+        m1_vals    = [s["metric1"] for s in recent if s.get("metric1") is not None]
+        m2_vals    = [s["metric2"] for s in recent if s.get("metric2") is not None]
+        m1_degraded = (
+            len(m1_vals) == METRIC_ALERT_CONSECUTIVE_DAYS and
+            all(v < METRIC1_ALERT_THRESHOLD for v in m1_vals)
         )
+        m2_degraded = (
+            len(m2_vals) == METRIC_ALERT_CONSECUTIVE_DAYS and
+            all(v < METRIC2_ALERT_THRESHOLD for v in m2_vals)
+        )
+        degraded = m1_degraded or m2_degraded
 
         if degraded:
             logger.warning(
-                "_check_pipeline_degraded: pipeline degraded over last %d days "
-                "(avg metric1=%s avg metric2=%s) — exhaustions will be blocked",
-                METRIC_ALERT_CONSECUTIVE_DAYS,
-                f"{avg_m1:.1f}%" if avg_m1 is not None else "N/A",
-                f"{avg_m2:.1f}%" if avg_m2 is not None else "N/A",
+                "_check_pipeline_degraded: pipeline degraded — "
+                "m1_degraded=%s m2_degraded=%s (window=%d days)",
+                m1_degraded, m2_degraded, METRIC_ALERT_CONSECUTIVE_DAYS,
             )
         else:
             logger.debug(
-                "_check_pipeline_degraded: pipeline healthy "
-                "(avg metric1=%s avg metric2=%s)",
-                f"{avg_m1:.1f}%" if avg_m1 is not None else "N/A",
-                f"{avg_m2:.1f}%" if avg_m2 is not None else "N/A",
+                "_check_pipeline_degraded: pipeline healthy — "
+                "m1_degraded=%s m2_degraded=%s",
+                m1_degraded, m2_degraded,
             )
 
         return degraded
@@ -340,6 +340,7 @@ def run():
                             create_alert(
                                 alert_type=ALERT_EXHAUSTION_BLOCKED,
                                 severity=CRITICAL,
+                                platform=company,  # per-company dedup key
                                 message=(
                                     f"Exhaustion blocked for '{company}': "
                                     f"no recruiters found but pipeline metrics "

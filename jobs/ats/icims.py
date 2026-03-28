@@ -78,10 +78,13 @@ def fetch_jobs(slug, company):
     # Handle both "schwab" and "careers-schwab" slug formats
     # patterns.py strips "careers-" prefix so slug is always bare
     # but guard against both forms for safety
-    if slug.startswith("careers-"):
-        base_url = f"https://{slug}.icims.com"
-    else:
-        base_url = f"https://careers-{slug}.icims.com"
+
+    # if slug.startswith("careers-"):
+    #     base_url = f"https://{slug}.icims.com"
+    # else:
+    #     base_url = f"https://careers-{slug}.icims.com"
+
+    base_url = f"https://{slug}.icims.com"
     all_jobs  = []
     seen_ids  = set()
 
@@ -178,7 +181,7 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return []
+        return None  #[]
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
@@ -285,7 +288,7 @@ def _clean_title(raw_title):
     iCIMS prepends "Job Title\n" to anchor text.
     Strip it and clean up whitespace.
     """
-    title = re.sub(r'^Job\s+Title\s*\n?\s*', '', raw_title, flags=re.IGNORECASE)
+    title = re.sub(r'^Job\s+(Posting\s+)?Title\s*\n?\s*', '', raw_title, flags=re.IGNORECASE)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 

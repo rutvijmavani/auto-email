@@ -198,10 +198,10 @@ def run():
                                 sheet_row, company, platform, slug, domain)
                     conn.execute(
                         "UPDATE prospective_companies "
-                        "SET status='active', domain=COALESCE(?, domain), "
+                        "SET status='active', "
                         "ats_platform=?, ats_slug=?, ats_detected_at=? "
                         "WHERE company=?",
-                        (domain, platform, slug, datetime.utcnow(), company)
+                        (platform, slug, datetime.utcnow(), company)
                     )
                     conn.commit()
                     logger.info("Row %d: ATS update committed for %r", sheet_row, company)
@@ -217,14 +217,14 @@ def run():
                                 sheet_row, company, bool(ats_result), domain)
                     conn.execute(
                         "UPDATE prospective_companies "
-                        "SET status='active', domain=COALESCE(?, domain)"
+                        "SET status='active'"
                         + (", ats_platform=?, ats_slug=?, ats_detected_at=?"
                            if ats_result else "") +
                         " WHERE company=?",
                         (
-                            (domain, platform, slug, datetime.utcnow(), company)
+                            (platform, slug, datetime.utcnow(), company)
                             if ats_result else
-                            (domain, company)
+                            (company,)
                         )
                     )
                     conn.commit()
@@ -243,11 +243,11 @@ def run():
                             sheet_row, company, platform, slug, domain)
                 conn.execute(
                     "INSERT INTO prospective_companies "
-                    "(company, domain, ats_platform, ats_slug, ats_detected_at, "
+                    "(company, ats_platform, ats_slug, ats_detected_at, "
                     "priority, status, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, 2, 'active', ?)",
+                    "VALUES (?, ?, ?, ?, 2, 'active', ?)",
                     (
-                        company, domain, platform, slug,
+                        company, platform, slug,
                         datetime.utcnow() if ats_result else None,
                         datetime.utcnow(),
                     )

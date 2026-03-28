@@ -235,7 +235,15 @@ def run():
                         "iCIMS fetch_job_detail failed for %s/%s: %s",
                         company, job.get("job_id"), e, exc_info=True
                     )
-
+            
+            if platform == "jobvite" and job.get("_slug"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Jobvite fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+                    
             if save_job_posting(job, status="new"):
                 new_count += 1
                 logger.info("NEW JOB: %r | %s | %s",
