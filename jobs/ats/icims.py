@@ -181,7 +181,7 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return None  #[]
+        return []
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)

@@ -243,6 +243,13 @@ def run():
                     logger.error("Jobvite fetch_job_detail failed for %s/%s: %s",
                         company, job.get("job_id"), e, exc_info=True
                     )
+            
+            if platform == "avature" and job.get("_slug_info"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Avature fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True)
                     
             if save_job_posting(job, status="new"):
                 new_count += 1

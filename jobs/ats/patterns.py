@@ -19,6 +19,7 @@ ATS_SITE_SEARCHES = [
     ("lever",           "site:jobs.lever.co"),
     ("ashby",           "site:jobs.ashbyhq.com"),
     ("smartrecruiters", "site:jobs.smartrecruiters.com"),
+    ("jobvite",         "site:jobs.jobvite.com"),
     ("workday",         "site:myworkdayjobs.com"),
     ("oracle_hcm",      "site:oraclecloud.com"),
     ("icims",           "site:icims.com careers"),  # careers-*.icims.com
@@ -205,6 +206,21 @@ def _make_patterns():
         ),
         "successfactors",
         lambda m: m.group(1).lower(),
+    ))
+
+    # Avature hosted — {slug}.avature.net
+    patterns.append((
+        re.compile(r"([a-z0-9]+)\.avature\.net/", re.IGNORECASE),
+        "avature",
+        lambda m: json.dumps({"base": f"https://{m.group(1)}.avature.net", "path": "careers"}),
+    ))
+
+    # Avature custom domains
+    for _domain, _path in [("jobs.ea.com", "en_US/careers"), ("jobs.siemens.com", "en_US/externaljobs")]:
+        patterns.append((
+            re.compile(re.escape(_domain), re.IGNORECASE),
+            "avature",
+            lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
     ))
 
     return patterns

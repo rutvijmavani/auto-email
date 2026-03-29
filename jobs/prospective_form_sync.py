@@ -175,13 +175,9 @@ def run():
             ).fetchone()
 
             if existing:
-                # Derive domain here so both update branches can use it
-                from urllib.parse import urlparse as _urlparse
-                domain = _urlparse(job_url).hostname if job_url else None
-
-                logger.debug("Row %d: existing record — id=%s status=%s ats_platform=%s domain=%s",
+                logger.debug("Row %d: existing record — id=%s status=%s ats_platform=%s",
                              sheet_row, existing["id"], existing["status"],
-                             existing["ats_platform"], domain)
+                             existing["ats_platform"])
 
                 # Update ATS if we now have it and didn't before
                 # Treat None and 'unknown' as equivalent to missing

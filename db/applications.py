@@ -222,7 +222,7 @@ def get_applications_by_date(date: str) -> list:
             SELECT id, company, job_url, job_title,
                    applied_date, status, expected_domain
             FROM applications
-            WHERE applied_date = ?
+            WHERE applied_date = ? AND status != 'prospective'
         """, (date,)).fetchall()
         return [dict(r) for r in rows]
     finally:

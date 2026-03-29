@@ -413,19 +413,20 @@ def check_api_health():
                     f"(threshold {threshold:.0f}%)"
                 ),
             )
-            if alert_id:
-                alerts.append({
-                    "alert_id":   alert_id,
-                    "alert_type": ALERT_API_FAILURE,
-                    "severity":   CRITICAL,
-                    "platform":   platform,
-                    "value":      round(avg_error, 1),
-                    "threshold":  threshold,
-                    "message": (
-                        f"{platform} API error rate {avg_error:.1f}% "
-                        f"for {days} consecutive days "
-                        f"(threshold {threshold:.0f}%)"
-                    ),
-                })
+            # Always append breach — alert_id may be None if deduped.
+            # Caller decides whether to notify; breach info is always present.
+            alerts.append({
+                "alert_id":   alert_id,
+                "alert_type": ALERT_API_FAILURE,
+                "severity":   CRITICAL,
+                "platform":   platform,
+                "value":      round(avg_error, 1),
+                "threshold":  threshold,
+                "message": (
+                    f"{platform} API error rate {avg_error:.1f}% "
+                    f"for {days} consecutive days "
+                    f"(threshold {threshold:.0f}%)"
+                ),
+            })
 
     return alerts

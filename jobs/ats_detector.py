@@ -17,7 +17,7 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
-from jobs.ats import oracle_hcm, icims
+from jobs.ats import oracle_hcm, icims , jobvite , avature
 from config import (
     ATS_STATUS_DETECTED,
     ATS_STATUS_UNSUPPORTED,
@@ -44,6 +44,8 @@ ATS_REGISTRY = {
     "workday":         workday,
     "oracle_hcm":      oracle_hcm,
     "icims":           icims,
+    "jobvite":         jobvite,
+    "avature":         avature,
 }
 
 ATS_STATUS_CUSTOM = "custom"
