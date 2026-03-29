@@ -81,6 +81,47 @@ def _is_valid_url(url):
     return bool(re.match(r"https?://", url.strip())) if url else False
 
 
+def _extract_registrable_domain(url):
+    """
+    Extract registrable/registrant domain from URL.
+
+    Examples:
+      https://jobs.capitalone.com/careers → "capitalone.com"
+      https://greenhouse.io/abc → "greenhouse.io"
+      https://stripe.com → "stripe.com"
+
+    Returns registrable domain or None if extraction fails.
+    Falls back to hostname if registrable domain cannot be determined.
+    """
+    from urllib.parse import urlparse as _urlparse
+    try:
+        hostname = _urlparse(url).hostname
+        if not hostname:
+            return None
+
+        # Split hostname into parts
+        parts = hostname.lower().split('.')
+
+        # Handle common TLDs and country-code TLDs
+        # registrable domain = SLD + TLD (e.g., "capitalone" + "com")
+        if len(parts) >= 2:
+            # Handle co.uk, com.au, etc. (two-part TLDs)
+            two_part_tlds = {'co.uk', 'com.au', 'co.nz', 'com.br', 'co.in', 'co.za'}
+            if len(parts) >= 3:
+                potential_tld = f"{parts[-2]}.{parts[-1]}"
+                if potential_tld in two_part_tlds:
+                    # Return domain.co.uk format
+                    return f"{parts[-3]}.{parts[-2]}.{parts[-1]}"
+
+            # Normal case: domain.tld
+            return f"{parts[-2]}.{parts[-1]}"
+
+        # Fallback to hostname if we can't extract registrable domain
+        return hostname
+    except Exception:
+        return None
+
+
 def run():
     """Sync prospective companies form responses to pipeline DB."""
     logger.info("════════════════════════════════════════")
@@ -149,11 +190,13 @@ def run():
         ats_result = None
         domain = None
         if job_url and _is_valid_url(job_url):
-            # Extract domain first
+            # Extract registrable domain (company domain) for normalization
             from urllib.parse import urlparse as _urlparse
             parsed_hostname = _urlparse(job_url).hostname if job_url else None
             if parsed_hostname:
-                domain = parsed_hostname
+                # Use registrable domain for downstream get_domain_for_prospective()
+                registrable = _extract_registrable_domain(job_url)
+                domain = registrable if registrable else parsed_hostname
 
             logger.debug("Row %d: running ATS pattern match on: %s", sheet_row, job_url)
             ats_result = match_ats_pattern(job_url)
@@ -199,12 +242,13 @@ def run():
                 if needs_ats_update:
                     logger.info("Row %d: updating ATS for %r — platform=%s slug=%s domain=%s",
                                 sheet_row, company, platform, slug, domain)
-                    # Only update domain if we have a new one
+                    # Only backfill domain if NULL or empty
                     if domain:
                         conn.execute(
                             "UPDATE prospective_companies "
                             "SET status='active', "
-                            "ats_platform=?, ats_slug=?, ats_detected_at=?, domain=? "
+                            "ats_platform=?, ats_slug=?, ats_detected_at=?, "
+                            "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END "
                             "WHERE company=?",
                             (platform, slug, datetime.utcnow(), domain, company)
                         )
@@ -232,7 +276,9 @@ def run():
                         if domain:
                             conn.execute(
                                 "UPDATE prospective_companies "
-                                "SET status='active', domain=?, ats_platform=?, ats_slug=?, ats_detected_at=? "
+                                "SET status='active', "
+                                "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END, "
+                                "ats_platform=?, ats_slug=?, ats_detected_at=? "
                                 "WHERE company=?",
                                 (domain, platform, slug, datetime.utcnow(), company)
                             )
@@ -247,7 +293,8 @@ def run():
                         if domain:
                             conn.execute(
                                 "UPDATE prospective_companies "
-                                "SET status='active', domain=? "
+                                "SET status='active', "
+                                "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END "
                                 "WHERE company=?",
                                 (domain, company)
                             )

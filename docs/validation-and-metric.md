@@ -571,9 +571,9 @@ With api_health — same event:
   → pipeline_alerts row created → email alert sent
 ```
 
-**Implementation status:** Schema created and deployed. All columns are currently 0 — the writer in `jobs/job_monitor.py` has not been implemented yet. When implemented, a row will be upserted per platform at the end of each `--monitor-jobs` run.
+**Implementation status:** Schema created and writer implemented. Rows are produced by calls to `db.api_health.record_request()` in `jobs/ats/icims.py` (and any other callers) during `--monitor-jobs` runs. The writer tracks ATS API telemetry in real-time.
 
-**Retention:** No cleanup function yet. Add `RETENTION_API_HEALTH` to `config.py` and `_cleanup_api_health()` in `db/schema.py` when the writer is added. Suggested value: 60 days (same as `monitor_stats`).
+**Retention:** Add `RETENTION_API_HEALTH` to `config.py` and implement `_cleanup_api_health()` in `db/schema.py` when implementing retention cleanup. Suggested value: 60 days (same as `monitor_stats`).
 
 ---
 

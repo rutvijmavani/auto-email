@@ -318,14 +318,14 @@ def _extract_location(soup):
     full_text = re.sub(r"Req\.Num\..*$", "", full_text, flags=re.IGNORECASE).strip()
 
     # Structure: "{Category} {City}, {State}"
-    # Split on comma — everything after last word before comma is city
-    # "Professional Services Barcelona, Spain"
-    #  → before_comma = "Professional Services Barcelona"
-    #  → after_comma  = "Spain"
-    #  → last word before comma = "Barcelona"
+    # Split on comma — everything before comma is city (preserves multi-word cities)
+    # "Professional Services San Francisco, California"
+    #  → before_comma = "Professional Services San Francisco"
+    #  → after_comma  = "California"
+    #  → city = "Professional Services San Francisco" (use full text before comma)
     if "," in full_text:
         before_comma, after_comma = full_text.rsplit(",", 1)
-        city  = before_comma.strip().rsplit(" ", 1)[-1]  # last word = city
+        city  = before_comma.strip()
         state = after_comma.strip()
         if city and state:
             return f"{city}, {state}"

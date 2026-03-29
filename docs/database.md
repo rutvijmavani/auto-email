@@ -442,7 +442,7 @@ Thresholds:
 **Alert behavior:**
 When Metric 1 < 50% OR Metric 2 < 60% for 3 consecutive days, a `pipeline_alerts` row is created and an email alert is sent. Crucially, before exhausting an application when metrics are below threshold, the pipeline skips the exhaust and fires an alert instead — human intervention required. See `validation-and-metric.md` for full exhaust vs skip logic.
 
-**Implementation status:** Schema created and deployed. Rows are persisted by `careershift/find_emails.py` during the `--find-only` run. The writer populates `metric1` and `metric2` at the end of each `--find-only` run.
+**Implementation status:** Schema created and deployed. Rows are written at the end of the `--find-only` run by the writer in `careershift/find_emails.py`. The writer populates `metric1` and `metric2` after completing the recruiter scraping workflow.
 
 **Retention:** Add `RETENTION_COVERAGE_STATS` to `config.py` and implement `_cleanup_coverage_stats()` function. Suggested value: 60 days (same as `monitor_stats`).
 
@@ -494,9 +494,9 @@ Error rate:        requests_error / requests_made  (target < 10%)
 Avg backoff/req:   backoff_total_s / requests_made
 ```
 
-**Implementation status:** Schema created and ready. Writer not yet implemented — all columns are currently 0. Will be populated inside `jobs/job_monitor.py` as each ATS platform's API calls are instrumented.
+**Implementation status:** Schema created and writer implemented. Rows are populated by calls to `db.api_health.record_request()` from `jobs/ats/icims.py` (and potentially other ATS modules). The writer tracks requests in real-time as ATS API calls are made during `--monitor-jobs` runs.
 
-**Retention:** No cleanup function yet — rows accumulate indefinitely. Add `RETENTION_API_HEALTH` to `config.py` and a `_cleanup_api_health()` function when the writer is implemented. Suggested retention: 60 days (same as `monitor_stats`).
+**Retention:** Add `RETENTION_API_HEALTH` to `config.py` and implement `_cleanup_api_health()` cleanup function (to be invoked from job_monitor or the db.api_health module). Suggested retention: 60 days (same as `monitor_stats`).
 
 ---
 

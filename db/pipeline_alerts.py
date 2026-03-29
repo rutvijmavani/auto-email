@@ -345,7 +345,7 @@ def check_api_health():
                    requests_made, requests_error,
                    CASE
                        WHEN requests_made > 0
-                       THEN ROUND(100.0 * requests_error / requests_made, 1)
+                       THEN 100.0 * requests_error / requests_made
                        ELSE 0
                    END AS error_pct
             FROM api_health

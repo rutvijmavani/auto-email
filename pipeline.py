@@ -748,6 +748,7 @@ def run_performance_report():
     try:
         send_email(to_email=EMAIL, body=body,
                    company="Pipeline", subject=subject)
+        # Only mark alerts as notified after successful email delivery
         logger.info("Performance alert email sent: %s", subject)
         print(f"[INFO] Alert email sent: {subject}")
         for alert in alerts:
@@ -759,6 +760,7 @@ def run_performance_report():
                      e, exc_info=True)
         print(f"[WARNING] Could not send alert email: {e}")
         print(f"[INFO] Alert details:\n{body}")
+        # Do NOT mark_notified on failure — alerts will be retried on next run
 
 
 def run_reactivate(company_name):
@@ -830,6 +832,7 @@ def run_pipeline_alert_report():
         try:
             send_email(to_email=EMAIL, body=body,
                        company="Pipeline", subject=subject)
+            # Only mark alerts as notified after successful email delivery
             logger.info("Pipeline alert email sent: %s", subject)
             print(f"[INFO] Alert email sent: {subject}")
             for alert in group:
@@ -838,6 +841,7 @@ def run_pipeline_alert_report():
             logger.error("Could not send pipeline alert email: %s",
                          e, exc_info=True)
             print(f"[WARNING] Could not send alert email: {e}")
+            # Do NOT mark_notified on failure — alerts will be retried on next run
 
 
 def run_quota_report(silent_if_healthy=False):

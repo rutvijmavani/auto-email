@@ -315,7 +315,7 @@ _COUNTRY_LABELS  = ["country", "country/region"]
 _DATE_LABELS     = ["date posted", "posted", "posted since", "posting date", "post date", "date"]
 
 # Article section headers to skip when finding description
-_SKIP_SECTIONS   = {"general information", "share this role", "share", "apply", ""}
+_SKIP_SECTIONS   = {"general information", "share this role", "share", "apply"}
 
 
 def _extract_fields(soup):
@@ -466,9 +466,8 @@ def _generalised_description(soup):
         header_txt = header.get_text(strip=True).lower() if header else ""
 
         # Skip non-content sections
-        if header_txt != "":
-            if any(skip in header_txt for skip in _SKIP_SECTIONS):
-                continue
+        if header_txt and any(skip in header_txt for skip in _SKIP_SECTIONS):
+            continue
 
         text = article.get_text(separator="\n", strip=True)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
