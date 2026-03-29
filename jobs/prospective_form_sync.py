@@ -83,7 +83,7 @@ def _is_valid_url(url):
 
 def _extract_registrable_domain(url):
     """
-    Extract registrable/registrant domain from URL.
+    Extract registrable/registrant domain from URL using tldextract.
 
     Examples:
       https://jobs.capitalone.com/careers → "capitalone.com"
@@ -95,31 +95,29 @@ def _extract_registrable_domain(url):
     """
     from urllib.parse import urlparse as _urlparse
     try:
+        import tldextract
+
         hostname = _urlparse(url).hostname
         if not hostname:
             return None
 
-        # Split hostname into parts
-        parts = hostname.lower().split('.')
+        # Use tldextract to get the registered domain
+        extracted = tldextract.extract(hostname)
+        registered_domain = extracted.registered_domain
 
-        # Handle common TLDs and country-code TLDs
-        # registrable domain = SLD + TLD (e.g., "capitalone" + "com")
-        if len(parts) >= 2:
-            # Handle co.uk, com.au, etc. (two-part TLDs)
-            two_part_tlds = {'co.uk', 'com.au', 'co.nz', 'com.br', 'co.in', 'co.za'}
-            if len(parts) >= 3:
-                potential_tld = f"{parts[-2]}.{parts[-1]}"
-                if potential_tld in two_part_tlds:
-                    # Return domain.co.uk format
-                    return f"{parts[-3]}.{parts[-2]}.{parts[-1]}"
-
-            # Normal case: domain.tld
-            return f"{parts[-2]}.{parts[-1]}"
-
-        # Fallback to hostname if we can't extract registrable domain
-        return hostname
+        # Fall back to hostname if registered_domain is empty
+        if registered_domain:
+            return registered_domain
+        else:
+            return hostname
     except Exception:
-        return None
+        # If tldextract fails or is unavailable, fall back to hostname
+        from urllib.parse import urlparse as _urlparse
+        try:
+            hostname = _urlparse(url).hostname
+            return hostname if hostname else None
+        except Exception:
+            return None
 
 
 def run():

@@ -145,7 +145,7 @@ def get_sendable_count_for_date(date: str) -> int:
             JOIN application_recruiters ar ON ar.application_id = a.id
             JOIN recruiters r              ON r.id = ar.recruiter_id
             WHERE a.applied_date = ?
-            AND   a.status != 'prospective'
+            AND   a.status = 'active'
             AND   r.recruiter_status = 'active'
         """, (date,)).fetchone()
         return row["sendable"] if row else 0

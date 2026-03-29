@@ -444,7 +444,7 @@ When Metric 1 < 50% OR Metric 2 < 60% for 3 consecutive days, a `pipeline_alerts
 
 **Implementation status:** Schema created and deployed. Rows are written at the end of the `--find-only` run by the writer in `careershift/find_emails.py`. The writer populates `metric1` and `metric2` after completing the recruiter scraping workflow.
 
-**Retention:** Add `RETENTION_COVERAGE_STATS` to `config.py` and implement `_cleanup_coverage_stats()` function. Suggested value: 60 days (same as `monitor_stats`).
+**Retention:** `RETENTION_COVERAGE_STATS` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_coverage_stats()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
 
 ---
 
@@ -494,9 +494,9 @@ Error rate:        requests_error / requests_made  (target < 10%)
 Avg backoff/req:   backoff_total_s / requests_made
 ```
 
-**Implementation status:** Schema created and writer implemented. Rows are populated by calls to `db.api_health.record_request()` from `jobs/ats/icims.py` (and potentially other ATS modules). The writer tracks requests in real-time as ATS API calls are made during `--monitor-jobs` runs.
+**Implementation status:** Schema created and writer implemented. Rows are populated by calls to `db.api_health.record_request()` from `jobs/ats/icims.py`. The writer tracks requests in real-time as ATS API calls are made during `--monitor-jobs` runs.
 
-**Retention:** Add `RETENTION_API_HEALTH` to `config.py` and implement `_cleanup_api_health()` cleanup function (to be invoked from job_monitor or the db.api_health module). Suggested retention: 60 days (same as `monitor_stats`).
+**Retention:** `RETENTION_API_HEALTH` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_api_health()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
 
 ---
 
@@ -529,7 +529,7 @@ coverage_drop    → monitor_stats companies_with_results / companies_monitored 
 
 **Implementation status:** Schema created and deployed. Rows are created and read by `db/pipeline_alerts.py` and `pipeline.py`. Alerts are triggered by `--find-only` and `--monitor-jobs` when performance thresholds are breached.
 
-**Retention:** Add `RETENTION_PIPELINE_ALERTS` to `config.py` and implement cleanup. Suggested retention: 30 days (same as `quota_alerts`).
+**Retention:** `RETENTION_PIPELINE_ALERTS` is defined in `config.py` (30 days, consistent with `quota_alerts`). The `_cleanup_pipeline_alerts()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
 
 ---
 
@@ -670,9 +670,9 @@ All retention values are configured in `config.py` and enforced at startup via `
 | `prospective_companies` | Permanent | Never deleted |
 | `monitor_stats` | 60 days | `date < now - 60 days` (`RETENTION_MONITOR_STATS`) |
 | `verify_filled_stats` | 60 days | `date < now - 60 days` (`RETENTION_VERIFY_FILLED_STATS`) |
-| `coverage_stats` | Not yet implemented | Will use `RETENTION_COVERAGE_STATS` when writer added |
-| `api_health` | Not yet implemented | Will use `RETENTION_API_HEALTH` when writer added |
-| `pipeline_alerts` | Not yet implemented | Will use `RETENTION_PIPELINE_ALERTS` when writer added |
+| `coverage_stats` | 60 days | `date < now - 60 days` (`RETENTION_COVERAGE_STATS`) |
+| `api_health` | 60 days | `date < now - 60 days` (`RETENTION_API_HEALTH`) |
+| `pipeline_alerts` | 30 days | `notified_at < now - 30 days` (WHERE `notified = 1`) (`RETENTION_PIPELINE_ALERTS`) |
 | `job_postings` (expired URLs) | Permanent | URL kept to prevent re-showing |
 | `outreach` (sent) | 30 days | `sent_at < now - 30 days` (`RETENTION_OUTREACH_SENT`) |
 | `outreach` (pending) | 30 days | `scheduled_for < now - 30 days` |
@@ -736,9 +736,10 @@ coverage_stats (1 per day) ← --find-only
     → alert trigger when thresholds breached for 3 consecutive days
     → persisted by careershift/find_emails.py
 
-api_health (1 per platform per day) ← --monitor-jobs [writer pending]
+api_health (1 per platform per day) ← --monitor-jobs
     → per-platform ATS API reliability
     → surfaces rate limiting and degrading APIs
+    → recorded by jobs/ats/icims.py
 
 pipeline_alerts ← all pipelines
     → unified alert log for all threshold breaches

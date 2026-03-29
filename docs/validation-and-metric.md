@@ -512,7 +512,7 @@ ON coverage_stats(date);
 
 **Implementation status:** Schema created and deployed. The writer in `careershift/find_emails.py` populates this table at the end of every `--find-only` run. `metric1` and `metric2` are now being written by the pipeline.
 
-**Retention:** Add `RETENTION_COVERAGE_STATS` to `config.py` and implement `_cleanup_coverage_stats()` in `db/schema.py`. Suggested value: 60 days (same as `monitor_stats`).
+**Retention:** `RETENTION_COVERAGE_STATS` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_coverage_stats()` cleanup hook has been implemented in `db/schema.py` and is invoked during cleanup.
 
 ---
 
@@ -571,9 +571,9 @@ With api_health — same event:
   → pipeline_alerts row created → email alert sent
 ```
 
-**Implementation status:** Schema created and writer implemented. Rows are produced by calls to `db.api_health.record_request()` in `jobs/ats/icims.py` (and any other callers) during `--monitor-jobs` runs. The writer tracks ATS API telemetry in real-time.
+**Implementation status:** Schema created and writer implemented. Rows are produced by calls to `db.api_health.record_request()` in `jobs/ats/icims.py` during `--monitor-jobs` runs. The writer tracks ATS API telemetry in real-time.
 
-**Retention:** Add `RETENTION_API_HEALTH` to `config.py` and implement `_cleanup_api_health()` in `db/schema.py` when implementing retention cleanup. Suggested value: 60 days (same as `monitor_stats`).
+**Retention:** `RETENTION_API_HEALTH` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_api_health()` cleanup hook has been implemented in `db/schema.py` and is invoked during cleanup.
 
 ---
 
@@ -630,7 +630,7 @@ Recommendation:
 
 **Implementation status:** Schema created and deployed. Rows are created and read by `db/pipeline_alerts.py` and `pipeline.py`. The system writes alerts when performance thresholds are breached during `--find-only` and `--monitor-jobs` runs.
 
-**Retention:** Add `RETENTION_PIPELINE_ALERTS` to `config.py` and implement `_cleanup_pipeline_alerts()` in `db/schema.py`. Suggested value: 30 days (same as `quota_alerts`).
+**Retention:** `RETENTION_PIPELINE_ALERTS` is defined in `config.py` (30 days, consistent with `quota_alerts`). The `_cleanup_pipeline_alerts()` cleanup hook has been implemented in `db/schema.py` and is invoked during cleanup.
 
 ---
 
@@ -657,11 +657,11 @@ METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
 METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires
 
 # ─────────────────────────────────────────
-# DATA RETENTION (add when writers implemented)
+# DATA RETENTION
 # ─────────────────────────────────────────
-# RETENTION_COVERAGE_STATS    = 60   # days (pending writer implementation)
-# RETENTION_API_HEALTH        = 60   # days (pending writer implementation)
-# RETENTION_PIPELINE_ALERTS   = 30   # days (pending writer implementation)
+RETENTION_COVERAGE_STATS    = 60   # days
+RETENTION_API_HEALTH        = 60   # days
+RETENTION_PIPELINE_ALERTS   = 30   # days
 ```
 
 ---

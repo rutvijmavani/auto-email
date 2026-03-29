@@ -149,7 +149,7 @@ def _cleanup_pipeline_alerts(c):
     c.execute("""
         DELETE FROM pipeline_alerts
         WHERE notified = 1
-        AND created_at < DATE('now', ?)
+        AND notified_at < DATE('now', ?)
     """, (f"-{RETENTION_PIPELINE_ALERTS} days",))
 
 
