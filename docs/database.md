@@ -442,9 +442,9 @@ Thresholds:
 **Alert behavior:**
 When Metric 1 < 50% OR Metric 2 < 60% for 3 consecutive days, a `pipeline_alerts` row is created and an email alert is sent. Crucially, before exhausting an application when metrics are below threshold, the pipeline skips the exhaust and fires an alert instead — human intervention required. See `validation-and-metric.md` for full exhaust vs skip logic.
 
-**Implementation status:** Schema created and ready. Writer not yet implemented — `metric1` and `metric2` are currently always NULL. Will be populated by `--find-only` and `--outreach-only` once the writer is added to `careershift/find_emails.py`.
+**Implementation status:** Schema created and deployed. Rows are persisted by `careershift/find_emails.py` during the `--find-only` run. The writer populates `metric1` and `metric2` at the end of each `--find-only` run.
 
-**Retention:** No cleanup function yet — rows accumulate indefinitely. Add `RETENTION_COVERAGE_STATS` to `config.py` and a `_cleanup_coverage_stats()` function when the writer is implemented.
+**Retention:** Add `RETENTION_COVERAGE_STATS` to `config.py` and implement `_cleanup_coverage_stats()` function. Suggested value: 60 days (same as `monitor_stats`).
 
 ---
 
@@ -527,9 +527,9 @@ api_rate_limited → platform requests_429 > 0 causing backoff > threshold
 coverage_drop    → monitor_stats companies_with_results / companies_monitored < 70%
 ```
 
-**Implementation status:** Schema created and ready. No writer or reader implemented yet. Currently nothing writes to this table. Will be populated by `--find-only`, `--monitor-jobs`, and a future `--performance-report` command.
+**Implementation status:** Schema created and deployed. Rows are created and read by `db/pipeline_alerts.py` and `pipeline.py`. Alerts are triggered by `--find-only` and `--monitor-jobs` when performance thresholds are breached.
 
-**Retention:** No cleanup function yet. Add `RETENTION_PIPELINE_ALERTS` to `config.py` when implemented. Suggested retention: 30 days (same as `quota_alerts`).
+**Retention:** Add `RETENTION_PIPELINE_ALERTS` to `config.py` and implement cleanup. Suggested retention: 30 days (same as `quota_alerts`).
 
 ---
 
@@ -731,17 +731,18 @@ verify_filled_stats (1 per day) ← --verify-filled
     → filled position cleanup metrics
     → inconclusive breakdown for diagnosing ATS blocks
 
-coverage_stats (1 per day) ← --find-only + --outreach-only [writer pending]
+coverage_stats (1 per day) ← --find-only
     → recruiter pipeline performance (metric1 + metric2)
     → alert trigger when thresholds breached for 3 consecutive days
+    → persisted by careershift/find_emails.py
 
 api_health (1 per platform per day) ← --monitor-jobs [writer pending]
     → per-platform ATS API reliability
     → surfaces rate limiting and degrading APIs
 
-pipeline_alerts ← all pipelines [writer pending]
+pipeline_alerts ← all pipelines
     → unified alert log for all threshold breaches
-    → replaces per-pipeline ad-hoc alerting
+    → created/read by db/pipeline_alerts.py and pipeline.py
 ```
 
 ---
@@ -764,9 +765,9 @@ job_postings (active)  ~2,000             ~6 MB
 job_postings (expired) ~50,000            ~12 MB
 monitor_stats          ~60 (rolling)      ~0.05 MB
 verify_filled_stats    ~60 (rolling)      ~0.01 MB
-coverage_stats         ~60 (rolling)      ~0.01 MB  [writer pending]
+coverage_stats         ~60 (rolling)      ~0.01 MB
 api_health             ~60×6 (rolling)    ~0.05 MB  [writer pending — 1 row/platform/day]
-pipeline_alerts        ~10 (rolling)      ~0.01 MB  [writer pending]
+pipeline_alerts        ~10 (rolling)      ~0.01 MB
 ─────────────────────────────────────────────────
 Total DB size          ~22 MB (6 months)
 

@@ -26,7 +26,7 @@ from jobs.ats.base import fetch_html, slugify, validate_company_match
 BASE_URL      = "https://jobs.jobvite.com/{slug}/jobs"
 SEARCH_URL    = "https://jobs.jobvite.com/{slug}/search"
 MAX_PAGES     = 20   # safety cap on category pagination
-JOB_ID_RE     = re.compile(r"/job/([A-Za-z0-9]+)(?:/|$)")
+JOB_ID_RE     = re.compile(r"/job/([A-Za-z0-9]+)(?:/|\?|$)")
 
 
 # ─────────────────────────────────────────
@@ -195,7 +195,9 @@ def fetch_job_detail(job):
         description = _extract_description(soup)
 
         job             = dict(job)
-        job["location"]    = location or ""
+        # Only overwrite location if current value is empty
+        if not job.get("location"):
+            job["location"] = location or ""
         job["description"] = description or ""
         # posted_at stays None — Jobvite does not expose it
 

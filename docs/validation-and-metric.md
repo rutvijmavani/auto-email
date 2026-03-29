@@ -510,9 +510,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
 ON coverage_stats(date);
 ```
 
-**Implementation status:** Schema created and deployed. `metric1` and `metric2` are currently always NULL — the writer in `careershift/find_emails.py` has not been implemented yet. When implemented, this table will be populated at the end of every `--find-only` run.
+**Implementation status:** Schema created and deployed. The writer in `careershift/find_emails.py` populates this table at the end of every `--find-only` run. `metric1` and `metric2` are now being written by the pipeline.
 
-**Retention:** No cleanup function yet. Add `RETENTION_COVERAGE_STATS` to `config.py` and `_cleanup_coverage_stats()` in `db/schema.py` when the writer is added. Suggested value: 60 days (same as `monitor_stats`).
+**Retention:** Add `RETENTION_COVERAGE_STATS` to `config.py` and implement `_cleanup_coverage_stats()` in `db/schema.py`. Suggested value: 60 days (same as `monitor_stats`).
 
 ---
 
@@ -628,9 +628,9 @@ Recommendation:
     python pipeline.py --reactivate "Collective"
 ```
 
-**Implementation status:** Schema created and deployed. Nothing writes to this table yet. Will be populated by `--find-only`, `--monitor-jobs`, and a future `--performance-report` command once `coverage_stats` and `api_health` writers are in place.
+**Implementation status:** Schema created and deployed. Rows are created and read by `db/pipeline_alerts.py` and `pipeline.py`. The system writes alerts when performance thresholds are breached during `--find-only` and `--monitor-jobs` runs.
 
-**Retention:** No cleanup function yet. Add `RETENTION_PIPELINE_ALERTS` to `config.py` and `_cleanup_pipeline_alerts()` in `db/schema.py` when implemented. Suggested value: 30 days (same as `quota_alerts`).
+**Retention:** Add `RETENTION_PIPELINE_ALERTS` to `config.py` and implement `_cleanup_pipeline_alerts()` in `db/schema.py`. Suggested value: 30 days (same as `quota_alerts`).
 
 ---
 
@@ -736,9 +736,9 @@ python pipeline.py --reactivate "CompanyName"
           Empty result → exhaust or skip based on metrics
 
   At end of run:
-    Record coverage_stats row (writer pending implementation)
+    Record coverage_stats row (careershift/find_emails.py)
     Check metric1 + metric2 against thresholds
     If below threshold for 3 consecutive days:
-      → Create pipeline_alerts row
-      → Send alert email
+      → Create pipeline_alerts row (db/pipeline_alerts.py)
+      → Send alert email (pipeline.py)
 ```

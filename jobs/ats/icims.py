@@ -79,12 +79,10 @@ def fetch_jobs(slug, company):
     # patterns.py strips "careers-" prefix so slug is always bare
     # but guard against both forms for safety
 
-    # if slug.startswith("careers-"):
-    #     base_url = f"https://{slug}.icims.com"
-    # else:
-    #     base_url = f"https://careers-{slug}.icims.com"
-
-    base_url = f"https://{slug}.icims.com"
+    if slug.startswith("careers-"):
+        base_url = f"https://{slug}.icims.com"
+    else:
+        base_url = f"https://careers-{slug}.icims.com"
     all_jobs  = []
     seen_ids  = set()
 

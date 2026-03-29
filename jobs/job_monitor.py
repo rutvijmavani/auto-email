@@ -211,8 +211,7 @@ def run():
                 continue
 
             # Check both new and legacy content hash during rollout period
-            if job.get("content_hash") and \
-               job_hash_exists(job.get("content_hash"),
+            if job_hash_exists(job.get("content_hash"),
                                job.get("content_hash_legacy")):
                 logger.debug("Duplicate content_hash skipped for %r", company)
                 continue

@@ -47,6 +47,13 @@ CUSTOM_DOMAINS = {
     "jobs.intuit.com":   "en_US/externalCareers",
 }
 
+# Domain → expected company mapping for validation
+COMPANY_BY_DOMAIN = {
+    "jobs.ea.com":       "ea",
+    "jobs.siemens.com":  "siemens",
+    "jobs.intuit.com":   "intuit",
+}
+
 
 # ─────────────────────────────────────────
 # DETECTION
@@ -92,6 +99,11 @@ def detect(company):
 
     # Try known custom domains
     for domain, path in CUSTOM_DOMAINS.items():
+        # Validate at domain level using company mapping
+        expected_company = COMPANY_BY_DOMAIN.get(domain, "")
+        if expected_company and not validate_company_match(expected_company, company):
+            continue
+
         base    = f"https://{domain}"
         sitemap = f"{base}/{path}/sitemap.xml"
         resp    = fetch_html(sitemap, platform="avature", track=False)
@@ -103,10 +115,6 @@ def detect(company):
         job_urls = _extract_job_urls(soup)
 
         if not job_urls:
-            continue
-
-        title_slug = _title_slug_from_url(job_urls[0]) if job_urls else ""
-        if not validate_company_match(title_slug, company):
             continue
 
         slug_info = {"base": base, "path": path}

@@ -703,6 +703,14 @@ def run_performance_report():
         print("[OK] Performance thresholds met — no alerts.")
         return
 
+    # Filter out deduped alerts (those without alert_id)
+    alerts = [a for a in alerts if a.get("alert_id") or a.get("id")]
+
+    if not alerts:
+        logger.info("Performance report: all alerts were deduped")
+        print("[OK] All alerts were already notified — no action needed.")
+        return
+
     logger.warning("Performance report: %d alert(s) detected", len(alerts))
 
     body_parts = []

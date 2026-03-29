@@ -147,7 +147,12 @@ def run():
         # If URL is not a known ATS URL (e.g. company careers page),
         # domain is still stored so P3a can detect ATS automatically
         ats_result = None
+        domain = None
         if job_url and _is_valid_url(job_url):
+            # Extract domain first
+            from urllib.parse import urlparse as _urlparse
+            domain = _urlparse(job_url).hostname if job_url else None
+
             logger.debug("Row %d: running ATS pattern match on: %s", sheet_row, job_url)
             ats_result = match_ats_pattern(job_url)
             if ats_result:
@@ -195,9 +200,9 @@ def run():
                     conn.execute(
                         "UPDATE prospective_companies "
                         "SET status='active', "
-                        "ats_platform=?, ats_slug=?, ats_detected_at=? "
+                        "ats_platform=?, ats_slug=?, ats_detected_at=?, domain=? "
                         "WHERE company=?",
-                        (platform, slug, datetime.utcnow(), company)
+                        (platform, slug, datetime.utcnow(), domain, company)
                     )
                     conn.commit()
                     logger.info("Row %d: ATS update committed for %r", sheet_row, company)
@@ -213,14 +218,14 @@ def run():
                                 sheet_row, company, bool(ats_result), domain)
                     conn.execute(
                         "UPDATE prospective_companies "
-                        "SET status='active'"
+                        "SET status='active', domain=?"
                         + (", ats_platform=?, ats_slug=?, ats_detected_at=?"
                            if ats_result else "") +
                         " WHERE company=?",
                         (
-                            (platform, slug, datetime.utcnow(), company)
+                            (domain, platform, slug, datetime.utcnow(), company)
                             if ats_result else
-                            (company,)
+                            (domain, company)
                         )
                     )
                     conn.commit()
@@ -231,19 +236,16 @@ def run():
                     rows_to_delete.append(sheet_row)
                     continue
             else:
-                # Extract domain from job URL for P3a career page detection
-                from urllib.parse import urlparse as _urlparse
-                domain = _urlparse(job_url).hostname if job_url else None
                 logger.info("Row %d: inserting NEW company %r — "
                             "platform=%s slug=%s domain=%s",
                             sheet_row, company, platform, slug, domain)
                 conn.execute(
                     "INSERT INTO prospective_companies "
-                    "(company, ats_platform, ats_slug, ats_detected_at, "
+                    "(company, domain, ats_platform, ats_slug, ats_detected_at, "
                     "priority, status, created_at) "
-                    "VALUES (?, ?, ?, ?, 2, 'active', ?)",
+                    "VALUES (?, ?, ?, ?, ?, 2, 'active', ?)",
                     (
-                        company, platform, slug,
+                        company, domain, platform, slug,
                         datetime.utcnow() if ats_result else None,
                         datetime.utcnow(),
                     )
