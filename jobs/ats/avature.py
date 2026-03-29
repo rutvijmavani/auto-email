@@ -466,8 +466,8 @@ def _generalised_description(soup):
         header_txt = header.get_text(strip=True).lower() if header else ""
 
         # Skip non-content sections
-        if any(skip in header_txt for skip in _SKIP_SECTIONS):
-            if header_txt != "":
+        if header_txt != "":
+            if any(skip in header_txt for skip in _SKIP_SECTIONS):
                 continue
 
         text = article.get_text(separator="\n", strip=True)

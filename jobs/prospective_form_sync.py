@@ -151,7 +151,9 @@ def run():
         if job_url and _is_valid_url(job_url):
             # Extract domain first
             from urllib.parse import urlparse as _urlparse
-            domain = _urlparse(job_url).hostname if job_url else None
+            parsed_hostname = _urlparse(job_url).hostname if job_url else None
+            if parsed_hostname:
+                domain = parsed_hostname
 
             logger.debug("Row %d: running ATS pattern match on: %s", sheet_row, job_url)
             ats_result = match_ats_pattern(job_url)
@@ -197,13 +199,23 @@ def run():
                 if needs_ats_update:
                     logger.info("Row %d: updating ATS for %r — platform=%s slug=%s domain=%s",
                                 sheet_row, company, platform, slug, domain)
-                    conn.execute(
-                        "UPDATE prospective_companies "
-                        "SET status='active', "
-                        "ats_platform=?, ats_slug=?, ats_detected_at=?, domain=? "
-                        "WHERE company=?",
-                        (platform, slug, datetime.utcnow(), domain, company)
-                    )
+                    # Only update domain if we have a new one
+                    if domain:
+                        conn.execute(
+                            "UPDATE prospective_companies "
+                            "SET status='active', "
+                            "ats_platform=?, ats_slug=?, ats_detected_at=?, domain=? "
+                            "WHERE company=?",
+                            (platform, slug, datetime.utcnow(), domain, company)
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE prospective_companies "
+                            "SET status='active', "
+                            "ats_platform=?, ats_slug=?, ats_detected_at=? "
+                            "WHERE company=?",
+                            (platform, slug, datetime.utcnow(), company)
+                        )
                     conn.commit()
                     logger.info("Row %d: ATS update committed for %r", sheet_row, company)
                     print("       [OK] ATS updated for existing company")
@@ -216,18 +228,36 @@ def run():
                     logger.info("Row %d: updating status/domain for %r "
                                 "(ats_result=%s domain=%s)",
                                 sheet_row, company, bool(ats_result), domain)
-                    conn.execute(
-                        "UPDATE prospective_companies "
-                        "SET status='active', domain=?"
-                        + (", ats_platform=?, ats_slug=?, ats_detected_at=?"
-                           if ats_result else "") +
-                        " WHERE company=?",
-                        (
-                            (domain, platform, slug, datetime.utcnow(), company)
-                            if ats_result else
-                            (domain, company)
-                        )
-                    )
+                    if ats_result:
+                        if domain:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', domain=?, ats_platform=?, ats_slug=?, ats_detected_at=? "
+                                "WHERE company=?",
+                                (domain, platform, slug, datetime.utcnow(), company)
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', ats_platform=?, ats_slug=?, ats_detected_at=? "
+                                "WHERE company=?",
+                                (platform, slug, datetime.utcnow(), company)
+                            )
+                    else:
+                        if domain:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', domain=? "
+                                "WHERE company=?",
+                                (domain, company)
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active' "
+                                "WHERE company=?",
+                                (company,)
+                            )
                     conn.commit()
                     logger.info("Row %d: update committed for %r", sheet_row, company)
                     # FIX: removed unnecessary f-prefix (Ruff F541 — no interpolation)

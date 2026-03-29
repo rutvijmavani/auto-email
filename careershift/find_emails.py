@@ -279,8 +279,8 @@ def run():
         # Check pipeline health BEFORE loop — gate exhaustions if degraded
         pipeline_is_degraded = _check_pipeline_degraded()
         if pipeline_is_degraded:
-            print(f"[WARNING] Pipeline degraded over last N days — "
-                  f"exhaustions blocked (human review required)")
+            print("[WARNING] Pipeline degraded over last N days — "
+                  "exhaustions blocked (human review required)")
 
         if not companies_to_scrape:
             print("\n[OK] All applications have enough recruiters. No scraping needed.")
