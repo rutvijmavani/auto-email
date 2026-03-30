@@ -81,6 +81,45 @@ def _is_valid_url(url):
     return bool(re.match(r"https?://", url.strip())) if url else False
 
 
+def _extract_registrable_domain(url):
+    """
+    Extract registrable/registrant domain from URL using tldextract.
+
+    Examples:
+      https://jobs.capitalone.com/careers → "capitalone.com"
+      https://greenhouse.io/abc → "greenhouse.io"
+      https://stripe.com → "stripe.com"
+
+    Returns registrable domain or None if extraction fails.
+    Falls back to hostname if registrable domain cannot be determined.
+    """
+    from urllib.parse import urlparse as _urlparse
+    try:
+        import tldextract
+
+        hostname = _urlparse(url).hostname
+        if not hostname:
+            return None
+
+        # Use tldextract to get the registered domain
+        extracted = tldextract.extract(hostname)
+        registered_domain = extracted.registered_domain
+
+        # Fall back to hostname if registered_domain is empty
+        if registered_domain:
+            return registered_domain
+        else:
+            return hostname
+    except Exception:
+        # If tldextract fails or is unavailable, fall back to hostname
+        from urllib.parse import urlparse as _urlparse
+        try:
+            hostname = _urlparse(url).hostname
+            return hostname if hostname else None
+        except Exception:
+            return None
+
+
 def run():
     """Sync prospective companies form responses to pipeline DB."""
     logger.info("════════════════════════════════════════")
@@ -147,7 +186,16 @@ def run():
         # If URL is not a known ATS URL (e.g. company careers page),
         # domain is still stored so P3a can detect ATS automatically
         ats_result = None
+        domain = None
         if job_url and _is_valid_url(job_url):
+            # Extract registrable domain (company domain) for normalization
+            from urllib.parse import urlparse as _urlparse
+            parsed_hostname = _urlparse(job_url).hostname if job_url else None
+            if parsed_hostname:
+                # Use registrable domain for downstream get_domain_for_prospective()
+                registrable = _extract_registrable_domain(job_url)
+                domain = registrable if registrable else parsed_hostname
+
             logger.debug("Row %d: running ATS pattern match on: %s", sheet_row, job_url)
             ats_result = match_ats_pattern(job_url)
             if ats_result:
@@ -175,13 +223,9 @@ def run():
             ).fetchone()
 
             if existing:
-                # Derive domain here so both update branches can use it
-                from urllib.parse import urlparse as _urlparse
-                domain = _urlparse(job_url).hostname if job_url else None
-
-                logger.debug("Row %d: existing record — id=%s status=%s ats_platform=%s domain=%s",
+                logger.debug("Row %d: existing record — id=%s status=%s ats_platform=%s",
                              sheet_row, existing["id"], existing["status"],
-                             existing["ats_platform"], domain)
+                             existing["ats_platform"])
 
                 # Update ATS if we now have it and didn't before
                 # Treat None and 'unknown' as equivalent to missing
@@ -196,13 +240,24 @@ def run():
                 if needs_ats_update:
                     logger.info("Row %d: updating ATS for %r — platform=%s slug=%s domain=%s",
                                 sheet_row, company, platform, slug, domain)
-                    conn.execute(
-                        "UPDATE prospective_companies "
-                        "SET status='active', domain=COALESCE(?, domain), "
-                        "ats_platform=?, ats_slug=?, ats_detected_at=? "
-                        "WHERE company=?",
-                        (domain, platform, slug, datetime.utcnow(), company)
-                    )
+                    # Only backfill domain if NULL or empty
+                    if domain:
+                        conn.execute(
+                            "UPDATE prospective_companies "
+                            "SET status='active', "
+                            "ats_platform=?, ats_slug=?, ats_detected_at=?, "
+                            "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END "
+                            "WHERE company=?",
+                            (platform, slug, datetime.utcnow(), domain, company)
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE prospective_companies "
+                            "SET status='active', "
+                            "ats_platform=?, ats_slug=?, ats_detected_at=? "
+                            "WHERE company=?",
+                            (platform, slug, datetime.utcnow(), company)
+                        )
                     conn.commit()
                     logger.info("Row %d: ATS update committed for %r", sheet_row, company)
                     print("       [OK] ATS updated for existing company")
@@ -215,18 +270,39 @@ def run():
                     logger.info("Row %d: updating status/domain for %r "
                                 "(ats_result=%s domain=%s)",
                                 sheet_row, company, bool(ats_result), domain)
-                    conn.execute(
-                        "UPDATE prospective_companies "
-                        "SET status='active', domain=COALESCE(?, domain)"
-                        + (", ats_platform=?, ats_slug=?, ats_detected_at=?"
-                           if ats_result else "") +
-                        " WHERE company=?",
-                        (
-                            (domain, platform, slug, datetime.utcnow(), company)
-                            if ats_result else
-                            (domain, company)
-                        )
-                    )
+                    if ats_result:
+                        if domain:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', "
+                                "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END, "
+                                "ats_platform=?, ats_slug=?, ats_detected_at=? "
+                                "WHERE company=?",
+                                (domain, platform, slug, datetime.utcnow(), company)
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', ats_platform=?, ats_slug=?, ats_detected_at=? "
+                                "WHERE company=?",
+                                (platform, slug, datetime.utcnow(), company)
+                            )
+                    else:
+                        if domain:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active', "
+                                "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END "
+                                "WHERE company=?",
+                                (domain, company)
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE prospective_companies "
+                                "SET status='active' "
+                                "WHERE company=?",
+                                (company,)
+                            )
                     conn.commit()
                     logger.info("Row %d: update committed for %r", sheet_row, company)
                     # FIX: removed unnecessary f-prefix (Ruff F541 — no interpolation)
@@ -235,9 +311,6 @@ def run():
                     rows_to_delete.append(sheet_row)
                     continue
             else:
-                # Extract domain from job URL for P3a career page detection
-                from urllib.parse import urlparse as _urlparse
-                domain = _urlparse(job_url).hostname if job_url else None
                 logger.info("Row %d: inserting NEW company %r — "
                             "platform=%s slug=%s domain=%s",
                             sheet_row, company, platform, slug, domain)

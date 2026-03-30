@@ -20,6 +20,7 @@
 
 import re
 import json
+import time
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
@@ -37,6 +38,25 @@ HEADERS = {
 TIMEOUT       = 12
 MAX_PAGES     = 20    # safety cap on pagination
 PAGE_DELAY    = 0.3   # seconds between page requests
+
+
+def _track(status_code, elapsed_ms, backoff_s=0):
+    """
+    Record request to api_health. Best-effort — never raises.
+    status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+    Logs failures at debug level so tracking errors are visible without blocking callers.
+    """
+    try:
+        from db.api_health import record_request
+        record_request("icims", status_code, elapsed_ms, backoff_s)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug(
+            "_track: failed to record icims request "
+            "(status=%s elapsed_ms=%s)",
+            status_code, elapsed_ms,
+            exc_info=True,
+        )
 
 
 def fetch_jobs(slug, company):
@@ -58,6 +78,7 @@ def fetch_jobs(slug, company):
     # Handle both "schwab" and "careers-schwab" slug formats
     # patterns.py strips "careers-" prefix so slug is always bare
     # but guard against both forms for safety
+
     if slug.startswith("careers-"):
         base_url = f"https://{slug}.icims.com"
     else:
@@ -65,7 +86,6 @@ def fetch_jobs(slug, company):
     all_jobs  = []
     seen_ids  = set()
 
-    import time
     for page in range(MAX_PAGES):
         url  = f"{base_url}/jobs/search?pr={page}&in_iframe=1"
         jobs = _fetch_listing_page(url, base_url, company, seen_ids)
@@ -90,69 +110,87 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         list of job dicts  — page fetched (may be empty = end of results)
         None               — network/HTTP error (caller should stop)
     """
+    start_ms = int(time.time() * 1000)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        elapsed_ms = int(time.time() * 1000) - start_ms
 
         # Non-200 = server error, not end of pages → return None
         if resp.status_code == 404:
+            _track(404, elapsed_ms)
             return []   # 404 = no jobs board exists
         if resp.status_code != 200:
+            _track(resp.status_code, elapsed_ms)
             return None  # error — stop pagination
 
-        # Detect JS redirect — company migrated away from iCIMS
-        # e.g. AMD: window.top.location.href = 'https://careers.amd.com/jobs'
-        # Page is tiny (<500 chars) and contains a redirect script
-        if (len(resp.text) < 500 and
-                "location.href" in resp.text and
-                "window.top" in resp.text):
-            return None  # company no longer on iCIMS — stop
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        anchors = soup.select("a.iCIMS_Anchor")
-
-        if not anchors:
-            return []   # genuine empty page = end of results
-
-        jobs = []
-        for anchor in anchors:
-            raw_title = anchor.text.strip()
-            href      = anchor.get("href", "")
-
-            if not href:
-                continue
-
-            # Strip "Job Title\n" prefix that iCIMS adds
-            title = _clean_title(raw_title)
-            if not title:
-                continue
-
-            # Extract job ID from URL
-            job_id = _extract_job_id(href)
-            if not job_id or job_id in seen_ids:
-                continue
-            seen_ids.add(job_id)
-
-            # Build clean job URL (without in_iframe)
-            job_url = _clean_job_url(href, base_url)
-
-            jobs.append({
-                "company":     company,
-                "title":       title,
-                "job_url":     job_url,
-                "job_id":      job_id,
-                "location":    "",        # filled by fetch_job_detail
-                "posted_at":   None,      # filled by fetch_job_detail
-                "description": "",        # filled by fetch_job_detail
-                "ats":         "icims",
-                "_base_url":   base_url,  # used for detail fetch
-            })
-
-        return jobs
+        _track(200, elapsed_ms)
 
     except requests.exceptions.Timeout:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
         return []
-    except Exception:
+    except requests.exceptions.ConnectionError:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
         return []
+    except requests.RequestException:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
+        return []
+
+    # ── Parsing block — separate from network I/O ──
+    # Detect JS redirect — company migrated away from iCIMS
+    # e.g. AMD: window.top.location.href = 'https://careers.amd.com/jobs'
+    # Page is tiny (<500 chars) and contains a redirect script
+    if (len(resp.text) < 500 and
+            "location.href" in resp.text and
+            "window.top" in resp.text):
+        return None  # company no longer on iCIMS — stop
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    anchors = soup.select("a.iCIMS_Anchor")
+
+    if not anchors:
+        return []   # genuine empty page = end of results
+
+    jobs = []
+    for anchor in anchors:
+        raw_title = anchor.text.strip()
+        href      = anchor.get("href", "")
+
+        if not href:
+            continue
+
+        # Strip "Job Title\n" prefix that iCIMS adds
+        title = _clean_title(raw_title)
+        if not title:
+            continue
+
+        # Extract job ID from URL
+        job_id = _extract_job_id(href)
+        if not job_id or job_id in seen_ids:
+            continue
+        seen_ids.add(job_id)
+
+        # Build clean job URL (without in_iframe)
+        job_url = _clean_job_url(href, base_url)
+
+        jobs.append({
+            "company":     company,
+            "title":       title,
+            "job_url":     job_url,
+            "job_id":      job_id,
+            "location":    "",        # filled by fetch_job_detail
+            "posted_at":   None,      # filled by fetch_job_detail
+            "description": "",        # filled by fetch_job_detail
+            "ats":         "icims",
+            "_base_url":   base_url,  # used for detail fetch
+        })
+
+    return jobs
 
 
 def fetch_job_detail(job):
@@ -180,50 +218,68 @@ def fetch_job_detail(job):
         sep = "&" if "?" in detail_url else "?"
         detail_url = f"{detail_url}{sep}in_iframe=1"
 
+    start_ms = int(time.time() * 1000)
+
+    # ── Block 1: Network I/O — track once based on HTTP status ──
     try:
-        resp = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
+        resp       = requests.get(detail_url, headers=HEADERS, timeout=TIMEOUT)
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        _track(resp.status_code, elapsed_ms)
+
         if resp.status_code != 200:
             return job
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(separator=" ", strip=True)
-
-        # Extract posted_at from body text
-        # Format: "Posted Date 3 days ago (05/03/2026 13:46)"
-        posted_at = _extract_posted_date(text)
-
-        # Try JSON-LD for richer data
-        json_ld = _extract_json_ld(soup)
-        if json_ld:
-            # Location from JSON-LD
-            location = _extract_location_from_json_ld(json_ld)
-            # posted_at from JSON-LD datePosted if not found in body
-            if not posted_at:
-                date_posted = json_ld.get("datePosted", "")
-                if date_posted:
-                    try:
-                        posted_at = datetime.fromisoformat(
-                            date_posted.replace("Z", "+00:00")
-                        )
-                    except (ValueError, AttributeError):
-                        pass
-        else:
-            location = _extract_location_from_html(soup, text)
-
-        # Extract description
-        description = _extract_description(soup)
-
-        job = dict(job)
-        job["posted_at"]   = posted_at
-        job["location"]    = location or ""
-        job["description"] = description or ""
-
-        return job
-
     except requests.exceptions.Timeout:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
         return job
-    except Exception:
+    except requests.exceptions.ConnectionError:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
         return job
+    except requests.RequestException:
+        elapsed_ms = int(time.time() * 1000) - start_ms
+        # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
+        _track(0, elapsed_ms)
+        return job
+
+    # ── Block 2: Parsing — no _track calls here (request already recorded) ──
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(separator=" ", strip=True)
+
+    # Extract posted_at from body text
+    # Format: "Posted Date 3 days ago (05/03/2026 13:46)"
+    posted_at = _extract_posted_date(text)
+
+    # Try JSON-LD for richer data
+    json_ld = _extract_json_ld(soup)
+    if json_ld:
+        # Location from JSON-LD
+        location = _extract_location_from_json_ld(json_ld)
+        # posted_at from JSON-LD datePosted if not found in body
+        if not posted_at:
+            date_posted = json_ld.get("datePosted", "")
+            if date_posted:
+                try:
+                    posted_at = datetime.fromisoformat(
+                        date_posted.replace("Z", "+00:00")
+                    )
+                except (ValueError, AttributeError):
+                    pass
+    else:
+        location = _extract_location_from_html(soup, text)
+
+    # Extract description
+    description = _extract_description(soup)
+
+    job = dict(job)
+    job["posted_at"]   = posted_at
+    job["location"]    = location or ""
+    job["description"] = description or ""
+
+    return job
 
 
 # ─────────────────────────────────────────
@@ -235,7 +291,7 @@ def _clean_title(raw_title):
     iCIMS prepends "Job Title\n" to anchor text.
     Strip it and clean up whitespace.
     """
-    title = re.sub(r'^Job\s+Title\s*\n?\s*', '', raw_title, flags=re.IGNORECASE)
+    title = re.sub(r'^Job\s+(Posting\s+)?Title\s*\n?\s*', '', raw_title, flags=re.IGNORECASE)
     title = re.sub(r'\s+', ' ', title).strip()
     return title
 

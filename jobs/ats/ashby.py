@@ -14,7 +14,8 @@ def detect(company):
     Returns (slug, sample_jobs) or (None, None).
     """
     for slug in slugify(company):
-        data = fetch_json(BASE_URL.format(slug=slug))
+        data = fetch_json(BASE_URL.format(slug=slug),
+                          platform="ashby", track=False)  # detection — don't track
         if data is None:
             continue
         jobs = data.get("jobs", [])
@@ -33,7 +34,8 @@ def fetch_jobs(slug, company):
     Fetch all jobs for company from Ashby.
     Returns list of normalized job dicts.
     """
-    data = fetch_json(BASE_URL.format(slug=slug))
+    data = fetch_json(BASE_URL.format(slug=slug),
+                      platform="ashby")  # tracked for api_health
     if not data:
         return []
     jobs = data.get("jobs", [])

@@ -176,7 +176,6 @@ def run():
             logger.debug("Missing from scan: %d jobs for %r",
                          len(missing_ids), company)
 
-
         if not raw_jobs:
             logger.info("No jobs returned for %r", company)
             update_company_check(company, found_jobs=False)
@@ -211,8 +210,8 @@ def run():
                     logger.debug("Duplicate URL skipped: %s", job["job_url"])
                 continue
 
-            if job.get("content_hash") and \
-               job_hash_exists(job["content_hash"],
+            # Check both new and legacy content hash during rollout period
+            if job_hash_exists(job.get("content_hash"),
                                job.get("content_hash_legacy")):
                 logger.debug("Duplicate content_hash skipped for %r", company)
                 continue
@@ -235,12 +234,26 @@ def run():
                         "iCIMS fetch_job_detail failed for %s/%s: %s",
                         company, job.get("job_id"), e, exc_info=True
                     )
-
+            
+            if platform == "jobvite" and job.get("_slug"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Jobvite fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+            
+            if platform == "avature" and job.get("_slug_info"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Avature fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True)
+                    
             if save_job_posting(job, status="new"):
                 new_count += 1
                 logger.info("NEW JOB: %r | %s | %s",
                             company, job.get("title"), job.get("location"))
-
 
         logger.info("Done %r: fetched=%d matched=%d new=%d",
                     company, len(raw_jobs), len(matched), new_count)

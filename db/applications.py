@@ -203,3 +203,28 @@ def get_existing_domain_for_company(company):
         domain = row["email"].split("@")[1]   # "collective.com"
         return domain.split(".")[0]            # "collective"
     return None
+
+
+# ─────────────────────────────────────────
+# ADD to db/applications.py
+# ─────────────────────────────────────────
+
+def get_applications_by_date(date: str) -> list:
+    """
+    Return all applications with applied_date = date.
+    date format: 'YYYY-MM-DD'
+    Used by find_emails.py to compute metric1/metric2
+    for yesterday's applications.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT id, company, job_url, job_title,
+                   applied_date, status, expected_domain
+            FROM applications
+            WHERE applied_date = ? AND status != 'prospective'
+        """, (date,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+ 

@@ -35,3 +35,4 @@ def send_email(to_email, body, company, subject=None):
 
     except Exception as e:
         print("Email sending failed:", e)
+        raise  # Re-raise exception so caller knows delivery failed

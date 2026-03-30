@@ -26,7 +26,8 @@ def detect(company):
     """
     for slug in slugify(company):
         url = BASE_URL.format(slug=slug)
-        data = fetch_json(url, params={"content": "true"})
+        data = fetch_json(url, params={"content": "true"},
+                          platform="greenhouse", track=False)  # detection — don't track
         if data is None:
             continue
         jobs = data.get("jobs", [])
@@ -52,7 +53,8 @@ def fetch_jobs(slug, company):
     all_jobs = []
     page = 1
     while True:
-        data = fetch_json(url, params={"content": "true", "page": page})
+        data = fetch_json(url, params={"content": "true", "page": page},
+                          platform="greenhouse")  # tracked for api_health
         if not data:
             break
         jobs = data.get("jobs", [])
@@ -77,7 +79,7 @@ def _normalize(job, company):
         "job_url":     job.get("absolute_url", ""),
         "location":    job.get("location", {}).get("name", ""),
         "posted_at":   _parse_date(job.get("first_published")),  # updated_at unreliable — not used
-        "job_id":      str(job.get("id", "")), 
+        "job_id":      str(job.get("id", "")),
         "description": job.get("content", ""),
         "ats":         "greenhouse",
     }

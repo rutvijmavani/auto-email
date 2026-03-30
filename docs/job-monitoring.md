@@ -1491,8 +1491,9 @@ Phase 10 — Tests:
      for direct URL verification requests
    → These show as inconclusive_other_status
    → Jobs stay in stale state until ATS allows verification
-   → Eventually deleted after VERIFY_FILLED_RETENTION days
-     regardless of whether 404 was confirmed
+   → Not deleted unless verification confirms filled
+    (status transitions to `filled` via 404/410 path)
+   → Inconclusive jobs remain stale and are retried on future runs
 
 8. Location filter accepts ambiguous locations
    → "2 Locations", "Stockholm", "Virtual" included by default

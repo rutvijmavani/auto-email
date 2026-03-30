@@ -14,7 +14,8 @@ def detect(company):
     Returns (slug, sample_jobs) or (None, None).
     """
     for slug in slugify(company):
-        data = fetch_json(BASE_URL.format(slug=slug))
+        data = fetch_json(BASE_URL.format(slug=slug),
+                          platform="smartrecruiters", track=False)  # detection — don't track
         if data is None:
             continue
         jobs = data.get("content", [])
@@ -44,7 +45,8 @@ def fetch_jobs(slug, company):
     while True:
         data = fetch_json(
             BASE_URL.format(slug=slug),
-            params={"limit": limit, "offset": offset}
+            params={"limit": limit, "offset": offset},
+            platform="smartrecruiters",  # tracked for api_health
         )
         if not data:
             break
@@ -99,7 +101,7 @@ def _normalize(job, company, company_slug=""):
         "job_url":     job_url,
         "location":    loc_str,
         "posted_at":   posted_at,
-        "job_id":      str(job_id), 
+        "job_id":      str(job_id),
         "description": (job.get("jobAd") or {}).get("sections", {})
                            .get("jobDescription", {}).get("text", ""),
         "ats":         "smartrecruiters",

@@ -65,7 +65,8 @@ def detect(company):
             for path in _get_path_variants(slug, company):
                 url  = _build_url({"slug": slug, "wd": wd, "path": path})
                 data = fetch_json_post(url, body={"limit": 20, "offset": 0},
-                                       headers=WORKDAY_HEADERS)
+                                       headers=WORKDAY_HEADERS,
+                                       platform="workday", track=False)  # detection — don't track
                 if data is None:
                     continue
                 jobs = data.get("jobPostings", [])
@@ -117,7 +118,8 @@ def fetch_jobs(slug_info, company):
 
     while True:
         data = fetch_json_post(url, body={"limit": limit, "offset": offset},
-                               headers=WORKDAY_HEADERS)
+                               headers=WORKDAY_HEADERS,
+                               platform="workday")  # tracked for api_health
         if not data:
             break
         jobs = data.get("jobPostings", [])
@@ -186,7 +188,6 @@ def _normalize(job, company, domain, path):
     external_path = (job.get("externalPath") or "").strip()
     external_url  = (job.get("externalUrl") or "").strip()
 
-    
     if external_path:
         # Relative path from real Workday API — prepend domain + career site name
         job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")
@@ -199,7 +200,7 @@ def _normalize(job, company, domain, path):
         job_url = domain.rstrip("/") + "/" + path.strip("/")
 
     import re as _re
-    _wd_match  = _re.search(r'_((?:JR|R)-\d+(?:-\d+)?)', job_url)
+    _wd_match  = _re.search(r'_((?:JR|R)-?\d+(?:-\d+)?)', job_url)
     _wd_job_id = _wd_match.group(1) if _wd_match else ""
 
     return {
@@ -210,5 +211,5 @@ def _normalize(job, company, domain, path):
         "posted_at":   posted_at,
         "description": " ".join(job.get("bulletFields", [])),
         "ats":         "workday",
-        "job_id":      _wd_job_id,  
+        "job_id":      _wd_job_id,
     }

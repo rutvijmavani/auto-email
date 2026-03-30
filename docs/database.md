@@ -391,6 +391,148 @@ Daily performance metrics for `--verify-filled` runs. Tracks how many stale job 
 
 ---
 
+### `coverage_stats`
+Daily performance metrics for the `--find-only` and `--outreach-only` pipelines. Tracks how effectively the recruiter sourcing pipeline is working — are we finding recruiters for the companies we apply to, and are those recruiters ready to be emailed?
+
+Think of this as the "health dashboard" for the recruiter pipeline specifically, complementing `monitor_stats` which tracks the job monitoring pipeline.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `date` | DATE NOT NULL UNIQUE | YYYY-MM-DD |
+| `total_applications` | INTEGER | Total active applications that day |
+| `companies_attempted` | INTEGER | Companies where scraping was attempted (excludes already-stocked) |
+| `auto_found` | INTEGER | Companies where recruiters were found with `auto` confidence |
+| `rejected_count` | INTEGER | Companies where buffer was discarded (domain mismatch, low confidence) |
+| `exhausted_count` | INTEGER | Companies marked `exhausted` (CareerShift has no data) |
+| `metric1` | REAL | Find-only performance % — see below |
+| `metric2` | REAL | Outreach coverage % — see below |
+| `created_at` | TIMESTAMP | When row created |
+
+**Metric 1 — Find-Only Pipeline Performance:**
+```text
+Formula: (auto_found / companies_attempted) * 100
+
+Example:
+  10 applications total → 4 already have recruiters → 6 attempted
+  4 found with auto confidence
+  Metric 1 = (4/6) * 100 = 66.7%
+
+Thresholds:
+  Green:  >= 70%   → healthy
+  Yellow: 50-70%   → degrading, monitor
+  Red:    < 50%    → alert fires after 3 consecutive days
+```
+
+**Metric 2 — Outreach Coverage Performance:**
+```text
+Formula: (companies_with_sendable_recruiters / total_applications) * 100
+
+Example:
+  10 total applications
+  4 already had recruiters + 4 newly found = 8 ready for outreach
+  Metric 2 = (8/10) * 100 = 80%
+
+Thresholds:
+  Green:  >= 75%   → healthy
+  Yellow: 60-75%   → degrading, monitor
+  Red:    < 60%    → alert fires after 3 consecutive days
+```
+
+**Alert behavior:**
+When Metric 1 < 50% OR Metric 2 < 60% for 3 consecutive days, a `pipeline_alerts` row is created and an email alert is sent. Crucially, before exhausting an application when metrics are below threshold, the pipeline skips the exhaust and fires an alert instead — human intervention required. See `validation-and-metric.md` for full exhaust vs skip logic.
+
+**Implementation status:** Schema created and deployed. Rows are written at the end of the `--find-only` run by the writer in `careershift/find_emails.py`. The writer populates `metric1` and `metric2` after completing the recruiter scraping workflow.
+
+**Retention:** `RETENTION_COVERAGE_STATS` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_coverage_stats()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
+
+---
+
+### `api_health`
+Per-platform ATS API reliability metrics recorded during each `--monitor-jobs` run. Tracks request counts, success/failure rates, response times, and rate limiting behavior per platform per day. Designed to power Metric 6 (API Failure Rate) and surface degrading ATS APIs before they silently cause job postings to be missed.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `date` | DATE NOT NULL | YYYY-MM-DD |
+| `platform` | TEXT NOT NULL | ATS platform name (`greenhouse` / `lever` / `ashby` etc.) |
+| `requests_made` | INTEGER | Total API requests attempted |
+| `requests_ok` | INTEGER | Responses with 200 status |
+| `requests_429` | INTEGER | Rate limit responses received |
+| `requests_404` | INTEGER | Not found responses (usually ATS detection misses) |
+| `requests_error` | INTEGER | All other errors (timeout, connection error, malformed JSON) |
+| `avg_response_ms` | INTEGER | Average response time in milliseconds |
+| `max_response_ms` | INTEGER | Slowest response time in milliseconds |
+| `total_ms` | INTEGER | Total time spent waiting on this platform |
+| `first_429_at` | TIMESTAMP | When the first rate limit response occurred |
+| `backoff_total_s` | INTEGER | Total seconds spent in backoff/retry waits |
+| `created_at` | TIMESTAMP | When row created |
+
+**UNIQUE constraint:** `(date, platform)` — one row per platform per day.
+
+**Why this matters:**
+```text
+Without api_health, a platform degrading looks like this:
+  Greenhouse: 40 companies → 0 new jobs found
+  Cause: Greenhouse API returning 429 all morning
+  What you see: empty digest
+  What you think: no new jobs posted today
+  Reality: you missed 40 companies worth of jobs
+
+With api_health, the same event looks like this:
+  Greenhouse: requests_made=40, requests_ok=0,
+              requests_429=40, backoff_total_s=2400
+  → Immediately visible in PDF digest health section
+  → pipeline_alerts row created → email alert sent
+```
+
+**Derived metrics:**
+```text
+Success rate:      requests_ok / requests_made
+Rate limit rate:   requests_429 / requests_made   (target < 5%)
+Error rate:        requests_error / requests_made  (target < 10%)
+Avg backoff/req:   backoff_total_s / requests_made
+```
+
+**Implementation status:** Schema created and writer implemented. Rows are populated by calls to `db.api_health.record_request()` from `jobs/ats/icims.py`. The writer tracks requests in real-time as ATS API calls are made during `--monitor-jobs` runs.
+
+**Retention:** `RETENTION_API_HEALTH` is defined in `config.py` (60 days, consistent with `monitor_stats`). The `_cleanup_api_health()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
+
+---
+
+### `pipeline_alerts`
+Unified alert table for all pipeline-level threshold breaches. A more flexible replacement for the recruiter-specific `quota_alerts` table — covers job monitoring failures, ATS API degradation, recruiter pipeline performance drops, and any other configurable threshold.
+
+Unlike `quota_alerts` which is specific to CareerShift/Gemini quota, `pipeline_alerts` is designed to be the single place where any automated alert is recorded before being emailed.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `alert_type` | TEXT NOT NULL | e.g. `metric1_low` / `metric2_low` / `api_failure_rate` / `coverage_drop` |
+| `severity` | TEXT NOT NULL | `warning` / `critical` |
+| `platform` | TEXT | ATS platform name if alert is platform-specific (NULL for pipeline-wide alerts) |
+| `value` | REAL | The actual metric value that triggered the alert |
+| `threshold` | REAL | The threshold that was breached |
+| `message` | TEXT | Human-readable description of what triggered the alert |
+| `notified` | INTEGER | `0` = alert created but email not yet sent, `1` = email sent |
+| `notified_at` | TIMESTAMP | When email was sent |
+| `created_at` | TIMESTAMP | When alert was created |
+
+**Alert types planned:**
+```text
+metric1_low      → find-only performance < METRIC1_ALERT_THRESHOLD (50%) for 3 days
+metric2_low      → outreach coverage < METRIC2_ALERT_THRESHOLD (60%) for 3 days
+api_failure_rate → platform requests_error / requests_made > 10% for 3 days
+api_rate_limited → platform requests_429 > 0 causing backoff > threshold
+coverage_drop    → monitor_stats companies_with_results / companies_monitored < 70%
+```
+
+**Implementation status:** Schema created and deployed. Rows are created and read by `db/pipeline_alerts.py` and `pipeline.py`. Alerts are triggered by `--find-only` and `--monitor-jobs` when performance thresholds are breached.
+
+**Retention:** `RETENTION_PIPELINE_ALERTS` is defined in `config.py` (30 days, consistent with `quota_alerts`). The `_cleanup_pipeline_alerts()` cleanup hook has been implemented and is invoked by `db/schema.py` during cleanup.
+
+---
+
 ### `serper_quota`
 Tracks total Serper API credit usage. One row (id=1), never deleted.
 
@@ -528,6 +670,9 @@ All retention values are configured in `config.py` and enforced at startup via `
 | `prospective_companies` | Permanent | Never deleted |
 | `monitor_stats` | 60 days | `date < now - 60 days` (`RETENTION_MONITOR_STATS`) |
 | `verify_filled_stats` | 60 days | `date < now - 60 days` (`RETENTION_VERIFY_FILLED_STATS`) |
+| `coverage_stats` | 60 days | `date < now - 60 days` (`RETENTION_COVERAGE_STATS`) |
+| `api_health` | 60 days | `date < now - 60 days` (`RETENTION_API_HEALTH`) |
+| `pipeline_alerts` | 30 days | `notified_at < now - 30 days` (WHERE `notified = 1`) (`RETENTION_PIPELINE_ALERTS`) |
 | `job_postings` (expired URLs) | Permanent | URL kept to prevent re-showing |
 | `outreach` (sent) | 30 days | `sent_at < now - 30 days` (`RETENTION_OUTREACH_SENT`) |
 | `outreach` (pending) | 30 days | `scheduled_for < now - 30 days` |
@@ -585,6 +730,20 @@ monitor_stats (1 per day) ← --monitor-jobs
 verify_filled_stats (1 per day) ← --verify-filled
     → filled position cleanup metrics
     → inconclusive breakdown for diagnosing ATS blocks
+
+coverage_stats (1 per day) ← --find-only
+    → recruiter pipeline performance (metric1 + metric2)
+    → alert trigger when thresholds breached for 3 consecutive days
+    → persisted by careershift/find_emails.py
+
+api_health (1 per platform per day) ← --monitor-jobs
+    → per-platform ATS API reliability
+    → surfaces rate limiting and degrading APIs
+    → recorded by jobs/ats/icims.py
+
+pipeline_alerts ← all pipelines
+    → unified alert log for all threshold breaches
+    → created/read by db/pipeline_alerts.py and pipeline.py
 ```
 
 ---
@@ -607,6 +766,9 @@ job_postings (active)  ~2,000             ~6 MB
 job_postings (expired) ~50,000            ~12 MB
 monitor_stats          ~60 (rolling)      ~0.05 MB
 verify_filled_stats    ~60 (rolling)      ~0.01 MB
+coverage_stats         ~60 (rolling)      ~0.01 MB
+api_health             ~60×6 (rolling)    ~0.05 MB  [writer pending — 1 row/platform/day]
+pipeline_alerts        ~10 (rolling)      ~0.01 MB
 ─────────────────────────────────────────────────
 Total DB size          ~22 MB (6 months)
 
