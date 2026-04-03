@@ -223,6 +223,119 @@ def _make_patterns():
             lambda m, d=_domain, p=_path: json.dumps({"base": f"https://{d}", "path": p}),
     ))
 
+    # ── Jobvite ─────────────────────────────────────────────────────────────────
+    # jobs.jobvite.com/{slug}/job/{id}
+    # jobs.jobvite.com/{slug}/jobs  (listing)
+    patterns.append((
+    re.compile(r"jobs\\.jobvite\\.com/([^/?&#\\s]+)/", re.IGNORECASE),
+    "jobvite",
+    lambda m: m.group(1).lower(),
+    ))
+
+    # ── Avature (hosted subdomain) ───────────────────────────────────────────────
+    # {slug}.avature.net/careers/...
+    # Stores slug_info as JSON with base URL and path
+    patterns.append((
+    re.compile(r"([a-z0-9][a-z0-9\\-]*)\\.avature\\.net/([a-z0-9_/]*)", re.IGNORECASE),
+    "avature",
+    lambda m: json.dumps({
+    "base": f"https://{m.group(1).lower()}.avature.net",
+    "path": m.group(2).strip("/") or "careers",
+    }),
+    ))
+
+    # ── Avature custom domain — EA ───────────────────────────────────────────────
+    # jobs.ea.com/en_US/careers/...
+    patterns.append((
+    re.compile(r"jobs\\.ea\\.com/([^?#\\s]+)", re.IGNORECASE),
+    "avature",
+    lambda m: json.dumps({
+    "base": "https://jobs.ea.com",
+    "path": "en_US/careers",
+    }),
+    ))
+
+    # ── Phenom People (custom domains) ──────────────────────────────────────────
+    # careers.chewy.com/us/en/job/{id}/{slug}
+    # jobs.ebayinc.com/us/en/job/{id}/{slug}
+    # Pattern: domain/path/job/{id}
+    # Slug_info stored as JSON with base, path, sitemap
+    for _phenom_domain, _phenom_path in [
+    ("careers.chewy.com",  "us/en"),
+    ("jobs.ebayinc.com",   "us/en"),
+    ]:
+    patterns.append((
+    re.compile(re.escape(_phenom_domain), re.IGNORECASE),
+    "phenom",
+    # Use default args to capture loop variables
+    lambda m, d=_phenom_domain, p=_phenom_path: json.dumps({
+    "base":    f"https://{d}",
+    "path":    p,
+    "sitemap": f"{p}/sitemap.xml",
+    }),
+    ))
+
+    # ── TalentBrew / Radancy ─────────────────────────────────────────────────────
+    # jobs.intuit.com/job/{city}/{slug}/{tenant_id}/{job_id}
+    # jobs.disneycareers.com/job/{city}/{slug}/{tenant_id}/{job_id}
+    # Tenant ID extracted from URL (3rd-to-last numeric segment)
+    for _tb_domain, _tb_tenant in [
+    ("jobs.intuit.com",         "27595"),
+    ("jobs.disneycareers.com",  "391"),
+    ]:
+    patterns.append((
+    re.compile(re.escape(_tb_domain), re.IGNORECASE),
+    "talentbrew",
+    lambda m, d=_tb_domain, t=_tb_tenant: json.dumps({
+    "base":      f"https://{d}",
+    "tenant_id": t,
+    }),
+    ))
+
+    # ── SAP SuccessFactors ───────────────────────────────────────────────────────
+    # career{dc}.successfactors.{region}/career?company={slug}&...
+    # Extracts dc, region, slug from URL
+    patterns.append((
+    re.compile(
+    r"career(\d+)\\.successfactors\\.(com|eu)/(?:career|careers)\\?.*company=([^&\\s]+)",
+    re.IGNORECASE
+    ),
+    "successfactors",
+    lambda m: json.dumps({
+    "slug":   m.group(3),
+    "dc":     m.group(1),
+    "region": m.group(2),
+    }),
+    ))
+
+    # ── Google Careers XML feed ──────────────────────────────────────────────────
+    # google.com/about/careers/applications/jobs/feed.xml
+    patterns.append((
+    re.compile(r"google\\.com/about/careers/applications/jobs/feed\\.xml", re.IGNORECASE),
+    "google",
+    lambda m: "{}",
+    ))
+
+    # ── Apple Jobs ──────────────────────────────────────────────────────────────
+    # jobs.apple.com/sitemap/sitemap-jobs-en-us.xml
+    # jobs.apple.com/en-us/details/{id}/{slug}
+    patterns.append((
+    re.compile(r"jobs\\.apple\\.com/", re.IGNORECASE),
+    "apple",
+    lambda m: "{}",
+    ))
+
+    # ── Generic sitemap / XML feed ───────────────────────────────────────────────
+    # Matches when user provides any sitemap.xml or feed.xml URL directly
+    # Stores full URL as slug_info for sitemap.py
+    # NOTE: This pattern is intentionally broad — only matched when URL
+    # explicitly contains sitemap.xml, feed.xml, or sitemal.xml
+    patterns.append((
+    re.compile(r"(https?://[^\\s]+(?:sitemap[^\\s]*\\.xml|feed\\.xml|sitemal\\.xml))", re.IGNORECASE),
+    "sitemap",
+    lambda m: json.dumps({"url": m.group(1)}),
+    ))
+
     return patterns
 
 

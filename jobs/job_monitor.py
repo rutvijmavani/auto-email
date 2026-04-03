@@ -235,20 +235,74 @@ def run():
                         company, job.get("job_id"), e, exc_info=True
                     )
             
+            # ── Jobvite — detail fetch for location/description ──────────────────────
             if platform == "jobvite" and job.get("_slug"):
                 try:
                     job = ats_module.fetch_job_detail(job)
                 except Exception as e:
-                    logger.error("Jobvite fetch_job_detail failed for %s/%s: %s",
+                    logger.error(
+                        "Jobvite fetch_job_detail failed for %s/%s: %s",
                         company, job.get("job_id"), e, exc_info=True
                     )
-            
-            if platform == "avature" and job.get("_slug_info"):
+        
+            # ── Avature — detail fetch for location/posted_at/description ────────────
+            if platform == "avature" and job.get("job_url"):
                 try:
                     job = ats_module.fetch_job_detail(job)
                 except Exception as e:
-                    logger.error("Avature fetch_job_detail failed for %s/%s: %s",
-                        company, job.get("job_id"), e, exc_info=True)
+                    logger.error(
+                        "Avature fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+        
+            # ── Phenom People — detail fetch for location/posted_at/description ──────
+            if platform == "phenom" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error(
+                        "Phenom fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+        
+            # ── TalentBrew — detail fetch for location/posted_at/description ─────────
+            if platform == "talentbrew" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error(
+                        "TalentBrew fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+        
+            # # ── Apple — detail fetch for location/posted_at/description ─────────────
+            # if platform == "apple" and job.get("job_url"):
+            #     try:
+            #         job = ats_module.fetch_job_detail(job)
+            #     except Exception as e:
+            #         logger.error(
+            #             "Apple fetch_job_detail failed for %s/%s: %s",
+            #             company, job.get("job_id"), e, exc_info=True
+            #         )
+        
+            # ── Sitemap — detail fetch ONLY for sitemap-based jobs (not XML feeds) ───
+            # XML feed jobs (_feed_type=xml) already have all data inline — skip.
+            if platform == "sitemap" and job.get("job_url") and job.get("_feed_type") != "xml":
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error(
+                        "Sitemap fetch_job_detail failed for %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True
+                    )
+        
+            # ── SuccessFactors — NO detail fetch needed ──────────────────────────────
+            # Option A: all data (title, location, posted_at, description) comes from
+            # the XML feed in fetch_jobs(). fetch_job_detail does not exist.
+        
+            # ── Google — NO detail fetch needed ──────────────────────────────────────
+            # Option A: all data comes inline from feed.xml.
+            # _feed_type="xml" flag is set on each job.
                     
             if save_job_posting(job, status="new"):
                 new_count += 1
