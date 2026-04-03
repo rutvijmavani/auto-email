@@ -188,7 +188,10 @@ def fetch_jobs(slug_info, company):
                 sub_resp = fetch_html(sub_url, platform="sitemap")
                 if sub_resp is None:
                     continue
-                sub_soup = BeautifulSoup(sub_resp.text, "html.parser")
+                sub_text = (sub_resp.text or "").strip()
+                if not sub_text:
+                    continue
+                sub_soup = BeautifulSoup(sub_text, "html.parser")
                 all_entries.extend(_extract_sitemap_entries(sub_soup))
             return _entries_to_stubs(all_entries, slug_info, company,
                                      job_pattern, locale_pref)

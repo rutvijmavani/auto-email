@@ -54,7 +54,8 @@ COL_XML_URL     = 5
 COL_NOTES       = 6
 
 # Hard ATS platforms — job URL gives no useful slug, try career page instead
-HARD_ATS = {"avature", "eightfold", "taleo", "successfactors"}
+# Note: Avature removed from this list as it can be detected via career page scan
+HARD_ATS = {"eightfold", "taleo", "successfactors"}
 
 # Well-known single global feeds — platform set directly from XML URL
 GLOBAL_FEEDS = {
@@ -157,7 +158,8 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url):
 
     if scan_url:
         result = _scan_career_page(company, scan_url)
-        if result and result.get("platform") not in HARD_ATS:
+        # Accept results except for hard ATS platforms (excluding avature which can be scanned)
+        if result and result.get("platform") not in {"eightfold", "taleo", "successfactors"}:
             logger.info("[sync] %r: ATS from career page — %s", company, result["platform"])
             print(f"       [ATS via career page] {result['platform']} / "
                   f"{str(result['slug'])[:50]}")
@@ -167,7 +169,8 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url):
     if domain:
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
-        if result and result.get("platform") not in HARD_ATS:
+        # Accept results except for hard ATS platforms (excluding avature which can be scanned)
+        if result and result.get("platform") not in {"eightfold", "taleo", "successfactors"}:
             logger.info("[sync] %r: ATS from domain scan — %s", company, result["platform"])
             print(f"       [ATS via domain] {result['platform']} / "
                   f"{str(result['slug'])[:50]}")

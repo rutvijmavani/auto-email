@@ -52,6 +52,7 @@ ATS_REGISTRY = {
     "sitemap":         sitemap,
     "successfactors":  successfactors,
     "google":          google,
+    "apple":           sitemap,  # Apple uses sitemap-based scraping
 }
 
 ATS_STATUS_CUSTOM = "custom"
