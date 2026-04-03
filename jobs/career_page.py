@@ -197,15 +197,7 @@ def _scan_html(html, company):
         result = match_ats_pattern(url)
         if not result:
             # Check if it's a rich-slug platform detected by CDN presence
-            for platform, signal in [
-                ("phenom",     "cdn.phenompeople.com"),
-                ("talentbrew", "tbcdn.talentbrew.com"),
-                ("avature",    "avature.net"),
-            ]:
-                if signal in url:
-                    logger.debug("[P3a] Rich-slug platform detected: %s", platform)
-                    # Return platform with empty slug — upstream extracts full slug_info
-                    return {"platform": platform, "slug": ""}
+            # Don't return empty slug - let upstream handle detection properly
             continue
 
         if _slug_valid_for_company(result, company):

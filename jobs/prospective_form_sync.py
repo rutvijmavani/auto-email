@@ -252,7 +252,7 @@ def _scan_career_page(company, career_page_url):
             return result
 
     # Check 2: Phenom People — cdn.phenompeople.com or use-widget: ph-
-    if "cdn.phenompeople.com" in html or "use-widget" in html and "ph-" in html:
+    if ("cdn.phenompeople.com" in html) or ("use-widget" in html and "ph-" in html):
         slug = _extract_phenom_slug(html, career_page_url)
         if slug:
             return {"platform": "phenom", "slug": slug}
@@ -399,7 +399,12 @@ def run():
         # Resolve domain — form field takes priority, else extract from job URL
         domain = None
         if domain_input:
-            domain = domain_input.lower().strip().lstrip("https://").lstrip("http://").rstrip("/")
+            normalized = domain_input.lower().strip()
+            if normalized.startswith("https://"):
+                normalized = normalized[8:]
+            elif normalized.startswith("http://"):
+                normalized = normalized[7:]
+            domain = normalized.rstrip("/")
         elif job_url and _is_valid_url(job_url):
             domain = _domain_from_url(job_url)
         elif career_page and _is_valid_url(career_page):
@@ -431,14 +436,14 @@ def run():
                     )
                 )
 
-                if needs_ats_update or ats_result:
+                if needs_ats_update:
                     conn.execute(
                         "UPDATE prospective_companies "
                         "SET status='active', "
                         "ats_platform=?, ats_slug=?, ats_detected_at=?, "
                         "domain = CASE WHEN domain IS NULL OR domain = '' THEN ? ELSE domain END "
                         "WHERE company=?",
-                        (platform, slug, datetime.utcnow() if ats_result else None,
+                        (platform, slug, datetime.utcnow(),
                          domain, company)
                     )
                 else:

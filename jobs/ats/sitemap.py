@@ -159,7 +159,7 @@ def fetch_jobs(slug_info, company):
     if resp is None:
         return []
 
-    text = resp.text.strip()
+    text = (resp.text or "").strip()
     if not text:
         return []
 
