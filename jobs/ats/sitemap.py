@@ -231,7 +231,7 @@ def fetch_job_detail(job):
         return job
 
     try:
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(getattr(resp, "text", "") or "", "html.parser")
 
         # Strategy 1 — JSON-LD
         ld = _extract_json_ld(soup)
@@ -597,7 +597,15 @@ def _entries_to_stubs(entries, slug_info, company, job_pattern="", locale_pref="
     Convert sitemap entries to job stub dicts.
     Filters to job URLs, deduplicates by job ID, picks best locale.
     """
-    custom_re = re.compile(job_pattern, re.IGNORECASE) if job_pattern else None
+    custom_re = None
+    if job_pattern:
+        try:
+            custom_re = re.compile(job_pattern, re.IGNORECASE)
+        except re.error as e:
+            # Log warning for invalid regex pattern and continue without custom filtering
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Invalid job_pattern regex '{job_pattern}': {e}")
 
     # Group entries by job ID (handles multi-locale duplicates)
     id_to_entries = {}
