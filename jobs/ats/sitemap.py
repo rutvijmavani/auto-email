@@ -635,6 +635,8 @@ def _entries_to_stubs(entries, slug_info, company, job_pattern="", locale_pref="
         lastmod   = entry.get("lastmod")
         posted_at = _parse_date(lastmod)
         title     = _title_from_url(url)
+        if not title:
+            title = f"Job {job_id}"
 
         jobs.append({
             "company":     company,
@@ -674,6 +676,8 @@ def _extract_json_ld(soup):
 def _from_json_ld(ld, job):
     """Extract all fields from JSON-LD JobPosting."""
     title     = ld.get("title", "") or job.get("title", "")
+    if not title:
+        title = f"Job {job.get('job_id', '')}"
     posted_at = _parse_date(ld.get("datePosted", "")) or job.get("posted_at")
 
     # Location
@@ -773,7 +777,10 @@ def _from_html(soup, job):
                 desc     = text[:5000]
 
     job              = dict(job)
-    job["title"]       = title or job.get("title", "")
+    final_title      = title or job.get("title", "")
+    if not final_title:
+        final_title = f"Job {job.get('job_id', '')}"
+    job["title"]       = final_title
     job["location"]    = location
     job["posted_at"]   = posted_at
     job["description"] = desc
