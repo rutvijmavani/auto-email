@@ -55,7 +55,7 @@ COL_NOTES       = 6
 
 # Hard ATS platforms — job URL gives no useful slug, try career page instead
 # Note: Avature removed from this list as it can be detected via career page scan
-HARD_ATS = {"eightfold", "taleo", "successfactors"}
+HARD_ATS = {"eightfold", "taleo"}
 
 # Well-known single global feeds — platform set directly from XML URL
 GLOBAL_FEEDS = {
