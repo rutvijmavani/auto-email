@@ -2519,13 +2519,16 @@ class TestICIMSFetch(unittest.TestCase):
     def test_fetch_jobs_returns_jobs(self, mock_get):
         """fetch_jobs returns job stubs from listing page."""
         from jobs.ats import icims
+        mock_probe = MagicMock()
+        mock_probe.status_code = 200
+        mock_probe.text = self._mock_listing_html()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = self._mock_listing_html()
         mock_empty = MagicMock()
         mock_empty.status_code = 200
         mock_empty.text = "<html><body></body></html>"
-        mock_get.side_effect = [mock_resp, mock_empty]
+        mock_get.side_effect = [mock_probe, mock_resp, mock_empty]
         jobs = icims.fetch_jobs("test", "Test Corp")
         self.assertEqual(len(jobs), 2)
         self.assertEqual(jobs[0]["ats"], "icims")
@@ -2536,13 +2539,16 @@ class TestICIMSFetch(unittest.TestCase):
     def test_fetch_jobs_strips_job_title_prefix(self, mock_get):
         """Strips Job Title prefix from anchor text."""
         from jobs.ats import icims
+        mock_probe = MagicMock()
+        mock_probe.status_code = 200
+        mock_probe.text = self._mock_listing_html()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.text = self._mock_listing_html()
         mock_empty = MagicMock()
         mock_empty.status_code = 200
         mock_empty.text = "<html><body></body></html>"
-        mock_get.side_effect = [mock_resp, mock_empty]
+        mock_get.side_effect = [mock_probe, mock_resp, mock_empty]
         jobs = icims.fetch_jobs("test", "Test Corp")
         self.assertEqual(jobs[0]["title"], "SHIFT OPERATOR DUBLIN")
         self.assertNotIn("Job Title", jobs[0]["title"])

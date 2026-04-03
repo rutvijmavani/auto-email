@@ -17,7 +17,8 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
-from jobs.ats import oracle_hcm, icims , jobvite , avature
+from jobs.ats import oracle_hcm, icims, jobvite, avature
+from jobs.ats import phenom, talentbrew, sitemap, successfactors, google
 from config import (
     ATS_STATUS_DETECTED,
     ATS_STATUS_UNSUPPORTED,
@@ -46,6 +47,12 @@ ATS_REGISTRY = {
     "icims":           icims,
     "jobvite":         jobvite,
     "avature":         avature,
+    "phenom":          phenom,
+    "talentbrew":      talentbrew,
+    "sitemap":         sitemap,
+    "successfactors":  successfactors,
+    "google":          google,
+    "apple":           sitemap,  # Apple uses sitemap-based scraping
 }
 
 ATS_STATUS_CUSTOM = "custom"
