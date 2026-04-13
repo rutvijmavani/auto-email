@@ -264,14 +264,15 @@ def _make_patterns():
     # Also handles /careers path (SAP uses this)
     patterns.append((
         re.compile(
-            r\"career(\\d+)\\.successfactors\\.(com|eu)/careers?\\?.*company=([^&\\s]+)\",
+            r"career(\d+)\.successfactors\.(com|eu)/(careers?)\?.*company=([^&\s]+)",
             re.IGNORECASE,
         ),
-        \"successfactors\",
+        "successfactors",
         lambda m: json.dumps({
-            \"slug\":   m.group(3),
-            \"dc\":     m.group(1),
-            \"region\": m.group(2),
+            "slug":   m.group(4),
+            "dc":     m.group(1),
+            "region": m.group(2),
+            "path":   m.group(3),
         }),
     ))
 
@@ -309,19 +310,19 @@ def _make_patterns():
 
     # Eightfold.ai — {slug}.eightfold.ai/careers
     patterns.append((
-        re.compile(r\"([a-z0-9][a-z0-9\\-]*)\\.eightfold\\.ai/\", re.IGNORECASE),
-        \"eightfold\",
+        re.compile(r"([a-z0-9][a-z0-9\-]*)\.eightfold\.ai/", re.IGNORECASE),
+        "eightfold",
         lambda m: json.dumps({
-            \"slug\":   m.group(1).lower(),
-            \"domain\": \"\",   # filled manually or via career page scan
+            "slug":   m.group(1).lower(),
+            "domain": f"{m.group(1).lower()}.eightfold.ai",
         }),
     ))
 
     # Jibe / iCIMS Jibe — {domain}/api/jobs or app.jibecdn.com in HTML
-    # slug = careers domain e.g. \"careers.rivian.com\"
+    # slug = careers domain e.g. "careers.rivian.com"
     patterns.append((
-        re.compile(r\"(careers\\.[a-z0-9\\-]+\\.[a-z]+)/(?:api/jobs|careers-home)\", re.IGNORECASE),
-        \"jibe\",
+        re.compile(r"(careers\.[a-z0-9\-]+\.[a-z]+)/(?:api/jobs|careers-home)", re.IGNORECASE),
+        "jibe",
         lambda m: m.group(1).lower(),
     ))
 

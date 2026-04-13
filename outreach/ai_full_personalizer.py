@@ -4,12 +4,15 @@ import os
 import json
 import hashlib
 import re
+import logging
 from google import genai
 from dotenv import load_dotenv
 from db.quota_manager import can_call, increment_usage, all_models_exhausted
 from db.quota import within_rpm
 from db.db import get_ai_cache, save_ai_cache
 import time
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -255,14 +258,15 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
     Both results come from a single AI call — one quota hit.
 
     Returns:
-        (field_map, total_field, ai_available)
+        (field_map, total_field, job_url_template, ai_available)
 
-        field_map:     dict like {"title": "jobTitle", ...} or None
-        total_field:   dot-separated path like "data.totalResults" or None
-        ai_available:  True if the AI call was attempted and completed
-                       (even if it returned nulls for some fields).
-                       False if quota exhausted, client unavailable, or
-                       an unhandled exception prevented the call.
+        field_map:         dict like {"title": "jobTitle", ...} or None
+        total_field:       dot-separated path like "data.totalResults" or None
+        job_url_template:  URL template string with {job_id} placeholder or None
+        ai_available:      True if the AI call was attempted and completed
+                           (even if it returned nulls for some fields).
+                           False if quota exhausted, client unavailable, or
+                           an unhandled exception prevented the call.
 
     Callers use ai_available to decide whether to run pattern fallbacks:
       - ai_available=True  → trust results as-is; null means genuinely absent
@@ -270,13 +274,13 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
     """
 
     if not first_job_raw or not isinstance(first_job_raw, dict):
-        return None, None, False
+        return None, None, None, False
 
     # ── Quota / availability checks ──────────────────────────────
     if not can_call(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
               f"skipping AI field map for {company}")
-        return None, None, False
+        return None, None, None, False
 
     if not within_rpm(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} RPM limit hit — "
@@ -285,11 +289,11 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         if not can_call(FIELD_MAP_MODEL):
             print(f"[INFO] {FIELD_MAP_MODEL} still unavailable — "
                   f"skipping AI field map for {company}")
-            return None, None, False
+            return None, None, None, False
 
     client = _get_client()
     if client is None:
-        return None, None, False
+        return None, None, None, False
 
     try:
         print(f"[AI DEBUG] building truncated preview...")
@@ -477,4 +481,4 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         print(f"[AI DEBUG] EXCEPTION at some step: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, False
+        return None, None, None, False

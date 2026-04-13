@@ -111,8 +111,8 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
     else:
         print("\n[2/5] No detail curl provided — skipping")
         print("  Jobs will be saved without descriptions.")
-        print("  Add later: --set-custom-ats \"{company}\" --curl \"...\" "
-              "--detail-curl \"...\"")
+        print(f"  Add later: --set-custom-ats \"{company}\" --curl \"...\" "
+              f"--detail-curl \"...\"")
 
     # ── Step 3: Warm session + replay ─────────────────────────────
     print("\n[3/5] Warming session and replaying listing request...")

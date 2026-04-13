@@ -96,6 +96,7 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
     if raw_str and len(raw_str) > max_len:
         raw_str = raw_str[:max_len] + f"\n... [truncated at {max_len} chars]"
 
+    conn = None
     try:
         conn = get_conn()
         cursor = conn.execute("""
@@ -105,7 +106,6 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
         """, (company, step, severity, pattern_hint, raw_str, notes))
         conn.commit()
         row_id = cursor.lastrowid
-        conn.close()
         return row_id
     except Exception as e:
         # Never let diagnostics crash the main pipeline
@@ -115,6 +115,9 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
             company, e
         )
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
 def has_open_diagnostic(company, step=None, pattern_hint=None):

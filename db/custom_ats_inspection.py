@@ -63,6 +63,7 @@ def save_inspection(company, listing_url, fmt, array_path,
 
     Returns True on success, False on failure.
     """
+    conn = None
     try:
         conn = get_conn()
 
@@ -115,7 +116,6 @@ def save_inspection(company, listing_url, fmt, array_path,
             datetime.utcnow().isoformat(),
         ))
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
         import logging
@@ -123,6 +123,9 @@ def save_inspection(company, listing_url, fmt, array_path,
             "custom_ats_inspection: save failed for %r: %s", company, e
         )
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────
@@ -252,4 +255,3 @@ def clear_field_map_override(company):
         return True
     except Exception:
         return False
-

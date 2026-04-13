@@ -482,7 +482,7 @@ def _process_company(company_row, position, total):
                 logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
                              company, job.get("job_id"), e, exc_info=True)
 
-        if platform == \"taleo\" and job.get(\"_contest_no\"):
+        if platform == "taleo" and job.get("_contest_no"):
             try:
                 job = ats_module.fetch_job_detail(job)
                 # taleo returns extra fields — store safely only if columns exist
@@ -492,16 +492,16 @@ def _process_company(company_row, position, total):
                 # If they don't exist yet, save_job_posting() will ignore them
                 # (as long as it uses named column inserts, not SELECT *).
             except Exception as e:
-                logger.error(\"Taleo fetch_job_detail failed for %s/%s: %s\",
-                            company, job.get(\"job_id\"), e, exc_info=True)
- 
+                logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
+                            company, job.get("job_id"), e, exc_info=True)
+
         # ── Eightfold ─────────────────────────────────────────────────────────────
-        if platform == \"eightfold\" and job.get(\"job_url\"):
+        if platform == "eightfold" and job.get("job_url"):
             try:
                 job = ats_module.fetch_job_detail(job)
             except Exception as e:
-                logger.error(\"Eightfold fetch_job_detail failed for %s/%s: %s\",
-                            company, job.get(\"job_id\"), e, exc_info=True)
+                logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
+                            company, job.get("job_id"), e, exc_info=True)
 
         if (platform == "custom"
                 and job.get("job_url")

@@ -598,35 +598,35 @@ def _scan_career_page(company, career_page_url):
             return {"platform": "avature", "slug": slug}
     
     # Jibe (iCIMS Jibe) — careers powered by app.jibecdn.com
-    if \"app.jibecdn.com\" in html or \"jibe-widget\" in html:
+    if "app.jibecdn.com" in html or "jibe-widget" in html:
         parsed = urlparse(career_page_url)
-        slug   = parsed.netloc.lower()   # e.g. \"careers.rivian.com\"
+        slug   = parsed.netloc.lower()   # e.g. "careers.rivian.com"
         if slug:
-            return {\"platform\": \"jibe\", \"slug\": slug}
- 
+            return {"platform": "jibe", "slug": slug}
+
     # Eightfold.ai — cdn.eightfold.ai or {slug}.eightfold.ai iframe
-    if \"eightfold.ai\" in html:
+    if "eightfold.ai" in html:
         # Try to extract slug from script/iframe src
-        m = re.search(r'([a-z0-9][a-z0-9\\-]*)\\.eightfold\\.ai', html, re.IGNORECASE)
+        m = re.search(r'([a-z0-9][a-z0-9\-]*)\.eightfold\.ai', html, re.IGNORECASE)
         if m:
             slug   = m.group(1).lower()
-            domain = _domain_from_url(career_page_url) or \"\"
+            domain = _domain_from_url(career_page_url) or ""
             return {
-                \"platform\": \"eightfold\",
-                \"slug\":     json.dumps({\"slug\": slug, \"domain\": domain}),
+                "platform": "eightfold",
+                "slug":     json.dumps({"slug": slug, "domain": domain}),
             }
- 
+
     # Taleo — taleo.net in script src or form action
-    if \".taleo.net\" in html:
-        m = re.search(r'([a-z0-9][a-z0-9\\-]*)\\.taleo\\.net', html, re.IGNORECASE)
+    if ".taleo.net" in html:
+        m = re.search(r'([a-z0-9][a-z0-9\-]*)\.taleo\.net', html, re.IGNORECASE)
         if m:
             company_slug = m.group(1).lower()
             return {
-                \"platform\": \"taleo\",
-                \"slug\":     json.dumps({
-                    \"company\":   company_slug,
-                    \"portal_id\": \"\",
-                    \"section\":   \"ex\",
+                "platform": "taleo",
+                "slug":     json.dumps({
+                    "company":   company_slug,
+                    "portal_id": "",
+                    "section":   "ex",
                 }),
             }
 

@@ -66,17 +66,20 @@ def _writer_loop(q):
         except queue.Empty:
             if pending:
                 _flush_batch(pending)
+                for _ in pending:
+                    q.task_done()
                 pending = []
             continue
 
         if item is None:   # sentinel — shutdown
-            q.task_done() 
             if pending:
                 _flush_batch(pending)
+                for _ in pending:
+                    q.task_done()
+            q.task_done()  # mark sentinel done after flush
             break
 
         pending.append(item)
-        q.task_done()
 
         # Drain more items without blocking
         while len(pending) < BATCH_SIZE:
@@ -85,14 +88,18 @@ def _writer_loop(q):
                 if item is None:
                     if pending:
                         _flush_batch(pending)
+                        for _ in pending:
+                            q.task_done()
+                    q.task_done()  # mark sentinel done after flush
                     return
                 pending.append(item)
-                q.task_done()
             except queue.Empty:
                 break
 
         if pending:
             _flush_batch(pending)
+            for _ in pending:
+                q.task_done()
             pending = []
 
 
@@ -101,16 +108,26 @@ def _flush_batch(records):
     Write a batch of api_health records to SQLite.
     One connection, one commit for the whole batch.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     conn = get_conn()
     try:
         for rec in records:
             _write_one(conn, rec)
         conn.commit()
-    except Exception:
+    except Exception as write_error:
+        logger.error(
+            "api_health batch write failed: batch_size=%d error=%s",
+            len(records), write_error, exc_info=True
+        )
         try:
             conn.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_error:
+            logger.error(
+                "api_health rollback failed: %s", rollback_error, exc_info=True
+            )
+        raise write_error
     finally:
         conn.close()
 

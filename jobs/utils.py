@@ -247,7 +247,10 @@ def parse_date_value(val):
             return None
         # ISO 8601
         try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except (ValueError, AttributeError):
             pass
         # Common formats
