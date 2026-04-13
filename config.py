@@ -48,6 +48,8 @@ APPLICATION_AUTO_CLOSE_DAYS    = 60
 RETENTION_COVERAGE_STATS       = 60
 RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
+DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
+RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely

@@ -3,111 +3,210 @@
 # Tracks every ATS API request per platform per day.
 # Used to detect rate limiting and performance issues.
 # Powers --monitor-status health table and alert emails.
+#
+# Thread safety: record_request() uses a background writer thread
+# with a Queue to avoid SQLite lock contention during parallel
+# --monitor-jobs runs. All query functions are unchanged.
 
 from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
 
 # ─────────────────────────────────────────
-# RECORD REQUESTS
+# THREAD-SAFE WRITE QUEUE
 # ─────────────────────────────────────────
+# Initialized lazily on first record_request() call.
+# The writer thread drains the queue and batches DB writes,
+# eliminating lock contention when 20 threads fire simultaneously.
 
-def record_request(platform, status_code, response_ms,
-                   backoff_s=0):
-    """
-    Record one API request in api_health.
-    Called by request_with_tracking() in base.py
-    after every ATS API call.
+import queue
+import threading
 
-    Args:
-        platform:     e.g. "greenhouse"
-        status_code:  HTTP status code (200/429/404/500 etc.)
-        response_ms:  response time in milliseconds
-        backoff_s:    seconds waited due to rate limit
+_write_queue   = None
+_writer_thread = None
+_queue_lock    = threading.Lock()
+
+
+def _get_write_queue():
     """
-    today = date.today().isoformat()
-    conn  = get_conn()
+    Return the singleton write queue, starting the writer thread
+    on first call. Thread-safe via _queue_lock.
+    """
+    global _write_queue, _writer_thread
+    if _write_queue is not None:
+        return _write_queue
+    with _queue_lock:
+        if _write_queue is None:
+            _write_queue = queue.Queue()
+            _writer_thread = threading.Thread(
+                target=_writer_loop,
+                args=(_write_queue,),
+                daemon=True,   # exits when main thread exits
+                name="api_health_writer",
+            )
+            _writer_thread.start()
+    return _write_queue
+
+
+def _writer_loop(q):
+    """
+    Background thread: drains write queue and commits to SQLite.
+    Batches up to 50 records per commit to reduce write frequency.
+    Runs until sentinel None is received.
+    """
+    BATCH_SIZE    = 50
+    DRAIN_TIMEOUT = 0.05   # seconds to wait for more items before committing
+
+    pending = []
+
+    while True:
+        # Block until at least one item arrives
+        try:
+            item = q.get(timeout=1.0)
+        except queue.Empty:
+            if pending:
+                _flush_batch(pending)
+                pending = []
+            continue
+
+        if item is None:   # sentinel — shutdown
+            q.task_done() 
+            if pending:
+                _flush_batch(pending)
+            break
+
+        pending.append(item)
+        q.task_done()
+
+        # Drain more items without blocking
+        while len(pending) < BATCH_SIZE:
+            try:
+                item = q.get_nowait()
+                if item is None:
+                    if pending:
+                        _flush_batch(pending)
+                    return
+                pending.append(item)
+                q.task_done()
+            except queue.Empty:
+                break
+
+        if pending:
+            _flush_batch(pending)
+            pending = []
+
+
+def _flush_batch(records):
+    """
+    Write a batch of api_health records to SQLite.
+    One connection, one commit for the whole batch.
+    """
+    conn = get_conn()
     try:
-        # Upsert row for today + platform
-        conn.execute("""
-            INSERT INTO api_health (date, platform)
-            VALUES (?, ?)
-            ON CONFLICT(date, platform) DO NOTHING
-        """, (today, platform))
-
-        # Determine which counter to increment
-        if status_code == 200:
-            ok_inc    = 1
-            e429_inc  = 0
-            e404_inc  = 0
-            err_inc   = 0
-        elif status_code == 429:
-            ok_inc    = 0
-            e429_inc  = 1
-            e404_inc  = 0
-            err_inc   = 0
-        elif status_code == 404:
-            ok_inc    = 0
-            e429_inc  = 0
-            e404_inc  = 1
-            err_inc   = 0
-        else:
-            ok_inc    = 0
-            e429_inc  = 0
-            e404_inc  = 0
-            err_inc   = 1
-
-        # Update counters + timing
-        conn.execute("""
-            UPDATE api_health SET
-                requests_made   = requests_made   + 1,
-                requests_ok     = requests_ok     + ?,
-                requests_429    = requests_429    + ?,
-                requests_404    = requests_404    + ?,
-                requests_error  = requests_error  + ?,
-                total_ms        = total_ms        + ?,
-                max_response_ms = MAX(max_response_ms, ?),
-                backoff_total_s = backoff_total_s + ?,
-                first_429_at    = CASE
-                    WHEN ? = 1 AND first_429_at IS NULL
-                    THEN CURRENT_TIMESTAMP
-                    ELSE first_429_at
-                END
-            WHERE date = ? AND platform = ?
-        """, (
-            ok_inc, e429_inc, e404_inc, err_inc,
-            response_ms, response_ms,
-            backoff_s,
-            e429_inc,
-            today, platform
-        ))
-
-        # Recalculate avg_response_ms
-        conn.execute("""
-            UPDATE api_health SET
-                avg_response_ms = CASE
-                    WHEN requests_made > 0
-                    THEN total_ms / requests_made
-                    ELSE 0
-                END
-            WHERE date = ? AND platform = ?
-        """, (today, platform))
-
+        for rec in records:
+            _write_one(conn, rec)
         conn.commit()
-
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     finally:
         conn.close()
 
 
+def _write_one(conn, rec):
+    """
+    Write one api_health record to an open connection.
+    Called inside _flush_batch() — no commit here.
+    """
+    today        = rec["date"]
+    platform     = rec["platform"]
+    status_code  = rec["status_code"]
+    response_ms  = rec["response_ms"]
+    backoff_s    = rec["backoff_s"]
+
+    if status_code == 200:
+        ok_inc, e429_inc, e404_inc, err_inc = 1, 0, 0, 0
+    elif status_code == 429:
+        ok_inc, e429_inc, e404_inc, err_inc = 0, 1, 0, 0
+    elif status_code == 404:
+        ok_inc, e429_inc, e404_inc, err_inc = 0, 0, 1, 0
+    else:
+        ok_inc, e429_inc, e404_inc, err_inc = 0, 0, 0, 1
+
+    conn.execute("""
+        INSERT INTO api_health (date, platform)
+        VALUES (?, ?)
+        ON CONFLICT(date, platform) DO NOTHING
+    """, (today, platform))
+
+    conn.execute("""
+        UPDATE api_health SET
+            requests_made   = requests_made   + 1,
+            requests_ok     = requests_ok     + ?,
+            requests_429    = requests_429    + ?,
+            requests_404    = requests_404    + ?,
+            requests_error  = requests_error  + ?,
+            total_ms        = total_ms        + ?,
+            max_response_ms = MAX(max_response_ms, ?),
+            backoff_total_s = backoff_total_s + ?,
+            first_429_at    = CASE
+                WHEN ? = 1 AND first_429_at IS NULL
+                THEN CURRENT_TIMESTAMP
+                ELSE first_429_at
+            END
+        WHERE date = ? AND platform = ?
+    """, (
+        ok_inc, e429_inc, e404_inc, err_inc,
+        response_ms, response_ms,
+        backoff_s,
+        e429_inc,
+        today, platform,
+    ))
+
+    conn.execute("""
+        UPDATE api_health SET
+            avg_response_ms = CASE
+                WHEN requests_made > 0
+                THEN total_ms / requests_made
+                ELSE 0
+            END
+        WHERE date = ? AND platform = ?
+    """, (today, platform))
+
+
 # ─────────────────────────────────────────
-# QUERY
+# RECORD REQUESTS (public API — unchanged signature)
+# ─────────────────────────────────────────
+
+def record_request(platform, status_code, response_ms, backoff_s=0):
+    """
+    Record one API request in api_health.
+    Non-blocking — enqueues to background writer thread.
+    Safe to call from multiple threads simultaneously.
+
+    Args:
+        platform:     e.g. "greenhouse"
+        status_code:  HTTP status code (0 for non-HTTP errors)
+        response_ms:  response time in milliseconds
+        backoff_s:    seconds waited due to rate limit
+    """
+    _get_write_queue().put({
+        "date":        date.today().isoformat(),
+        "platform":    platform,
+        "status_code": status_code,
+        "response_ms": response_ms,
+        "backoff_s":   backoff_s,
+    })
+
+
+# ─────────────────────────────────────────
+# QUERY FUNCTIONS (all unchanged)
 # ─────────────────────────────────────────
 
 def get_platform_stats(platform, for_date=None):
-    """
-    Get api_health stats for one platform on one date.
-    Defaults to today.
-    """
+    """Get api_health stats for one platform on one date."""
     for_date = for_date or date.today().isoformat()
     conn = get_conn()
     try:
@@ -122,15 +221,8 @@ def get_platform_stats(platform, for_date=None):
 
 def get_health_summary(days=7):
     """
-    Get aggregated health stats per platform
-    for the last N days.
-
-    Returns list of dicts sorted by platform:
-    [{
-        platform, total_requests, total_429s,
-        rate_429_pct, avg_response_ms, max_response_ms,
-        total_errors, error_pct, days_with_data
-    }]
+    Get aggregated health stats per platform for the last N days.
+    Returns list of dicts sorted by platform.
     """
     since = (date.today() - timedelta(days=days)).isoformat()
     conn  = get_conn()
@@ -192,8 +284,7 @@ def get_todays_stats():
 def get_run_429_rate(platform):
     """
     Get today's aggregate 429 rate for a platform.
-    Returns percentage (0-100) based on daily counters.
-    Used to check if rate limiting is occurring today.
+    Returns percentage (0-100).
     """
     conn = get_conn()
     try:
@@ -203,13 +294,19 @@ def get_run_429_rate(platform):
             FROM api_health
             WHERE date = ? AND platform = ?
         """, (today, platform)).fetchone()
-
         if not row or row["requests_made"] == 0:
             return 0.0
-
         return round(
-            100.0 * row["requests_429"] / row["requests_made"],
-            1
+            100.0 * row["requests_429"] / row["requests_made"], 1
         )
     finally:
         conn.close()
+
+def flush():
+    """
+    Block until the write queue is fully drained.
+    Call before process exit to ensure no records are lost.
+    """
+    q = _write_queue
+    if q is not None:
+        q.join()   # blocks until all q.task_done() calls complete

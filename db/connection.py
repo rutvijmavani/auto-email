@@ -7,12 +7,14 @@ DB_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "recruiter_pipel
 
 DAILY_LIMITS = {
     "gemini-2.5-flash-lite": 20,
-    "gemini-2.5-flash": 20
+    "gemini-2.5-flash": 20,
+    "gemma-4-31b-it":  1500,
 }
 
 RPM_LIMITS = {
     "gemini-2.5-flash-lite": 10,
-    "gemini-2.5-flash":       5,
+    "gemini-2.5-flash":  5,
+    "gemma-4-31b-it": 15,
 }
 
 

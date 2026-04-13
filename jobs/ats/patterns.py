@@ -170,17 +170,16 @@ def _make_patterns():
 
     # iCIMS — careers-{slug}.icims.com/jobs
     # Also: {slug}.icims.com/jobs
-    # Note: "careers-" prefix stripped from slug
     patterns.append((
         re.compile(
-            r"(?:careers-)?([a-z0-9][a-z0-9\-]*[a-z0-9]|[a-z0-9]+)"
+            r"((?:careers-)?[a-z0-9][a-z0-9\-]*[a-z0-9]|[a-z0-9]+)"
             r"\.icims\.com(?:/jobs|$)",
             re.IGNORECASE
         ),
-        "icims",
-        lambda m: m.group(1).lower(),
+    "icims",
+    lambda m: m.group(1).lower(),
     ))
-
+    
     # Jobvite — jobs.jobvite.com/{slug}/job/{id}
     # Also: jobs.jobvite.com/{slug}/jobs (listing)
     patterns.append((
@@ -189,25 +188,25 @@ def _make_patterns():
         lambda m: m.group(1).lower(),
     ))
 
-    # SAP SuccessFactors — {company}.jobs2web.com
-    patterns.append((
-        re.compile(
-            r"([a-z0-9]+)\.jobs2web\.com",
-            re.IGNORECASE
-        ),
-        "successfactors",
-        lambda m: m.group(1).lower(),
-    ))
+    # # SAP SuccessFactors — {company}.jobs2web.com
+    # patterns.append((
+    #     re.compile(
+    #         r"([a-z0-9]+)\.jobs2web\.com",
+    #         re.IGNORECASE
+    #     ),
+    #     "successfactors",
+    #     lambda m: m.group(1).lower(),
+    # ))
 
-    # SAP SuccessFactors — {company}.successfactors.com/careers
-    patterns.append((
-        re.compile(
-            r"([a-z0-9]+)\.successfactors\.com/careers",
-            re.IGNORECASE
-        ),
-        "successfactors",
-        lambda m: m.group(1).lower(),
-    ))
+    # # SAP SuccessFactors — {company}.successfactors.com/careers
+    # patterns.append((
+    #     re.compile(
+    #         r"([a-z0-9]+)\.successfactors\.com/careers",
+    #         re.IGNORECASE
+    #     ),
+    #     "successfactors",
+    #     lambda m: m.group(1).lower(),
+    # ))
 
     # Avature hosted — {slug}.avature.net
     patterns.append((
@@ -217,7 +216,7 @@ def _make_patterns():
     ))
 
     # Avature custom domains
-    for _domain, _path in [("jobs.ea.com", "en_US/careers"), ("jobs.siemens.com", "en_US/externaljobs")]:
+    for _domain, _path in [("jobs.ea.com", "en_US/careers")]:
         patterns.append((
             re.compile(re.escape(_domain), re.IGNORECASE),
             "avature",
@@ -261,19 +260,18 @@ def _make_patterns():
             }),
         ))
 
-    # ── SAP SuccessFactors ───────────────────────────────────────────────────────
-    # career{dc}.successfactors.{region}/career?company={slug}&...
-    # Extracts dc, region, slug from URL
+    # SAP SuccessFactors — career{dc}.successfactors.{region}/career?company=...
+    # Also handles /careers path (SAP uses this)
     patterns.append((
         re.compile(
-            r"career(\d+)\.successfactors\.(com|eu)/(?:career|careers)\?.*company=([^&\s]+)",
-            re.IGNORECASE
+            r\"career(\\d+)\\.successfactors\\.(com|eu)/careers?\\?.*company=([^&\\s]+)\",
+            re.IGNORECASE,
         ),
-        "successfactors",
+        \"successfactors\",
         lambda m: json.dumps({
-            "slug":   m.group(3),
-            "dc":     m.group(1),
-            "region": m.group(2),
+            \"slug\":   m.group(3),
+            \"dc\":     m.group(1),
+            \"region\": m.group(2),
         }),
     ))
 
@@ -285,6 +283,21 @@ def _make_patterns():
         lambda m: "{}",
     ))
 
+    # Taleo — {company}.taleo.net/careersection/...
+    # portal_id auto-discovered during first fetch_jobs() call
+    patterns.append((
+        re.compile(
+            r"([a-z0-9][a-z0-9\-]*?)\.taleo\.net/careersection/([^/?&#\s]+)/",
+            re.IGNORECASE
+        ),
+        "taleo",
+        lambda m: json.dumps({
+            "company": m.group(1).lower(),
+            "portal_id": "",   # auto-discovered on first fetch
+            "section":  m.group(2).lower(),
+        }),
+    ))
+
     # ── Apple Jobs ──────────────────────────────────────────────────────────────
     # jobs.apple.com/sitemap/sitemap-jobs-en-us.xml
     # jobs.apple.com/en-us/details/{id}/{slug}
@@ -292,6 +305,24 @@ def _make_patterns():
         re.compile(r"jobs\.apple\.com/", re.IGNORECASE),
         "apple",
         lambda m: "{}",
+    ))
+
+    # Eightfold.ai — {slug}.eightfold.ai/careers
+    patterns.append((
+        re.compile(r\"([a-z0-9][a-z0-9\\-]*)\\.eightfold\\.ai/\", re.IGNORECASE),
+        \"eightfold\",
+        lambda m: json.dumps({
+            \"slug\":   m.group(1).lower(),
+            \"domain\": \"\",   # filled manually or via career page scan
+        }),
+    ))
+
+    # Jibe / iCIMS Jibe — {domain}/api/jobs or app.jibecdn.com in HTML
+    # slug = careers domain e.g. \"careers.rivian.com\"
+    patterns.append((
+        re.compile(r\"(careers\\.[a-z0-9\\-]+\\.[a-z]+)/(?:api/jobs|careers-home)\", re.IGNORECASE),
+        \"jibe\",
+        lambda m: m.group(1).lower(),
     ))
 
     # ── Generic sitemap / XML feed ───────────────────────────────────────────────

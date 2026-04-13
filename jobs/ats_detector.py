@@ -1,12 +1,19 @@
-# jobs/ats_detector.py — ATS detection orchestrator
-#
-# Detection flow (4 phases):
-#
-#   Phase 1: Sitemap lookup (FREE, instant)
-#   Phase 2: ATS API name probe (FREE, ~50ms)
-#   Phase 3a: HTML + redirect scan (FREE, ~100ms)
-#   Phase 3b: Serper API (2500 free credits)
-#   Phase 4: Unknown → store as unknown
+"""
+jobs/ats_detector.py — ATS detection orchestrator.
+
+Detection flow (4 phases):
+  Phase 1: Sitemap lookup       (FREE, instant)
+  Phase 2: ATS API name probe   (FREE, ~50ms)
+  Phase 3a: HTML + redirect     (FREE, ~100ms)
+  Phase 3b: Serper API          (2500 free credits)
+  Phase 4: Unknown → store as unknown
+
+custom platform:
+  Companies with ats_platform='custom' and a valid ats_slug
+  (curl captured via Google Form) are fully monitorable.
+  They are NOT re-detected — their slug contains everything needed.
+  Only custom companies with NO slug need re-detection.
+"""
 
 import json
 import logging
@@ -19,6 +26,7 @@ logger = get_logger(__name__)
 from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
 from jobs.ats import oracle_hcm, icims, jobvite, avature
 from jobs.ats import phenom, talentbrew, sitemap, successfactors, google
+from jobs.ats import custom_career   # ← universal custom ATS engine
 from config import (
     ATS_STATUS_DETECTED,
     ATS_STATUS_UNSUPPORTED,
@@ -36,7 +44,10 @@ class QuotaExhaustedException(Exception):
     pass
 
 
-# Platform registry — used by job_monitor for fetching jobs
+# ─────────────────────────────────────────
+# PLATFORM REGISTRY
+# ─────────────────────────────────────────
+
 ATS_REGISTRY = {
     "greenhouse":      greenhouse,
     "lever":           lever,
@@ -52,7 +63,8 @@ ATS_REGISTRY = {
     "sitemap":         sitemap,
     "successfactors":  successfactors,
     "google":          google,
-    "apple":           sitemap,  # Apple uses sitemap-based scraping
+    "apple":           sitemap,       # Apple uses sitemap-based scraping
+    "custom":          custom_career, # Universal custom ATS engine
 }
 
 ATS_STATUS_CUSTOM = "custom"
@@ -65,9 +77,8 @@ ATS_STATUS_CUSTOM = "custom"
 def _get_keywords(company):
     """
     Extract significant keywords from company name.
-    "Capital One"     -> ["capital", "one"]
-    "JPMorgan Chase"  -> ["jpmorgan", "chase"]
-    "AT&T"            -> ["at"]
+    "Capital One"    -> ["capital", "one"]
+    "JPMorgan Chase" -> ["jpmorgan", "chase"]
     """
     name     = company.lower().strip()
     name     = re.sub(r"[^a-z0-9\s]", " ", name)
@@ -84,56 +95,45 @@ def _get_keywords(company):
 # ─────────────────────────────────────────
 
 def detect_ats(company, domain=None, page=None, sb=None):
-    """
-    Detect ATS for a company using 4-phase approach.
-    """
+    """Detect ATS for a company using 4-phase approach."""
     logger.info("━━━ ATS detection: company=%r domain=%r", company, domain)
     print(f"   [INFO] Detecting ATS for {company}...")
 
     # Phase 1: Sitemap lookup
-    logger.debug("[P1] Sitemap lookup for %r", company)
     print("   [P1] Sitemap lookup...")
     from jobs.ats_sitemap import detect_via_sitemap
     result = detect_via_sitemap(company)
     if result:
-        logger.info("[P1 HIT] %r → platform=%s slug=%s",
+        logger.info("[P1 HIT] %r → %s / %s",
                     company, result["platform"], result["slug"])
         print(f"   [P1 HIT] {company} -> "
               f"{result['platform']} / {result['slug']}")
         return _store_and_return(company, result)
-    logger.debug("[P1 MISS] %r", company)
 
     # Phase 2: ATS API name probe
-    logger.debug("[P2] API name probe for %r", company)
     print("   [P2] API name probe...")
     from jobs.ats_verifier import detect_via_api
     result = detect_via_api(company)
     if result:
-        logger.info("[P2 HIT] %r → platform=%s slug=%s",
+        logger.info("[P2 HIT] %r → %s / %s",
                     company, result["platform"], result["slug"])
         print(f"   [P2 HIT] {company} -> "
               f"{result['platform']} / {result['slug']}")
         return _store_and_return(company, result)
-    logger.debug("[P2 MISS] %r", company)
 
     # Phase 3a: HTML + redirect scan
     if domain:
-        logger.debug("[P3a] HTML redirect scan for %r (domain=%s)",
-                     company, domain)
         print(f"   [P3a] HTML redirect scan ({domain})...")
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
         if result:
-            logger.info("[P3a HIT] %r → platform=%s slug=%s",
+            logger.info("[P3a HIT] %r → %s / %s",
                         company, result["platform"], result["slug"])
             print(f"   [P3a HIT] {company} -> "
                   f"{result['platform']} / {result['slug']}")
             return _store_and_return(company, result)
-        logger.debug("[P3a MISS] %r", company)
     else:
-        logger.warning("[P3a SKIP] No domain for %r — "
-                       "Oracle HCM and redirect-based ATS will not be detected",
-                       company)
+        logger.warning("[P3a SKIP] No domain for %r", company)
 
     # Phase 3b: Serper API
     if company in KNOWN_CUSTOM_ATS:
@@ -149,27 +149,24 @@ def detect_ats(company, domain=None, page=None, sb=None):
             "ats_slug":     None,
         }
 
-    logger.debug("[P3b] Serper search for %r", company)
     print("   [P3b] Serper API search...")
     from jobs.serper import detect_via_serper, SERPER_EXHAUSTED
     serper_result = detect_via_serper(company)
 
     if serper_result is SERPER_EXHAUSTED:
         logger.warning("[P3b] Serper credits exhausted for %r", company)
-        print(f"   [WARNING] Serper credits exhausted — "
-              f"storing as unknown, retry when credits available")
+        print("[WARNING] Serper credits exhausted")
         raise QuotaExhaustedException("Serper credits exhausted")
 
     if serper_result:
-        logger.info("[P3b HIT] %r → platform=%s slug=%s",
+        logger.info("[P3b HIT] %r → %s / %s",
                     company, serper_result["platform"], serper_result["slug"])
         print(f"   [P3b HIT] {company} -> "
               f"{serper_result['platform']} / {serper_result['slug']}")
         return _store_and_return(company, serper_result)
-    logger.debug("[P3b MISS] %r", company)
 
     # Phase 4: Unknown
-    logger.warning("[UNKNOWN] %r — no ATS found in any phase", company)
+    logger.warning("[UNKNOWN] %r — no ATS found", company)
     print(f"   [UNKNOWN] {company} — no ATS found in any phase")
     _store_detection(company, ATS_STATUS_UNKNOWN, None)
 
@@ -184,11 +181,7 @@ def detect_ats(company, domain=None, page=None, sb=None):
 
 
 def _store_and_return(company, result):
-    """
-    Store detection result in:
-    1. prospective_companies table (main pipeline DB)
-    2. ats_discovery.db (self-populating reference data)
-    """
+    """Store detection result and self-populate ats_discovery.db."""
     platform = result["platform"]
     slug     = result["slug"]
 
@@ -198,10 +191,8 @@ def _store_and_return(company, result):
     else:
         status = ATS_STATUS_UNSUPPORTED
         label  = "[UNSUPPORTED]"
-        logger.info("%r uses unsupported platform=%s — stored for future use",
-                    company, platform)
         print(f"   [INFO] {company} uses {platform} "
-              f"(not yet supported — stored for future use)")
+              f"(not yet supported)")
 
     _store_detection(company, platform, slug)
 
@@ -209,23 +200,15 @@ def _store_and_return(company, result):
         from db.ats_companies import mark_from_detection
         from db.schema_discovery import init_discovery_db
         init_discovery_db()
-        mark_from_detection(
-            platform=platform,
-            slug=slug,
-            company_name=company,
-        )
-        logger.debug("Self-populated ats_discovery.db: platform=%s slug=%s company=%r",
-                     platform, slug, company)
+        mark_from_detection(platform=platform, slug=slug,
+                            company_name=company)
     except Exception as e:
         logger.error(
-            "Failed to self-populate ats_discovery.db "
-            "for %s/%s (%s): %s",
-            platform, slug, company, e, exc_info=True
+            "Failed to self-populate ats_discovery.db: %s", e,
+            exc_info=True
         )
 
-    logger.info("%s %r → %s (slug: %s)", label, company, platform, slug)
     print(f"   {label} {company} -> {platform} (slug: {slug})")
-
     return {
         "company":      company,
         "status":       status,
@@ -237,11 +220,112 @@ def _store_and_return(company, result):
 
 
 # ─────────────────────────────────────────
-# SCORING (kept for legacy API buffer tests)
+# NEEDS REDETECTION
+# ─────────────────────────────────────────
+
+def needs_redetection(company_row, redetect_days=14):
+    """
+    Check if company needs ATS re-detection.
+
+    Rules:
+      manual                          → False (permanent override)
+      unsupported                     → False (out of scope)
+      custom + valid slug (url field) → False (curl captured, ready)
+      custom + no slug / invalid slug → True  (needs curl capture)
+      unknown / no platform           → True
+      no slug                         → True
+      never detected                  → True
+      14+ consecutive empty days      → True
+    """
+    platform    = company_row.get("ats_platform", ATS_STATUS_UNKNOWN)
+    slug        = company_row.get("ats_slug")
+    empty_days  = company_row.get("consecutive_empty_days", 0) or 0
+    detected_at = company_row.get("ats_detected_at")
+    company     = company_row.get("company", "?")
+
+    # Manual override — never re-detect
+    if platform == ATS_STATUS_MANUAL:
+        logger.debug("needs_redetection: %r → False (manual)", company)
+        return False
+
+    # Check _manual flag in slug JSON
+    if slug:
+        try:
+            slug_data = json.loads(slug)
+            if slug_data.get("_manual"):
+                logger.debug(
+                    "needs_redetection: %r → False (_manual flag)",
+                    company
+                )
+                return False
+        except (ValueError, TypeError):
+            pass
+
+    # Unsupported — never re-detect
+    if platform == ATS_STATUS_UNSUPPORTED:
+        logger.debug(
+            "needs_redetection: %r → False (unsupported)", company
+        )
+        return False
+
+    # Custom platform — check if curl has been captured
+    if platform == "custom":
+        if slug:
+            try:
+                slug_data = json.loads(slug)
+                if slug_data.get("url"):
+                    # Valid curl config present — monitorable, no re-detection
+                    logger.debug(
+                        "needs_redetection: %r → False "
+                        "(custom with valid slug)", company
+                    )
+                    return False
+            except (ValueError, TypeError):
+                pass
+        # custom but no valid slug — needs curl to be captured
+        logger.debug(
+            "needs_redetection: %r → True "
+            "(custom but no valid slug — needs curl capture)", company
+        )
+        return True
+
+    # Unknown or missing
+    if not platform or platform == ATS_STATUS_UNKNOWN:
+        logger.debug(
+            "needs_redetection: %r → True (platform=%s)",
+            company, platform
+        )
+        return True
+
+    if not slug:
+        logger.debug("needs_redetection: %r → True (no slug)", company)
+        return True
+
+    if detected_at is None:
+        logger.debug(
+            "needs_redetection: %r → True (never detected)", company
+        )
+        return True
+
+    if empty_days >= redetect_days:
+        logger.debug(
+            "needs_redetection: %r → True (empty_days=%d)",
+            company, empty_days
+        )
+        return True
+
+    logger.debug(
+        "needs_redetection: %r → False (platform=%s empty_days=%d)",
+        company, platform, empty_days
+    )
+    return False
+
+
+# ─────────────────────────────────────────
+# SCORING (legacy — kept for tests)
 # ─────────────────────────────────────────
 
 def _score_response(jobs, company):
-    """Score API response confidence. Used by legacy tests."""
     import math
     from config import ATS_SAMPLE_SIZE
 
@@ -264,13 +348,11 @@ def _score_response(jobs, company):
             job.get("name",          ""),
             job.get("_company_name", ""),
         ])).lower()
-
         if all(kw in text for kw in keywords):
             matches += 1
 
     confidence  = int((matches / len(sample)) * 100)
     final_score = round(confidence * math.log10(job_count + 1), 2)
-
     return {
         "confidence":  confidence,
         "job_count":   job_count,
@@ -279,7 +361,6 @@ def _score_response(jobs, company):
 
 
 def _tie_break(candidates):
-    """Tie-break by date reliability."""
     def rank(e):
         try:
             return ATS_DATE_RELIABILITY.index(e["platform"])
@@ -289,7 +370,6 @@ def _tie_break(candidates):
 
 
 def _classify(buffer):
-    """Classify buffer entries. Kept for legacy tests."""
     from config import (
         ATS_MIN_CONFIDENCE, ATS_DETECTION_THRESHOLD,
         ATS_CLOSE_CALL_GAP, ATS_STATUS_CLOSE_CALL,
@@ -341,7 +421,7 @@ def _classify(buffer):
             / winner["final_score"]
         ) * 100
         if gap_pct <= ATS_CLOSE_CALL_GAP:
-            winner = _tie_break([winner, runner_up])
+            winner    = _tie_break([winner, runner_up])
             runner_up = next(
                 (e for e in viable_sorted if e != winner), None
             )
@@ -366,7 +446,7 @@ def _classify(buffer):
 
 def _store_detection(company, platform, slug):
     """Store ATS detection result. Resets consecutive_empty_days."""
-    logger.debug("DB write: company=%r platform=%s slug=%s", company, platform, slug)
+    logger.debug("DB write: company=%r platform=%s", company, platform)
     conn = get_conn()
     try:
         conn.execute("""
@@ -383,12 +463,8 @@ def _store_detection(company, platform, slug):
 
 
 def override_ats(company, platform, slug):
-    """
-    Manually override ATS detection.
-    Manual overrides are never auto-re-detected.
-    """
-    logger.info("Manual override: company=%r platform=%s slug=%s",
-                company, platform, slug)
+    """Manually override ATS detection. Never auto-re-detected."""
+    logger.info("Manual override: %r → %s", company, platform)
     try:
         slug_data = json.loads(slug) if slug and slug.startswith("{") else {}
         slug_data["_manual"]   = True
@@ -410,57 +486,9 @@ def override_ats(company, platform, slug):
             WHERE company = ?
         """, (platform, slug_str, company))
         conn.commit()
-        logger.info("Override stored: company=%r platform=%s slug=%s",
-                    company, platform, slug_str)
-        print(f"[OK] {company} -> manually set to {platform} "
-              f"(slug: {slug_str})")
+        print(f"[OK] {company} -> manually set to {platform}")
     finally:
         conn.close()
-
-
-def needs_redetection(company_row, redetect_days=14):
-    """
-    Check if company needs ATS re-detection.
-    """
-    platform    = company_row.get("ats_platform", ATS_STATUS_UNKNOWN)
-    slug        = company_row.get("ats_slug")
-    empty_days  = company_row.get("consecutive_empty_days", 0) or 0
-    detected_at = company_row.get("ats_detected_at")
-    company     = company_row.get("company", "?")
-
-    if platform == ATS_STATUS_MANUAL:
-        logger.debug("needs_redetection: %r → False (manual override)", company)
-        return False
-    if slug:
-        try:
-            slug_data = json.loads(slug)
-            if slug_data.get("_manual"):
-                logger.debug("needs_redetection: %r → False (_manual flag)", company)
-                return False
-        except (ValueError, TypeError):
-            pass
-
-    if platform == ATS_STATUS_UNSUPPORTED:
-        logger.debug("needs_redetection: %r → False (unsupported)", company)
-        return False
-
-    if not platform or platform in (ATS_STATUS_UNKNOWN, "custom"):
-        logger.debug("needs_redetection: %r → True (platform=%s)", company, platform)
-        return True
-
-    if not slug:
-        logger.debug("needs_redetection: %r → True (no slug)", company)
-        return True
-    if detected_at is None:
-        logger.debug("needs_redetection: %r → True (never detected)", company)
-        return True
-    if empty_days >= redetect_days:
-        logger.debug("needs_redetection: %r → True (empty_days=%d)", company, empty_days)
-        return True
-
-    logger.debug("needs_redetection: %r → False (platform=%s empty_days=%d)",
-                 company, platform, empty_days)
-    return False
 
 
 def get_ats_module(platform):

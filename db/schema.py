@@ -20,6 +20,8 @@ from config import (
     RETENTION_COVERAGE_STATS,
     RETENTION_API_HEALTH,
     RETENTION_PIPELINE_ALERTS,
+    RETENTION_CUSTOM_ATS_DIAGNOSTIC,
+    DIAGNOSTICS_AUTO_RESOLVED_DAYS,
 )
 
 def _cleanup_monitor_stats(c):
@@ -48,6 +50,25 @@ def _cleanup_closed_application_recruiters(c):
             WHERE status = 'closed'
         )
     """)
+
+def _cleanup_mark_resolved_diagnostics(c):
+    """Mark diagnostics resolved older than DIAGNOSTICS_AUTO_RESOLVED_DAYS."""
+    c.execute("""
+        UPDATE custom_ats_diagnostics 
+        SET resolved = 1
+        WHERE resolved = 0
+        AND created_at < DATE('now' , ?)
+    """, (f"-{DIAGNOSTICS_AUTO_RESOLVED_DAYS} days",))
+
+def _cleanup_resolved_diagnostics(c):
+    """
+    Delete rows for resolved diagnostics in custom_ats_diagnostics older than retention period.
+    """
+    c.execute("""
+            DELETE FROM custom_ats_diagnostics
+            WHERE resolved = 1
+              AND created_at < DATETIME('now', ?)
+        """, (f"-{RETENTION_CUSTOM_ATS_DIAGNOSTIC} days",))
 
 def _cleanup_expired_ai_cache(c):
     c.execute("DELETE FROM ai_cache WHERE expires_at <= CURRENT_TIMESTAMP")
@@ -151,6 +172,19 @@ def _cleanup_pipeline_alerts(c):
         WHERE notified = 1
         AND notified_at < DATE('now', ?)
     """, (f"-{RETENTION_PIPELINE_ALERTS} days",))
+
+def _cleanup_custom_ats_inspection(c):
+    """
+    Remove inspection rows for companies no longer in
+    prospective_companies table.
+    Keeps table lean as companies are added/removed.
+    """
+    c.execute("""
+        DELETE FROM custom_ats_inspection
+        WHERE company NOT IN (
+            SELECT company FROM prospective_companies
+        )
+    """)
 
 
 def init_db():
@@ -299,6 +333,27 @@ def init_db():
     """)
 
     c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_ats_diagnostics (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                company       TEXT NOT NULL,
+                step          TEXT NOT NULL,
+                severity      TEXT NOT NULL,
+                pattern_hint  TEXT,
+                raw_response  TEXT,
+                notes         TEXT,
+                resolved      INTEGER DEFAULT 0,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
+    # Index for fast open-issue queries
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_custom_ats_diag_company_resolved
+        ON custom_ats_diagnostics(company, resolved)
+    """)
+
+    c.execute("""
         CREATE TABLE IF NOT EXISTS job_postings (
             id                       INTEGER PRIMARY KEY AUTOINCREMENT,
             company                  TEXT NOT NULL,
@@ -438,6 +493,32 @@ def init_db():
         ON pipeline_alerts(alert_type, platform, created_at)
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_ats_inspection (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            company              TEXT NOT NULL UNIQUE,
+            listing_url          TEXT,
+            format               TEXT,
+            array_path           TEXT,
+            total_jobs           INTEGER,
+            total_field          TEXT,
+            all_numeric_fields   TEXT,
+            page_size            INTEGER,
+            pagination           TEXT,
+            session_strategy     TEXT,
+            first_job_raw        TEXT,
+            field_map            TEXT,
+            field_map_override   TEXT,
+            sample_normalized    TEXT,
+            last_updated         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_custom_ats_inspection_company
+        ON custom_ats_inspection(company)
+    """)
+
     # Migration: add ATS detection columns to prospective_companies
     for col, definition in [
         ("ats_platform",          "TEXT DEFAULT 'unknown'"),
@@ -451,6 +532,14 @@ def init_db():
         try:
             c.execute(f"ALTER TABLE prospective_companies "
                       f"ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    
+    for col in ("listing_curl_raw", "detail_curl_raw"):
+        try:
+            c.execute(f"ALTER TABLE prospective_companies "
+                    f"ADD COLUMN {col} TEXT")
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
@@ -503,6 +592,9 @@ def init_db():
     _cleanup_coverage_stats(c)
     _cleanup_api_health(c)
     _cleanup_pipeline_alerts(c)
+    _cleanup_mark_resolved_diagnostics(c)
+    _cleanup_resolved_diagnostics(c)
+    _cleanup_custom_ats_inspection(c)
     conn.commit()
     conn.close()
     print("[OK] Database initialized: data/recruiter_pipeline.db")
