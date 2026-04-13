@@ -1025,8 +1025,24 @@ def main():
     if "--resolve-diagnostic" in args:
         from jobs.job_monitor import run_resolve_diagnostic
         non_flag_args = [a for a in args if not a.startswith("--")]
-        diagnostic_id = non_flag_args[0] if non_flag_args else None
-        company       = non_flag_args[1] if len(non_flag_args) > 1 else None
+
+        # Parse first argument: if it's an integer, treat as diagnostic_id
+        # otherwise treat as company name
+        diagnostic_id = None
+        company = None
+
+        if non_flag_args:
+            first_arg = non_flag_args[0]
+            try:
+                # Try to convert to int - if successful, it's a diagnostic_id
+                diagnostic_id = int(first_arg)
+                # Second arg (if present) is company
+                company = non_flag_args[1] if len(non_flag_args) > 1 else None
+            except ValueError:
+                # Not an integer - treat as company name
+                company = first_arg
+                diagnostic_id = None
+
         run_resolve_diagnostic(diagnostic_id=diagnostic_id, company=company)
         return
 

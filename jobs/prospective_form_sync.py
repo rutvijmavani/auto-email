@@ -67,11 +67,12 @@ SCOPES = [
 COL_TIMESTAMP   = 0
 COL_COMPANY     = 1
 COL_JOB_URL     = 2
-COL_DOMAIN      = 3   # Domain
-COL_CAREER_PAGE = 4   # Career Page URL
-COL_XML_URL     = 5
-COL_CURL        = 6   # Listing curl command
-COL_DETAIL_CURL = 7   # Detail curl command (optional)
+COL_CAREER_PAGE = 3   # Career Page URL
+COL_DOMAIN      = 4   # Domain
+COL_XML_URL     = 5   # XML/Sitemap URL
+COL_NOTES       = 6   # Notes
+COL_CURL        = 7   # Listing curl command
+COL_DETAIL_CURL = 8   # Detail curl command (optional)
 
 # Hard ATS platforms — job URL gives no useful slug
 HARD_ATS = set()

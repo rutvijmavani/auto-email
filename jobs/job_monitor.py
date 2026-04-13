@@ -325,6 +325,7 @@ def _process_company(company_row, position, total):
     # Replaces between_companies_delay() from the sequential version.
     sem = _get_semaphore(platform)
 
+    # Acquire semaphore for entire platform work including detail fetches
     with sem:
         # ── Fetch jobs ────────────────────────────────────
         try:
@@ -370,167 +371,168 @@ def _process_company(company_row, position, total):
             result["failure_name"] = company
             return result
 
-    # ── Post-fetch processing (outside semaphore — no HTTP) ──
-    logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
-    result["fetched"] = len(raw_jobs)
+        # ── Post-fetch processing (inside semaphore — includes detail HTTP) ──
+        logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
+        result["fetched"] = len(raw_jobs)
 
-    # URL presence tracking (DB reads — fast, no HTTP)
-    fetched_urls = {job["job_url"] for job in raw_jobs}
-    tracked      = get_tracked_urls_for_company(company)
-    present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
-    missing_ids  = [tracked[url] for url in tracked
-                    if url not in fetched_urls]
-    if present_ids:
-        reset_missing_days(present_ids)
-    if missing_ids:
-        increment_missing_days(missing_ids)
-        logger.debug("Missing from scan: %d jobs for %r",
-                     len(missing_ids), company)
+        # URL presence tracking (DB reads — fast, no HTTP)
+        fetched_urls = {job["job_url"] for job in raw_jobs}
+        tracked      = get_tracked_urls_for_company(company)
+        present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
+        missing_ids  = [tracked[url] for url in tracked
+                        if url not in fetched_urls]
+        if present_ids:
+            reset_missing_days(present_ids)
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
 
-    if not raw_jobs:
-        logger.info("No jobs returned for %r", company)
-        update_company_check(company, found_jobs=False)
-        print(f"  [{position}/{total}] {company} — 0 jobs")
-        return result
+        if not raw_jobs:
+            logger.info("No jobs returned for %r", company)
+            update_company_check(company, found_jobs=False)
+            print(f"  [{position}/{total}] {company} — 0 jobs")
+            return result
 
-    result["with_results"] = 1
-    update_company_check(company, found_jobs=True)
+        result["with_results"] = 1
+        update_company_check(company, found_jobs=True)
 
-    # ── Filter ────────────────────────────────────────────
-    matched = filter_jobs(raw_jobs)
-    logger.debug("Filter: %d raw → %d matched for %r",
-                 len(raw_jobs), len(matched), company)
-    result["matched"] = len(matched)
+        # ── Filter ────────────────────────────────────────────
+        matched = filter_jobs(raw_jobs)
+        logger.debug("Filter: %d raw → %d matched for %r",
+                     len(raw_jobs), len(matched), company)
+        result["matched"] = len(matched)
 
-    is_first_scan = company_row.get("first_scanned_at") is None
-    if is_first_scan:
-        logger.info("First scan for %r — all jobs marked pre_existing",
-                    company)
-
-    # ── Save new jobs ─────────────────────────────────────
-    new_count = 0
-    slug_info_cached = slug_info if platform == "custom" else None
-
-    for job in matched:
-        exists, is_filled = job_url_exists(job["job_url"])
-        if exists:
-            if is_filled:
-                reactivate_job(job["job_url"], job)
-                logger.info("REACTIVATED: %r | %s",
-                            company, job.get("title"))
-            else:
-                logger.debug("Duplicate URL: %s", job["job_url"])
-            continue
-
-        if job.get("content_hash") and \
-                job_hash_exists(job.get("content_hash"),
-                                job.get("content_hash_legacy")):
-            logger.debug("Duplicate content_hash for %r", company)
-            continue
-
-        if platform != "greenhouse" and not is_fresh(job, platform):
-            logger.debug("Pre-existing (stale): %r | %s",
-                         company, job.get("title"))
-            save_job_posting(job, status="pre_existing")
-            continue
-
+        is_first_scan = company_row.get("first_scanned_at") is None
         if is_first_scan:
-            save_job_posting(job, status="pre_existing")
-            continue
+            logger.info("First scan for %r — all jobs marked pre_existing",
+                        company)
 
-        # Platform-specific detail fetches
-        if platform == "icims" and job.get("_base_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("iCIMS fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+        # ── Save new jobs ─────────────────────────────────────
+        new_count = 0
+        slug_info_cached = slug_info if platform == "custom" else None
 
-        if platform == "jobvite" and job.get("_slug"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Jobvite fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+        for job in matched:
+            exists, is_filled = job_url_exists(job["job_url"])
+            if exists:
+                if is_filled:
+                    reactivate_job(job["job_url"], job)
+                    logger.info("REACTIVATED: %r | %s",
+                                company, job.get("title"))
+                else:
+                    logger.debug("Duplicate URL: %s", job["job_url"])
+                continue
 
-        if platform == "avature" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Avature fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            if job.get("content_hash") and \
+                    job_hash_exists(job.get("content_hash"),
+                                    job.get("content_hash_legacy")):
+                logger.debug("Duplicate content_hash for %r", company)
+                continue
 
-        if platform == "phenom" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Phenom fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            if platform != "greenhouse" and not is_fresh(job, platform):
+                logger.debug("Pre-existing (stale): %r | %s",
+                             company, job.get("title"))
+                save_job_posting(job, status="pre_existing")
+                continue
 
-        if platform == "talentbrew" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("TalentBrew fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            if is_first_scan:
+                save_job_posting(job, status="pre_existing")
+                continue
 
-        if platform == "sitemap" and job.get("job_url") and \
-                job.get("_feed_type") != "xml":
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "taleo" and job.get("_contest_no"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-                # taleo returns extra fields — store safely only if columns exist
-                # salary_min, salary_max, salary_type, contact, contact_phone,
-                # full_location are stored in job dict and saved by save_job_posting()
-                # if those columns exist in the DB schema.
-                # If they don't exist yet, save_job_posting() will ignore them
-                # (as long as it uses named column inserts, not SELECT *).
-            except Exception as e:
-                logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True)
-
-        # ── Eightfold ─────────────────────────────────────────────────────────────
-        if platform == "eightfold" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True)
-
-        if (platform == "custom"
-                and job.get("job_url")
-                and not job.get("description")):    # ← skip if listing already has it
-            if slug_info_cached is None:
+            # Platform-specific detail fetches (inside semaphore)
+            if platform == "icims" and job.get("_base_url"):
                 try:
-                    slug_info_cached = json.loads(slug)
-                except (json.JSONDecodeError, TypeError):
-                    slug_info_cached = {}
-            if slug_info_cached.get("detail"):
-                try:
-                    job = ats_module.fetch_job_detail(job, slug_info_cached)
-                    logger.debug(
-                        "Custom detail fetched for %r/%s desc_len=%d",
-                        company, job.get("job_id"),
-                        len(job.get("description", "") or ""),
-                    )
+                    job = ats_module.fetch_job_detail(job)
                 except Exception as e:
-                    logger.error(
-                        "Custom fetch_job_detail failed %s/%s: %s",
-                        company, job.get("job_id"), e, exc_info=True,
-                    )
+                    logger.error("iCIMS fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
-        if save_job_posting(job, status="new"):
-            new_count += 1
-            logger.info("NEW JOB: %r | %s | %s",
-                        company, job.get("title"), job.get("location"))
+            if platform == "jobvite" and job.get("_slug"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Jobvite fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
-    result["new"] = new_count
+            if platform == "avature" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Avature fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
+            if platform == "phenom" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Phenom fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
+            if platform == "talentbrew" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("TalentBrew fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
+            if platform == "sitemap" and job.get("job_url") and \
+                    job.get("_feed_type") != "xml":
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
+            if platform == "taleo" and job.get("_contest_no"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                    # taleo returns extra fields — store safely only if columns exist
+                    # salary_min, salary_max, salary_type, contact, contact_phone,
+                    # full_location are stored in job dict and saved by save_job_posting()
+                    # if those columns exist in the DB schema.
+                    # If they don't exist yet, save_job_posting() will ignore them
+                    # (as long as it uses named column inserts, not SELECT *).
+                except Exception as e:
+                    logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
+                                company, job.get("job_id"), e, exc_info=True)
+
+            # ── Eightfold ─────────────────────────────────────────────────────────────
+            if platform == "eightfold" and job.get("job_url"):
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
+                                company, job.get("job_id"), e, exc_info=True)
+
+            if (platform == "custom"
+                    and job.get("job_url")
+                    and not job.get("description")):    # ← skip if listing already has it
+                if slug_info_cached is None:
+                    try:
+                        slug_info_cached = json.loads(slug)
+                    except (json.JSONDecodeError, TypeError):
+                        slug_info_cached = {}
+                if slug_info_cached.get("detail"):
+                    try:
+                        job = ats_module.fetch_job_detail(job, slug_info_cached)
+                        logger.debug(
+                            "Custom detail fetched for %r/%s desc_len=%d",
+                            company, job.get("job_id"),
+                            len(job.get("description", "") or ""),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Custom fetch_job_detail failed %s/%s: %s",
+                            company, job.get("job_id"), e, exc_info=True,
+                        )
+
+            if save_job_posting(job, status="new"):
+                new_count += 1
+                logger.info("NEW JOB: %r | %s | %s",
+                            company, job.get("title"), job.get("location"))
+
+        result["new"] = new_count
+    # End of semaphore scope
 
     logger.info("Done %r: fetched=%d matched=%d new=%d",
                 company, len(raw_jobs), len(matched), new_count)

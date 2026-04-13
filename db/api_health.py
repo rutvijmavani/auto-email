@@ -65,17 +65,25 @@ def _writer_loop(q):
             item = q.get(timeout=1.0)
         except queue.Empty:
             if pending:
-                _flush_batch(pending)
-                for _ in pending:
-                    q.task_done()
-                pending = []
+                try:
+                    _flush_batch(pending)
+                except Exception as e:
+                    logger.error("Batch flush failed in Empty handler: %s", e, exc_info=True)
+                finally:
+                    for _ in pending:
+                        q.task_done()
+                    pending = []
             continue
 
         if item is None:   # sentinel — shutdown
             if pending:
-                _flush_batch(pending)
-                for _ in pending:
-                    q.task_done()
+                try:
+                    _flush_batch(pending)
+                except Exception as e:
+                    logger.error("Batch flush failed on sentinel: %s", e, exc_info=True)
+                finally:
+                    for _ in pending:
+                        q.task_done()
             q.task_done()  # mark sentinel done after flush
             break
 
@@ -87,9 +95,13 @@ def _writer_loop(q):
                 item = q.get_nowait()
                 if item is None:
                     if pending:
-                        _flush_batch(pending)
-                        for _ in pending:
-                            q.task_done()
+                        try:
+                            _flush_batch(pending)
+                        except Exception as e:
+                            logger.error("Batch flush failed on inner sentinel: %s", e, exc_info=True)
+                        finally:
+                            for _ in pending:
+                                q.task_done()
                     q.task_done()  # mark sentinel done after flush
                     return
                 pending.append(item)
@@ -97,10 +109,14 @@ def _writer_loop(q):
                 break
 
         if pending:
-            _flush_batch(pending)
-            for _ in pending:
-                q.task_done()
-            pending = []
+            try:
+                _flush_batch(pending)
+            except Exception as e:
+                logger.error("Batch flush failed in main loop: %s", e, exc_info=True)
+            finally:
+                for _ in pending:
+                    q.task_done()
+                pending = []
 
 
 def _flush_batch(records):

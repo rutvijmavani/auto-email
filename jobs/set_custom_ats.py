@@ -62,8 +62,11 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
     # Even if parsing fails, the original curl is preserved in DB
     # for debugging via --diagnostics.
     print("[0/5] Storing raw curl(s) in DB...")
-    _store_raw_curls(company, curl_string, detail_curl)
-    print("  [OK] Raw curl(s) stored")
+    if not _store_raw_curls(company, curl_string, detail_curl):
+        print("  [WARNING] Failed to store raw curl(s) — continuing anyway")
+        logger.warning("Raw curl storage failed for %r, continuing", company)
+    else:
+        print("  [OK] Raw curl(s) stored")
 
     # ── Step 1: Parse listing curl ────────────────────────────────
     print("\n[1/5] Parsing listing curl...")
@@ -330,11 +333,9 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
     Store raw curl strings in DB before any parsing.
     Creates the company row if it doesn't exist yet.
     """
+    conn = None
     try:
         from db.connection import get_conn
-        from db.custom_ats_diagnostics import init_diagnostics_table
-        init_diagnostics_table()
-
         conn = get_conn()
 
         # Create row if needed
@@ -369,9 +370,13 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
             )
 
         conn.commit()
-        conn.close()
+        return True
     except Exception as e:
-        logger.warning("could not store raw curls for %r: %s", company, e)
+        logger.error("Could not store raw curls for %r: %s", company, e, exc_info=True)
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def _flag_parse_failure(company, step_name, error_msg, raw_data):

@@ -176,7 +176,18 @@ def parse_salary_text(text):
     # Handle 'k' suffix: 120k → 120000
     raw_nums = re.findall(r"(\d+(?:\.\d+)?)\s*[kK]\b", text)
     k_nums = [str(int(float(n) * 1000)) for n in raw_nums]
-    nums = k_nums if k_nums else nums
+
+    # Merge both sets instead of replacing
+    if k_nums:
+        nums += k_nums
+        # Deduplicate while preserving order
+        seen = set()
+        deduplicated = []
+        for n in nums:
+            if n not in seen:
+                seen.add(n)
+                deduplicated.append(n)
+        nums = deduplicated
 
     if len(nums) >= 2:
         return nums[0], nums[1]

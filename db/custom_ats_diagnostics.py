@@ -162,12 +162,53 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
     Prevents flooding the table on repeated daily runs.
 
     Returns row_id if written, None if already exists or failed.
+
+    Uses INSERT ... ON CONFLICT DO NOTHING for atomic operation.
     """
-    if has_open_diagnostic(company, step, pattern_hint):
+    # Truncate raw response
+    if isinstance(raw_response, bytes):
+        try:
+            raw_str = raw_response.decode("utf-8", errors="replace")
+        except Exception:
+            raw_str = repr(raw_response[:200])
+    else:
+        raw_str = str(raw_response) if raw_response else None
+
+    # Cap at 5KB for listing, 2KB for detail
+    max_len = 2048 if step == STEP_DETAIL_FETCH else 5120
+    if raw_str and len(raw_str) > max_len:
+        raw_str = raw_str[:max_len] + f"\n... [truncated at {max_len} chars]"
+
+    conn = None
+    try:
+        conn = get_conn()
+
+        # Atomic insert with conflict handling
+        cursor = conn.execute("""
+            INSERT INTO custom_ats_diagnostics
+              (company, step, severity, pattern_hint, raw_response, notes)
+            SELECT ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM custom_ats_diagnostics
+                WHERE company = ? AND step = ? AND pattern_hint = ? AND resolved = 0
+            )
+        """, (company, step, severity, pattern_hint, raw_str, notes,
+              company, step, pattern_hint))
+
+        conn.commit()
+        row_id = cursor.lastrowid if cursor.rowcount > 0 else None
+        return row_id
+    except Exception as e:
+        # Never let diagnostics crash the main pipeline
+        import logging
+        logging.getLogger(__name__).warning(
+            "custom_ats_diagnostics: write failed for %r: %s",
+            company, e
+        )
         return None
-    return flag_diagnostic(
-        company, step, severity, pattern_hint, raw_response, notes
-    )
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────

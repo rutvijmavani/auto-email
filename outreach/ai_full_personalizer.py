@@ -277,19 +277,26 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         return None, None, None, False
 
     # ── Quota / availability checks ──────────────────────────────
-    if not can_call(FIELD_MAP_MODEL):
-        print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
-              f"skipping AI field map for {company}")
-        return None, None, None, False
-
+    # Check RPM first before daily limit (RPM is transient, daily is permanent)
     if not within_rpm(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} RPM limit hit — "
               f"waiting 60s for field map ({company})...")
         time.sleep(60)
-        if not can_call(FIELD_MAP_MODEL):
-            print(f"[INFO] {FIELD_MAP_MODEL} still unavailable — "
+        # Re-check both RPM and daily limit after wait
+        if not within_rpm(FIELD_MAP_MODEL):
+            print(f"[INFO] {FIELD_MAP_MODEL} still over RPM — "
                   f"skipping AI field map for {company}")
             return None, None, None, False
+        if not can_call(FIELD_MAP_MODEL):
+            print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
+                  f"skipping AI field map for {company}")
+            return None, None, None, False
+
+    # Check daily limit (only reached if RPM check passed)
+    if not can_call(FIELD_MAP_MODEL):
+        print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
+              f"skipping AI field map for {company}")
+        return None, None, None, False
 
     client = _get_client()
     if client is None:
