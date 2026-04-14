@@ -270,13 +270,13 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
     """
 
     if not first_job_raw or not isinstance(first_job_raw, dict):
-        return None, None, False
+        return None, None, None, False
 
     # ── Quota / availability checks ──────────────────────────────
     if not can_call(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
               f"skipping AI field map for {company}")
-        return None, None, False
+        return None, None, None , False
 
     if not within_rpm(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} RPM limit hit — "
@@ -285,11 +285,11 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         if not can_call(FIELD_MAP_MODEL):
             print(f"[INFO] {FIELD_MAP_MODEL} still unavailable — "
                   f"skipping AI field map for {company}")
-            return None, None, False
+            return None, None, None , False
 
     client = _get_client()
     if client is None:
-        return None, None, False
+        return None, None, None , False
 
     try:
         print(f"[AI DEBUG] building truncated preview...")
@@ -477,4 +477,4 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         print(f"[AI DEBUG] EXCEPTION at some step: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, False
+        return None, None, None ,False

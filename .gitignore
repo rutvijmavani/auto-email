@@ -51,3 +51,5 @@ Thumbs.db
 
 # Test artifacts with non-deterministic output
 results/build_ats_list_test.txt
+
+.claude/worktrees/
