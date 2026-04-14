@@ -303,7 +303,7 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         return None, None, None, False
 
     try:
-        print(f"[AI DEBUG] building truncated preview...")
+        print("[AI DEBUG] building truncated preview...")
         # ── Build job dict preview ───────────────────────────────────
         truncated = {}
         for k, v in first_job_raw.items():
@@ -407,7 +407,7 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         {{"title": "path_or_null", "job_url": "path_or_null", "location_city": "path_or_null", "location_state": "path_or_null", "location_country": "path_or_null", "posted_at": "path_or_null", "job_id": "path_or_null", "description": "path_or_null", "job_url_template": "template_or_null"{total_field_instruction}}}"""
         # ── Call model ───────────────────────────────────────────────
         try:
-            print(f"[AI DEBUG] calling model...")
+            print("[AI DEBUG] calling model...")
             response = client.models.generate_content(
                 model=FIELD_MAP_MODEL,
                 contents=prompt,
@@ -433,6 +433,11 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
             field_map    = None
             job_url_template = None
 
+            # Validate job_url_template has {job_id} placeholder (moved outside title check)
+            tmpl = data.get(TEMPLATE_KEY)
+            if tmpl and isinstance(tmpl, str) and "{job_id}" in tmpl:
+                job_url_template = tmpl
+
             if data.get("title"):
                 title_val = _walk_path(first_job_raw, data["title"])
                 if title_val is not None:
@@ -451,11 +456,6 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
                             )
                     if validated.get("title"):
                         field_map = validated
-
-                    # Validate job_url_template has {job_id} placeholder
-                    tmpl = data.get(TEMPLATE_KEY)
-                    if tmpl and isinstance(tmpl, str) and "{job_id}" in tmpl:
-                        job_url_template = tmpl
 
             # Validate total_field path exists in full_response
             total_field = None

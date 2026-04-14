@@ -826,26 +826,29 @@ def run():
 
                 if existing:
                     # Update ATS if:
-                    # - new detection found something
-                    # - existing platform is null/unknown/custom
+                    # - new detection found something AND
+                    # - existing platform is null/unknown/custom (treat custom as authoritative)
                     needs_ats_update = (
                         ats_result and (
                             existing["ats_platform"] is None or
-                            existing["ats_platform"] in
-                            ("unknown", "custom")
+                            existing["ats_platform"] in ("unknown", "custom")
                         )
                     )
 
                     if needs_ats_update:
+                        # Use CASE to preserve existing slug/detail if new ones are empty
                         conn.execute(
                             "UPDATE prospective_companies "
                             "SET status='active', "
-                            "ats_platform=?, ats_slug=?, "
+                            "ats_platform=?, "
+                            "ats_slug=CASE "
+                            "  WHEN ? IS NOT NULL AND ? != '' THEN ? "
+                            "  ELSE ats_slug END, "
                             "ats_detected_at=?, "
                             "domain = CASE WHEN domain IS NULL "
                             "  OR domain = '' THEN ? ELSE domain END "
                             "WHERE company=?",
-                            (platform, slug, datetime.utcnow(),
+                            (platform, slug, slug, slug, datetime.utcnow(),
                              domain, company)
                         )
                     else:

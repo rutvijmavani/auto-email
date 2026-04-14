@@ -76,12 +76,13 @@ _PLATFORM_SEMAPHORES = {
     platform: threading.Semaphore(limit)
     for platform, limit in MONITOR_PLATFORM_CONCURRENCY.items()
 }
-_DEFAULT_SEMAPHORE = threading.Semaphore(_DEFAULT_CONCURRENCY)
 
 
 def _get_semaphore(platform):
-    """Return the semaphore for this platform (or default)."""
-    return _PLATFORM_SEMAPHORES.get(platform, _DEFAULT_SEMAPHORE)
+    """Return the semaphore for this platform (or create one with default concurrency)."""
+    return _PLATFORM_SEMAPHORES.setdefault(
+        platform, threading.Semaphore(_DEFAULT_CONCURRENCY)
+    )
 
 
 # ─────────────────────────────────────────

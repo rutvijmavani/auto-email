@@ -96,6 +96,7 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
         print(f"  Sample URL : {sample_job_url.strip()}")
 
     # ── Step 2: Parse detail curl (optional) ─────────────────────
+    detail_parse_failed = False
     if detail_curl and detail_curl.strip():
         print("\n[2/5] Parsing detail curl...")
         try:
@@ -111,6 +112,7 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
             print("  Detail fetch will be disabled for this company.")
             logger.warning("detail curl parse failed for %r: %s", company, e)
             _flag_parse_failure(company, "detail", str(e), detail_curl)
+            detail_parse_failed = True
     else:
         print("\n[2/5] No detail curl provided — skipping")
         print("  Jobs will be saved without descriptions.")
@@ -208,16 +210,18 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
         return False
 
     # Resolve any open diagnostics for this company since config is fresh
-    try:
-        from db.custom_ats_diagnostics import resolve_all_for_company
-        resolved = resolve_all_for_company(company)
-        if resolved > 0:
-            print(f"  [OK] Resolved {resolved} open diagnostic(s) "
-                  f"for {company}")
-    except Exception as e:
-        logger.exception(
-            "Failed to resolve diagnostics for %r: %s", company, e
-        )
+    # Only call resolve_all_for_company if detail parsing did not fail
+    if not detail_parse_failed:
+        try:
+            from db.custom_ats_diagnostics import resolve_all_for_company
+            resolved = resolve_all_for_company(company)
+            if resolved > 0:
+                print(f"  [OK] Resolved {resolved} open diagnostic(s) "
+                      f"for {company}")
+        except Exception as e:
+            logger.exception(
+                "Failed to resolve diagnostics for %r: %s", company, e
+            )
 
     print(f"\n{'='*60}")
     print(f"  [OK] Custom ATS configured for {company}")
@@ -438,9 +442,19 @@ def _save_to_db(company, slug_info):
         conn = get_conn()
 
         existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company = ?",
+            "SELECT id, ats_slug FROM prospective_companies WHERE company = ?",
             (company,)
         ).fetchone()
+
+        # Merge detail from existing slug if new slug_info lacks detail
+        if existing and existing["ats_slug"] and not slug_info.get("detail"):
+            try:
+                existing_slug = json.loads(existing["ats_slug"])
+                if existing_slug.get("detail"):
+                    slug_info["detail"] = existing_slug["detail"]
+                    logger.debug("Merged detail from existing slug for %r", company)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass  # existing ats_slug is invalid JSON
 
         slug_json = json.dumps(slug_info)
         now       = datetime.utcnow()

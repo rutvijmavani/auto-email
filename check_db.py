@@ -31,7 +31,12 @@ def test_company(company_name):
         print("[ERROR] No slug stored — run --sync-prospective first")
         return
 
-    slug_info = json.loads(slug)
+    try:
+        slug_info = json.loads(slug)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"[ERROR] Invalid JSON in ats_slug: {e}")
+        return
+
     print(f"  URL: {slug_info.get('url')}")
     print(f"  Strategy: {slug_info.get('session_strategy', 'not detected yet')}")
     print(f"  Detail: {'yes' if slug_info.get('detail') else 'no'}")
@@ -39,9 +44,24 @@ def test_company(company_name):
 
     jobs = fetch_jobs(slug_info, company_name)
 
-    slug_info = json.loads(slug)
     from jobs.ats.custom_career import _fetch_page,  _build_legacy_session, _warm_session, _extract_jobs_array
     session, _ = _warm_session(slug_info, company_name)
+    if session is None:
+        print("[ERROR] Session warm-up failed — skipping raw fetch")
+        print(f"\n  Result: {len(jobs)} jobs fetched")
+        if jobs:
+            print(f"\n  Sample (first 3):")
+            for job in jobs[:3]:
+                print(f"    - {job.get('title', '?')[:50]}")
+                print(f"      Location: {job.get('location', '?')}")
+                print(f"      URL: {job.get('job_url', '?')[:60]}")
+                print(f"      Description: "
+                      f"{'yes' if job.get('description') else 'no'}")
+        else:
+            print("  [WARNING] No jobs returned — check diagnostics:")
+            print("  python pipeline.py --diagnostics")
+        return
+
     raw = _fetch_page(session, slug_info, page=1, offset=0)
     jobs_raw = _extract_jobs_array(raw, slug_info)
     if jobs_raw:
@@ -50,7 +70,7 @@ def test_company(company_name):
 
     print(f"\n  Result: {len(jobs)} jobs fetched")
     if jobs:
-        print(f"\n  Sample (first 3):")
+        print("\n  Sample (first 3):")
         for job in jobs[:3]:
             print(f"    - {job.get('title', '?')[:50]}")
             print(f"      Location: {job.get('location', '?')}")

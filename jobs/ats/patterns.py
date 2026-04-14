@@ -313,8 +313,7 @@ def _make_patterns():
         re.compile(r"([a-z0-9][a-z0-9\-]*)\.eightfold\.ai/", re.IGNORECASE),
         "eightfold",
         lambda m: json.dumps({
-            "slug":   m.group(1).lower(),
-            "domain": f"{m.group(1).lower()}.eightfold.ai",
+            "slug": m.group(1).lower(),
         }),
     ))
 

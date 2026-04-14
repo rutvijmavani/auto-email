@@ -1029,6 +1029,20 @@ def main():
         diagnostic_id = None
         company = None
 
+        # Check for positional diagnostic id immediately following --resolve-diagnostic
+        try:
+            idx = args.index("--resolve-diagnostic")
+            if idx + 1 < len(args):
+                next_arg = args[idx + 1]
+                # Check if next arg is a positive integer (not another flag)
+                if not next_arg.startswith("--"):
+                    try:
+                        diagnostic_id = int(next_arg)
+                    except ValueError:
+                        pass  # fall through to flag parsing
+        except (ValueError, IndexError):
+            pass
+
         # Check for --diagnostic-id flag
         if "--diagnostic-id" in args:
             try:

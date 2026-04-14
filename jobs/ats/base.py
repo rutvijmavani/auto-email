@@ -47,7 +47,7 @@ def between_companies_delay():
 # ─────────────────────────────────────────
 
 def fetch_json(url, params=None, retries=2,
-               platform=None, track=True):
+               platform=None, track=True, headers=None):
     """
     Fetch JSON from URL with timeout + retry.
     Records request stats to api_health if platform given.
@@ -60,11 +60,12 @@ def fetch_json(url, params=None, retries=2,
         backoff_s   = 0
 
         try:
+            request_headers = headers if headers is not None else {"User-Agent": "Mozilla/5.0"}
             resp = requests.get(
                 url,
                 params=params,
                 timeout=JOB_MONITOR_API_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers=request_headers,
             )
             status_code  = resp.status_code
             elapsed_ms   = int(time.time() * 1000) - start_ms

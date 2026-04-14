@@ -223,7 +223,7 @@ def _store_and_return(company, result):
 # NEEDS REDETECTION
 # ─────────────────────────────────────────
 
-def needs_redetection(company_row, redetect_days=14):
+def needs_redetection(company_row, redetect_days=JOB_MONITOR_REDETECT_DAYS):
     """
     Check if company needs ATS re-detection.
 
