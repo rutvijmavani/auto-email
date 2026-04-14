@@ -258,13 +258,14 @@ def clear_field_map_override(company):
     conn = None
     try:
         conn = get_conn()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE custom_ats_inspection
             SET field_map_override = NULL
             WHERE company = ?
         """, (company,))
         conn.commit()
-        return True
+        affected = cursor.rowcount
+        return affected > 0
     except Exception:
         return False
     finally:

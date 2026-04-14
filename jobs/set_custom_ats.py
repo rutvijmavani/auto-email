@@ -214,8 +214,10 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
         if resolved > 0:
             print(f"  [OK] Resolved {resolved} open diagnostic(s) "
                   f"for {company}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.exception(
+            "Failed to resolve diagnostics for %r: %s", company, e
+        )
 
     print(f"\n{'='*60}")
     print(f"  [OK] Custom ATS configured for {company}")

@@ -532,7 +532,8 @@ def _detect_job_id_in_url(url, params, body=None):
 
 
 def _find_id_param_in_body(body, job_id):
-    """Find which field in a JSON body contains the job_id."""
+    """Find which field in a JSON or form-encoded body contains the job_id."""
+    # Try JSON first
     try:
         data = json.loads(body)
         if isinstance(data, dict):
@@ -541,6 +542,18 @@ def _find_id_param_in_body(body, job_id):
                     return k
     except (json.JSONDecodeError, TypeError):
         pass
+
+    # Try form-encoded body
+    if '=' in body:
+        try:
+            from urllib.parse import parse_qsl
+            fields = dict(parse_qsl(body, keep_blank_values=True))
+            for k, v in fields.items():
+                if str(v) == str(job_id):
+                    return k
+        except Exception:
+            pass
+
     return None
 
 

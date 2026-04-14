@@ -1024,24 +1024,30 @@ def main():
     
     if "--resolve-diagnostic" in args:
         from jobs.job_monitor import run_resolve_diagnostic
-        non_flag_args = [a for a in args if not a.startswith("--")]
 
-        # Parse first argument: if it's an integer, treat as diagnostic_id
-        # otherwise treat as company name
+        # Parse explicit flags for clarity
         diagnostic_id = None
         company = None
 
-        if non_flag_args:
-            first_arg = non_flag_args[0]
+        # Check for --diagnostic-id flag
+        if "--diagnostic-id" in args:
             try:
-                # Try to convert to int - if successful, it's a diagnostic_id
-                diagnostic_id = int(first_arg)
-                # Second arg (if present) is company
-                company = non_flag_args[1] if len(non_flag_args) > 1 else None
-            except ValueError:
-                # Not an integer - treat as company name
-                company = first_arg
-                diagnostic_id = None
+                idx = args.index("--diagnostic-id")
+                if idx + 1 < len(args):
+                    diagnostic_id = int(args[idx + 1])
+            except (ValueError, IndexError):
+                print('[ERROR] --diagnostic-id requires an integer argument')
+                return
+
+        # Check for --company flag
+        if "--company" in args:
+            try:
+                idx = args.index("--company")
+                if idx + 1 < len(args):
+                    company = args[idx + 1]
+            except IndexError:
+                print('[ERROR] --company requires a company name argument')
+                return
 
         run_resolve_diagnostic(diagnostic_id=diagnostic_id, company=company)
         return

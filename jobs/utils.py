@@ -125,6 +125,9 @@ def build_request_kwargs(method, url, params=None, body=None,
         else:
             kwargs["data"] = body
 
+    if extra_headers:
+        kwargs["headers"] = dict(extra_headers)
+
     return kwargs
 
 

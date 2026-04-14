@@ -256,8 +256,12 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
             LIMIT ?
         """, params + [limit]).fetchall()
         return [dict(r) for r in rows]
-    except Exception:
-        return []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to retrieve open diagnostics: %s", e
+        )
+        raise
     finally:
         if conn:
             conn.close()
@@ -287,8 +291,12 @@ def get_diagnostic_summary():
                 END
         """).fetchall()
         return [dict(r) for r in rows]
-    except Exception:
-        return []
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to retrieve diagnostic summary: %s", e
+        )
+        raise
     finally:
         if conn:
             conn.close()
@@ -308,8 +316,12 @@ def get_raw_curl_for_company(company):
             WHERE company = ?
         """, (company,)).fetchone()
         return dict(row) if row else {}
-    except Exception:
-        return {}
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(
+            "Failed to retrieve raw curl for company %r: %s", company, e
+        )
+        raise
     finally:
         if conn:
             conn.close()

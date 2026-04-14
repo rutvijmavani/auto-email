@@ -178,14 +178,12 @@ def _cleanup_custom_ats_inspection(c):
     Remove inspection rows for companies no longer in
     prospective_companies table.
     Keeps table lean as companies are added/removed.
-    Preserves rows where field_map_override IS NOT NULL (manual overrides).
     """
     c.execute("""
         DELETE FROM custom_ats_inspection
         WHERE company NOT IN (
             SELECT company FROM prospective_companies
         )
-        AND field_map_override IS NULL
     """)
 
 
