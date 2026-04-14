@@ -339,7 +339,7 @@ def _post_detail_ajax(session, base_url, section, job_id, contest_no, csrf):
         "tz":                          "GMT-04:00",
         "tzname":                      "America/New_York",
         "lang":                        "en",
-        "requisitionno":               job_id,
+        "requisitionno":               contest_no,
         "csrftoken":                   csrf,
         "portal":                      "",
         "isListEmpty":                 "false",

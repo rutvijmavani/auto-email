@@ -392,9 +392,11 @@ def build_graphql_body(graphql_config, lsd, rev):
         # Build JSON body
         body_data = {}
         stable = graphql_config.get("stable_params", {})
+
+        # First add all stable params (includes query and extensions if present)
         body_data.update(stable)
 
-        # Add GraphQL-specific fields
+        # Add GraphQL-specific fields (override if needed)
         if graphql_config.get("doc_id"):
             body_data["doc_id"] = str(graphql_config["doc_id"])
         if graphql_config.get("friendly_name"):
@@ -615,7 +617,7 @@ def _extract_graphql_config(parsed):
             config["is_json_body"]  = True
             config["stable_params"] = {
                 k: v for k, v in data.items()
-                if k not in ("variables", "query", "lsd", "extensions")
+                if k not in ("variables", "lsd")
                 and not k.startswith("__")
             }
     except (json.JSONDecodeError, TypeError):

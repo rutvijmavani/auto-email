@@ -250,9 +250,11 @@ def _extract_career_page_from_curl(curl_string):
     Returns URL string or None.
     """
     import re
+    # Match both -H and --header forms, case-insensitive Referer/Referrer
     m = re.search(
-        r'-H\s+["\']?[Rr]eferer:\s*([^\s"\'\\^]+)',
-        curl_string
+        r'(?:-H|--header)\s+["\']?[Rr]efer(?:er|rer):\s*([^\s"\'\\^]+)',
+        curl_string,
+        re.IGNORECASE
     )
     if m:
         url = m.group(1).strip().rstrip("'\"^")
@@ -418,6 +420,7 @@ def _flag_parse_failure(company, step_name, error_msg, raw_data):
 
 def _save_to_db(company, slug_info):
     """Upsert prospective_companies with custom ATS config."""
+    conn = None
     try:
         from db.connection import get_conn
         conn = get_conn()
@@ -452,7 +455,6 @@ def _save_to_db(company, slug_info):
             print(f"  Inserted new company: {company}")
 
         conn.commit()
-        conn.close()
         return True
 
     except Exception as e:
@@ -460,3 +462,6 @@ def _save_to_db(company, slug_info):
         logger.error("DB write failed for %r: %s", company, e,
                      exc_info=True)
         return False
+    finally:
+        if conn is not None:
+            conn.close()
