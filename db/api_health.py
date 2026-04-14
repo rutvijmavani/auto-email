@@ -222,7 +222,7 @@ def _write_one(conn, rec):
 # RECORD REQUESTS (public API — unchanged signature)
 # ─────────────────────────────────────────
 
-def record_request(platform, status_code, response_ms, backoff_s=0):
+def record_request(platform, status_code, response_ms, backoff_s=0, flush=False):
     """
     Record one API request in api_health.
     Non-blocking — enqueues to background writer thread.
@@ -233,6 +233,7 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         status_code:  HTTP status code (0 for non-HTTP errors)
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit
+        flush:        if True, block until this write is committed to DB
     """
     _get_write_queue().put({
         "date":        date.today().isoformat(),
@@ -241,6 +242,8 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         "response_ms": response_ms,
         "backoff_s":   backoff_s,
     })
+    if flush:
+        _get_write_queue().join()
 
 
 # ─────────────────────────────────────────
@@ -352,40 +355,20 @@ def flush():
     """
     q = _write_queue
     if q is not None:
-        # Use timeout to avoid indefinite hang
-        try:
-            # Poll with timeout to detect failures
-            while not q.empty() or q.unfinished_tasks > 0:
-                if _writer_failed.is_set():
-                    raise RuntimeError(
-                        "api_health writer thread reported batch flush failure"
-                    )
-                # Wait briefly, then check again
-                try:
-                    q.join(timeout=1.0)
-                    break
-                except:
-                    # join() doesn't support timeout in Python < 3.9
-                    # fallback: busy-wait with sleep
-                    import time
-                    time.sleep(0.1)
-                    continue
-        except AttributeError:
-            # Python < 3.9: q.join() has no timeout parameter
-            # Use a timed loop instead
-            import time
-            timeout_s = 30
-            start = time.time()
-            while not q.empty() or (hasattr(q, 'unfinished_tasks') and q.unfinished_tasks > 0):
-                if _writer_failed.is_set():
-                    raise RuntimeError(
-                        "api_health writer thread reported batch flush failure"
-                    )
-                if time.time() - start > timeout_s:
-                    raise TimeoutError(
-                        f"flush() timed out after {timeout_s}s waiting for queue drain"
-                    )
-                time.sleep(0.1)
+        import time
+        timeout_s = 30
+        start = time.monotonic()
+
+        while not q.empty() or (hasattr(q, 'unfinished_tasks') and q.unfinished_tasks > 0):
+            if _writer_failed.is_set():
+                raise RuntimeError(
+                    "api_health writer thread reported batch flush failure"
+                )
+            if time.monotonic() - start > timeout_s:
+                raise TimeoutError(
+                    f"flush() timed out after {timeout_s}s waiting for queue drain"
+                )
+            time.sleep(0.1)
 
         # Final check after queue drained
         if _writer_failed.is_set():

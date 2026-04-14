@@ -54,7 +54,7 @@ def fetch_jobs(slug, company):
 
     for page in range(MAX_PAGES):
         url  = f"{base_url}?limit={PAGE_SIZE}&offset={offset}"
-        data = fetch_json(url, headers=HEADERS)
+        data = fetch_json(url, headers=HEADERS, platform="jibe")
 
         if not data:
             logger.debug("Jibe fetch: no data for %r page=%d", company, page)

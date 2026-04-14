@@ -519,11 +519,7 @@ def _detect_column_map(requisition_list):
             v = val.strip()
             if v.startswith("[") and '"' in v:
                 loc_votes[i] = loc_votes.get(i, 0) + 1
-            elif re.match(
-                r"^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}$"
-                r"|^\d{1,2}/\d{1,2}/\d{4}$",
-                v
-            ):
+            elif _parse_date(v):
                 date_votes[i] = date_votes.get(i, 0) + 1
 
     return {

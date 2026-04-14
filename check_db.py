@@ -44,7 +44,7 @@ def test_company(company_name):
 
     jobs = fetch_jobs(slug_info, company_name)
 
-    from jobs.ats.custom_career import _fetch_page,  _build_legacy_session, _warm_session, _extract_jobs_array
+    from jobs.ats.custom_career import _fetch_page,  _build_legacy_session, _warm_session, _extract_jobs_array, _get_initial_page
     session, _ = _warm_session(slug_info, company_name)
     if session is None:
         print("[ERROR] Session warm-up failed — skipping raw fetch")
@@ -63,7 +63,8 @@ def test_company(company_name):
         return
 
     try:
-        raw = _fetch_page(session, slug_info, page=1, offset=0)
+        initial_page = _get_initial_page(slug_info)
+        raw = _fetch_page(session, slug_info, page=initial_page, offset=0)
         jobs_raw = _extract_jobs_array(raw, slug_info)
         if jobs_raw:
             print("\nRAW FIRST JOB KEYS:", list(jobs_raw[0].keys()))

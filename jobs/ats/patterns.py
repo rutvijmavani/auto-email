@@ -314,13 +314,14 @@ def _make_patterns():
         "eightfold",
         lambda m: json.dumps({
             "slug": m.group(1).lower(),
+            "domain": m.group(0).lower(),
         }),
     ))
 
     # Jibe / iCIMS Jibe — {domain}/api/jobs or app.jibecdn.com in HTML
-    # slug = careers domain e.g. "careers.rivian.com"
+    # slug = careers domain e.g. "careers.rivian.com" or "careers.foo.co.uk"
     patterns.append((
-        re.compile(r"(careers\.[a-z0-9\-]+\.[a-z]+)/(?:api/jobs|careers-home)", re.IGNORECASE),
+        re.compile(r"(careers\.[^/]+)/(?:api/jobs|careers-home)", re.IGNORECASE),
         "jibe",
         lambda m: m.group(1).lower(),
     ))

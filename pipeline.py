@@ -1029,7 +1029,7 @@ def main():
         diagnostic_id = None
         company = None
 
-        # Check for positional diagnostic id immediately following --resolve-diagnostic
+        # Check for positional diagnostic id and company following --resolve-diagnostic
         try:
             idx = args.index("--resolve-diagnostic")
             if idx + 1 < len(args):
@@ -1038,6 +1038,11 @@ def main():
                 if not next_arg.startswith("--"):
                     try:
                         diagnostic_id = int(next_arg)
+                        # Check for second positional argument (company)
+                        if idx + 2 < len(args):
+                            second_arg = args[idx + 2]
+                            if not second_arg.startswith("--"):
+                                company = second_arg
                     except ValueError:
                         pass  # fall through to flag parsing
         except (ValueError, IndexError):
@@ -1053,8 +1058,8 @@ def main():
                 print('[ERROR] --diagnostic-id requires an integer argument')
                 return
 
-        # Check for --company flag
-        if "--company" in args:
+        # Check for --company flag (only if not already set from positional)
+        if "--company" in args and company is None:
             try:
                 idx = args.index("--company")
                 if idx + 1 < len(args):

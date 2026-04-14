@@ -169,6 +169,8 @@ def parse_detail_curl(curl_string, listing_slug_info):
     # GraphQL detail
     graphql_config = None
     if _is_graphql(parsed):
+        # Pass detected_id to replace IDs in variables
+        parsed["detected_id"] = job_id
         graphql_config = _extract_graphql_config(parsed)
         # Only clean/reformat body if it's form-encoded
         if not graphql_config.get("is_json_body"):
@@ -462,6 +464,47 @@ def compute_jazoest(lsd):
 # INTERNAL — JOB ID DETECTION
 # ─────────────────────────────────────────
 
+def _scan_nested_json_for_id(data, depth=0):
+    """
+    Recursively scan JSON for known ID params.
+    Returns (job_id, param_name) or (None, None).
+    """
+    if depth > 5:  # Prevent infinite recursion
+        return None, None
+
+    if isinstance(data, dict):
+        for k, v in data.items():
+            # Check if key matches known ID params
+            norm = k.lower().replace("_", "").replace("-", "")
+            if norm in {p.replace("_", "").replace("-", "") for p in KNOWN_ID_PARAMS}:
+                if isinstance(v, (str, int)):
+                    return str(v), k
+
+            # Recursively check nested objects
+            if isinstance(v, dict):
+                result_id, result_key = _scan_nested_json_for_id(v, depth + 1)
+                if result_id:
+                    return result_id, result_key
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        result_id, result_key = _scan_nested_json_for_id(item, depth + 1)
+                        if result_id:
+                            return result_id, result_key
+
+            # Try to JSON-decode string values (for nested GraphQL variables)
+            if isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    nested = json.loads(v)
+                    result_id, result_key = _scan_nested_json_for_id(nested, depth + 1)
+                    if result_id:
+                        return result_id, result_key
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+    return None, None
+
+
 def _detect_job_id_in_url(url, params, body=None):
     """
     Detect job_id in URL path, query params, or POST body.
@@ -501,17 +544,14 @@ def _detect_job_id_in_url(url, params, body=None):
         if m:
             return m.group(1), pattern_name, "path"
 
-    # Check POST body for id field
+    # Check POST body for id field (including nested structures)
     if body:
-        # Try JSON first
+        # Try JSON first (recursive scan)
         try:
             data = json.loads(body)
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    norm = k.lower().replace("_", "").replace("-", "")
-                    if norm in {p.replace("_", "").replace("-", "")
-                                for p in KNOWN_ID_PARAMS}:
-                        return str(v), "body_field", "body"
+            job_id, param_name = _scan_nested_json_for_id(data)
+            if job_id:
+                return job_id, "body_field", "body"
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -525,6 +565,15 @@ def _detect_job_id_in_url(url, params, body=None):
                     if norm in {p.replace("_", "").replace("-", "")
                                 for p in KNOWN_ID_PARAMS}:
                         return str(v), "body_field", "body"
+                    # Check if value is JSON-encoded
+                    if isinstance(v, str) and v.strip().startswith(("{", "[")):
+                        try:
+                            nested = json.loads(v)
+                            job_id, param_name = _scan_nested_json_for_id(nested)
+                            if job_id:
+                                return job_id, "body_field", "body"
+                        except (json.JSONDecodeError, TypeError):
+                            pass
             except Exception:
                 pass
 
@@ -574,13 +623,48 @@ def _is_graphql(parsed):
     return False
 
 
+def _replace_ids_in_nested_json(data, detected_id):
+    """
+    Recursively replace detected_id with {job_id} placeholder in nested JSON.
+    Returns modified copy of data.
+    """
+    if data is None:
+        return data
+
+    if isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            # Check if key is an ID param and value matches detected_id
+            norm = k.lower().replace("_", "").replace("-", "")
+            if norm in {p.replace("_", "").replace("-", "") for p in KNOWN_ID_PARAMS}:
+                if str(v) == str(detected_id):
+                    result[k] = "{job_id}"
+                    continue
+            # Recursively process nested structures
+            if isinstance(v, (dict, list)):
+                result[k] = _replace_ids_in_nested_json(v, detected_id)
+            else:
+                result[k] = v
+        return result
+
+    elif isinstance(data, list):
+        return [_replace_ids_in_nested_json(item, detected_id) for item in data]
+
+    else:
+        # Replace string values that match detected_id
+        if isinstance(data, str) and data == str(detected_id):
+            return "{job_id}"
+        return data
+
+
 def _extract_graphql_config(parsed):
     """
     Extract stable GraphQL config from curl.
-    Strips rotating session params.
+    Strips rotating session params and replaces detected IDs with placeholders.
     """
     body = parsed.get("body", "") or ""
     url  = parsed.get("url", "")
+    detected_id = parsed.get("detected_id")
 
     config = {
         "doc_id":        None,
@@ -607,7 +691,11 @@ def _extract_graphql_config(parsed):
                 config["friendly_name"] = fields["fb_api_req_friendly_name"]
             if "variables" in fields:
                 try:
-                    config["variables"] = json.loads(fields["variables"])
+                    variables = json.loads(fields["variables"])
+                    # Replace detected IDs in variables
+                    if detected_id:
+                        variables = _replace_ids_in_nested_json(variables, detected_id)
+                    config["variables"] = variables
                 except (json.JSONDecodeError, TypeError):
                     config["variables"] = fields["variables"]
 
@@ -642,7 +730,11 @@ def _extract_graphql_config(parsed):
             config["doc_id"]        = data.get("doc_id") or data.get("docid")
             config["friendly_name"] = (data.get("operationName") or
                                        data.get("fb_api_req_friendly_name"))
-            config["variables"]     = data.get("variables")
+            variables = data.get("variables")
+            # Replace detected IDs in variables
+            if variables and detected_id:
+                variables = _replace_ids_in_nested_json(variables, detected_id)
+            config["variables"] = variables
             config["is_json_body"]  = True
             config["stable_params"] = {
                 k: v for k, v in data.items()

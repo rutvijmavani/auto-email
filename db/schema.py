@@ -54,8 +54,8 @@ def _cleanup_closed_application_recruiters(c):
 def _cleanup_mark_resolved_diagnostics(c):
     """Mark diagnostics resolved older than DIAGNOSTICS_AUTO_RESOLVED_DAYS."""
     c.execute("""
-        UPDATE custom_ats_diagnostics 
-        SET resolved = 1
+        UPDATE custom_ats_diagnostics
+        SET resolved = 1, resolved_at = DATETIME('now')
         WHERE resolved = 0
         AND created_at < DATE('now' , ?)
     """, (f"-{DIAGNOSTICS_AUTO_RESOLVED_DAYS} days",))
@@ -63,11 +63,13 @@ def _cleanup_mark_resolved_diagnostics(c):
 def _cleanup_resolved_diagnostics(c):
     """
     Delete rows for resolved diagnostics in custom_ats_diagnostics older than retention period.
+    Uses resolved_at timestamp to honor post-resolution retention window.
     """
     c.execute("""
             DELETE FROM custom_ats_diagnostics
             WHERE resolved = 1
-              AND created_at < DATETIME('now', ?)
+              AND resolved_at IS NOT NULL
+              AND resolved_at < DATETIME('now', ?)
         """, (f"-{RETENTION_CUSTOM_ATS_DIAGNOSTIC} days",))
 
 def _cleanup_expired_ai_cache(c):
@@ -585,6 +587,20 @@ def init_db():
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
         ON coverage_stats(date)
+    """)
+
+    # Migration: add resolved_at column to custom_ats_diagnostics
+    try:
+        c.execute("ALTER TABLE custom_ats_diagnostics ADD COLUMN resolved_at TIMESTAMP")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+    # Backfill resolved_at for existing resolved rows (set to created_at)
+    c.execute("""
+        UPDATE custom_ats_diagnostics
+        SET resolved_at = created_at
+        WHERE resolved = 1 AND resolved_at IS NULL
     """)
     _cleanup_auto_close_applications(c) 
     _cleanup_closed_application_recruiters(c)

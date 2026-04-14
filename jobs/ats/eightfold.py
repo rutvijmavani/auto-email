@@ -113,42 +113,46 @@ def fetch_jobs(slug_info, company):
 
     # Step 1: GET /careers to obtain session cookie + CSRF token
     session    = _make_session()
-    csrf_token = _fetch_csrf_token(session, slug)
 
-    # Step 2: Paginate through all jobs
-    all_jobs = []
-    start    = 0
+    try:
+        csrf_token = _fetch_csrf_token(session, slug)
 
-    for page in range(MAX_PAGES):
-        positions, total = _fetch_page(
-            session, slug, domain, base_url, start, csrf_token
-        )
+        # Step 2: Paginate through all jobs
+        all_jobs = []
+        start    = 0
 
-        if positions is None:
-            # Hard error — stop
-            break
+        for page in range(MAX_PAGES):
+            positions, total = _fetch_page(
+                session, slug, domain, base_url, start, csrf_token
+            )
 
-        if not positions:
-            # Empty page = end of results
-            break
+            if positions is None:
+                # Hard error — stop
+                break
 
-        for pos in positions:
-            job = _normalize(pos, company, slug, base_url)
-            if job:
-                all_jobs.append(job)
+            if not positions:
+                # Empty page = end of results
+                break
 
-        start += len(positions)
+            for pos in positions:
+                job = _normalize(pos, company, slug, base_url)
+                if job:
+                    all_jobs.append(job)
 
-        logger.debug(
-            "eightfold: %s page %d — %d jobs fetched, %d total",
-            slug, page + 1, len(all_jobs), total,
-        )
+            start += len(positions)
 
-        if start >= total:
-            break
+            logger.debug(
+                "eightfold: %s page %d — %d jobs fetched, %d total",
+                slug, page + 1, len(all_jobs), total,
+            )
 
-    logger.info("eightfold: fetched %d jobs for %s", len(all_jobs), company)
-    return all_jobs
+            if start >= total:
+                break
+
+        logger.info("eightfold: fetched %d jobs for %s", len(all_jobs), company)
+        return all_jobs
+    finally:
+        session.close()
 
 
 # ─────────────────────────────────────────

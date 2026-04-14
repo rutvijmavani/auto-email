@@ -300,6 +300,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
     import random
     captured  = []
     captured_lock = asyncio.Lock()
+    pending_tasks = []
 
     print(f"\n{'='*70}")
     print(f"  Navigating to: {career_url}")
@@ -386,7 +387,12 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                     exc_info=True
                 )
 
-        page.on("response", on_response)
+        def _on_response_sync(response):
+            """Sync wrapper that schedules async handler as task."""
+            task = asyncio.create_task(on_response(response))
+            pending_tasks.append(task)
+
+        page.on("response", _on_response_sync)
 
         # ── Initial load ──────────────────────────────────
         try:
@@ -448,6 +454,10 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                 if len(captured) == prev_count:
                     print(f"  No new responses after scroll — end of content")
                     break
+
+        # Drain pending async tasks before closing browser
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         await browser.close()
 
