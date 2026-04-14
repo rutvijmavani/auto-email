@@ -765,14 +765,14 @@ def run():
                     # so we have a row to update
                     existing_check = conn.execute(
                         "SELECT id FROM prospective_companies "
-                        "WHERE company = ?", (company,)
+                        "WHERE company = ? COLLATE NOCASE", (company,)
                     ).fetchone()
 
                     if not existing_check:
                         conn.execute(
                             "INSERT OR IGNORE INTO prospective_companies "
                             "(company, domain, priority, status, created_at) "
-                            "VALUES (?, ?, 2, 'active', ?)",
+                            "VALUES (?, ?, 2, 'pending', ?)",
                             (company, domain, datetime.utcnow())
                         )
 
@@ -789,7 +789,7 @@ def run():
                         conn.execute(
                             f"UPDATE prospective_companies "
                             f"SET {', '.join(update_parts)} "
-                            f"WHERE company = ?",
+                            f"WHERE company = ? COLLATE NOCASE",
                             update_vals + [company]
                         )
                     conn.commit()
@@ -816,7 +816,7 @@ def run():
             try:
                 existing = conn.execute(
                     "SELECT id, status, ats_platform "
-                    "FROM prospective_companies WHERE company = ?",
+                    "FROM prospective_companies WHERE company = ? COLLATE NOCASE",
                     (company,)
                 ).fetchone()
 
@@ -824,6 +824,7 @@ def run():
                     # Update ATS if:
                     # - new detection found something
                     # - existing platform is null/unknown/custom
+                    # Never touch status — preserve whatever the company already has
                     needs_ats_update = (
                         ats_result and (
                             existing["ats_platform"] is None or
@@ -835,22 +836,20 @@ def run():
                     if needs_ats_update:
                         conn.execute(
                             "UPDATE prospective_companies "
-                            "SET status='active', "
-                            "ats_platform=?, ats_slug=?, "
+                            "SET ats_platform=?, ats_slug=?, "
                             "ats_detected_at=?, "
                             "domain = CASE WHEN domain IS NULL "
                             "  OR domain = '' THEN ? ELSE domain END "
-                            "WHERE company=?",
+                            "WHERE company=? COLLATE NOCASE",
                             (platform, slug, datetime.utcnow(),
                              domain, company)
                         )
                     else:
                         conn.execute(
                             "UPDATE prospective_companies "
-                            "SET status='active', "
-                            "domain = CASE WHEN domain IS NULL "
+                            "SET domain = CASE WHEN domain IS NULL "
                             "  OR domain = '' THEN ? ELSE domain END "
-                            "WHERE company=?",
+                            "WHERE company=? COLLATE NOCASE",
                             (domain, company)
                         )
                     conn.commit()
@@ -861,7 +860,7 @@ def run():
                         "INSERT INTO prospective_companies "
                         "(company, domain, ats_platform, ats_slug, "
                         "ats_detected_at, priority, status, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, 2, 'active', ?)",
+                        "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?)",
                         (
                             company, domain, platform, slug,
                             datetime.utcnow() if ats_result else None,

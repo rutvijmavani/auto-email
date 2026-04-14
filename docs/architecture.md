@@ -24,10 +24,17 @@ Recruiters found in advance so outreach begins immediately when you apply.
 
 **`--monitor-jobs`** — Job Monitoring
 Queries public ATS APIs (Greenhouse, Lever, Ashby, SmartRecruiters, Workday,
-Oracle HCM) to find newly posted jobs matching your profile. Uses a 4-phase
-ATS detection system (DB lookup → API probe → HTML redirect → Serper) to identify
-which platform each company uses. Slug database built monthly via AWS Athena
-queries against Common Crawl index (ats_discovery.db). Sends a daily digest email with ranked results. Also tracks URL presence per company — each day a tracked job URL is missing from the API response, its `consecutive_missing_days` counter increments.
+Oracle HCM, iCIMS, Avature, Phenom, TalentBrew, SuccessFactors, Jobvite,
+and fully custom career pages) to find newly posted jobs matching your profile.
+Companies are processed in parallel using `ThreadPoolExecutor(max_workers=20)`
+with per-ATS concurrency limits (`MONITOR_PLATFORM_CONCURRENCY`) to avoid
+rate-limiting shared API domains (e.g. Greenhouse capped at 5 concurrent).
+Uses a 4-phase ATS detection system (DB lookup → API probe → HTML redirect → Serper)
+to identify which platform each company uses. Slug database built monthly via
+AWS Athena queries against Common Crawl index (ats_discovery.db). Sends a daily
+digest email with ranked results. Also tracks URL presence per company — each day
+a tracked job URL is missing from the API response, its `consecutive_missing_days`
+counter increments.
 
 **`--verify-filled`** — Filled Position Cleanup
 Runs nightly after `--find-only` as part of the nightly chain. Picks up job postings that have been absent from the API for `VERIFY_FILLED_MISSING_DAYS` (3) or more consecutive days and verifies them via direct HTTP request:
@@ -149,6 +156,12 @@ verify_filled_stats table (daily run metrics)
 | `jobs/ats/workday.py` | Workday undocumented API (human-readable date parsing, pagination) |
 | `jobs/ats/oracle_hcm.py` | Oracle HCM API client (uses Id field, pagination fixed) |
 | `jobs/ats/icims.py` | iCIMS HTML scraping client |
+| `jobs/ats/avature.py` | Avature sitemap scraper |
+| `jobs/ats/phenom.py` | Phenom People career page scraper |
+| `jobs/ats/talentbrew.py` | Radancy/TalentBrew career page scraper |
+| `jobs/ats/successfactors.py` | SAP SuccessFactors career page scraper |
+| `jobs/ats/jobvite.py` | Jobvite API client |
+| `jobs/ats/custom_career.py` | Universal custom career page scraper — handles any company that doesn't fit a standard ATS (Amazon, Microsoft, Apple, Tesla, Meta, Wayfair, Siemens, etc.) via auto-detected session strategies (cookie_only, csrf_token, bearer_token, graphql, url_session) |
 | `jobs/job_filter.py` | Filter + score jobs, content hash generation (includes job_id) |
 | `jobs/job_monitor.py` | Daily job monitoring + digest email + URL presence tracking |
 | `jobs/fill_verifier.py` | Nightly filled position verification via HTTP |

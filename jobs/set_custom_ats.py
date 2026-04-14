@@ -339,7 +339,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
 
         # Create row if needed
         existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company = ?",
+            "SELECT id FROM prospective_companies WHERE company = ? COLLATE NOCASE",
             (company,)
         ).fetchone()
 
@@ -347,7 +347,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
             conn.execute(
                 "INSERT OR IGNORE INTO prospective_companies "
                 "(company, priority, status, created_at) "
-                "VALUES (?, 2, 'active', ?)",
+                "VALUES (?, 2, 'pending', ?)",
                 (company, datetime.utcnow())
             )
 
@@ -364,7 +364,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
         if parts:
             conn.execute(
                 f"UPDATE prospective_companies "
-                f"SET {', '.join(parts)} WHERE company = ?",
+                f"SET {', '.join(parts)} WHERE company = ? COLLATE NOCASE",
                 vals + [company]
             )
 
@@ -418,7 +418,7 @@ def _save_to_db(company, slug_info):
         conn = get_conn()
 
         existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company = ?",
+            "SELECT id FROM prospective_companies WHERE company = ? COLLATE NOCASE",
             (company,)
         ).fetchone()
 
@@ -426,13 +426,13 @@ def _save_to_db(company, slug_info):
         now       = datetime.utcnow()
 
         if existing:
+            # Never touch status — preserve whatever the company already has
             conn.execute("""
                 UPDATE prospective_companies
                 SET ats_platform    = 'custom',
                     ats_slug        = ?,
-                    ats_detected_at = ?,
-                    status          = 'active'
-                WHERE company = ?
+                    ats_detected_at = ?
+                WHERE company = ? COLLATE NOCASE
             """, (slug_json, now, company))
             print(f"  Updated existing company: {company}")
         else:
@@ -442,7 +442,7 @@ def _save_to_db(company, slug_info):
                 INSERT INTO prospective_companies
                   (company, domain, ats_platform, ats_slug,
                    ats_detected_at, priority, status, created_at)
-                VALUES (?, ?, 'custom', ?, ?, 2, 'active', ?)
+                VALUES (?, ?, 'custom', ?, ?, 2, 'pending', ?)
             """, (company, domain, slug_json, now, now))
             print(f"  Inserted new company: {company}")
 

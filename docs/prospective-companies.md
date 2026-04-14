@@ -195,6 +195,23 @@ mismatched email domains before saving.
               (rare for big tech)
 ```
 
+### Status preservation rules
+
+- **New companies** (added via `--import-prospects`, `--sync-prospective`, or
+  `--set-custom-ats`) always start at `'pending'`.
+- **Existing companies** — ATS detection updates (`--sync-prospective`,
+  `--set-custom-ats`) never change the current status. A company that
+  is already `'scraped'` or `'converted'` keeps that status even after
+  its ATS config is refreshed. Clobbering the status with `'active'`
+  would break downstream detection in `--find-only` and `--add`.
+
+### Case-insensitive matching
+
+All `WHERE company = ?` queries use `COLLATE NOCASE` so that
+`"Google"`, `"google"`, and `"GOOGLE"` all resolve to the same
+row. Without this, a name-case mismatch would silently insert a
+duplicate record instead of updating the existing one.
+
 ---
 
 ## Quota Distribution with Prospective
