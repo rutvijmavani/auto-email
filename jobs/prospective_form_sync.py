@@ -900,4 +900,4 @@ def run():
                 imported, skipped)
     print(f"\n{'='*55}")
     print(f"[OK] Imported: {imported} | Skipped: {skipped}")
-    logger.info("════ --sync-forms (prospective) finished ════")
+    logger.info("════ --sync-forms (prospective) finished ════") 
