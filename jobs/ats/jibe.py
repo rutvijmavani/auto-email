@@ -148,14 +148,21 @@ def _parse_date(date_str):
     if not date_str:
         return None
     try:
-        # Handle +0000 format (no colon in offset)
+        # Normalize trailing "Z" to "+00:00" for older Python versions
         normalized = date_str
-        if len(date_str) > 19 and date_str[-5] in ("+", "-") and ":" not in date_str[-5:]:
-            normalized = date_str[:-2] + ":" + date_str[-2:]
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        # Handle +0000 format (no colon in offset)
+        elif len(normalized) > 19 and normalized[-5] in ("+", "-") and ":" not in normalized[-5:]:
+            normalized = normalized[:-2] + ":" + normalized[-2:]
         return datetime.fromisoformat(normalized)
     except (ValueError, AttributeError):
         try:
-            return datetime.strptime(date_str[:19], "%Y-%m-%dT%H:%M:%S").replace(
+            # Fallback: use normalized value (not date_str[:19]) to preserve timezone
+            normalized_fallback = normalized
+            if normalized_fallback.endswith("Z"):
+                normalized_fallback = normalized_fallback[:-1] + "+00:00"
+            return datetime.strptime(normalized_fallback[:19], "%Y-%m-%dT%H:%M:%S").replace(
                 tzinfo=timezone.utc
             )
         except (ValueError, AttributeError):

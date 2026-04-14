@@ -219,7 +219,7 @@ def get_monitorable_companies():
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
-                   last_checked_at, consecutive_empty_days
+                   last_checked_at, consecutive_empty_days, domain
             FROM prospective_companies
             WHERE ats_platform IS NOT NULL
               AND ats_platform NOT IN ('unknown', 'unsupported')

@@ -384,12 +384,12 @@ def _flag_parse_failure(company, step_name, error_msg, raw_data):
     try:
         from db.custom_ats_diagnostics import (
             flag_diagnostic_once, BLOCKED, UNKNOWN_PATTERN,
-            STEP_STRUCTURE_DETECT, STEP_LISTING_FETCH
+            STEP_STRUCTURE_DETECT, STEP_LISTING_FETCH, STEP_DETAIL_FETCH
         )
 
         step_map = {
             "listing":   STEP_LISTING_FETCH,
-            "detail":    STEP_LISTING_FETCH,
+            "detail":    STEP_DETAIL_FETCH,
             "replay":    STEP_LISTING_FETCH,
             "structure": STEP_STRUCTURE_DETECT,
         }

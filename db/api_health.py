@@ -10,6 +10,9 @@
 
 from datetime import datetime, date, timedelta
 from db.connection import get_conn
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────
@@ -124,9 +127,6 @@ def _flush_batch(records):
     Write a batch of api_health records to SQLite.
     One connection, one commit for the whole batch.
     """
-    import logging
-    logger = logging.getLogger(__name__)
-
     conn = get_conn()
     try:
         for rec in records:

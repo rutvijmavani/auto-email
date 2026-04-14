@@ -92,8 +92,12 @@ def curl_to_slug_info(curl_string, career_page_url=None):
 
     # Detect GraphQL and extract stable config
     if _is_graphql(result):
-        result["graphql_config"] = _extract_graphql_config(result)
-        result["body"]           = _clean_graphql_body(result.get("body", ""))
+        graphql_config = _extract_graphql_config(result)
+        result["graphql_config"] = graphql_config
+        # Only clean/reformat body if it's form-encoded
+        # If is_json_body=True, preserve the JSON structure
+        if not graphql_config.get("is_json_body"):
+            result["body"] = _clean_graphql_body(result.get("body", ""))
 
     # Discard live cookies when career_page_url present —
     # fresh cookies acquired dynamically before every fetch.
@@ -166,7 +170,9 @@ def parse_detail_curl(curl_string, listing_slug_info):
     graphql_config = None
     if _is_graphql(parsed):
         graphql_config = _extract_graphql_config(parsed)
-        stored_body    = _clean_graphql_body(body)
+        # Only clean/reformat body if it's form-encoded
+        if not graphql_config.get("is_json_body"):
+            stored_body = _clean_graphql_body(body)
 
     detail = {
         "url_template": url_template,
@@ -376,10 +382,29 @@ def build_graphql_body(graphql_config, lsd, rev):
         lsd            -- CSRF token extracted from page HTML
         rev            -- build revision extracted from page JS
 
-    Returns form-encoded POST body string.
+    Returns form-encoded POST body string or JSON string based on is_json_body flag.
     """
     import time as _time
 
+    is_json_body = graphql_config.get("is_json_body", False)
+
+    if is_json_body:
+        # Build JSON body
+        body_data = {}
+        stable = graphql_config.get("stable_params", {})
+        body_data.update(stable)
+
+        # Add GraphQL-specific fields
+        if graphql_config.get("doc_id"):
+            body_data["doc_id"] = str(graphql_config["doc_id"])
+        if graphql_config.get("friendly_name"):
+            body_data["operationName"] = graphql_config["friendly_name"]
+        if graphql_config.get("variables"):
+            body_data["variables"] = graphql_config["variables"]
+
+        return json.dumps(body_data)
+
+    # Form-encoded body (Meta style)
     jazoest = compute_jazoest(lsd) if lsd else "22348"
 
     # Layer 1 — semi-stable params from curl (e.g. __dyn, __csr, __hs)

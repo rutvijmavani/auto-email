@@ -183,17 +183,13 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
     try:
         conn = get_conn()
 
-        # Atomic insert with conflict handling
+        # Atomic insert with conflict handling via INSERT OR IGNORE
+        # Relies on unique index on (company, step, pattern_hint, resolved)
         cursor = conn.execute("""
-            INSERT INTO custom_ats_diagnostics
-              (company, step, severity, pattern_hint, raw_response, notes)
-            SELECT ?, ?, ?, ?, ?, ?
-            WHERE NOT EXISTS (
-                SELECT 1 FROM custom_ats_diagnostics
-                WHERE company = ? AND step = ? AND pattern_hint = ? AND resolved = 0
-            )
-        """, (company, step, severity, pattern_hint, raw_str, notes,
-              company, step, pattern_hint))
+            INSERT OR IGNORE INTO custom_ats_diagnostics
+              (company, step, severity, pattern_hint, raw_response, notes, resolved)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+        """, (company, step, severity, pattern_hint, raw_str, notes))
 
         conn.commit()
         row_id = cursor.lastrowid if cursor.rowcount > 0 else None
@@ -310,18 +306,21 @@ def get_raw_curl_for_company(company):
 
 def resolve_diagnostic(diagnostic_id):
     """Mark a diagnostic row as resolved."""
+    conn = None
     try:
         conn = get_conn()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE custom_ats_diagnostics
             SET resolved = 1
             WHERE id = ?
         """, (diagnostic_id,))
         conn.commit()
-        conn.close()
-        return True
+        return cursor.rowcount > 0
     except Exception:
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def resolve_all_for_company(company):

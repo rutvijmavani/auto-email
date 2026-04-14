@@ -21,8 +21,9 @@ RPM_LIMITS = {
 def get_conn():
     """Returns a connection using current DB_FILE value (supports test overrides)."""
     import db.connection as _self
-    conn = sqlite3.connect(_self.DB_FILE)
+    conn = sqlite3.connect(_self.DB_FILE, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
     return conn

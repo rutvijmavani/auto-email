@@ -67,12 +67,12 @@ SCOPES = [
 COL_TIMESTAMP   = 0
 COL_COMPANY     = 1
 COL_JOB_URL     = 2
-COL_DOMAIN      = 3   # Domain
-COL_CAREER_PAGE = 4   # Career Page URL
+COL_CAREER_PAGE = 3   # Career Page URL
+COL_DOMAIN      = 4   # Domain
 COL_XML_URL     = 5   # XML/Sitemap URL
-COL_CURL        = 6   # Listing curl command
-COL_DETAIL_CURL = 7   # Detail curl command (optional)
-COL_NOTES       = 8   # Notes
+COL_NOTES       = 6   # Notes
+COL_CURL        = 7   # Listing curl command
+COL_DETAIL_CURL = 8   # Detail curl command (optional)
 
 # Hard ATS platforms — job URL gives no useful slug
 HARD_ATS = set()
@@ -475,9 +475,7 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     scan_url = career_page_url if _is_valid_url(career_page_url or "") else None
     if scan_url:
         result = _scan_career_page(company, scan_url)
-        if result and result.get("platform") not in {
-            "eightfold", "taleo", "successfactors"
-        }:
+        if result and result.get("platform"):
             logger.info("[sync] %r: ATS from career page — %s",
                         company, result["platform"])
             print(f"       [ATS via career page] {result['platform']} / "
@@ -503,9 +501,7 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     if domain:
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
-        if result and result.get("platform") not in {
-            "eightfold", "taleo", "successfactors"
-        }:
+        if result and result.get("platform"):
             logger.info("[sync] %r: ATS from domain — %s",
                         company, result["platform"])
             print(f"       [ATS via domain] {result['platform']} / "
@@ -607,10 +603,17 @@ def _scan_career_page(company, career_page_url):
 
     # Eightfold.ai — cdn.eightfold.ai or {slug}.eightfold.ai iframe
     if "eightfold.ai" in html:
-        # Try to extract slug from script/iframe src
-        m = re.search(r'([a-z0-9][a-z0-9\-]*)\.eightfold\.ai', html, re.IGNORECASE)
-        if m:
-            slug   = m.group(1).lower()
+        # Try to extract slug from script/iframe src, skipping "cdn"
+        matches = re.findall(r'([a-z0-9][a-z0-9\-]*)\.eightfold\.ai', html, re.IGNORECASE)
+        slug = None
+        for match in matches:
+            if match.lower() != "cdn":
+                slug = match.lower()
+                break
+        if not slug and matches:
+            # Fallback: use first match even if it's "cdn"
+            slug = matches[0].lower()
+        if slug:
             domain = _domain_from_url(career_page_url) or ""
             return {
                 "platform": "eightfold",
