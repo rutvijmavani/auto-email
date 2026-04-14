@@ -304,9 +304,21 @@ def get_run_429_rate(platform):
 
 def flush():
     """
-    Block until the write queue is fully drained.
-    Call before process exit to ensure no records are lost.
+    Block until all pending api_health writes are committed to SQLite.
+    Call once at process exit to ensure no records are lost.
+
+    Uses sentinel + thread join rather than q.join() because task_done()
+    is called immediately on dequeue (before _flush_batch), so q.join()
+    can return while the last batch is still being written.  Joining the
+    writer thread guarantees the DB commit has completed.
+
+    Safe to call only once — the writer thread exits after the sentinel
+    and is not restarted.  Any record_request() calls after flush() will
+    enqueue to the now-readerless queue (no crash, records silently lost),
+    but flush() is only ever called at the end of run().
     """
-    q = _write_queue
-    if q is not None:
-        q.join()   # blocks until all q.task_done() calls complete
+    if _write_queue is None:
+        return
+    _write_queue.put(None)          # sentinel → writer drains pending + exits
+    if _writer_thread is not None:
+        _writer_thread.join()       # wait for full thread exit (DB write done)
