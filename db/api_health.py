@@ -28,6 +28,7 @@ import threading
 _write_queue   = None
 _writer_thread = None
 _queue_lock    = threading.Lock()
+_writer_failed = threading.Event()  # Shared failure flag
 
 
 def _get_write_queue():
@@ -76,6 +77,7 @@ def _writer_loop(q):
                     pending = []
                 except Exception as e:
                     logger.error("Batch flush failed in Empty handler: %s", e, exc_info=True)
+                    _writer_failed.set()
                     # Leave pending intact; do not call task_done
             continue
 
@@ -88,6 +90,7 @@ def _writer_loop(q):
                         q.task_done()
                 except Exception as e:
                     logger.error("Batch flush failed on sentinel: %s", e, exc_info=True)
+                    _writer_failed.set()
                     # Leave pending intact; do not call task_done
             q.task_done()  # mark sentinel done after flush
             break
@@ -107,6 +110,7 @@ def _writer_loop(q):
                                 q.task_done()
                         except Exception as e:
                             logger.error("Batch flush failed on inner sentinel: %s", e, exc_info=True)
+                            _writer_failed.set()
                             # Leave pending intact; do not call task_done
                     q.task_done()  # mark sentinel done after flush
                     return
@@ -123,6 +127,7 @@ def _writer_loop(q):
                 pending = []
             except Exception as e:
                 logger.error("Batch flush failed in main loop: %s", e, exc_info=True)
+                _writer_failed.set()
                 # Leave pending intact; do not call task_done or clear
 
 
@@ -343,7 +348,47 @@ def flush():
     """
     Block until the write queue is fully drained.
     Call before process exit to ensure no records are lost.
+    Raises RuntimeError if writer thread reported a failure.
     """
     q = _write_queue
     if q is not None:
-        q.join()   # blocks until all q.task_done() calls complete
+        # Use timeout to avoid indefinite hang
+        try:
+            # Poll with timeout to detect failures
+            while not q.empty() or q.unfinished_tasks > 0:
+                if _writer_failed.is_set():
+                    raise RuntimeError(
+                        "api_health writer thread reported batch flush failure"
+                    )
+                # Wait briefly, then check again
+                try:
+                    q.join(timeout=1.0)
+                    break
+                except:
+                    # join() doesn't support timeout in Python < 3.9
+                    # fallback: busy-wait with sleep
+                    import time
+                    time.sleep(0.1)
+                    continue
+        except AttributeError:
+            # Python < 3.9: q.join() has no timeout parameter
+            # Use a timed loop instead
+            import time
+            timeout_s = 30
+            start = time.time()
+            while not q.empty() or (hasattr(q, 'unfinished_tasks') and q.unfinished_tasks > 0):
+                if _writer_failed.is_set():
+                    raise RuntimeError(
+                        "api_health writer thread reported batch flush failure"
+                    )
+                if time.time() - start > timeout_s:
+                    raise TimeoutError(
+                        f"flush() timed out after {timeout_s}s waiting for queue drain"
+                    )
+                time.sleep(0.1)
+
+        # Final check after queue drained
+        if _writer_failed.is_set():
+            raise RuntimeError(
+                "api_health writer thread reported batch flush failure"
+            )

@@ -445,6 +445,8 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
                     for k, path in data.items():
                         if k in (TOTAL_KEY, TEMPLATE_KEY) or path is None:
                             continue
+                        if not isinstance(path, str):
+                            continue
                         val = _walk_path(first_job_raw, path)
                         if val is not None:
                             validated[k] = path
@@ -460,18 +462,19 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
             # Validate total_field path exists in full_response
             total_field = None
             if full_response and data.get(TOTAL_KEY):
-                path  = data[TOTAL_KEY]
-                parts = path.lstrip(".").split(".")
-                obj   = full_response
-                valid = True
-                for part in parts:
-                    if isinstance(obj, dict) and part in obj:
-                        obj = obj[part]
-                    else:
-                        valid = False
-                        break
-                if valid:
-                    total_field = path
+                path = data[TOTAL_KEY]
+                if isinstance(path, str):
+                    parts = path.lstrip(".").split(".")
+                    obj   = full_response
+                    valid = True
+                    for part in parts:
+                        if isinstance(obj, dict) and part in obj:
+                            obj = obj[part]
+                        else:
+                            valid = False
+                            break
+                    if valid:
+                        total_field = path
 
             print(f"[INFO] AI detection for {company} using {FIELD_MAP_MODEL}: "
                 f"field_map={field_map} total_field={total_field!r} "

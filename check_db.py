@@ -62,11 +62,14 @@ def test_company(company_name):
             print("  python pipeline.py --diagnostics")
         return
 
-    raw = _fetch_page(session, slug_info, page=1, offset=0)
-    jobs_raw = _extract_jobs_array(raw, slug_info)
-    if jobs_raw:
-        print("\nRAW FIRST JOB KEYS:", list(jobs_raw[0].keys()))
-        print("RAW FIRST JOB:", json.dumps(jobs_raw[0], indent=2))
+    try:
+        raw = _fetch_page(session, slug_info, page=1, offset=0)
+        jobs_raw = _extract_jobs_array(raw, slug_info)
+        if jobs_raw:
+            print("\nRAW FIRST JOB KEYS:", list(jobs_raw[0].keys()))
+            print("RAW FIRST JOB:", json.dumps(jobs_raw[0], indent=2))
+    finally:
+        session.close()
 
     print(f"\n  Result: {len(jobs)} jobs fetched")
     if jobs:

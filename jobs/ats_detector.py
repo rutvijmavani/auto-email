@@ -252,7 +252,7 @@ def needs_redetection(company_row, redetect_days=JOB_MONITOR_REDETECT_DAYS):
     if slug:
         try:
             slug_data = json.loads(slug)
-            if slug_data.get("_manual"):
+            if isinstance(slug_data, dict) and slug_data.get("_manual"):
                 logger.debug(
                     "needs_redetection: %r → False (_manual flag)",
                     company
@@ -273,7 +273,7 @@ def needs_redetection(company_row, redetect_days=JOB_MONITOR_REDETECT_DAYS):
         if slug:
             try:
                 slug_data = json.loads(slug)
-                if slug_data.get("url"):
+                if isinstance(slug_data, dict) and slug_data.get("url"):
                     # Valid curl config present — monitorable, no re-detection
                     logger.debug(
                         "needs_redetection: %r → False "

@@ -259,6 +259,17 @@ def parse_date_value(val):
         val = val.strip()
         if not val:
             return None
+        # Check if string is a numeric timestamp (digit-only, possibly negative)
+        if re.match(r'^-?\d+$', val):
+            try:
+                ts_int = int(val)
+                # Reuse the integer timestamp handling logic
+                if UNIX_TS_MS_MIN <= ts_int <= UNIX_TS_MS_MAX:
+                    return datetime.fromtimestamp(ts_int / 1000, tz=timezone.utc)
+                if UNIX_TS_MIN <= ts_int < UNIX_TS_MS_MIN:
+                    return datetime.fromtimestamp(ts_int, tz=timezone.utc)
+            except (ValueError, OSError):
+                pass
         # ISO 8601
         try:
             dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
