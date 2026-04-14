@@ -93,6 +93,39 @@ MIN_RECRUITERS_PER_COMPANY    = 1    # minimum active recruiters to start outrea
                                       # pipeline tops up to MAX_CONTACTS_HARD_CAP over time
 GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 
+
+# ─────────────────────────────────────────
+# PARALLEL JOB MONITORING (Phase 1)
+# ─────────────────────────────────────────
+ 
+# Number of companies processed in parallel.
+# 20 workers = ~10x speedup for Workday-heavy portfolios.
+# Workday is safe at 20 because each company uses its own subdomain.
+# Reduce to 10 if you see increased 429s in api_health after enabling.
+MONITOR_MAX_WORKERS = 20
+ 
+# Max concurrent requests per ATS platform.
+# Platforms sharing one API domain (Greenhouse, SmartRecruiters)
+# are throttled more aggressively than per-subdomain platforms (Workday).
+MONITOR_PLATFORM_CONCURRENCY = {
+    "workday":         20,   # each company = own subdomain, safe to parallelize fully
+    "greenhouse":       5,   # all hit boards-api.greenhouse.io
+    "lever":            5,   # all hit api.lever.co
+    "smartrecruiters":  5,   # all hit api.smartrecruiters.com
+    "ashby":            8,   # all hit api.ashbyhq.com
+    "oracle_hcm":       8,   # per-tenant subdomain
+    "icims":            8,   # per-tenant subdomain
+    "talentbrew":       5,
+    "phenom":           5,
+    "jobvite":          5,
+    "successfactors":   3,   # slow avg (7161ms) — keep low
+    "avature":          3,
+    "custom":          10,   # varies per company
+    # default for unlisted: 10
+}
+MONITOR_PLATFORM_CONCURRENCY_DEFAULT = 10
+ 
+
 # ─────────────────────────────────────────
 # PIPELINE PERFORMANCE THRESHOLDS
 # ─────────────────────────────────────────
