@@ -5,13 +5,12 @@ Google Form fields (0-based column index):
   0: Timestamp
   1: Company Name
   2: Job URL
-  3: Career Page URL
-  4: Domain
+  3: Domain
+  4: Career Page URL
   5: XML/Sitemap URL
-  6: Notes
-  7: Listing Curl Command
-  8: Detail Curl Command   ← new optional column
-
+  6: Listing Curl Command
+  7: Detail Curl Command   ← new optional column
+  8: Notes
 Flow:
   1. Read rows from "Prospective" tab in Google Sheet
   2. Store raw curl strings verbatim in DB (before any parsing)
