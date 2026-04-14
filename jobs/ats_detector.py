@@ -63,6 +63,9 @@ ATS_REGISTRY = {
     "sitemap":         sitemap,
     "successfactors":  successfactors,
     "google":          google,
+    "taleo":           taleo,
+    "jibe":            jibe,
+    "eightfold":       eightfold,
     "apple":           sitemap,       # Apple uses sitemap-based scraping
     "custom":          custom_career, # Universal custom ATS engine
 }
