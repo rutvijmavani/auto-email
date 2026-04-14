@@ -188,6 +188,7 @@ def get_domain_for_prospective(company):
     """Return the domain root for a prospective company, or '' if not set.
     e.g. 'lucidmotors.com' → 'lucidmotors', 'snap.com' → 'snap'
     """
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute(

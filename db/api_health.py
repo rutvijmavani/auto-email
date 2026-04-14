@@ -8,8 +8,11 @@
 # with a Queue to avoid SQLite lock contention during parallel
 # --monitor-jobs runs. All query functions are unchanged.
 
+import logging
 from datetime import datetime, date, timedelta
 from db.connection import get_conn
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────
@@ -83,6 +86,7 @@ def _writer_loop(q):
             try:
                 item = q.get_nowait()
                 if item is None:
+                    q.task_done()
                     if pending:
                         _flush_batch(pending)
                     return
@@ -106,7 +110,9 @@ def _flush_batch(records):
         for rec in records:
             _write_one(conn, rec)
         conn.commit()
-    except Exception:
+    except Exception as e:
+        logger.error("api_health: batch write failed (%d records): %s",
+                     len(records), e, exc_info=True)
         try:
             conn.rollback()
         except Exception:

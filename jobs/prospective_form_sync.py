@@ -112,7 +112,7 @@ def _get_sheet():
         ws = sheet.add_worksheet(SHEET_NAME, rows=200, cols=9)
         ws.update("A1:I1", [[
             "Timestamp", "Company Name", "Job URL",
-            "Career Page URL", "Domain", "XML/Sitemap URL",
+            "Domain", "Career Page URL", "XML/Sitemap URL",
             "Notes", "Listing Curl", "Detail Curl",
         ]])
         logger.info("Created '%s' tab with 9 columns", SHEET_NAME)
@@ -473,9 +473,7 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     scan_url = career_page_url if _is_valid_url(career_page_url or "") else None
     if scan_url:
         result = _scan_career_page(company, scan_url)
-        if result and result.get("platform") not in {
-            "eightfold", "taleo", "successfactors"
-        }:
+        if result:
             logger.info("[sync] %r: ATS from career page — %s",
                         company, result["platform"])
             print(f"       [ATS via career page] {result['platform']} / "
@@ -597,35 +595,35 @@ def _scan_career_page(company, career_page_url):
             return {"platform": "avature", "slug": slug}
     
     # Jibe (iCIMS Jibe) — careers powered by app.jibecdn.com
-    if \"app.jibecdn.com\" in html or \"jibe-widget\" in html:
+    if "app.jibecdn.com" in html or "jibe-widget" in html:
         parsed = urlparse(career_page_url)
-        slug   = parsed.netloc.lower()   # e.g. \"careers.rivian.com\"
+        slug   = parsed.netloc.lower()   # e.g. "careers.rivian.com"
         if slug:
-            return {\"platform\": \"jibe\", \"slug\": slug}
- 
+            return {"platform": "jibe", "slug": slug}
+
     # Eightfold.ai — cdn.eightfold.ai or {slug}.eightfold.ai iframe
-    if \"eightfold.ai\" in html:
+    if "eightfold.ai" in html:
         # Try to extract slug from script/iframe src
-        m = re.search(r'([a-z0-9][a-z0-9\\-]*)\\.eightfold\\.ai', html, re.IGNORECASE)
+        m = re.search(r'([a-z0-9][a-z0-9\-]*)\.eightfold\.ai', html, re.IGNORECASE)
         if m:
             slug   = m.group(1).lower()
-            domain = _domain_from_url(career_page_url) or \"\"
+            domain = _domain_from_url(career_page_url) or ""
             return {
-                \"platform\": \"eightfold\",
-                \"slug\":     json.dumps({\"slug\": slug, \"domain\": domain}),
+                "platform": "eightfold",
+                "slug":     json.dumps({"slug": slug, "domain": domain}),
             }
- 
+
     # Taleo — taleo.net in script src or form action
-    if \".taleo.net\" in html:
-        m = re.search(r'([a-z0-9][a-z0-9\\-]*)\\.taleo\\.net', html, re.IGNORECASE)
+    if ".taleo.net" in html:
+        m = re.search(r'([a-z0-9][a-z0-9\-]*)\.taleo\.net', html, re.IGNORECASE)
         if m:
             company_slug = m.group(1).lower()
             return {
-                \"platform\": \"taleo\",
-                \"slug\":     json.dumps({
-                    \"company\":   company_slug,
-                    \"portal_id\": \"\",
-                    \"section\":   \"ex\",
+                "platform": "taleo",
+                "slug":     json.dumps({
+                    "company":   company_slug,
+                    "portal_id": "",
+                    "section":   "ex",
                 }),
             }
 

@@ -446,7 +446,7 @@ def _build_detect_section(stats):
     p1 = stats.get("priority1_new", 0) or 0
     p2 = stats.get("priority2_quiet", 0) or 0
     p3 = stats.get("priority3_unknown", 0) or 0
-    p4 = stats.get("priority4_custom", 0) or 0
+    p4 = stats.get("priority4_custom_nocurl", 0) or 0
     total = p1 + p2 + p3 + p4
 
     if total == 0:
