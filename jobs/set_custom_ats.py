@@ -347,11 +347,21 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
         ).fetchone()
 
         if not existing:
+            from urllib.parse import urlparse
+            # Extract domain from the curl URL for new companies
+            try:
+                from jobs.curl_parser import curl_to_slug_info
+                temp_slug = curl_to_slug_info(curl_string)
+                parsed = urlparse(temp_slug.get("url", ""))
+                domain = parsed.netloc or ""
+            except Exception:
+                domain = ""
+
             conn.execute(
                 "INSERT OR IGNORE INTO prospective_companies "
-                "(company, priority, status, created_at) "
-                "VALUES (?, 2, 'active', ?)",
-                (company, datetime.utcnow())
+                "(company, domain, priority, status, created_at) "
+                "VALUES (?, ?, 2, 'active', ?)",
+                (company, domain, datetime.utcnow())
             )
 
         # Store raw curls
@@ -433,19 +443,21 @@ def _save_to_db(company, slug_info):
         slug_json = json.dumps(slug_info)
         now       = datetime.utcnow()
 
+        from urllib.parse import urlparse
+        domain = urlparse(slug_info.get("url", "")).netloc or ""
+
         if existing:
             conn.execute("""
                 UPDATE prospective_companies
                 SET ats_platform    = 'custom',
                     ats_slug        = ?,
                     ats_detected_at = ?,
+                    domain          = ?,
                     status          = 'active'
                 WHERE company = ?
-            """, (slug_json, now, company))
+            """, (slug_json, now, domain, company))
             print(f"  Updated existing company: {company}")
         else:
-            from urllib.parse import urlparse
-            domain = urlparse(slug_info.get("url", "")).netloc or ""
             conn.execute("""
                 INSERT INTO prospective_companies
                   (company, domain, ats_platform, ats_slug,

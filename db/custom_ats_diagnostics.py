@@ -127,6 +127,7 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
 
     Returns True if an unresolved diagnostic exists.
     """
+    conn = None
     try:
         conn = get_conn()
         if step and pattern_hint:
@@ -148,10 +149,12 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
                 WHERE company = ? AND resolved = 0
                 LIMIT 1
             """, (company,)).fetchone()
-        conn.close()
         return row is not None
     except Exception:
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def flag_diagnostic_once(company, step, severity, pattern_hint=None,
@@ -179,6 +182,9 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
     if raw_str and len(raw_str) > max_len:
         raw_str = raw_str[:max_len] + f"\n... [truncated at {max_len} chars]"
 
+    # Normalize pattern_hint: convert None/empty to "" so NULLs don't bypass the index
+    normalized_hint = pattern_hint if pattern_hint else ""
+
     conn = None
     try:
         conn = get_conn()
@@ -189,7 +195,7 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
             INSERT OR IGNORE INTO custom_ats_diagnostics
               (company, step, severity, pattern_hint, raw_response, notes, resolved)
             VALUES (?, ?, ?, ?, ?, ?, 0)
-        """, (company, step, severity, pattern_hint, raw_str, notes))
+        """, (company, step, severity, normalized_hint, raw_str, notes))
 
         conn.commit()
         row_id = cursor.lastrowid if cursor.rowcount > 0 else None
@@ -220,6 +226,7 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
         severity -- filter by severity (None = all)
         limit    -- max rows to return
     """
+    conn = None
     try:
         conn = get_conn()
         conditions = ["resolved = 0"]
@@ -248,16 +255,19 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
                 created_at DESC
             LIMIT ?
         """, params + [limit]).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_diagnostic_summary():
     """
     Return counts grouped by severity for --diagnostics display.
     """
+    conn = None
     try:
         conn = get_conn()
         rows = conn.execute("""
@@ -276,10 +286,12 @@ def get_diagnostic_summary():
                     ELSE 4
                 END
         """).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_raw_curl_for_company(company):
@@ -287,6 +299,7 @@ def get_raw_curl_for_company(company):
     Return stored raw curl strings for a company.
     Used by --diagnostics to show replay instructions.
     """
+    conn = None
     try:
         conn = get_conn()
         row  = conn.execute("""
@@ -294,10 +307,12 @@ def get_raw_curl_for_company(company):
             FROM prospective_companies
             WHERE company = ?
         """, (company,)).fetchone()
-        conn.close()
         return dict(row) if row else {}
     except Exception:
         return {}
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────
@@ -325,6 +340,7 @@ def resolve_diagnostic(diagnostic_id):
 
 def resolve_all_for_company(company):
     """Mark all open diagnostics for a company as resolved."""
+    conn = None
     try:
         conn = get_conn()
         conn.execute("""
@@ -334,7 +350,9 @@ def resolve_all_for_company(company):
         """, (company,))
         conn.commit()
         count = conn.execute("SELECT changes()").fetchone()[0]
-        conn.close()
         return count
     except Exception:
         return 0
+    finally:
+        if conn:
+            conn.close()

@@ -243,9 +243,9 @@ def parse_date_value(val):
     # Unix timestamp (int)
     if isinstance(val, int):
         try:
-            if val > UNIX_TS_MS_MIN:
+            if UNIX_TS_MS_MIN < val <= UNIX_TS_MS_MAX:
                 return datetime.fromtimestamp(val / 1000, tz=timezone.utc)
-            if val > UNIX_TS_MIN:
+            if UNIX_TS_MIN <= val < UNIX_TS_MS_MIN:
                 return datetime.fromtimestamp(val, tz=timezone.utc)
         except (ValueError, OSError):
             pass
@@ -306,9 +306,10 @@ def extract_url_from_value(val, base_url=""):
     val = val.strip()
     if val.startswith("http"):
         return val
-    if val.startswith("/") and base_url:
-        parsed = urlparse(base_url)
-        return f"{parsed.scheme}://{parsed.netloc}{val}"
+    # Handle relative paths (leading slash or non-absolute paths)
+    if base_url and val:
+        from urllib.parse import urljoin
+        return urljoin(base_url, val)
     return val
 
 

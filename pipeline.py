@@ -1068,10 +1068,22 @@ def main():
     
     if "--set-custom-ats" in args:
         from jobs.set_custom_ats import run as run_set_custom_ats
-        non_flag_args = [a for a in args if not a.startswith("--")]
-        company       = non_flag_args[0] if non_flag_args else None
         curl_idx      = args.index("--curl") if "--curl" in args else None
         detail_idx    = args.index("--detail-curl") if "--detail-curl" in args else None
+
+        # Determine positions of flag values to exclude from non_flag_args
+        excluded_positions = set()
+        if curl_idx is not None and curl_idx + 1 < len(args):
+            excluded_positions.add(curl_idx + 1)
+        if detail_idx is not None and detail_idx + 1 < len(args):
+            excluded_positions.add(detail_idx + 1)
+
+        # Pick company as the first non-flag arg that's not a flag value
+        non_flag_args = [
+            args[i] for i in range(len(args))
+            if not args[i].startswith("--") and i not in excluded_positions
+        ]
+        company       = non_flag_args[0] if non_flag_args else None
         curl_string   = args[curl_idx + 1] if curl_idx is not None and curl_idx + 1 < len(args) else None
         detail_curl   = args[detail_idx + 1] if detail_idx is not None and detail_idx + 1 < len(args) else None
         if not company or not curl_string:

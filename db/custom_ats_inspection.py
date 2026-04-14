@@ -137,16 +137,19 @@ def get_inspection(company):
     Return inspection row for a company.
     Returns dict or None if not found.
     """
+    conn = None
     try:
         conn = get_conn()
         row  = conn.execute("""
             SELECT * FROM custom_ats_inspection
             WHERE company = ?
         """, (company,)).fetchone()
-        conn.close()
         return dict(row) if row else None
     except Exception:
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_field_map_override(company):
@@ -155,6 +158,7 @@ def get_field_map_override(company):
     Returns parsed dict or None.
     Called by custom_career.py before using auto-detected field_map.
     """
+    conn = None
     try:
         conn = get_conn()
         row  = conn.execute("""
@@ -162,12 +166,14 @@ def get_field_map_override(company):
             FROM custom_ats_inspection
             WHERE company = ?
         """, (company,)).fetchone()
-        conn.close()
         if not row or not row["field_map_override"]:
             return None
         return json.loads(row["field_map_override"])
     except Exception:
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_all_inspections():
@@ -175,6 +181,7 @@ def get_all_inspections():
     Return all inspection rows ordered by last_updated DESC.
     Used by --diagnostics / --monitor-status for overview.
     """
+    conn = None
     try:
         conn = get_conn()
         rows = conn.execute("""
@@ -185,10 +192,12 @@ def get_all_inspections():
             FROM custom_ats_inspection
             ORDER BY last_updated DESC
         """).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────
@@ -210,6 +219,7 @@ def set_field_map_override(company, field_map):
 
     Returns True on success, False on failure.
     """
+    conn = None
     try:
         conn = get_conn()
         conn.execute("""
@@ -219,7 +229,6 @@ def set_field_map_override(company, field_map):
         """, (json.dumps(field_map), company))
         conn.commit()
         affected = conn.execute("SELECT changes()").fetchone()[0]
-        conn.close()
         if affected == 0:
             import logging
             logging.getLogger(__name__).warning(
@@ -236,6 +245,9 @@ def set_field_map_override(company, field_map):
             company, e
         )
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def clear_field_map_override(company):
@@ -243,6 +255,7 @@ def clear_field_map_override(company):
     Clear manual field_map override — revert to auto-detected.
     Returns True on success.
     """
+    conn = None
     try:
         conn = get_conn()
         conn.execute("""
@@ -251,7 +264,9 @@ def clear_field_map_override(company):
             WHERE company = ?
         """, (company,))
         conn.commit()
-        conn.close()
         return True
     except Exception:
         return False
+    finally:
+        if conn:
+            conn.close()

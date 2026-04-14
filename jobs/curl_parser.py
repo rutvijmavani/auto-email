@@ -503,6 +503,7 @@ def _detect_job_id_in_url(url, params, body=None):
 
     # Check POST body for id field
     if body:
+        # Try JSON first
         try:
             data = json.loads(body)
             if isinstance(data, dict):
@@ -513,6 +514,19 @@ def _detect_job_id_in_url(url, params, body=None):
                         return str(v), "body_field", "body"
         except (json.JSONDecodeError, TypeError):
             pass
+
+        # Try form-encoded body
+        if '=' in body and ('&' in body or '=' in body):
+            try:
+                from urllib.parse import parse_qsl
+                fields = dict(parse_qsl(body, keep_blank_values=True))
+                for k, v in fields.items():
+                    norm = k.lower().replace("_", "").replace("-", "")
+                    if norm in {p.replace("_", "").replace("-", "")
+                                for p in KNOWN_ID_PARAMS}:
+                        return str(v), "body_field", "body"
+            except Exception:
+                pass
 
     return None, None, None
 
@@ -572,37 +586,39 @@ def _extract_graphql_config(parsed):
                 k, _, v = part.partition("=")
                 fields[unquote_plus(k)] = unquote_plus(v)
 
-        if "doc_id" in fields:
-            config["doc_id"] = fields["doc_id"]
-        if "fb_api_req_friendly_name" in fields:
-            config["friendly_name"] = fields["fb_api_req_friendly_name"]
-        if "variables" in fields:
-            try:
-                config["variables"] = json.loads(fields["variables"])
-            except (json.JSONDecodeError, TypeError):
-                config["variables"] = fields["variables"]
+        # Only proceed if we found form fields
+        if fields:
+            if "doc_id" in fields:
+                config["doc_id"] = fields["doc_id"]
+            if "fb_api_req_friendly_name" in fields:
+                config["friendly_name"] = fields["fb_api_req_friendly_name"]
+            if "variables" in fields:
+                try:
+                    config["variables"] = json.loads(fields["variables"])
+                except (json.JSONDecodeError, TypeError):
+                    config["variables"] = fields["variables"]
 
-        # Always-excluded: rotating tokens rebuilt fresh every run
-        ALWAYS_EXCLUDE = {
-            "lsd", "jazoest", "av", "__user", "__a",
-            "server_timestamps", "fb_api_caller_class",
-            "fb_api_req_friendly_name", "variables", "doc_id",
-            "__spin_r", "__spin_b", "__spin_t",
-        }
+            # Always-excluded: rotating tokens rebuilt fresh every run
+            ALWAYS_EXCLUDE = {
+                "lsd", "jazoest", "av", "__user", "__a",
+                "server_timestamps", "fb_api_caller_class",
+                "fb_api_req_friendly_name", "variables", "doc_id",
+                "__spin_r", "__spin_b", "__spin_t",
+            }
 
-        stable = {}
-        for k, v in fields.items():
-            if k in ALWAYS_EXCLUDE:
-                continue
-            if k in GRAPHQL_NOISE_PARAMS:
-                continue
-            # Store semi-stable __ params (e.g. __dyn, __csr, __hs)
-            # and all regular params — these come from curl and are
-            # refreshed when the user re-captures curl
-            stable[k] = v
+            stable = {}
+            for k, v in fields.items():
+                if k in ALWAYS_EXCLUDE:
+                    continue
+                if k in GRAPHQL_NOISE_PARAMS:
+                    continue
+                # Store semi-stable __ params (e.g. __dyn, __csr, __hs)
+                # and all regular params — these come from curl and are
+                # refreshed when the user re-captures curl
+                stable[k] = v
 
-        config["stable_params"] = stable
-        return config
+            config["stable_params"] = stable
+            return config
     except Exception:
         pass
 
@@ -795,7 +811,7 @@ def _parse_header(s, headers):
     if ':' in s:
         name, _, value = s.partition(':')
         key = name.strip().lower()
-        if not key.startswith(':'):
+        if not key.startswith(':') and key not in SKIP_HEADERS:
             headers[key] = value.strip()
 
 

@@ -154,7 +154,7 @@ def fetch_jobs(slug_info, company):
             contest_no = job.get("contestNo", "")
             job_id     = str(job.get("jobId", "") or contest_no)
 
-            if not title or not job_id:
+            if not title or not job_id or not contest_no:
                 continue
 
             loc_idx   = col_map.get("location", 4)

@@ -177,7 +177,7 @@ def _make_patterns():
             re.IGNORECASE
         ),
     "icims",
-    lambda m: m.group(1).lower(),
+    lambda m: m.group(1).lower().removeprefix("careers-"),
     ))
     
     # Jobvite — jobs.jobvite.com/{slug}/job/{id}

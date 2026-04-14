@@ -376,8 +376,15 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                     print(f"  {indicator} [{response.request.method}] "
                           f"{url[:75]}  →  {len(arr)} items  (score={score})")
 
-            except Exception:
-                pass
+            except Exception as e:
+                # Log parse/processing failures with context
+                import logging
+                logging.getLogger("diagnose_career").error(
+                    "Failed to process response from %s: %s",
+                    getattr(response, 'url', 'unknown'),
+                    e,
+                    exc_info=True
+                )
 
         page.on("response", on_response)
 
