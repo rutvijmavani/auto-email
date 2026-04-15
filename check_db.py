@@ -7,7 +7,7 @@ def test_company(company_name):
     conn = get_conn()
     row = conn.execute(
         "SELECT ats_platform, ats_slug FROM prospective_companies "
-        "WHERE company = ?", (company_name,)
+        "WHERE company = ?  COLLATE NOCASE", (company_name,)
     ).fetchone()
     conn.close()
 
@@ -57,8 +57,12 @@ def test_company(company_name):
         raw = _fetch_page(session, slug_info, page=1, offset=0)
         jobs_raw = _extract_jobs_array(raw, slug_info)
         if jobs_raw:
-            print("\nRAW FIRST JOB KEYS:", list(jobs_raw[0].keys()))
-            print("RAW FIRST JOB:", json.dumps(jobs_raw[0], indent=2))
+            first_raw = jobs_raw[0]
+            if isinstance(first_raw, dict):
+                print("\nRAW FIRST JOB KEYS:", list(first_raw.keys()))
+            else:
+                print(f"\nRAW FIRST JOB TYPE: {type(first_raw).__name__}")
+            print("RAW FIRST JOB:", json.dumps(first_raw, indent=2, default=str))
 
         print(f"\n  Result: {len(jobs)} jobs fetched")
         if jobs:
