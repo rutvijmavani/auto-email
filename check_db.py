@@ -1,4 +1,4 @@
-# test_custom_ats.py
+# check_db.py — Custom ATS test harness
 import json
 from db.connection import get_conn
 from jobs.ats.custom_career import fetch_jobs
