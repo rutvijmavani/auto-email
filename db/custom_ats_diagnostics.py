@@ -96,17 +96,16 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
     if raw_str and len(raw_str) > max_len:
         raw_str = raw_str[:max_len] + f"\n... [truncated at {max_len} chars]"
 
+    conn = None 
     try:
         conn = get_conn()
         cursor = conn.execute("""
-            INSERT INTO custom_ats_diagnostics
+            INSERT OR IGNORE INTO custom_ats_diagnostics
               (company, step, severity, pattern_hint, raw_response, notes)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (company, step, severity, pattern_hint, raw_str, notes))
         conn.commit()
-        row_id = cursor.lastrowid
-        conn.close()
-        return row_id
+        return cursor.lastrowid
     except Exception as e:
         # Never let diagnostics crash the main pipeline
         import logging
@@ -115,6 +114,9 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
             company, e
         )
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
 def has_open_diagnostic(company, step=None, pattern_hint=None):
@@ -161,10 +163,12 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
     company+step+pattern_hint combination.
     Prevents flooding the table on repeated daily runs.
 
-    Returns row_id if written, None if already exists or failed.
+    Race-safe: flag_diagnostic uses INSERT OR IGNORE backed by a partial
+    unique index on (company, step, COALESCE(pattern_hint, '')) WHERE resolved=0,
+    so concurrent calls cannot produce duplicate rows.
+
+    Returns row_id if a new row was written, None if already exists or failed.
     """
-    if has_open_diagnostic(company, step, pattern_hint):
-        return None
     return flag_diagnostic(
         company, step, severity, pattern_hint, raw_response, notes
     )
@@ -287,7 +291,7 @@ def resolve_diagnostic(diagnostic_id):
             WHERE id = ?
         """, (diagnostic_id,))
         conn.commit()
-        return True
+        return conn.execute("SELECT changes()").fetchone()[0] > 0
     except Exception:
         return False
     finally:

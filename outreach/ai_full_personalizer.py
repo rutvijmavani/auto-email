@@ -261,10 +261,11 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
     Both results come from a single AI call — one quota hit.
 
     Returns:
-        (field_map, total_field, ai_available)
+        (field_map, total_field, job_url_template, ai_available)
 
         field_map:     dict like {"title": "jobTitle", ...} or None
         total_field:   dot-separated path like "data.totalResults" or None
+        job_url_template: URL template with {job_id} placeholder or None
         ai_available:  True if the AI call was attempted and completed
                        (even if it returned nulls for some fields).
                        False if quota exhausted, client unavailable, or

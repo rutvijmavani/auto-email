@@ -105,9 +105,14 @@ def fetch_jobs(slug_info, company):
     slug   = slug_info.get("slug", "")
     domain = slug_info.get("domain", "")
 
-    if not slug or not domain:
-        logger.error("eightfold: missing slug or domain for %s", company)
+    if not slug:
+        logger.error("eightfold: missing slug for %s", company)
         return []
+    if not domain:
+        logger.warning(
+            "eightfold: no domain for %s — fetching without domain filter",
+            company,
+        )
 
     base_url = f"https://{slug}.eightfold.ai"
 
@@ -413,7 +418,7 @@ def _extract_location(std_locs, raw_locs, work_option):
     if work_option == "remote":
         return "Remote"
 
-    return raw_locs[0] if raw_locs else ""
+    return ""
 
 
 def _extract_description(soup):

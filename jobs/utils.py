@@ -176,7 +176,11 @@ def parse_salary_text(text):
     # Handle 'k' suffix: 120k → 120000
     raw_nums = re.findall(r"(\d+(?:\.\d+)?)\s*[kK]\b", text)
     k_nums = [str(int(float(n) * 1000)) for n in raw_nums]
-    nums = k_nums if k_nums else nums
+    # Merge both lists — k-suffix and regular numbers
+    if k_nums:
+        nums = list(set(nums + k_nums))
+        # Sort numerically to get proper min/max
+        nums.sort(key=lambda x: int(x))
 
     if len(nums) >= 2:
         return nums[0], nums[1]

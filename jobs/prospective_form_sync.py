@@ -113,7 +113,7 @@ def _get_sheet():
         ws.update("A1:I1", [[
             "Timestamp", "Company Name", "Job URL",
             "Domain", "Career Page URL", "XML/Sitemap URL",
-            "Notes", "Listing Curl", "Detail Curl",
+            "Listing Curl", "Detail Curl", "Notes",
         ]])
         logger.info("Created '%s' tab with 9 columns", SHEET_NAME)
         print(f"[OK] Created '{SHEET_NAME}' tab in Google Sheet")
@@ -314,7 +314,13 @@ def _replay_request(slug_info, company):
                 "[sync] %r: career page warm failed — "
                 "falling back to stored cookies", company
             )
-            session = _build_legacy_session(slug_info)
+            # Restore fallback cookies (preserved by curl_to_slug_info from
+            # the original curl) so _build_legacy_session has credentials
+            # even though dynamic refresh failed.
+            fallback_info = slug_info
+            if slug_info.get("_fallback_cookies") and not slug_info.get("cookies"):
+                fallback_info = {**slug_info, "cookies": slug_info["_fallback_cookies"]}
+            session = _build_legacy_session(fallback_info)
     else:
         session = _build_legacy_session(slug_info)
 

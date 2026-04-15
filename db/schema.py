@@ -358,6 +358,16 @@ def init_db():
         ON custom_ats_diagnostics(company, resolved)
     """)
 
+    # Partial unique index to prevent duplicate open diagnostics at DB level.
+    # Enforces that (company, step, pattern_hint) is unique among unresolved rows,
+    # eliminating the TOCTOU race between has_open_diagnostic() and flag_diagnostic().
+    # COALESCE maps NULL pattern_hint to '' so NULLs compare equal in the index.
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_diag_unique_open
+        ON custom_ats_diagnostics(company, step, COALESCE(pattern_hint, ''))
+        WHERE resolved = 0
+    """)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS job_postings (
             id                       INTEGER PRIMARY KEY AUTOINCREMENT,

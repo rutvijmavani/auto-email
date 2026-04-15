@@ -326,10 +326,13 @@ def flush():
     global _write_queue, _writer_thread
     if _write_queue is None:
         return
-    q = _write_queue
-    t = _writer_thread
-    _write_queue   = None           # null out before join so record_request()
-    _writer_thread = None           # callers see None immediately
-    q.put(None)                     # sentinel → writer drains pending + exits
+    with _queue_lock:
+        q = _write_queue
+        t = _writer_thread
+        if q is None:
+            return
+        q.put(None)                 # sentinel → writer drains pending + exits
+        _write_queue   = None
+        _writer_thread = None
     if t is not None:
         t.join()                    # wait for full thread exit (DB write done)

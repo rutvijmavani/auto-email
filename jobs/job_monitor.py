@@ -409,7 +409,10 @@ def _process_company(company_row, position, total):
 
     # ── Save new jobs ─────────────────────────────────────
     new_count = 0
-    slug_info_cached = slug_info if platform == "custom" else None
+    slug_info_cached = None 
+
+    if platform == "custom":
+        slug_info_cached = slug_info
 
     for job in matched:
         exists, is_filled = job_url_exists(job["job_url"])

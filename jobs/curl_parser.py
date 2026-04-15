@@ -95,10 +95,12 @@ def curl_to_slug_info(curl_string, career_page_url=None):
         result["graphql_config"] = _extract_graphql_config(result)
         result["body"]           = _clean_graphql_body(result.get("body", ""))
 
-    # Discard live cookies when career_page_url present —
-    # fresh cookies acquired dynamically before every fetch.
-    # Keep cookies only as fallback when no career_page_url.
+    # When career_page_url is present, fresh cookies are acquired dynamically
+    # before every fetch, so live curl cookies are normally discarded.
+    # Preserve them under _fallback_cookies so _build_legacy_session can use
+    # them if the dynamic session warm-up fails (e.g. career page timeout).
     if career_page_url and result.get("cookies"):
+        result["_fallback_cookies"] = result["cookies"]
         result["cookies"] = {}
 
     return result

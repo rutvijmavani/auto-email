@@ -518,8 +518,8 @@ def analyse_and_print(captured):
         print(f"\n  {'FIELD':<35} {'TYPES':<30} SAMPLE VALUE")
         print(f"  {'─'*35} {'─'*30} {'─'*35}")
 
-        def field_sort_key(k):
-            types = set(fields_info[k])
+        def field_sort_key(k , _fields_info=fields_info):
+            types = set(_fields_info[k])
             if any(t in types for t in ("title_hint", "url", "url_hint",
                                          "date_hint", "date_ms", "date_s",
                                          "id_hint", "location_hint",
