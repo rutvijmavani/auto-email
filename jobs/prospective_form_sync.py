@@ -820,21 +820,25 @@ def run():
             # Write to DB
             try:
                 existing = conn.execute(
-                    "SELECT id, status, ats_platform "
+                    "SELECT id, status, ats_platform, ats_slug "
                     "FROM prospective_companies WHERE company = ? COLLATE NOCASE",
                     (company,)
                 ).fetchone()
 
                 if existing:
                     # Update ATS if:
-                    # - new detection found something
-                    # - existing platform is null/unknown/custom
+                    # - new detection found something AND EITHER:
+                    #   a) existing platform is null/unknown/custom, OR
+                    #   b) the new (platform, slug) pair differs from stored
+                    #      values (e.g. company migrated ATS provider or slug
+                    #      was corrected by re-submitting a curl)
                     # Never touch status — preserve whatever the company already has
                     needs_ats_update = (
                         ats_result and (
                             existing["ats_platform"] is None or
-                            existing["ats_platform"] in
-                            ("unknown", "custom")
+                            existing["ats_platform"] in ("unknown", "custom") or
+                            platform != existing["ats_platform"] or
+                            slug != existing["ats_slug"]
                         )
                     )
 

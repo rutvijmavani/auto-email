@@ -335,6 +335,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
     Store raw curl strings in DB before any parsing.
     Creates the company row if it doesn't exist yet.
     """
+    conn = None
     try:
         from db.connection import get_conn
         from db.custom_ats_diagnostics import init_diagnostics_table
@@ -374,9 +375,11 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
             )
 
         conn.commit()
-        conn.close()
     except Exception as e:
         logger.warning("could not store raw curls for %r: %s", company, e)
+    finally:
+        if conn:
+            conn.close()
 
 
 def _flag_parse_failure(company, step_name, error_msg, raw_data):
@@ -418,6 +421,7 @@ def _flag_parse_failure(company, step_name, error_msg, raw_data):
 
 def _save_to_db(company, slug_info):
     """Upsert prospective_companies with custom ATS config."""
+    conn = None
     try:
         from db.connection import get_conn
         conn = get_conn()
@@ -452,7 +456,6 @@ def _save_to_db(company, slug_info):
             print(f"  Inserted new company: {company}")
 
         conn.commit()
-        conn.close()
         return True
 
     except Exception as e:
@@ -460,3 +463,6 @@ def _save_to_db(company, slug_info):
         logger.error("DB write failed for %r: %s", company, e,
                      exc_info=True)
         return False
+    finally:
+        if conn:
+            conn.close()

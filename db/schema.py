@@ -514,7 +514,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS custom_ats_inspection (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-            company              TEXT NOT NULL UNIQUE,
+            company              TEXT NOT NULL UNIQUE COLLATE NOCASE,
             listing_url          TEXT,
             format               TEXT,
             array_path           TEXT,

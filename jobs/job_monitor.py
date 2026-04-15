@@ -248,7 +248,8 @@ def run():
         from db.api_health import flush as flush_api_health
         flush_api_health()
     except Exception:
-        logger.debug("flush_api_health failed", exc_info=True)
+        logger.error("flush_api_health failed — some health records may be lost",
+                     exc_info=True)
 
     logger.info("════ --monitor-jobs finished ════")
     return final_stats

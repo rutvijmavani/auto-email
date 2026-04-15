@@ -1025,7 +1025,10 @@ def main():
     if "--resolve-diagnostic" in args:
         from jobs.job_monitor import run_resolve_diagnostic
         non_flag_args = [a for a in args if not a.startswith("--")]
-        diagnostic_id = non_flag_args[0] if non_flag_args else None
+        if not non_flag_args:
+            print('[ERROR] Usage: --resolve-diagnostic <id> [CompanyName]')
+            return
+        diagnostic_id = non_flag_args[0]
         company       = non_flag_args[1] if len(non_flag_args) > 1 else None
         run_resolve_diagnostic(diagnostic_id=diagnostic_id, company=company)
         return

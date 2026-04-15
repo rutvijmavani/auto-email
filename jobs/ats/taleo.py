@@ -418,12 +418,12 @@ def _parse_ajax_response(raw):
 
         for i, field in enumerate(all_fields):
             # Salary pattern: "140,000.00" or "22.00"
-            if re.match(r'^[\d,]+\.\d{2}$', field) and i + 3 < len(all_fields):
-                result["salary_max"]    = all_fields[i + 2] if i+2 < len(all_fields) else field
-                result["salary_min"]    = all_fields[i + 1] if i+1 < len(all_fields) else ""
-                result["salary_type"]   = all_fields[i + 3] if i+3 < len(all_fields) else ""
-                result["contact"]       = all_fields[i + 4] if i+4 < len(all_fields) else ""
-                result["contact_phone"] = all_fields[i + 5] if i+5 < len(all_fields) else ""
+            if re.match(r'^[\d,]+\.\d{2}$', field):
+                result["salary_min"]    = all_fields[i + 1] if i + 1 < len(all_fields) else ""
+                result["salary_max"]    = all_fields[i + 2] if i + 2 < len(all_fields) else field
+                result["salary_type"]   = all_fields[i + 3] if i + 3 < len(all_fields) else ""
+                result["contact"]       = all_fields[i + 4] if i + 4 < len(all_fields) else ""
+                result["contact_phone"] = all_fields[i + 5] if i + 5 < len(all_fields) else ""
                 break
             # Full location: "United States-Massachusetts-Boston"
             if field.startswith("United States-") and not result["full_location"]:

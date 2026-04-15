@@ -249,6 +249,8 @@ def parse_date_value(val):
         val = val.strip()
         if not val:
             return None
+        if re.fullmatch(r"\d{10,13}", val):
+            return parse_date_value(int(val))
         # ISO 8601
         try:
             dt = datetime.fromisoformat(val.replace("Z", "+00:00"))

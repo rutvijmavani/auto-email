@@ -24,10 +24,12 @@ logger = logging.getLogger(__name__)
 
 import queue
 import threading
+import atexit
 
 _write_queue   = None
 _writer_thread = None
 _queue_lock    = threading.Lock()
+_writer_error  = None   # stores first unhandled exception from _writer_loop
 
 
 def _get_write_queue():
@@ -41,13 +43,18 @@ def _get_write_queue():
     with _queue_lock:
         if _write_queue is None:
             _write_queue = queue.Queue()
-            _writer_thread = threading.Thread(
+            t = threading.Thread(
                 target=_writer_loop,
                 args=(_write_queue,),
-                daemon=True,   # exits when main thread exits
+                daemon=False,   # non-daemon: process waits for final flush
                 name="api_health_writer",
             )
-            _writer_thread.start()
+            _writer_thread = t
+            t.start()
+            # Register flush() for normal process exit so records are not
+            # lost when run() is interrupted before its explicit flush call.
+            # flush() is idempotent — safe to call multiple times.
+            atexit.register(flush)
     return _write_queue
 
 
@@ -56,48 +63,55 @@ def _writer_loop(q):
     Background thread: drains write queue and commits to SQLite.
     Batches up to 50 records per commit to reduce write frequency.
     Runs until sentinel None is received.
+    Any unhandled exception is stored in _writer_error so flush() can log it.
     """
+    global _writer_error
     BATCH_SIZE    = 50
     DRAIN_TIMEOUT = 0.05   # seconds to wait for more items before committing
 
     pending = []
 
-    while True:
-        # Block until at least one item arrives
-        try:
-            item = q.get(timeout=1.0)
-        except queue.Empty:
+    try:
+        while True:
+            # Block until at least one item arrives
+            try:
+                item = q.get(timeout=1.0)
+            except queue.Empty:
+                if pending:
+                    _flush_batch(pending)
+                    pending = []
+                continue
+
+            if item is None:   # sentinel — shutdown
+                q.task_done()
+                if pending:
+                    _flush_batch(pending)
+                break
+
+            pending.append(item)
+            q.task_done()
+
+            # Drain more items without blocking
+            while len(pending) < BATCH_SIZE:
+                try:
+                    item = q.get_nowait()
+                    if item is None:
+                        q.task_done()
+                        if pending:
+                            _flush_batch(pending)
+                        return
+                    pending.append(item)
+                    q.task_done()
+                except queue.Empty:
+                    break
+
             if pending:
                 _flush_batch(pending)
                 pending = []
-            continue
-
-        if item is None:   # sentinel — shutdown
-            q.task_done() 
-            if pending:
-                _flush_batch(pending)
-            break
-
-        pending.append(item)
-        q.task_done()
-
-        # Drain more items without blocking
-        while len(pending) < BATCH_SIZE:
-            try:
-                item = q.get_nowait()
-                if item is None:
-                    q.task_done()
-                    if pending:
-                        _flush_batch(pending)
-                    return
-                pending.append(item)
-                q.task_done()
-            except queue.Empty:
-                break
-
-        if pending:
-            _flush_batch(pending)
-            pending = []
+    except Exception as exc:
+        _writer_error = exc
+        logger.error("api_health writer thread died unexpectedly: %s",
+                     exc, exc_info=True)
 
 
 def _flush_batch(records):
@@ -336,3 +350,6 @@ def flush():
         _writer_thread = None
     if t is not None:
         t.join()                    # wait for full thread exit (DB write done)
+        if _writer_error is not None:
+            logger.error("api_health: writer thread had an unhandled error — "
+                         "some health records may be lost: %s", _writer_error)

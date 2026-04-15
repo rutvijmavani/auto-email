@@ -563,7 +563,8 @@ def analyse_and_print(captured):
         print(f"     {best['url']}")
         print()
         parsed_path = urlparse(best["url"]).path
-        filter_hint = parsed_path.split("/")[1] if "/" in parsed_path else "XHR"
+        path_parts = [p for p in parsed_path.split("/") if p]
+        filter_hint = path_parts[0] if path_parts else "XHR"
         print(f"  Next step — capture the curl for this endpoint:")
         print(f"  1. Open DevTools → Network tab")
         print(f"  2. Filter by: {filter_hint}")
