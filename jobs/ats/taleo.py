@@ -392,7 +392,10 @@ def _parse_ajax_response(raw):
 
         # ── Description: sections 1+ contain HTML ────────────────
         for section in star_sections[1:]:
-            chunk = section.strip().rstrip("!|!").strip()
+            chunk = section.strip()
+            if chunk.endswith("!|!"):
+                chunk = chunk[:-3]
+            chunk = chunk.strip()
             if not chunk:
                 continue
             decoded = unquote(chunk)

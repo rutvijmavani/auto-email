@@ -272,7 +272,6 @@ def _fetch_page(session, slug, domain, base_url, start, csrf_token):
     params = {
         "domain":                domain,
         "query":                 "",
-        "location":              "United States",
         "start":                 start,
         "num":                   PAGE_SIZE,  # server ignores this, uses its own default (~10)
         "sort_by":               "distance",

@@ -166,7 +166,9 @@ def parse_detail_curl(curl_string, listing_slug_info):
     graphql_config = None
     if _is_graphql(parsed):
         graphql_config = _extract_graphql_config(parsed)
-        stored_body    = _clean_graphql_body(body)
+        # Pass stored_body (not raw body) so the {job_id} placeholder written
+        # by _build_template survives the noise-param cleanup.
+        stored_body    = _clean_graphql_body(stored_body)
 
     detail = {
         "url_template": url_template,
@@ -603,6 +605,16 @@ def _clean_graphql_body(body):
     """Remove rotating params from GraphQL body before storing."""
     if not body:
         return body
+    # JSON bodies must not be split on '&' — return as-is
+    stripped = body.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        return body
+    try:
+        import json as _json
+        _json.loads(stripped)
+        return body
+    except (ValueError, TypeError):
+        pass
     try:
         fields = {}
         for part in body.split("&"):
@@ -617,10 +629,15 @@ def _clean_graphql_body(body):
                           "__spin_r", "__spin_b", "__rev",
                           "av", "__user", "__a")
         }
-        return "&".join(
+        result = "&".join(
             f"{quote_plus(k)}={quote_plus(v)}"
             for k, v in clean.items()
         )
+        # quote_plus encodes literal '{' and '}' as %7B/%7D, so the
+        # {job_id} placeholder written by _build_template becomes
+        # %7Bjob_id%7D — restore it so build_detail_url can substitute.
+        result = result.replace("%7Bjob_id%7D", "{job_id}")
+        return result
     except Exception:
         return body
 

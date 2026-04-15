@@ -124,6 +124,7 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
 
     Returns True if an unresolved diagnostic exists.
     """
+    conn = None
     try:
         conn = get_conn()
         if step and pattern_hint:
@@ -145,10 +146,12 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
                 WHERE company = ? AND resolved = 0
                 LIMIT 1
             """, (company,)).fetchone()
-        conn.close()
         return row is not None
     except Exception:
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def flag_diagnostic_once(company, step, severity, pattern_hint=None,
@@ -180,6 +183,7 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
         severity -- filter by severity (None = all)
         limit    -- max rows to return
     """
+    conn = None
     try:
         conn = get_conn()
         conditions = ["resolved = 0"]
@@ -208,16 +212,19 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
                 created_at DESC
             LIMIT ?
         """, params + [limit]).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_diagnostic_summary():
     """
     Return counts grouped by severity for --diagnostics display.
     """
+    conn = None
     try:
         conn = get_conn()
         rows = conn.execute("""
@@ -236,10 +243,12 @@ def get_diagnostic_summary():
                     ELSE 4
                 END
         """).fetchall()
-        conn.close()
         return [dict(r) for r in rows]
     except Exception:
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_raw_curl_for_company(company):
@@ -247,6 +256,7 @@ def get_raw_curl_for_company(company):
     Return stored raw curl strings for a company.
     Used by --diagnostics to show replay instructions.
     """
+    conn = None
     try:
         conn = get_conn()
         row  = conn.execute("""
@@ -254,10 +264,12 @@ def get_raw_curl_for_company(company):
             FROM prospective_companies
             WHERE company = ?
         """, (company,)).fetchone()
-        conn.close()
         return dict(row) if row else {}
     except Exception:
         return {}
+    finally:
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────
@@ -266,32 +278,38 @@ def get_raw_curl_for_company(company):
 
 def resolve_diagnostic(diagnostic_id):
     """Mark a diagnostic row as resolved."""
+    conn = None
     try:
         conn = get_conn()
         conn.execute("""
             UPDATE custom_ats_diagnostics
-            SET resolved = 1
+            SET resolved = 1, resolved_at = DATETIME('now')
             WHERE id = ?
         """, (diagnostic_id,))
         conn.commit()
-        conn.close()
         return True
     except Exception:
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def resolve_all_for_company(company):
     """Mark all open diagnostics for a company as resolved."""
+    conn = None
     try:
         conn = get_conn()
         conn.execute("""
             UPDATE custom_ats_diagnostics
-            SET resolved = 1
+            SET resolved = 1, resolved_at = DATETIME('now')
             WHERE company = ? AND resolved = 0
         """, (company,))
         conn.commit()
         count = conn.execute("SELECT changes()").fetchone()[0]
-        conn.close()
         return count
     except Exception:
         return 0
+    finally:
+        if conn:
+            conn.close()

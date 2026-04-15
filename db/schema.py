@@ -54,21 +54,25 @@ def _cleanup_closed_application_recruiters(c):
 def _cleanup_mark_resolved_diagnostics(c):
     """Mark diagnostics resolved older than DIAGNOSTICS_AUTO_RESOLVED_DAYS."""
     c.execute("""
-        UPDATE custom_ats_diagnostics 
-        SET resolved = 1
+        UPDATE custom_ats_diagnostics
+        SET resolved = 1,
+            resolved_at = DATETIME('now')
         WHERE resolved = 0
         AND created_at < DATE('now' , ?)
     """, (f"-{DIAGNOSTICS_AUTO_RESOLVED_DAYS} days",))
 
 def _cleanup_resolved_diagnostics(c):
     """
-    Delete rows for resolved diagnostics in custom_ats_diagnostics older than retention period.
+    Delete resolved diagnostics older than RETENTION_CUSTOM_ATS_DIAGNOSTIC days.
+    Retention is measured from resolved_at (when it was resolved), not created_at,
+    so auto-resolved rows aren't immediately purged in the same cleanup run.
+    Falls back to created_at for rows that pre-date the resolved_at column.
     """
     c.execute("""
-            DELETE FROM custom_ats_diagnostics
-            WHERE resolved = 1
-              AND created_at < DATETIME('now', ?)
-        """, (f"-{RETENTION_CUSTOM_ATS_DIAGNOSTIC} days",))
+        DELETE FROM custom_ats_diagnostics
+        WHERE resolved = 1
+          AND COALESCE(resolved_at, created_at) < DATETIME('now', ?)
+    """, (f"-{RETENTION_CUSTOM_ATS_DIAGNOSTIC} days",))
 
 def _cleanup_expired_ai_cache(c):
     c.execute("DELETE FROM ai_cache WHERE expires_at <= CURRENT_TIMESTAMP")
@@ -323,7 +327,7 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS prospective_companies (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            company      TEXT NOT NULL UNIQUE,
+            company      TEXT NOT NULL UNIQUE COLLATE NOCASE,
             priority     INTEGER DEFAULT 0,
             status       TEXT DEFAULT 'pending',
             scraped_at   TIMESTAMP,
@@ -342,6 +346,7 @@ def init_db():
                 raw_response  TEXT,
                 notes         TEXT,
                 resolved      INTEGER DEFAULT 0,
+                resolved_at   TIMESTAMP,
                 created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -543,6 +548,36 @@ def init_db():
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
+
+    # Migration: case-insensitive unique constraint for prospective_companies.company.
+    # Deduplicate case-variant rows (keep highest id), then create NOCASE index.
+    # Existing DBs have a case-sensitive UNIQUE column constraint; the NOCASE index
+    # adds the missing enforcement without requiring a table recreation.
+    c.execute("""
+        DELETE FROM prospective_companies
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM prospective_companies GROUP BY lower(company)
+        )
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
+        ON prospective_companies(company COLLATE NOCASE)
+    """)
+
+    # Migration: add resolved_at to custom_ats_diagnostics.
+    # Retention is now measured from resolved_at (not created_at) so auto-resolved
+    # rows aren't immediately deleted in the same cleanup run.
+    try:
+        c.execute("ALTER TABLE custom_ats_diagnostics ADD COLUMN resolved_at TIMESTAMP")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+    # Back-fill existing resolved rows so COALESCE(resolved_at, created_at) is accurate.
+    c.execute("""
+        UPDATE custom_ats_diagnostics
+        SET resolved_at = created_at
+        WHERE resolved = 1 AND resolved_at IS NULL
+    """)
 
     # Migration: add expected_domain and exhausted_at to applications if missing
     try:

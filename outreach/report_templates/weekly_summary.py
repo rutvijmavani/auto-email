@@ -467,6 +467,7 @@ def _build_detect_section(stats):
           {stat_card(p1, "New", COLORS["accent"])}
           {stat_card(p2, "Gone Quiet", COLORS["warning"])}
           {stat_card(p3, "Unknown", COLORS["neutral"])}
+          {stat_card(p4, "Custom/No cURL", COLORS["neutral"])}
           {stat_card(total, "Total", COLORS["text"])}
         </tr>
       </table>

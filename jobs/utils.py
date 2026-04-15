@@ -20,7 +20,7 @@ Constants:
 import re
 import json
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -227,7 +227,7 @@ def parse_date_value(val):
     if isinstance(val, datetime):
         if val.tzinfo is None:
             return val.replace(tzinfo=timezone.utc)
-        return val
+        return val.astimezone(timezone.utc)
 
     # Unix timestamp (int)
     if isinstance(val, int):
@@ -247,7 +247,10 @@ def parse_date_value(val):
             return None
         # ISO 8601
         try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
         except (ValueError, AttributeError):
             pass
         # Common formats
@@ -292,9 +295,8 @@ def extract_url_from_value(val, base_url=""):
     val = val.strip()
     if val.startswith("http"):
         return val
-    if val.startswith("/") and base_url:
-        parsed = urlparse(base_url)
-        return f"{parsed.scheme}://{parsed.netloc}{val}"
+    if base_url:
+        return urljoin(base_url, val)
     return val
 
 

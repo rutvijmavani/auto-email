@@ -248,7 +248,7 @@ def run():
         from db.api_health import flush as flush_api_health
         flush_api_health()
     except Exception:
-        pass
+        logger.debug("flush_api_health failed", exc_info=True)
 
     logger.info("════ --monitor-jobs finished ════")
     return final_stats
@@ -764,7 +764,7 @@ def run_detect_ats(company=None, override_platform=None,
 
         if remaining <= 0:
             logger.warning("Serper credits exhausted")
-            print(f"[WARNING] Serper credits exhausted.")
+            print("[WARNING] Serper credits exhausted.")
             _print_detection_queue_status()
             return
 
@@ -845,7 +845,7 @@ def _print_detection_queue_status():
         else:
             print("[OK] Detection queue empty")
     except Exception:
-        pass
+        logger.debug("Detection queue status unavailable", exc_info=True)
 
 
 def run_monitor_status():

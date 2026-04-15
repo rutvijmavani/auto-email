@@ -218,8 +218,9 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
                     f"Raw response stored for inspection."
                 ),
             )
-        except Exception:
-            pass
+        except Exception as diag_e:
+            logger.debug("Failed to write structure diagnostic for %r: %s",
+                         company, diag_e)
         return None
 
     if not detected:
@@ -239,13 +240,14 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
                 pattern_hint = "no_array_found",
                 raw_response = raw_bytes,
                 notes        = (
-                    f"_detect_structure() returned None. "
-                    f"Raw response stored — inspect to identify new pattern. "
-                    f"Ensure curl is from the job LISTING endpoint."
+                    "_detect_structure() returned None. "
+                    "Raw response stored — inspect to identify new pattern. "
+                    "Ensure curl is from the job LISTING endpoint."
                 ),
             )
-        except Exception:
-            pass
+        except Exception as diag_e:
+            logger.debug("Failed to write no-array diagnostic for %r: %s",
+                         company, diag_e)
         return None
 
     # Merge detected config
@@ -271,8 +273,8 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
         print(f"       [Curl] Sample job: {str(title_val)[:60]}")
 
     if detail_curl_str and slug_info.get("detail"):
-        print(f"       [Curl] Detail config ready — "
-              f"will fetch descriptions for matched jobs")
+        print("       [Curl] Detail config ready — "
+              "will fetch descriptions for matched jobs")
     elif detail_curl_str:
         print("       [Curl] Detail curl provided but parse failed")
     else:
@@ -306,7 +308,7 @@ def _replay_request(slug_info, company):
     # Use warm session if career_page_url available
     career_page_url = slug_info.get("career_page_url")
     if career_page_url:
-        session, strategy = _warm_session(slug_info, company)
+        session, _ = _warm_session(slug_info, company)
         if session is None:
             logger.warning(
                 "[sync] %r: career page warm failed — "

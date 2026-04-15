@@ -231,7 +231,8 @@ def get_monitorable_companies():
                   -- Custom: only include when slug has captured URL
                   -- json_extract returns NULL if key missing or not JSON
                   (ats_platform = 'custom'
-                   AND json_extract(ats_slug, '$.url') IS NOT NULL)
+                   AND json_extract(ats_slug, '$.url') IS NOT NULL
+                   AND json_extract(ats_slug, '$.url') <> '')
               )
             ORDER BY company ASC
         """).fetchall()
@@ -260,7 +261,8 @@ def get_detection_queue(batch_size=10):
                      WHEN consecutive_empty_days >= 14 THEN 2
                      WHEN ats_platform = 'unknown' THEN 3
                      WHEN ats_platform = 'custom'
-                          AND json_extract(ats_slug, '$.url') IS NULL
+                          AND (json_extract(ats_slug, '$.url') IS NULL
+                               OR json_extract(ats_slug, '$.url') = '')
                           THEN 4
                      ELSE 99
                    END AS priority
@@ -271,7 +273,8 @@ def get_detection_queue(batch_size=10):
                 OR ats_platform = 'unknown'
                 OR (ats_platform = 'custom'
                     AND (ats_slug IS NULL
-                         OR json_extract(ats_slug, '$.url') IS NULL))
+                         OR json_extract(ats_slug, '$.url') IS NULL
+                         OR json_extract(ats_slug, '$.url') = ''))
             )
             ORDER BY
                 priority ASC,
@@ -307,7 +310,8 @@ def get_detection_queue_stats():
                         WHEN ats_platform = 'unknown' THEN 3
                         WHEN ats_platform = 'custom'
                              AND (ats_slug IS NULL
-                             OR json_extract(ats_slug, '$.url') IS NULL)
+                             OR json_extract(ats_slug, '$.url') IS NULL
+                             OR json_extract(ats_slug, '$.url') = '')
                              THEN 4
                         ELSE 99
                     END AS priority
@@ -318,7 +322,8 @@ def get_detection_queue_stats():
                     OR ats_platform = 'unknown'
                     OR (ats_platform = 'custom'
                         AND (ats_slug IS NULL
-                             OR json_extract(ats_slug, '$.url') IS NULL))
+                             OR json_extract(ats_slug, '$.url') IS NULL
+                             OR json_extract(ats_slug, '$.url') = ''))
                 )
             ) sub
             WHERE priority < 99

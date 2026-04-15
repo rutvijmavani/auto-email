@@ -1056,8 +1056,12 @@ def main():
         company       = non_flag_args[0] if non_flag_args else None
         curl_idx      = args.index("--curl") if "--curl" in args else None
         detail_idx    = args.index("--detail-curl") if "--detail-curl" in args else None
-        curl_string   = args[curl_idx + 1] if curl_idx is not None else None
-        detail_curl   = args[detail_idx + 1] if detail_idx is not None else None
+        curl_string   = (args[curl_idx + 1]
+                         if curl_idx is not None and curl_idx + 1 < len(args)
+                         else None)
+        detail_curl   = (args[detail_idx + 1]
+                         if detail_idx is not None and detail_idx + 1 < len(args)
+                         else None)
         if not company or not curl_string:
             print('[ERROR] Usage: --set-custom-ats "Company" --curl "curl ..."')
             return

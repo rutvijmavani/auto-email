@@ -2,6 +2,7 @@
 
 import os
 import json
+import logging
 import hashlib
 import re
 from google import genai
@@ -12,6 +13,8 @@ from db.db import get_ai_cache, save_ai_cache
 import time
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -73,16 +76,19 @@ def _call_model(prompt, cache_key, company, job_title):
         return {}
 
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        if not can_call(model):
+        # Check RPM first — a soft RPM limit shouldn't trigger an immediate skip.
+        # can_call() includes RPM internally, so checking it first would exit
+        # without the 60-second retry window when only RPM is the issue.
+        if not within_rpm(model):
+            print(f"{model} RPM limit hit — waiting 60s...")
+            time.sleep(60)
             if not within_rpm(model):
-                print(f"{model} RPM limit hit — waiting 60s...")
-                time.sleep(60)
-                if not can_call(model):
-                    print(f"{model} still unavailable after wait — trying next model.")
-                    continue
-            else:
-                print(f"{model} daily limit reached (local guard).")
+                print(f"{model} still unavailable after wait — trying next model.")
                 continue
+
+        if not can_call(model):
+            print(f"{model} daily limit reached — trying next model.")
+            continue
 
         try:
             response = client.models.generate_content(
@@ -273,19 +279,22 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
         return None, None, None, False
 
     # ── Quota / availability checks ──────────────────────────────
-    if not can_call(FIELD_MAP_MODEL):
-        print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
-              f"skipping AI field map for {company}")
-        return None, None, None , False
-
+    # Check RPM first — a soft RPM limit shouldn't exhaust the daily budget.
+    # can_call() includes RPM internally, so checking it first would cause
+    # an early exit without the 60-second retry window.
     if not within_rpm(FIELD_MAP_MODEL):
         print(f"[INFO] {FIELD_MAP_MODEL} RPM limit hit — "
               f"waiting 60s for field map ({company})...")
         time.sleep(60)
-        if not can_call(FIELD_MAP_MODEL):
+        if not within_rpm(FIELD_MAP_MODEL):
             print(f"[INFO] {FIELD_MAP_MODEL} still unavailable — "
                   f"skipping AI field map for {company}")
-            return None, None, None , False
+            return None, None, None, False
+
+    if not can_call(FIELD_MAP_MODEL):
+        print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
+              f"skipping AI field map for {company}")
+        return None, None, None, False
 
     client = _get_client()
     if client is None:

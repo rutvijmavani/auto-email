@@ -223,7 +223,7 @@ def _store_and_return(company, result):
 # NEEDS REDETECTION
 # ─────────────────────────────────────────
 
-def needs_redetection(company_row, redetect_days=14):
+def needs_redetection(company_row, redetect_days=JOB_MONITOR_REDETECT_DAYS):
     """
     Check if company needs ATS re-detection.
 
@@ -235,7 +235,7 @@ def needs_redetection(company_row, redetect_days=14):
       unknown / no platform           → True
       no slug                         → True
       never detected                  → True
-      14+ consecutive empty days      → True
+      JOB_MONITOR_REDETECT_DAYS+ consecutive empty days → True
     """
     platform    = company_row.get("ats_platform", ATS_STATUS_UNKNOWN)
     slug        = company_row.get("ats_slug")

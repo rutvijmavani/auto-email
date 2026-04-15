@@ -323,8 +323,13 @@ def flush():
     enqueue to the now-readerless queue (no crash, records silently lost),
     but flush() is only ever called at the end of run().
     """
+    global _write_queue, _writer_thread
     if _write_queue is None:
         return
-    _write_queue.put(None)          # sentinel → writer drains pending + exits
-    if _writer_thread is not None:
-        _writer_thread.join()       # wait for full thread exit (DB write done)
+    q = _write_queue
+    t = _writer_thread
+    _write_queue   = None           # null out before join so record_request()
+    _writer_thread = None           # callers see None immediately
+    q.put(None)                     # sentinel → writer drains pending + exits
+    if t is not None:
+        t.join()                    # wait for full thread exit (DB write done)

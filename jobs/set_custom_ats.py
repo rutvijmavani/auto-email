@@ -119,7 +119,12 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
     import requests as req_lib
     from jobs.ats.custom_career import _warm_session, _build_legacy_session
 
-    session, strategy = _warm_session(slug_info, company)
+    try:
+        session, strategy = _warm_session(slug_info, company)
+    except Exception as e:
+        logger.warning("_warm_session raised for %r: %s", company, e)
+        session  = None
+        strategy = "none"
     if session is None:
         print("  [WARNING] Career page unreachable — using plain session")
         session  = _build_legacy_session(slug_info)

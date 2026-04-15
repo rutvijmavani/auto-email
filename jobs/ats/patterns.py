@@ -264,14 +264,16 @@ def _make_patterns():
     # Also handles /careers path (SAP uses this)
     patterns.append((
         re.compile(
-            r"career(\d+)\.successfactors\.(com|eu)/careers?\?.*company=([^&\s]+)",
+            r"career(\d+)\.successfactors\.(com|eu)/(careers?)\?.*company=([^&\s]+)",
             re.IGNORECASE,
         ),
         "successfactors",
         lambda m: json.dumps({
-            "slug":   m.group(3),
+            "slug":   m.group(4),
             "dc":     m.group(1),
             "region": m.group(2),
+            # Only store "path" when non-default (/careers) — mirrors detect() behaviour
+            **({} if m.group(3).lower() == "career" else {"path": f"/{m.group(3)}"}),
         }),
     ))
 
