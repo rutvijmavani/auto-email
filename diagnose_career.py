@@ -300,6 +300,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
     import random
     captured  = []
     captured_lock = asyncio.Lock()
+    response_event_count = 0
 
     print(f"\n{'='*70}")
     print(f"  Navigating to: {career_url}")
@@ -328,6 +329,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
             await stealth_async(page)
 
         async def on_response(response):
+            nonlocal response_event_count
             try:
                 url = response.url
                 if should_skip(url):
@@ -344,6 +346,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                 arr, path = find_largest_array(data)
 
                 async with captured_lock:
+                    response_event_count += 1
                     # Update existing entry if we have a larger array now
                     existing = next((r for r in captured if r["url"] == url), None)
                     if existing:
@@ -410,7 +413,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
 
             if next_btn:
                 print(f"  Found button — clicking...")
-                prev_count = len(captured)
+                prev_event_count = response_event_count
                 success = await _try_click(page, next_btn)
 
                 if success:
@@ -421,8 +424,8 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                         pass
                     await asyncio.sleep(2)
 
-                    if len(captured) > prev_count:
-                        print(f"  ✓ Click triggered {len(captured) - prev_count} new response(s)")
+                    if response_event_count > prev_event_count:
+                        print(f"  ✓ Click triggered {response_event_count - prev_event_count} new response(s)")
                     else:
                         print(f"  Click succeeded but no new responses — may be same data")
                 else:
@@ -432,13 +435,13 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
             else:
                 # Infinite scroll
                 print(f"  No button found — scrolling...")
-                prev_count = len(captured)
+                prev_event_count = response_event_count
                 await page.mouse.wheel(0, 8000)
                 await asyncio.sleep(3)
                 await page.mouse.wheel(0, 8000)
                 await asyncio.sleep(2)
 
-                if len(captured) == prev_count:
+                if response_event_count == prev_event_count:
                     print(f"  No new responses after scroll — end of content")
                     break
 

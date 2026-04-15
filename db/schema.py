@@ -563,13 +563,114 @@ def init_db():
                 raise
 
     # Migration: case-insensitive unique constraint for prospective_companies.company.
-    # Deduplicate case-variant rows (keep highest id), then create NOCASE index.
-    # Existing DBs have a case-sensitive UNIQUE column constraint; the NOCASE index
-    # adds the missing enforcement without requiring a table recreation.
+    # Deduplicate case-variant rows by selecting the most complete record per group,
+    # then create NOCASE index. Prefer rows with ats_slug, status='scraped', and
+    # converted_at set. Update survivor to merge any missing fields from other rows
+    # before deleting duplicates.
+    c.execute("""
+        WITH ranked AS (
+            SELECT
+                id,
+                company,
+                lower(company) as company_lower,
+                CASE
+                    WHEN ats_slug IS NOT NULL THEN 100 ELSE 0
+                END +
+                CASE
+                    WHEN status = 'scraped' THEN 50 ELSE 0
+                END +
+                CASE
+                    WHEN converted_at IS NOT NULL THEN 50 ELSE 0
+                END +
+                CASE
+                    WHEN ats_platform IS NOT NULL AND ats_platform != 'unknown' THEN 30 ELSE 0
+                END +
+                CASE
+                    WHEN domain IS NOT NULL THEN 20 ELSE 0
+                END +
+                CASE
+                    WHEN scraped_at IS NOT NULL THEN 10 ELSE 0
+                END AS completeness_score,
+                ROW_NUMBER() OVER (
+                    PARTITION BY lower(company)
+                    ORDER BY
+                        CASE
+                            WHEN ats_slug IS NOT NULL THEN 100 ELSE 0
+                        END +
+                        CASE
+                            WHEN status = 'scraped' THEN 50 ELSE 0
+                        END +
+                        CASE
+                            WHEN converted_at IS NOT NULL THEN 50 ELSE 0
+                        END +
+                        CASE
+                            WHEN ats_platform IS NOT NULL AND ats_platform != 'unknown' THEN 30 ELSE 0
+                        END +
+                        CASE
+                            WHEN domain IS NOT NULL THEN 20 ELSE 0
+                        END +
+                        CASE
+                            WHEN scraped_at IS NOT NULL THEN 10 ELSE 0
+                        END DESC,
+                        id DESC
+                ) as rn
+            FROM prospective_companies
+        ),
+        survivors AS (
+            SELECT id, company_lower FROM ranked WHERE rn = 1
+        ),
+        others AS (
+            SELECT
+                r.company_lower,
+                MAX(p.ats_slug) as max_ats_slug,
+                MAX(p.domain) as max_domain,
+                MAX(p.ats_platform) as max_ats_platform,
+                MAX(p.ats_detected_at) as max_ats_detected_at,
+                MAX(p.first_scanned_at) as max_first_scanned_at,
+                MAX(p.last_checked_at) as max_last_checked_at,
+                MAX(p.scraped_at) as max_scraped_at,
+                MAX(p.converted_at) as max_converted_at,
+                MAX(p.priority) as max_priority
+            FROM ranked r
+            JOIN prospective_companies p ON r.company_lower = lower(p.company)
+            WHERE r.rn > 1
+            GROUP BY r.company_lower
+        )
+        UPDATE prospective_companies
+        SET
+            ats_slug = COALESCE(ats_slug, (SELECT max_ats_slug FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            domain = COALESCE(domain, (SELECT max_domain FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            ats_platform = COALESCE(
+                CASE WHEN ats_platform = 'unknown' THEN NULL ELSE ats_platform END,
+                (SELECT CASE WHEN max_ats_platform = 'unknown' THEN NULL ELSE max_ats_platform END FROM others WHERE others.company_lower = lower(prospective_companies.company))
+            ),
+            ats_detected_at = COALESCE(ats_detected_at, (SELECT max_ats_detected_at FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            first_scanned_at = COALESCE(first_scanned_at, (SELECT max_first_scanned_at FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            last_checked_at = COALESCE(last_checked_at, (SELECT max_last_checked_at FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            scraped_at = COALESCE(scraped_at, (SELECT max_scraped_at FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            converted_at = COALESCE(converted_at, (SELECT max_converted_at FROM others WHERE others.company_lower = lower(prospective_companies.company))),
+            priority = COALESCE(priority, (SELECT max_priority FROM others WHERE others.company_lower = lower(prospective_companies.company)))
+        WHERE id IN (SELECT id FROM survivors)
+    """)
     c.execute("""
         DELETE FROM prospective_companies
         WHERE id NOT IN (
-            SELECT MAX(id) FROM prospective_companies GROUP BY lower(company)
+            SELECT id FROM (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY lower(company)
+                        ORDER BY
+                            CASE WHEN ats_slug IS NOT NULL THEN 100 ELSE 0 END +
+                            CASE WHEN status = 'scraped' THEN 50 ELSE 0 END +
+                            CASE WHEN converted_at IS NOT NULL THEN 50 ELSE 0 END +
+                            CASE WHEN ats_platform IS NOT NULL AND ats_platform != 'unknown' THEN 30 ELSE 0 END +
+                            CASE WHEN domain IS NOT NULL THEN 20 ELSE 0 END +
+                            CASE WHEN scraped_at IS NOT NULL THEN 10 ELSE 0 END DESC,
+                            id DESC
+                    ) as rn
+                FROM prospective_companies
+            ) WHERE rn = 1
         )
     """)
     c.execute("""

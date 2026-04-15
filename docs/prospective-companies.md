@@ -265,7 +265,7 @@ BUT 8 of those 30 companies were already prospective:
 ```sql
 CREATE TABLE IF NOT EXISTS prospective_companies (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    company      TEXT NOT NULL UNIQUE,
+    company      TEXT NOT NULL UNIQUE COLLATE NOCASE,
     domain       TEXT,                        -- used for email validation + ATS detection
     priority     INTEGER DEFAULT 0,
     status       TEXT DEFAULT 'pending',

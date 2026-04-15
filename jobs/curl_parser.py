@@ -380,10 +380,11 @@ def build_graphql_body(graphql_config, lsd, rev):
         lsd            -- CSRF token extracted from page HTML
         rev            -- build revision extracted from page JS
 
-    Returns form-encoded POST body string.
+    Returns form-encoded POST body string or JSON string (depending on is_json_body).
     """
     import time as _time
 
+    is_json_body = graphql_config.get("is_json_body", False)
     jazoest = compute_jazoest(lsd) if lsd else "22348"
 
     # Layer 1 — semi-stable params from curl (e.g. __dyn, __csr, __hs)
@@ -414,15 +415,26 @@ def build_graphql_body(graphql_config, lsd, rev):
     })
 
     # Layer 4 — query definition (override all)
-    if graphql_config.get("variables"):
-        try:
-            fields["variables"] = json.dumps(graphql_config["variables"])
-        except (TypeError, ValueError):
-            pass
+    variables = graphql_config.get("variables")
+    if variables:
+        if is_json_body:
+            # For JSON body, store variables as object
+            fields["variables"] = variables
+        else:
+            # For form-encoded, store as JSON string
+            try:
+                fields["variables"] = json.dumps(variables)
+            except (TypeError, ValueError):
+                pass
 
     if graphql_config.get("doc_id"):
         fields["doc_id"] = str(graphql_config["doc_id"])
 
+    # Return JSON string for JSON bodies
+    if is_json_body:
+        return json.dumps(fields)
+
+    # Return form-encoded string for form bodies
     return "&".join(
         f"{quote_plus(k)}={quote_plus(str(v))}"
         for k, v in fields.items()
@@ -438,6 +450,37 @@ def compute_jazoest(lsd):
 # ─────────────────────────────────────────
 # INTERNAL — JOB ID DETECTION
 # ─────────────────────────────────────────
+
+def _find_id_in_nested_structure(data, depth=0, max_depth=5):
+    """
+    Recursively search for job_id in nested dicts/lists.
+    Returns (value, field_name, location_type) or (None, None, None).
+    """
+    if depth > max_depth:
+        return None, None, None
+
+    # Normalize known ID params for comparison
+    normalized_id_params = {p.replace("_", "").replace("-", "") for p in KNOWN_ID_PARAMS}
+
+    if isinstance(data, dict):
+        for k, v in data.items():
+            norm = k.lower().replace("_", "").replace("-", "")
+            if norm in normalized_id_params:
+                return str(v), k, "body"
+            # Recurse into nested structures
+            if isinstance(v, (dict, list)):
+                result, field, loc = _find_id_in_nested_structure(v, depth + 1, max_depth)
+                if result:
+                    return result, field, loc
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                result, field, loc = _find_id_in_nested_structure(item, depth + 1, max_depth)
+                if result:
+                    return result, field, loc
+
+    return None, None, None
+
 
 def _detect_job_id_in_url(url, params, body=None):
     """
@@ -478,16 +521,13 @@ def _detect_job_id_in_url(url, params, body=None):
         if m:
             return m.group(1), pattern_name, "path"
 
-    # Check POST body for id field
+    # Check POST body for id field (including nested structures)
     if body:
         try:
             data = json.loads(body)
-            if isinstance(data, dict):
-                for k, v in data.items():
-                    norm = k.lower().replace("_", "").replace("-", "")
-                    if norm in {p.replace("_", "").replace("-", "")
-                                for p in KNOWN_ID_PARAMS}:
-                        return str(v), "body_field", "body"
+            result, field, loc = _find_id_in_nested_structure(data)
+            if result:
+                return result, "body_field", loc
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -495,13 +535,30 @@ def _detect_job_id_in_url(url, params, body=None):
 
 
 def _find_id_param_in_body(body, job_id):
-    """Find which field in a JSON body contains the job_id."""
+    """Find which field in a JSON body contains the job_id (including nested)."""
     try:
         data = json.loads(body)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                if str(v) == str(job_id):
-                    return k
+
+        def search_nested(obj, depth=0, max_depth=5):
+            if depth > max_depth:
+                return None
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if str(v) == str(job_id):
+                        return k
+                    if isinstance(v, (dict, list)):
+                        result = search_nested(v, depth + 1, max_depth)
+                        if result:
+                            return result
+            elif isinstance(obj, list):
+                for item in obj:
+                    if isinstance(item, (dict, list)):
+                        result = search_nested(item, depth + 1, max_depth)
+                        if result:
+                            return result
+            return None
+
+        return search_nested(data)
     except (json.JSONDecodeError, TypeError):
         pass
     return None
@@ -541,13 +598,38 @@ def _extract_graphql_config(parsed):
         "is_json_body":  False,
     }
 
+    # Try JSON body first (other GraphQL APIs)
+    stripped = body.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                config["doc_id"]        = data.get("doc_id") or data.get("docid")
+                config["friendly_name"] = (data.get("operationName") or
+                                           data.get("fb_api_req_friendly_name"))
+                config["variables"]     = data.get("variables")
+                config["is_json_body"]  = True
+                config["stable_params"] = {
+                    k: v for k, v in data.items()
+                    if k not in ("variables", "query", "lsd", "extensions")
+                    and not k.startswith("__")
+                }
+                return config
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     # Form-encoded body (Meta style)
     try:
         fields = {}
         for part in body.split("&"):
-            if "=" in part:
-                k, _, v = part.partition("=")
-                fields[unquote_plus(k)] = unquote_plus(v)
+            if not part or "=" not in part:
+                continue
+            k, _, v = part.partition("=")
+            fields[unquote_plus(k)] = unquote_plus(v)
+
+        # Only proceed if we actually parsed fields
+        if not fields:
+            return config
 
         if "doc_id" in fields:
             config["doc_id"] = fields["doc_id"]
@@ -583,23 +665,6 @@ def _extract_graphql_config(parsed):
     except Exception:
         pass
 
-    # JSON body (other GraphQL APIs)
-    try:
-        data = json.loads(body)
-        if isinstance(data, dict):
-            config["doc_id"]        = data.get("doc_id") or data.get("docid")
-            config["friendly_name"] = (data.get("operationName") or
-                                       data.get("fb_api_req_friendly_name"))
-            config["variables"]     = data.get("variables")
-            config["is_json_body"]  = True
-            config["stable_params"] = {
-                k: v for k, v in data.items()
-                if k not in ("variables", "query", "lsd", "extensions")
-                and not k.startswith("__")
-            }
-    except (json.JSONDecodeError, TypeError):
-        pass
-
     return config
 
 
@@ -610,19 +675,25 @@ def _clean_graphql_body(body):
     # JSON bodies must not be split on '&' — return as-is
     stripped = body.strip()
     if stripped.startswith("{") or stripped.startswith("["):
-        return body
-    try:
-        import json as _json
-        _json.loads(stripped)
-        return body
-    except (ValueError, TypeError):
-        pass
+        try:
+            import json as _json
+            _json.loads(stripped)
+            return body
+        except (ValueError, TypeError):
+            pass
+
+    # Only process as form-encoded if it doesn't look like JSON
     try:
         fields = {}
         for part in body.split("&"):
-            if "=" in part:
-                k, _, v = part.partition("=")
-                fields[unquote_plus(k)] = unquote_plus(v)
+            if not part or "=" not in part:
+                continue
+            k, _, v = part.partition("=")
+            fields[unquote_plus(k)] = unquote_plus(v)
+
+        # If no fields parsed, body wasn't form-encoded — return as-is
+        if not fields:
+            return body
 
         clean = {
             k: v for k, v in fields.items()

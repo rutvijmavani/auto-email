@@ -102,6 +102,10 @@ def fetch_jobs(slug_info, company):
             logger.error("eightfold: invalid slug_info JSON for %s", company)
             return []
 
+    if not isinstance(slug_info, dict):
+        logger.error("eightfold: invalid slug_info JSON for %s", company)
+        return []
+
     slug   = slug_info.get("slug", "")
     domain = slug_info.get("domain", "")
 

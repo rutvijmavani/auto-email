@@ -290,7 +290,7 @@ def resolve_diagnostic(diagnostic_id):
         conn.execute("""
             UPDATE custom_ats_diagnostics
             SET resolved = 1, resolved_at = DATETIME('now')
-            WHERE id = ?
+            WHERE id = ? AND resolved = 0
         """, (diagnostic_id,))
         conn.commit()
         return conn.execute("SELECT changes()").fetchone()[0] > 0

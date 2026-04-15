@@ -110,7 +110,7 @@ def build_request_kwargs(method, url, params=None, body=None,
         url           — target URL
         params        — dict of query params (None = omit)
         body          — raw body string (None = omit)
-        extra_headers — dict of headers to add (applied by caller)
+        extra_headers — dict of headers to add (None = omit)
 
     Returns dict suitable for **requests.request(method, url, **kwargs).
     """
@@ -124,6 +124,9 @@ def build_request_kwargs(method, url, params=None, body=None,
             kwargs["json"] = json.loads(body)
         else:
             kwargs["data"] = body
+
+    if extra_headers:
+        kwargs["headers"] = extra_headers
 
     return kwargs
 
@@ -176,16 +179,18 @@ def parse_salary_text(text):
     # Handle 'k' suffix: 120k → 120000
     raw_nums = re.findall(r"(\d+(?:\.\d+)?)\s*[kK]\b", text)
     k_nums = [str(int(float(n) * 1000)) for n in raw_nums]
-    # Merge both lists — k-suffix and regular numbers
-    if k_nums:
-        nums = list(set(nums + k_nums))
-        # Sort numerically to get proper min/max
-        nums.sort(key=lambda x: int(x))
 
-    if len(nums) >= 2:
-        return nums[0], nums[1]
-    if len(nums) == 1:
-        return nums[0], nums[0]
+    # Merge both lists — k-suffix and regular numbers
+    all_nums = list(set(nums + k_nums))
+
+    # Always sort numerically to get proper min/max
+    if all_nums:
+        all_nums.sort(key=lambda x: int(x))
+
+    if len(all_nums) >= 2:
+        return all_nums[0], all_nums[1]
+    if len(all_nums) == 1:
+        return all_nums[0], all_nums[0]
     return "", ""
 
 

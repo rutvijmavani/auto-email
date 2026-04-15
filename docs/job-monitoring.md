@@ -39,7 +39,7 @@ effectiveness. Maximum reliability is required.
 ### Data Flow
 
 ```text
-prospects.txt (137 companies)
+prospects.txt (164 companies)
          ↓
 --import-prospects
          ↓
@@ -399,15 +399,15 @@ Ashby:           ~15 companies  (100% confidence via Google ✓)
 SmartRecruiters: ~30 companies  (verified via Google ✓)
 Workday:         ~20 companies  (slug+path via Google ✓)
 Oracle HCM:      ~10 companies  (slug+site_id via Google ✓)
-iCIMS:           ~5  companies  (subdomain detected)
-Avature:         ~5  companies  (sitemap-based detection)
-Phenom:          ~5  companies  (cdn.phenompeople.com fingerprint)
+iCIMS:           ~8  companies  (subdomain detected)
+Avature:         ~6  companies  (sitemap-based detection)
+Phenom:          ~6  companies  (cdn.phenompeople.com fingerprint)
 TalentBrew:      ~3  companies  (tbcdn.talentbrew.com fingerprint)
 SuccessFactors:  ~3  companies  (successfactors.com/career?company= pattern)
-Jobvite:         ~3  companies  (jobs.jobvite.com URL pattern)
-Custom:          ~5  companies  (curl-captured, session-refreshed)
+Jobvite:         ~2  companies  (jobs.jobvite.com URL pattern)
+Custom:          ~4  companies  (curl-captured, session-refreshed)
 ─────────────────────────────────────────────────────────
-Via detection:   ~164 companies
+Via detection:   ~167 companies
 
 Unknown (<2%):
   → Store as 'unknown' → email notification → manual --override
@@ -1282,13 +1282,13 @@ data/digests/jobs_digest_2026-03-04.pdf
 Page 1 — Summary + Pipeline Health
   ┌────────────────────────────────────────┐
   │  Job Digest · March 4, 2026           │
-  │  Companies monitored: 137             │
+  │  Companies monitored: 164             │
   │  New jobs found: 47                   │
   │  Matching your profile: 23            │
   ├────────────────────────────────────────┤
   │  PIPELINE HEALTH                      │
-  │  Coverage:    129/137 (94%) ✓         │
-  │  ATS Known:   119/137 (87%) ✓         │
+  │  Coverage:    155/164 (95%) ✓         │
+  │  ATS Known:   143/164 (87%) ✓         │
   │  API Failures: 3  ⚠ (Stripe, Linear) │
   │  Match Rate:   18% ✓                  │
   ├────────────────────────────────────────┤
