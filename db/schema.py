@@ -182,10 +182,13 @@ def _cleanup_custom_ats_inspection(c):
     Remove inspection rows for companies no longer in
     prospective_companies table.
     Keeps table lean as companies are added/removed.
+    COLLATE NOCASE on both sides ensures the cross-table company
+    comparison is case-insensitive (prospective_companies uses NOCASE
+    collation; custom_ats_inspection uses default BINARY).
     """
     c.execute("""
         DELETE FROM custom_ats_inspection
-        WHERE company NOT IN (
+        WHERE company COLLATE NOCASE NOT IN (
             SELECT company FROM prospective_companies
         )
     """)

@@ -455,7 +455,7 @@ def _store_detection(company, platform, slug):
                 ats_slug               = ?,
                 ats_detected_at        = CURRENT_TIMESTAMP,
                 consecutive_empty_days = 0
-            WHERE company = ?
+            WHERE company = ? COLLATE NOCASE
         """, (platform, slug, company))
         conn.commit()
     finally:
@@ -483,7 +483,7 @@ def override_ats(company, platform, slug):
                 ats_slug               = ?,
                 ats_detected_at        = CURRENT_TIMESTAMP,
                 consecutive_empty_days = 0
-            WHERE company = ?
+            WHERE company = ? COLLATE NOCASE
         """, (platform, slug_str, company))
         conn.commit()
         print(f"[OK] {company} -> manually set to {platform}")

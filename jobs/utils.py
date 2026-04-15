@@ -236,7 +236,7 @@ def parse_date_value(val):
     # Unix timestamp (int)
     if isinstance(val, int):
         try:
-            if val > UNIX_TS_MS_MIN:
+            if UNIX_TS_MS_MIN < val < UNIX_TS_MS_MAX:
                 return datetime.fromtimestamp(val / 1000, tz=timezone.utc)
             if val > UNIX_TS_MIN:
                 return datetime.fromtimestamp(val, tz=timezone.utc)

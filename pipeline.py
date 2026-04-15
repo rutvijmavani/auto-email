@@ -1052,10 +1052,13 @@ def main():
     
     if "--set-custom-ats" in args:
         from jobs.set_custom_ats import run as run_set_custom_ats
-        non_flag_args = [a for a in args if not a.startswith("--")]
-        company       = non_flag_args[0] if non_flag_args else None
         curl_idx      = args.index("--curl") if "--curl" in args else None
         detail_idx    = args.index("--detail-curl") if "--detail-curl" in args else None
+        company_args  = (
+            [a for a in args[:curl_idx] if not a.startswith("--")]
+            if curl_idx is not None else []
+        )
+        company       = company_args[0] if company_args else None
         curl_string   = (args[curl_idx + 1]
                          if curl_idx is not None and curl_idx + 1 < len(args)
                          else None)

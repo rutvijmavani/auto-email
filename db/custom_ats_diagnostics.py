@@ -105,6 +105,8 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
             VALUES (?, ?, ?, ?, ?, ?)
         """, (company, step, severity, pattern_hint, raw_str, notes))
         conn.commit()
+        if cursor.rowcount == 0:
+            return None
         return cursor.lastrowid
     except Exception as e:
         # Never let diagnostics crash the main pipeline
@@ -266,7 +268,7 @@ def get_raw_curl_for_company(company):
         row  = conn.execute("""
             SELECT listing_curl_raw, detail_curl_raw
             FROM prospective_companies
-            WHERE company = ?
+            WHERE company = ? COLLATE NOCASE
         """, (company,)).fetchone()
         return dict(row) if row else {}
     except Exception:
@@ -307,7 +309,7 @@ def resolve_all_for_company(company):
         conn.execute("""
             UPDATE custom_ats_diagnostics
             SET resolved = 1, resolved_at = DATETIME('now')
-            WHERE company = ? AND resolved = 0
+            WHERE company = ? COLLATE NOCASE AND resolved = 0
         """, (company,))
         conn.commit()
         count = conn.execute("SELECT changes()").fetchone()[0]

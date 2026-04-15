@@ -370,7 +370,9 @@ def _process_company(company_row, position, total):
             result["failure_name"] = company
             return result
 
-    # ── Post-fetch processing (outside semaphore — no HTTP) ──
+    # ── Post-fetch processing (outside listing semaphore) ──
+    # NOTE: fetch_job_detail calls below re-acquire the semaphore individually
+    # to throttle detail HTTP requests with the same per-platform limit.
     logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
     result["fetched"] = len(raw_jobs)
 
@@ -441,70 +443,79 @@ def _process_company(company_row, position, total):
             save_job_posting(job, status="pre_existing")
             continue
 
-        # Platform-specific detail fetches
+        # Platform-specific detail fetches — each re-acquires the semaphore
+        # so detail HTTP requests obey the same per-platform throttle as listing.
         if platform == "icims" and job.get("_base_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("iCIMS fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("iCIMS fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "jobvite" and job.get("_slug"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Jobvite fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Jobvite fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "avature" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Avature fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Avature fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "phenom" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Phenom fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Phenom fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "talentbrew" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("TalentBrew fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("TalentBrew fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "sitemap" and job.get("job_url") and \
                 job.get("_feed_type") != "xml":
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
-                             company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
 
         if platform == "taleo" and job.get("_contest_no"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-                # taleo returns extra fields — store safely only if columns exist
-                # salary_min, salary_max, salary_type, contact, contact_phone,
-                # full_location are stored in job dict and saved by save_job_posting()
-                # if those columns exist in the DB schema.
-                # If they don't exist yet, save_job_posting() will ignore them
-                # (as long as it uses named column inserts, not SELECT *).
-            except Exception as e:
-                logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                    # taleo returns extra fields — store safely only if columns exist
+                    # salary_min, salary_max, salary_type, contact, contact_phone,
+                    # full_location are stored in job dict and saved by save_job_posting()
+                    # if those columns exist in the DB schema.
+                    # If they don't exist yet, save_job_posting() will ignore them
+                    # (as long as it uses named column inserts, not SELECT *).
+                except Exception as e:
+                    logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
+                                company, job.get("job_id"), e, exc_info=True)
 
         # ── Eightfold ─────────────────────────────────────────────────────────────
         if platform == "eightfold" and job.get("job_url"):
-            try:
-                job = ats_module.fetch_job_detail(job)
-            except Exception as e:
-                logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True)
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
+                                company, job.get("job_id"), e, exc_info=True)
 
         if (platform == "custom"
                 and job.get("job_url")
@@ -515,18 +526,19 @@ def _process_company(company_row, position, total):
                 except (json.JSONDecodeError, TypeError):
                     slug_info_cached = {}
             if slug_info_cached.get("detail"):
-                try:
-                    job = ats_module.fetch_job_detail(job, slug_info_cached)
-                    logger.debug(
-                        "Custom detail fetched for %r/%s desc_len=%d",
-                        company, job.get("job_id"),
-                        len(job.get("description", "") or ""),
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Custom fetch_job_detail failed %s/%s: %s",
-                        company, job.get("job_id"), e, exc_info=True,
-                    )
+                with sem:
+                    try:
+                        job = ats_module.fetch_job_detail(job, slug_info_cached)
+                        logger.debug(
+                            "Custom detail fetched for %r/%s desc_len=%d",
+                            company, job.get("job_id"),
+                            len(job.get("description", "") or ""),
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Custom fetch_job_detail failed %s/%s: %s",
+                            company, job.get("job_id"), e, exc_info=True,
+                        )
 
         if save_job_posting(job, status="new"):
             new_count += 1
@@ -945,7 +957,12 @@ def run_resolve_diagnostic(diagnostic_id=None, company=None):
         count = resolve_all_for_company(company)
         print(f"[OK] Resolved {count} diagnostic(s) for {company}")
     elif diagnostic_id is not None:
-        success = resolve_diagnostic(int(diagnostic_id))
+        try:
+            diagnostic_id = int(diagnostic_id)
+        except (TypeError, ValueError):
+            print("[ERROR] Diagnostic ID must be an integer.")
+            return
+        success = resolve_diagnostic(diagnostic_id)
         if success:
             print(f"[OK] Resolved diagnostic #{diagnostic_id}")
         else:

@@ -45,8 +45,15 @@ def test_company(company_name):
     try:
         jobs = fetch_jobs(slug_info, company_name)
 
-        from jobs.ats.custom_career import _fetch_page, _build_legacy_session, _warm_session, _extract_jobs_array
+        from jobs.ats.custom_career import (
+            _fetch_page,
+            _build_legacy_session,
+            _warm_session,
+            _extract_jobs_array,
+        )
         session, _ = _warm_session(slug_info, company_name)
+        if session is None:
+            session = _build_legacy_session(slug_info)
         raw = _fetch_page(session, slug_info, page=1, offset=0)
         jobs_raw = _extract_jobs_array(raw, slug_info)
         if jobs_raw:
