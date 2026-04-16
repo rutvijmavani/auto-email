@@ -151,33 +151,44 @@ def _make_patterns():
     ))
 
     # Oracle HCM — {slug}.fa.oraclecloud.com/hcmUI/.../sites/{site_id}
-    # Also handles regional variants:
-    #   hdpc.fa.us2.oraclecloud.com  (Goldman Sachs)
-    #   jpmc.fa.oraclecloud.com      (JPMorgan — no region)
+    # Also handles regional and OCS variants:
+    #   hdpc.fa.us2.oraclecloud.com           (Goldman Sachs — regional)
+    #   jpmc.fa.oraclecloud.com               (JPMorgan — no region)
+    #   fa-extu-saasfaprod1.fa.ocs.oraclecloud.com  (Akamai — OCS cluster)
+    #   fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com  (Nokia  — OCS cluster)
+    # Group layout:
+    #   1 = slug
+    #   2 = "ocs." when present (None otherwise) — stored as bool flag
+    #   3 = region (us2, eu1, ap1 …) or None
+    #   4 = site_id
     patterns.append((
         re.compile(
-            r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.fa\.(?:ocs\.)?(?:(us\d+|eu\d+|ap\d+)\.)?"
+            r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.fa\.(ocs\.)?(?:(us\d+|eu\d+|ap\d+)\.)?"
             r"oraclecloud\.com/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
             re.IGNORECASE
         ),
         "oracle_hcm",
         lambda m: json.dumps({
             "slug":   m.group(1).lower(),
-            "region": m.group(2).lower() if m.group(2) else "",
-            "site":   m.group(3).rstrip("/"),
+            "ocs":    m.group(2) is not None,   # True for .fa.ocs.oraclecloud.com
+            "region": m.group(3).lower() if m.group(3) else "",
+            "site":   m.group(4).rstrip("/"),
         }),
     ))
 
-    # iCIMS — careers-{slug}.icims.com/jobs
-    # Also: {slug}.icims.com/jobs
+    # iCIMS — careers-{slug}.icims.com/jobs  or  {slug}.icims.com/jobs
+    # The full subdomain is stored as the slug (including any careers-/career-
+    # prefix) because it is used verbatim when building iCIMS API URLs.
+    # e.g. careers-schwab.icims.com → slug "careers-schwab"
+    #      careers-charter.icims.com → slug "careers-charter"
     patterns.append((
         re.compile(
             r"((?:careers-)?[a-z0-9][a-z0-9\-]*[a-z0-9]|[a-z0-9]+)"
             r"\.icims\.com(?:/jobs|$)",
             re.IGNORECASE
         ),
-    "icims",
-    lambda m: m.group(1).lower(),
+        "icims",
+        lambda m: m.group(1).lower(),
     ))
     
     # Jobvite — jobs.jobvite.com/{slug}/job/{id}
