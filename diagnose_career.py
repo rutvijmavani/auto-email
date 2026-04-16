@@ -360,6 +360,31 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                     return
                 status = response.status
                 ct     = response.headers.get("content-type", "")
+
+                # Check if response is worth processing before awaiting body
+                content_length = response.headers.get("content-length")
+                if content_length and int(content_length) < 50:
+                    return
+
+                # Only await body for JSON/XHR responses or non-trivial payloads
+                ct_lower = ct.lower()
+                is_json_ct = (
+                    "application/json" in ct_lower or
+                    "+json" in ct_lower or
+                    "/json" in ct_lower or
+                    "xhr" in ct_lower
+                )
+                has_meaningful_size = (
+                    not content_length or int(content_length) >= 50
+                )
+
+                if not (is_json_ct or has_meaningful_size):
+                    return
+
+                # Skip non-success status codes
+                if status < 200 or status >= 400:
+                    return
+
                 body   = await response.body()
                 if not body or len(body) < 50:
                     return
