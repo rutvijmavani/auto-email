@@ -213,12 +213,13 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit
     """
-    global _closed
-    with _queue_lock:
-        if _closed:
-            return
-        q = _get_write_queue()
-    q.put({
+    # _closed is a plain bool — reading it is atomic under CPython's GIL.
+    # No lock needed here: _get_write_queue() handles its own thread-safe
+    # initialization internally via _queue_lock, and calling it while
+    # already holding _queue_lock would deadlock (Lock is not reentrant).
+    if _closed:
+        return
+    _get_write_queue().put({
         "date":        date.today().isoformat(),
         "platform":    platform,
         "status_code": status_code,
