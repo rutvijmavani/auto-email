@@ -2645,14 +2645,15 @@ class TestICIMSFetch(unittest.TestCase):
         self.assertIsNone(_extract_posted_date("No date here"))
 
     def test_icims_pattern_matches_careers_prefix(self):
-        """iCIMS URL pattern handles careers- prefix."""
+        """iCIMS URL pattern stores the full subdomain as slug (including
+        careers- prefix) so downstream iCIMS API calls use it verbatim."""
         from jobs.ats.patterns import match_ats_pattern
         result = match_ats_pattern(
             "https://careers-schwab.icims.com/jobs/search"
         )
         self.assertIsNotNone(result)
         self.assertEqual(result["platform"], "icims")
-        self.assertEqual(result["slug"], "schwab")
+        self.assertEqual(result["slug"], "careers-schwab")
 
     def test_icims_pattern_matches_plain_subdomain(self):
         """iCIMS URL pattern handles plain subdomain."""

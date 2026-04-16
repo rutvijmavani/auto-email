@@ -46,7 +46,10 @@ def _ensure_writer_running():
     t = threading.Thread(
         target=_writer_loop,
         args=(_write_queue,),
-        daemon=False,   # non-daemon: process waits for final flush
+        daemon=True,    # daemon: Python won't wait for this thread at shutdown;
+                        # atexit.register(flush) sends the sentinel and joins
+                        # the thread while it is still alive — before daemon
+                        # threads are killed — so data is not lost on exit.
         name="api_health_writer",
     )
     _writer_thread = t

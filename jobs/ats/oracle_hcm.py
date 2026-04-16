@@ -17,16 +17,23 @@ from jobs.ats.base import fetch_json
 # Parameters are semicolon-separated key=value pairs inside the finder value
 #
 # URL variants:
-#   Standard: {slug}.fa.oraclecloud.com          (JPMorgan)
-#   Regional: {slug}.fa.{region}.oraclecloud.com (Goldman Sachs → us2)
-def _build_oracle_url(slug, region, site_id, limit, offset):
-    """Build Oracle HCM API URL handling optional region subdomain.
+#   Standard: {slug}.fa.oraclecloud.com                (JPMorgan)
+#   Regional: {slug}.fa.{region}.oraclecloud.com       (Goldman Sachs → us2)
+#   OCS:      {slug}.fa.ocs.oraclecloud.com            (Akamai, Nokia)
+def _build_oracle_url(slug, region, site_id, limit, offset, ocs=False):
+    """Build Oracle HCM API URL handling optional region/OCS subdomain.
 
     IMPORTANT: limit and offset must be inside the finder value
     as semicolon-separated params, NOT as separate URL params.
     Verified via browser XHR inspection on jpmc.fa.oraclecloud.com
+
+    ocs=True  → host is {slug}.fa.ocs.oraclecloud.com  (OCS cluster tenants)
+    region    → host is {slug}.fa.{region}.oraclecloud.com (regional tenants)
+    neither   → host is {slug}.fa.oraclecloud.com
     """
-    if region:
+    if ocs:
+        host = f"{slug}.fa.ocs.oraclecloud.com"
+    elif region:
         host = f"{slug}.fa.{region}.oraclecloud.com"
     else:
         host = f"{slug}.fa.oraclecloud.com"
@@ -49,9 +56,11 @@ def _build_oracle_url(slug, region, site_id, limit, offset):
         f"finder={quote(finder)}"
     )
 
-def _build_careers_url(slug, region, site_id):
+def _build_careers_url(slug, region, site_id, ocs=False):
     """Build Oracle HCM careers page URL."""
-    if region:
+    if ocs:
+        host = f"{slug}.fa.ocs.oraclecloud.com"
+    elif region:
         host = f"{slug}.fa.{region}.oraclecloud.com"
     else:
         host = f"{slug}.fa.oraclecloud.com"
@@ -160,6 +169,7 @@ def fetch_jobs(slug_info, company):
     slug    = slug_info.get("slug", "")
     site_id = slug_info.get("site", "")
     region  = slug_info.get("region", "")
+    ocs     = slug_info.get("ocs", False)
 
     if not slug or not site_id:
         return []
@@ -169,7 +179,7 @@ def fetch_jobs(slug_info, company):
     limit    = 200
 
     while True:
-        url  = _build_oracle_url(slug, region, site_id, limit, offset)
+        url  = _build_oracle_url(slug, region, site_id, limit, offset, ocs=ocs)
         data = fetch_json(url, platform="oracle_hcm")  # tracked for api_health
         if not data:
             break
@@ -216,11 +226,12 @@ def _normalize(job, company, slug_info, slug, site_id):
             job.get("ExternalJobId", "") or \
             job.get("RequisitionId", "")
     region  = slug_info.get("region", "") if isinstance(slug_info, dict) else ""
+    ocs     = slug_info.get("ocs", False) if isinstance(slug_info, dict) else False
     job_url = (
-        f"{_build_careers_url(slug, region, site_id).rstrip('/jobs')}"
+        f"{_build_careers_url(slug, region, site_id, ocs=ocs).rstrip('/jobs')}"
         f"/job/{req_id}"
         if req_id else
-        _build_careers_url(slug, region, site_id)
+        _build_careers_url(slug, region, site_id, ocs=ocs)
     )
 
     return {
