@@ -63,7 +63,9 @@ ATS_REGISTRY = {
     "sitemap":         sitemap,
     "successfactors":  successfactors,
     "google":          google,
-    "apple":           sitemap,       # Apple uses sitemap-based scraping
+    "taleo":           taleo,
+    "eightfold":       eightfold,
+    "jibe":            jibe,
     "custom":          custom_career, # Universal custom ATS engine
 }
 
@@ -194,7 +196,10 @@ def _store_and_return(company, result):
         print(f"   [INFO] {company} uses {platform} "
               f"(not yet supported)")
 
-    _store_detection(company, platform, slug)
+    stored_platform = (
+        platform if platform in ATS_REGISTRY else ATS_STATUS_UNSUPPORTED
+    )
+    _store_detection(company, stored_platform, slug)
 
     try:
         from db.ats_companies import mark_from_detection
@@ -214,7 +219,7 @@ def _store_and_return(company, result):
         "status":       status,
         "platform":     platform,
         "slug":         slug,
-        "ats_platform": platform,
+        "ats_platform": stored_platform,
         "ats_slug":     slug,
     }
 
@@ -466,10 +471,11 @@ def override_ats(company, platform, slug):
     """Manually override ATS detection. Never auto-re-detected."""
     logger.info("Manual override: %r → %s", company, platform)
     try:
-        slug_data = json.loads(slug) if slug and slug.startswith("{") else {}
+        parsed_json = bool(slug and slug.lstrip().startswith("{"))
+        slug_data = json.loads(slug) if parsed_json else {}
         slug_data["_manual"]   = True
         slug_data["_platform"] = platform
-        if not slug_data.get("slug"):
+        if not parsed_json and not slug_data.get("slug"):
             slug_data["slug"] = slug
         slug_str = json.dumps(slug_data)
     except Exception:

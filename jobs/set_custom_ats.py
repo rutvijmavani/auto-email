@@ -284,9 +284,13 @@ def _replay_listing(session, slug_info, company):
     # _is_json imported from jobs.utils
 
     try:
-        content_type = slug_info.get("headers", {}).get(
-            "content-type", ""
-        ).lower()
+        # Forward headers from the original curl (auth, CSRF, API-key headers).
+        # Filter out transport/hop-by-hop headers that must not be replayed.
+        raw_headers = slug_info.get("headers", {})
+        extra_headers = {k: v for k, v in raw_headers.items()
+                         if k not in SKIP_HEADERS}
+
+        content_type = raw_headers.get("content-type", "").lower()
 
         if method == "POST":
             if "form" in content_type or (body and not _is_json(body)):
@@ -294,6 +298,7 @@ def _replay_listing(session, slug_info, company):
                     slug_info["url"],
                     params=params,
                     data=body,
+                    headers=extra_headers,
                     timeout=20,
                 )
             else:
@@ -302,12 +307,14 @@ def _replay_listing(session, slug_info, company):
                     params=params,
                     json=json.loads(body) if body and _is_json(body) else None,
                     data=body if body and not _is_json(body) else None,
+                    headers=extra_headers,
                     timeout=20,
                 )
         else:
             resp = session.get(
                 slug_info["url"],
                 params=params,
+                headers=extra_headers,
                 timeout=20,
             )
 
@@ -387,12 +394,12 @@ def _flag_parse_failure(company, step_name, error_msg, raw_data):
     try:
         from db.custom_ats_diagnostics import (
             flag_diagnostic_once, BLOCKED, UNKNOWN_PATTERN,
-            STEP_STRUCTURE_DETECT, STEP_LISTING_FETCH
+            STEP_STRUCTURE_DETECT, STEP_LISTING_FETCH, STEP_DETAIL_FETCH
         )
 
         step_map = {
             "listing":   STEP_LISTING_FETCH,
-            "detail":    STEP_LISTING_FETCH,
+            "detail":    STEP_DETAIL_FETCH,
             "replay":    STEP_LISTING_FETCH,
             "structure": STEP_STRUCTURE_DETECT,
         }

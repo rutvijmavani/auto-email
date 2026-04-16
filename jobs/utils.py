@@ -69,7 +69,7 @@ def is_valid_url(url):
     """Return True if url starts with http:// or https://."""
     if not url:
         return False
-    return bool(re.match(r"https?://", url.strip()))
+    return urlparse(url.strip()).scheme.lower() in {"http", "https"}
 
 
 def domain_from_url(url):
@@ -304,7 +304,7 @@ def extract_url_from_value(val, base_url=""):
     if not isinstance(val, str) or not val.strip():
         return ""
     val = val.strip()
-    if val.startswith("http"):
+    if urlparse(val).scheme.lower() in {"http", "https"}:
         return val
     if base_url:
         return urljoin(base_url, val)

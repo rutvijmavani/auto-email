@@ -26,7 +26,8 @@ Public API:
 import re
 import json
 import shlex
-from urllib.parse import urlparse, parse_qs, urlunparse, quote_plus, unquote_plus
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlunparse, quote_plus, unquote_plus
+from jobs.utils import SKIP_HEADERS
 
 
 # ─────────────────────────────────────────
@@ -290,7 +291,7 @@ def extract_job_id_from_url(job_url, detail_config):
             return m.group(1)
 
     elif pattern_name == "after_slug":
-        m = re.search(r'/[a-z0-9\-]+-(\d{5,})(?:\?|$)', path)
+        m = re.search(r'/[a-z0-9\-]+-(\d{5,})(?:/|\?|$)', path)
         if m:
             return m.group(1)
 
@@ -523,12 +524,39 @@ def _detect_job_id_in_url(url, params, body=None):
 
     # Check POST body for id field (including nested structures)
     if body:
+        # Try JSON body first
         try:
             data = json.loads(body)
             result, field, loc = _find_id_in_nested_structure(data)
             if result:
                 return result, "body_field", loc
         except (json.JSONDecodeError, TypeError):
+            pass
+
+        # Fall back to form-encoded body (e.g. Meta GraphQL uses
+        # application/x-www-form-urlencoded with a JSON "variables" value)
+        try:
+            fields = dict(parse_qsl(body, keep_blank_values=False))
+            if fields:
+                # First: look for direct ID fields in the top-level form params
+                norm_fields = {k.lower().replace("_", "").replace("-", ""): v
+                               for k, v in fields.items()}
+                for param in KNOWN_ID_PARAMS:
+                    norm = param.replace("_", "").replace("-", "")
+                    if norm in norm_fields:
+                        return norm_fields[norm], "body_field", "body"
+
+                # Second: look for values that are JSON strings (e.g. variables)
+                for k, v in fields.items():
+                    if v and v.strip().startswith(("{", "[")):
+                        try:
+                            nested = json.loads(v)
+                            result, field, loc = _find_id_in_nested_structure(nested)
+                            if result:
+                                return result, "body_field", "body"
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+        except Exception:
             pass
 
     return None, None, None
@@ -858,7 +886,9 @@ def _parse_header(s, headers):
     if ':' in s:
         name, _, value = s.partition(':')
         key = name.strip().lower()
-        if not key.startswith(':'):
+        # Drop HTTP/2 pseudo-headers (any :xxx) and hop-by-hop transport
+        # headers (host, content-length, etc.) — replaying them causes errors.
+        if not key.startswith(':') and key not in SKIP_HEADERS:
             headers[key] = value.strip()
 
 

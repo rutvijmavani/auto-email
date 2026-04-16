@@ -1026,10 +1026,18 @@ def main():
         from jobs.job_monitor import run_resolve_diagnostic
         non_flag_args = [a for a in args if not a.startswith("--")]
         if not non_flag_args:
-            print('[ERROR] Usage: --resolve-diagnostic <id> [CompanyName]')
+            print('[ERROR] Usage: --resolve-diagnostic <id> | --resolve-diagnostic "CompanyName"')
             return
-        diagnostic_id = non_flag_args[0]
-        company       = non_flag_args[1] if len(non_flag_args) > 1 else None
+        diagnostic_id = None
+        company = None
+        if len(non_flag_args) == 1:
+            if non_flag_args[0].isdigit():
+                diagnostic_id = non_flag_args[0]
+            else:
+                company = non_flag_args[0]
+        else:
+            diagnostic_id = non_flag_args[0]
+            company = non_flag_args[1]
         run_resolve_diagnostic(diagnostic_id=diagnostic_id, company=company)
         return
 

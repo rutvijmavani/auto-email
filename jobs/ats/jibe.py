@@ -76,9 +76,11 @@ def fetch_jobs(slug, company):
         logger.debug("Jibe page %d: %d jobs for %r (total so far: %d)",
                      page, len(jobs_page), company, len(all_jobs))
 
-        total = data.get("totalCount", 0)
+        total = data.get("totalCount")
         offset += PAGE_SIZE
-        if offset >= total:
+        if isinstance(total, int) and total > 0 and offset >= total:
+            break
+        if len(jobs_page) < PAGE_SIZE:
             break
 
         time.sleep(0.3)

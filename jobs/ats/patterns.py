@@ -188,25 +188,25 @@ def _make_patterns():
         lambda m: m.group(1).lower(),
     ))
 
-    # # SAP SuccessFactors — {company}.jobs2web.com
-    # patterns.append((
-    #     re.compile(
-    #         r"([a-z0-9]+)\.jobs2web\.com",
-    #         re.IGNORECASE
-    #     ),
-    #     "successfactors",
-    #     lambda m: m.group(1).lower(),
-    # ))
+    # SAP SuccessFactors — {company}.jobs2web.com
+    patterns.append((
+        re.compile(
+            r"([a-z0-9]+)\.jobs2web\.com",
+            re.IGNORECASE
+        ),
+        "successfactors",
+        lambda m: m.group(1).lower(),
+    ))
 
-    # # SAP SuccessFactors — {company}.successfactors.com/careers
-    # patterns.append((
-    #     re.compile(
-    #         r"([a-z0-9]+)\.successfactors\.com/careers",
-    #         re.IGNORECASE
-    #     ),
-    #     "successfactors",
-    #     lambda m: m.group(1).lower(),
-    # ))
+    # SAP SuccessFactors — {company}.successfactors.com/careers
+    patterns.append((
+        re.compile(
+            r"([a-z0-9]+)\.successfactors\.com/careers",
+            re.IGNORECASE
+        ),
+        "successfactors",
+        lambda m: m.group(1).lower(),
+    ))
 
     # Avature hosted — {slug}.avature.net
     patterns.append((
