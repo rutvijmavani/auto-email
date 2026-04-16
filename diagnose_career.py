@@ -153,7 +153,8 @@ def classify_value(field_name, value):
         if fl in DATE_HINTS:
             return "date_hint"
         return "short_string"
-
+    if isinstance(value, bool):
+        return "bool"
     if isinstance(value, int):
         if value >= UNIX_TS_MS_MIN:
             return "date_ms"

@@ -37,7 +37,7 @@ def _get_client():
 
 PRIMARY_MODEL = "gemini-2.5-flash-lite"
 FALLBACK_MODEL = "gemini-2.5-flash"
-FIELD_MAP_MODEL = "gemini-2.0-flash-exp"
+FIELD_MAP_MODEL = "gemma-4-31b-it"
 CACHE_TTL_DAYS = 21
 
 
@@ -411,7 +411,10 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
                 model=FIELD_MAP_MODEL,
                 contents=prompt,
             )
-            print(f"[AI DEBUG] response received: {response.text[:200]!r}")
+            logger.debug(
+                "detect_field_map_with_ai: response received (chars=%d)",
+                len(response.text or "")
+            )
             increment_usage(FIELD_MAP_MODEL)
 
             text  = response.text.strip()
@@ -432,12 +435,19 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
             field_map    = None
             job_url_template = None
 
-            if data.get("title"):
-                title_val = _walk_path(first_job_raw, data["title"])
+            title_path = data.get("title")
+            if isinstance(title_path, str) and title_path.strip():
+                title_val = _walk_path(first_job_raw, title_path)
                 if title_val is not None:
                     validated = {}
                     for k, path in data.items():
                         if k in (TOTAL_KEY, TEMPLATE_KEY) or path is None:
+                            continue
+                        if not isinstance(path, str) or not path.strip():
+                            logger.debug(
+                                "detect_field_map_with_ai: non-string path for %r in %r — dropping",
+                                k, company
+                            )
                             continue
                         val = _walk_path(first_job_raw, path)
                         if val is not None:
@@ -458,8 +468,9 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
 
             # Validate total_field path exists in full_response
             total_field = None
-            if full_response and data.get(TOTAL_KEY):
-                path  = data[TOTAL_KEY]
+            total_candidate = data.get(TOTAL_KEY)
+            if full_response and isinstance(total_candidate, str) and total_candidate.strip():
+                path  = total_candidate
                 parts = path.lstrip(".").split(".")
                 obj   = full_response
                 valid = True
