@@ -260,6 +260,7 @@ def run():
 # Logic is identical to the original sequential loop body.
 # Only difference: uses semaphore instead of between_companies_delay().
 # ─────────────────────────────────────────
+_REDETECT_SEMAPHORE = threading.Semaphore(1)
 
 def _process_company(company_row, position, total):
     """
@@ -293,7 +294,8 @@ def _process_company(company_row, position, total):
         logger.info("Re-detection triggered for %r (domain=%s)",
                     company, domain)
         try:
-            detection = detect_ats(company, domain=domain)
+            with _REDETECT_SEMAPHORE:
+                detection = detect_ats(company, domain=domain)
             platform  = detection["ats_platform"]
             slug      = detection["ats_slug"]
         except Exception as e:

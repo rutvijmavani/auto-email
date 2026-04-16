@@ -640,7 +640,10 @@ def _extract_graphql_config(parsed):
                 config["stable_params"] = {
                     k: v for k, v in data.items()
                     if k not in ("variables", "query", "lsd", "extensions")
-                    and not k.startswith("__")
+                    and (
+                        not k.startswith("__")
+                        or k in GRAPHQL_SEMI_STABLE_PARAMS
+                    )
                 }
                 return config
         except (json.JSONDecodeError, TypeError):

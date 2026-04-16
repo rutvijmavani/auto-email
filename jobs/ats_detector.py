@@ -23,9 +23,9 @@ from db.connection import get_conn
 from logger import get_logger
 logger = get_logger(__name__)
 
-from jobs.ats import greenhouse, lever, ashby, smartrecruiters, workday
-from jobs.ats import oracle_hcm, icims, jobvite, avature
-from jobs.ats import phenom, talentbrew, sitemap, successfactors, google
+from jobs.ats import (greenhouse, lever, ashby, smartrecruiters, workday)
+from jobs.ats import (oracle_hcm, icims, jobvite, avature)
+from jobs.ats import (phenom, talentbrew, sitemap, successfactors, google)
 from jobs.ats import custom_career   # ← universal custom ATS engine
 from config import (
     ATS_STATUS_DETECTED,
@@ -479,7 +479,11 @@ def override_ats(company, platform, slug):
             slug_data["slug"] = slug
         slug_str = json.dumps(slug_data)
     except Exception:
-        slug_str = slug
+        slug_str = json.dumps({
+            "_manual": True,
+            "_platform": platform,
+            "slug": slug,
+        })
 
     conn = get_conn()
     try:

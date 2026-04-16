@@ -19,9 +19,15 @@ RPM_LIMITS = {
 
 
 def get_conn():
-    """Returns a connection using current DB_FILE value (supports test overrides)."""
+    """Returns a connection using current DB_FILE value (supports test overrides).
+
+    timeout=30: when a concurrent writer holds the lock, sqlite3 retries for
+    up to 30 seconds before raising OperationalError.  The default (5 s) is
+    too short when 20 _process_company threads write simultaneously even under
+    WAL mode (WAL serialises concurrent writers, not concurrent readers).
+    """
     import db.connection as _self
-    conn = sqlite3.connect(_self.DB_FILE)
+    conn = sqlite3.connect(_self.DB_FILE, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row

@@ -62,8 +62,10 @@ def run(company, curl_string, detail_curl=None , sample_job_url=None):
     # Even if parsing fails, the original curl is preserved in DB
     # for debugging via --diagnostics.
     print("[0/5] Storing raw curl(s) in DB...")
-    _store_raw_curls(company, curl_string, detail_curl)
-    print("  [OK] Raw curl(s) stored")
+    if _store_raw_curls(company, curl_string, detail_curl):
+        print("  [OK] Raw curl(s) stored")
+    else:
+        print("  [WARNING] Could not store raw curl(s); diagnostics will be limited")
 
     # ── Step 1: Parse listing curl ────────────────────────────────
     print("\n[1/5] Parsing listing curl...")
@@ -382,8 +384,10 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
             )
 
         conn.commit()
+        return True
     except Exception as e:
         logger.warning("could not store raw curls for %r: %s", company, e)
+        return False
     finally:
         if conn:
             conn.close()

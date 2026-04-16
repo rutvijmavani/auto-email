@@ -134,20 +134,20 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
         if step and pattern_hint:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? AND step = ?
+                WHERE company = ? COLLATE NOCASE AND step = ?
                   AND pattern_hint = ? AND resolved = 0
                 LIMIT 1
             """, (company, step, pattern_hint)).fetchone()
         elif step:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? AND step = ? AND resolved = 0
+                WHERE company = ? COLLATE NOCASE AND step = ? AND resolved = 0
                 LIMIT 1
             """, (company, step)).fetchone()
         else:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? AND resolved = 0
+                WHERE company = ? COLLATE NOCASE AND resolved = 0
                 LIMIT 1
             """, (company,)).fetchone()
         return row is not None

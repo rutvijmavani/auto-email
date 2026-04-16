@@ -388,6 +388,11 @@ def _replay_request(slug_info, company):
             print(f"       [GraphQL] body fields: {body_preview}")
 
     try:
+        raw_headers = slug_info.get("headers", {})
+        extra_headers = {
+            k: v for k, v in raw_headers.items()
+            if k.lower() not in SKIP_HEADERS
+        }
         if method == "POST":
             content_type = slug_info.get("headers", {}).get(
                 "content-type", ""
@@ -399,6 +404,7 @@ def _replay_request(slug_info, company):
                     slug_info["url"],
                     params=params,
                     data=body,
+                    headers=extra_headers,
                     timeout=20,
                 )
             else:
@@ -407,12 +413,14 @@ def _replay_request(slug_info, company):
                     params=params,
                     json=json.loads(body) if body and _is_json(body) else None,
                     data=body if body and not _is_json(body) else None,
+                    headers=extra_headers,
                     timeout=20,
                 )
         else:
             resp = session.get(
                 slug_info["url"],
                 params=params,
+                headers=extra_headers,
                 timeout=20,
             )
 
