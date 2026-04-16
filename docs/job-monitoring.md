@@ -39,7 +39,7 @@ effectiveness. Maximum reliability is required.
 ### Data Flow
 
 ```text
-prospects.txt (137 companies)
+prospects.txt (164 companies)
          ↓
 --import-prospects
          ↓
@@ -71,6 +71,36 @@ Email with PDF attachment (7 AM daily) → mark_postings_digested()
          ↓
 HTTP verification of stale URLs → 404 → status='filled' → deleted after 7 days
 ```
+
+---
+
+## Parallel Processing
+
+Companies are processed concurrently using `ThreadPoolExecutor`:
+
+```text
+config.py:
+  MONITOR_MAX_WORKERS = 20          # total parallel company workers
+  MONITOR_PLATFORM_CONCURRENCY = {  # per-ATS domain limits
+      "workday":         20,         # own subdomain per company — safe to max
+      "greenhouse":       5,         # all share boards-api.greenhouse.io
+      "lever":            5,         # all share api.lever.co
+      "smartrecruiters":  5,         # all share api.smartrecruiters.com
+      "ashby":            8,         # all share api.ashbyhq.com
+      "oracle_hcm":       8,         # per-tenant subdomain
+      "icims":            8,
+      "talentbrew":       5,
+      "phenom":           5,
+      "jobvite":          5,
+      "successfactors":   3,         # slow avg (7161ms) — keep low
+      "avature":          3,
+      "custom":          10,         # varies per company
+  }
+```
+
+Stats (companies monitored, failures, new jobs) are accumulated
+thread-safely via `threading.Lock`. If Workday-heavy portfolios see
+increased 429s, reduce `MONITOR_MAX_WORKERS` to 10 in `config.py`.
 
 ---
 
@@ -177,19 +207,28 @@ Cost: 2 queries per company. 2500 free credits on signup covers
 
 Expected coverage: additional ~10%.
 
-### Phase 4 — Unknown / Custom ATS
+### Phase 4 — Custom Career Page Engine
 
-Companies known to use fully custom ATS platforms are stored
-immediately without consuming Serper credits:
+Companies using non-standard or proprietary ATS platforms are handled
+by the universal custom career page scraper (`jobs/ats/custom_career.py`).
+The ATS config is captured once via `--set-custom-ats` or `--sync-prospective`
+by supplying a DevTools curl command for the job listing endpoint.
 
+Auto-detected session strategies (cached in `ats_slug`):
 ```text
-KNOWN_CUSTOM_ATS = {
-    Amazon, Apple, Google, Meta,
-    Microsoft, Netflix, Uber, Lyft
-}
+cookie_only   — career page GET sets session cookies automatically
+                (Amazon, Tesla, Apple, Wayfair)
+csrf_token    — CSRF token extracted from HTML/meta/JS, injected into headers
+                (Microsoft x-csrf-token, Wayfair CSN_CSRF)
+bearer_token  — JWT extracted from page JS or __NEXT_DATA__
+graphql       — Meta-style: lsd + doc_id + __rev rebuilt fresh on every run
+url_session   — Session token embedded in URL query params (Siemens ste_sid)
+none          — No auth signals; proceeds without credentials
 ```
 
-Any remaining undetected companies stored as `unknown` and
+Companies known to use fully custom ATS platforms are stored as
+`platform='custom'` immediately without consuming Serper credits.
+Any remaining undetected companies are stored as `unknown` and
 retried after 14 consecutive empty days.
 
 ### Detection Accuracy
@@ -360,12 +399,18 @@ Ashby:           ~15 companies  (100% confidence via Google ✓)
 SmartRecruiters: ~30 companies  (verified via Google ✓)
 Workday:         ~20 companies  (slug+path via Google ✓)
 Oracle HCM:      ~10 companies  (slug+site_id via Google ✓)
+iCIMS:           ~8  companies  (subdomain detected)
+Avature:         ~6  companies  (sitemap-based detection)
+Phenom:          ~6  companies  (cdn.phenompeople.com fingerprint)
+TalentBrew:      ~3  companies  (tbcdn.talentbrew.com fingerprint)
+SuccessFactors:  ~3  companies  (successfactors.com/career?company= pattern)
+Jobvite:         ~2  companies  (jobs.jobvite.com URL pattern)
+Custom:          ~4  companies  (curl-captured, session-refreshed)
 ─────────────────────────────────────────────────────────
-Via Google+API:  ~135 companies (99%)
+Via detection:   ~167 companies
 
-Unknown (~2%):
-  → Custom career pages (Meta, Google, Apple, Amazon)
-  → Email notification → manual --override
+Unknown (<2%):
+  → Store as 'unknown' → email notification → manual --override
 ```
 
 ---
@@ -1237,13 +1282,13 @@ data/digests/jobs_digest_2026-03-04.pdf
 Page 1 — Summary + Pipeline Health
   ┌────────────────────────────────────────┐
   │  Job Digest · March 4, 2026           │
-  │  Companies monitored: 137             │
+  │  Companies monitored: 164             │
   │  New jobs found: 47                   │
   │  Matching your profile: 23            │
   ├────────────────────────────────────────┤
   │  PIPELINE HEALTH                      │
-  │  Coverage:    129/137 (94%) ✓         │
-  │  ATS Known:   119/137 (87%) ✓         │
+  │  Coverage:    155/164 (95%) ✓         │
+  │  ATS Known:   143/164 (87%) ✓         │
   │  API Failures: 3  ⚠ (Stripe, Linear) │
   │  Match Rate:   18% ✓                  │
   ├────────────────────────────────────────┤

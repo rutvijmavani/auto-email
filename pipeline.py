@@ -2,31 +2,44 @@
 pipeline.py — Master orchestrator for the recruiter outreach pipeline.
 
 Daily schedule:
-  Evening:   python pipeline.py --sync-forms    → pull form responses + scrape JD
-  Night:     python pipeline.py --find-only     → find recruiters + generate AI content
-  Weekly:    python pipeline.py --verify-only   → verify recruiters + report under-stocked
-  Morning:   python pipeline.py --outreach-only → send emails (9 AM - 11 AM window)
+  Evening:   python pipeline.py --sync-forms       → pull form responses + scrape JD
+  Evening:   python pipeline.py --sync-prospective → sync prospective company form
+  Night:     python pipeline.py --find-only        → find recruiters + generate AI content
+  Weekly:    python pipeline.py --verify-only      → verify recruiters + report under-stocked
+  Morning:   python pipeline.py --outreach-only    → send emails (9 AM - 11 AM window)
 
   Or all at once:
              python pipeline.py
 
 CLI flags:
-  --sync-forms    pull Google Form responses → insert into DB + scrape JD
-  --add           add a single job application interactively
-  --find-only           scrape CareerShift + generate AI content + quota health check
-  --verify-only         verify all active recruiters + report under-stocked companies
-  --import-prospects    bulk import prospective companies from prospects.txt
-  --prospects-status    show prospective pipeline status summary
-  --monitor-jobs        scan all companies for new job postings + send PDF digest
-  --detect-ats          auto-detect ATS for all undetected companies
-  --detect-ats "Name"   force re-detect ATS for specific company
-  --monitor-status      show job monitoring status summary
-  --weekly-summary      send Monday weekly summary email
-  --outreach-only       schedule + send outreach emails
-  --quota-report        check quota health and send alert email if needed
-  --performance-report  check pipeline performance metrics + send alert if needed
-  --reactivate "Name"   reactivate an exhausted application
-  --sync-prospective    
+  --sync-forms                pull Google Form responses → insert into DB + scrape JD
+  --sync-prospective          pull prospective company form → detect ATS + store config
+  --add                       add a single job application interactively
+  --find-only                 scrape CareerShift + generate AI content + quota health check
+  --verify-only               verify all active recruiters + report under-stocked companies
+  --import-prospects          bulk import prospective companies from prospects.txt
+  --prospects-status          show prospective pipeline status summary
+  --monitor-jobs              scan all companies for new job postings + send PDF digest
+  --detect-ats                auto-detect ATS for all undetected companies
+  --detect-ats "Name"         force re-detect ATS for specific company
+  --detect-ats "Co" --override <platform> <slug>
+                              manually set ATS for a company (permanent)
+  --detect-ats --batch        detect next batch only (respects Serper quota)
+  --monitor-status            show job monitoring status summary
+  --verify-filled             verify stale job URLs → mark filled positions
+  --set-custom-ats "Co" --curl "curl '...'"
+                              capture custom ATS config from DevTools curl
+  --set-custom-ats "Co" --curl "curl '...'" --detail-curl "curl '...'"
+                              capture listing + detail curl for full description fetch
+  --diagnostics               show open custom ATS diagnostic issues
+  --resolve-diagnostic <id>   mark a diagnostic as resolved by ID
+  --resolve-diagnostic <id> "CompanyName"
+                              resolve all open diagnostics for a company
+  --weekly-summary            send Monday weekly summary email
+  --outreach-only             schedule + send outreach emails
+  --quota-report              check quota health + send alert email if needed
+  --performance-report        check pipeline performance metrics + send alert if needed
+  --reactivate "Name"         reactivate an exhausted application
 """
 
 import os
@@ -1003,6 +1016,30 @@ def main():
         from jobs.job_monitor import run_monitor_status
         run_monitor_status()
         return
+    
+    if "--diagnostics" in args:
+        from jobs.job_monitor import run_diagnostics
+        run_diagnostics()
+        return
+    
+    if "--resolve-diagnostic" in args:
+        from jobs.job_monitor import run_resolve_diagnostic
+        non_flag_args = [a for a in args if not a.startswith("--")]
+        if not non_flag_args:
+            print('[ERROR] Usage: --resolve-diagnostic <id> | --resolve-diagnostic "CompanyName"')
+            return
+        diagnostic_id = None
+        company = None
+        if len(non_flag_args) == 1:
+            if non_flag_args[0].isdigit():
+                diagnostic_id = non_flag_args[0]
+            else:
+                company = non_flag_args[0]
+        else:
+            diagnostic_id = non_flag_args[0]
+            company = non_flag_args[1]
+        run_resolve_diagnostic(diagnostic_id=diagnostic_id, company=company)
+        return
 
     if "--quota-report" in args:
         run_quota_report()
@@ -1022,6 +1059,27 @@ def main():
     if "--verify-filled" in args:
         from jobs.fill_verifier import run as verify_filled_run
         verify_filled_run()
+        return
+    
+    if "--set-custom-ats" in args:
+        from jobs.set_custom_ats import run as run_set_custom_ats
+        curl_idx      = args.index("--curl") if "--curl" in args else None
+        detail_idx    = args.index("--detail-curl") if "--detail-curl" in args else None
+        company_args  = (
+            [a for a in args[:curl_idx] if not a.startswith("--")]
+            if curl_idx is not None else []
+        )
+        company       = company_args[0] if company_args else None
+        curl_string   = (args[curl_idx + 1]
+                         if curl_idx is not None and curl_idx + 1 < len(args)
+                         else None)
+        detail_curl   = (args[detail_idx + 1]
+                         if detail_idx is not None and detail_idx + 1 < len(args)
+                         else None)
+        if not company or not curl_string:
+            print('[ERROR] Usage: --set-custom-ats "Company" --curl "curl ..."')
+            return
+        run_set_custom_ats(company, curl_string, detail_curl=detail_curl)
         return
 
     # Full pipeline

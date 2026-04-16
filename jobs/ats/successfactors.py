@@ -31,6 +31,7 @@
 # Slug format stored in DB (JSON):
 #   {"slug": "Ericsson", "dc": "2", "region": "eu"}
 #   {"slug": "netappinc", "dc": "4", "region": "com"}
+#   {"slug": "SAP", "dc": "5", "region": "eu", "path": "/careers"}
 
 import re
 import json
@@ -65,40 +66,54 @@ def detect(company):
     Try to detect if company uses SuccessFactors XML feed.
 
     Probes all DC/region combinations with each slug variant.
+    Tries both /career and /careers path variants per probe.
     Validates by checking XML response contains job data.
 
     Returns (slug_info dict, sample_jobs) or (None, None).
     slug_info = {"slug": "ericsson", "dc": "2", "region": "eu"}
+    slug_info = {"slug": "SAP", "dc": "5", "region": "eu", "path": "/careers"}
     """
     for slug in slugify(company):
         for dc in DC_VARIANTS:
             for region in REGIONS:
-                url  = _feed_url(slug, dc, region)
-                resp = fetch_html(url, platform="successfactors", track=False)
-                if resp is None:
-                    continue
+                # Try both path variants — /career (most tenants) and
+                # /careers (SAP and some other tenants).
+                # Store "path" in slug_info only when non-default (/careers)
+                # so existing slug_infos without "path" keep working.
+                for path in ("/career", "/careers"):
+                    url  = _feed_url(slug, dc, region, path=path)
+                    resp = fetch_html(url, platform="successfactors",
+                                      track=False)
+                    if resp is None:
+                        continue
 
-                # Must be XML — HTML response means wrong tenant/slug
-                ctype = resp.headers.get("content-type", "").lower()
-                if "html" in ctype and "xml" not in ctype:
-                    continue
-                if not resp.text.strip().startswith("<?xml"):
-                    continue
+                    # Must be XML — HTML response = wrong tenant/slug/path
+                    ctype = resp.headers.get("content-type", "").lower()
+                    if "html" in ctype and "xml" not in ctype:
+                        continue
+                    if not resp.text.strip().startswith("<?xml"):
+                        continue
 
-                soup = BeautifulSoup(resp.text, "xml")
-                jobs = soup.find_all("Job")
-                if not jobs:
-                    continue
+                    soup = BeautifulSoup(resp.text, "xml")
+                    jobs = soup.find_all("Job")
+                    if not jobs:
+                        continue
 
-                # Validate company match using first job title + slug
-                first_title = jobs[0].find("JobTitle")
-                text        = (first_title.get_text(strip=True) if first_title else "") + slug
-                if not validate_company_match(text, company):
-                    continue
+                    # Validate company match using first job title + slug
+                    first_title = jobs[0].find("JobTitle")
+                    text        = (
+                        (first_title.get_text(strip=True) if first_title else "")
+                        + slug
+                    )
+                    if not validate_company_match(text, company):
+                        continue
 
-                slug_info = {"slug": slug, "dc": dc, "region": region}
-                sample    = [_normalize(j, company, slug_info) for j in jobs[:3]]
-                return slug_info, sample
+                    slug_info = {"slug": slug, "dc": dc, "region": region}
+                    if path != "/career":
+                        slug_info["path"] = path   # only store non-default
+                    sample = [_normalize(j, company, slug_info)
+                              for j in jobs[:3]]
+                    return slug_info, sample
 
     return None, None
 
@@ -116,7 +131,7 @@ def fetch_jobs(slug_info, company):
     This is Option A (all data in one call), not Option C.
 
     Args:
-        slug_info: dict with "slug", "dc", "region"
+        slug_info: dict with "slug", "dc", "region", and optionally "path"
                    or JSON string (stored in DB)
         company:   company name
 
@@ -140,7 +155,10 @@ def fetch_jobs(slug_info, company):
     if not all([slug, dc, region]):
         return []
 
-    url  = _feed_url(slug, dc, region)
+    # Use stored path if present (e.g. "/careers" for SAP).
+    # Defaults to "/career" for existing slug_infos without path key.
+    path = slug_info.get("path", "/career")
+    url  = _feed_url(slug, dc, region, path=path)
     resp = fetch_html(url, platform="successfactors")
 
     if resp is None:
@@ -174,13 +192,14 @@ def _normalize(job, company, slug_info):
     slug   = slug_info.get("slug", "")
     dc     = slug_info.get("dc", "")
     region = slug_info.get("region", "")
+    path   = slug_info.get("path", "/career")
 
     title       = _text(job, "JobTitle")
     req_id      = _text(job, "ReqId")
     date_str    = _text(job, "Posted-Date")
     description = _extract_description(job)
     location    = _extract_location(job)
-    job_url     = _job_url(slug, dc, region, req_id)
+    job_url     = _job_url(slug, dc, region, req_id, path=path)
 
     return {
         "company":     company,
@@ -316,23 +335,31 @@ def _extract_description(job):
 # HELPERS — URL BUILDING
 # ─────────────────────────────────────────
 
-def _feed_url(slug, dc, region):
-    """Build SuccessFactors XML feed URL."""
+def _feed_url(slug, dc, region, path="/career"):
+    """
+    Build SuccessFactors XML feed URL.
+    path="/career"  for most tenants (Ericsson, NetApp, etc.)
+    path="/careers" for SAP-hosted tenants (career5.successfactors.eu/careers)
+    """
     base = f"https://career{dc}.successfactors.{region}"
     return (
-        f"{base}/career"
+        f"{base}{path}"
         f"?company={slug}"
         f"&career_ns=job_listing_summary"
         f"&resultType=XML"
     )
 
 
-def _job_url(slug, dc, region, req_id):
-    """Build canonical job detail URL from ReqId."""
+def _job_url(slug, dc, region, req_id, path="/career"):
+    """
+    Build canonical job detail URL from ReqId.
+    path="/career"  for most tenants
+    path="/careers" for SAP-hosted tenants
+    """
     if not req_id:
         return ""
     base = f"https://career{dc}.successfactors.{region}"
-    return f"{base}/career?company={slug}&career_job_req_id={req_id}"
+    return f"{base}{path}?company={slug}&career_job_req_id={req_id}"
 
 
 # ─────────────────────────────────────────

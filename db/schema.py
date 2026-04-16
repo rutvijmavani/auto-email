@@ -20,6 +20,8 @@ from config import (
     RETENTION_COVERAGE_STATS,
     RETENTION_API_HEALTH,
     RETENTION_PIPELINE_ALERTS,
+    RETENTION_CUSTOM_ATS_DIAGNOSTIC,
+    DIAGNOSTICS_AUTO_RESOLVED_DAYS,
 )
 
 def _cleanup_monitor_stats(c):
@@ -48,6 +50,29 @@ def _cleanup_closed_application_recruiters(c):
             WHERE status = 'closed'
         )
     """)
+
+def _cleanup_mark_resolved_diagnostics(c):
+    """Mark diagnostics resolved older than DIAGNOSTICS_AUTO_RESOLVED_DAYS."""
+    c.execute("""
+        UPDATE custom_ats_diagnostics
+        SET resolved = 1,
+            resolved_at = DATETIME('now')
+        WHERE resolved = 0
+        AND created_at < DATE('now' , ?)
+    """, (f"-{DIAGNOSTICS_AUTO_RESOLVED_DAYS} days",))
+
+def _cleanup_resolved_diagnostics(c):
+    """
+    Delete resolved diagnostics older than RETENTION_CUSTOM_ATS_DIAGNOSTIC days.
+    Retention is measured from resolved_at (when it was resolved), not created_at,
+    so auto-resolved rows aren't immediately purged in the same cleanup run.
+    Falls back to created_at for rows that pre-date the resolved_at column.
+    """
+    c.execute("""
+        DELETE FROM custom_ats_diagnostics
+        WHERE resolved = 1
+          AND COALESCE(resolved_at, created_at) < DATETIME('now', ?)
+    """, (f"-{RETENTION_CUSTOM_ATS_DIAGNOSTIC} days",))
 
 def _cleanup_expired_ai_cache(c):
     c.execute("DELETE FROM ai_cache WHERE expires_at <= CURRENT_TIMESTAMP")
@@ -151,6 +176,22 @@ def _cleanup_pipeline_alerts(c):
         WHERE notified = 1
         AND notified_at < DATE('now', ?)
     """, (f"-{RETENTION_PIPELINE_ALERTS} days",))
+
+def _cleanup_custom_ats_inspection(c):
+    """
+    Remove inspection rows for companies no longer in
+    prospective_companies table.
+    Keeps table lean as companies are added/removed.
+    COLLATE NOCASE on both sides ensures the cross-table company
+    comparison is case-insensitive (prospective_companies uses NOCASE
+    collation; custom_ats_inspection uses default BINARY).
+    """
+    c.execute("""
+        DELETE FROM custom_ats_inspection
+        WHERE company COLLATE NOCASE NOT IN (
+            SELECT company FROM prospective_companies
+        )
+    """)
 
 
 def init_db():
@@ -289,13 +330,45 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS prospective_companies (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            company      TEXT NOT NULL UNIQUE,
+            company      TEXT NOT NULL UNIQUE COLLATE NOCASE,
             priority     INTEGER DEFAULT 0,
             status       TEXT DEFAULT 'pending',
             scraped_at   TIMESTAMP,
             converted_at TIMESTAMP,
             created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+
+    c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_ats_diagnostics (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                company       TEXT NOT NULL,
+                step          TEXT NOT NULL,
+                severity      TEXT NOT NULL,
+                pattern_hint  TEXT,
+                raw_response  TEXT,
+                notes         TEXT,
+                resolved      INTEGER DEFAULT 0,
+                resolved_at   TIMESTAMP,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
+    # Index for fast open-issue queries
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS
+        idx_custom_ats_diag_company_resolved
+        ON custom_ats_diagnostics(company, resolved)
+    """)
+
+    # Partial unique index to prevent duplicate open diagnostics at DB level.
+    # Enforces that (company, step, pattern_hint) is unique among unresolved rows,
+    # eliminating the TOCTOU race between has_open_diagnostic() and flag_diagnostic().
+    # COALESCE maps NULL pattern_hint to '' so NULLs compare equal in the index.
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_diag_unique_open
+        ON custom_ats_diagnostics(company COLLATE NOCASE, step, COALESCE(pattern_hint, ''))
+        WHERE resolved = 0
     """)
 
     c.execute("""
@@ -438,6 +511,32 @@ def init_db():
         ON pipeline_alerts(alert_type, platform, created_at)
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS custom_ats_inspection (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            company              TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            listing_url          TEXT,
+            format               TEXT,
+            array_path           TEXT,
+            total_jobs           INTEGER,
+            total_field          TEXT,
+            all_numeric_fields   TEXT,
+            page_size            INTEGER,
+            pagination           TEXT,
+            session_strategy     TEXT,
+            first_job_raw        TEXT,
+            field_map            TEXT,
+            field_map_override   TEXT,
+            sample_normalized    TEXT,
+            last_updated         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_custom_ats_inspection_company
+        ON custom_ats_inspection(company)
+    """)
+
     # Migration: add ATS detection columns to prospective_companies
     for col, definition in [
         ("ats_platform",          "TEXT DEFAULT 'unknown'"),
@@ -454,6 +553,34 @@ def init_db():
         except sqlite3.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
                 raise
+    
+    for col in ("listing_curl_raw", "detail_curl_raw"):
+        try:
+            c.execute(f"ALTER TABLE prospective_companies "
+                    f"ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
+        ON prospective_companies(company COLLATE NOCASE)
+    """)
+
+    # Migration: add resolved_at to custom_ats_diagnostics.
+    # Retention is now measured from resolved_at (not created_at) so auto-resolved
+    # rows aren't immediately deleted in the same cleanup run.
+    try:
+        c.execute("ALTER TABLE custom_ats_diagnostics ADD COLUMN resolved_at TIMESTAMP")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+    # Back-fill existing resolved rows so COALESCE(resolved_at, created_at) is accurate.
+    c.execute("""
+        UPDATE custom_ats_diagnostics
+        SET resolved_at = created_at
+        WHERE resolved = 1 AND resolved_at IS NULL
+    """)
 
     # Migration: add expected_domain and exhausted_at to applications if missing
     try:
@@ -503,6 +630,9 @@ def init_db():
     _cleanup_coverage_stats(c)
     _cleanup_api_health(c)
     _cleanup_pipeline_alerts(c)
+    _cleanup_mark_resolved_diagnostics(c)
+    _cleanup_resolved_diagnostics(c)
+    _cleanup_custom_ats_inspection(c)
     conn.commit()
     conn.close()
     print("[OK] Database initialized: data/recruiter_pipeline.db")

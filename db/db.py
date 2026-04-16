@@ -216,6 +216,42 @@ from db.job_monitor import (
 )
 
 # ─────────────────────────────────────────
+# CUSTOM ATS DIAGNOSTICS
+# ─────────────────────────────────────────
+from db.custom_ats_diagnostics import (
+    flag_diagnostic,
+    flag_diagnostic_once,
+    has_open_diagnostic,
+    get_open_diagnostics,
+    get_diagnostic_summary,
+    get_raw_curl_for_company,
+    resolve_diagnostic,
+    resolve_all_for_company,
+    BLOCKED,
+    DEGRADED,
+    UNKNOWN_PATTERN,
+    STEP_SESSION_WARM,
+    STEP_AUTH_ERROR,
+    STEP_LISTING_FETCH,
+    STEP_STRUCTURE_DETECT,
+    STEP_DETAIL_FETCH,
+    STEP_PAGINATION,
+    STEP_UNKNOWN_PATTERN,
+)
+
+# ─────────────────────────────────────────────────────────────
+# CUSTOM ATS INSPECTION
+# ─────────────────────────────────────────────────────────────
+from db.custom_ats_inspection import (
+    save_inspection,
+    get_inspection,
+    get_field_map_override,
+    get_all_inspections,
+    set_field_map_override,
+    clear_field_map_override,
+)
+
+# ─────────────────────────────────────────
 # SCHEMA CLEANUP (used by tests directly)
 # ─────────────────────────────────────────
 from db.schema import (
@@ -229,6 +265,9 @@ from db.schema import (
     _cleanup_closed_application_recruiters,
     _cleanup_auto_close_applications,
     _cleanup_monitor_stats,
+    _cleanup_mark_resolved_diagnostics, 
+    _cleanup_resolved_diagnostics, 
+    _cleanup_custom_ats_inspection,      
 )
 
 

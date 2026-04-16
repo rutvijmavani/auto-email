@@ -40,7 +40,7 @@ def add_prospective_company(company, priority=0, domain=None):
         c.execute("""
             UPDATE prospective_companies
             SET domain = ?
-            WHERE company = ? AND (domain IS NULL OR domain = '')
+            WHERE company = ? COLLATE NOCASE AND (domain IS NULL OR domain = '')
         """, (domain, company))
         conn.commit()
     conn.close()
@@ -100,7 +100,7 @@ def mark_prospective_scraped(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'scraped', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status = 'pending'
+        WHERE company = ? COLLATE NOCASE AND status = 'pending'
     """, (company,))
     conn.commit()
     conn.close()
@@ -114,7 +114,7 @@ def mark_prospective_exhausted(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'exhausted', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status = 'pending'
+        WHERE company = ? COLLATE NOCASE AND status = 'pending'
     """, (company,))
     conn.commit()
     conn.close()
@@ -131,7 +131,7 @@ def mark_prospective_converted(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'converted', converted_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status IN ('pending', 'scraped')
+        WHERE company = ? COLLATE NOCASE AND status IN ('pending', 'scraped')
     """, (company,))
     conn.commit()
     conn.close()
@@ -148,7 +148,7 @@ def is_prospective(company):
     c = conn.cursor()
     c.execute("""
         SELECT id FROM prospective_companies
-        WHERE company = ? AND status = 'scraped'
+        WHERE company = ? COLLATE NOCASE AND status = 'scraped'
     """, (company,))
     row = c.fetchone()
     conn.close()
@@ -178,7 +178,7 @@ def get_prospective_company(company):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT * FROM prospective_companies WHERE company = ?
+        SELECT * FROM prospective_companies WHERE company = ? COLLATE NOCASE
     """, (company,))
     row = c.fetchone()
     conn.close()
@@ -188,10 +188,11 @@ def get_domain_for_prospective(company):
     """Return the domain root for a prospective company, or '' if not set.
     e.g. 'lucidmotors.com' → 'lucidmotors', 'snap.com' → 'snap'
     """
+    company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT domain FROM prospective_companies WHERE company = ?",
+        "SELECT domain FROM prospective_companies WHERE company = ? COLLATE NOCASE",
         (company,)
     )
     row = c.fetchone()
