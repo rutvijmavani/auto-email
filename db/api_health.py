@@ -33,29 +33,41 @@ _writer_error  = None   # stores first unhandled exception from _writer_loop
 _closed        = False  # prevents new writes after flush() begins
 
 
+def _ensure_writer_running():
+    """
+    Start the writer thread and queue if not already running.
+    MUST be called while _queue_lock is held by the caller.
+    Does NOT acquire _queue_lock itself — avoids re-entrancy deadlock.
+    """
+    global _write_queue, _writer_thread
+    if _write_queue is not None:
+        return
+    _write_queue = queue.Queue()
+    t = threading.Thread(
+        target=_writer_loop,
+        args=(_write_queue,),
+        daemon=False,   # non-daemon: process waits for final flush
+        name="api_health_writer",
+    )
+    _writer_thread = t
+    t.start()
+    # Register flush() for normal process exit so records are not
+    # lost when run() is interrupted before its explicit flush call.
+    # flush() is idempotent — safe to call multiple times.
+    atexit.register(flush)
+
+
 def _get_write_queue():
     """
     Return the singleton write queue, starting the writer thread
     on first call. Thread-safe via _queue_lock.
+    Callers that already hold _queue_lock must use _ensure_writer_running()
+    directly to avoid deadlock (Lock is not reentrant).
     """
-    global _write_queue, _writer_thread
     if _write_queue is not None:
         return _write_queue
     with _queue_lock:
-        if _write_queue is None:
-            _write_queue = queue.Queue()
-            t = threading.Thread(
-                target=_writer_loop,
-                args=(_write_queue,),
-                daemon=False,   # non-daemon: process waits for final flush
-                name="api_health_writer",
-            )
-            _writer_thread = t
-            t.start()
-            # Register flush() for normal process exit so records are not
-            # lost when run() is interrupted before its explicit flush call.
-            # flush() is idempotent — safe to call multiple times.
-            atexit.register(flush)
+        _ensure_writer_running()
     return _write_queue
 
 
@@ -213,19 +225,24 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit
     """
-    # _closed is a plain bool — reading it is atomic under CPython's GIL.
-    # No lock needed here: _get_write_queue() handles its own thread-safe
-    # initialization internally via _queue_lock, and calling it while
-    # already holding _queue_lock would deadlock (Lock is not reentrant).
-    if _closed:
-        return
-    _get_write_queue().put({
-        "date":        date.today().isoformat(),
-        "platform":    platform,
-        "status_code": status_code,
-        "response_ms": response_ms,
-        "backoff_s":   backoff_s,
-    })
+    # Hold _queue_lock for the entire check-and-enqueue so it is atomic
+    # with flush().  Without the lock, flush() could run between the _closed
+    # check and the put(), set _write_queue=None, and force _get_write_queue()
+    # to spin up a new writer thread that never receives a sentinel.
+    # We call _ensure_writer_running() directly (not _get_write_queue()) to
+    # avoid re-acquiring _queue_lock inside _get_write_queue() — Lock is not
+    # reentrant and doing so would deadlock.
+    with _queue_lock:
+        if _closed:
+            return
+        _ensure_writer_running()
+        _write_queue.put({
+            "date":        date.today().isoformat(),
+            "platform":    platform,
+            "status_code": status_code,
+            "response_ms": response_ms,
+            "backoff_s":   backoff_s,
+        })
 
 
 # ─────────────────────────────────────────
