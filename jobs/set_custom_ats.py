@@ -289,10 +289,16 @@ def _replay_listing(session, slug_info, company):
         # Forward headers from the original curl (auth, CSRF, API-key headers).
         # Filter out transport/hop-by-hop headers that must not be replayed.
         raw_headers = slug_info.get("headers", {})
-        extra_headers = {k: v for k, v in raw_headers.items()
-                         if k not in SKIP_HEADERS}
 
-        content_type = raw_headers.get("content-type", "").lower()
+        # Normalize header names to lowercase for comparison
+        raw_headers_normalized = {k.lower(): v for k, v in raw_headers.items()}
+
+        # Filter against SKIP_HEADERS (which should also be lowercased)
+        skip_headers_lower = {h.lower() for h in SKIP_HEADERS}
+        extra_headers = {k: v for k, v in raw_headers.items()
+                         if k.lower() not in skip_headers_lower}
+
+        content_type = raw_headers_normalized.get("content-type", "").lower()
 
         if method == "POST":
             if "form" in content_type or (body and not _is_json(body)):
@@ -445,13 +451,16 @@ def _save_to_db(company, slug_info):
 
         if existing:
             # Never touch status — preserve whatever the company already has
+            from urllib.parse import urlparse
+            domain = urlparse(slug_info.get("url", "")).netloc or ""
             conn.execute("""
                 UPDATE prospective_companies
                 SET ats_platform    = 'custom',
                     ats_slug        = ?,
-                    ats_detected_at = ?
+                    ats_detected_at = ?,
+                    domain          = ?
                 WHERE company = ? COLLATE NOCASE
-            """, (slug_json, now, company))
+            """, (slug_json, now, domain, company))
             print(f"  Updated existing company: {company}")
         else:
             from urllib.parse import urlparse

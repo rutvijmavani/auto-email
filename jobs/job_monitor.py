@@ -377,6 +377,15 @@ def _process_company(company_row, position, total):
     # NOTE: fetch_job_detail calls below re-acquire the semaphore individually
     # to throttle detail HTTP requests with the same per-platform limit.
     logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
+
+    # Filter out entries missing job_url before processing
+    initial_count = len(raw_jobs)
+    raw_jobs = [job for job in raw_jobs if job.get("job_url")]
+    dropped_count = initial_count - len(raw_jobs)
+    if dropped_count > 0:
+        logger.warning("Dropped %d jobs missing job_url for %r",
+                      dropped_count, company)
+
     result["fetched"] = len(raw_jobs)
 
     # URL presence tracking (DB reads — fast, no HTTP)
