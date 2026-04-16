@@ -178,14 +178,18 @@ def job_relevance_score(fields_info):
         all_types.update(classifications)
 
     score = 0
-    if any(t in all_types for t in ("title_hint", "short_string")):   score += 20
-    if any(t in all_types for t in ("url", "url_hint")):               score += 15
-    if any(t in all_types for t in ("date", "date_hint",
-                                     "date_ms", "date_s")):            score += 10
-    if any(t in all_types for t in ("id_numeric", "id_uuid",
-                                     "id_int", "id_hint")):            score += 10
-    if any(t in all_types for t in ("location_hint",)):                score += 10
-    if any(t in all_types for t in ("description", "long_text")):      score += 15
+    if any(t in all_types for t in ("title_hint", "short_string")):
+        score += 20
+    if any(t in all_types for t in ("url", "url_hint")):
+        score += 15
+    if any(t in all_types for t in ("date", "date_hint", "date_ms", "date_s")):
+        score += 10
+    if any(t in all_types for t in ("id_numeric", "id_uuid", "id_int", "id_hint")):
+        score += 10
+    if any(t in all_types for t in ("location_hint",)):
+        score += 10
+    if any(t in all_types for t in ("description", "long_text")):
+        score += 15
     return score
 
 
@@ -321,13 +325,13 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
     captured_lock = asyncio.Lock()
     response_event_count = 0
 
-    print(f"\n{'='*70}")
+    print("\n" + "="*70)
     print(f"  Navigating to: {career_url}")
     print(f"  Pages to scan: {max_pages}")
     print(f"  Headless: {headless}")
     if use_stealth:
-        print(f"  Stealth: enabled")
-    print(f"{'='*70}\n")
+        print("  Stealth: enabled")
+    print("="*70 + "\n")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
@@ -398,8 +402,8 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                     print(f"  {indicator} [{response.request.method}] "
                           f"{url[:75]}  →  {len(arr)} items  (score={score})")
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [ERROR] Failed to process response from {url}: {e}")
 
         page.on("response", on_response)
 
@@ -431,7 +435,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
             next_btn = await _get_next_button(page)
 
             if next_btn:
-                print(f"  Found button — clicking...")
+                print("  Found button — clicking...")
                 prev_event_count = response_event_count
                 success = await _try_click(page, next_btn)
 
@@ -446,14 +450,14 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                     if response_event_count > prev_event_count:
                         print(f"  ✓ Click triggered {response_event_count - prev_event_count} new response(s)")
                     else:
-                        print(f"  Click succeeded but no new responses — may be same data")
+                        print("  Click succeeded but no new responses — may be same data")
                 else:
-                    print(f"  All click strategies failed — trying scroll")
+                    print("  All click strategies failed — trying scroll")
                     await page.mouse.wheel(0, 8000)
                     await asyncio.sleep(3)
             else:
                 # Infinite scroll
-                print(f"  No button found — scrolling...")
+                print("  No button found — scrolling...")
                 prev_event_count = response_event_count
                 await page.mouse.wheel(0, 8000)
                 await asyncio.sleep(3)
@@ -461,7 +465,7 @@ async def capture_responses(career_url, max_pages=DEFAULT_PAGES, headless=True):
                 await asyncio.sleep(2)
 
                 if response_event_count == prev_event_count:
-                    print(f"  No new responses after scroll — end of content")
+                    print("  No new responses after scroll — end of content")
                     break
 
         await browser.close()
@@ -484,9 +488,9 @@ def analyse_and_print(captured):
 
     captured.sort(key=lambda r: r["arr_len"], reverse=True)
 
-    print(f"\n{'='*70}")
+    print("\n" + "="*70)
     print(f"  CAPTURED {len(captured)} JSON RESPONSES")
-    print(f"{'='*70}")
+    print("="*70)
 
     for idx, resp in enumerate(captured):
         arr     = resp["arr"]
@@ -497,13 +501,13 @@ def analyse_and_print(captured):
         ct      = resp["ct"]
         path    = resp["path"] or ""
 
-        print(f"\n{'─'*70}")
+        print("\n" + "─"*70)
         print(f"  [{idx}] {method} {status}  —  {resp['raw_len']} bytes")
         print(f"  URL: {url}")
         print(f"  CT : {ct}")
 
         if not arr:
-            print(f"  ARRAY: none")
+            print("  ARRAY: none")
             if isinstance(resp["data"], dict):
                 print(f"  Top-level keys: {list(resp['data'].keys())[:12]}")
             continue
@@ -512,7 +516,7 @@ def analyse_and_print(captured):
 
         sample = [j for j in arr[:SAMPLE_SIZE] if isinstance(j, dict)]
         if not sample:
-            print(f"  (array items are not dicts)")
+            print("  (array items are not dicts)")
             continue
 
         all_keys = set()
@@ -566,9 +570,9 @@ def analyse_and_print(captured):
     # ── Summary ───────────────────────────────────────────
     likely = [(i, r) for i, r in enumerate(captured) if _score_response(r) >= 40]
 
-    print(f"\n{'='*70}")
-    print(f"  SUMMARY")
-    print(f"{'='*70}")
+    print("\n" + "="*70)
+    print("  SUMMARY")
+    print("="*70)
 
     if likely:
         print(f"\n  ✅ {len(likely)} response(s) look like job listings:\n")
@@ -587,12 +591,12 @@ def analyse_and_print(captured):
         parsed_path = urlparse(best["url"]).path
         path_parts = [p for p in parsed_path.split("/") if p]
         filter_hint = path_parts[0] if path_parts else "XHR"
-        print(f"  Next step — capture the curl for this endpoint:")
-        print(f"  1. Open DevTools → Network tab")
+        print("  Next step — capture the curl for this endpoint:")
+        print("  1. Open DevTools → Network tab")
         print(f"  2. Filter by: {filter_hint}")
-        print(f"  3. Reload the page or trigger the request again")
-        print(f"  4. Right-click the request → Copy → Copy as cURL")
-        print(f"  5. Paste into the Google Form (Listing Curl column)")
+        print("  3. Reload the page or trigger the request again")
+        print("  4. Right-click the request → Copy → Copy as cURL")
+        print("  5. Paste into the Google Form (Listing Curl column)")
     else:
         print("\n  ⚠  No responses scored ≥ 40.")
         print("     Try:")

@@ -65,9 +65,6 @@ GRAPHQL_SEMI_STABLE_PARAMS = {
     "dpr",
 }
 
-# SKIP_HEADERS imported from jobs.utils
-from jobs.utils import SKIP_HEADERS
-
 
 # ─────────────────────────────────────────
 # PUBLIC API — LISTING CURL

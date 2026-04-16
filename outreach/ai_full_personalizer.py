@@ -37,7 +37,7 @@ def _get_client():
 
 PRIMARY_MODEL = "gemini-2.5-flash-lite"
 FALLBACK_MODEL = "gemini-2.5-flash"
-FIELD_MAP_MODEL = "gemma-4-31b-it"
+FIELD_MAP_MODEL = "gemini-2.0-flash-exp"
 CACHE_TTL_DAYS = 21
 
 

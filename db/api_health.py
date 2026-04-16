@@ -30,6 +30,7 @@ _write_queue   = None
 _writer_thread = None
 _queue_lock    = threading.Lock()
 _writer_error  = None   # stores first unhandled exception from _writer_loop
+_closed        = False  # prevents new writes after flush() begins
 
 
 def _get_write_queue():
@@ -212,7 +213,12 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit
     """
-    _get_write_queue().put({
+    global _closed
+    with _queue_lock:
+        if _closed:
+            return
+        q = _get_write_queue()
+    q.put({
         "date":        date.today().isoformat(),
         "platform":    platform,
         "status_code": status_code,
@@ -334,10 +340,9 @@ def flush():
 
     Safe to call only once — the writer thread exits after the sentinel
     and is not restarted.  Any record_request() calls after flush() will
-    enqueue to the now-readerless queue (no crash, records silently lost),
-    but flush() is only ever called at the end of run().
+    be blocked by _closed flag and return immediately.
     """
-    global _write_queue, _writer_thread
+    global _write_queue, _writer_thread, _closed
     if _write_queue is None:
         return
     with _queue_lock:
@@ -345,6 +350,7 @@ def flush():
         t = _writer_thread
         if q is None:
             return
+        _closed = True              # prevent new writes
         q.put(None)                 # sentinel → writer drains pending + exits
         _write_queue   = None
         _writer_thread = None

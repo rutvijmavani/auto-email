@@ -61,8 +61,8 @@ SCOPES = [
 ]
 
 # Column indices (0-based)
-# Timestamp | Company Name | Job URL | Career Page URL | Domain |
-# XML/Sitemap URL | Notes | Listing Curl | Detail Curl
+# Timestamp | Company Name | Job URL | Domain | Career Page URL |
+# XML/Sitemap URL | Listing Curl | Detail Curl | Notes
 COL_TIMESTAMP   = 0
 COL_COMPANY     = 1
 COL_JOB_URL     = 2
