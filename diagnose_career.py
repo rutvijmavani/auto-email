@@ -127,29 +127,48 @@ def classify_value(field_name, value):
 
     if isinstance(value, str):
         v = value.strip()
-        if URL_PATTERN.match(v):           return "url"
-        if ISO_DATE_PATTERN.match(v):      return "date"
-        if re.match(r'^\d{4,}$', v):       return "id_numeric"
-        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
-                    r'-[0-9a-f]{4}-[0-9a-f]{12}$', v, re.I): return "id_uuid"
-        if len(v) > 200:                   return "long_text"
-        if fl in DESC_HINTS:               return "description"
-        if fl in TITLE_HINTS:              return "title_hint"
-        if fl in LOCATION_HINTS:           return "location_hint"
-        if fl in ID_HINTS:                 return "id_hint"
-        if fl in URL_HINTS:                return "url_hint"
-        if fl in DATE_HINTS:               return "date_hint"
+        if URL_PATTERN.match(v):
+            return "url"
+        if ISO_DATE_PATTERN.match(v):
+            return "date"
+        if re.match(r'^\d{4,}$', v):
+            return "id_numeric"
+        if re.match(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}'
+            r'-[0-9a-f]{4}-[0-9a-f]{12}$', v, re.I,
+        ):
+            return "id_uuid"
+        if len(v) > 200:
+            return "long_text"
+        if fl in DESC_HINTS:
+            return "description"
+        if fl in TITLE_HINTS:
+            return "title_hint"
+        if fl in LOCATION_HINTS:
+            return "location_hint"
+        if fl in ID_HINTS:
+            return "id_hint"
+        if fl in URL_HINTS:
+            return "url_hint"
+        if fl in DATE_HINTS:
+            return "date_hint"
         return "short_string"
 
     if isinstance(value, int):
-        if value >= UNIX_TS_MS_MIN: return "date_ms"
-        if value >= UNIX_TS_MIN:    return "date_s"
-        if 1 <= value <= 9_999_999: return "id_int"
+        if value >= UNIX_TS_MS_MIN:
+            return "date_ms"
+        if value >= UNIX_TS_MIN:
+            return "date_s"
+        if 1 <= value <= 9_999_999:
+            return "id_int"
         return "int"
 
-    if isinstance(value, float):    return "float"
-    if isinstance(value, list):     return f"list[{len(value)}]"
-    if isinstance(value, dict):     return f"dict{{{len(value)} keys}}"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, list):
+        return f"list[{len(value)}]"
+    if isinstance(value, dict):
+        return f"dict{{{len(value)} keys}}"
     return "other"
 
 

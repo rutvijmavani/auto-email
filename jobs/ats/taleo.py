@@ -151,8 +151,8 @@ def fetch_jobs(slug_info, company):
                 return _col[i].strip() if i < len(_col) and _col[i].strip() else ""
 
             title      = c(0)
-            contest_no = job.get("contestNo", "")
-            job_id     = str(job.get("jobId", "") or contest_no)
+            contest_no = str(job.get("contestNo") or job.get("jobId") or "")
+            job_id     = str(job.get("jobId") or contest_no)
 
             if not title or not job_id:
                 continue

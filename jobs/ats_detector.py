@@ -25,7 +25,11 @@ logger = get_logger(__name__)
 
 from jobs.ats import (greenhouse, lever, ashby, smartrecruiters, workday)
 from jobs.ats import (oracle_hcm, icims, jobvite, avature)
-from jobs.ats import (phenom, talentbrew, sitemap, successfactors, google)
+from jobs.ats import (
+    phenom, talentbrew, sitemap, successfactors, google,
+    taleo, eightfold, jibe,
+)
+from jobs.ats import (greenhouse, lever, ashby, smartrecruiters, workday, eightfold)
 from jobs.ats import custom_career   # ← universal custom ATS engine
 from config import (
     ATS_STATUS_DETECTED,

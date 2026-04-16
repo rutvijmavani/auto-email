@@ -708,7 +708,14 @@ def _clean_graphql_body(body):
     if stripped.startswith("{") or stripped.startswith("["):
         try:
             import json as _json
-            _json.loads(stripped)
+            data = _json.loads(stripped)
+            if isinstance(data, dict):
+                for key in (
+                    "lsd", "jazoest", "__spin_t", "__spin_r",
+                    "__spin_b", "__rev", "av", "__user", "__a",
+                ):
+                    data.pop(key, None)
+                return _json.dumps(data, separators=(",", ":"))
             return body
         except (ValueError, TypeError):
             pass

@@ -347,8 +347,6 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
     conn = None
     try:
         from db.connection import get_conn
-        from db.custom_ats_diagnostics import init_diagnostics_table
-        init_diagnostics_table()
 
         conn = get_conn()
 

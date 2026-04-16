@@ -892,7 +892,8 @@ def run():
                     "Row %d: DB error for %r: %s",
                     sheet_row, company, e, exc_info=True
                 )
-                raise
+                skipped += 1
+                continue
 
             imported += 1
             rows_to_delete.append(sheet_row)
