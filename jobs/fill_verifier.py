@@ -89,7 +89,9 @@ def _is_job_gone(url):
 
         # 403 from ATS platforms that return it specifically for removed jobs
         if r.status_code == 403:
-            host = urlparse(r.url).netloc.lower().lstrip("www.")
+            host = urlparse(r.url).netloc.lower()
+            if host.startswith("www."):
+                host = host[4:]
             if any(host == d or host.endswith("." + d) for d in ATS_403_MEANS_GONE):
                 logger.debug("403 from known ATS domain → treating as gone: %s", url)
                 return True

@@ -608,6 +608,15 @@ def init_db():
         if "duplicate column name" not in str(e).lower():
             raise
 
+    try:
+        c.execute(
+            "ALTER TABLE verify_filled_stats "
+            "ADD COLUMN status_code_breakdown TEXT DEFAULT '{}'"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
     # Migration: ensure coverage_stats.date has a unique index
     # Deduplicates existing rows keeping latest per date before creating index
     c.execute("""
