@@ -372,16 +372,19 @@ def save_monitor_stats(stats):
 
 def save_verify_filled_stats(stats):
     """Save --verify-filled run stats."""
+    import json
     conn = get_conn()
     try:
         today = datetime.now().strftime("%Y-%m-%d")
+        breakdown = json.dumps(stats.get("status_code_breakdown", {}))
         conn.execute("""
             INSERT OR REPLACE INTO verify_filled_stats
               (date, verified, filled, active,
                inconclusive, inconclusive_timeout,
                inconclusive_conn_error, inconclusive_other_status,
-               inconclusive_exception, remaining, run_duration_secs)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               inconclusive_exception, status_code_breakdown,
+               remaining, run_duration_secs)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             today,
             stats.get("verified",                  0),
@@ -392,6 +395,7 @@ def save_verify_filled_stats(stats):
             stats.get("inconclusive_conn_error",   0),
             stats.get("inconclusive_other_status", 0),
             stats.get("inconclusive_exception",    0),
+            breakdown,
             stats.get("remaining",                 0),
             stats.get("run_duration_secs",         0),
         ))

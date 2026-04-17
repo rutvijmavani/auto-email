@@ -105,6 +105,20 @@ def _probe_lever(company, candidates):
 
             # Lever returns list — verify slug matches company
             if isinstance(data, list):
+                # Guard: ALL significant company keywords must appear in the
+                # slug before calling validate_slug_for_company.
+                # Without this, slugify("Capital One") → ["capital", "one", ...]
+                # and slug="capital" returns 200 from Lever (some company
+                # named "Capital" exists), then validate_slug_for_company
+                # passes because "capital" is in "Capital One" — but "one"
+                # is absent, so it's a different company.
+                if not _all_keywords_present(company, slug):
+                    logger.debug(
+                        "[P2] Lever: slug=%r missing keywords for %r — skip",
+                        slug, company,
+                    )
+                    continue
+
                 # Verify via slug validation
                 if validate_slug_for_company(slug, company):
                     logger.debug("[P2] Lever slug match: slug=%s company=%r", slug, company)

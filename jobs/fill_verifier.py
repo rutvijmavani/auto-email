@@ -37,25 +37,44 @@ HEADERS = {
 }
 
 # Status codes that confirm job is gone
-GONE_CODES = {404, 410, 301, 302}
+GONE_CODES = {404, 410}
 
 # Redirect destinations that indicate job is gone
-GONE_PATTERNS = [
-    "/jobs",           # redirected to job listing page
-    "/careers",        # redirected to careers page
-    "?error",          # error page
-    "not-found",       # not found page
-    "expired",         # expired job page
-]
+GONE_REDIRECT_PATHS = {"/jobs", "/careers", "/job-search", "/open-positions"}
+GONE_REDIRECT_KEYWORDS = ["not-found", "expired", "no-longer", "position-filled",
+                          "job-closed", "requisition-closed"]
+GONE_REDIRECT_QUERIES  = {"error=true", "error=1", "error=404", "flow=error",
+                          "status=closed", "status=filled"}
+
+# ATS domains that return 403 when a job no longer exists (not when it's active).
+# These platforms gate real job pages behind JS/cookie auth — a plain HTTP GET
+# to a live job returns 200; a plain GET to a closed/removed job returns 403.
+# So 403 from these domains is effectively the same signal as 404.
+ATS_403_MEANS_GONE = {
+    "boards.greenhouse.io",
+    "job-boards.greenhouse.io",
+    "jobs.ashbyhq.com",
+    "jobs.lever.co",
+    "hire.lever.co",
+    "jobs.smartrecruiters.com",
+    "jobs.jobvite.com",
+}
 
 
 def _is_job_gone(url):
     """
     Make HTTP request to job URL.
-    Returns True if job is confirmed gone (404/410 or redirect to listing page).
-    Returns False if job is still active (200 with valid content).
-    Returns None if inconclusive (timeout, connection error).
+
+    Returns:
+        True              — job confirmed gone (404/410, ATS-403, or terminal redirect)
+        False             — job still active (200)
+        "status_{code}"   — inconclusive (unexpected status code)
+        "timeout"         — request timed out
+        "conn_error"      — connection error
+        "exception"       — other exception
     """
+    from urllib.parse import urlparse
+
     try:
         r = requests.get(
             url,
@@ -63,37 +82,43 @@ def _is_job_gone(url):
             timeout=10,
             allow_redirects=True,
         )
+
         # Hard 404/410 → definitely gone
-        if r.status_code in {404, 410}:
+        if r.status_code in GONE_CODES:
             return True
 
-        # Redirected to a generic page → likely gone
+        # 403 from ATS platforms that return it specifically for removed jobs
+        if r.status_code == 403:
+            host = urlparse(r.url).netloc.lower().lstrip("www.")
+            if any(host == d or host.endswith("." + d) for d in ATS_403_MEANS_GONE):
+                logger.debug("403 from known ATS domain → treating as gone: %s", url)
+                return True
+            # Unknown domain 403 → inconclusive (might be bot-blocking a live job)
+            return "status_403"
+
+        # Redirect to a terminal/listing page → gone
         if r.url != url:
-            from urllib.parse import urlparse
-
-            original = urlparse(url)
-            final = urlparse(r.url)
-            original_path = original.path.rstrip("/").lower()
+            original   = urlparse(url)
+            final      = urlparse(r.url)
             final_path = final.path.rstrip("/").lower()
-            final_query = final.query.lower()
+            final_q    = final.query.lower()
 
-            redirected_to_terminal_page = (
-                final_path in {"/jobs", "/careers"}
-                or "not-found" in final_path
-                or "expired" in final_path
-                or final_query in {"error=true", "error=1", "error=404"}
+            terminal = (
+                final_path in GONE_REDIRECT_PATHS
+                or any(kw in final_path for kw in GONE_REDIRECT_KEYWORDS)
+                or any(q in final_q    for q  in GONE_REDIRECT_QUERIES)
             )
-
-            if redirected_to_terminal_page and (
-                final.netloc != original.netloc or final_path != original_path
+            if terminal and (
+                final.netloc != original.netloc
+                or final_path != original.path.rstrip("/").lower()
             ):
                 return True
 
-        # 200 with content → still active
+        # 200 → still active
         if r.status_code == 200:
             return False
 
-        # Other codes → inconclusive
+        # Everything else → inconclusive, but named so we can count per-code
         return f"status_{r.status_code}"
 
     except requests.exceptions.Timeout:
@@ -135,6 +160,7 @@ def run():
             "inconclusive_conn_error":   0,
             "inconclusive_other_status": 0,
             "inconclusive_exception":    0,
+            "status_code_breakdown":     {},
             "remaining":                 0,
             "run_duration_secs":         duration,
         }
@@ -163,6 +189,7 @@ def run():
     inconclusive_conn_error   = 0
     inconclusive_other_status = 0
     inconclusive_exception    = 0
+    status_code_breakdown     = {}   # {"403": 89, "429": 5, …}
 
     for i, job in enumerate(batch, 1):
         job_id  = job["id"]
@@ -195,7 +222,9 @@ def run():
                 print(f"   [SKIP] Connection error")
             elif result and result.startswith("status_"):
                 inconclusive_other_status += 1
-                print(f"   [SKIP] Unexpected status: {result.replace('status_', '')}")
+                code = result.replace("status_", "")
+                status_code_breakdown[code] = status_code_breakdown.get(code, 0) + 1
+                print(f"   [SKIP] Unexpected status: {code}")
             else:
                 inconclusive_exception += 1
                 print(f"   [SKIP] Exception")
@@ -227,6 +256,7 @@ def run():
         "inconclusive_conn_error":   inconclusive_conn_error,
         "inconclusive_other_status": inconclusive_other_status,
         "inconclusive_exception":    inconclusive_exception,
+        "status_code_breakdown":     status_code_breakdown,
         "remaining":                 remaining,
         "run_duration_secs":         duration,
     }

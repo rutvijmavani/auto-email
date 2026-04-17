@@ -499,6 +499,10 @@ def init_db():
             inconclusive_conn_error   INTEGER DEFAULT 0,
             inconclusive_other_status INTEGER DEFAULT 0,
             inconclusive_exception    INTEGER DEFAULT 0,
+            -- JSON map of status_code → count for inconclusive_other_status.
+            -- e.g. {"403": 89, "429": 5, "301": 3}
+            -- Lets us see exactly which codes are piling up without a schema change.
+            status_code_breakdown     TEXT DEFAULT '{}',
             remaining           INTEGER DEFAULT 0,
             run_duration_secs   INTEGER DEFAULT 0,
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP

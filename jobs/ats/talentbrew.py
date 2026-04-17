@@ -48,7 +48,8 @@ DATE_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]
 
 # Known TalentBrew custom domains
 KNOWN_DOMAINS = {
-    "jobs.intuit.com": {"tenant_id": "27595"},
+    "jobs.intuit.com":        {"tenant_id": "27595"},
+    "jobs.disneycareers.com": {"tenant_id": "391"},
 }
 
 

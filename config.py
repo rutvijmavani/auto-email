@@ -98,32 +98,40 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 # PARALLEL JOB MONITORING (Phase 1)
 # ─────────────────────────────────────────
  
-# Number of companies processed in parallel.
-# 20 workers = ~10x speedup for Workday-heavy portfolios.
-# Workday is safe at 20 because each company uses its own subdomain.
-# Reduce to 10 if you see increased 429s in api_health after enabling.
+# Number of companies processed in parallel (thread pool size).
+# Real throttling is done by MONITOR_PLATFORM_CONCURRENCY semaphores below —
+# MAX_WORKERS just controls how many companies are in-flight at once.
+# 20 is fine here because the per-platform semaphores prevent any single
+# ATS from being hammered even when all 20 slots are busy.
 MONITOR_MAX_WORKERS = 20
  
 # Max concurrent requests per ATS platform.
 # Platforms sharing one API domain (Greenhouse, SmartRecruiters)
 # are throttled more aggressively than per-subdomain platforms (Workday).
 MONITOR_PLATFORM_CONCURRENCY = {
-    "workday":         20,   # each company = own subdomain, safe to parallelize fully
+    # Workday: each company has its own subdomain BUT parallel fetches
+    # still share the OS TCP connection pool.  At concurrency=20 with
+    # 36 companies each making multiple paginated requests, the pool
+    # saturates → requests_error spikes → companies return 0 jobs →
+    # coverage drops.  Observed: concurrency=20 → 32 errors, 14 companies
+    # lost from coverage (98→84).  concurrency=5 keeps max simultaneous
+    # Workday connections to ~5 and eliminates the errors.
+    "workday":          5,
     "greenhouse":       5,   # all hit boards-api.greenhouse.io
     "lever":            5,   # all hit api.lever.co
     "smartrecruiters":  5,   # all hit api.smartrecruiters.com
-    "ashby":            8,   # all hit api.ashbyhq.com
-    "oracle_hcm":       8,   # per-tenant subdomain
-    "icims":            8,   # per-tenant subdomain
-    "talentbrew":       5,
-    "phenom":           5,
-    "jobvite":          5,
-    "successfactors":   3,   # slow avg (7161ms) — keep low
-    "avature":          3,
-    "custom":          10,   # varies per company
-    # default for unlisted: 10
+    "ashby":            5,   # all hit api.ashbyhq.com
+    "oracle_hcm":       5,   # per-tenant subdomain
+    "icims":            5,   # per-tenant subdomain
+    "talentbrew":       3,
+    "phenom":           3,
+    "jobvite":          3,
+    "successfactors":   2,   # slow avg (7161ms) — keep low
+    "avature":          2,
+    "custom":           5,   # varies per company
+    # default for unlisted: 5
 }
-MONITOR_PLATFORM_CONCURRENCY_DEFAULT = 10
+MONITOR_PLATFORM_CONCURRENCY_DEFAULT = 5
  
 
 # ─────────────────────────────────────────
