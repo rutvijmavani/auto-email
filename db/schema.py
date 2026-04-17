@@ -499,6 +499,10 @@ def init_db():
             inconclusive_conn_error   INTEGER DEFAULT 0,
             inconclusive_other_status INTEGER DEFAULT 0,
             inconclusive_exception    INTEGER DEFAULT 0,
+            -- JSON map of status_code → count for inconclusive_other_status.
+            -- e.g. {"403": 89, "429": 5, "301": 3}
+            -- Lets us see exactly which codes are piling up without a schema change.
+            status_code_breakdown     TEXT DEFAULT '{}',
             remaining           INTEGER DEFAULT 0,
             run_duration_secs   INTEGER DEFAULT 0,
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -600,6 +604,15 @@ def init_db():
             raise
     try:
         c.execute("ALTER TABLE job_postings ADD COLUMN stale_since DATE;")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            raise
+
+    try:
+        c.execute(
+            "ALTER TABLE verify_filled_stats "
+            "ADD COLUMN status_code_breakdown TEXT DEFAULT '{}'"
+        )
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e).lower():
             raise
