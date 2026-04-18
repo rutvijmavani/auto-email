@@ -531,6 +531,22 @@ def _process_company(company_row, position, total):
                     logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
                                 company, job.get("job_id"), e, exc_info=True)
 
+        if platform == "smartrecruiters" and job.get("_company_slug"):
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("SmartRecruiters fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
+        if platform == "workday" and job.get("_external_path"):
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error("Workday fetch_job_detail failed %s/%s: %s",
+                                 company, job.get("job_id"), e, exc_info=True)
+
         if (platform == "custom"
                 and job.get("job_url")
                 and not job.get("description")):    # ← skip if listing already has it
