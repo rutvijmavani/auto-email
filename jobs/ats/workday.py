@@ -169,14 +169,23 @@ def fetch_job_detail(job):
     wd            = job.get("_wd", "")
     path          = job.get("_path", "")
     external_path = job.get("_external_path", "")
+    site          = job.get("_site")
 
     if not all([slug, wd, path, external_path]):
         return job
 
-    url  = (
-        f"https://{slug}.{wd}.myworkdayjobs.com"
-        f"/wday/cxs/{slug}/{path}{external_path}"
-    )
+    # Build URL based on which Workday domain variant is used
+    if site == "myworkdaysite":
+        url = (
+            f"https://{wd}.myworkdaysite.com"
+            f"/wday/cxs/{slug}/{path}{external_path}"
+        )
+    else:
+        url = (
+            f"https://{slug}.{wd}.myworkdayjobs.com"
+            f"/wday/cxs/{slug}/{path}{external_path}"
+        )
+
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
         return job
@@ -270,4 +279,5 @@ def _normalize(job, company, domain, path, slug_info=None):
         "_slug":          _si.get("slug", ""),
         "_wd":            _si.get("wd", ""),
         "_path":          path,
+        "_site":          _si.get("site"),
     }

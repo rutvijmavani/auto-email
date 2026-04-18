@@ -100,7 +100,7 @@ def fetch_job_detail(job):
     if not data:
         return job
 
-    sections  = (data.get("jobAd") or {}).get("sections", {})
+    sections  = ((data.get("jobAd") or {}).get("sections") or {})
     raw_parts = []
     for key in _DESCRIPTION_SECTIONS:
         text = (sections.get(key) or {}).get("text", "")
