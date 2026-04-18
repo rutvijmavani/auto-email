@@ -310,8 +310,22 @@ def needs_redetection(company_row, redetect_days=JOB_MONITOR_REDETECT_DAYS):
         return True
 
     if detected_at is None:
+        # Only trigger detection if the company has NEVER been successfully
+        # scanned. Companies with a working slug but no detected_at were
+        # manually configured — their slug is proven to work (first_scanned_at
+        # is set). Re-detecting them would overwrite a correct config with
+        # whatever the broken detector finds (e.g. a wrong company's tenant).
+        first_scanned = company_row.get("first_scanned_at")
+        if first_scanned is not None:
+            logger.debug(
+                "needs_redetection: %r → False "
+                "(ats_detected_at=NULL but scanned before — manually configured)",
+                company,
+            )
+            return False
         logger.debug(
-            "needs_redetection: %r → True (never detected)", company
+            "needs_redetection: %r → True (never detected, never scanned)",
+            company
         )
         return True
 

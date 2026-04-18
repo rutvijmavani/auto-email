@@ -29,9 +29,14 @@ def add_prospective_company(company, priority=0, domain=None):
     company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
+    # ats_detected_at is stamped at INSERT time so it is never NULL for any
+    # company in the pipeline.  This prevents needs_redetection() from
+    # treating every manually-added company as "never detected" and
+    # triggering automatic ATS re-detection on the next monitor run.
     c.execute("""
-        INSERT OR IGNORE INTO prospective_companies (company, priority, status, domain)
-        VALUES (?, ?, 'pending', ?)
+        INSERT OR IGNORE INTO prospective_companies
+            (company, priority, status, domain, ats_detected_at)
+        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP)
     """, (company, priority, domain))
     conn.commit()
     inserted = c.rowcount > 0

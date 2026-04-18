@@ -76,12 +76,17 @@ def init_logging(command: str = "pipeline") -> None:
     formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
 
     # ── 1. Console handler ──────────────────────────────────────────
-    # Shows DEBUG+ in terminal during manual test runs.
-    # Cron captures this via >> logs/... redirection.
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(LOG_LEVEL)
-    console.setFormatter(formatter)
-    root.addHandler(console)
+    # Only active when running interactively (TTY present).
+    # Under cron, stdout is NOT a TTY, so we skip this handler.
+    # Previously cron redirected stdout to the same file the
+    # TimedRotatingFileHandler already writes to — causing every
+    # log line to appear twice.  Skipping the console handler under
+    # cron eliminates the duplication while keeping the file handlers.
+    if sys.stdout.isatty():
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(LOG_LEVEL)
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
     # ── 2. Command-specific rotating file ──────────────────────────
     # Separate file per command so monitor logs don't mix with detect logs.

@@ -873,6 +873,10 @@ def run():
                     print("       [OK] Updated existing company")
 
                 else:
+                    # ats_detected_at is always stamped at INSERT time.
+                    # When curl/ATS was provided it reflects the actual detection.
+                    # When no ATS yet, it still marks "company was added now"
+                    # so needs_redetection() never treats the row as "never seen".
                     conn.execute(
                         "INSERT INTO prospective_companies "
                         "(company, domain, ats_platform, ats_slug, "
@@ -880,7 +884,7 @@ def run():
                         "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?)",
                         (
                             company, domain, platform, slug,
-                            datetime.utcnow() if ats_result else None,
+                            datetime.utcnow(),   # always set — never NULL
                             datetime.utcnow(),
                         )
                     )

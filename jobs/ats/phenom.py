@@ -153,7 +153,9 @@ def fetch_jobs(slug_info, company):
         return []
 
     sitemap_url = f"{base}/{sitemap}"
-    resp        = fetch_html(sitemap_url, platform="phenom")
+    # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
+    # Applied to sub-sitemap fetches too (sitemap-index tenants have N child files).
+    resp        = fetch_html(sitemap_url, platform="phenom", timeout=(10, None))
     if resp is None:
         return []
 
@@ -167,7 +169,7 @@ def fetch_jobs(slug_info, company):
             loc = sub.find("loc")
             if not loc:
                 continue
-            sub_resp = fetch_html(loc.text, platform="phenom")
+            sub_resp = fetch_html(loc.text, platform="phenom", timeout=(10, None))
             if sub_resp is None:
                 continue
             sub_soup = BeautifulSoup(sub_resp.text, "xml")
