@@ -194,11 +194,20 @@ def fetch_json_post(url, body=None, retries=2,
     return None
 
 
-def fetch_html(url, params=None, platform=None, track=True):
+def fetch_html(url, params=None, platform=None, track=True, timeout=None):
     """
-    Fetch HTML from URL with tracking.
-    Used by iCIMS and career_page.py.
+    Fetch HTML/XML from URL with tracking.
+    Used by iCIMS, SuccessFactors, TalentBrew, Avature, Phenom, and career_page.py.
+
+    timeout — passed directly to requests.  Accepts:
+        None              → use JOB_MONITOR_API_TIMEOUT (int, both connect+read)
+        int               → both connect and read timeout (seconds)
+        (connect, read)   → separate timeouts; use read=None for large downloads
+                            where the response size is unbounded (sitemaps, XML feeds).
+                            The connect timeout still catches dead hosts quickly while
+                            the None read timeout lets any active stream finish.
     """
+    request_timeout = timeout if timeout is not None else JOB_MONITOR_API_TIMEOUT
     start_ms    = int(time.time() * 1000)
     status_code = 0
 
@@ -206,7 +215,7 @@ def fetch_html(url, params=None, platform=None, track=True):
         resp = requests.get(
             url,
             params=params,
-            timeout=JOB_MONITOR_API_TIMEOUT,
+            timeout=request_timeout,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         status_code = resp.status_code

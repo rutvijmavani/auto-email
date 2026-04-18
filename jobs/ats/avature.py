@@ -161,7 +161,9 @@ def fetch_jobs(slug_info, company):
         return []
 
     sitemap_url = f"{base}/{path}/sitemap.xml"
-    resp        = fetch_html(sitemap_url, platform="avature")
+    # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
+    resp        = fetch_html(sitemap_url, platform="avature",
+                             timeout=(10, None))
 
     if resp is None:
         return []

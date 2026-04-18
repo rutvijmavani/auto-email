@@ -143,12 +143,20 @@ def mark_postings_digested():
 
 
 def mark_first_scan_complete(company):
-    """Mark company as having completed first scan."""
+    """
+    Mark company as having completed first scan.
+
+    Idempotent — only sets first_scanned_at when it is NULL so calling it
+    multiple times (e.g. after update_company_check already set it) is safe.
+    """
     conn = get_conn()
     try:
         conn.execute("""
             UPDATE prospective_companies
-            SET first_scanned_at = CURRENT_TIMESTAMP
+            SET first_scanned_at = CASE
+                    WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                    ELSE first_scanned_at
+                END
             WHERE company = ?
         """, (company,))
         conn.commit()
@@ -157,20 +165,37 @@ def mark_first_scan_complete(company):
 
 
 def update_company_check(company, found_jobs):
-    """Update last_checked_at and consecutive_empty_days."""
+    """
+    Update company timestamps and consecutive_empty_days after each monitor run.
+
+    first_scanned_at — set on the very first call (when NULL); never overwritten.
+    last_checked_at  — updated on every call.
+    consecutive_empty_days — reset to 0 when jobs found, incremented otherwise.
+
+    Combining first_scanned_at into this call ensures it is set even when the
+    company returns 0 jobs on its first scan (early-return path in _process_company).
+    """
     conn = get_conn()
     try:
         if found_jobs:
             conn.execute("""
                 UPDATE prospective_companies
-                SET last_checked_at        = CURRENT_TIMESTAMP,
+                SET first_scanned_at = CASE
+                        WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                        ELSE first_scanned_at
+                    END,
+                    last_checked_at        = CURRENT_TIMESTAMP,
                     consecutive_empty_days = 0
                 WHERE company = ?
             """, (company,))
         else:
             conn.execute("""
                 UPDATE prospective_companies
-                SET last_checked_at        = CURRENT_TIMESTAMP,
+                SET first_scanned_at = CASE
+                        WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                        ELSE first_scanned_at
+                    END,
+                    last_checked_at        = CURRENT_TIMESTAMP,
                     consecutive_empty_days = COALESCE(
                         consecutive_empty_days, 0
                     ) + 1

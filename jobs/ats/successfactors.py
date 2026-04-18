@@ -159,7 +159,10 @@ def fetch_jobs(slug_info, company):
     # Defaults to "/career" for existing slug_infos without path key.
     path = slug_info.get("path", "/career")
     url  = _feed_url(slug, dc, region, path=path)
-    resp = fetch_html(url, platform="successfactors")
+    # SuccessFactors returns ALL jobs in a single XML response.
+    # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
+    # SAP America has 2000+ jobs; any hard read cap would break large tenants.
+    resp = fetch_html(url, platform="successfactors", timeout=(10, None))
 
     if resp is None:
         return []

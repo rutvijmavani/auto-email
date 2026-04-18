@@ -247,8 +247,21 @@ def is_us_location(location: str) -> bool:
         return False
 
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────
-    if any(p in simplemap_cities for p in phrases):
-        return True
+    # Cross-check with city_country before accepting a SimpleMaps hit.
+    # SimpleMaps includes small US cities (London, KY; Camden, NJ; Paris, TX)
+    # whose names are shared with globally-famous non-US cities.  If
+    # geonamescache knows the name exclusively as non-US (e.g. "london" →
+    # {"GB","CA"}, "paris" → {"FR","CA",...}) we skip S5 and let S6 resolve
+    # it — which will correctly return False.
+    # Only return True from S5 when:
+    #   • city_country has no entry for the name (US-only per SimpleMaps), OR
+    #   • city_country includes "US" (city genuinely exists in both countries)
+    for p in phrases:
+        if p in simplemap_cities:
+            cc_set = city_country.get(p)
+            if cc_set is None or "US" in cc_set:
+                return True
+            # geonamescache knows this name as non-US only → skip, fall to S6
 
     # ── Signal 6: geonamescache global city → country codes ──────────────
     # city_country maps name → frozenset of country codes.

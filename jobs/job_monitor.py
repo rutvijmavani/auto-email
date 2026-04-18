@@ -288,18 +288,20 @@ def _process_company(company_row, position, total):
     logger.info("── [%d/%d] %r  platform=%s",
                 position, total, company, platform)
 
-    # ── ATS re-detection if needed ────────────────────────
+    # ── ATS re-detection intentionally disabled ───────────
+    # detect_ats() is unreliable and overwrites working configs with wrong
+    # results when it misidentifies a company's ATS tenant (e.g. assigned
+    # Gartner's Workday slug to SAP America after SF timeouts pushed
+    # consecutive_empty_days to 14+). Run --detect-ats manually only.
+    # Logging still fires so stale companies are visible in logs.
     if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
         domain = company_row.get("domain")
-        logger.info("Re-detection triggered for %r (domain=%s)",
-                    company, domain)
-        try:
-            with _REDETECT_SEMAPHORE:
-                detection = detect_ats(company, domain=domain)
-            platform  = detection["ats_platform"]
-            slug      = detection["ats_slug"]
-        except Exception as e:
-            logger.error("Re-detection failed for %r: %s", company, e)
+        logger.warning(
+            "Re-detection needed for %r (domain=%s, empty_days=%d) "
+            "— skipped (inline re-detection disabled, run --detect-ats manually)",
+            company, domain,
+            company_row.get("consecutive_empty_days", 0),
+        )
 
     if platform == "unknown" or not slug:
         logger.warning("Skipping %r — unknown ATS", company)
@@ -565,7 +567,8 @@ def _process_company(company_row, position, total):
           f"{len(raw_jobs)} fetched → {len(matched)} matched → {new_count} new")
 
     if is_first_scan:
-        mark_first_scan_complete(company)
+        # first_scanned_at was already set atomically in update_company_check()
+        # above — no separate DB call needed.
         logger.info("First scan complete for %r", company)
         print(f"  [{position}/{total}] {company} — "
               f"first scan complete (existing jobs pre_existing)")

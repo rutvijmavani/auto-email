@@ -125,7 +125,13 @@ def fetch_jobs(slug_info, company):
         return []
 
     sitemap_url = f"{base}/sitemap.xml"
-    resp        = fetch_html(sitemap_url, platform="talentbrew")
+    # (connect_timeout=10, read_timeout=None):
+    #   - 10s to establish the TCP connection (catches dead hosts fast)
+    #   - No read timeout — once data flows, download completes regardless
+    #     of sitemap size (UnitedHealthGroup has 5000+ jobs; hard-capping
+    #     the read would break large tenants every time they add more jobs)
+    resp        = fetch_html(sitemap_url, platform="talentbrew",
+                             timeout=(10, None))
     if resp is None:
         return []
 
