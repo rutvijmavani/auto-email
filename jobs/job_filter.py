@@ -4,6 +4,7 @@ import re
 import csv
 import hashlib
 import logging
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,25 +18,36 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Location data — loaded once at import, zero runtime cost
-# ─────────────────────────────────────────────────────────────────────────────
-
 _DATA_DIR = Path(__file__).parent.parent / "data"
 
+# Dotted forms ("u.s.a.", "u.s.") are stripped by _normalize_location before
+# matching — store the post-normalization space-separated forms instead.
+_US_EXPLICIT = {"united states", "usa", "u s a", "america"}
 
-def _load_simplemap_cities(csv_path: Path) -> set[str]:
+# Intentionally NOT checked in Signal 1 — placed after country/city checks
+# (Signal 7) so an explicit non-US signal wins over a generic remote keyword.
+# e.g. "Remote - India" → India rejected at Signal 4 before remote fires.
+_US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lazy-loaded location data (computed once on first use, cached forever)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_simplemap_cities(csv_path: Path) -> frozenset:
     """
     Load SimpleMaps US cities CSV — city names only.
-    Reads 'city' and 'city_ascii' columns (columns 1 & 2).
+    Reads 'city' and 'city_ascii' columns.
     State codes/names come from geonamescache (cleaner, authoritative).
-    Returns set of lowercase city name strings.
+    Returns frozenset of lowercase city name strings.
     """
-    city_names: set[str] = set()
+    city_names: set = set()
 
     if not csv_path.exists():
-        logger.warning("SimpleMaps CSV not found at %s — city lookup disabled", csv_path)
-        return city_names
+        logger.warning(
+            "SimpleMaps CSV not found at %s — US city lookup disabled", csv_path
+        )
+        return frozenset()
 
     with open(csv_path, encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -48,43 +60,67 @@ def _load_simplemap_cities(csv_path: Path) -> set[str]:
                 city_names.add(city_asc)
 
     logger.debug("SimpleMaps loaded: %d US city names", len(city_names))
-    return city_names
+    return frozenset(city_names)
 
 
-_SIMPLEMAP_CITIES: set[str] = _load_simplemap_cities(_DATA_DIR / "uscities.csv")
+@lru_cache(maxsize=1)
+def _get_simplemap_cities() -> frozenset:
+    return _load_simplemap_cities(_DATA_DIR / "uscities.csv")
 
-# geonamescache — state codes/names + global city→countrycode lookup
-_gc = geonamescache.GeonamesCache()
 
-_US_STATE_CODES: set[str] = {k.lower() for k in _gc.get_us_states().keys()}
-_US_STATE_NAMES: set[str] = {v["name"].lower() for v in _gc.get_us_states().values()}
+@lru_cache(maxsize=1)
+def _get_state_and_city_data():
+    """
+    Load geonamescache once and return three structures:
+      state_codes  — frozenset of lowercase 2-letter US state codes
+      state_names  — frozenset of lowercase full US state names
+      city_country — dict mapping city name → frozenset of country codes
+                     (set preserves ambiguous cities, e.g. Cambridge → {"US","GB"})
+    """
+    gc = geonamescache.GeonamesCache()
 
-_CITY_COUNTRY: dict[str, str] = {
-    c["name"].lower(): c["countrycode"]
-    for c in _gc.get_cities().values()
-}
+    state_codes = frozenset(k.lower() for k in gc.get_us_states().keys())
+    state_names = frozenset(
+        v["name"].lower() for v in gc.get_us_states().values()
+    )
 
-# ISO alpha-3 → alpha-2 mapping  e.g. "ind" → "IN", "usa" → "US"
-_ALPHA3_TO_ALPHA2: dict[str, str] = {
-    c.alpha_3.lower(): c.alpha_2
-    for c in pycountry.countries
-    if hasattr(c, "alpha_3")
-}
-_NON_US_ALPHA3: set[str] = {k for k, v in _ALPHA3_TO_ALPHA2.items() if v != "US"}
+    # Build city → {countrycodes} — do NOT overwrite duplicates
+    tmp: dict = {}
+    for c in gc.get_cities().values():
+        tmp.setdefault(c["name"].lower(), set()).add(c["countrycode"])
+    city_country = {k: frozenset(v) for k, v in tmp.items()}
 
-# Non-US country names and common names, minus any that collide with US state names
-# (e.g. "Georgia" is both a country and a US state — keep it as US)
-_NON_US_COUNTRY_WORDS: set[str] = set()
-for _c in pycountry.countries:
-    if _c.alpha_2 == "US":
-        continue
-    _NON_US_COUNTRY_WORDS.add(_c.name.lower())
-    if hasattr(_c, "common_name"):
-        _NON_US_COUNTRY_WORDS.add(_c.common_name.lower())
-_NON_US_COUNTRY_WORDS -= _US_STATE_NAMES   # remove Georgia, Jordan, etc.
+    return state_codes, state_names, city_country
 
-_US_EXPLICIT = {"united states", "usa", "u.s.a.", "u.s.", "america"}
-_US_REMOTE   = {"remote", "work from home", "wfh", "anywhere"}
+
+@lru_cache(maxsize=1)
+def _get_pycountry_data():
+    """
+    Load pycountry once and return:
+      non_us_alpha3        — frozenset of lowercase ISO alpha-3 codes for non-US countries
+      non_us_country_words — frozenset of lowercase country names/common-names,
+                             minus US state names to avoid collisions (Georgia etc.)
+    """
+    alpha3_map = {
+        c.alpha_3.lower(): c.alpha_2
+        for c in pycountry.countries
+        if hasattr(c, "alpha_3")
+    }
+    non_us_alpha3 = frozenset(k for k, v in alpha3_map.items() if v != "US")
+
+    # State names must be excluded BEFORE building non_us_country_words
+    _, state_names, _ = _get_state_and_city_data()
+
+    words: set = set()
+    for c in pycountry.countries:
+        if c.alpha_2 == "US":
+            continue
+        words.add(c.name.lower())
+        if hasattr(c, "common_name"):
+            words.add(c.common_name.lower())
+    words -= state_names   # remove "georgia", "jordan" etc.
+
+    return non_us_alpha3, frozenset(words)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,12 +132,12 @@ def _normalize_location(loc: str) -> str:
     Collapse any location encoding into a clean space-separated lowercase string.
 
     Handles (non-exhaustive):
-        IND.Chennai          → "ind chennai"
-        US-CA-Menlo Park     → "us ca menlo park"
-        Seattle (WA)         → "seattle wa"
-        PUNE 05              → "pune"
+        IND.Chennai              → "ind chennai"
+        US-CA-Menlo Park         → "us ca menlo park"
+        Seattle (WA)             → "seattle wa"
+        PUNE 05                  → "pune"
         Burlington Massachusetts → "burlington massachusetts"
-        USA Remote Worksite  → "usa remote worksite"
+        USA Remote Worksite      → "usa remote worksite"
         Menlo Park, CA; New York, NY → "menlo park ca new york ny"
     """
     # ISO alpha-3 dot pattern:  IND.Chennai → IND Chennai
@@ -116,13 +152,13 @@ def _normalize_location(loc: str) -> str:
     # Pure digit tokens:        PUNE 05 → PUNE
     loc = re.sub(r'\b\d+\b', ' ', loc)
 
-    # Remaining punctuation → spaces
+    # Remaining punctuation → spaces (dots included — removes "u.s.a." dots)
     loc = re.sub(r'[,;|/\-–—_.]+', ' ', loc)
 
     return ' '.join(loc.lower().split())
 
 
-def _ngrams(tokens: list[str], max_n: int = 3) -> list[str]:
+def _ngrams(tokens: list, max_n: int = 3) -> list:
     """
     Generate all 1-, 2-, and 3-word phrases from a token list.
     Used to match multi-word city/state names regardless of format.
@@ -144,16 +180,33 @@ def is_us_location(location: str) -> bool:
     Scans the entire string for US / non-US signals regardless of format.
 
     Signal priority (first match wins):
-        1. Explicit US keyword           → True
-        2. ISO alpha-3 non-US code       → False   (IND, GBR, CAN …)
-        3. Non-US country name           → False   (India, Germany …)
-        4. US state code or full name    → True    (CA, NY, California …)
-        5. SimpleMaps US city lookup     → True    (San Francisco, Austin …)
-        6. geonamescache city→country    → True/False
-        7. Default                       → True    (preserve false-positive tolerance)
+        1. Explicit US keyword           → True   (usa, united states, u s a …)
+        2. ISO alpha-3 non-US code       → False  (IND, GBR, CAN … uppercase-gated)
+        3. US state code or full name    → True   (CA, NY, California … runs BEFORE
+                                                   country-name check so "Jordan, UT"
+                                                   is accepted on state code "ut")
+        4. Non-US country name           → False  (India, Germany, Canada …)
+        5. SimpleMaps US city lookup     → True   (San Francisco, Austin …)
+        6. geonamescache city → country  → True/False  (set-based; prefers US when
+                                                        city exists in multiple countries)
+        7. Remote / work-from-home       → True   (last resort; placed here so
+                                                   "Remote - India" is rejected at
+                                                   Signal 4 before this fires)
+        8. Default                       → True   (preserve false-positive tolerance)
     """
     if not location or not location.strip():
         return True   # no location → assume US
+
+    # ── Uppercase alpha-3 gate ────────────────────────────────────────────
+    # Capture 3-letter ALL-CAPS tokens from the ORIGINAL string before
+    # normalization. Only these are treated as ISO country codes in Signal 2.
+    # Prevents common English words ("can", "per", "and") from being
+    # misread as country codes (CAN=Canada, PER=Peru, AND=Andorra).
+    orig_upper_alpha3: set = {
+        tok.lower()
+        for tok in re.split(r'[^A-Za-z]+', location)
+        if len(tok) == 3 and tok.isupper() and tok.isalpha()
+    }
 
     clean  = _normalize_location(location)
     tokens = clean.split()
@@ -162,51 +215,67 @@ def is_us_location(location: str) -> bool:
 
     phrases = _ngrams(tokens, max_n=3)
 
+    # Load lazy data (computed once, cached via lru_cache)
+    state_codes, state_names, city_country = _get_state_and_city_data()
+    non_us_alpha3, non_us_country_words    = _get_pycountry_data()
+    simplemap_cities                       = _get_simplemap_cities()
+
     # ── Signal 1: Explicit US keywords ───────────────────────────────────
     if any(p in _US_EXPLICIT for p in phrases):
         return True
-    if any(p in _US_REMOTE for p in phrases):
-        return True
 
     # ── Signal 2: ISO alpha-3 non-US country code ─────────────────────────
-    # Catches "IND", "GBR", "CAN", "DEU" etc. regardless of surrounding chars
+    # Only fires for tokens that were ALL-CAPS in the original string.
     for tok in tokens:
-        if len(tok) == 3:
+        if len(tok) == 3 and tok in orig_upper_alpha3:
             if tok == "usa":
                 return True
-            if tok in _NON_US_ALPHA3:
+            if tok in non_us_alpha3:
                 return False
 
-    # ── Signal 3: Non-US country name ────────────────────────────────────
-    if any(p in _NON_US_COUNTRY_WORDS for p in phrases):
+    # ── Signal 3: US state code or full name ─────────────────────────────
+    # Runs BEFORE country-name check (Signal 4) so locations like
+    # "Jordan, UT" and "Lebanon, NH" are accepted via state code before
+    # "Jordan" / "Lebanon" trigger a country-name rejection.
+    if any(tok in state_codes for tok in tokens):
+        return True
+    if any(p in state_names for p in phrases):
+        return True
+
+    # ── Signal 4: Non-US country name ────────────────────────────────────
+    if any(p in non_us_country_words for p in phrases):
         return False
 
-    # ── Signal 4: US state code or full name ─────────────────────────────
-    if any(tok in _US_STATE_CODES for tok in tokens):
-        return True
-    if any(p in _US_STATE_NAMES for p in phrases):
-        return True
-
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────
-    if any(p in _SIMPLEMAP_CITIES for p in phrases):
+    if any(p in simplemap_cities for p in phrases):
         return True
 
-    # ── Signal 6: geonamescache global city → countrycode ────────────────
+    # ── Signal 6: geonamescache global city → country codes ──────────────
+    # city_country maps name → frozenset of country codes.
+    # Prefer US: if "US" is in the set the city exists in the US regardless
+    # of other countries sharing the same name (e.g. Cambridge → {US, GB}).
     found_us     = False
     found_non_us = False
     for p in phrases:
-        cc = _CITY_COUNTRY.get(p)
-        if cc == "US":
-            found_us = True
-        elif cc is not None:
-            found_non_us = True
+        cc_set = city_country.get(p)
+        if cc_set:
+            if "US" in cc_set:
+                found_us = True
+            else:
+                found_non_us = True
 
     if found_us:
         return True
-    if found_non_us and not found_us:
+    if found_non_us:
         return False
 
-    # ── Signal 7: Default ─────────────────────────────────────────────────
+    # ── Signal 7: Remote / work-from-home ────────────────────────────────
+    # Intentionally last positive signal so a non-US country name in the
+    # same string (Signal 4) wins first, e.g. "Remote - India" → False.
+    if any(p in _US_REMOTE for p in phrases):
+        return True
+
+    # ── Signal 8: Default ─────────────────────────────────────────────────
     return True   # genuinely ambiguous → allow (false-positive tolerance)
 
 

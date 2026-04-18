@@ -41,11 +41,12 @@ def main():
         test_prospective,
         test_reports,
         test_job_monitor,
+        test_location_filter,
     )
 
     unit_tests        = [test_database, test_outreach, test_pipeline,
                          test_validation, test_verify_only, test_prospective,
-                         test_reports, test_job_monitor]
+                         test_reports, test_job_monitor, test_location_filter]
     integration_tests = [test_integration]
     scraper_tests     = [test_job_scraper]
     all_tests         = unit_tests + integration_tests + scraper_tests
