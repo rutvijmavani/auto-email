@@ -1,11 +1,23 @@
 # jobs/ats/smartrecruiters.py — SmartRecruiters public API client
 # Date field: releasedDate (RELIABLE — original release date)
 
+import html as _html
 from datetime import datetime
+
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.utils import clean_html
 
 
-BASE_URL = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+BASE_URL    = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
+DETAIL_URL  = "https://api.smartrecruiters.com/v1/companies/{slug}/postings/{job_id}"
+
+# Sections returned by the detail endpoint — extracted in this order
+_DESCRIPTION_SECTIONS = (
+    "companyDescription",
+    "jobDescription",
+    "qualifications",
+    "additionalInformation",
+)
 
 
 def detect(company):
@@ -62,6 +74,44 @@ def fetch_jobs(slug, company):
     return [_normalize(j, company, slug) for j in all_jobs if j.get("name")]
 
 
+def fetch_job_detail(job):
+    """
+    Fetch full job description from SmartRecruiters detail endpoint.
+    Called only for NEW jobs (Option C strategy).
+
+    GET /v1/companies/{slug}/postings/{job_id}
+    Response includes jobAd.sections with four possible sub-sections:
+      companyDescription, jobDescription, qualifications, additionalInformation
+    Each section's "text" field contains HTML — unescaped and stripped via clean_html().
+
+    Args:
+        job: job dict from fetch_jobs() — must contain job_id and _company_slug
+
+    Returns:
+        Updated job dict with description filled.
+    """
+    job_id       = job.get("job_id", "")
+    company_slug = job.get("_company_slug", "")
+    if not job_id or not company_slug:
+        return job
+
+    url  = DETAIL_URL.format(slug=company_slug, job_id=job_id)
+    data = fetch_json(url, platform="smartrecruiters")
+    if not data:
+        return job
+
+    sections  = ((data.get("jobAd") or {}).get("sections") or {})
+    raw_parts = []
+    for key in _DESCRIPTION_SECTIONS:
+        text = (sections.get(key) or {}).get("text", "")
+        if text:
+            raw_parts.append(_html.unescape(text))
+
+    job              = dict(job)
+    job["description"] = clean_html("\n\n".join(raw_parts))
+    return job
+
+
 def _normalize(job, company, company_slug=""):
     """Normalize SmartRecruiters job to standard format."""
     posted_at = None
@@ -96,13 +146,13 @@ def _normalize(job, company, company_slug=""):
     )
 
     return {
-        "company":     company,
-        "title":       job.get("name", ""),
-        "job_url":     job_url,
-        "location":    loc_str,
-        "posted_at":   posted_at,
-        "job_id":      str(job_id),
-        "description": (job.get("jobAd") or {}).get("sections", {})
-                           .get("jobDescription", {}).get("text", ""),
-        "ats":         "smartrecruiters",
+        "company":       company,
+        "title":         job.get("name", ""),
+        "job_url":       job_url,
+        "location":      loc_str,
+        "posted_at":     posted_at,
+        "job_id":        str(job_id),
+        "description":   "",             # filled by fetch_job_detail
+        "ats":           "smartrecruiters",
+        "_company_slug": company_slug,   # used by fetch_job_detail
     }

@@ -2,7 +2,10 @@
 # Date field: first_published (RELIABLE — original publish date)
 # Freshness: first_seen + content_hash approach
 
+import html as _html
+
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.utils import clean_html
 
 
 BASE_URL = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
@@ -80,6 +83,6 @@ def _normalize(job, company):
         "location":    job.get("location", {}).get("name", ""),
         "posted_at":   _parse_date(job.get("first_published")),  # updated_at unreliable — not used
         "job_id":      str(job.get("id", "")),
-        "description": job.get("content", ""),
+        "description": clean_html(_html.unescape(job.get("content", ""))),
         "ats":         "greenhouse",
     }

@@ -4,6 +4,7 @@
 
 from datetime import datetime
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
+from jobs.utils import clean_html
 
 
 WD_VARIANTS = [
@@ -140,13 +141,69 @@ def fetch_jobs(slug_info, company):
     for j in all_jobs:
         if not j.get("title"):
             continue
-        norm = _normalize(j, company, domain, path)
+        norm = _normalize(j, company, domain, path, slug_info)
         if norm is not None:
             results.append(norm)
     return results
 
 
-def _normalize(job, company, domain, path):
+def fetch_job_detail(job):
+    """
+    Fetch full job description from Workday detail endpoint.
+    Called only for NEW jobs (Option C strategy).
+
+    Confirmed URL pattern (tested against AT&T/wd1, State Street/wd1, Red Hat/wd5):
+      GET https://{slug}.{wd}.myworkdayjobs.com/wday/cxs/{slug}/{path}{externalPath}
+      e.g. https://att.wd1.myworkdayjobs.com/wday/cxs/att/ATTGeneral/job/Mesa-Arizona/..._R-107385
+
+    Response: jobPostingInfo.jobDescription  — HTML, present in all tenants tested.
+    Requires WORKDAY_HEADERS (plain User-Agent returns 406).
+
+    Args:
+        job: job dict from fetch_jobs() — must contain _slug, _wd, _path, _external_path
+
+    Returns:
+        Updated job dict with description filled.
+    """
+    slug          = job.get("_slug", "")
+    wd            = job.get("_wd", "")
+    path          = job.get("_path", "")
+    external_path = job.get("_external_path", "")
+    site          = job.get("_site")
+
+    if not all([slug, wd, path, external_path]):
+        return job
+
+    # Build URL based on which Workday domain variant is used
+    if site == "myworkdaysite":
+        url = (
+            f"https://{wd}.myworkdaysite.com"
+            f"/wday/cxs/{slug}/{path}{external_path}"
+        )
+    else:
+        url = (
+            f"https://{slug}.{wd}.myworkdayjobs.com"
+            f"/wday/cxs/{slug}/{path}{external_path}"
+        )
+
+    data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
+    if not data:
+        return job
+
+    info = data.get("jobPostingInfo", {})
+    if not info:
+        return job
+
+    desc = info.get("jobDescription", "")
+    if not desc:
+        return job
+
+    job              = dict(job)
+    job["description"] = clean_html(desc)
+    return job
+
+
+def _normalize(job, company, domain, path, slug_info=None):
     """
     Normalize Workday job to standard format.
 
@@ -199,17 +256,28 @@ def _normalize(job, company, domain, path):
         # so we never silently drop a job with a valid title
         job_url = domain.rstrip("/") + "/" + path.strip("/")
 
+    # bulletFields[0] is the job req ID (e.g. "R-107385") — confirmed across tenants.
+    # Fall back to regex on job_url for safety.
     import re as _re
-    _wd_match  = _re.search(r'_((?:JR|R)-?\d+(?:-\d+)?)', job_url)
-    _wd_job_id = _wd_match.group(1) if _wd_match else ""
+    _bullet_id = (job.get("bulletFields") or [""])[0]
+    if not _bullet_id:
+        _wd_match  = _re.search(r'_((?:JR|R)-?\d+(?:-\d+)?)', job_url)
+        _bullet_id = _wd_match.group(1) if _wd_match else ""
 
+    _si = slug_info or {}
     return {
-        "company":     company,
-        "title":       job.get("title", ""),
-        "job_url":     job_url,
-        "location":    job.get("locationsText", ""),
-        "posted_at":   posted_at,
-        "description": " ".join(job.get("bulletFields", [])),
-        "ats":         "workday",
-        "job_id":      _wd_job_id,
+        "company":        company,
+        "title":          job.get("title", ""),
+        "job_url":        job_url,
+        "location":       job.get("locationsText", ""),
+        "posted_at":      posted_at,
+        "description":    "",              # filled by fetch_job_detail
+        "ats":            "workday",
+        "job_id":         _bullet_id,
+        # Detail-fetch fields — used by fetch_job_detail(), not stored in DB
+        "_external_path": external_path,
+        "_slug":          _si.get("slug", ""),
+        "_wd":            _si.get("wd", ""),
+        "_path":          path,
+        "_site":          _si.get("site"),
     }
