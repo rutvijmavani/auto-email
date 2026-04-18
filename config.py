@@ -175,22 +175,11 @@ TARGET_SKILLS = [
     "java", "kubernetes", "docker",
 ]
 
-# Priority 4 — USA location keywords
-USA_LOCATION_KEYWORDS = [
-    "united states", "usa", "u.s.", "remote",
-    "new york", "san francisco", "seattle",
-    "austin", "boston", "chicago", "denver",
-    "los angeles", "atlanta", "miami", "dallas",
-    "new jersey", "washington", "virginia",
-    "texas", "california",
-]
-EXCLUDE_LOCATIONS = [
-    "canada", "toronto", "uk", "london",
-    "india", "bangalore", "germany", "berlin",
-    "australia", "singapore", "ireland", "dublin",
-    "poland", "netherlands", "france", "paris",
-    "mexico", "brazil", "japan", "china",
-]
+# Priority 4 — USA location filtering
+# Handled dynamically in job_filter.py via:
+#   - SimpleMaps US city dataset   (data/uscities.csv)
+#   - geonamescache state codes/names
+#   - pycountry country name/ISO detection
 
 # Freshness
 JOB_MONITOR_DAYS_FRESH        = 3    # days to consider a job fresh
