@@ -29,14 +29,19 @@ def add_prospective_company(company, priority=0, domain=None):
     company = _normalize_company(company)
     conn = get_conn()
     c = conn.cursor()
-    # ats_detected_at is stamped at INSERT time so it is never NULL for any
-    # company in the pipeline.  This prevents needs_redetection() from
-    # treating every manually-added company as "never detected" and
-    # triggering automatic ATS re-detection on the next monitor run.
+    # ats_detected_at stamped at INSERT — never NULL — prevents stale companies
+    # from triggering automatic re-detection on every monitor run.
+    #
+    # ats_platform explicitly set to NULL (overriding schema DEFAULT 'unknown')
+    # so get_detection_queue() can distinguish:
+    #   NULL     → new company, never through ATS detection  (priority 1)
+    #   'unknown'→ detection ran, nothing found              (priority 3)
+    # The schema DEFAULT 'unknown' is intentional only for pre-existing rows
+    # that pre-date the column; fresh inserts must be NULL.
     c.execute("""
         INSERT OR IGNORE INTO prospective_companies
-            (company, priority, status, domain, ats_detected_at)
-        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP)
+            (company, priority, status, domain, ats_detected_at, ats_platform)
+        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, NULL)
     """, (company, priority, domain))
     conn.commit()
     inserted = c.rowcount > 0

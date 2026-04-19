@@ -33,7 +33,12 @@ _US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
 # country name list does not cover.  "uk" is the most common — pycountry stores
 # "United Kingdom of Great Britain and Northern Ireland", not "uk".
 # Checked in Signal 4 so "Remote (UK)" → False (not True via Signal 7 remote).
-_NON_US_ALIASES = frozenset({"uk", "england", "emea"})
+#
+# "england" intentionally excluded: it causes a false positive on the US region
+# "New England" (phrases includes "england" → S4 wrongly rejects it).
+# Coverage is adequate without it: "London, England" → S6 catches "london" →
+# {"GB","CA"} → False; bare "England" is rare and defaults to True (S8).
+_NON_US_ALIASES = frozenset({"uk", "emea"})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

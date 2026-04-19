@@ -236,7 +236,7 @@ def _build_detail_location(info):
         # without a country component, e.g. "London" → "London, United Kingdom".
         # Skip when country is US (state code already disambiguates) or already present.
         if country and "united states" not in country.lower():
-            if "," not in primary or len(primary.split(",")) < 2:
+            if "," not in primary:
                 primary = f"{primary}, {country}"
         parts.append(primary)
 
@@ -257,8 +257,10 @@ def _parse_additional_location(loc):
 
     Internal code (AT&T):
         "USA:AZ:Gilbert:2224 E Williams Field Rd:RET/RET"
-        →  parts[0]=country, [1]=state, [2]=city
-        →  "Gilbert, AZ"
+        →  parts[0]=country code, [1]=state, [2]=city
+        →  US:  "Gilbert, AZ"          (country omitted — state code is enough for S3)
+        →  Non-US: "London, ENG, GBR"  (country code kept in UPPERCASE so Signal 2
+                                         alpha-3 gate recognises it as non-US)
 
     Returns clean string or "" if unparseable.
     """
@@ -267,12 +269,22 @@ def _parse_additional_location(loc):
     loc = loc.strip()
     parts = loc.split(":")
     if len(parts) >= 3:
-        # Internal code format — extract city + state
-        state = parts[1].strip()
-        city  = parts[2].strip()
-        if city and state:
-            return f"{city}, {state}"
-        return city or ""
+        country_code = parts[0].strip().upper()
+        state        = parts[1].strip()
+        city         = parts[2].strip()
+        if country_code == "USA":
+            # US — state code alone is sufficient for Signal 3 detection
+            if city and state:
+                return f"{city}, {state}"
+            return city or ""
+        else:
+            # Non-US — include country code in UPPERCASE so Signal 2 can
+            # recognise the alpha-3 code (e.g. "GBR") and return False
+            if city and state:
+                return f"{city}, {state}, {country_code}"
+            elif city:
+                return f"{city}, {country_code}"
+            return country_code or ""
     # Human-readable — use as-is
     return loc
 
