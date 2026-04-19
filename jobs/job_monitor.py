@@ -456,6 +456,28 @@ def _process_company(company_row, position, total):
             logger.debug("Duplicate content_hash for %r", company)
             continue
 
+        # ── Workday: detail fetch + location gate (before any save) ──────────
+        # Must run before the pre-existing / first-scan save paths so that
+        # non-US Workday jobs are never persisted in the DB at all.
+        # Listing-stage filter was title-only (locationsText is too vague);
+        # precise location comes from fetch_job_detail() → jobPostingInfo.
+        if platform == "workday":
+            if job.get("_external_path"):
+                with sem:
+                    try:
+                        job = ats_module.fetch_job_detail(job)
+                    except Exception as e:
+                        logger.error(
+                            "Workday fetch_job_detail failed %s/%s: %s",
+                            company, job.get("job_id"), e, exc_info=True,
+                        )
+            if not is_us_location(job.get("location", "")):
+                logger.debug(
+                    "Workday post-detail location dropped: %r | %s | %s",
+                    company, job.get("title"), job.get("location"),
+                )
+                continue
+
         if platform != "greenhouse" and not is_fresh(job, platform):
             logger.debug("Pre-existing (stale): %r | %s",
                          company, job.get("title"))
@@ -547,29 +569,6 @@ def _process_company(company_row, position, total):
                 except Exception as e:
                     logger.error("SmartRecruiters fetch_job_detail failed %s/%s: %s",
                                  company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "workday":
-            # Fetch detail for description + precise location.
-            # Even when _external_path is missing we still apply the location
-            # filter below (falls back to listing locationsText).
-            if job.get("_external_path"):
-                with sem:
-                    try:
-                        job = ats_module.fetch_job_detail(job)
-                    except Exception as e:
-                        logger.error(
-                            "Workday fetch_job_detail failed %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True,
-                        )
-            # Post-detail location filter — precise location now in job["location"].
-            # Listing-stage filter was title-only (see filter_jobs_title_only above)
-            # because locationsText is too vague ("2 Locations", bare city names).
-            if not is_us_location(job.get("location", "")):
-                logger.debug(
-                    "Workday post-detail location dropped: %r | %s | %s",
-                    company, job.get("title"), job.get("location"),
-                )
-                continue
 
         if (platform == "custom"
                 and job.get("job_url")

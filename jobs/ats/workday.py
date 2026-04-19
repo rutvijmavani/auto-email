@@ -232,18 +232,28 @@ def _build_detail_location(info):
     parts = []
 
     if primary:
-        # Append country descriptor when primary looks like a bare city/city+state
-        # without a country component, e.g. "London" → "London, United Kingdom".
-        # Skip when country is US (state code already disambiguates) or already present.
-        if country and "united states" not in country.lower():
-            if "," not in primary:
-                primary = f"{primary}, {country}"
+        # Append country descriptor when the country is non-US and not already
+        # present in the primary string, e.g.:
+        #   "London"       → "London, United Kingdom"
+        #   "London, ENG"  → "London, ENG, United Kingdom"
+        # Skip when country is US (state code already disambiguates) or when
+        # the descriptor is already contained in the primary string.
+        if country and "united states" not in country.lower() \
+                and country.lower() not in primary.lower():
+            primary = f"{primary}, {country}"
         parts.append(primary)
 
     for loc in additional:
         parsed = _parse_additional_location(loc)
-        if parsed and parsed not in parts:
-            parts.append(parsed)
+        if parsed:
+            # Append country descriptor to additional locations too, so
+            # human-readable non-US entries like "Berlin" become "Berlin, Germany"
+            # and is_us_location() can reject them via Signal 4.
+            if country and "united states" not in country.lower() \
+                    and country.lower() not in parsed.lower():
+                parsed = f"{parsed}, {country}"
+            if parsed not in parts:
+                parts.append(parsed)
 
     return "; ".join(parts)
 
