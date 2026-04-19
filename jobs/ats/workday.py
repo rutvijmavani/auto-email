@@ -194,13 +194,87 @@ def fetch_job_detail(job):
     if not info:
         return job
 
-    desc = info.get("jobDescription", "")
-    if not desc:
-        return job
+    job = dict(job)
 
-    job              = dict(job)
-    job["description"] = clean_html(desc)
+    # ── Description ───────────────────────────────────────────────────────
+    desc = info.get("jobDescription", "")
+    if desc:
+        job["description"] = clean_html(desc)
+
+    # ── Location ──────────────────────────────────────────────────────────
+    # Listing only gives locationsText ("2 Locations", "London") — too vague
+    # for is_us_location() filtering and incomplete for display.
+    # Detail gives precise location + additionalLocations + country fallback.
+    location = _build_detail_location(info)
+    if location:
+        job["location"] = location
+
     return job
+
+
+def _build_detail_location(info):
+    """
+    Build a clean location string from jobPostingInfo.
+
+    Primary:   info["location"]             e.g. "Irving, TX"
+    Additional: info["additionalLocations"] — two known formats:
+      • Human-readable: "Fort Myers, FL"              (Gartner, most tenants)
+      • Internal code:  "USA:AZ:Gilbert:addr:RET/RET" (AT&T)
+    Country fallback: info["country"]["descriptor"]    e.g. "United States of America"
+      Appended to primary when primary has no country context (e.g. bare "London").
+
+    Returns semicolon-joined string of all unique locations, or "" if nothing found.
+    """
+    primary    = (info.get("location") or "").strip()
+    additional = info.get("additionalLocations") or []
+    country    = ((info.get("country") or {}).get("descriptor") or "").strip()
+
+    parts = []
+
+    if primary:
+        # Append country descriptor when primary looks like a bare city/city+state
+        # without a country component, e.g. "London" → "London, United Kingdom".
+        # Skip when country is US (state code already disambiguates) or already present.
+        if country and "united states" not in country.lower():
+            if "," not in primary or len(primary.split(",")) < 2:
+                primary = f"{primary}, {country}"
+        parts.append(primary)
+
+    for loc in additional:
+        parsed = _parse_additional_location(loc)
+        if parsed and parsed not in parts:
+            parts.append(parsed)
+
+    return "; ".join(parts)
+
+
+def _parse_additional_location(loc):
+    """
+    Parse one additionalLocations entry — handles two formats seen in the wild:
+
+    Human-readable (Gartner, most tenants):
+        "Fort Myers, FL"  →  "Fort Myers, FL"
+
+    Internal code (AT&T):
+        "USA:AZ:Gilbert:2224 E Williams Field Rd:RET/RET"
+        →  parts[0]=country, [1]=state, [2]=city
+        →  "Gilbert, AZ"
+
+    Returns clean string or "" if unparseable.
+    """
+    if not loc:
+        return ""
+    loc = loc.strip()
+    parts = loc.split(":")
+    if len(parts) >= 3:
+        # Internal code format — extract city + state
+        state = parts[1].strip()
+        city  = parts[2].strip()
+        if city and state:
+            return f"{city}, {state}"
+        return city or ""
+    # Human-readable — use as-is
+    return loc
 
 
 def _normalize(job, company, domain, path, slug_info=None):

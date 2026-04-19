@@ -540,7 +540,7 @@ class TestWorkdayClient(unittest.TestCase):
         return {
             "title": title, "externalUrl": url,
             "postedOn": posted, "locationsText": "New York, NY",
-            "bulletFields": ["Python", "3+ years"],
+            "bulletFields": ["R-12345"],   # bulletFields[0] is the job req ID
         }
 
     def _slug_info(self):
@@ -641,12 +641,17 @@ class TestWorkdayClient(unittest.TestCase):
         )
 
     @patch("jobs.ats.workday.fetch_json_post")
-    def test_bullet_fields_as_description(self, mock_fetch):
+    def test_description_empty_from_listing(self, mock_fetch):
+        """Description is empty from listing — filled by fetch_job_detail (Option C)."""
         mock_fetch.return_value = {
             "jobPostings": [self._job()], "total": 1
         }
         jobs = self.wd.fetch_jobs(self._slug_info(), "JPMorgan")
-        self.assertIn("Python", jobs[0]["description"])
+        # Description is always empty from the listing endpoint — filled later
+        # by fetch_job_detail() via jobPostingInfo.jobDescription (HTML→plain text).
+        self.assertEqual(jobs[0]["description"], "")
+        # bulletFields[0] is the job req ID — confirmed across AT&T, State Street, Red Hat
+        self.assertEqual(jobs[0]["job_id"], "R-12345")
 
 
 # ═════════════════════════════════════════════════════════════════

@@ -29,6 +29,12 @@ _US_EXPLICIT = {"united states", "usa", "u s a", "america"}
 # e.g. "Remote - India" → India rejected at Signal 4 before remote fires.
 _US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
 
+# Well-known non-US abbreviations used in job postings that pycountry's full
+# country name list does not cover.  "uk" is the most common — pycountry stores
+# "United Kingdom of Great Britain and Northern Ireland", not "uk".
+# Checked in Signal 4 so "Remote (UK)" → False (not True via Signal 7 remote).
+_NON_US_ALIASES = frozenset({"uk", "england", "emea"})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lazy-loaded location data (computed once on first use, cached forever)
@@ -244,6 +250,8 @@ def is_us_location(location: str) -> bool:
 
     # ── Signal 4: Non-US country name ────────────────────────────────────
     if any(p in non_us_country_words for p in phrases):
+        return False
+    if any(p in _NON_US_ALIASES for p in phrases):
         return False
 
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────

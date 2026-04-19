@@ -272,10 +272,14 @@ def get_detection_queue(batch_size=10):
     """
     Get next batch of companies for ATS detection.
     Priority order:
-      1. Never detected (ats_detected_at IS NULL)
+      1. Platform unknown — never been through detection (ats_platform IS NULL)
       2. Active companies gone quiet (14+ empty days)
-      3. Unknown for longest time
+      3. Unknown for longest time (ats_platform = 'unknown')
       4. Custom without valid slug (needs curl capture)
+
+    Note: ats_detected_at is always stamped at INSERT time to prevent stale
+    NULL values triggering unintended re-detection. Priority 1 therefore uses
+    ats_platform IS NULL (no platform ever detected) not ats_detected_at IS NULL.
     """
     conn = get_conn()
     try:
@@ -284,7 +288,7 @@ def get_detection_queue(batch_size=10):
                    ats_detected_at, consecutive_empty_days,
                    created_at, domain,
                    CASE
-                     WHEN ats_detected_at IS NULL THEN 1
+                     WHEN ats_platform IS NULL THEN 1
                      WHEN consecutive_empty_days >= 14 THEN 2
                      WHEN ats_platform = 'unknown' THEN 3
                      WHEN ats_platform = 'custom'
@@ -296,7 +300,7 @@ def get_detection_queue(batch_size=10):
                    END AS priority
             FROM prospective_companies
             WHERE (
-                ats_detected_at IS NULL
+                ats_platform IS NULL
                 OR consecutive_empty_days >= 14
                 OR ats_platform = 'unknown'
                 OR (ats_platform = 'custom'
@@ -334,7 +338,7 @@ def get_detection_queue_stats():
             FROM (
                 SELECT
                     CASE
-                        WHEN ats_detected_at IS NULL THEN 1
+                        WHEN ats_platform IS NULL THEN 1
                         WHEN consecutive_empty_days >= 14 THEN 2
                         WHEN ats_platform = 'unknown' THEN 3
                         WHEN ats_platform = 'custom'
@@ -347,7 +351,7 @@ def get_detection_queue_stats():
                     END AS priority
                 FROM prospective_companies
                 WHERE (
-                    ats_detected_at IS NULL
+                    ats_platform IS NULL
                     OR consecutive_empty_days >= 14
                     OR ats_platform = 'unknown'
                     OR (ats_platform = 'custom'
