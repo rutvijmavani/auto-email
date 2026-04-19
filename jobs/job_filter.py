@@ -473,6 +473,42 @@ def filter_jobs(jobs):
     return results
 
 
+def filter_jobs_title_only(jobs):
+    """
+    Apply title filter only — no location check.
+
+    Used for platforms (e.g. Workday) where the listing-stage location is
+    too vague to filter on reliably ("2 Locations", bare city without country,
+    "London" that might map to Kentucky or the UK).  The caller is responsible
+    for applying is_us_location() after fetching the detail endpoint which
+    gives the full, precise location.
+
+    Adds skill_score and content_hash (keyed on listing location) so the job
+    dict is ready for save_job_posting() after the detail fetch updates the
+    location field.
+    """
+    results = []
+    for job in jobs:
+        title    = job.get("title", "")
+        location = job.get("location", "")
+
+        if not matches_title(title):
+            continue
+
+        job["skill_score"]         = score_job(job)
+        job["content_hash"]        = make_content_hash(
+            job.get("company", ""), title, location,
+            job.get("job_id", "")
+        )
+        job["content_hash_legacy"] = make_legacy_content_hash(
+            job.get("company", ""), title, location
+        )
+
+        results.append(job)
+
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Freshness
 # ─────────────────────────────────────────────────────────────────────────────

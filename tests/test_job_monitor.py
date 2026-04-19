@@ -997,6 +997,54 @@ class TestFilterJobs(unittest.TestCase):
 
 
 # ═════════════════════════════════════════════════════════════════
+# TEST: Title-only filter (Workday listing stage)
+# ═════════════════════════════════════════════════════════════════
+
+class TestFilterJobsTitleOnly(unittest.TestCase):
+    """filter_jobs_title_only passes title-matched jobs regardless of location."""
+
+    def setUp(self):
+        from jobs.job_filter import filter_jobs_title_only
+        self.filter = filter_jobs_title_only
+
+    def _j(self, **kw):
+        base = {
+            "company": "Stripe", "title": "Senior Software Engineer",
+            "location": "Remote", "description": "",
+            "posted_at": None, "job_url": "https://stripe.com/1",
+            "job_id": "R-1",
+        }
+        base.update(kw)
+        return base
+
+    def test_non_us_location_passes(self):
+        """Non-US locations must NOT be dropped — caller filters post-detail."""
+        result = self.filter([self._j(location="London, UK")])
+        self.assertEqual(len(result), 1)
+
+    def test_vague_location_passes(self):
+        """Workday '2 Locations' or bare city passes through."""
+        for loc in ("2 Locations", "London", "Noida", ""):
+            with self.subTest(location=loc):
+                result = self.filter([self._j(location=loc)])
+                self.assertEqual(len(result), 1)
+
+    def test_title_filter_still_applied(self):
+        """Non-matching titles are still excluded."""
+        self.assertEqual(len(self.filter([self._j(title="HR Manager")])), 0)
+        self.assertEqual(len(self.filter([self._j(title="")])), 0)
+
+    def test_augments_skill_score_and_hash(self):
+        result = self.filter([self._j()])
+        self.assertIn("skill_score", result[0])
+        self.assertIn("content_hash", result[0])
+        self.assertIsNotNone(result[0]["content_hash"])
+
+    def test_empty_input(self):
+        self.assertEqual(self.filter([]), [])
+
+
+# ═════════════════════════════════════════════════════════════════
 # TEST: Freshness detection
 # ═════════════════════════════════════════════════════════════════
 
