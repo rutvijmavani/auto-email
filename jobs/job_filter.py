@@ -29,6 +29,17 @@ _US_EXPLICIT = {"united states", "usa", "u s a", "america"}
 # e.g. "Remote - India" → India rejected at Signal 4 before remote fires.
 _US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
 
+# Well-known non-US abbreviations used in job postings that pycountry's full
+# country name list does not cover.  "uk" is the most common — pycountry stores
+# "United Kingdom of Great Britain and Northern Ireland", not "uk".
+# Checked in Signal 4 so "Remote (UK)" → False (not True via Signal 7 remote).
+#
+# "england" intentionally excluded: it causes a false positive on the US region
+# "New England" (phrases includes "england" → S4 wrongly rejects it).
+# Coverage is adequate without it: "London, England" → S6 catches "london" →
+# {"GB","CA"} → False; bare "England" is rare and defaults to True (S8).
+_NON_US_ALIASES = frozenset({"uk", "emea"})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lazy-loaded location data (computed once on first use, cached forever)
@@ -245,6 +256,8 @@ def is_us_location(location: str) -> bool:
     # ── Signal 4: Non-US country name ────────────────────────────────────
     if any(p in non_us_country_words for p in phrases):
         return False
+    if any(p in _NON_US_ALIASES for p in phrases):
+        return False
 
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────
     # Cross-check with city_country before accepting a SimpleMaps hit.
@@ -444,6 +457,42 @@ def filter_jobs(jobs):
             continue
 
         if not is_us_location(location):
+            continue
+
+        job["skill_score"]         = score_job(job)
+        job["content_hash"]        = make_content_hash(
+            job.get("company", ""), title, location,
+            job.get("job_id", "")
+        )
+        job["content_hash_legacy"] = make_legacy_content_hash(
+            job.get("company", ""), title, location
+        )
+
+        results.append(job)
+
+    return results
+
+
+def filter_jobs_title_only(jobs):
+    """
+    Apply title filter only — no location check.
+
+    Used for platforms (e.g. Workday) where the listing-stage location is
+    too vague to filter on reliably ("2 Locations", bare city without country,
+    "London" that might map to Kentucky or the UK).  The caller is responsible
+    for applying is_us_location() after fetching the detail endpoint which
+    gives the full, precise location.
+
+    Adds skill_score and content_hash (keyed on listing location) so the job
+    dict is ready for save_job_posting() after the detail fetch updates the
+    location field.
+    """
+    results = []
+    for job in jobs:
+        title    = job.get("title", "")
+        location = job.get("location", "")
+
+        if not matches_title(title):
             continue
 
         job["skill_score"]         = score_job(job)

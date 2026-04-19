@@ -194,13 +194,109 @@ def fetch_job_detail(job):
     if not info:
         return job
 
-    desc = info.get("jobDescription", "")
-    if not desc:
-        return job
+    job = dict(job)
 
-    job              = dict(job)
-    job["description"] = clean_html(desc)
+    # ── Description ───────────────────────────────────────────────────────
+    desc = info.get("jobDescription", "")
+    if desc:
+        job["description"] = clean_html(desc)
+
+    # ── Location ──────────────────────────────────────────────────────────
+    # Listing only gives locationsText ("2 Locations", "London") — too vague
+    # for is_us_location() filtering and incomplete for display.
+    # Detail gives precise location + additionalLocations + country fallback.
+    location = _build_detail_location(info)
+    if location:
+        job["location"] = location
+
     return job
+
+
+def _build_detail_location(info):
+    """
+    Build a clean location string from jobPostingInfo.
+
+    Primary:   info["location"]             e.g. "Irving, TX"
+    Additional: info["additionalLocations"] — two known formats:
+      • Human-readable: "Fort Myers, FL"              (Gartner, most tenants)
+      • Internal code:  "USA:AZ:Gilbert:addr:RET/RET" (AT&T)
+    Country fallback: info["country"]["descriptor"]    e.g. "United States of America"
+      Appended to primary when primary has no country context (e.g. bare "London").
+
+    Returns semicolon-joined string of all unique locations, or "" if nothing found.
+    """
+    primary    = (info.get("location") or "").strip()
+    additional = info.get("additionalLocations") or []
+    country    = ((info.get("country") or {}).get("descriptor") or "").strip()
+
+    parts = []
+
+    if primary:
+        # Append country descriptor when the country is non-US and not already
+        # present in the primary string, e.g.:
+        #   "London"       → "London, United Kingdom"
+        #   "London, ENG"  → "London, ENG, United Kingdom"
+        # Skip when country is US (state code already disambiguates) or when
+        # the descriptor is already contained in the primary string.
+        if country and "united states" not in country.lower() \
+                and country.lower() not in primary.lower():
+            primary = f"{primary}, {country}"
+        parts.append(primary)
+
+    for loc in additional:
+        parsed = _parse_additional_location(loc)
+        if parsed:
+            # Append country descriptor to additional locations too, so
+            # human-readable non-US entries like "Berlin" become "Berlin, Germany"
+            # and is_us_location() can reject them via Signal 4.
+            if country and "united states" not in country.lower() \
+                    and country.lower() not in parsed.lower():
+                parsed = f"{parsed}, {country}"
+            if parsed not in parts:
+                parts.append(parsed)
+
+    return "; ".join(parts)
+
+
+def _parse_additional_location(loc):
+    """
+    Parse one additionalLocations entry — handles two formats seen in the wild:
+
+    Human-readable (Gartner, most tenants):
+        "Fort Myers, FL"  →  "Fort Myers, FL"
+
+    Internal code (AT&T):
+        "USA:AZ:Gilbert:2224 E Williams Field Rd:RET/RET"
+        →  parts[0]=country code, [1]=state, [2]=city
+        →  US:  "Gilbert, AZ"          (country omitted — state code is enough for S3)
+        →  Non-US: "London, ENG, GBR"  (country code kept in UPPERCASE so Signal 2
+                                         alpha-3 gate recognises it as non-US)
+
+    Returns clean string or "" if unparseable.
+    """
+    if not loc:
+        return ""
+    loc = loc.strip()
+    parts = loc.split(":")
+    if len(parts) >= 3:
+        country_code = parts[0].strip().upper()
+        state        = parts[1].strip()
+        city         = parts[2].strip()
+        if country_code == "USA":
+            # US — state code alone is sufficient for Signal 3 detection
+            if city and state:
+                return f"{city}, {state}"
+            return city or ""
+        else:
+            # Non-US — include country code in UPPERCASE so Signal 2 can
+            # recognise the alpha-3 code (e.g. "GBR") and return False
+            if city and state:
+                return f"{city}, {state}, {country_code}"
+            elif city:
+                return f"{city}, {country_code}"
+            return country_code or ""
+    # Human-readable — use as-is
+    return loc
 
 
 def _normalize(job, company, domain, path, slug_info=None):
