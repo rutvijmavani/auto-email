@@ -201,10 +201,19 @@ def fetch_job_detail(job):
     if desc:
         job["description"] = clean_html(desc)
 
-    # ── Location ──────────────────────────────────────────────────────────
-    # Listing only gives locationsText ("2 Locations", "London") — too vague
-    # for is_us_location() filtering and incomplete for display.
-    # Detail gives precise location + additionalLocations + country fallback.
+    # ── Country code (Tier 1) ─────────────────────────────────────────────
+    # jobRequisitionLocation.country.alpha2Code is the authoritative signal.
+    # Confirmed present across tenants: "US" (Gartner), "IN" (Capital One).
+    # Stored as _country_code; job_monitor uses it before text parsing.
+    # Falls back to "" — job_monitor then uses descriptor-embedded location.
+    req_loc = info.get("jobRequisitionLocation") or {}
+    alpha2  = ((req_loc.get("country") or {}).get("alpha2Code") or "").upper()
+    job["_country_code"] = alpha2
+
+    # ── Location (display + Tier 3 fallback) ─────────────────────────────
+    # _build_detail_location() embeds country.descriptor into the location
+    # string for non-US jobs (e.g. "Bangalore, In" → "Bangalore, In, India")
+    # so is_us_location() has the full country name if alpha2Code is absent.
     location = _build_detail_location(info)
     if location:
         job["location"] = location

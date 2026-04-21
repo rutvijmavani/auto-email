@@ -47,10 +47,9 @@ from db.db import (
     reactivate_job,
 )
 from jobs.ats_detector import (
-    detect_ats, needs_redetection, override_ats,
-    get_ats_module, QuotaExhaustedException
+    detect_ats, needs_redetection, override_ats, get_ats_module,
 )
-from db.serper_quota import get_serper_credits
+from jobs.ats.registry import get_config
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
@@ -85,6 +84,68 @@ _DEFAULT_SEMAPHORE = threading.Semaphore(_DEFAULT_CONCURRENCY)
 def _get_semaphore(platform):
     """Return the semaphore for this platform (or default)."""
     return _PLATFORM_SEMAPHORES.get(platform, _DEFAULT_SEMAPHORE)
+
+
+# ─────────────────────────────────────────
+# PER-COMPANY HELPERS (registry-driven)
+# ─────────────────────────────────────────
+
+def _parse_slug(platform, slug, config):
+    """
+    Parse the raw DB slug into the form each ATS module expects.
+
+    Registry slug_type:
+      "string" → pass slug as-is (str)
+      "json"   → json.loads(slug); platform-specific defaults if parse fails
+
+    Returns either a string (slug_type="string") or a dict (slug_type="json").
+    """
+    if config.get("slug_type") != "json":
+        return slug
+    try:
+        slug_info = json.loads(slug)
+        # Workday: ensure "path" key exists (older slugs may predate it)
+        if platform == "workday" and "path" not in slug_info:
+            slug_info["path"] = "careers"
+        return slug_info
+    except (json.JSONDecodeError, TypeError):
+        defaults = {
+            "workday":    {"slug": slug or "", "wd": "wd5", "path": "careers"},
+            "oracle_hcm": {"slug": slug or "", "site": ""},
+        }
+        return defaults.get(platform, {})
+
+
+def _should_fetch_detail(job, platform, config, slug_info=None):
+    """
+    Return True if fetch_job_detail() should be called for this job.
+
+    Checks the registry has_detail flag and platform-specific preconditions
+    (the job dict must contain the key the detail fetcher needs).
+    """
+    if not config.get("has_detail"):
+        return False
+    # Platforms that require a specific key in the job dict
+    required_keys = {
+        "icims":           "_base_url",
+        "jobvite":         "_slug",
+        "taleo":           "_contest_no",
+        "smartrecruiters": "_company_slug",
+        "workday":         "_external_path",
+    }
+    key = required_keys.get(platform)
+    if key is not None:
+        return bool(job.get(key))
+    # sitemap: skip XML feeds (they already have all data in the feed)
+    if platform == "sitemap":
+        return bool(job.get("job_url")) and job.get("_feed_type") != "xml"
+    # custom: only if detail config exists AND listing didn't already fill description
+    if platform == "custom":
+        return bool(
+            slug_info and slug_info.get("detail") and not job.get("description")
+        )
+    # Default: fetch detail if a job URL is available
+    return bool(job.get("job_url"))
 
 
 # ─────────────────────────────────────────
@@ -313,20 +374,15 @@ def _process_company(company_row, position, total):
         print(f"  [{position}/{total}] {company} — [SKIP] Unknown ATS")
         return result
 
-    # ── Get ATS module ────────────────────────────────────
-    # custom platform is handled inline below — get_ats_module()
-    # returns None for it, so we import directly to avoid the
-    # "No ATS module" failure path.
-    if platform == "custom":
-        from jobs.ats import custom_career as ats_module
-    else:
-        ats_module = get_ats_module(platform)
-        if not ats_module:
-            logger.error("No ATS module for platform=%s (%r)",
-                         platform, company)
-            result["failed"]       = 1
-            result["failure_name"] = company
-            return result
+    # ── Get ATS module + registry config ─────────────────
+    config     = get_config(platform)
+    ats_module = get_ats_module(platform)
+    if not ats_module:
+        logger.error("No ATS module for platform=%s (%r)",
+                     platform, company)
+        result["failed"]       = 1
+        result["failure_name"] = company
+        return result
 
     # ── Acquire per-ATS semaphore ─────────────────────────
     # Limits concurrent requests to the same ATS domain.
@@ -336,40 +392,15 @@ def _process_company(company_row, position, total):
     with sem:
         # ── Fetch jobs ────────────────────────────────────
         try:
-            if platform == "workday":
-                try:
-                    slug_info = json.loads(slug)
-                    if "path" not in slug_info:
-                        slug_info["path"] = "careers"
-                except (json.JSONDecodeError, TypeError):
-                    slug_info = {"slug": slug, "wd": "wd5", "path": "careers"}
-                logger.debug("Workday fetch: %r slug=%s", company, slug_info)
-                raw_jobs = ats_module.fetch_jobs(slug_info, company)
-
-            elif platform == "oracle_hcm":
-                try:
-                    slug_info = json.loads(slug)
-                except (json.JSONDecodeError, TypeError):
-                    slug_info = {"slug": slug, "site": ""}
-                logger.debug("Oracle HCM fetch: %r slug=%s", company, slug_info)
-                raw_jobs = ats_module.fetch_jobs(slug_info, company)
-
-            elif platform == "custom":
-                try:
-                    slug_info = json.loads(slug)
-                except (json.JSONDecodeError, TypeError):
-                    logger.error("custom: invalid slug JSON for %r", company)
-                    result["failed"]       = 1
-                    result["failure_name"] = company
-                    return result
-                logger.debug("custom fetch: %r slug_info keys=%s",
-                             company, list(slug_info.keys()))
-                raw_jobs = ats_module.fetch_jobs(slug_info, company)
-
-            else:
-                logger.debug("%s fetch: %r slug=%s", platform, company, slug)
-                raw_jobs = ats_module.fetch_jobs(slug, company)
-
+            slug_info = _parse_slug(platform, slug, config)
+            # custom: validate that the slug parsed to a usable dict
+            if platform == "custom" and not isinstance(slug_info, dict):
+                logger.error("custom: invalid slug JSON for %r", company)
+                result["failed"]       = 1
+                result["failure_name"] = company
+                return result
+            logger.debug("%s fetch: %r slug=%s", platform, company, slug_info)
+            raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except Exception as e:
             logger.error("API fetch failed for %r (platform=%s): %s",
                          company, platform, e, exc_info=True)
@@ -416,10 +447,10 @@ def _process_company(company_row, position, total):
     update_company_check(company, found_jobs=True)
 
     # ── Filter ────────────────────────────────────────────
-    # Workday listing locations are too vague to filter on reliably
-    # ("2 Locations", bare "London", etc.).  Apply title-only filter here;
-    # is_us_location() fires post-detail-fetch with the precise location.
-    if platform == "workday":
+    # Registry listing_filter drives which filter to apply:
+    #   "full"       → filter_jobs()             (title + location at listing)
+    #   "title_only" → filter_jobs_title_only()  (location deferred to detail)
+    if config.get("listing_filter") == "title_only":
         matched = filter_jobs_title_only(raw_jobs)
     else:
         matched = filter_jobs(raw_jobs)
@@ -434,10 +465,9 @@ def _process_company(company_row, position, total):
 
     # ── Save new jobs ─────────────────────────────────────
     new_count = 0
-    slug_info_cached = None 
-
-    if platform == "custom":
-        slug_info_cached = slug_info
+    # slug_info is already parsed above — used by custom detail fetcher
+    # and any other platform that needs it inside the per-job loop.
+    slug_info_cached = slug_info if isinstance(slug_info, dict) else None
 
     for job in matched:
         exists, is_filled = job_url_exists(job["job_url"])
@@ -456,25 +486,53 @@ def _process_company(company_row, position, total):
             logger.debug("Duplicate content_hash for %r", company)
             continue
 
-        # ── Workday: detail fetch + location gate (before any save) ──────────
-        # Must run before the pre-existing / first-scan save paths so that
-        # non-US Workday jobs are never persisted in the DB at all.
-        # Listing-stage filter was title-only (locationsText is too vague);
-        # precise location comes from fetch_job_detail() → jobPostingInfo.
-        if platform == "workday":
-            if job.get("_external_path"):
-                with sem:
-                    try:
-                        job = ats_module.fetch_job_detail(job)
-                    except Exception as e:
-                        logger.error(
-                            "Workday fetch_job_detail failed %s/%s: %s",
-                            company, job.get("job_id"), e, exc_info=True,
-                        )
-            if not is_us_location(job.get("location", "")):
+        # ── Workday: early detail fetch + location gate ───────────────────────
+        # Workday listing locations are too vague ("2 Locations", bare "London").
+        # Fetch detail BEFORE freshness/pre_existing checks so non-US jobs are
+        # never written to the DB at all (even as pre_existing).
+        # All other has_detail platforms fetch detail for new jobs only (below).
+        #
+        # Location waterfall (most → least reliable):
+        #   Tier 1: jobRequisitionLocation.country.alpha2Code ("US", "IN", "DE")
+        #           → stored as _country_code by fetch_job_detail(); definitive.
+        #   Tier 3: is_us_location() on descriptor-embedded location string
+        #           → fallback when alpha2Code absent (older/custom tenants).
+        if platform == "workday" and job.get("_external_path"):
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error(
+                        "Workday fetch_job_detail failed %s/%s: %s",
+                        company, job.get("job_id"), e, exc_info=True,
+                    )
+            alpha2 = (job.get("_country_code") or "").upper()
+            if alpha2:
+                # Tier 1: structured alpha-2 code — no text parsing needed
+                if alpha2 != "US":
+                    logger.debug(
+                        "Workday non-US dropped (alpha2): %r | %s | country=%s",
+                        company, job.get("title"), alpha2,
+                    )
+                    continue
+            elif not is_us_location(job.get("location", "")):
+                # Tier 3: alpha2Code absent → fall back to descriptor-embedded text
                 logger.debug(
-                    "Workday post-detail location dropped: %r | %s | %s",
+                    "Workday non-US dropped (text): %r | %s | %s",
                     company, job.get("title"), job.get("location"),
+                )
+                continue
+
+        # ── Alpha-2 listing-level gate ────────────────────────────────────────
+        # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
+        # alpha-2 code in every listing.  Drop non-US jobs before the detail
+        # fetch — saves one HTTP call per non-US job.
+        if config.get("country_source") == "alpha2":
+            code = (job.get("_country_code") or "").lower()
+            if code and code != "us":
+                logger.debug(
+                    "Listing-level alpha2 country dropped: %r | %s | country=%s",
+                    company, job.get("title"), code,
                 )
                 continue
 
@@ -488,97 +546,13 @@ def _process_company(company_row, position, total):
             save_job_posting(job, status="pre_existing")
             continue
 
-        # Platform-specific detail fetches — each re-acquires the semaphore
-        # so detail HTTP requests obey the same per-platform throttle as listing.
-        if platform == "icims" and job.get("_base_url"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("iCIMS fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "jobvite" and job.get("_slug"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("Jobvite fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "avature" and job.get("job_url"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("Avature fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "phenom" and job.get("job_url"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("Phenom fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "talentbrew" and job.get("job_url"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("TalentBrew fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "sitemap" and job.get("job_url") and \
-                job.get("_feed_type") != "xml":
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("Sitemap fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "taleo" and job.get("_contest_no"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                    # taleo returns extra fields — store safely only if columns exist
-                    # salary_min, salary_max, salary_type, contact, contact_phone,
-                    # full_location are stored in job dict and saved by save_job_posting()
-                    # if those columns exist in the DB schema.
-                    # If they don't exist yet, save_job_posting() will ignore them
-                    # (as long as it uses named column inserts, not SELECT *).
-                except Exception as e:
-                    logger.error("Taleo fetch_job_detail failed for %s/%s: %s",
-                                company, job.get("job_id"), e, exc_info=True)
-
-        # ── Eightfold ─────────────────────────────────────────────────────────────
-        if platform == "eightfold" and job.get("job_url"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("Eightfold fetch_job_detail failed for %s/%s: %s",
-                                company, job.get("job_id"), e, exc_info=True)
-
-        if platform == "smartrecruiters" and job.get("_company_slug"):
-            with sem:
-                try:
-                    job = ats_module.fetch_job_detail(job)
-                except Exception as e:
-                    logger.error("SmartRecruiters fetch_job_detail failed %s/%s: %s",
-                                 company, job.get("job_id"), e, exc_info=True)
-
-        if (platform == "custom"
-                and job.get("job_url")
-                and not job.get("description")):    # ← skip if listing already has it
-            if slug_info_cached is None:
-                try:
-                    slug_info_cached = json.loads(slug)
-                except (json.JSONDecodeError, TypeError):
-                    slug_info_cached = {}
-            if slug_info_cached.get("detail"):
+        # ── Detail fetch for new jobs ─────────────────────────────────────────
+        # Registry has_detail + _should_fetch_detail() drive when to fetch.
+        # Each call re-acquires the semaphore to throttle detail HTTP requests.
+        # Workday excluded — detail was fetched in the early-fetch path above.
+        # Custom uses a different signature (passes slug_info_cached).
+        if platform == "custom":
+            if _should_fetch_detail(job, platform, config, slug_info_cached):
                 with sem:
                     try:
                         job = ats_module.fetch_job_detail(job, slug_info_cached)
@@ -592,6 +566,40 @@ def _process_company(company_row, position, total):
                             "Custom fetch_job_detail failed %s/%s: %s",
                             company, job.get("job_id"), e, exc_info=True,
                         )
+        elif platform != "workday" and _should_fetch_detail(job, platform, config):
+            with sem:
+                try:
+                    job = ats_module.fetch_job_detail(job)
+                except Exception as e:
+                    logger.error(
+                        "%s fetch_job_detail failed %s/%s: %s",
+                        platform, company, job.get("job_id"), e, exc_info=True,
+                    )
+
+        # ── Post-detail location gate ─────────────────────────────────────────
+        # Applies to all platforms where detail fills/refines location
+        # (registry has_detail=True), except Workday (gated above).
+        #
+        # country_source="alpha2"     → _country_code set by detail parse (iCIMS
+        #                               JSON-LD); listing gate caught SmartRecruiters
+        # country_source="text"       → location string via is_us_location()
+        # country_source="descriptor" → full country name embedded by detail
+        #                               normaliser; is_us_location() Signal 4 fires
+        if config.get("has_detail") and platform != "workday":
+            code = (job.get("_country_code") or "").upper()
+            if code and code != "US":
+                logger.debug(
+                    "Post-detail country code dropped: %r | %s | country=%s",
+                    company, job.get("title"), code,
+                )
+                continue
+            loc = job.get("location", "")
+            if loc and not is_us_location(loc):
+                logger.debug(
+                    "Post-detail location dropped: %r | %s | %s",
+                    company, job.get("title"), loc,
+                )
+                continue
 
         if save_job_posting(job, status="new"):
             new_count += 1
@@ -809,34 +817,13 @@ def run_detect_ats(company=None, override_platform=None,
             print(f"[ERROR] '{company}' not found.")
             return
 
-        credits = get_serper_credits()
-        logger.info("Serper credits: %d/%d",
-                    credits["credits_remaining"], credits["credits_limit"])
-        print(f"[INFO] Serper credits: "
-              f"{credits['credits_remaining']}/{credits['credits_limit']}")
-
         domain = matches[0].get("domain") if matches else None
-        try:
-            result = detect_ats(company_normalized, domain=domain)
-            logger.info("Result: %s", result)
-            build_detection_report([result], date_str)
-        except QuotaExhaustedException:
-            logger.warning("Serper exhausted during detection of %r",
-                           company_normalized)
-            print("[WARNING] Serper credits exhausted")
+        result = detect_ats(company_normalized, domain=domain)
+        logger.info("Result: %s", result)
+        build_detection_report([result], date_str)
         return
 
     if batch:
-        credits   = get_serper_credits()
-        remaining = credits["credits_remaining"]
-        logger.info("Batch detection: Serper remaining=%d", remaining)
-
-        if remaining <= 0:
-            logger.warning("Serper credits exhausted")
-            print("[WARNING] Serper credits exhausted.")
-            _print_detection_queue_status()
-            return
-
         to_detect = get_detection_queue(batch_size=DETECT_ATS_BATCH_SIZE)
         if not to_detect:
             logger.info("Detection queue empty")
@@ -852,15 +839,9 @@ def run_detect_ats(company=None, override_platform=None,
             comp   = company_row["company"]
             domain = company_row.get("domain")
             print(f"[{i}/{len(to_detect)}] {comp}")
-            try:
-                result = detect_ats(comp, domain=domain)
-                results.append(result)
-            except QuotaExhaustedException:
-                logger.warning("Serper exhausted after %d companies", i - 1)
-                print(f"\n[WARNING] Serper exhausted after {i-1}.")
-                break
+            result = detect_ats(comp, domain=domain)
+            results.append(result)
 
-        credits = get_serper_credits()
         logger.info("Batch complete: %d results", len(results))
         _print_detection_queue_status()
         if results:
@@ -874,7 +855,6 @@ def run_detect_ats(company=None, override_platform=None,
         _print_detection_queue_status()
         return
 
-    credits = get_serper_credits()
     print(f"[INFO] Detecting {len(to_detect)} companies...\n")
 
     results = []
@@ -882,12 +862,8 @@ def run_detect_ats(company=None, override_platform=None,
         comp   = company_row["company"]
         domain = company_row.get("domain")
         print(f"[{i}/{len(to_detect)}] {comp}")
-        try:
-            result = detect_ats(comp, domain=domain)
-            results.append(result)
-        except QuotaExhaustedException:
-            print(f"\n[WARNING] Serper exhausted after {i-1}.")
-            break
+        result = detect_ats(comp, domain=domain)
+        results.append(result)
 
     _print_detection_queue_status()
     if results:

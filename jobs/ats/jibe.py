@@ -100,7 +100,7 @@ def _normalize(job, company, slug):
     if not job_url:
         return None
 
-    # Location — prefer full_location, fall back to city+state
+    # Location — prefer full_location, fall back to city+state+country
     location = (job.get("full_location") or "").strip()
     if not location:
         city    = job.get("city") or ""
@@ -109,19 +109,25 @@ def _normalize(job, company, slug):
         parts   = [p for p in [city, state, country] if p]
         location = ", ".join(parts)
 
+    # Country code (Tier 1 gate)
+    # Jibe API provides country_code as ISO alpha-2 ("US", "IN", "GB" …)
+    # on every job — far more reliable than text-parsing the location string.
+    country_code = (job.get("country_code") or "").strip().upper()
+
     posted_at = _parse_date(job.get("posted_date"))
 
     description = _build_description(job)
 
     return {
-        "company":     company,
-        "title":       title,
-        "job_url":     job_url,
-        "job_id":      req_id,
-        "location":    location,
-        "posted_at":   posted_at,
-        "description": description,
-        "ats":         "jibe",
+        "company":       company,
+        "title":         title,
+        "job_url":       job_url,
+        "job_id":        req_id,
+        "location":      location,
+        "posted_at":     posted_at,
+        "description":   description,
+        "ats":           "jibe",
+        "_country_code": country_code,
     }
 
 

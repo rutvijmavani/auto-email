@@ -1,12 +1,22 @@
 """
 jobs/ats_detector.py — ATS detection orchestrator.
 
-Detection flow (4 phases):
-  Phase 1: Sitemap lookup       (FREE, instant)
-  Phase 2: ATS API name probe   (FREE, ~50ms)
-  Phase 3a: HTML + redirect     (FREE, ~100ms)
-  Phase 3b: Serper API          (2500 free credits)
+Detection flow (3 phases):
+  Phase 1: Sitemap lookup     (FREE, instant)
+  Phase 2: ATS API name probe (FREE, ~50ms)
+                               Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS
+  Phase 3: Career page scan   (FREE, ~200-600ms)
+                               Layer 1 — HTTP redirect to ATS domain
+                               Layer 2 — Deep HTML scan (all attributes +
+                                         inline scripts)
+                               Layer 3 — Follow 2-3 individual job links;
+                                         the ATS embed/apply URL lives here
+                                         (Greenhouse iframe, Workday redirect)
   Phase 4: Unknown → store as unknown
+
+  Serper (Google search API) was Phase 3b but removed: result quality is too
+  low (≤2 relevant URLs out of 10 results) to reliably extract ATS slugs.
+  Phase 3 Layer 3 (job link following) replaces it at zero credit cost.
 
 custom platform:
   Companies with ats_platform='custom' and a valid ats_slug
@@ -23,13 +33,7 @@ from db.connection import get_conn
 from logger import get_logger
 logger = get_logger(__name__)
 
-from jobs.ats import (greenhouse, lever, ashby, smartrecruiters, workday)
-from jobs.ats import (oracle_hcm, icims, jobvite, avature)
-from jobs.ats import (
-    phenom, talentbrew, sitemap, successfactors, google,
-    taleo, eightfold, jibe,
-)
-from jobs.ats import custom_career   # ← universal custom ATS engine
+from jobs.ats.registry import get_module, is_supported
 from config import (
     ATS_STATUS_DETECTED,
     ATS_STATUS_UNSUPPORTED,
@@ -46,31 +50,6 @@ class QuotaExhaustedException(Exception):
     """Raised when Serper API credits are exhausted."""
     pass
 
-
-# ─────────────────────────────────────────
-# PLATFORM REGISTRY
-# ─────────────────────────────────────────
-
-ATS_REGISTRY = {
-    "greenhouse":      greenhouse,
-    "lever":           lever,
-    "ashby":           ashby,
-    "smartrecruiters": smartrecruiters,
-    "workday":         workday,
-    "oracle_hcm":      oracle_hcm,
-    "icims":           icims,
-    "jobvite":         jobvite,
-    "avature":         avature,
-    "phenom":          phenom,
-    "talentbrew":      talentbrew,
-    "sitemap":         sitemap,
-    "successfactors":  successfactors,
-    "google":          google,
-    "taleo":           taleo,
-    "eightfold":       eightfold,
-    "jibe":            jibe,
-    "custom":          custom_career, # Universal custom ATS engine
-}
 
 ATS_STATUS_CUSTOM = "custom"
 
@@ -100,7 +79,7 @@ def _get_keywords(company):
 # ─────────────────────────────────────────
 
 def detect_ats(company, domain=None, page=None, sb=None):
-    """Detect ATS for a company using 4-phase approach."""
+    """Detect ATS for a company using 3-phase approach."""
     logger.info("━━━ ATS detection: company=%r domain=%r", company, domain)
     print(f"   [INFO] Detecting ATS for {company}...")
 
@@ -126,24 +105,24 @@ def detect_ats(company, domain=None, page=None, sb=None):
               f"{result['platform']} / {result['slug']}")
         return _store_and_return(company, result)
 
-    # Phase 3a: HTML + redirect scan
+    # Phase 3: Career page scan (redirect + deep HTML + job link follow)
     if domain:
-        print(f"   [P3a] HTML redirect scan ({domain})...")
+        print(f"   [P3] Career page scan ({domain})...")
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
         if result:
-            logger.info("[P3a HIT] %r → %s / %s",
+            logger.info("[P3 HIT] %r → %s / %s",
                         company, result["platform"], result["slug"])
-            print(f"   [P3a HIT] {company} -> "
+            print(f"   [P3 HIT] {company} -> "
                   f"{result['platform']} / {result['slug']}")
             return _store_and_return(company, result)
     else:
-        logger.warning("[P3a SKIP] No domain for %r", company)
+        logger.warning("[P3 SKIP] No domain for %r", company)
 
-    # Phase 3b: Serper API
+    # Custom ATS check (was gated on Serper — keep the fast-path)
     if company in KNOWN_CUSTOM_ATS:
-        logger.info("[CUSTOM] %r uses custom ATS — skipping Serper", company)
-        print(f"   [CUSTOM] {company} uses custom ATS — skipping Serper")
+        logger.info("[CUSTOM] %r uses custom ATS", company)
+        print(f"   [CUSTOM] {company} uses custom ATS")
         _store_detection(company, ATS_STATUS_CUSTOM, None)
         return {
             "company":      company,
@@ -153,22 +132,6 @@ def detect_ats(company, domain=None, page=None, sb=None):
             "ats_platform": ATS_STATUS_CUSTOM,
             "ats_slug":     None,
         }
-
-    print("   [P3b] Serper API search...")
-    from jobs.serper import detect_via_serper, SERPER_EXHAUSTED
-    serper_result = detect_via_serper(company)
-
-    if serper_result is SERPER_EXHAUSTED:
-        logger.warning("[P3b] Serper credits exhausted for %r", company)
-        print("[WARNING] Serper credits exhausted")
-        raise QuotaExhaustedException("Serper credits exhausted")
-
-    if serper_result:
-        logger.info("[P3b HIT] %r → %s / %s",
-                    company, serper_result["platform"], serper_result["slug"])
-        print(f"   [P3b HIT] {company} -> "
-              f"{serper_result['platform']} / {serper_result['slug']}")
-        return _store_and_return(company, serper_result)
 
     # Phase 4: Unknown
     logger.warning("[UNKNOWN] %r — no ATS found", company)
@@ -190,7 +153,7 @@ def _store_and_return(company, result):
     platform = result["platform"]
     slug     = result["slug"]
 
-    if platform in ATS_REGISTRY:
+    if is_supported(platform):
         status = ATS_STATUS_DETECTED
         label  = "[OK]"
     else:
@@ -200,7 +163,7 @@ def _store_and_return(company, result):
               f"(not yet supported)")
 
     stored_platform = (
-        platform if platform in ATS_REGISTRY else ATS_STATUS_UNSUPPORTED
+        platform if is_supported(platform) else ATS_STATUS_UNSUPPORTED
     )
     _store_detection(company, stored_platform, slug)
 
@@ -520,7 +483,7 @@ def override_ats(company, platform, slug):
 
 def get_ats_module(platform):
     """Return ATS module for given platform name."""
-    module = ATS_REGISTRY.get(platform)
+    module = get_module(platform)
     if not module:
         logger.warning("No ATS module for platform=%s", platform)
     return module

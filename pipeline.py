@@ -69,7 +69,10 @@ logger = get_logger(__name__)
 
 def extract_expected_domain(job_url):
     """
-    Extract expected company domain root from job URL.
+    Extract a company-identifying slug from a job URL.
+
+    Delegates ATS URL parsing to match_ats_pattern() (single source of truth),
+    then falls back to hostname-based extraction for direct company domains.
 
     Examples:
       https://jobs.ashbyhq.com/collective/54259edc  → "collective"
@@ -77,81 +80,41 @@ def extract_expected_domain(job_url):
       https://collective.com/careers/engineer       → "collective"
       https://jobs.lever.co/stripe/abc123           → "stripe"
       https://careers-schwab.icims.com/jobs/123     → "schwab"
-      https://schwab.icims.com/jobs/123             → "schwab"
-      https://jpmc.fa.oraclecloud.com/hcmUI/...     → "jpmc"
       https://capitalone.wd12.myworkdayjobs.com/... → "capitalone"
+      https://jpmc.fa.oraclecloud.com/hcmUI/...     → "jpmc"
     """
+    if not job_url:
+        return None
     try:
+        import json as _json
         from urllib.parse import urlparse
-        import re
+        from jobs.ats.patterns import match_ats_pattern
 
-        parsed   = urlparse(job_url)
-        hostname = parsed.hostname or ""           # "jobs.ashbyhq.com"
-        path     = parsed.path.strip("/")          # "collective/54259edc"
-
-        # ── iCIMS — slug is in subdomain ──────────────────────────
-        # careers-schwab.icims.com → "schwab"
-        # schwab.icims.com         → "schwab"
-
-        if hostname.endswith(".icims.com"):
-            subdomain = hostname[: -len(".icims.com")]
-            slug = re.sub(r"^careers-", "", subdomain)
-            if slug and "." not in slug and slug not in {"careers", "jobs", "www"}:
+        # ── Step 1: known ATS URL patterns (patterns.py is the single source) ─
+        match = match_ats_pattern(job_url)
+        if match:
+            slug = match["slug"]
+            # JSON slugs (Workday, Oracle HCM, etc.) store company id under "slug"
+            if isinstance(slug, str) and slug.startswith("{"):
+                try:
+                    company_id = _json.loads(slug).get("slug", "")
+                    if company_id:
+                        return company_id.lower()
+                except (_json.JSONDecodeError, AttributeError):
+                    pass
+            elif slug:
                 return slug.lower()
-            return None
 
-        # ── Oracle HCM — slug is first subdomain ──────────────────
-        # jpmc.fa.oraclecloud.com → "jpmc"
-        if hostname.endswith(".fa.oraclecloud.com"):
-            slug = hostname[: -len(".fa.oraclecloud.com")]
-            if slug and "." not in slug and slug not in {"fa", "www"}:
-                return slug.lower()
-            return None
-
-        # ── Workday — slug is first subdomain before .wd{N} ───────
-        # capitalone.wd12.myworkdayjobs.com → "capitalone"
-        for suffix in (".myworkdayjobs.com", ".myworkdaysite.com"):
-            if hostname.endswith(suffix):
-                slug = hostname[: -len(suffix)].split(".")[0]
-                if slug and slug not in {"www", "jobs", "careers"}:
-                    return slug.lower()
-                return None
-
-        # ── Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
-        if hostname in ("job-boards.greenhouse.io", "boards.greenhouse.io"):
-            from urllib.parse import parse_qs
-            qs = parse_qs(parsed.query)
-            if "for" in qs:
-                return qs["for"][0].lower()
-            # Fall through to normal path extraction
-            slug = path.split("/")[0].lower()
-            if slug and slug not in {"embed", "jobs", "careers"}:
-                return slug
-            return None
-
-        # ── ATS platforms — extract company slug from path ─────────
-        ats_hosts = [
-            "jobs.ashbyhq.com", "boards.greenhouse.io", "job-boards.greenhouse.io",
-            "jobs.lever.co", "boards.eu.greenhouse.io", "jobs.jobvite.com",
-            "jobs.smartrecruiters.com", "apply.workable.com",
-        ]
-        for ats in ats_hosts:
-            if ats in hostname:
-                slug = path.split("/")[0].lower()
-                if slug:
-                    # Remove common suffixes from slug
-                    slug = re.sub(r'(jobs?|careers?|hiring)$', '', slug)
-                    return slug.strip("-_") or None
-
-        # ── Direct company domain — extract root ───────────────────
+        # ── Step 2: direct company domain — extract root from hostname ─────────
         # e.g. "collective.com" → "collective"
         # e.g. "careers.stripe.com" → "stripe"
-        parts = hostname.split(".")
+        parsed   = urlparse(job_url)
+        hostname = parsed.hostname or ""
+        parts    = hostname.split(".")
         if len(parts) >= 2:
-            # Skip common subdomains
             skip = {"www", "jobs", "careers", "boards", "apply", "hire",
                     "talent", "recruiting", "work"}
-            for part in parts[:-1]:  # exclude TLD
+            for part in parts[:-1]:   # exclude TLD
                 if part not in skip:
                     return part.lower()
 

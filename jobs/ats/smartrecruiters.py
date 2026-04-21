@@ -125,13 +125,32 @@ def _normalize(job, company, company_slug=""):
             posted_at = None
 
     location = job.get("location", {}) or {}
-    loc_str = ", ".join(filter(None, [
-        location.get("city", ""),
-        location.get("region", ""),
-        location.get("country", ""),
-    ]))
+
+    # SmartRecruiters provides a pre-formatted fullLocation string that
+    # already contains the full country name (e.g. "Bangalore, Karnataka, India").
+    # Prefer it over building from parts so is_us_location() Signal 4 can
+    # detect non-US country names without any alpha-2 code translation.
+    # Fall back to building from city/region/country only when fullLocation
+    # is absent.  The raw country field is an ISO alpha-2 code ("in", "ie",
+    # "de") which is NOT suitable for is_us_location() — it resolves only "us".
+    full_location = (location.get("fullLocation") or "").strip()
+    if full_location:
+        loc_str = full_location
+    else:
+        # Fallback: build from structured parts.  Skip the raw alpha-2 country
+        # code because it confuses is_us_location() (e.g. "in" = Indiana).
+        # country_code check in job_monitor.py handles non-US filtering instead.
+        loc_str = ", ".join(filter(None, [
+            location.get("city", ""),
+            location.get("region", ""),
+        ]))
     if location.get("remote"):
         loc_str = "Remote"
+
+    # Store the alpha-2 code for a direct US/non-US gate in job_monitor.py.
+    # This is the authoritative signal — no text parsing needed.
+    # "us" = United States, anything else = non-US (drop the job).
+    country_code = (location.get("country") or "").lower().strip()
 
     # Build job URL using slug derived from caller
     job_id     = job.get("id", "")
@@ -146,13 +165,14 @@ def _normalize(job, company, company_slug=""):
     )
 
     return {
-        "company":       company,
-        "title":         job.get("name", ""),
-        "job_url":       job_url,
-        "location":      loc_str,
-        "posted_at":     posted_at,
-        "job_id":        str(job_id),
-        "description":   "",             # filled by fetch_job_detail
-        "ats":           "smartrecruiters",
-        "_company_slug": company_slug,   # used by fetch_job_detail
+        "company":        company,
+        "title":          job.get("name", ""),
+        "job_url":        job_url,
+        "location":       loc_str,
+        "posted_at":      posted_at,
+        "job_id":         str(job_id),
+        "description":    "",              # filled by fetch_job_detail
+        "ats":            "smartrecruiters",
+        "_company_slug":  company_slug,   # used by fetch_job_detail
+        "_country_code":  country_code,   # ISO alpha-2, e.g. "us", "in", "ie"
     }
