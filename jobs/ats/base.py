@@ -354,28 +354,7 @@ def slugify(company):
     return variants
 
 
-def validate_company_match(response_text, expected_company):
-    """
-    Check that API response is for the right company.
-    Returns True if likely correct company.
-    """
-    if not response_text or not expected_company:
-        return True
-    expected = expected_company.lower().strip()
-    response = response_text.lower()
-    stop_words = {
-        "inc", "corp", "llc", "ltd", "co", "the",
-        "and", "jobs", "careers", "group"
-    }
-    words = [
-        w for w in expected.split()
-        if len(w) > 3 and w not in stop_words
-    ]
-    if not words:
-        return True
-    for word in words[:2]:
-        pattern = (r'(?<![a-z0-9])' + re.escape(word)
-                   + r'(?![a-z0-9])')
-        if re.search(pattern, response):
-            return True
-    return False
+# validate_company_match lives in patterns.py (single home for all ATS validation).
+# Re-exported here so existing callers (`from jobs.ats.base import validate_company_match`)
+# continue to work without any changes.
+from jobs.ats.patterns import validate_company_match  # noqa: F401  (re-export)

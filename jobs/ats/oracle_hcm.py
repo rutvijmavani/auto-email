@@ -218,8 +218,15 @@ def _normalize(job, company, slug_info, slug, site_id):
             posted_at = None
 
     # Location
-    primary = job.get("PrimaryLocation", "")
+    primary  = job.get("PrimaryLocation", "")
     location = primary if primary else ""
+
+    # Country code (Tier 1 gate)
+    # PrimaryLocationCountry is an ISO alpha-2 code present on every listing
+    # ("US", "TR", "IN", "GB" …) — far more reliable than text-parsing PrimaryLocation.
+    # Stored as _country_code; job_monitor's listing-level alpha-2 gate uses it
+    # to drop non-US jobs before any further processing.
+    country_code = (job.get("PrimaryLocationCountry") or "").strip().upper()
 
     # Build job URL
     req_id  = job.get("Id", "") or \
@@ -235,12 +242,13 @@ def _normalize(job, company, slug_info, slug, site_id):
     )
 
     return {
-        "company":     company,
-        "title":       job.get("Title", ""),
-        "job_url":     job_url,
-        "location":    location,
-        "posted_at":   posted_at,
-        "job_id":      str(req_id) if req_id else "",
-        "description": job.get("ShortDescriptionStr", ""),
-        "ats":         "oracle_hcm",
+        "company":       company,
+        "title":         job.get("Title", ""),
+        "job_url":       job_url,
+        "location":      location,
+        "posted_at":     posted_at,
+        "job_id":        str(req_id) if req_id else "",
+        "description":   job.get("ShortDescriptionStr", ""),  # teaser only — full description pending
+        "ats":           "oracle_hcm",
+        "_country_code": country_code,
     }

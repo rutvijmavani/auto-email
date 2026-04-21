@@ -34,10 +34,8 @@ _US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
 # "United Kingdom of Great Britain and Northern Ireland", not "uk".
 # Checked in Signal 4 so "Remote (UK)" → False (not True via Signal 7 remote).
 #
-# "england" intentionally excluded: it causes a false positive on the US region
-# "New England" (phrases includes "england" → S4 wrongly rejects it).
-# Coverage is adequate without it: "London, England" → S6 catches "london" →
-# {"GB","CA"} → False; bare "England" is rare and defaults to True (S8).
+# "england" intentionally excluded from this set: Signal 4.5 handles it with
+# the required "new england" exclusion so "Boston, New England" isn't rejected.
 _NON_US_ALIASES = frozenset({"uk", "emea"})
 
 
@@ -111,6 +109,8 @@ def _get_pycountry_data():
       non_us_alpha3        — frozenset of lowercase ISO alpha-3 codes for non-US countries
       non_us_country_words — frozenset of lowercase country names/common-names,
                              minus US state names to avoid collisions (Georgia etc.)
+      non_us_alpha2        — frozenset of lowercase ISO alpha-2 codes for non-US countries
+                             (used by Signal 2.5 for unambiguous 2-letter codes like IE, GB)
     """
     alpha3_map = {
         c.alpha_3.lower(): c.alpha_2
@@ -118,6 +118,10 @@ def _get_pycountry_data():
         if hasattr(c, "alpha_3")
     }
     non_us_alpha3 = frozenset(k for k, v in alpha3_map.items() if v != "US")
+
+    non_us_alpha2 = frozenset(
+        c.alpha_2.lower() for c in pycountry.countries if c.alpha_2 != "US"
+    )
 
     # State names must be excluded BEFORE building non_us_country_words
     _, state_names, _ = _get_state_and_city_data()
@@ -131,7 +135,7 @@ def _get_pycountry_data():
             words.add(c.common_name.lower())
     words -= state_names   # remove "georgia", "jordan" etc.
 
-    return non_us_alpha3, frozenset(words)
+    return non_us_alpha3, frozenset(words), non_us_alpha2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -191,32 +195,50 @@ def is_us_location(location: str) -> bool:
     Scans the entire string for US / non-US signals regardless of format.
 
     Signal priority (first match wins):
-        1. Explicit US keyword           → True   (usa, united states, u s a …)
-        2. ISO alpha-3 non-US code       → False  (IND, GBR, CAN … uppercase-gated)
-        3. US state code or full name    → True   (CA, NY, California … runs BEFORE
-                                                   country-name check so "Jordan, UT"
-                                                   is accepted on state code "ut")
-        4. Non-US country name           → False  (India, Germany, Canada …)
-        5. SimpleMaps US city lookup     → True   (San Francisco, Austin …)
-        6. geonamescache city → country  → True/False  (set-based; prefers US when
-                                                        city exists in multiple countries)
-        7. Remote / work-from-home       → True   (last resort; placed here so
-                                                   "Remote - India" is rejected at
-                                                   Signal 4 before this fires)
-        8. Default                       → True   (preserve false-positive tolerance)
+        1.   Explicit US keyword           → True   (usa, united states, u s a …)
+        2.   ISO alpha-3 non-US code       → False  (IND, GBR, CAN … 3-letter uppercase-gated)
+        2.5. ISO alpha-2 non-US code       → False  (IE, GB, SG … 2-letter uppercase-gated;
+                                                     skipped when code conflicts with a US
+                                                     state code — Signal 3 handles those)
+        3.   US state code or full name    → True   (CA, NY, California … runs BEFORE
+                                                     country-name check so "Jordan, UT"
+                                                     is accepted on state code "ut";
+                                                     state codes are skipped when a non-US
+                                                     country word follows them, e.g.
+                                                     "Delhi, IN, India" → "IN" skipped)
+        4.   Non-US country name           → False  (India, Germany, Canada …)
+        4.5. UK constituent nations        → False  (England, Scotland, Wales,
+                                                     Northern Ireland; "New England" excluded)
+        5.   SimpleMaps US city lookup     → True   (San Francisco, Austin …)
+        6.   geonamescache city → country  → True/False  (set-based; prefers US when
+                                                          city exists in multiple countries)
+        7.   Remote / work-from-home       → True   (last resort; placed here so
+                                                     "Remote - India" is rejected at
+                                                     Signal 4 before this fires)
+        8.   Default                       → True   (preserve false-positive tolerance)
     """
     if not location or not location.strip():
         return True   # no location → assume US
 
-    # ── Uppercase alpha-3 gate ────────────────────────────────────────────
-    # Capture 3-letter ALL-CAPS tokens from the ORIGINAL string before
-    # normalization. Only these are treated as ISO country codes in Signal 2.
-    # Prevents common English words ("can", "per", "and") from being
-    # misread as country codes (CAN=Canada, PER=Peru, AND=Andorra).
+    # ── Uppercase alpha-3 / alpha-2 gate ─────────────────────────────────
+    # Capture ALL-CAPS alpha tokens from the ORIGINAL string before
+    # normalization.  Only tokens that were uppercase in the original are
+    # treated as ISO country codes, preventing common English words ("can",
+    # "per", "in", "and") from being misread as codes.
+    orig_alpha_tokens = re.split(r'[^A-Za-z]+', location)
+
     orig_upper_alpha3: set = {
         tok.lower()
-        for tok in re.split(r'[^A-Za-z]+', location)
+        for tok in orig_alpha_tokens
         if len(tok) == 3 and tok.isupper() and tok.isalpha()
+    }
+
+    # 2-letter ALL-CAPS tokens (potential ISO alpha-2 country codes).
+    # e.g. "IE" for Ireland, "GB" for UK — used in Signal 2.5.
+    orig_upper_alpha2: set = {
+        tok.lower()
+        for tok in orig_alpha_tokens
+        if len(tok) == 2 and tok.isupper() and tok.isalpha()
     }
 
     clean  = _normalize_location(location)
@@ -227,16 +249,16 @@ def is_us_location(location: str) -> bool:
     phrases = _ngrams(tokens, max_n=3)
 
     # Load lazy data (computed once, cached via lru_cache)
-    state_codes, state_names, city_country = _get_state_and_city_data()
-    non_us_alpha3, non_us_country_words    = _get_pycountry_data()
-    simplemap_cities                       = _get_simplemap_cities()
+    state_codes, state_names, city_country         = _get_state_and_city_data()
+    non_us_alpha3, non_us_country_words, non_us_alpha2 = _get_pycountry_data()
+    simplemap_cities                               = _get_simplemap_cities()
 
     # ── Signal 1: Explicit US keywords ───────────────────────────────────
     if any(p in _US_EXPLICIT for p in phrases):
         return True
 
     # ── Signal 2: ISO alpha-3 non-US country code ─────────────────────────
-    # Only fires for tokens that were ALL-CAPS in the original string.
+    # Only fires for tokens that were ALL-CAPS (3-letter) in the original.
     for tok in tokens:
         if len(tok) == 3 and tok in orig_upper_alpha3:
             if tok == "usa":
@@ -244,19 +266,57 @@ def is_us_location(location: str) -> bool:
             if tok in non_us_alpha3:
                 return False
 
+    # ── Signal 2.5: ISO alpha-2 non-US country code ───────────────────────
+    # Catches "Dublin, IE", "London, GB", "Singapore, SG" etc. where the
+    # ATS passes a 2-letter ALL-CAPS country code.
+    # Skips codes that conflict with US state codes (e.g. "IN" = Indiana /
+    # India, "DE" = Delaware / Germany) — Signal 3's positional check handles
+    # those ambiguous cases.
+    for tok_lower in orig_upper_alpha2:
+        if tok_lower in state_codes:
+            continue   # ambiguous with US state — let Signal 3 decide
+        if tok_lower in non_us_alpha2:
+            return False
+
     # ── Signal 3: US state code or full name ─────────────────────────────
-    # Runs BEFORE country-name check (Signal 4) so locations like
-    # "Jordan, UT" and "Lebanon, NH" are accepted via state code before
-    # "Jordan" / "Lebanon" trigger a country-name rejection.
-    if any(tok in state_codes for tok in tokens):
-        return True
+    # Full state names (California, Texas …) are unambiguous — match directly.
     if any(p in state_names for p in phrases):
+        return True
+
+    # 2-letter state codes are ambiguous when a non-US country word follows.
+    # "Jordan, UT"     → "ut" fires (nothing non-US after) → True  ✓
+    # "Delhi, IN, India" → "in" fires but "india" follows  → skip  ✓
+    # Falls through to Signal 4 which then rejects "india".
+    for tok in tokens:
+        if tok not in state_codes:
+            continue
+        match = re.search(r'\b' + re.escape(tok) + r'\b', clean)
+        if not match:
+            continue
+        after         = clean[match.end():]
+        after_tokens  = after.split()
+        after_phrases = _ngrams(after_tokens, max_n=3) if after_tokens else []
+        if any(p in non_us_country_words for p in after_phrases):
+            continue   # country suffix after state code → non-US context
+        if any(p in _NON_US_ALIASES for p in after_phrases):
+            continue
         return True
 
     # ── Signal 4: Non-US country name ────────────────────────────────────
     if any(p in non_us_country_words for p in phrases):
         return False
     if any(p in _NON_US_ALIASES for p in phrases):
+        return False
+
+    # ── Signal 4.5: UK constituent nations ───────────────────────────────
+    # "England", "Scotland", "Wales", "Northern Ireland" are not sovereign
+    # countries in pycountry and are intentionally absent from _NON_US_ALIASES
+    # (to avoid false rejection of "New England").  Catch them explicitly here.
+    # "new england" exclusion: the phrase check fires on "england" alone but
+    # is guarded against the 2-gram "new england" being present first.
+    if "england" in phrases and "new england" not in phrases:
+        return False
+    if any(p in {"scotland", "wales", "northern ireland"} for p in phrases):
         return False
 
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────

@@ -364,22 +364,29 @@ def _normalize(pos, company, slug, base_url):
         except (ValueError, OSError):
             pass
 
+    std_locs = pos.get("standardizedLocations", [])
+    raw_locs = pos.get("locations", [])
+
     # Location: prefer standardizedLocations (cleaner) over raw locations
-    location = _extract_location(
-        pos.get("standardizedLocations", []),
-        pos.get("locations", []),
-        wlo,
-    )
+    location = _extract_location(std_locs, raw_locs, wlo)
+
+    # Country code (Tier 1 gate)
+    # standardizedLocations entries follow "City, State, CountryCode" format,
+    # e.g. "Vacaville, CA, US" or "Bangalore, KA, IN".
+    # The trailing alpha-2 code is authoritative — far safer than text-parsing
+    # the location string where "IN" (India) conflicts with Indiana (Signal 3).
+    country_code = _extract_country_code(std_locs)
 
     return {
-        "company":     company,
-        "title":       title,
-        "job_url":     job_url,
-        "job_id":      ats_id,
-        "location":    location,
-        "posted_at":   posted_at,
-        "description": "",   # filled by fetch_job_detail
-        "ats":         "eightfold",
+        "company":       company,
+        "title":         title,
+        "job_url":       job_url,
+        "job_id":        ats_id,
+        "location":      location,
+        "posted_at":     posted_at,
+        "description":   "",   # filled by fetch_job_detail
+        "ats":           "eightfold",
+        "_country_code": country_code,
     }
 
 
@@ -421,6 +428,35 @@ def _extract_location(std_locs, raw_locs, work_option):
     # workLocationOption is authoritative for remote
     if work_option == "remote":
         return "Remote"
+
+    return ""
+
+
+def _extract_country_code(std_locs):
+    """
+    Extract ISO alpha-2 country code from standardizedLocations.
+
+    Eightfold's standardizedLocations entries follow a consistent format:
+      "City, State, CountryCode"  e.g. "Vacaville, CA, US"
+                                       "Bangalore, KA, IN"
+      "State, CountryCode"        e.g. "WA, US"
+      "CountryCode"               e.g. "US"
+
+    The country code is always the LAST comma-separated segment.
+    We scan the list and return the first non-"Remote"/"" entry's last segment.
+
+    Returns uppercase alpha-2 string (e.g. "US", "IN", "GB") or "".
+    """
+    SKIP = {"Remote", "United States", "US", ""}
+
+    for loc in std_locs:
+        if not loc or loc in SKIP:
+            continue
+        parts = [p.strip() for p in loc.split(",")]
+        last  = parts[-1].upper()
+        # Must be exactly 2 alphabetic characters to be a valid alpha-2 code
+        if len(last) == 2 and last.isalpha():
+            return last
 
     return ""
 

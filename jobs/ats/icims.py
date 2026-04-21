@@ -297,8 +297,8 @@ def fetch_job_detail(job):
         # Try JSON-LD for richer data
         json_ld = _extract_json_ld(soup)
         if json_ld:
-            # Location from JSON-LD
-            location = _extract_location_from_json_ld(json_ld)
+            # Location + country code from JSON-LD structured data
+            location, country_code = _extract_location_from_json_ld(json_ld)
             # posted_at from JSON-LD datePosted if not found in body
             if not posted_at:
                 date_posted = json_ld.get("datePosted", "")
@@ -310,15 +310,19 @@ def fetch_job_detail(job):
                     except (ValueError, AttributeError):
                         pass
         else:
-            location = _extract_location_from_html(soup, text)
+            location     = _extract_location_from_html(soup, text)
+            country_code = ""
 
         # Extract description
         description = _extract_description(soup)
 
         job = dict(job)
-        job["posted_at"]   = posted_at
-        job["location"]    = location or ""
-        job["description"] = description or ""
+        job["posted_at"]      = posted_at
+        job["location"]       = location or ""
+        job["description"]    = description or ""
+        # ISO alpha-2 country code from JSON-LD (e.g. "US", "IN", "IE").
+        # Used by job_monitor.py for a direct US/non-US gate after detail fetch.
+        job["_country_code"]  = country_code
 
         return job
 
@@ -416,22 +420,45 @@ def _extract_json_ld(soup):
 
 
 def _extract_location_from_json_ld(json_ld):
-    """Extract location string from JSON-LD jobLocation."""
+    """
+    Extract location string and country code from JSON-LD jobLocation.
+
+    Returns (location_str, country_code) where country_code is the raw
+    ISO alpha-2 string (e.g. "US", "IN", "IE") as found in the schema.
+
+    The country is resolved to a full name for non-US entries so that
+    is_us_location() Signal 4 can detect it via country-name scan.
+    Raw alpha-2 codes (e.g. "IN") would otherwise be misread by Signal 3
+    as US state codes (Indiana).
+    """
     try:
         locations = json_ld.get("jobLocation", [])
         if not locations:
-            return ""
+            return "", ""
         if isinstance(locations, dict):
             locations = [locations]
-        addr = locations[0].get("address", {})
+        addr         = locations[0].get("address", {})
+        country_code = (addr.get("addressCountry") or "").strip().upper()
+
         parts = [
             addr.get("addressLocality", ""),
             addr.get("addressRegion", ""),
-            addr.get("addressCountry", ""),
         ]
-        return ", ".join(p for p in parts if p)
+
+        if country_code and country_code != "US":
+            # Resolve alpha-2 → full name so is_us_location() can detect it.
+            # e.g. "IN" → "India", "IE" → "Ireland", "DE" → "Germany"
+            try:
+                import pycountry
+                c = pycountry.countries.get(alpha_2=country_code)
+                country_display = getattr(c, "common_name", c.name) if c else country_code
+            except Exception:
+                country_display = country_code
+            parts.append(country_display)
+
+        return ", ".join(p for p in parts if p), country_code
     except Exception:
-        return ""
+        return "", ""
 
 
 def _extract_location_from_html(soup, text):

@@ -500,7 +500,14 @@ class TestSlugExtraction(unittest.TestCase):
         self.assertEqual(result[1], "linear")
 
     def test_workday_extracts_slug_with_wd_and_path(self):
-        """Workday extracts tenant + wd variant + path."""
+        """Workday extracts tenant + wd variant + path.
+
+        URL: /en-US/External_Careers/job/Area-Manager
+        The locale prefix (en-US) is skipped; the career site name
+        (External_Careers) is stored as `path`.  This matches the
+        documented behaviour in patterns.py: "We always want the career
+        site name, not the locale prefix."
+        """
         result = self._extract({
             "url_host_registered_domain": "myworkdayjobs.com",
             "url_host_3rd_last_part":     "wd1",
@@ -513,7 +520,8 @@ class TestSlugExtraction(unittest.TestCase):
         data = json.loads(result[1])
         self.assertEqual(data["slug"], "2020companies")
         self.assertEqual(data["wd"],   "wd1")
-        self.assertEqual(data["path"], "en-US")
+        # en-US is a locale prefix and is skipped; the career site name is stored
+        self.assertEqual(data["path"], "External_Careers")
 
     def test_workday_excludes_aggregator_subdomains(self):
         """Workday aggregator subdomains are excluded."""

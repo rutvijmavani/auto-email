@@ -1,31 +1,13 @@
-# jobs/ats/patterns.py — ATS URL patterns for Google search detection
+# jobs/ats/patterns.py — ATS URL patterns and validation helpers
 #
-# Each pattern extracts platform + slug from a career page URL.
-# Used by google_detector.py to identify ATS from Google search results.
+# Each URL pattern extracts platform + slug from a career page URL.
+# Used by career_page.py, ats_verifier.py, ats_sitemap.py to identify ATS.
+#
+# Site-search queries (formerly ATS_SITE_SEARCHES) now live in registry.py
+# under each platform's "site_search" key — single source of truth.
 
 import re
 import json
-
-# ─────────────────────────────────────────
-# ATS SITE SEARCH QUERIES
-# Order matters — try most common/reliable first
-# Stop early on first high-confidence match
-# ─────────────────────────────────────────
-
-ATS_SITE_SEARCHES = [
-    # platform          site: filter
-    ("greenhouse",      "site:boards.greenhouse.io"),
-    ("greenhouse",      "site:job-boards.greenhouse.io"),  # newer subdomain
-    ("lever",           "site:jobs.lever.co"),
-    ("ashby",           "site:jobs.ashbyhq.com"),
-    ("smartrecruiters", "site:jobs.smartrecruiters.com"),
-    ("jobvite",         "site:jobs.jobvite.com"),
-    ("workday",         "site:myworkdayjobs.com"),
-    ("oracle_hcm",      "site:oraclecloud.com"),
-    ("icims",           "site:icims.com careers"),  # careers-*.icims.com
-    ("successfactors",  "site:successfactors.com"),
-    ("successfactors",  "site:jobs2web.com"),
-]
 
 # ─────────────────────────────────────────
 # URL PATTERNS
@@ -36,20 +18,26 @@ def _make_patterns():
     patterns = []
 
 
-    # Greenhouse embed — job-boards.greenhouse.io/embed/job_board?for=Databricks
+    # Greenhouse embed — any path under /embed/ that carries ?for={slug}
+    # Covers all known variants:
+    #   /embed/job_board?for=stripe            (job board widget)
+    #   /embed/job_app?for=stripe&token=…      (apply form iframe — Stripe pattern)
+    #   /embed/job_board/js?for=stripe&b=1     (JS script loader)
     patterns.append((
         re.compile(
-            r"(?:boards|job-boards)\.greenhouse\.io/embed/job_board\?(?:.*&)?for=([^&\s]+)",
+            r"(?:boards|job-boards)\.greenhouse\.io/embed/[^?#\s]+\?(?:[^#\s]*&)?for=([^&\s\"'<>]+)",
             re.IGNORECASE
         ),
         "greenhouse",
         lambda m: m.group(1).lower(),
     ))
-    # Greenhouse — boards.greenhouse.io/{slug}/jobs
-    # Also: job-boards.greenhouse.io/{slug}/jobs
+    # Greenhouse — boards.greenhouse.io/{slug}/jobs  (slug is first path segment,
+    # not "embed" — the embed pattern above must run first so embed/ URLs don't
+    # fall through here and return "embed" as the slug).
+    # Also handles EU region: boards.eu.greenhouse.io/{slug}
     patterns.append((
         re.compile(
-            r"(?:boards|job-boards)\.greenhouse\.io/([^/?&#\s]+)",
+            r"(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io/(?!embed/)([^/?&#\s]+)",
             re.IGNORECASE
         ),
         "greenhouse",
@@ -581,6 +569,44 @@ def _slug_to_text(slug):
         ).lower()
     except (json.JSONDecodeError, TypeError):
         return str(slug).lower()
+
+
+# ─────────────────────────────────────────
+# COMPANY NAME MATCHING
+# Moved here from base.py so all ATS validation logic lives in one module.
+# base.py re-exports this for backward compatibility with existing importers.
+# ─────────────────────────────────────────
+
+def validate_company_match(response_text, expected_company):
+    """
+    Check that an API response or URL text belongs to the expected company.
+
+    Strips common legal suffixes (Inc, Corp, LLC…) and checks that at least
+    one significant keyword from the company name appears in the response,
+    using word-boundary matching to avoid false positives.
+
+    Returns True when the match is likely correct (or when there is
+    insufficient signal to make a determination).
+    """
+    if not response_text or not expected_company:
+        return True
+    expected = expected_company.lower().strip()
+    response = response_text.lower()
+    stop_words = {
+        "inc", "corp", "llc", "ltd", "co", "the",
+        "and", "jobs", "careers", "group",
+    }
+    words = [
+        w for w in expected.split()
+        if len(w) > 3 and w not in stop_words
+    ]
+    if not words:
+        return True
+    for word in words[:2]:
+        pattern = r'(?<![a-z0-9])' + re.escape(word) + r'(?![a-z0-9])'
+        if re.search(pattern, response):
+            return True
+    return False
 
 
 def _decode_google_redirect(url):

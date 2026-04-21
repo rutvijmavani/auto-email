@@ -297,7 +297,50 @@ def _clean_title(raw_title):
 
 
 def _extract_location(soup):
-    """Extract location from Jobvite detail page."""
+    """
+    Extract location from Jobvite detail page.
+
+    Jobvite detail page structure:
+      <p class="jv-job-detail-meta">
+        Accounting & Finance
+        <span class='jv-inline-separator'></span>
+        Bangalore, India
+        <span class='jv-inline-separator'></span>Req.Num.: 30935
+      </p>
+
+    The inline separators divide: [Category] [City, State/Country] [Req.Num.]
+    Location is always the segment between the 1st and 2nd separator.
+    """
+    # Strategy 1: parse .jv-job-detail-meta directly — split on separator spans.
+    # Confirmed from DevTools: location is always between 1st and 2nd separator.
+    meta = soup.select_one(".jv-job-detail-meta, .jv-job-detail-header")
+    if meta:
+        # Split the paragraph's content on the inline separator spans.
+        # Each segment between spans is one field: [Category, Location, Req.Num.]
+        segments = []
+        current  = []
+        for node in meta.children:
+            if hasattr(node, "name") and node.name == "span" \
+                    and "jv-inline-separator" in (node.get("class") or []):
+                segments.append(" ".join(current).strip())
+                current = []
+            else:
+                text = node.get_text(strip=True) if hasattr(node, "name") else node.strip()
+                if text:
+                    current.append(text)
+        if current:
+            segments.append(" ".join(current).strip())
+
+        # segments = ["Accounting & Finance", "Bangalore,\nIndia", "Req.Num.: 30935"]
+        # Location is index 1 (between first and second separator)
+        if len(segments) >= 2:
+            loc = re.sub(r"\s+", " ", segments[1]).strip()
+            loc = re.sub(r"Req\.Num\..*$", "", loc, flags=re.IGNORECASE).strip()
+            if loc:
+                return loc
+
+    # Strategy 2: fallback — scrape text from siblings after the h2 heading.
+    # Catches non-standard Jobvite templates that don't use .jv-job-detail-meta.
     heading = soup.find("h2")
     if not heading:
         return ""
@@ -317,20 +360,12 @@ def _extract_location(soup):
     full_text = re.sub(r"\s+", " ", full_text).strip()
     full_text = re.sub(r"Req\.Num\..*$", "", full_text, flags=re.IGNORECASE).strip()
 
-    # Structure: "{Category} {City}, {State}"
-    # Split on comma — everything before comma is city (preserves multi-word cities)
-    # "Professional Services San Francisco, California"
-    #  → before_comma = "Professional Services San Francisco"
-    #  → after_comma  = "California"
-    #  → city = "Professional Services San Francisco" (use full text before comma)
+    # As last resort, strip the leading category word (everything before first comma)
+    # only when the result is clearly category+location (e.g. "Engineering San Jose, CA")
     if "," in full_text:
         before_comma, after_comma = full_text.rsplit(",", 1)
-        city  = before_comma.strip()
-        state = after_comma.strip()
-        if city and state:
-            return f"{city}, {state}"
+        return f"{before_comma.strip()}, {after_comma.strip()}"
 
-    # Fallback: return as-is if short
     if len(full_text) < 60:
         return full_text
 
