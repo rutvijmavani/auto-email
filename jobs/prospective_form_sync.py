@@ -187,23 +187,25 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
 
     # Replay listing request to verify
     print("       [Curl] Replaying listing request...")
-    raw_bytes = _replay_request(slug_info, company)
+    raw_bytes, replay_status = _replay_request(slug_info, company)
     if raw_bytes is None:
-        # For GraphQL endpoints (e.g. Meta/metacareers.com), a 400 during the
-        # sync-time replay is expected — Meta validates IP + cookie fingerprint
-        # server-side, so a headless Python replay always fails even with a
-        # freshly extracted lsd token.  The parsed slug_info is still correct;
-        # custom_career.fetch_jobs() uses _warm_session at runtime and succeeds.
-        # Save the config without structure detection; field_map will be
-        # auto-detected on first real fetch.
-        if slug_info.get("graphql_config"):
+        # For GraphQL endpoints, a 400 specifically can mean the server is
+        # rejecting a headless replay via IP/fingerprint checks even when the
+        # config is correct (e.g. Meta's metacareers.com GraphQL).
+        # In that case, save the parsed config and let custom_career.fetch_jobs()
+        # perform structure detection at runtime using _warm_session.
+        #
+        # Other failure modes (401/403 = bad auth, None = network error,
+        # 5xx = server error) are NOT treated as recoverable here — they
+        # indicate a real problem with the curl or the endpoint.
+        if slug_info.get("graphql_config") and replay_status == 400:
             logger.info(
-                "[sync] %r: GraphQL replay blocked (anti-bot) — "
+                "[sync] %r: GraphQL replay returned 400 — "
                 "saving parsed config for runtime detection",
                 company
             )
             print(
-                "       [Curl] GraphQL replay blocked by anti-bot — "
+                "       [Curl] GraphQL replay returned 400 — "
                 "config saved, structure detected at first fetch"
             )
             slug_info["_replay_skipped"] = True
@@ -322,7 +324,11 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
 def _replay_request(slug_info, company):
     """
     Replay the listing request using the warm session system.
-    Returns raw response bytes or None.
+
+    Returns:
+        (bytes, status_code)  on success        — status_code is the HTTP status (2xx)
+        (None,  status_code)  on HTTP failure   — status_code is the actual HTTP status
+        (None,  None)         on network/exception error
     """
     import requests as req_lib
     from jobs.ats.custom_career import _warm_session, _build_legacy_session
@@ -455,7 +461,7 @@ def _replay_request(slug_info, company):
                   + ("career page session did not authenticate"
                      if career_page_url
                      else "stored cookies may be expired"))
-            return None
+            return None, resp.status_code
 
         if not resp.ok:
             logger.warning(
@@ -465,14 +471,14 @@ def _replay_request(slug_info, company):
             )
             print(f"       [Curl] HTTP {resp.status_code} — replay failed")
             print(f"       [Curl] Response: {resp.content[:300]}")
-            return None
+            return None, resp.status_code
 
-        return resp.content
+        return resp.content, resp.status_code
 
     except Exception as e:
         logger.warning("[sync] %r: replay exception: %s", company, e)
         print(f"       [Curl] Request error: {e}")
-        return None
+        return None, None
 
 
 # ─────────────────────────────────────────
