@@ -187,8 +187,32 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
 
     # Replay listing request to verify
     print("       [Curl] Replaying listing request...")
-    raw_bytes = _replay_request(slug_info, company)
+    raw_bytes, replay_status = _replay_request(slug_info, company)
     if raw_bytes is None:
+        # For GraphQL endpoints, a 400 specifically can mean the server is
+        # rejecting a headless replay via IP/fingerprint checks even when the
+        # config is correct (e.g. Meta's metacareers.com GraphQL).
+        # In that case, save the parsed config and let custom_career.fetch_jobs()
+        # perform structure detection at runtime using _warm_session.
+        #
+        # Other failure modes (401/403 = bad auth, None = network error,
+        # 5xx = server error) are NOT treated as recoverable here — they
+        # indicate a real problem with the curl or the endpoint.
+        if slug_info.get("graphql_config") and replay_status == 400:
+            logger.info(
+                "[sync] %r: GraphQL replay returned 400 — "
+                "saving parsed config for runtime detection",
+                company
+            )
+            print(
+                "       [Curl] GraphQL replay returned 400 — "
+                "config saved, structure detected at first fetch"
+            )
+            slug_info["_replay_skipped"] = True
+            return {
+                "platform": "custom",
+                "slug":     json.dumps(slug_info),
+            }
         print("       [Curl] Replay failed — falling through")
         return None
 
@@ -300,7 +324,11 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
 def _replay_request(slug_info, company):
     """
     Replay the listing request using the warm session system.
-    Returns raw response bytes or None.
+
+    Returns:
+        (bytes, status_code)  on success        — status_code is the HTTP status (2xx)
+        (None,  status_code)  on HTTP failure   — status_code is the actual HTTP status
+        (None,  None)         on network/exception error
     """
     import requests as req_lib
     from jobs.ats.custom_career import _warm_session, _build_legacy_session
@@ -433,7 +461,7 @@ def _replay_request(slug_info, company):
                   + ("career page session did not authenticate"
                      if career_page_url
                      else "stored cookies may be expired"))
-            return None
+            return None, resp.status_code
 
         if not resp.ok:
             logger.warning(
@@ -443,14 +471,14 @@ def _replay_request(slug_info, company):
             )
             print(f"       [Curl] HTTP {resp.status_code} — replay failed")
             print(f"       [Curl] Response: {resp.content[:300]}")
-            return None
+            return None, resp.status_code
 
-        return resp.content
+        return resp.content, resp.status_code
 
     except Exception as e:
         logger.warning("[sync] %r: replay exception: %s", company, e)
         print(f"       [Curl] Request error: {e}")
-        return None
+        return None, None
 
 
 # ─────────────────────────────────────────

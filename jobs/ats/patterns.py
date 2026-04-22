@@ -152,7 +152,7 @@ def _make_patterns():
     patterns.append((
         re.compile(
             r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.fa\.(ocs\.)?(?:(us\d+|eu\d+|ap\d+)\.)?"
-            r"oraclecloud\.com/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
+            r"oraclecloud\.com(?::\d+)?/hcmUI/[^?#]*?/sites/([^/?&#\s]+)",
             re.IGNORECASE
         ),
         "oracle_hcm",
@@ -161,6 +161,32 @@ def _make_patterns():
             "ocs":    m.group(2) is not None,   # True for .fa.ocs.oraclecloud.com
             "region": m.group(3).lower() if m.group(3) else "",
             "site":   m.group(4).rstrip("/"),
+        }),
+    ))
+
+    # Oracle HCM JS fingerprint — {slug}.fa.{region}.oraclecloud.com/hcmUI/
+    # (no /sites/ in URL — fires on <script src="..."> asset tags from custom-domain
+    # career pages such as careers.americanexpress.com)
+    #
+    # These pages embed the Oracle HCM JS as:
+    #   <script src="https://egug.fa.us2.oraclecloud.com:443/hcmUI/CandExpStatic/js/ce-custom.js">
+    # The :443 port and absence of /sites/ meant the primary pattern above never fired.
+    # (?::\d+)? handles the explicit port; site="" triggers auto-discovery in fetch_jobs().
+    #
+    # MUST come AFTER the primary pattern so URLs that do contain /sites/ are handled
+    # by the richer pattern (site extracted directly) and don't fall through here.
+    patterns.append((
+        re.compile(
+            r"([a-z0-9][a-z0-9\-]*[a-z0-9])\.fa\.(ocs\.)?(?:(us\d+|eu\d+|ap\d+)\.)?"
+            r"oraclecloud\.com(?::\d+)?/hcmUI/",
+            re.IGNORECASE
+        ),
+        "oracle_hcm",
+        lambda m: json.dumps({
+            "slug":   m.group(1).lower(),
+            "ocs":    m.group(2) is not None,
+            "region": m.group(3).lower() if m.group(3) else "",
+            "site":   "",   # auto-discovered by oracle_hcm.fetch_jobs()
         }),
     ))
 

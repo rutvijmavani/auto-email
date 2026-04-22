@@ -154,6 +154,41 @@ def detect(company, domain):
     return slug_info
 
 
+def _discover_site_id(slug, region, ocs=False):
+    """
+    Auto-discover the career site code for an Oracle HCM tenant.
+
+    Called when the slug was detected from a JS fingerprint URL (no /sites/ in URL)
+    and site_id was not captured at detection time.
+
+    Oracle HCM exposes its site list at:
+      /hcmRestApi/resources/latest/recruitingCESites?onlyData=true
+
+    Returns the SiteNumber of the first active external site, or "" on failure.
+    Typical values: "CX_1", "CX_1001", "CX_MAIN", "ERlive" …
+    """
+    if ocs:
+        host = f"{slug}.fa.ocs.oraclecloud.com"
+    elif region:
+        host = f"{slug}.fa.{region}.oraclecloud.com"
+    else:
+        host = f"{slug}.fa.oraclecloud.com"
+
+    url = f"https://{host}/hcmRestApi/resources/latest/recruitingCESites?onlyData=true"
+    data = fetch_json(url, platform="oracle_hcm")
+    if not data:
+        return ""
+
+    items = data.get("items", [])
+    # Pick first active external site; fall back to first item if no status field
+    for item in items:
+        site_num = item.get("SiteNumber") or item.get("siteNumber") or item.get("SiteCode") or ""
+        if site_num:
+            return str(site_num).rstrip("/")
+
+    return ""
+
+
 def fetch_jobs(slug_info, company):
     """
     Fetch all jobs for company from Oracle HCM.
@@ -171,8 +206,19 @@ def fetch_jobs(slug_info, company):
     region  = slug_info.get("region", "")
     ocs     = slug_info.get("ocs", False)
 
-    if not slug or not site_id:
+    if not slug:
         return []
+
+    # site="" means the tenant was detected from a JS asset URL (custom-domain career page)
+    # and /sites/{id} was not present — auto-discover the site number via the sites API.
+    if not site_id:
+        logger = logging.getLogger(__name__)
+        logger.debug("Oracle HCM: site_id missing for %r, attempting auto-discovery", slug)
+        site_id = _discover_site_id(slug, region, ocs=ocs)
+        if not site_id:
+            logger.warning("Oracle HCM: could not discover site_id for slug=%r — skipping", slug)
+            return []
+        logger.info("Oracle HCM: auto-discovered site_id=%r for slug=%r", site_id, slug)
 
     all_jobs = []
     offset   = 0
