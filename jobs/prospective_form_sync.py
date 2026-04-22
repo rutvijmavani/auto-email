@@ -189,6 +189,28 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
     print("       [Curl] Replaying listing request...")
     raw_bytes = _replay_request(slug_info, company)
     if raw_bytes is None:
+        # For GraphQL endpoints (e.g. Meta/metacareers.com), a 400 during the
+        # sync-time replay is expected — Meta validates IP + cookie fingerprint
+        # server-side, so a headless Python replay always fails even with a
+        # freshly extracted lsd token.  The parsed slug_info is still correct;
+        # custom_career.fetch_jobs() uses _warm_session at runtime and succeeds.
+        # Save the config without structure detection; field_map will be
+        # auto-detected on first real fetch.
+        if slug_info.get("graphql_config"):
+            logger.info(
+                "[sync] %r: GraphQL replay blocked (anti-bot) — "
+                "saving parsed config for runtime detection",
+                company
+            )
+            print(
+                "       [Curl] GraphQL replay blocked by anti-bot — "
+                "config saved, structure detected at first fetch"
+            )
+            slug_info["_replay_skipped"] = True
+            return {
+                "platform": "custom",
+                "slug":     json.dumps(slug_info),
+            }
         print("       [Curl] Replay failed — falling through")
         return None
 
