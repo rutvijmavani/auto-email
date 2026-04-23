@@ -516,7 +516,12 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     # Priority 2: Career page fingerprint
     scan_url = career_page_url if _is_valid_url(career_page_url or "") else None
     if scan_url:
-        result = _scan_career_page(company, scan_url)
+        # Pass domain so the eightfold slug builder can use the real company
+        # domain (e.g. "starbucks.com") instead of deriving it from the career
+        # page URL which may itself be the eightfold subdomain
+        # (e.g. "starbucks.eightfold.ai") — which is what caused the DB to
+        # store domain="starbucks.eightfold.ai" instead of "starbucks.com".
+        result = _scan_career_page(company, scan_url, domain=domain)
         if result:
             logger.info("[sync] %r: ATS from career page — %s",
                         company, result["platform"])
@@ -588,7 +593,20 @@ def _resolve_from_xml_url(xml_url, company):
     return {"platform": "sitemap", "slug": json.dumps({"url": xml_url})}
 
 
-def _scan_career_page(company, career_page_url):
+def _scan_career_page(company, career_page_url, domain=None):
+    """
+    Scan a career page URL for ATS fingerprints.
+
+    Args:
+        company:         company name for logging
+        career_page_url: URL to scan
+        domain:          company's real domain (e.g. "starbucks.com") from the
+                         form's Domain column or derived from job_url/career_page.
+                         Used to populate eightfold slug_info correctly instead
+                         of deriving from career_page_url, which may itself be
+                         the eightfold subdomain (starbucks.eightfold.ai) and
+                         would produce the wrong domain= API param value.
+    """
     import requests
     from jobs.ats.patterns import match_ats_pattern
 
@@ -645,16 +663,42 @@ def _scan_career_page(company, career_page_url):
         if slug:
             return {"platform": "jibe", "slug": slug}
 
-    # Eightfold.ai — cdn.eightfold.ai or {slug}.eightfold.ai iframe
+    # Eightfold.ai — cdn.eightfold.ai or {slug}.eightfold.ai iframe/script
     if "eightfold.ai" in html:
-        # Try to extract slug from script/iframe src
         m = re.search(r'([a-z0-9][a-z0-9\-]*)\.eightfold\.ai', html, re.IGNORECASE)
         if m:
-            slug   = m.group(1).lower()
-            domain = _domain_from_url(career_page_url) or ""
+            ef_slug = m.group(1).lower()
+
+            # Build the real company domain for the API domain= param.
+            #
+            # Priority:
+            #   1. `domain` arg — passed from form's Domain column or derived
+            #      from job_url. Most reliable since it's the company's own domain.
+            #   2. slug.com — heuristic that works for the vast majority of
+            #      enterprise companies (starbucks→starbucks.com, etc.).
+            #      Consistent with the probe logic in eightfold.py.
+            #
+            # We intentionally do NOT use _domain_from_url(career_page_url) here
+            # because career_page_url may be the eightfold subdomain itself
+            # (e.g. "starbucks.eightfold.ai/careers"), which would store
+            # domain="starbucks.eightfold.ai" — causing 404s in the API.
+            ef_domain = (
+                domain
+                if domain and not domain.lower().endswith(".eightfold.ai")
+                else f"{ef_slug}.com"
+            )
+
+            logger.debug(
+                "[sync] %r: eightfold detected slug=%r domain=%r "
+                "(from %s)",
+                company, ef_slug, ef_domain,
+                "form domain" if domain and not domain.lower().endswith(".eightfold.ai")
+                else "slug.com heuristic",
+            )
+
             return {
                 "platform": "eightfold",
-                "slug":     json.dumps({"slug": slug, "domain": domain}),
+                "slug":     json.dumps({"slug": ef_slug, "domain": ef_domain}),
             }
 
     # Taleo — taleo.net in script src or form action
@@ -949,4 +993,4 @@ def run():
                 imported, skipped)
     print(f"\n{'='*55}")
     print(f"[OK] Imported: {imported} | Skipped: {skipped}")
-    logger.info("════ --sync-forms (prospective) finished ════") 
+    logger.info("════ --sync-forms (prospective) finished ════")
