@@ -26,10 +26,18 @@
 #
 # Slug format stored in DB:
 #   {"base": "https://jobs.intuit.com", "tenant_id": "27595"}
+#
+# NOTE on tenant_id drift:
+#   TalentBrew tenant IDs can change when companies migrate or restructure
+#   their Radancy instance (observed: Schwab changed from 27326 → 33727).
+#   fetch_jobs() auto-detects the live tenant_id from the sitemap and updates
+#   slug_info in-place so the caller can persist the corrected value.
+#   The stored tenant_id is used only as a hint / starting point.
 
 import re
 import json
 import html as html_lib
+from collections import Counter
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match
@@ -50,6 +58,9 @@ DATE_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]
 KNOWN_DOMAINS = {
     "jobs.intuit.com":        {"tenant_id": "27595"},
     "jobs.disneycareers.com": {"tenant_id": "391"},
+    # Schwab: tenant_id intentionally omitted — auto-detected from sitemap
+    # because it drifted from 27326 → 33727. Will be resolved at runtime.
+    "www.schwabjobs.com":     {"tenant_id": ""},
 }
 
 
@@ -75,9 +86,12 @@ def detect(company):
             continue
 
         # Use html.parser — BOM prefix breaks xml parser
-        soup     = BeautifulSoup(resp.text, "html.parser")
-        job_urls = _extract_job_urls(soup, config["tenant_id"])
-        if not job_urls:
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Auto-detect tenant_id from sitemap — don't trust stored value
+        # (tenant IDs can drift when companies migrate Radancy instances)
+        live_tenant_id = _detect_tenant_id(soup)
+        if not live_tenant_id:
             continue
 
         if not validate_company_match(domain, company):
@@ -85,9 +99,10 @@ def detect(company):
 
         slug_info = {
             "base":      f"https://{domain}",
-            "tenant_id": config["tenant_id"],
+            "tenant_id": live_tenant_id,
         }
-        sample = _urls_to_stubs(job_urls[:3], slug_info, company)
+        job_urls = _extract_job_urls(soup, live_tenant_id)
+        sample   = _urls_to_stubs(job_urls[:3], slug_info, company)
         return slug_info, sample
 
     return None, None
@@ -109,6 +124,11 @@ def fetch_jobs(slug_info, company):
     Returns:
         List of normalized job dicts.
         All fields filled by fetch_job_detail().
+
+    Side-effect:
+        If the live tenant_id in the sitemap differs from the stored one,
+        slug_info["tenant_id"] is updated in-place so the caller can
+        persist the corrected value back to the DB.
     """
     if not slug_info:
         return []
@@ -130,15 +150,37 @@ def fetch_jobs(slug_info, company):
     #   - No read timeout — once data flows, download completes regardless
     #     of sitemap size (UnitedHealthGroup has 5000+ jobs; hard-capping
     #     the read would break large tenants every time they add more jobs)
-    resp        = fetch_html(sitemap_url, platform="talentbrew",
-                             timeout=(10, None))
+    resp = fetch_html(sitemap_url, platform="talentbrew", timeout=(10, None))
     if resp is None:
         return []
 
     # IMPORTANT: use html.parser — BOM prefix breaks xml/lxml-xml parsers
-    soup     = BeautifulSoup(resp.text, "html.parser")
-    job_urls = _extract_job_urls(soup, tenant_id)
+    soup = BeautifulSoup(resp.text, "html.parser")
 
+    # Always auto-detect the live tenant_id from the sitemap.
+    # Stored tenant_id is used as a fallback only — it can drift when
+    # companies migrate Radancy instances (e.g. Schwab: 27326 → 33727).
+    live_tenant_id = _detect_tenant_id(soup)
+
+    if live_tenant_id and live_tenant_id != tenant_id:
+        import logging
+        logging.getLogger(__name__).warning(
+            "talentbrew: tenant_id mismatch for %s — stored=%s live=%s — "
+            "updating slug_info (caller should persist this to DB)",
+            company, tenant_id, live_tenant_id,
+        )
+        slug_info["tenant_id"] = live_tenant_id  # update in-place for caller
+        tenant_id = live_tenant_id
+
+    if not tenant_id:
+        import logging
+        logging.getLogger(__name__).error(
+            "talentbrew: could not determine tenant_id for %s — aborting",
+            company,
+        )
+        return []
+
+    job_urls = _extract_job_urls(soup, tenant_id)
     return _urls_to_stubs(job_urls, slug_info, company)
 
 
@@ -205,6 +247,30 @@ def fetch_job_detail(job):
 # ─────────────────────────────────────────
 # HELPERS — SITEMAP PARSING
 # ─────────────────────────────────────────
+
+def _detect_tenant_id(soup):
+    """
+    Auto-detect the dominant tenant_id from sitemap job URLs.
+
+    Finds all /job/.../tenant_id/job_id URLs and returns the tenant_id
+    that appears most frequently. This is robust to mixed-tenant sitemaps
+    and handles tenant ID drift without requiring a DB update first.
+
+    Returns the tenant_id string, or "" if no job URLs found.
+    """
+    counts = Counter()
+    for loc in soup.find_all("loc"):
+        m = JOB_URL_RE.search(loc.text.strip())
+        if m:
+            counts[m.group(1)] += 1
+
+    if not counts:
+        return ""
+
+    # Return the most common tenant_id — handles edge cases where a sitemap
+    # may contain a handful of stale URLs from a prior tenant ID
+    return counts.most_common(1)[0][0]
+
 
 def _extract_job_urls(soup, tenant_id=""):
     """
