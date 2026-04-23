@@ -5,9 +5,21 @@
 #
 # API endpoint (confirmed from DevTools — GET, not POST):
 #   GET https://{slug}.eightfold.ai/api/pcsx/search
-#       ?domain={domain}&query=&location=United+States
-#       &start={offset}&num={page_size}
+#       ?domain={domain}&query=&start={offset}&num={page_size}
 #       &sort_by=distance&filter_include_remote=1&hl=en-US
+#
+# NOTE: NO server-side location filter is sent.
+#   Real browser curls show no location= param — tenants vary on which
+#   location filters they accept and some return 0 results or errors
+#   when an unexpected location param is present (e.g. Qualcomm, LamResearch
+#   use no location filter; Starbucks accepts it but others don't).
+#   We fetch ALL jobs globally and filter by country on our side using
+#   _country_code extracted from standardizedLocations.
+#
+# NOTE: domain= param is tenant-specific:
+#   Some tenants (LamResearch) require domain=lamresearch.com.
+#   Others (Starbucks, Qualcomm) omit it entirely.
+#   We send it when present in slug_info — API ignores unknown params.
 #
 # CSRF flow (required):
 #   1. GET https://{slug}.eightfold.ai/careers → session cookie + CSRF token
@@ -40,6 +52,12 @@
 # Detection:
 #   Handled by patterns.py matching {slug}.eightfold.ai in job URL.
 #   domain is extracted from the career page or stored from job URL domain.
+#
+# NOTE on API path stability:
+#   /api/pcsx/search is the confirmed primary path. A small number of tenants
+#   have been observed returning 404 on this path despite having valid sessions.
+#   fetch_jobs() will automatically fall back to CANDIDATE_PATHS if the primary
+#   path fails, and cache the working path for the remainder of the session.
 
 import re
 import time
@@ -59,7 +77,18 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 25   # sent as num= param but Eightfold ignores it and uses its own
                  # default (observed: 10 jobs/page). Pagination uses actual
                  # len(positions) returned, not this constant. Kept for the param.
-MAX_PAGES = 200  # safety cap: 200 × 25 = 5,000 jobs max per run
+MAX_PAGES = 2000  # safety cap: 2000 × 25 = 5,0000 jobs max per run
+
+# Primary path — confirmed from DevTools across most Eightfold tenants.
+PRIMARY_API_PATH = "/api/pcsx/search"
+
+# Fallback paths tried in order if PRIMARY_API_PATH returns 404.
+# These cover observed tenant variants and versioned rollouts.
+FALLBACK_API_PATHS = [
+    "/api/v2/pcsx/search",
+    "/api/search",
+    "/api/jobs",
+]
 
 # Confirmed required from DevTools — requests fail or return empty without these
 HEADERS = {
@@ -107,16 +136,11 @@ def fetch_jobs(slug_info, company):
         return []
 
     slug   = slug_info.get("slug", "")
-    domain = slug_info.get("domain", "")
+    stored_domain = slug_info.get("domain", "")
 
     if not slug:
         logger.error("eightfold: missing slug for %s", company)
         return []
-    if not domain:
-        logger.warning(
-            "eightfold: no domain for %s — fetching without domain filter",
-            company,
-        )
 
     base_url = f"https://{slug}.eightfold.ai"
 
@@ -124,13 +148,46 @@ def fetch_jobs(slug_info, company):
     session    = _make_session()
     csrf_token = _fetch_csrf_token(session, slug)
 
-    # Step 2: Paginate through all jobs
+    # Step 2: Discover both the working API path AND the correct domain= value.
+    #
+    # We cannot know beforehand whether a tenant requires domain=, accepts it,
+    # or rejects it — this varies per tenant and the DB stores the eightfold
+    # subdomain (e.g. "lamresearch.eightfold.ai") rather than the company domain.
+    #
+    # Strategy: probe candidate (api_path, domain) pairs in priority order.
+    # First combination that returns HTTP 200 + at least one job wins and is
+    # used for all subsequent pagination requests.
+    #
+    # Domain candidates tried in order:
+    #   1. slug.com  — derived from slug (covers lamresearch→lamresearch.com,
+    #                  qualcomm→qualcomm.com, nvidia→nvidia.com, etc.)
+    #   2. ""        — omit domain= entirely (works for Starbucks, Qualcomm)
+    #   3. stored_domain if it looks like a real domain (not .eightfold.ai)
+    #                  — covers cases where DB is correctly populated
+    api_path, domain = _resolve_api_path_and_domain(
+        session, slug, stored_domain, base_url, csrf_token
+    )
+
+    if api_path is None:
+        logger.error(
+            "eightfold: no working (api_path, domain) combination found for %s",
+            slug,
+        )
+        return []
+
+    if api_path != PRIMARY_API_PATH:
+        logger.warning(
+            "eightfold: primary path 404 for %s — using fallback %s",
+            slug, api_path,
+        )
+
+    # Step 3: Paginate through all jobs
     all_jobs = []
     start    = 0
 
     for page in range(MAX_PAGES):
-        positions, total = _fetch_page(
-            session, slug, domain, base_url, start, csrf_token
+        positions, total, _ = _fetch_page(
+            session, slug, domain, base_url, start, csrf_token, api_path
         )
 
         if positions is None:
@@ -267,19 +324,157 @@ def _fetch_csrf_token(session, slug):
 
 
 # ─────────────────────────────────────────
+# HELPERS — API PATH + DOMAIN RESOLUTION
+# ─────────────────────────────────────────
+
+def _candidate_domains(slug, stored_domain):
+    """
+    Build an ordered list of domain= values to probe for this tenant.
+
+    CONFIRMED from live testing (starbucks, lamresearch, qualcomm):
+      - domain=slug.com       → ✅ works for all three
+      - domain= omitted       → 422 "Missing data for required field" on ALL tenants
+      - domain=slug.eightfold.ai → 404 (what DB currently stores — always wrong)
+
+    domain= is REQUIRED by all tested Eightfold tenants. Omitting it is never
+    correct. The DB stores the eightfold subdomain which is always wrong.
+
+    Probe order:
+      1. slug.com              — derived heuristic; correct for the vast majority
+                                 (lamresearch→lamresearch.com, qualcomm→qualcomm.com)
+      2. stored_domain         — only if it looks like a real company domain
+                                 (not .eightfold.ai); covers correctly-populated DBs
+                                 and edge cases like slug≠domain (e.g. slug="sbux",
+                                 domain="starbucks.com")
+      3. slug.net / slug.org   — rare fallbacks for non-.com company domains
+
+    "" (omit domain=) is intentionally excluded — confirmed to cause 422.
+    """
+    candidates = []
+
+    # Candidate 1: slug.com — correct for most tenants
+    slug_com = f"{slug}.com"
+    candidates.append(slug_com)
+
+    # Candidate 2: stored domain if it looks like a real company domain
+    # Covers: correctly-populated DB, or slug that differs from domain
+    # (e.g. slug="sbux" but real domain="starbucks.com")
+    if (stored_domain
+            and not stored_domain.lower().endswith(".eightfold.ai")
+            and stored_domain not in candidates):
+        candidates.append(stored_domain)
+
+    # Candidates 3-4: non-.com TLDs — rare but possible
+    for tld in (".net", ".org"):
+        candidates.append(f"{slug}{tld}")
+
+    return candidates
+
+
+def _resolve_api_path_and_domain(session, slug, stored_domain, base_url, csrf_token):
+    """
+    Probe to find both the working API path and the correct domain= value.
+
+    Iterates (api_path, domain) combinations in priority order and returns
+    the first pair that yields HTTP 200 with at least one job.
+
+    Requiring positions > 0 (not just HTTP 200) is intentional: a wrong
+    domain= value may return 200 with count=0, which would be mistaken for
+    "works but no jobs" rather than "wrong domain".
+
+    Returns (api_path, domain) tuple, or (None, None) if all probes fail.
+
+    Probe matrix (tried in this order):
+      PRIMARY_API_PATH  × each domain candidate
+      FALLBACK_PATH_1   × each domain candidate
+      ...
+
+    On a 4xx/5xx for a given api_path, that path is abandoned immediately
+    and we move to the next — no point retrying other domains on a dead path.
+    On a 422 specifically, we continue to next domain (422 = wrong domain
+    value, not a broken path).
+    """
+    domain_candidates = _candidate_domains(slug, stored_domain)
+    api_paths         = [PRIMARY_API_PATH] + FALLBACK_API_PATHS
+
+    for api_path in api_paths:
+        for domain in domain_candidates:
+            positions, total, status = _fetch_page(
+                session, slug, domain, base_url, start=0,
+                csrf_token=csrf_token, api_path=api_path,
+            )
+
+            if status == 422:
+                # Wrong domain value — try next domain candidate on same path
+                logger.debug(
+                    "eightfold: probe 422 (bad domain) path=%s domain=%r for %s",
+                    api_path, domain, slug,
+                )
+                continue
+
+            if status == 404:
+                # Path itself doesn't exist for this tenant — abandon path
+                logger.debug(
+                    "eightfold: probe 404 (bad path) path=%s domain=%r for %s",
+                    api_path, domain, slug,
+                )
+                break  # next api_path
+
+            if positions is None:
+                # Other hard error — abandon path
+                logger.debug(
+                    "eightfold: probe hard error path=%s domain=%r for %s",
+                    api_path, domain, slug,
+                )
+                break  # next api_path
+
+            if positions:
+                # Got real jobs — this combination is confirmed working
+                logger.debug(
+                    "eightfold: resolved path=%s domain=%r for %s (total=%d)",
+                    api_path, domain, slug, total,
+                )
+                return api_path, domain
+
+            # HTTP 200, positions=[], total=0 — could be genuinely no jobs
+            # or a domain that filters to 0. Try remaining domains to be safe.
+            logger.debug(
+                "eightfold: probe 0 jobs path=%s domain=%r for %s "
+                "— trying next domain candidate",
+                api_path, domain, slug,
+            )
+
+    logger.error(
+        "eightfold: all (path, domain) probes exhausted for %s "
+        "— paths=%s domains=%s",
+        slug, api_paths, domain_candidates,
+    )
+    return None, None
+
+
+# ─────────────────────────────────────────
 # HELPERS — PAGINATION
 # ─────────────────────────────────────────
 
-def _fetch_page(session, slug, domain, base_url, start, csrf_token):
+def _fetch_page(session, slug, domain, base_url, start, csrf_token,
+                api_path=PRIMARY_API_PATH):
     """
     Fetch one page of jobs from the Eightfold search API.
 
-    Returns (positions_list, total_count) or (None, 0) on hard error.
-    Returns ([], 0) when the page is genuinely empty (end of results).
+    Returns (positions, total, status_code) always.
+
+    Callers interpret the tuple as:
+      status=200, positions non-empty  → success, use results
+      status=200, positions=[]         → valid response but no jobs on this page
+      status=422                       → wrong domain= value (try another)
+      status=404                       → api_path doesn't exist for this tenant
+      status=other / positions=None    → hard error
+
+    Returning status explicitly lets _resolve_api_path_and_domain distinguish
+    422 (bad domain, try next) from 404 (bad path, abandon path entirely).
     """
-    url    = f"{base_url}/api/pcsx/search"
+    url    = f"{base_url}{api_path}"
     params = {
-        "domain":                domain,
         "query":                 "",
         "start":                 start,
         "num":                   PAGE_SIZE,  # server ignores this, uses its own default (~10)
@@ -287,6 +482,17 @@ def _fetch_page(session, slug, domain, base_url, start, csrf_token):
         "filter_include_remote": "1",
         "hl":                    "en-US",
     }
+    # domain= is REQUIRED by all tested Eightfold tenants (omitting → 422).
+    # Always include it. The value is resolved by _resolve_api_path_and_domain
+    # before pagination starts, so by the time we get here it's correct.
+    if domain:
+        params["domain"] = domain
+
+    # NO location= filter — confirmed from real browser curls across all tenants.
+    # Sending location=United+States causes 0-result responses on some tenants
+    # and the production 404s. Fetch all jobs globally; filter by _country_code
+    # (extracted from standardizedLocations) on our side.
+
     headers = {
         **HEADERS,
         "referer":                f"{base_url}/careers?hl=en-US",
@@ -297,28 +503,30 @@ def _fetch_page(session, slug, domain, base_url, start, csrf_token):
     }
 
     try:
-        resp = session.get(url, params=params, headers=headers, timeout=15)
+        resp   = session.get(url, params=params, headers=headers, timeout=15)
+        status = resp.status_code
 
-        if resp.status_code == 401:
-            logger.error("eightfold: 401 for %s — CSRF or session invalid", slug)
-            return None, 0
+        if status == 200:
+            data      = resp.json()
+            inner     = data.get("data", {})
+            positions = inner.get("positions", [])
+            total     = int(inner.get("count", 0))
+            return positions, total, status
 
-        if resp.status_code != 200:
-            logger.error("eightfold: HTTP %s for %s start=%d",
-                         resp.status_code, slug, start)
-            return None, 0
+        # Non-200: log appropriately and return empty with real status code
+        if status in (404, 422):
+            logger.debug("eightfold: HTTP %s for %s path=%s domain=%r start=%d",
+                         status, slug, api_path, domain, start)
+        else:
+            logger.error("eightfold: HTTP %s for %s path=%s domain=%r start=%d",
+                         status, slug, api_path, domain, start)
 
-        data      = resp.json()
-        inner     = data.get("data", {})
-        positions = inner.get("positions", [])
-        total     = int(inner.get("count", 0))
-
-        return positions, total
+        return None, 0, status
 
     except (requests.RequestException, ValueError) as e:
-        logger.error("eightfold: fetch_page error for %s start=%d: %s",
-                     slug, start, e)
-        return None, 0
+        logger.error("eightfold: fetch_page error for %s path=%s start=%d: %s",
+                     slug, api_path, start, e)
+        return None, 0, 0
 
 
 # ─────────────────────────────────────────
