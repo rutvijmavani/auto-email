@@ -352,6 +352,19 @@ def _make_patterns():
         lambda m: m.group(1).lower(),
     ))
 
+    # ── ADP WorkforceNow — myjobs.adp.com/{slug}/cx/ ────────────────────────────
+    # Career page / listing API: myjobs.adp.com/{slug}/cx/job-listing
+    # Job detail page:           myjobs.adp.com/{slug}/cx/job-details?reqId=…
+    # The {slug} is the company identifier (e.g. "apply", "scacareers").
+    patterns.append((
+        re.compile(
+            r"myjobs\.adp\.com/([a-z0-9][a-z0-9\-]*)/cx/",
+            re.IGNORECASE
+        ),
+        "adp",
+        lambda m: m.group(1).lower(),
+    ))
+
     # ── Generic sitemap / XML feed ───────────────────────────────────────────────
     # Matches when user provides any sitemap.xml or feed.xml URL directly
     # Stores full URL as slug_info for sitemap.py
