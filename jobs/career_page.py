@@ -287,9 +287,11 @@ def _fetch_and_scan(url, company):
             if resp.url != http_url:
                 r = match_ats_pattern(resp.url)
                 if r and _slug_ok(r, company):
-                    return r, None, resp.url
+                    return _enrich_eightfold_domain(r, resp.url), None, resp.url
             if resp.status_code == 200:
                 r = _scan_html(resp.text, company)
+                if r:
+                    r = _enrich_eightfold_domain(r, resp.url)
                 return r, resp.text, resp.url
         except Exception:
             pass

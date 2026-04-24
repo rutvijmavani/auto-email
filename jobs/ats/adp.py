@@ -95,6 +95,7 @@ def fetch_jobs(slug, company):
 
     all_jobs = []
     offset   = 0
+    seen_ids = set()
 
     for _ in range(MAX_PAGES):
         url  = f"{BASE_URL}/{slug}/cx/job-listing"
@@ -111,7 +112,11 @@ def fetch_jobs(slug, company):
         if not reqs:
             break
 
-        all_jobs.extend(_parse_reqs(reqs, slug, company))
+        for job in _parse_reqs(reqs, slug, company):
+            if job["job_id"] in seen_ids:
+                continue
+            seen_ids.add(job["job_id"])
+            all_jobs.append(job)
 
         total   = data.get("count", 0)
         offset += len(reqs)
