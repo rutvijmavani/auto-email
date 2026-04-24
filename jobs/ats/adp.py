@@ -55,6 +55,10 @@ def detect(company):
             continue
 
         sample = _parse_reqs(reqs[:3], slug, company)
+        # Guard against unrelated tenants that happen to share the slug variant.
+        sample_text = " ".join(j.get("title", "") for j in sample)
+        if sample_text and not validate_company_match(sample_text, company):
+            continue
         return slug, sample
 
     return None, None

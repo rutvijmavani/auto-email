@@ -126,10 +126,12 @@ def detect_via_career_page(company, domain):
         url = f"https://{domain}{path}"
         result, html, final_url = _fetch_and_scan(url, company)
         if result:
-            if result["platform"] == "eightfold" and tentative_eightfold is None:
-                logger.debug("[P3a tentative Eightfold] %r via %s — continuing scan",
-                             company, url)
-                tentative_eightfold = result
+            if result["platform"] == "eightfold":
+                if tentative_eightfold is None:
+                    logger.debug("[P3a tentative Eightfold] %r via %s — continuing scan",
+                                 company, url)
+                    tentative_eightfold = result
+                # Always keep scanning past Eightfold — harder ATS may follow.
             else:
                 logger.info("[P3a HIT] %r → %s / %s via %s",
                             company, result["platform"], result["slug"], url)
