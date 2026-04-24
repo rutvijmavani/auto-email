@@ -42,6 +42,8 @@ DATE_FORMATS = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"]
 
 # Known Phenom People custom domains
 # Maps domain → {path, sitemap_path}
+# sitemap: leave as "sitemap.xml" — fetch_jobs() auto-falls back to
+# sitemap_index.xml when needed via _follow_sitemap().
 KNOWN_DOMAINS = {
     "careers.chewy.com": {
         "path":    "us/en",
@@ -50,6 +52,10 @@ KNOWN_DOMAINS = {
     "jobs.ebayinc.com": {
         "path":    "us/en",
         "sitemap": "us/en/sitemap1.xml",  # eBay uses sub-sitemap directly
+    },
+    "careers.brighthorizons.com": {
+        "path":    "us/en",
+        "sitemap": "us/en/sitemap.xml",   # index at sitemap_index.xml — auto-detected
     },
 }
 
@@ -71,18 +77,12 @@ def detect(company):
     """
     # Check known custom domains
     for domain, config in KNOWN_DOMAINS.items():
-        sitemap_url = f"https://{domain}/{config['sitemap']}"
-        resp        = fetch_html(sitemap_url, platform="phenom", track=False)
-        if resp is None:
-            continue
-
-        soup     = BeautifulSoup(resp.text, "xml")
-        job_urls = _extract_job_urls(soup)
-        if not job_urls:
-            continue
-
-        # Validate company match using domain
         if not validate_company_match(domain, company):
+            continue
+
+        sitemap_url = f"https://{domain}/{config['sitemap']}"
+        job_urls    = _fetch_all_job_urls(sitemap_url)
+        if not job_urls:
             continue
 
         slug_info = {
@@ -97,12 +97,7 @@ def detect(company):
     for slug in slugify(company):
         base        = f"https://{slug}.phenompeople.com"
         sitemap_url = f"{base}/sitemap.xml"
-        resp        = fetch_html(sitemap_url, platform="phenom", track=False)
-        if resp is None:
-            continue
-
-        soup     = BeautifulSoup(resp.text, "xml")
-        job_urls = _extract_job_urls(soup)
+        job_urls    = _fetch_all_job_urls(sitemap_url)
         if not job_urls:
             continue
 
@@ -153,31 +148,13 @@ def fetch_jobs(slug_info, company):
         return []
 
     sitemap_url = f"{base}/{sitemap}"
-    # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
-    # Applied to sub-sitemap fetches too (sitemap-index tenants have N child files).
-    resp        = fetch_html(sitemap_url, platform="phenom", timeout=(10, None))
-    if resp is None:
-        return []
-
-    soup = BeautifulSoup(resp.text, "xml")
-
-    # Handle sitemap index — points to sub-sitemaps
-    sub_sitemaps = soup.find_all("sitemap")
-    if sub_sitemaps:
-        all_urls = []
-        for sub in sub_sitemaps:
-            loc = sub.find("loc")
-            if not loc:
-                continue
-            sub_resp = fetch_html(loc.text, platform="phenom", timeout=(10, None))
-            if sub_resp is None:
-                continue
-            sub_soup = BeautifulSoup(sub_resp.text, "xml")
-            all_urls.extend(_extract_job_urls(sub_soup))
-        return _urls_to_stubs(all_urls, slug_info, company)
-
-    # Direct job URLs in sitemap
-    job_urls = _extract_job_urls(soup)
+    # _fetch_all_job_urls handles:
+    #   • Regular sitemaps (direct job URLs)
+    #   • Sitemap indexes (follows all child sitemaps recursively)
+    #   • sitemap_index.xml fallback when sitemap.xml yields nothing
+    #     (Bright Horizons: sitemap.xml is absent but sitemap_index.xml
+    #      points to sitemap1.xml, sitemap2.xml, … with all job URLs)
+    job_urls = _fetch_all_job_urls(sitemap_url)
     return _urls_to_stubs(job_urls, slug_info, company)
 
 
@@ -245,6 +222,81 @@ def fetch_job_detail(job):
 
     except Exception:
         return job
+
+
+# ─────────────────────────────────────────
+# HELPERS — SITEMAP FETCHING
+# ─────────────────────────────────────────
+
+def _follow_sitemap(sitemap_url, depth=0, _seen=None):
+    """
+    Recursively fetch all <loc> entries from a sitemap or sitemap index.
+
+    Handles two formats transparently:
+      Regular sitemap  — <urlset><url><loc>…
+      Sitemap index    — <sitemapindex><sitemap><loc>…
+
+    Also transparently probes sitemap_index.xml when sitemap.xml returns
+    nothing useful (Bright Horizons pattern: sitemap.xml → 404/empty but
+    sitemap_index.xml → valid index with sitemap1.xml / sitemap2.xml children).
+
+    depth limit = 3 to prevent runaway recursion on pathological indexes.
+    Returns a flat list of URL strings (all <loc> leaves).
+    """
+    if depth > 3:
+        return []
+    if _seen is None:
+        _seen = set()
+    if sitemap_url in _seen:
+        return []
+    _seen.add(sitemap_url)
+
+    resp = fetch_html(sitemap_url, platform="phenom", timeout=(10, None))
+    if resp is None:
+        return []
+
+    # xml parser handles both <sitemapindex> and <urlset> correctly
+    soup = BeautifulSoup(resp.text, "xml")
+
+    # Sitemap index: has <sitemap> child elements, each with a <loc>
+    sub_tags = soup.find_all("sitemap")
+    if sub_tags:
+        all_locs = []
+        for tag in sub_tags:
+            loc_tag = tag.find("loc")
+            if loc_tag and loc_tag.text.strip():
+                all_locs.extend(
+                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen)
+                )
+        return all_locs
+
+    # Regular sitemap: return all <loc> leaf entries
+    return [loc.text.strip() for loc in soup.find_all("loc") if loc.text.strip()]
+
+
+def _fetch_all_job_urls(base_sitemap_url):
+    """
+    Fetch all job URLs from a sitemap, with sitemap_index.xml fallback.
+
+    Tries base_sitemap_url first. If it yields no results (404, empty, or
+    no job URLs at all), automatically probes the sibling sitemap_index.xml
+    — which is the Bright Horizons / Phenom pattern where the canonical
+    entry point is sitemap_index.xml rather than sitemap.xml.
+
+    Returns flat list of job URL strings.
+    """
+    locs = _follow_sitemap(base_sitemap_url)
+    job_urls = [u for u in locs if JOB_URL_RE.search(u)]
+
+    if not job_urls:
+        # Try sitemap_index.xml alongside whatever sitemap name was given
+        index_url = re.sub(r"sitemap[^/]*\.xml$", "sitemap_index.xml",
+                           base_sitemap_url)
+        if index_url != base_sitemap_url:
+            locs = _follow_sitemap(index_url)
+            job_urls = [u for u in locs if JOB_URL_RE.search(u)]
+
+    return job_urls
 
 
 # ─────────────────────────────────────────

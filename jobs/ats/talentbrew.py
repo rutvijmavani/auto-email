@@ -145,22 +145,25 @@ def fetch_jobs(slug_info, company):
         return []
 
     sitemap_url = f"{base}/sitemap.xml"
-    # (connect_timeout=10, read_timeout=None):
-    #   - 10s to establish the TCP connection (catches dead hosts fast)
-    #   - No read timeout — once data flows, download completes regardless
-    #     of sitemap size (UnitedHealthGroup has 5000+ jobs; hard-capping
-    #     the read would break large tenants every time they add more jobs)
-    resp = fetch_html(sitemap_url, platform="talentbrew", timeout=(10, None))
-    if resp is None:
-        return []
 
-    # IMPORTANT: use html.parser — BOM prefix breaks xml/lxml-xml parsers
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # First pass: fetch all locs (handles sitemap index + sub-sitemaps + fallback
+    # to sitemap_index.xml) WITHOUT tenant_id filter, so we can auto-detect
+    # the live tenant_id from whatever URLs the sitemap actually contains.
+    # (connect_timeout=10, read_timeout=None) — see module header for rationale.
+    all_locs = _follow_sitemap(sitemap_url)
 
-    # Always auto-detect the live tenant_id from the sitemap.
-    # Stored tenant_id is used as a fallback only — it can drift when
-    # companies migrate Radancy instances (e.g. Schwab: 27326 → 33727).
-    live_tenant_id = _detect_tenant_id(soup)
+    if not any(JOB_URL_RE.search(u) for u in all_locs):
+        # sitemap.xml empty or missing — try sitemap_index.xml
+        index_url = f"{base}/sitemap_index.xml"
+        all_locs  = _follow_sitemap(index_url)
+
+    # Auto-detect live tenant_id from the collected URLs
+    from collections import Counter as _Counter
+    counts = _Counter(
+        JOB_URL_RE.search(u).group(1)
+        for u in all_locs if JOB_URL_RE.search(u)
+    )
+    live_tenant_id = counts.most_common(1)[0][0] if counts else ""
 
     if live_tenant_id and live_tenant_id != tenant_id:
         import logging
@@ -180,7 +183,9 @@ def fetch_jobs(slug_info, company):
         )
         return []
 
-    job_urls = _extract_job_urls(soup, tenant_id)
+    job_urls = [u for u in all_locs
+                if JOB_URL_RE.search(u)
+                and JOB_URL_RE.search(u).group(1) == tenant_id]
     return _urls_to_stubs(job_urls, slug_info, company)
 
 
@@ -242,6 +247,80 @@ def fetch_job_detail(job):
 
     except Exception:
         return job
+
+
+# ─────────────────────────────────────────
+# HELPERS — SITEMAP FETCHING
+# ─────────────────────────────────────────
+
+def _follow_sitemap(sitemap_url, depth=0, _seen=None):
+    """
+    Recursively fetch all <loc> entries from a sitemap or sitemap index.
+
+    Uses html.parser (not xml) — TalentBrew sitemaps have a BOM prefix
+    that breaks lxml/xml parsers (observed on jobs.intuit.com).
+
+    Handles:
+      Regular sitemap  — <urlset><url><loc>…
+      Sitemap index    — <sitemapindex><sitemap><loc>…
+
+    depth limit = 3. Returns flat list of URL strings.
+    """
+    if depth > 3:
+        return []
+    if _seen is None:
+        _seen = set()
+    if sitemap_url in _seen:
+        return []
+    _seen.add(sitemap_url)
+
+    resp = fetch_html(sitemap_url, platform="talentbrew", timeout=(10, None))
+    if resp is None:
+        return []
+
+    # IMPORTANT: html.parser — BOM prefix breaks xml/lxml-xml parsers
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Sitemap index: has <sitemap> child elements each with a <loc>
+    sub_tags = soup.find_all("sitemap")
+    if sub_tags:
+        all_locs = []
+        for tag in sub_tags:
+            loc_tag = tag.find("loc")
+            if loc_tag and loc_tag.text.strip():
+                all_locs.extend(
+                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen)
+                )
+        return all_locs
+
+    # Regular sitemap: return all <loc> leaf entries
+    return [loc.text.strip() for loc in soup.find_all("loc") if loc.text.strip()]
+
+
+def _fetch_all_job_urls(base_sitemap_url, tenant_id):
+    """
+    Fetch all TalentBrew job URLs, with sitemap_index.xml fallback.
+
+    Tries base_sitemap_url first via _follow_sitemap (handles indexes
+    recursively). If no matching job URLs found, probes the sibling
+    sitemap_index.xml — some TalentBrew tenants use this as the entry point.
+
+    Returns flat list of job URL strings matching tenant_id.
+    """
+    locs     = _follow_sitemap(base_sitemap_url)
+    job_urls = [u for u in locs if JOB_URL_RE.search(u)
+                and (not tenant_id or JOB_URL_RE.search(u).group(1) == tenant_id)]
+
+    if not job_urls:
+        index_url = re.sub(r"sitemap[^/]*\.xml$", "sitemap_index.xml",
+                           base_sitemap_url)
+        if index_url != base_sitemap_url:
+            locs     = _follow_sitemap(index_url)
+            job_urls = [u for u in locs if JOB_URL_RE.search(u)
+                        and (not tenant_id
+                             or JOB_URL_RE.search(u).group(1) == tenant_id)]
+
+    return job_urls
 
 
 # ─────────────────────────────────────────

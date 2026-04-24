@@ -15,7 +15,7 @@
 
 import re
 import requests
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
 
 from logger import get_logger
@@ -71,6 +71,8 @@ _ATS_SCRIPT_HINTS = (
     "phenompeople.com",
     "talentbrew.com",
     "jibecdn.com",
+    "myjobs.adp.com",
+    # Note: vscdn.net is Eightfold's CDN but not a reliable ATS signal on its own
 )
 
 # How many individual job links to follow when top-level scan misses
@@ -113,14 +115,25 @@ def detect_via_career_page(company, domain):
     # ── Layer 1 + 2: scan standard career paths ────────────────────────────
     first_career_html = None
     first_career_url  = None
+    # Eightfold is treated as tentative — many companies embed Eightfold
+    # tracking / LinkedIn RMS scripts on their career page without actually
+    # being Eightfold customers (e.g. Netflix uses Workday but loads an
+    # Eightfold real-time-listing widget).  We keep scanning and only fall
+    # back to the Eightfold result if no harder ATS is found in Layer 3.
+    tentative_eightfold = None
 
     for path in CAREER_PATHS:
         url = f"https://{domain}{path}"
         result, html, final_url = _fetch_and_scan(url, company)
         if result:
-            logger.info("[P3a HIT] %r → %s / %s via %s",
-                        company, result["platform"], result["slug"], url)
-            return result
+            if result["platform"] == "eightfold" and tentative_eightfold is None:
+                logger.debug("[P3a tentative Eightfold] %r via %s — continuing scan",
+                             company, url)
+                tentative_eightfold = result
+            else:
+                logger.info("[P3a HIT] %r → %s / %s via %s",
+                            company, result["platform"], result["slug"], url)
+                return result
         if html is not None and first_career_html is None:
             first_career_html = html
             first_career_url  = final_url
@@ -137,8 +150,93 @@ def detect_via_career_page(company, domain):
                         company, result["platform"], result["slug"])
             return result
 
+    # ── Eightfold fallback ─────────────────────────────────────────────────
+    # Nothing harder found — accept the tentative Eightfold result.
+    if tentative_eightfold:
+        logger.info("[P3a HIT Eightfold fallback] %r → %s / %s",
+                    company, tentative_eightfold["platform"], tentative_eightfold["slug"])
+        return tentative_eightfold
+
     logger.debug("[P3a MISS] %r (domain=%s)", company, domain)
     return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Eightfold domain enrichment
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Common career-page subdomain prefixes to strip when deriving company domain
+_CAREER_PREFIXES = (
+    "careers.", "career.", "jobs.", "job.", "work.", "apply.",
+    "hiring.", "talent.", "join.", "opportunities.",
+)
+
+def _enrich_eightfold_domain(result, page_url):
+    """
+    After detecting an Eightfold slug, fill in the domain= field from the
+    career page URL that was being scanned.
+
+    The Eightfold pattern stores domain="" because the slug URL alone
+    ({slug}.eightfold.ai) doesn't tell us the company's real domain.
+    At detection time we recover it two ways (in priority order):
+
+    1. domain= query param — Eightfold passes it explicitly in the URL:
+         apply.starbucks.com/careers?domain=starbucks.com  → starbucks.com
+    2. Hostname prefix strip — fallback when no query param present:
+         careers.starbucks.com/jobs  → starbucks.com
+         jobs.lamresearch.com/       → lamresearch.com
+
+    Hosted tenants (slug.eightfold.ai) are skipped — the slug already
+    encodes the subdomain, no separate domain field needed.
+
+    Only applied when the result is Eightfold and domain is currently empty.
+    Leaves all other platforms untouched.
+    """
+    if not result or result.get("platform") != "eightfold":
+        return result
+    if not page_url:
+        return result
+
+    import json as _json
+    try:
+        slug_info = _json.loads(result["slug"])
+    except (ValueError, TypeError, KeyError):
+        return result
+
+    # Only enrich if domain is missing
+    if slug_info.get("domain"):
+        return result
+
+    try:
+        parsed = urlparse(page_url)
+
+        # Prefer explicit domain= query param — Eightfold embeds it in the URL
+        # e.g. apply.starbucks.com/careers?domain=starbucks.com
+        qs     = parse_qs(parsed.query)
+        domain = (qs.get("domain") or [""])[0].strip()
+
+        if not domain:
+            # Fallback: strip common career-page subdomain prefixes from hostname
+            # e.g. careers.starbucks.com → starbucks.com
+            host   = parsed.hostname or ""
+            domain = host
+            for prefix in _CAREER_PREFIXES:
+                if host.startswith(prefix):
+                    domain = host[len(prefix):]
+                    break
+
+        # Exclude eightfold.ai itself (hosted tenant — slug already IS the domain prefix)
+        if domain.endswith(".eightfold.ai"):
+            domain = ""
+
+        if domain:
+            slug_info["domain"] = domain
+            result = dict(result)
+            result["slug"] = _json.dumps(slug_info)
+    except Exception:
+        pass
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,13 +264,15 @@ def _fetch_and_scan(url, company):
             logger.debug("[P3a] Redirect: %s → %s", url, final_url)
             r = match_ats_pattern(final_url)
             if r and _slug_ok(r, company):
-                return r, None, final_url
+                return _enrich_eightfold_domain(r, final_url), None, final_url
 
         if resp.status_code != 200:
             return None, None, None
 
         # Layer 2: deep HTML scan
         r = _scan_html(resp.text, company)
+        if r:
+            r = _enrich_eightfold_domain(r, final_url)
         return r, resp.text, final_url
 
     except requests.exceptions.SSLError:
@@ -246,6 +346,28 @@ def _scan_html(html, company):
         r = match_ats_pattern(url)
         if r and _slug_ok(r, company):
             return r
+
+    # ── Eightfold footer fingerprint fallback ─────────────────────────────
+    # Every Eightfold career page embeds a "Powered by eightfold.ai" footer
+    # containing href="https://eightfold.ai" and an img from static.vscdn.net.
+    # These signals confirm Eightfold is in use but don't carry the slug.
+    # The {slug}.eightfold.ai URL is always present elsewhere in the page
+    # (typically inside a JS config object) but may not surface as a clean
+    # attribute URL — so we do a targeted raw-HTML regex search as a fallback.
+    # Eightfold footer: every Eightfold-powered career page has a
+    # "Powered by eightfold.ai" footer with href="https://eightfold.ai".
+    # vscdn.net is their CDN but can appear on non-Eightfold pages —
+    # only the eightfold.ai href is a reliable confirmation signal.
+    if "eightfold.ai" in html.lower():
+        m = re.search(
+            r'https?://([a-z0-9][a-z0-9\-]*)\.eightfold\.ai/',
+            html,
+            re.IGNORECASE,
+        )
+        if m:
+            r = match_ats_pattern(m.group(0))
+            if r and _slug_ok(r, company):
+                return r
 
     return None
 
@@ -351,10 +473,28 @@ def _slug_ok(result, company):
     """
     Validate that the detected slug belongs to the expected company.
     Skips validation for platforms with opaque or rich slugs.
+
+    Eightfold slugs are JSON-encoded dicts — we parse and validate the inner
+    "slug" field rather than the raw JSON string.  This prevents false positives
+    from pages that embed Eightfold RMS/LinkedIn tracking scripts without being
+    real Eightfold customers (e.g. a Workday company whose career page loads
+    an Eightfold real-time-listing widget).
     """
+    import json as _json
+
     platform = result.get("platform", "")
     if platform in _OPAQUE_SLUG_PLATFORMS:
         return True
     if platform in _RICH_SLUG_PLATFORMS:
         return True
-    return validate_slug_for_company(result.get("slug", ""), company)
+
+    slug = result.get("slug", "")
+
+    # Eightfold stores slug as JSON — extract the inner slug for comparison
+    if platform == "eightfold":
+        try:
+            slug = _json.loads(slug).get("slug", "")
+        except (ValueError, TypeError):
+            pass
+
+    return validate_slug_for_company(slug, company)

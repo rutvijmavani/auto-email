@@ -29,7 +29,7 @@ from jobs.ats import (
     greenhouse, lever, ashby, smartrecruiters, workday,
     oracle_hcm, icims, jobvite, avature, phenom,
     talentbrew, sitemap, successfactors, google,
-    taleo, eightfold, jibe, custom_career,
+    taleo, eightfold, jibe, custom_career, adp,
 )
 
 ATS_REGISTRY = {
@@ -234,6 +234,20 @@ ATS_REGISTRY = {
         "site_search":     None,
         "listing_filter":  "full",
         "has_detail":      True,
+        "country_source":  "alpha2",
+    },
+
+    "adp": {
+        # Full description + location available at listing level — no detail fetch.
+        # Location: "Charlotte, North Carolina, USA" / "Mississauga, Ontario, CAN".
+        # country.codeValue is alpha-3 ("USA", "CAN") — get_country_code() converts
+        # to alpha-2 ("US", "CA") for the listing-level country gate.
+        "module":          adp,
+        "slug_type":       "string",
+        "detect_phases":   ["career_page", "api"],
+        "site_search":     "site:myjobs.adp.com",
+        "listing_filter":  "full",
+        "has_detail":      False,
         "country_source":  "alpha2",
     },
 
