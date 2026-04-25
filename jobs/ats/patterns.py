@@ -65,7 +65,19 @@ def _make_patterns():
         lambda m: m.group(1).lower().rstrip("/"),
     ))
 
-    # SmartRecruiters — jobs.smartrecruiters.com/{slug}
+    # SmartRecruiters — oneclick-ui job-detail URLs:
+    #   jobs.smartrecruiters.com/oneclick-ui/company/{slug}/publication/{id}
+    # Must come before the generic pattern below (same domain, longer path).
+    patterns.append((
+        re.compile(
+            r"jobs\.smartrecruiters\.com/oneclick-ui/company/([^/?&#\s]+)",
+            re.IGNORECASE
+        ),
+        "smartrecruiters",
+        lambda m: m.group(1).lower().rstrip("/"),
+    ))
+
+    # SmartRecruiters — jobs.smartrecruiters.com/{slug}  (standard listing page)
     patterns.append((
         re.compile(
             r"jobs\.smartrecruiters\.com/([^/?&#\s]+)",
@@ -223,7 +235,27 @@ def _make_patterns():
         lambda m: m.group(1).lower(),
     ))
 
+    # SAP SuccessFactors — career{dc}.successfactors.{region}/career(s)?company=...
+    # Must come before the generic subdomain pattern below — same domain but the
+    # subdomain is a datacenter ID (career4, career12) not the company slug.
+    # The company slug is in the ?company= query param.
+    patterns.append((
+        re.compile(
+            r"career(\d+)\.successfactors\.(com|eu)/(careers?)\?.*company=([^&\s]+)",
+            re.IGNORECASE,
+        ),
+        "successfactors",
+        lambda m: json.dumps({
+            "slug":   m.group(4),
+            "dc":     m.group(1),
+            "region": m.group(2),
+            # Only store "path" when non-default (/careers) — mirrors detect() behaviour
+            **({} if m.group(3).lower() == "career" else {"path": f"/{m.group(3)}"}),
+        }),
+    ))
+
     # SAP SuccessFactors — {company}.successfactors.com/careers
+    # Generic pattern: subdomain IS the company slug (not a datacenter ID).
     patterns.append((
         re.compile(
             r"([a-z0-9]+)\.successfactors\.com/careers",
@@ -284,23 +316,6 @@ def _make_patterns():
                 "tenant_id": t,
             }),
         ))
-
-    # SAP SuccessFactors — career{dc}.successfactors.{region}/career?company=...
-    # Also handles /careers path (SAP uses this)
-    patterns.append((
-        re.compile(
-            r"career(\d+)\.successfactors\.(com|eu)/(careers?)\?.*company=([^&\s]+)",
-            re.IGNORECASE,
-        ),
-        "successfactors",
-        lambda m: json.dumps({
-            "slug":   m.group(4),
-            "dc":     m.group(1),
-            "region": m.group(2),
-            # Only store "path" when non-default (/careers) — mirrors detect() behaviour
-            **({} if m.group(3).lower() == "career" else {"path": f"/{m.group(3)}"}),
-        }),
-    ))
 
     # ── Google Careers XML feed ──────────────────────────────────────────────────
     # google.com/about/careers/applications/jobs/feed.xml
