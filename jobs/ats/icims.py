@@ -24,6 +24,7 @@ import time
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
+from jobs.ats.base import alpha2_to_country_name
 
 HEADERS = {
     "User-Agent": (
@@ -448,13 +449,7 @@ def _extract_location_from_json_ld(json_ld):
         if country_code and country_code != "US":
             # Resolve alpha-2 → full name so is_us_location() can detect it.
             # e.g. "IN" → "India", "IE" → "Ireland", "DE" → "Germany"
-            try:
-                import pycountry
-                c = pycountry.countries.get(alpha_2=country_code)
-                country_display = getattr(c, "common_name", c.name) if c else country_code
-            except Exception:
-                country_display = country_code
-            parts.append(country_display)
+            parts.append(alpha2_to_country_name(country_code))
 
         return ", ".join(p for p in parts if p), country_code
     except Exception:

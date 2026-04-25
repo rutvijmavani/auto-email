@@ -358,3 +358,45 @@ def slugify(company):
 # Re-exported here so existing callers (`from jobs.ats.base import validate_company_match`)
 # continue to work without any changes.
 from jobs.ats.patterns import validate_company_match  # noqa: F401  (re-export)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared country-code utilities (used by any ATS module that needs ISO lookups)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def alpha3_to_alpha2(code: str) -> str:
+    """
+    Convert an ISO 3166-1 alpha-3 country code to alpha-2.
+
+    e.g.  "USA" → "US",  "CAN" → "CA",  "CZE" → "CZ"
+
+    Uses pycountry for full coverage (~250 countries + territories).
+    Returns "" if the code is unknown or pycountry is unavailable.
+    """
+    if not code:
+        return ""
+    try:
+        import pycountry
+        c = pycountry.countries.get(alpha_3=code.upper())
+        return c.alpha_2 if c else ""
+    except Exception:
+        return ""
+
+
+def alpha2_to_country_name(code: str) -> str:
+    """
+    Convert an ISO 3166-1 alpha-2 country code to a human-readable name.
+
+    e.g.  "US" → "United States",  "IN" → "India",  "IE" → "Ireland"
+
+    Prefers common_name (e.g. "South Korea" over "Korea, Republic of").
+    Returns the original code if the lookup fails or pycountry is unavailable.
+    """
+    if not code:
+        return ""
+    try:
+        import pycountry
+        c = pycountry.countries.get(alpha_2=code.upper())
+        return getattr(c, "common_name", c.name) if c else code
+    except Exception:
+        return code
