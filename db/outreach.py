@@ -8,14 +8,16 @@ from db.recruiters import mark_recruiter_inactive
 def schedule_outreach(recruiter_id, application_id, stage, scheduled_for):
     conn = get_conn()
     c = conn.cursor()
+    # RETURNING id replaces c.lastrowid (not available with psycopg2).
     c.execute("""
         INSERT INTO outreach (recruiter_id, application_id, stage, scheduled_for)
         VALUES (?, ?, ?, ?)
+        RETURNING id
     """, (recruiter_id, application_id, stage, scheduled_for))
+    row = c.fetchone()
     conn.commit()
-    oid = c.lastrowid
     conn.close()
-    return oid
+    return row["id"]
 
 
 def schedule_next_outreach(recruiter_id, application_id):
@@ -55,8 +57,9 @@ def schedule_next_outreach(recruiter_id, application_id):
     conn = get_conn()
     c = conn.cursor()
     try:
-        # Atomic check + insert — BEGIN IMMEDIATE prevents concurrent duplicates
-        c.execute("BEGIN IMMEDIATE")
+        # PostgreSQL uses standard transactions — BEGIN IMMEDIATE (SQLite-specific
+        # write-ahead lock) is not needed. Autocommit is off; the SELECT + INSERT
+        # below runs inside a single implicit transaction, which is sufficient.
         c.execute("""
             SELECT id FROM outreach
             WHERE recruiter_id = ? AND application_id = ?
@@ -71,11 +74,12 @@ def schedule_next_outreach(recruiter_id, application_id):
         c.execute("""
             INSERT INTO outreach (recruiter_id, application_id, stage, scheduled_for)
             VALUES (?, ?, ?, ?)
+            RETURNING id
         """, (recruiter_id, application_id, next_stage, scheduled_for))
-        oid = c.lastrowid
+        row = c.fetchone()
         conn.commit()
         print(f"   [INFO] Scheduled {next_stage} for {scheduled_for}")
-        return oid
+        return row["id"]
     finally:
         conn.close()
 
@@ -83,13 +87,14 @@ def schedule_next_outreach(recruiter_id, application_id):
 def get_pending_outreach():
     conn = get_conn()
     c = conn.cursor()
+    # CURRENT_DATE replaces DATE('now') (SQLite-specific).
     c.execute("""
         SELECT o.*, r.name, r.email, r.company, a.job_url, a.job_title
         FROM outreach o
         JOIN recruiters r ON r.id = o.recruiter_id
         JOIN applications a ON a.id = o.application_id
         WHERE o.status = 'pending'
-        AND o.scheduled_for <= DATE('now')
+        AND o.scheduled_for <= CURRENT_DATE
         AND o.replied = 0
         AND r.recruiter_status = 'active'
         ORDER BY o.scheduled_for ASC

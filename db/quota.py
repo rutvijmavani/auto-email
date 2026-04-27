@@ -68,7 +68,7 @@ def increment_quota_used(count=1):
     c.execute("""
         UPDATE careershift_quota
         SET used = used + ?,
-            remaining = MAX(0, remaining - ?)
+            remaining = GREATEST(0, remaining - ?)
         WHERE date = ?
     """, (count, count, today))
     conn.commit()

@@ -1,9 +1,9 @@
 # db/recruiters.py — Recruiter table helpers
 
-import sqlite3
 import json
 from datetime import datetime, timedelta
 
+import psycopg2.errors
 from db.connection import get_conn
 
 
@@ -24,15 +24,17 @@ def add_recruiter(company, name, position, email, confidence):
     conn = get_conn()
     c = conn.cursor()
     try:
+        # RETURNING id replaces c.lastrowid (not available with psycopg2).
         c.execute("""
             INSERT INTO recruiters (company, name, position, email, confidence, verified_at)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            RETURNING id
         """, (company, name, position, email, confidence))
+        row = c.fetchone()
         conn.commit()
-        return c.lastrowid
-    except sqlite3.IntegrityError as e:
-        if "UNIQUE constraint failed: recruiters.email" not in str(e):
-            raise
+        return row["id"]
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         c.execute("SELECT id FROM recruiters WHERE email = ?", (email,))
         row = c.fetchone()
         return row["id"] if row else None
@@ -65,9 +67,8 @@ def update_recruiter(recruiter_id, name=None, position=None,
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError as e:
-        if "UNIQUE constraint failed: recruiters.email" not in str(e):
-            raise
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         # Email conflict — retry without email field to preserve other updates
         retry_fields = [f for f in fields if f != "email = ?"]
         retry_values = [v for f, v in zip(fields, values[:-1]) if f != "email = ?"]
@@ -111,7 +112,7 @@ def get_recruiters_by_tier(days_tier1=30, days_tier2=60):
             tier3.append(r)
             continue
         try:
-            verified = datetime.fromisoformat(r["verified_at"])
+            verified = datetime.fromisoformat(str(r["verified_at"]))
             days_ago = (now - verified).days
             if days_ago < days_tier1:
                 tier1.append(r)
@@ -198,6 +199,7 @@ def update_company_last_scraped(company):
     """, (company,))
     conn.commit()
     conn.close()
+
 
 def get_existing_emails_for_company(company):
     """Return set of all emails already in DB for a company (any status)."""

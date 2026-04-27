@@ -1,5 +1,15 @@
 # Architecture
 
+## Related Documentation
+
+| Document | What it covers |
+|---|---|
+| [adaptive-polling-architecture.md](./adaptive-polling-architecture.md) | Complete design of the new continuous polling system — priority queue, adaptive intervals, Tier 1/2 guarantees, Redis integration, PostgreSQL schema, scaling properties. Start here for the new architecture. |
+| [ats-fetch-strategy.md](./ats-fetch-strategy.md) | Per-platform fetch strategy — which data is available at listing level vs detail level, how smart early exit works per ATS, the canonical `ATS_TIER1_CONFIG` reference. |
+| [job-monitoring.md](./job-monitoring.md) | Current job monitoring pipeline — ATS detection, job filtering, freshness detection, digest generation. |
+
+---
+
 ## Overview
 
 The Recruiter Outreach Pipeline is an automated system that finds recruiter contacts for companies you apply to and sends personalized cold outreach emails. It consists of three independently runnable stages that work together as a daily workflow.
@@ -35,6 +45,14 @@ AWS Athena queries against Common Crawl index (ats_discovery.db). Sends a daily
 digest email with ranked results. Also tracks URL presence per company — each day
 a tracked job URL is missing from the API response, its `consecutive_missing_days`
 counter increments.
+
+> **Planned evolution:** The current once-daily batch model is being replaced
+> with a continuous adaptive polling architecture that checks active companies
+> every 5–30 minutes and dormant companies every 6–24 hours. This reduces
+> detection delay from 24 hours to under 1 hour for active companies, and
+> reduces wasted fetches by ~99% (today: 146,497 fetches to find 157 new jobs).
+> See [adaptive-polling-architecture.md](./adaptive-polling-architecture.md)
+> for the full design.
 
 **`--verify-filled`** — Filled Position Cleanup
 Runs nightly after `--find-only` as part of the nightly chain. Picks up job postings that have been absent from the API for `VERIFY_FILLED_MISSING_DAYS` (3) or more consecutive days and verifies them via direct HTTP request:

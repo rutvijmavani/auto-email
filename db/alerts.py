@@ -129,7 +129,7 @@ def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
                 FROM careershift_quota
                 ORDER BY date DESC
                 LIMIT ?
-            )
+            ) sub
         """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
         row = c.fetchone()
         conn.close()
@@ -172,7 +172,7 @@ def save_coverage_stats(stats: dict):
     """
     Save daily pipeline performance metrics.
     Takes a dict — same pattern as save_monitor_stats().
-    Uses INSERT OR REPLACE to handle re-runs on same day.
+    Uses ON CONFLICT DO UPDATE to handle re-runs on the same day.
 
     Expected keys:
       total_applications, companies_attempted,
@@ -182,12 +182,21 @@ def save_coverage_stats(stats: dict):
     conn = get_conn()
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
+    # ON CONFLICT(date) DO UPDATE replaces INSERT OR REPLACE (SQLite).
     c.execute("""
-        INSERT OR REPLACE INTO coverage_stats (
+        INSERT INTO coverage_stats (
             date, total_applications, companies_attempted,
             auto_found, rejected_count, exhausted_count,
             metric1, metric2
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(date) DO UPDATE SET
+            total_applications  = EXCLUDED.total_applications,
+            companies_attempted = EXCLUDED.companies_attempted,
+            auto_found          = EXCLUDED.auto_found,
+            rejected_count      = EXCLUDED.rejected_count,
+            exhausted_count     = EXCLUDED.exhausted_count,
+            metric1             = EXCLUDED.metric1,
+            metric2             = EXCLUDED.metric2
     """, (
         today,
         stats.get("total_applications",  0),

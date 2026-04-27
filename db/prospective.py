@@ -38,10 +38,12 @@ def add_prospective_company(company, priority=0, domain=None):
     #   'unknown'→ detection ran, nothing found              (priority 3)
     # The schema DEFAULT 'unknown' is intentional only for pre-existing rows
     # that pre-date the column; fresh inserts must be NULL.
+    # ON CONFLICT(company) DO NOTHING replaces INSERT OR IGNORE (SQLite).
     c.execute("""
-        INSERT OR IGNORE INTO prospective_companies
+        INSERT INTO prospective_companies
             (company, priority, status, domain, ats_detected_at, ats_platform)
         VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, NULL)
+        ON CONFLICT(company) DO NOTHING
     """, (company, priority, domain))
     conn.commit()
     inserted = c.rowcount > 0
@@ -50,7 +52,7 @@ def add_prospective_company(company, priority=0, domain=None):
         c.execute("""
             UPDATE prospective_companies
             SET domain = ?
-            WHERE company = ? COLLATE NOCASE AND (domain IS NULL OR domain = '')
+            WHERE company = ? AND (domain IS NULL OR domain = '')
         """, (domain, company))
         conn.commit()
     conn.close()
@@ -110,7 +112,7 @@ def mark_prospective_scraped(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'scraped', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? COLLATE NOCASE AND status = 'pending'
+        WHERE company = ? AND status = 'pending'
     """, (company,))
     conn.commit()
     conn.close()
@@ -124,7 +126,7 @@ def mark_prospective_exhausted(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'exhausted', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? COLLATE NOCASE AND status = 'pending'
+        WHERE company = ? AND status = 'pending'
     """, (company,))
     conn.commit()
     conn.close()
@@ -141,7 +143,7 @@ def mark_prospective_converted(company):
     c.execute("""
         UPDATE prospective_companies
         SET status = 'converted', converted_at = CURRENT_TIMESTAMP
-        WHERE company = ? COLLATE NOCASE AND status IN ('pending', 'scraped')
+        WHERE company = ? AND status IN ('pending', 'scraped')
     """, (company,))
     conn.commit()
     conn.close()
@@ -158,7 +160,7 @@ def is_prospective(company):
     c = conn.cursor()
     c.execute("""
         SELECT id FROM prospective_companies
-        WHERE company = ? COLLATE NOCASE AND status = 'scraped'
+        WHERE company = ? AND status = 'scraped'
     """, (company,))
     row = c.fetchone()
     conn.close()
@@ -188,7 +190,7 @@ def get_prospective_company(company):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT * FROM prospective_companies WHERE company = ? COLLATE NOCASE
+        SELECT * FROM prospective_companies WHERE company = ?
     """, (company,))
     row = c.fetchone()
     conn.close()
@@ -202,7 +204,7 @@ def get_domain_for_prospective(company):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "SELECT domain FROM prospective_companies WHERE company = ? COLLATE NOCASE",
+        "SELECT domain FROM prospective_companies WHERE company = ?",
         (company,)
     )
     row = c.fetchone()

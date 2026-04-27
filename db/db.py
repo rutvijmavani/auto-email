@@ -132,6 +132,8 @@ from db.api_health import (
     get_health_summary,
     get_todays_stats,
     get_run_429_rate,
+    get_error_breakdown,
+    flush as flush_api_health,
 )
 
 # ─────────────────────────────────────────

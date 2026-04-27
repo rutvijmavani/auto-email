@@ -48,15 +48,17 @@ def create_alert(alert_type, severity, platform=None,
 
     conn = get_conn()
     try:
-        cursor = conn.execute("""
+        # RETURNING id replaces cursor.lastrowid (not available with psycopg2).
+        row = conn.execute("""
             INSERT INTO pipeline_alerts
                 (alert_type, severity, platform,
                  value, threshold, message)
             VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
         """, (alert_type, severity, platform,
-              value, threshold, message))
+              value, threshold, message)).fetchone()
         conn.commit()
-        return cursor.lastrowid
+        return row["id"] if row else None
     finally:
         conn.close()
 
@@ -67,9 +69,6 @@ def has_recent_alert(alert_type, platform=None, hours=None):
     Prevents duplicate alert records within dedup window.
     Checks ALL rows regardless of notified flag — a pending unnotified
     alert should still prevent a duplicate from being inserted.
-
-    Uses strftime('%Y-%m-%d %H:%M:%S') to match SQLite CURRENT_TIMESTAMP
-    format — isoformat() produces a 'T' separator that breaks string comparison.
     """
     hours  = hours or ALERT_DEDUP_HOURS
     cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")

@@ -5,7 +5,7 @@
 # Powers --monitor-status health table and alert emails.
 #
 # Thread safety: record_request() uses a background writer thread
-# with a Queue to avoid SQLite lock contention during parallel
+# with a Queue to avoid lock contention during parallel
 # --monitor-jobs runs. All query functions are unchanged.
 
 import logging
@@ -76,16 +76,24 @@ def _get_write_queue():
 
 def _writer_loop(q):
     """
-    Background thread: drains write queue and commits to SQLite.
+    Background thread: drains write queue and commits to PostgreSQL.
     Batches up to 50 records per commit to reduce write frequency.
     Runs until sentinel None is received.
     Any unhandled exception is stored in _writer_error so flush() can log it.
+
+    known_pairs: set of (date, platform) tuples whose api_health row is
+    confirmed to already exist. Skipping the INSERT for known pairs prevents
+    the BIGSERIAL sequence from burning an ID on every ON CONFLICT DO NOTHING
+    no-op — which was causing large ID gaps (e.g. 1, 139, 326, ...) when
+    a busy platform made thousands of requests per day. The set resets on
+    process restart (once per day at 7 AM cycle start — acceptable).
     """
     global _writer_error
     BATCH_SIZE    = 50
     DRAIN_TIMEOUT = 0.05   # seconds to wait for more items before committing
 
-    pending = []
+    pending     = []
+    known_pairs: set = set()   # (date, platform) rows confirmed in DB
 
     try:
         while True:
@@ -94,14 +102,14 @@ def _writer_loop(q):
                 item = q.get(timeout=1.0)
             except queue.Empty:
                 if pending:
-                    _flush_batch(pending)
+                    _flush_batch(pending, known_pairs)
                     pending = []
                 continue
 
             if item is None:   # sentinel — shutdown
                 q.task_done()
                 if pending:
-                    _flush_batch(pending)
+                    _flush_batch(pending, known_pairs)
                 break
 
             pending.append(item)
@@ -114,7 +122,7 @@ def _writer_loop(q):
                     if item is None:
                         q.task_done()
                         if pending:
-                            _flush_batch(pending)
+                            _flush_batch(pending, known_pairs)
                         return
                     pending.append(item)
                     q.task_done()
@@ -122,7 +130,7 @@ def _writer_loop(q):
                     break
 
             if pending:
-                _flush_batch(pending)
+                _flush_batch(pending, known_pairs)
                 pending = []
     except Exception as exc:
         _writer_error = exc
@@ -130,15 +138,16 @@ def _writer_loop(q):
                      exc, exc_info=True)
 
 
-def _flush_batch(records):
+def _flush_batch(records, known_pairs: set):
     """
-    Write a batch of api_health records to SQLite.
+    Write a batch of api_health records to PostgreSQL.
     One connection, one commit for the whole batch.
+    known_pairs is updated in-place as new rows are created.
     """
     conn = get_conn()
     try:
         for rec in records:
-            _write_one(conn, rec)
+            _write_one(conn, rec, known_pairs)
         conn.commit()
     except Exception as e:
         logger.error("api_health: batch write failed (%d records): %s",
@@ -151,10 +160,15 @@ def _flush_batch(records):
         conn.close()
 
 
-def _write_one(conn, rec):
+def _write_one(conn, rec, known_pairs: set):
     """
     Write one api_health record to an open connection.
     Called inside _flush_batch() — no commit here.
+
+    known_pairs is a set of (date, platform) tuples maintained by the
+    writer thread. If the pair is not yet known, we INSERT the row and
+    add it to the set. If already known, we skip the INSERT entirely —
+    avoiding the BIGSERIAL sequence burn that caused large ID gaps.
     """
     today        = rec["date"]
     platform     = rec["platform"]
@@ -171,23 +185,44 @@ def _write_one(conn, rec):
     else:
         ok_inc, e429_inc, e404_inc, err_inc = 0, 0, 0, 1
 
-    conn.execute("""
-        INSERT INTO api_health (date, platform)
-        VALUES (?, ?)
-        ON CONFLICT(date, platform) DO NOTHING
-    """, (today, platform))
+    # Error sub-type breakdown (Fix 1 — adaptive polling architecture)
+    timeout_inc = 1 if rec.get("error_type") == "requests_timeout"  else 0
+    conn_inc    = 1 if rec.get("error_type") == "requests_conn_err" else 0
+    e5xx_inc    = 1 if rec.get("error_type") == "requests_5xx"      else 0
+    other_inc   = 1 if rec.get("error_type") == "requests_other_err" else 0
 
+    pair = (today, platform)
+    if pair not in known_pairs:
+        # First time this (date, platform) is seen in this process — create
+        # the row if it doesn't exist yet. ON CONFLICT DO NOTHING handles the
+        # case where the row was created by a previous process (e.g. yesterday's
+        # run left the row open, or a parallel worker beat us to it).
+        conn.execute("""
+            INSERT INTO api_health (date, platform)
+            VALUES (?, ?)
+            ON CONFLICT(date, platform) DO NOTHING
+        """, pair)
+        known_pairs.add(pair)
+    # If pair already in known_pairs: row is confirmed to exist — skip INSERT,
+    # no sequence increment, IDs stay clean.
+
+    # GREATEST() replaces MAX() in UPDATE context (MAX() does not work as a
+    # two-argument comparison function in PostgreSQL UPDATE statements).
     conn.execute("""
         UPDATE api_health SET
-            requests_made   = requests_made   + 1,
-            requests_ok     = requests_ok     + ?,
-            requests_429    = requests_429    + ?,
-            requests_404    = requests_404    + ?,
-            requests_error  = requests_error  + ?,
-            total_ms        = total_ms        + ?,
-            max_response_ms = MAX(max_response_ms, ?),
-            backoff_total_s = backoff_total_s + ?,
-            first_429_at    = CASE
+            requests_made        = requests_made        + 1,
+            requests_ok          = requests_ok          + ?,
+            requests_429         = requests_429         + ?,
+            requests_404         = requests_404         + ?,
+            requests_error       = requests_error       + ?,
+            requests_timeout     = requests_timeout     + ?,
+            requests_conn_err    = requests_conn_err    + ?,
+            requests_5xx         = requests_5xx         + ?,
+            requests_other_err   = requests_other_err   + ?,
+            total_ms             = total_ms             + ?,
+            max_response_ms      = GREATEST(max_response_ms, ?),
+            backoff_total_s      = backoff_total_s      + ?,
+            first_429_at         = CASE
                 WHEN ? = 1 AND first_429_at IS NULL
                 THEN CURRENT_TIMESTAMP
                 ELSE first_429_at
@@ -195,6 +230,7 @@ def _write_one(conn, rec):
         WHERE date = ? AND platform = ?
     """, (
         ok_inc, e429_inc, e404_inc, err_inc,
+        timeout_inc, conn_inc, e5xx_inc, other_inc,
         response_ms, response_ms,
         backoff_s,
         e429_inc,
@@ -216,7 +252,8 @@ def _write_one(conn, rec):
 # RECORD REQUESTS (public API — unchanged signature)
 # ─────────────────────────────────────────
 
-def record_request(platform, status_code, response_ms, backoff_s=0):
+def record_request(platform, status_code, response_ms, backoff_s=0,
+                   error_type=None):
     """
     Record one API request in api_health.
     Non-blocking — enqueues to background writer thread.
@@ -227,6 +264,8 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
         status_code:  HTTP status code (0 for non-HTTP errors)
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit
+        error_type:   one of requests_timeout | requests_conn_err |
+                      requests_5xx | requests_other_err  (None = not an error)
     """
     # Hold _queue_lock for the entire check-and-enqueue so it is atomic
     # with flush().  Without the lock, flush() could run between the _closed
@@ -245,11 +284,12 @@ def record_request(platform, status_code, response_ms, backoff_s=0):
             "status_code": status_code,
             "response_ms": response_ms,
             "backoff_s":   backoff_s,
+            "error_type":  error_type,
         })
 
 
 # ─────────────────────────────────────────
-# QUERY FUNCTIONS (all unchanged)
+# QUERY FUNCTIONS
 # ─────────────────────────────────────────
 
 def get_platform_stats(platform, for_date=None):
@@ -349,9 +389,35 @@ def get_run_429_rate(platform):
     finally:
         conn.close()
 
+
+def get_error_breakdown(platform, for_date=None):
+    """
+    Return per-error-type counts for a platform on a given date.
+    Used by --monitor-status to show detailed failure reasons.
+    """
+    for_date = for_date or date.today().isoformat()
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT
+                requests_timeout,
+                requests_conn_err,
+                requests_5xx,
+                requests_other_err
+            FROM api_health
+            WHERE date = ? AND platform = ?
+        """, (for_date, platform)).fetchone()
+        return dict(row) if row else {
+            "requests_timeout": 0, "requests_conn_err": 0,
+            "requests_5xx": 0,    "requests_other_err": 0,
+        }
+    finally:
+        conn.close()
+
+
 def flush():
     """
-    Block until all pending api_health writes are committed to SQLite.
+    Block until all pending api_health writes are committed to PostgreSQL.
     Call once at process exit to ensure no records are lost.
 
     Uses sentinel + thread join rather than q.join() because task_done()
