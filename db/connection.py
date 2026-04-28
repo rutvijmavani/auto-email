@@ -24,6 +24,9 @@ import threading
 import psycopg2
 import psycopg2.extras
 import psycopg2.pool
+from dotenv import load_dotenv
+
+load_dotenv()   # no-op if env vars already set; loads .env on first import
 
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
