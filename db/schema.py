@@ -245,6 +245,19 @@ def init_db():
     conn = get_conn()
     c = conn.cursor()
 
+    # ── Serialize concurrent DDL ──────────────────────────────────────────────
+    # Worker processes are spawned via multiprocessing.Process and all call
+    # init_db() at startup.  CREATE OR REPLACE FUNCTION / CREATE EXTENSION
+    # lock PostgreSQL system catalog rows; concurrent calls race on those locks
+    # producing "tuple concurrently updated".
+    #
+    # pg_advisory_xact_lock(N) is transaction-scoped: it auto-releases when
+    # this transaction commits (conn.commit() at the end of this function), so
+    # there is no risk of leaving a stale lock.  Workers queue up here and each
+    # run the DDL in turn — idempotent statements (IF NOT EXISTS / OR REPLACE)
+    # make the repeated executions harmless.
+    c.execute("SELECT pg_advisory_xact_lock(7387641)")   # arbitrary unique int
+
     # ── Extensions ────────────────────────────────────────────────────────────
     # citext: case-insensitive TEXT type (replaces COLLATE NOCASE)
     c.execute("CREATE EXTENSION IF NOT EXISTS citext")
