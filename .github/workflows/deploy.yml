@@ -82,7 +82,7 @@ jobs:
             import sys
             sys.path.insert(0, '.')
             from dotenv import load_dotenv
-            load_dotenv()
+            load_dotenv('.env')   # explicit path — find_dotenv() fails on stdin
             from db.connection import get_conn
             conn = get_conn()
             row = conn.execute("SELECT COUNT(*) AS cnt FROM prospective_companies").fetchone()

@@ -132,6 +132,29 @@ echo "[OK]  Database '$PG_DB' and user '$PG_USER' ready"
 echo ""
 
 # ─────────────────────────────────────────
+# 2b. Switch pg_hba.conf from ident → md5
+# ─────────────────────────────────────────
+# Oracle Linux / RHEL default pg_hba.conf uses 'ident' auth for TCP connections,
+# which checks the OS user name — not the DB password. pipeline_user has no OS
+# account so every psycopg2 connection gets "FATAL: Ident authentication failed".
+# Switch to md5 (password-based) for all localhost connections.
+
+PG_HBA="/var/lib/pgsql/data/pg_hba.conf"
+if [ -f "$PG_HBA" ]; then
+    sudo sed -i \
+        -e 's/^host[[:space:]]\+all[[:space:]]\+all[[:space:]]\+127\.0\.0\.1\/32[[:space:]]\+ident/host    all             all             127.0.0.1\/32            md5/' \
+        -e 's/^host[[:space:]]\+all[[:space:]]\+all[[:space:]]\+::1\/128[[:space:]]\+ident/host    all             all             ::1\/128                 md5/' \
+        "$PG_HBA"
+    sudo systemctl reload "$PG_SERVICE"
+    echo "[OK]  pg_hba.conf: ident → md5 for localhost connections"
+else
+    echo "[WARN] pg_hba.conf not found at $PG_HBA — skipping auth fix"
+    echo "       If psycopg2 gets 'Ident authentication failed', manually change"
+    echo "       'ident' to 'md5' in pg_hba.conf and reload PostgreSQL."
+fi
+echo ""
+
+# ─────────────────────────────────────────
 # 3. Update .env with DATABASE_URL
 # ─────────────────────────────────────────
 echo "[3/6] Updating .env with DATABASE_URL..."
