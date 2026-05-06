@@ -96,18 +96,25 @@ def flag_diagnostic(company, step, severity, pattern_hint=None,
     if raw_str and len(raw_str) > max_len:
         raw_str = raw_str[:max_len] + f"\n... [truncated at {max_len} chars]"
 
-    conn = None 
+    conn = None
     try:
         conn = get_conn()
+        # ON CONFLICT DO NOTHING replaces INSERT OR IGNORE (SQLite).
+        # The partial unique index on (company, step, COALESCE(pattern_hint,''))
+        # WHERE resolved=0 is defined in db/schema.py and backs this constraint.
+        # RETURNING id replaces cursor.lastrowid (not available on psycopg2).
         cursor = conn.execute("""
-            INSERT OR IGNORE INTO custom_ats_diagnostics
+            INSERT INTO custom_ats_diagnostics
               (company, step, severity, pattern_hint, raw_response, notes)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING id
         """, (company, step, severity, pattern_hint, raw_str, notes))
+        row = cursor.fetchone()
         conn.commit()
-        if cursor.rowcount == 0:
+        if row is None:
             return None
-        return cursor.lastrowid
+        return row["id"]
     except Exception as e:
         # Never let diagnostics crash the main pipeline
         import logging
@@ -131,23 +138,24 @@ def has_open_diagnostic(company, step=None, pattern_hint=None):
     conn = None
     try:
         conn = get_conn()
+        # ILIKE replaces COLLATE NOCASE (SQLite) for case-insensitive comparison.
         if step and pattern_hint:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? COLLATE NOCASE AND step = ?
-                  AND pattern_hint = ? AND resolved = 0
+                WHERE company ILIKE %s AND step = %s
+                  AND pattern_hint = %s AND resolved = 0
                 LIMIT 1
             """, (company, step, pattern_hint)).fetchone()
         elif step:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? COLLATE NOCASE AND step = ? AND resolved = 0
+                WHERE company ILIKE %s AND step = %s AND resolved = 0
                 LIMIT 1
             """, (company, step)).fetchone()
         else:
             row = conn.execute("""
                 SELECT id FROM custom_ats_diagnostics
-                WHERE company = ? COLLATE NOCASE AND resolved = 0
+                WHERE company ILIKE %s AND resolved = 0
                 LIMIT 1
             """, (company,)).fetchone()
         return row is not None
@@ -165,7 +173,7 @@ def flag_diagnostic_once(company, step, severity, pattern_hint=None,
     company+step+pattern_hint combination.
     Prevents flooding the table on repeated daily runs.
 
-    Race-safe: flag_diagnostic uses INSERT OR IGNORE backed by a partial
+    Race-safe: flag_diagnostic uses ON CONFLICT DO NOTHING backed by a partial
     unique index on (company, step, COALESCE(pattern_hint, '')) WHERE resolved=0,
     so concurrent calls cannot produce duplicate rows.
 
@@ -196,10 +204,10 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
         params     = []
 
         if company:
-            conditions.append("company = ?")
+            conditions.append("company ILIKE %s")
             params.append(company)
         if severity:
-            conditions.append("severity = ?")
+            conditions.append("severity = %s")
             params.append(severity)
 
         where = " AND ".join(conditions)
@@ -216,7 +224,7 @@ def get_open_diagnostics(company=None, severity=None, limit=50):
                     ELSE 4
                 END,
                 created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, params + [limit]).fetchall()
         return [dict(r) for r in rows]
     except Exception:
@@ -268,7 +276,7 @@ def get_raw_curl_for_company(company):
         row  = conn.execute("""
             SELECT listing_curl_raw, detail_curl_raw
             FROM prospective_companies
-            WHERE company = ? COLLATE NOCASE
+            WHERE company ILIKE %s
         """, (company,)).fetchone()
         return dict(row) if row else {}
     except Exception:
@@ -287,13 +295,14 @@ def resolve_diagnostic(diagnostic_id):
     conn = None
     try:
         conn = get_conn()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE custom_ats_diagnostics
-            SET resolved = 1, resolved_at = DATETIME('now')
-            WHERE id = ? AND resolved = 0
+            SET resolved = 1, resolved_at = NOW()
+            WHERE id = %s AND resolved = 0
         """, (diagnostic_id,))
         conn.commit()
-        return conn.execute("SELECT changes()").fetchone()[0] > 0
+        # cursor.rowcount replaces SELECT changes() (SQLite-specific).
+        return cursor.rowcount > 0
     except Exception:
         return False
     finally:
@@ -306,14 +315,13 @@ def resolve_all_for_company(company):
     conn = None
     try:
         conn = get_conn()
-        conn.execute("""
+        cursor = conn.execute("""
             UPDATE custom_ats_diagnostics
-            SET resolved = 1, resolved_at = DATETIME('now')
-            WHERE company = ? COLLATE NOCASE AND resolved = 0
+            SET resolved = 1, resolved_at = NOW()
+            WHERE company ILIKE %s AND resolved = 0
         """, (company,))
         conn.commit()
-        count = conn.execute("SELECT changes()").fetchone()[0]
-        return count
+        return cursor.rowcount
     except Exception:
         return 0
     finally:

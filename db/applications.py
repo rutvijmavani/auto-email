@@ -1,8 +1,8 @@
 # db/applications.py — Application table helpers
 
-import sqlite3
 from datetime import datetime
 
+import psycopg2.errors
 from db.connection import get_conn
 
 
@@ -18,18 +18,20 @@ def add_application(company, job_url, job_title=None, applied_date=None,
     c = conn.cursor()
     status = status_override or "active"
     try:
+        # RETURNING id replaces c.lastrowid (not available with psycopg2).
         c.execute("""
             INSERT INTO applications (company, job_url, job_title, applied_date,
                                       expected_domain, status)
             VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
         """, (company, job_url, job_title,
               applied_date or datetime.now().strftime("%Y-%m-%d"),
               expected_domain, status))
+        row = c.fetchone()
         conn.commit()
-        return c.lastrowid, True
-    except sqlite3.IntegrityError as e:
-        if "UNIQUE constraint failed: applications.job_url" not in str(e):
-            raise
+        return row["id"], True
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
         c.execute("SELECT id, expected_domain FROM applications WHERE job_url = ?",
                   (job_url,))
         row = c.fetchone()
@@ -124,14 +126,11 @@ def convert_prospective_to_active(company, real_job_url, job_title=None,
     Prospective → active conversion now handled directly in pipeline.py
     via add_application() + link_top_recruiters_for_company().
     Kept for backward compatibility only.
-    """
 
-    """
     Convert a prospective placeholder application to active when user applies.
     Updates the placeholder URL to the real job URL and marks status active.
     Returns app_id if converted, None if no prospective found or URL conflict.
     """
-    
     conn = get_conn()
     c = conn.cursor()
     company = company.strip()
@@ -145,19 +144,20 @@ def convert_prospective_to_active(company, real_job_url, job_title=None,
         conn.close()
         return None
     try:
+        # CURRENT_DATE replaces DATE('now') (SQLite-specific).
         c.execute("""
             UPDATE applications
             SET job_url = ?,
                 job_title = COALESCE(?, job_title),
                 expected_domain = COALESCE(?, expected_domain),
                 status = 'active',
-                applied_date = DATE('now')
+                applied_date = CURRENT_DATE
             WHERE id = ?
         """, (real_job_url, job_title, expected_domain, row["id"]))
         conn.commit()
         app_id = row["id"]
         return app_id
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
         # real_job_url already exists in applications table
         conn.rollback()
         print(f"   [WARNING] Job URL already exists: {real_job_url}")
@@ -205,10 +205,6 @@ def get_existing_domain_for_company(company):
     return None
 
 
-# ─────────────────────────────────────────
-# ADD to db/applications.py
-# ─────────────────────────────────────────
-
 def get_applications_by_date(date: str) -> list:
     """
     Return all applications with applied_date = date.
@@ -227,4 +223,3 @@ def get_applications_by_date(date: str) -> list:
         return [dict(r) for r in rows]
     finally:
         conn.close()
- 

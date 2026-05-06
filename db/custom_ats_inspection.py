@@ -75,6 +75,8 @@ def save_inspection(company, listing_url, fmt, array_path,
                 return v
             return json.dumps(v, ensure_ascii=False, default=str)
 
+        # field_map_override is intentionally NOT listed in DO UPDATE SET —
+        # manual overrides persist across runs until explicitly cleared.
         conn.execute("""
             INSERT INTO custom_ats_inspection
                 (company, listing_url, format, array_path,
@@ -84,21 +86,19 @@ def save_inspection(company, listing_url, fmt, array_path,
                  last_updated)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(company) DO UPDATE SET
-                listing_url        = excluded.listing_url,
-                format             = excluded.format,
-                array_path         = excluded.array_path,
-                total_jobs         = excluded.total_jobs,
-                total_field        = excluded.total_field,
-                all_numeric_fields = excluded.all_numeric_fields,
-                page_size          = excluded.page_size,
-                pagination         = excluded.pagination,
-                session_strategy   = excluded.session_strategy,
-                first_job_raw      = excluded.first_job_raw,
-                field_map          = excluded.field_map,
-                sample_normalized  = excluded.sample_normalized,
-                last_updated       = excluded.last_updated
-                -- field_map_override intentionally NOT updated
-                -- manual overrides persist across runs
+                listing_url        = EXCLUDED.listing_url,
+                format             = EXCLUDED.format,
+                array_path         = EXCLUDED.array_path,
+                total_jobs         = EXCLUDED.total_jobs,
+                total_field        = EXCLUDED.total_field,
+                all_numeric_fields = EXCLUDED.all_numeric_fields,
+                page_size          = EXCLUDED.page_size,
+                pagination         = EXCLUDED.pagination,
+                session_strategy   = EXCLUDED.session_strategy,
+                first_job_raw      = EXCLUDED.first_job_raw,
+                field_map          = EXCLUDED.field_map,
+                sample_normalized  = EXCLUDED.sample_normalized,
+                last_updated       = EXCLUDED.last_updated
         """, (
             company,
             listing_url,
@@ -222,14 +222,14 @@ def set_field_map_override(company, field_map):
     conn = None
     try:
         conn = get_conn()
-        conn.execute("""
+        # cursor.rowcount replaces SELECT changes() (SQLite-specific).
+        cursor = conn.execute("""
             UPDATE custom_ats_inspection
             SET field_map_override = ?
             WHERE company = ?
         """, (json.dumps(field_map), company))
         conn.commit()
-        affected = conn.execute("SELECT changes()").fetchone()[0]
-        if affected == 0:
+        if cursor.rowcount == 0:
             import logging
             logging.getLogger(__name__).warning(
                 "custom_ats_inspection: no row found for %r — "

@@ -17,7 +17,7 @@ def get_ai_cache(cache_key):
     c = conn.cursor()
     c.execute("""
         SELECT * FROM ai_cache
-        WHERE cache_key = ?
+        WHERE cache_key = %s
         AND expires_at > CURRENT_TIMESTAMP
     """, (cache_key,))
     row = c.fetchone()
@@ -39,21 +39,22 @@ def save_ai_cache(cache_key, company, job_title, data, ttl_days=21):
     conn = get_conn()
     c = conn.cursor()
     expires_at = (datetime.now() + timedelta(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
+    # ON CONFLICT(cache_key) DO UPDATE replaces INSERT OR REPLACE (SQLite).
     c.execute("""
         INSERT INTO ai_cache (
             cache_key, company, job_title,
             subject_initial, subject_followup1, subject_followup2,
             intro, followup1, followup2,
             expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT(cache_key) DO UPDATE SET
-            subject_initial   = excluded.subject_initial,
-            subject_followup1 = excluded.subject_followup1,
-            subject_followup2 = excluded.subject_followup2,
-            intro             = excluded.intro,
-            followup1         = excluded.followup1,
-            followup2         = excluded.followup2,
-            expires_at        = excluded.expires_at,
+            subject_initial   = EXCLUDED.subject_initial,
+            subject_followup1 = EXCLUDED.subject_followup1,
+            subject_followup2 = EXCLUDED.subject_followup2,
+            intro             = EXCLUDED.intro,
+            followup1         = EXCLUDED.followup1,
+            followup2         = EXCLUDED.followup2,
+            expires_at        = EXCLUDED.expires_at,
             created_at        = CURRENT_TIMESTAMP
     """, (
         cache_key, company, job_title,
@@ -104,9 +105,16 @@ def save_job(url, content):
     conn = get_conn()
     c = conn.cursor()
     compressed = zlib.compress(content.encode())
+    # ON CONFLICT(url_hash) DO UPDATE replaces INSERT OR REPLACE (SQLite).
+    # content is stored as BYTEA in PostgreSQL — psycopg2 handles bytes→bytea
+    # automatically when the column type is bytea.
     c.execute("""
-        INSERT OR REPLACE INTO jobs (url_hash, job_url, content, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO jobs (url_hash, job_url, content, created_at)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT(url_hash) DO UPDATE SET
+            job_url    = EXCLUDED.job_url,
+            content    = EXCLUDED.content,
+            created_at = EXCLUDED.created_at
     """, (_hash_url(url), url, compressed, int(time.time())))
     conn.commit()
     conn.close()
@@ -119,7 +127,7 @@ def get_job(url):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT content, created_at FROM jobs WHERE url_hash = ?
+        SELECT content, created_at FROM jobs WHERE url_hash = %s
     """, (_hash_url(url),))
     row = c.fetchone()
     conn.close()
@@ -134,7 +142,9 @@ def get_job(url):
         return None
 
     try:
-        return zlib.decompress(content).decode("utf-8")
+        # psycopg2 returns bytea columns as memoryview — convert to bytes first.
+        raw = bytes(content) if isinstance(content, memoryview) else content
+        return zlib.decompress(raw).decode("utf-8")
     except (zlib.error, UnicodeDecodeError):
         delete_job(url)
         return None
@@ -143,7 +153,7 @@ def get_job(url):
 def delete_job(url):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("DELETE FROM jobs WHERE url_hash = ?", (_hash_url(url),))
+    c.execute("DELETE FROM jobs WHERE url_hash = %s", (_hash_url(url),))
     conn.commit()
     conn.close()
 

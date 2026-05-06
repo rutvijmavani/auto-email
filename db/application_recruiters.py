@@ -19,9 +19,11 @@ def link_recruiter_to_application(application_id, recruiter_id):
         """, (application_id,))
         if c.fetchone()["cnt"] >= MAX_RECRUITERS_PER_APPLICATION:
             return False  # cap reached — silent skip
+        # ON CONFLICT DO NOTHING replaces INSERT OR IGNORE (SQLite).
         c.execute("""
-            INSERT OR IGNORE INTO application_recruiters (application_id, recruiter_id)
+            INSERT INTO application_recruiters (application_id, recruiter_id)
             VALUES (?, ?)
+            ON CONFLICT DO NOTHING
         """, (application_id, recruiter_id))
         conn.commit()
         return True

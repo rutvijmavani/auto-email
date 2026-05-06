@@ -14,6 +14,7 @@
 # Workday, Oracle HCM, iCIMS, SuccessFactors → caught here.
 
 import re
+import json
 import requests
 from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
@@ -371,6 +372,34 @@ def _scan_html(html, company):
         if m:
             r = match_ats_pattern(m.group(0))
             if r and _slug_ok(r, company):
+                return r
+
+    # ── SuccessFactors j2w.init() fingerprint ─────────────────────────────
+    # Companies hosting careers on their own domain (e.g. careers.aflac.com)
+    # embed a j2w.init({...}) block with ssoCompanyId (slug) and ssoUrl
+    # (datacenter URL).  This fires when no SF-hosted URL appears in the page.
+    #
+    # path is intentionally omitted — fetch_jobs() self-heals by trying both
+    # /career and /careers automatically.
+    if "ssocompanyid" in html.lower() or "j2w.init" in html.lower():
+        m_slug = re.search(
+            r'["\']ssoCompanyId["\']\s*:\s*["\']([^"\']+)["\']',
+            html,
+            re.IGNORECASE,
+        )
+        m_url = re.search(
+            r'["\']ssoUrl["\']\s*:\s*["\']https?://career(\d+)\.successfactors\.(com|eu)["\']',
+            html,
+            re.IGNORECASE,
+        )
+        if m_slug and m_url:
+            slug_info = {
+                "slug":   m_slug.group(1),
+                "dc":     m_url.group(1),
+                "region": m_url.group(2),
+            }
+            r = {"platform": "successfactors", "slug": json.dumps(slug_info)}
+            if _slug_ok(r, company):
                 return r
 
     return None

@@ -46,10 +46,12 @@ def increment_serper_credits(count=1):
     conn = get_conn()
     try:
         # Ensure row exists
+        # ON CONFLICT(id) DO NOTHING replaces INSERT OR IGNORE (SQLite).
         conn.execute("""
-            INSERT OR IGNORE INTO serper_quota
+            INSERT INTO serper_quota
                 (id, credits_used, credits_limit)
             VALUES (1, 0, ?)
+            ON CONFLICT(id) DO NOTHING
         """, (SERPER_TOTAL_LIMIT,))
 
         conn.execute("""

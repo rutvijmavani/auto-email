@@ -5,7 +5,7 @@ Key change: get_monitorable_companies() now includes custom platform
 companies when they have a valid ats_slug (curl has been captured).
 """
 
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
 
@@ -91,11 +91,14 @@ def save_job_posting(job, status="new"):
         if isinstance(posted_at, datetime):
             posted_at = posted_at.isoformat()
 
-        conn.execute("""
-            INSERT OR IGNORE INTO job_postings
+        # ON CONFLICT DO NOTHING replaces INSERT OR IGNORE (SQLite).
+        # cursor.rowcount replaces SELECT changes() (SQLite-specific).
+        cursor = conn.execute("""
+            INSERT INTO job_postings
               (company, title, job_url, content_hash, location,
                posted_at, description, skill_score, status, first_seen)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
         """, (
             job.get("company", ""),
             job.get("title", ""),
@@ -109,8 +112,7 @@ def save_job_posting(job, status="new"):
             today,
         ))
         conn.commit()
-        inserted = conn.execute("SELECT changes()").fetchone()[0]
-        return inserted > 0
+        return cursor.rowcount > 0
     finally:
         conn.close()
 
@@ -241,6 +243,9 @@ def get_monitorable_companies():
     """
     conn = get_conn()
     try:
+        # json_valid() / json_extract() are SQLite-specific.
+        # PostgreSQL: cast ats_slug::json->>'url' to extract the url field.
+        # The cast is safe because the app always writes valid JSON to ats_slug.
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
@@ -254,12 +259,9 @@ def get_monitorable_companies():
                   ats_platform != 'custom'
                   OR
                   -- Custom: only include when slug has captured URL.
-                  -- json_valid guard prevents "malformed JSON" error on
-                  -- plain-string slugs with SQLite 3.38.0+.
                   (ats_platform = 'custom'
-                   AND json_valid(ats_slug)
-                   AND json_extract(ats_slug, '$.url') IS NOT NULL
-                   AND json_extract(ats_slug, '$.url') <> '')
+                   AND (ats_slug::json->>'url') IS NOT NULL
+                   AND (ats_slug::json->>'url') <> '')
               )
             ORDER BY company ASC
         """).fetchall()
@@ -283,6 +285,7 @@ def get_detection_queue(batch_size=10):
     """
     conn = get_conn()
     try:
+        # json_valid() / json_extract() replaced with PostgreSQL equivalents.
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, consecutive_empty_days,
@@ -292,9 +295,9 @@ def get_detection_queue(batch_size=10):
                      WHEN consecutive_empty_days >= 14 THEN 2
                      WHEN ats_platform = 'unknown' THEN 3
                      WHEN ats_platform = 'custom'
-                          AND (NOT json_valid(ats_slug)
-                               OR json_extract(ats_slug, '$.url') IS NULL
-                               OR json_extract(ats_slug, '$.url') = '')
+                          AND (ats_slug IS NULL
+                               OR (ats_slug::json->>'url') IS NULL
+                               OR (ats_slug::json->>'url') = '')
                           THEN 4
                      ELSE 99
                    END AS priority
@@ -305,9 +308,8 @@ def get_detection_queue(batch_size=10):
                 OR ats_platform = 'unknown'
                 OR (ats_platform = 'custom'
                     AND (ats_slug IS NULL
-                         OR NOT json_valid(ats_slug)
-                         OR json_extract(ats_slug, '$.url') IS NULL
-                         OR json_extract(ats_slug, '$.url') = ''))
+                         OR (ats_slug::json->>'url') IS NULL
+                         OR (ats_slug::json->>'url') = ''))
             )
             ORDER BY
                 priority ASC,
@@ -343,9 +345,8 @@ def get_detection_queue_stats():
                         WHEN ats_platform = 'unknown' THEN 3
                         WHEN ats_platform = 'custom'
                              AND (ats_slug IS NULL
-                             OR NOT json_valid(ats_slug)
-                             OR json_extract(ats_slug, '$.url') IS NULL
-                             OR json_extract(ats_slug, '$.url') = '')
+                             OR (ats_slug::json->>'url') IS NULL
+                             OR (ats_slug::json->>'url') = '')
                              THEN 4
                         ELSE 99
                     END AS priority
@@ -356,9 +357,8 @@ def get_detection_queue_stats():
                     OR ats_platform = 'unknown'
                     OR (ats_platform = 'custom'
                         AND (ats_slug IS NULL
-                             OR NOT json_valid(ats_slug)
-                             OR json_extract(ats_slug, '$.url') IS NULL
-                             OR json_extract(ats_slug, '$.url') = ''))
+                             OR (ats_slug::json->>'url') IS NULL
+                             OR (ats_slug::json->>'url') = ''))
                 )
             ) sub
             WHERE priority < 99
@@ -373,14 +373,26 @@ def save_monitor_stats(stats):
     conn = get_conn()
     try:
         today = datetime.now().strftime("%Y-%m-%d")
+        # ON CONFLICT(date) DO UPDATE replaces INSERT OR REPLACE (SQLite).
         conn.execute("""
-            INSERT OR REPLACE INTO monitor_stats
+            INSERT INTO monitor_stats
               (date, companies_monitored, companies_with_results,
                companies_unknown_ats, api_failures,
                total_jobs_fetched, new_jobs_found,
                jobs_matched_filters, run_duration_seconds,
                pdf_generated, email_sent)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                companies_monitored    = EXCLUDED.companies_monitored,
+                companies_with_results = EXCLUDED.companies_with_results,
+                companies_unknown_ats  = EXCLUDED.companies_unknown_ats,
+                api_failures           = EXCLUDED.api_failures,
+                total_jobs_fetched     = EXCLUDED.total_jobs_fetched,
+                new_jobs_found         = EXCLUDED.new_jobs_found,
+                jobs_matched_filters   = EXCLUDED.jobs_matched_filters,
+                run_duration_seconds   = EXCLUDED.run_duration_seconds,
+                pdf_generated          = EXCLUDED.pdf_generated,
+                email_sent             = EXCLUDED.email_sent
         """, (
             today,
             stats.get("companies_monitored",    0),
@@ -407,13 +419,25 @@ def save_verify_filled_stats(stats):
         today = datetime.now().strftime("%Y-%m-%d")
         breakdown = json.dumps(stats.get("status_code_breakdown", {}))
         conn.execute("""
-            INSERT OR REPLACE INTO verify_filled_stats
+            INSERT INTO verify_filled_stats
               (date, verified, filled, active,
                inconclusive, inconclusive_timeout,
                inconclusive_conn_error, inconclusive_other_status,
                inconclusive_exception, status_code_breakdown,
                remaining, run_duration_secs)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(date) DO UPDATE SET
+                verified                   = EXCLUDED.verified,
+                filled                     = EXCLUDED.filled,
+                active                     = EXCLUDED.active,
+                inconclusive               = EXCLUDED.inconclusive,
+                inconclusive_timeout       = EXCLUDED.inconclusive_timeout,
+                inconclusive_conn_error    = EXCLUDED.inconclusive_conn_error,
+                inconclusive_other_status  = EXCLUDED.inconclusive_other_status,
+                inconclusive_exception     = EXCLUDED.inconclusive_exception,
+                status_code_breakdown      = EXCLUDED.status_code_breakdown,
+                remaining                  = EXCLUDED.remaining,
+                run_duration_secs          = EXCLUDED.run_duration_secs
         """, (
             today,
             stats.get("verified",                  0),
@@ -437,11 +461,14 @@ def get_monitor_stats(days=7):
     """Return last N days of monitor stats."""
     conn = get_conn()
     try:
+        # DATE('now', '-N days') is SQLite-specific.
+        # Compute the cutoff date in Python and pass as a parameter.
+        cutoff = (date.today() - timedelta(days=days)).isoformat()
         rows = conn.execute("""
             SELECT * FROM monitor_stats
-            WHERE date >= DATE('now', ?)
+            WHERE date >= ?
             ORDER BY date DESC
-        """, (f"-{days} days",)).fetchall()
+        """, (cutoff,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()

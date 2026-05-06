@@ -155,29 +155,44 @@ def fetch_jobs(slug_info, company):
     if not all([slug, dc, region]):
         return []
 
-    # Use stored path if present (e.g. "/careers" for SAP).
-    # Defaults to "/career" for existing slug_infos without path key.
-    path = slug_info.get("path", "/career")
-    url  = _feed_url(slug, dc, region, path=path)
-    # SuccessFactors returns ALL jobs in a single XML response.
-    # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
-    # SAP America has 2000+ jobs; any hard read cap would break large tenants.
-    resp = fetch_html(url, platform="successfactors", timeout=(10, None))
+    # Use stored path if present; default to /career for backwards compat.
+    # Self-healing: if the primary path returns HTML (wrong variant), retry
+    # with the alternative path automatically — no manual slug correction needed.
+    #
+    # Backward compat matrix:
+    #   SAP   {"path":"/careers"} → tries /careers first (stored wins) ✓
+    #   AFLAC {}                  → tries /career, falls back to /careers ✓
+    #   Ericsson {}               → tries /career (works) ✓
+    path     = slug_info.get("path", "/career")
+    alt_path = "/careers" if path == "/career" else "/career"
 
-    if resp is None:
-        return []
+    for try_path in (path, alt_path):
+        url  = _feed_url(slug, dc, region, path=try_path)
+        # SuccessFactors returns ALL jobs in a single XML response.
+        # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
+        # SAP America has 2000+ jobs; any hard read cap would break large tenants.
+        resp = fetch_html(url, platform="successfactors", timeout=(10, None))
 
-    # Validate XML response
-    ctype = resp.headers.get("content-type", "").lower()
-    if "html" in ctype and "xml" not in ctype:
-        return []
-    if not resp.text.strip().startswith("<?xml"):
-        return []
+        if resp is None:
+            continue
 
-    soup = BeautifulSoup(resp.text, "xml")
-    jobs = soup.find_all("Job")
+        # Validate XML — HTML response means wrong path variant, try the other.
+        ctype = resp.headers.get("content-type", "").lower()
+        if "html" in ctype and "xml" not in ctype:
+            continue
+        if not resp.text.strip().startswith("<?xml"):
+            continue
 
-    return [_normalize(j, company, slug_info) for j in jobs if j.find("JobTitle")]
+        soup = BeautifulSoup(resp.text, "xml")
+        jobs = soup.find_all("Job")
+
+        # Pass the path that actually worked so _normalize builds correct job URLs.
+        # This ensures SAP (path stored) and new slugs (no path stored) both get
+        # correct URLs — whichever path variant returned valid XML is used.
+        effective = {**slug_info, "path": try_path}
+        return [_normalize(j, company, effective) for j in jobs if j.find("JobTitle")]
+
+    return []
 
 
 # ─────────────────────────────────────────
