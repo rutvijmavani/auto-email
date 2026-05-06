@@ -243,9 +243,11 @@ def get_monitorable_companies():
     """
     conn = get_conn()
     try:
-        # json_valid() / json_extract() are SQLite-specific.
-        # PostgreSQL: cast ats_slug::json->>'url' to extract the url field.
-        # The cast is safe because the app always writes valid JSON to ats_slug.
+        # json_extract_text() is a safe PL/pgSQL helper defined in init_db()
+        # that returns NULL for non-JSON input (catches cast exceptions).
+        # Using it here avoids the "invalid input syntax for type json" error
+        # that occurs when PostgreSQL eagerly evaluates ats_slug::json for
+        # non-custom rows whose ats_slug is a plain string (e.g. "amazon").
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
@@ -258,10 +260,11 @@ def get_monitorable_companies():
                   -- Standard platforms: include as long as slug present
                   ats_platform != 'custom'
                   OR
-                  -- Custom: only include when slug has captured URL.
+                  -- Custom: only include when slug has a captured URL.
+                  -- json_extract_text() safely returns NULL for non-JSON input.
                   (ats_platform = 'custom'
-                   AND (ats_slug::json->>'url') IS NOT NULL
-                   AND (ats_slug::json->>'url') <> '')
+                   AND json_extract_text(ats_slug, '$.url') IS NOT NULL
+                   AND json_extract_text(ats_slug, '$.url') <> '')
               )
             ORDER BY company ASC
         """).fetchall()
@@ -569,5 +572,236 @@ def get_tracked_urls_for_company(company):
             AND status NOT IN ('expired', 'dismissed', 'applied')
         """, (company,)).fetchall()
         return {r["job_url"]: r["id"] for r in rows}
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────
+# ADAPTIVE POLLING HELPERS
+# ─────────────────────────────────────────
+
+def get_company_row(company: str) -> "dict | None":
+    """
+    Fetch a single company row by name for the scan worker.
+    Returns the same shape as get_monitorable_companies() rows,
+    plus domain (used by re-detection logging in _process_company).
+    Returns None if company not found.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT company, ats_platform, ats_slug,
+                   ats_detected_at, first_scanned_at,
+                   last_checked_at, consecutive_empty_days,
+                   domain
+            FROM prospective_companies
+            WHERE company = ?
+        """, (company,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def save_pending_detail(company: str, platform: str, job: dict,
+                        found_by: str = "tier1_adaptive") -> bool:
+    """
+    Insert a job as status='pending_detail' for the detail queue.
+
+    Called by scan_worker (found_by='tier1_adaptive') after detecting a new
+    job_id via the seen:{company} Redis SET diff, and by fullscan_worker
+    (found_by='tier2_fullscan') for jobs found during a full scan.
+
+    The detail_worker will later UPDATE this to 'new' after fetching full
+    detail and applying filters.
+
+    Returns True if inserted (new row), False if job_url already exists.
+    """
+    from datetime import datetime
+    conn = get_conn()
+    today = datetime.now().strftime("%Y-%m-%d")
+    posted_at = job.get("posted_at")
+    if isinstance(posted_at, datetime):
+        posted_at = posted_at.isoformat()
+
+    try:
+        cursor = conn.execute("""
+            INSERT INTO job_postings
+              (company, title, job_url, job_id, ats_platform,
+               location, posted_at, description, skill_score,
+               status, found_by, first_seen)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    'pending_detail', %s, %s)
+            ON CONFLICT (job_url) DO NOTHING
+        """, (
+            company,
+            job.get("title", ""),
+            job.get("job_url", ""),
+            job.get("job_id"),
+            platform,
+            job.get("location", ""),
+            posted_at,
+            job.get("description", ""),
+            job.get("skill_score", 0),
+            found_by,
+            today,
+        ))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def save_pre_existing_listing(company: str, platform: str, job: dict) -> bool:
+    """
+    Persist a job from the first-scan run as status='pre_existing'.
+
+    Called by scan_worker for every job on a company's first ever scan so
+    Redis seen:{company} can be rebuilt correctly on restart (rebuild reads
+    job_postings WHERE job_id IS NOT NULL).
+
+    Returns True if inserted, False if job_url already exists.
+    """
+    from datetime import datetime
+    conn = get_conn()
+    today = datetime.now().strftime("%Y-%m-%d")
+    posted_at = job.get("posted_at")
+    if isinstance(posted_at, datetime):
+        posted_at = posted_at.isoformat()
+
+    try:
+        cursor = conn.execute("""
+            INSERT INTO job_postings
+              (company, title, job_url, job_id, ats_platform,
+               location, posted_at, status, found_by, first_seen)
+            VALUES (%s, %s, %s, %s, %s, %s, %s,
+                    'pre_existing', 'tier1_adaptive', %s)
+            ON CONFLICT (job_url) DO NOTHING
+        """, (
+            company,
+            job.get("title", ""),
+            job.get("job_url", ""),
+            job.get("job_id"),
+            platform,
+            job.get("location", ""),
+            posted_at,
+            today,
+        ))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def complete_pending_detail(company: str, job_id: str, job: dict,
+                             status: str = "new") -> bool:
+    """
+    Update a pending_detail row to its final status after detail fetch.
+
+    Called by detail_worker after full job data is available and filters pass.
+    If status='new' → job is emitted in the next digest.
+    If status='pre_existing' → job was seen before and will not be re-emitted.
+
+    Returns True if updated, False if no matching pending_detail row found.
+    """
+    from datetime import datetime
+    posted_at = job.get("posted_at")
+    if isinstance(posted_at, datetime):
+        posted_at = posted_at.isoformat()
+
+    conn = get_conn()
+    try:
+        cursor = conn.execute("""
+            UPDATE job_postings SET
+                status        = %s,
+                title         = %s,
+                description   = %s,
+                location      = %s,
+                posted_at     = %s,
+                content_hash  = %s,
+                skill_score   = %s,
+                found_by      = %s,
+                _country_code = %s,
+                last_polled   = NOW()
+            WHERE company = %s
+              AND job_id  = %s
+              AND status  = 'pending_detail'
+        """, (
+            status,
+            job.get("title", ""),
+            job.get("description", ""),
+            job.get("location", ""),
+            posted_at,
+            job.get("content_hash"),
+            job.get("skill_score", 0),
+            job.get("found_by", "tier1_adaptive"),
+            job.get("_country_code"),
+            company,
+            job_id,
+        ))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_pending_detail(company: str, job_id: str) -> None:
+    """
+    Remove a pending_detail row that failed filters.
+
+    Called by detail_worker when a job is fetched but does not match
+    location / freshness filters — so it never enters the digest.
+    The job_id is still in seen:{company} so it won't be re-detected.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("""
+            DELETE FROM job_postings
+            WHERE company = %s AND job_id = %s AND status = 'pending_detail'
+        """, (company, job_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_poll_stats(company: str, platform: str,
+                      new_jobs: int, duration_ms: int) -> None:
+    """
+    Create or update the company_poll_stats row after a scan completes.
+
+    On first scan: inserts a new row.
+    On subsequent scans: increments total_polls, total_new_jobs,
+    resets or increments consecutive_empty based on whether new_jobs > 0.
+
+    duration_ms is stored for scheduler latency tracking but not
+    persisted here — the scheduler reads it from the result payload.
+    next_poll_at and adaptive_score are left for the scheduler to set.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("""
+            INSERT INTO company_poll_stats
+                (company, ats_platform, last_poll_at,
+                 total_polls, total_new_jobs,
+                 consecutive_empty, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT(company) DO UPDATE SET
+                ats_platform      = EXCLUDED.ats_platform,
+                last_poll_at      = CURRENT_TIMESTAMP,
+                total_polls       = company_poll_stats.total_polls + 1,
+                total_new_jobs    = company_poll_stats.total_new_jobs
+                                    + EXCLUDED.total_new_jobs,
+                consecutive_empty = CASE
+                    WHEN EXCLUDED.total_new_jobs > 0
+                    THEN 0
+                    ELSE company_poll_stats.consecutive_empty + 1
+                END,
+                updated_at        = CURRENT_TIMESTAMP
+        """, (company, platform, new_jobs))
+        conn.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(
+            "upsert_poll_stats failed for %r: %s", company, e, exc_info=True
+        )
     finally:
         conn.close()

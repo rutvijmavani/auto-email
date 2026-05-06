@@ -26,13 +26,8 @@ from tests.conftest import cleanup_db
 
 
 def db_today():
-    """Get today's date from SQLite clock — matches get_pending_outreach filtering."""
-    conn = db_module.get_conn()
-    c = conn.cursor()
-    c.execute("SELECT DATE('now')")
-    today = c.fetchone()[0]
-    conn.close()
-    return today
+    """Return today's date string — matches get_pending_outreach filtering."""
+    return datetime.now().strftime("%Y-%m-%d")
 
 TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
@@ -327,8 +322,12 @@ class TestQuotaHealthIntegration(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("""
-            INSERT OR REPLACE INTO careershift_quota (date, total_limit, used, remaining)
+            INSERT INTO careershift_quota (date, total_limit, used, remaining)
             VALUES (?, 50, ?, ?)
+            ON CONFLICT (date) DO UPDATE SET
+                total_limit = EXCLUDED.total_limit,
+                used        = EXCLUDED.used,
+                remaining   = EXCLUDED.remaining
         """, (date, used, remaining))
         conn.commit()
         conn.close()

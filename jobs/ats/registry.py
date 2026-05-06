@@ -288,3 +288,71 @@ def all_platforms() -> list:
 def is_supported(platform: str) -> bool:
     """Return True if platform is in the registry."""
     return platform in ATS_REGISTRY
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slug / detail-fetch helpers (used by adaptive scan_worker + detail_worker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+import json as _json
+
+
+def parse_slug(platform: str, slug: str, config: dict):
+    """
+    Parse the raw DB slug into the form each ATS module expects.
+
+    slug_type="string" → pass as-is (str)
+    slug_type="json"   → json.loads(slug); platform-specific defaults on error.
+
+    Returns a string or dict.
+    """
+    if config.get("slug_type") != "json":
+        return slug
+    try:
+        slug_info = _json.loads(slug)
+        if platform == "workday" and "path" not in slug_info:
+            slug_info["path"] = "careers"
+        return slug_info
+    except (_json.JSONDecodeError, TypeError):
+        defaults = {
+            "workday":    {"slug": slug or "", "wd": "wd5", "path": "careers"},
+            "oracle_hcm": {"slug": slug or "", "site": ""},
+        }
+        return defaults.get(platform, {})
+
+
+def should_fetch_detail(job: dict, platform: str, config: dict,
+                         slug_info=None) -> bool:
+    """
+    Return True if fetch_job_detail() should be called for this job.
+
+    Mirrors _should_fetch_detail() from jobs/job_monitor.py with the
+    same platform-specific preconditions.
+    """
+    if not config.get("has_detail"):
+        return False
+
+    # Platforms that require a specific key in the job dict
+    required_keys = {
+        "icims":           "_base_url",
+        "jobvite":         "_slug",
+        "taleo":           "_contest_no",
+        "smartrecruiters": "_company_slug",
+        "workday":         "_external_path",
+    }
+    key = required_keys.get(platform)
+    if key is not None:
+        return bool(job.get(key))
+
+    if platform == "sitemap":
+        return bool(job.get("job_url")) and job.get("_feed_type") != "xml"
+
+    if platform == "custom":
+        return bool(
+            slug_info
+            and isinstance(slug_info, dict)
+            and slug_info.get("detail")
+            and not job.get("description")
+        )
+
+    return bool(job.get("job_url"))

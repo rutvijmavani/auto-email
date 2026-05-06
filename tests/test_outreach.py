@@ -129,7 +129,7 @@ class TestSendWindow(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("SELECT scheduled_for FROM outreach WHERE id = ?", (oid,))
-        self.assertEqual(c.fetchone()["scheduled_for"], tomorrow)
+        self.assertEqual(str(c.fetchone()["scheduled_for"]), tomorrow)
         conn.close()
 
     def test_reschedule_remaining_handles_empty_list(self):
@@ -179,7 +179,7 @@ class TestScheduleInitialOutreach(unittest.TestCase):
         today = _now().strftime("%Y-%m-%d")
         schedule_initial_outreach()
         pending = db_module.get_pending_outreach()
-        self.assertEqual(pending[0]["scheduled_for"], today)
+        self.assertEqual(str(pending[0]["scheduled_for"]), today)
 
     def test_no_outreach_when_no_recruiters(self):
         from outreach.outreach_engine import schedule_initial_outreach

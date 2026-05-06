@@ -211,6 +211,12 @@ from db.job_monitor import (
     get_tracked_urls_for_company,
     reactivate_job,
     save_verify_filled_stats,
+    get_company_row,
+    upsert_poll_stats,
+    save_pending_detail,
+    save_pre_existing_listing,
+    complete_pending_detail,
+    delete_pending_detail,
     # NOTE: save_coverage_stats, get_coverage_stats, save_pipeline_alert,
     # save_api_health, get_unnotified_alerts, mark_alert_notified
     # have been removed from db.job_monitor — they now live in
