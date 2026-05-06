@@ -25,11 +25,35 @@ VENV="$PROJECT_DIR/venv"
 
 PG_DB="recruiter_pipeline"
 PG_USER="pipeline_user"
-PG_PASS="pipeline123"
+
+# ── Resolve password ──────────────────────────────────────────────────────────
+# Priority:
+#   1. PG_PASS already set in the environment (caller supplied it)
+#   2. Existing DATABASE_URL in .env (re-use the password already there)
+#   3. Generate a fresh random 32-char password via openssl
+
+if [ -z "${PG_PASS:-}" ]; then
+    # Try to extract existing password from .env
+    if [ -f "$ENV_FILE" ]; then
+        existing_url=$(grep -E '^DATABASE_URL=' "$ENV_FILE" | head -1 | sed "s/^DATABASE_URL=//;s/['\"]//g")
+        if [[ "$existing_url" =~ ://[^:]+:([^@]+)@ ]]; then
+            PG_PASS="${BASH_REMATCH[1]}"
+        fi
+    fi
+fi
+
+if [ -z "${PG_PASS:-}" ]; then
+    # Generate a cryptographically random password
+    PG_PASS=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9!@#%^&*' | head -c 32)
+    echo "[INFO] Generated new random password for $PG_USER (stored in .env only)"
+fi
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " PostgreSQL Setup for Recruiter Pipeline"
-echo " Project: $PROJECT_DIR"
+echo " Project : $PROJECT_DIR"
+echo " DB      : $PG_DB"
+echo " User    : $PG_USER"
+echo " Password: [set — not shown]"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
@@ -117,7 +141,12 @@ else
     echo "[OK]  Added DATABASE_URL to .env"
 fi
 
-echo "      DATABASE_URL=$DATABASE_URL_VALUE"
+# Protect .env so other users cannot read the password
+chmod 600 "$ENV_FILE"
+
+# Export for all subsequent Python invocations in this shell session
+export DATABASE_URL="$DATABASE_URL_VALUE"
+echo "[OK]  DATABASE_URL exported (password not shown)"
 echo ""
 
 # ─────────────────────────────────────────

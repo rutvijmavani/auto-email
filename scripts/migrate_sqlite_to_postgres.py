@@ -123,9 +123,49 @@ def reset_sequence(pg_conn, table):
             pass
 
 
-def migrate_table(table, sqlite_conn, pg_conn, force=False):
+def _force_truncate_all(pg_conn, tables_with_data: list[str]) -> None:
+    """
+    Grouped upfront truncation in reverse-FK order (children first).
+
+    Called once before any migration when --force is given.
+    Truncating in reverse order means FK constraints are never violated,
+    and there is no hidden CASCADE removing rows from un-migrated tables.
+    Prints a clear warning before doing anything destructive.
+    """
+    if not tables_with_data:
+        return
+
+    # reverse(TABLE_ORDER) = children before parents
+    ordered = [t for t in reversed(TABLE_ORDER) if t in tables_with_data]
+
+    print()
+    print("  ┌─ WARNING ──────────────────────────────────────────────────")
+    print("  │  --force mode: the following tables will be CLEARED first:")
+    for t in ordered:
+        print(f"  │    {t}")
+    print("  │  No CASCADE surprises — each table is truncated individually")
+    print("  │  in child-before-parent order.")
+    print("  └────────────────────────────────────────────────────────────")
+    print()
+
+    for table in ordered:
+        try:
+            pg_conn.execute(
+                f"TRUNCATE TABLE {table} RESTART IDENTITY"  # no CASCADE
+            )
+            pg_conn.commit()
+        except Exception as e:
+            try:
+                pg_conn.rollback()
+            except Exception:
+                pass
+            print(f"  [WARN] Could not truncate {table}: {e}")
+
+
+def migrate_table(table, sqlite_conn, pg_conn):
     """
     Migrate one table from SQLite to PostgreSQL.
+    Assumes the table is already empty (caller handles --force truncation).
     Returns (rows_migrated, skipped_reason) tuple.
     """
     # ── Check if table exists in SQLite ──────────────────────────────────────
@@ -140,16 +180,8 @@ def migrate_table(table, sqlite_conn, pg_conn, force=False):
     except Exception as e:
         return 0, f"PG table missing or error: {e}"
 
-    if pg_count > 0 and not force:
+    if pg_count > 0:
         return 0, f"already has {pg_count} rows (use --force to overwrite)"
-
-    if pg_count > 0 and force:
-        try:
-            pg_conn.execute(f"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE")
-            pg_conn.commit()
-        except Exception as e:
-            pg_conn.rollback()
-            return 0, f"TRUNCATE failed: {e}"
 
     # ── Compute shared column set ─────────────────────────────────────────────
     sqlite_cols = get_sqlite_columns(sqlite_conn, table)
@@ -212,6 +244,19 @@ def migrate_table(table, sqlite_conn, pg_conn, force=False):
     return inserted, None
 
 
+def _redact_dsn(url: str) -> str:
+    """Return DSN with password replaced by ***."""
+    from urllib.parse import urlparse, urlunparse
+    try:
+        p = urlparse(url)
+        if p.password:
+            netloc = f"{p.username}:***@{p.hostname}" + (f":{p.port}" if p.port else "")
+            return urlunparse(p._replace(netloc=netloc))
+    except Exception:
+        pass
+    return url
+
+
 def run(sqlite_path: Path, force: bool):
     # ── Locate SQLite DB ──────────────────────────────────────────────────────
     if not sqlite_path.exists():
@@ -226,7 +271,7 @@ def run(sqlite_path: Path, force: bool):
     load_dotenv()
 
     db_url = os.environ.get("DATABASE_URL", "postgresql://localhost/recruiter_pipeline")
-    print(f"[INFO] PostgreSQL DSN: {db_url}")
+    print(f"[INFO] PostgreSQL DSN: {_redact_dsn(db_url)}")
     print()
 
     # ── Open SQLite (read-only) ───────────────────────────────────────────────
@@ -245,6 +290,20 @@ def run(sqlite_path: Path, force: bool):
     from db.connection import get_conn
     pg_conn = get_conn()
 
+    # ── Upfront truncation (--force only) ────────────────────────────────────
+    # Done before migration starts so all destructive work is grouped and visible.
+    # Truncated in reverse-FK order (children first) — no hidden CASCADE.
+    if force:
+        tables_with_data = []
+        for table in TABLE_ORDER:
+            try:
+                row = pg_conn.execute(f"SELECT COUNT(*) AS cnt FROM {table}").fetchone()
+                if row and row["cnt"] > 0:
+                    tables_with_data.append(table)
+            except Exception:
+                pass
+        _force_truncate_all(pg_conn, tables_with_data)
+
     # ── Migrate tables ────────────────────────────────────────────────────────
     total_rows   = 0
     migrated_tbl = 0
@@ -252,7 +311,7 @@ def run(sqlite_path: Path, force: bool):
 
     for table in TABLE_ORDER:
         print(f"  [{table}]", end=" ", flush=True)
-        count, reason = migrate_table(table, sqlite_conn, pg_conn, force=force)
+        count, reason = migrate_table(table, sqlite_conn, pg_conn)
 
         if reason and count == 0:
             print(f"SKIP — {reason}")

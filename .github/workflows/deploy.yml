@@ -77,17 +77,18 @@ jobs:
             pip install -r requirements.txt --quiet
 
             echo "[5/6] Verifying PostgreSQL connection..."
-            python -c "
-import sys, os
-sys.path.insert(0, '.')
-from dotenv import load_dotenv
-load_dotenv()
-from db.connection import get_conn
-conn = get_conn()
-row = conn.execute('SELECT COUNT(*) AS cnt FROM prospective_companies').fetchone()
-print(f'[OK] PostgreSQL OK — prospective_companies has {row[\"cnt\"]} rows')
-conn.close()
-"
+            
+            python - <<'PY'
+            import sys
+            sys.path.insert(0, '.')
+            from dotenv import load_dotenv
+            load_dotenv()
+            from db.connection import get_conn
+            conn = get_conn()
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM prospective_companies").fetchone()
+            print(f"[OK] PostgreSQL OK — prospective_companies has {row['cnt']} rows")
+            conn.close()
+            PY
 
             echo "[6/6] Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"

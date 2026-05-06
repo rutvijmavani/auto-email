@@ -18,6 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -26,16 +27,34 @@ PROJECT_DIR    = Path("/home/opc/mail")
 BACKUP_DIR     = Path("/mnt/backups")
 RETENTION_DAYS = 7
 
-# PostgreSQL connection params (read from .env / environment)
-PG_DB   = os.environ.get("PG_DB",   "recruiter_pipeline")
-PG_USER = os.environ.get("PG_USER", "pipeline_user")
-PG_HOST = os.environ.get("PG_HOST", "localhost")
-PG_PORT = os.environ.get("PG_PORT", "5432")
-
 # Legacy SQLite DBs still on disk (keep backing up until fully retired)
 SQLITE_DBS = [
     PROJECT_DIR / "data" / "ats_discovery.db",
 ]
+
+
+def _pg_params() -> dict:
+    """
+    Parse PostgreSQL connection params from DATABASE_URL (after .env is loaded).
+    Falls back to sensible defaults if DATABASE_URL is unset or unparseable.
+    Returns dict with keys: host, port, user, password, dbname.
+    """
+    from dotenv import load_dotenv
+    load_dotenv(PROJECT_DIR / ".env")
+
+    raw = os.environ.get("DATABASE_URL", "postgresql://pipeline_user@localhost/recruiter_pipeline")
+    try:
+        p = urlparse(raw)
+        return {
+            "host":     p.hostname or "localhost",
+            "port":     str(p.port or 5432),
+            "user":     p.username or "pipeline_user",
+            "password": p.password or "",   # percent-decoded by urlparse
+            "dbname":   (p.path or "/recruiter_pipeline").lstrip("/"),
+        }
+    except Exception:
+        return {"host": "localhost", "port": "5432",
+                "user": "pipeline_user", "password": "", "dbname": "recruiter_pipeline"}
 
 
 # ─────────────────────────────────────────
@@ -44,34 +63,24 @@ SQLITE_DBS = [
 
 def backup_postgres(dest: Path) -> None:
     """
-    Dump PostgreSQL database to a gzip-compressed SQL file using pg_dump.
-    Uses PGPASSWORD env var to pass the password without a .pgpass file.
+    Dump PostgreSQL database to a compressed file using pg_dump (-Fc).
+    PGPASSWORD is set in the subprocess environment; never printed.
     """
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_DIR / ".env")
-
-    # Parse DATABASE_URL for password if set
-    db_url = os.environ.get("DATABASE_URL", "")
-    pg_pass = ""
-    if ":" in db_url and "@" in db_url:
-        # postgresql://user:pass@host/db
-        try:
-            userinfo = db_url.split("//")[1].split("@")[0]
-            pg_pass  = userinfo.split(":")[1] if ":" in userinfo else ""
-        except Exception:
-            pass
+    params = _pg_params()
 
     env = os.environ.copy()
-    env["PGPASSWORD"] = pg_pass
+    # Only set PGPASSWORD if not already provided (e.g. via .pgpass or keyring)
+    if "PGPASSWORD" not in env and params["password"]:
+        env["PGPASSWORD"] = params["password"]
 
     cmd = [
         "pg_dump",
-        "-h", PG_HOST,
-        "-p", PG_PORT,
-        "-U", PG_USER,
+        "-h", params["host"],
+        "-p", params["port"],
+        "-U", params["user"],
         "-Fc",            # custom format (compressed, parallel-restore capable)
         "-f", str(dest),
-        PG_DB,
+        params["dbname"],
     ]
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if result.returncode != 0:
@@ -130,15 +139,17 @@ def run():
     print()
 
     # ── PostgreSQL backup ──────────────────────────────────────────────────
+    params  = _pg_params()
+    pg_name = params["dbname"]
     pg_dest = BACKUP_DIR / f"recruiter_pipeline_{timestamp}.dump"
-    print(f"[INFO] Backing up PostgreSQL '{PG_DB}' → {pg_dest.name}")
+    print(f"[INFO] Backing up PostgreSQL '{pg_name}' → {pg_dest.name}")
     try:
         backup_postgres(pg_dest)
         size_mb = pg_dest.stat().st_size / (1024 * 1024)
         print(f"[OK]   {pg_dest.name} ({size_mb:.2f} MB)")
     except Exception as e:
         print(f"[ERROR] PostgreSQL backup failed: {e}")
-        errors.append(PG_DB)
+        errors.append(pg_name)
 
     enforce_retention(BACKUP_DIR, "recruiter_pipeline", RETENTION_DAYS, ".dump")
     print()
