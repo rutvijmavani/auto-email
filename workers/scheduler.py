@@ -1090,6 +1090,28 @@ def _remaining_work_minimum(r) -> int:
 
 # ── Process target functions ──────────────────────────────────────────────────
 
+def _reset_inherited_db_pool() -> None:
+    """
+    Discard any PostgreSQL connection pool inherited from the parent process.
+
+    multiprocessing.Process forks the parent, so the child inherits the
+    parent's _pool which holds open TCP sockets to PostgreSQL.  Both parent
+    and child would then share the same file descriptors, causing libpq to
+    emit "error with status PGRES_TUPLES_OK and no message from the libpq"
+    when the child tries to use or re-initialise the connection.
+
+    Calling this at the top of every worker-process target function ensures
+    the child creates its own fresh pool on first get_conn() call.
+    """
+    import db.connection as _dbc
+    if _dbc._pool is not None:
+        try:
+            _dbc._pool.closeall()
+        except Exception:
+            pass
+        _dbc._pool = None
+
+
 def _scan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     """
     Target function for scan worker processes (multiprocessing.Process).
@@ -1099,6 +1121,8 @@ def _scan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     when shutdown_event is set — the run_worker() loop's
     `except KeyboardInterrupt: break` then exits cleanly.
     """
+    _reset_inherited_db_pool()
+
     def _watcher() -> None:
         shutdown_event.wait()
         # Inject KeyboardInterrupt into this process's main thread.
@@ -1121,6 +1145,8 @@ def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
 
     Mirrors _scan_worker_process but runs detail_worker.run_worker().
     """
+    _reset_inherited_db_pool()
+
     def _watcher() -> None:
         shutdown_event.wait()
         ctypes.pythonapi.PyThreadState_SetAsyncExc(
