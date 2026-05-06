@@ -71,6 +71,7 @@ jobs:
             git config advice.detachedHead false
 
             echo "[3/6] Checking out exact validated commit..."
+            git reset --hard HEAD
             git checkout ${{ github.sha }}
 
             echo "[4/6] Installing dependencies..."
