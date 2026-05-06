@@ -364,7 +364,8 @@ def _finish(
 # MAIN LOOP
 # ─────────────────────────────────────────
 
-def run_worker(once: bool = False, shutdown_event=None) -> None:
+def run_worker(once: bool = False, shutdown_event=None,
+               skip_init_db: bool = False) -> None:
     """
     Main detail fetch worker loop.
 
@@ -380,8 +381,11 @@ def run_worker(once: bool = False, shutdown_event=None) -> None:
                         source queue (LPUSH) so it is not lost — detail jobs
                         do not use exponential backoff since the issue is
                         worker count, not a platform error for this job.
+        skip_init_db:   if True, skip the init_db() call (used when the
+                        scheduler parent process already ran it before fork).
     """
-    init_db()
+    if not skip_init_db:
+        init_db()
 
     if not ping():
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
