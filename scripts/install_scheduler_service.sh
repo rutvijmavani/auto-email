@@ -54,8 +54,9 @@ Type=simple
 User=$USER
 WorkingDirectory=$PROJECT_DIR
 Environment=PYTHONPATH=$PROJECT_DIR
-EnvironmentFile=$PROJECT_DIR/.env
 
+# .env is loaded by python-dotenv inside the process — no EnvironmentFile
+# needed (and SELinux blocks systemd from reading user-owned .env files).
 ExecStart=$VENV/bin/python -m workers.scheduler
 Restart=on-failure
 RestartSec=15s
