@@ -647,7 +647,8 @@ def _build_detail_payload(
 # MAIN LOOP
 # ─────────────────────────────────────────
 
-def run_worker(once: bool = False, shutdown_event=None) -> None:
+def run_worker(once: bool = False, shutdown_event=None,
+               skip_init_db: bool = False) -> None:
     """
     Main adaptive scan worker loop.
 
@@ -664,8 +665,11 @@ def run_worker(once: bool = False, shutdown_event=None) -> None:
                              Company is re-queued with exponential backoff.
                           2. Inside _run_listing_scan() after fetch_jobs()
                              returns — before any DB writes are committed.
+        skip_init_db:   if True, skip the init_db() call (used when the
+                        scheduler parent process already ran it before fork).
     """
-    init_db()
+    if not skip_init_db:
+        init_db()
 
     if not ping():
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")

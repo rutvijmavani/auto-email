@@ -1136,7 +1136,7 @@ def _scan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     threading.Thread(target=_watcher, daemon=True, name="scan_shutdown_watcher").start()
 
     from workers.scan_worker import run_worker
-    run_worker(shutdown_event=shutdown_event)
+    run_worker(shutdown_event=shutdown_event, skip_init_db=True)
 
 
 def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
@@ -1157,7 +1157,7 @@ def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
     threading.Thread(target=_watcher, daemon=True, name="detail_shutdown_watcher").start()
 
     from workers.detail_worker import run_worker
-    run_worker(shutdown_event=shutdown_event)
+    run_worker(shutdown_event=shutdown_event, skip_init_db=True)
 
 
 # ── Pool management helpers ───────────────────────────────────────────────────
