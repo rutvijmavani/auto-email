@@ -26,7 +26,15 @@ import psycopg2.extras
 import psycopg2.pool
 from dotenv import load_dotenv
 
-load_dotenv()   # no-op if env vars already set; loads .env on first import
+try:
+    load_dotenv()   # no-op if env vars already set; loads .env on first import
+except AssertionError:
+    # find_dotenv() inspects the call-stack frame to locate .env, which fails
+    # when Python reads from stdin (python - or python -c).  Fall back to a
+    # path relative to this file so the deploy health-check and any other
+    # stdin-driven invocations still pick up the server's .env.
+    from pathlib import Path as _Path
+    load_dotenv(_Path(__file__).resolve().parent.parent / ".env")
 
 DATABASE_URL: str = os.environ.get(
     "DATABASE_URL",
