@@ -167,6 +167,16 @@ def _force_truncate_all(pg_conn, tables_with_data: list[str]) -> None:
         raise RuntimeError("--force truncate failed for " + ", ".join(failures))
 
 
+def _get_pg_col_types(pg_conn, table) -> dict:
+    """Return {column_name: data_type} for a PostgreSQL table."""
+    c = pg_conn.execute("""
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = %s
+    """, (table,))
+    return {row["column_name"]: row["data_type"] for row in c.fetchall()}
+
+
 def migrate_table(table, sqlite_conn, pg_conn):
     """
     Migrate one table from SQLite to PostgreSQL.
@@ -218,12 +228,21 @@ def migrate_table(table, sqlite_conn, pg_conn):
     BATCH = 500
     batch = []
 
+    # PostgreSQL column types — used to coerce SQLite empty strings to NULL
+    pg_col_types = _get_pg_col_types(pg_conn, table)
+
     for row in rows:
         values = []
         for col in shared:
             val = row[col]
-            # SQLite stores BLOB as bytes — PostgreSQL BYTEA also accepts bytes
-            # No conversion needed; psycopg2 handles it.
+            # SQLite stores '' for columns that should be NULL in typed PG
+            # columns (TIMESTAMP, DATE, INTEGER, BIGINT, REAL, BOOLEAN).
+            # An empty string is never valid for those types — coerce to None.
+            if val == "" and pg_col_types.get(col, "text") not in (
+                "text", "citext", "character varying", "varchar",
+                "char", "bpchar", "name", "bytea",
+            ):
+                val = None
             values.append(val)
         batch.append(tuple(values))
 
