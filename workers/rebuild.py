@@ -110,7 +110,7 @@ def rebuild_detail_queue() -> int:
             SELECT company, job_url, job_id, ats_platform
             FROM job_postings
             WHERE status = 'pending_detail'
-            ORDER BY found_at ASC
+            ORDER BY first_seen ASC
         """).fetchall()
     finally:
         conn.close()
