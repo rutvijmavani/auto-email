@@ -91,6 +91,9 @@ jobs:
             conn.close()
             PY
 
-            echo "[6/6] Deploy complete ✓"
+            echo "[6/6] Restarting scheduler service..."
+            sudo systemctl restart recruiter-scheduler || echo "[WARN] recruiter-scheduler not installed yet — run scripts/install_scheduler_service.sh"
+
+            echo "[7/7] Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"
