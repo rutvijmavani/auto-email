@@ -33,20 +33,28 @@ PG_USER="pipeline_user"
 #   3. Generate a fresh random 32-char password via openssl
 
 if [ -z "${PG_PASS:-}" ]; then
-    # Try to extract existing password from .env
+    # Try to extract existing password from .env.
+    # The stored value is URL-encoded, so decode it to recover the raw password.
     if [ -f "$ENV_FILE" ]; then
         existing_url=$(grep -E '^DATABASE_URL=' "$ENV_FILE" | head -1 | sed "s/^DATABASE_URL=//;s/['\"]//g")
         if [[ "$existing_url" =~ ://[^:]+:([^@]+)@ ]]; then
-            PG_PASS="${BASH_REMATCH[1]}"
+            PG_PASS=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "${BASH_REMATCH[1]}")
         fi
     fi
 fi
 
 if [ -z "${PG_PASS:-}" ]; then
-    # Generate a cryptographically random password
-    PG_PASS=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9!@#%^&*' | head -c 32)
+    # Generate a cryptographically random password using alphanumeric chars only.
+    # This avoids URL-special characters (@, #, %) that would break DSN parsing.
+    # 32 chars from a 62-char alphabet gives ~190 bits of entropy.
+    PG_PASS=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 32)
     echo "[INFO] Generated new random password for $PG_USER (stored in .env only)"
 fi
+
+# URL-encode the raw password for safe interpolation into the postgresql:// DSN.
+# Handles special chars in caller-supplied passwords (e.g. PG_PASS env var).
+# The raw PG_PASS is retained below for the SQL CREATE USER statement.
+PG_PASS_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1],safe=''))" "$PG_PASS")
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo " PostgreSQL Setup for Recruiter Pipeline"
@@ -128,7 +136,7 @@ echo ""
 # ─────────────────────────────────────────
 echo "[3/6] Updating .env with DATABASE_URL..."
 
-DATABASE_URL_VALUE="postgresql://$PG_USER:$PG_PASS@localhost/$PG_DB"
+DATABASE_URL_VALUE="postgresql://$PG_USER:$PG_PASS_ENC@localhost/$PG_DB"
 
 if grep -q "^DATABASE_URL" "$ENV_FILE" 2>/dev/null; then
     # Replace existing line

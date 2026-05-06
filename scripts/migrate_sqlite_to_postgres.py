@@ -148,6 +148,8 @@ def _force_truncate_all(pg_conn, tables_with_data: list[str]) -> None:
     print("  └────────────────────────────────────────────────────────────")
     print()
 
+    failures = []
+
     for table in ordered:
         try:
             pg_conn.execute(
@@ -159,7 +161,10 @@ def _force_truncate_all(pg_conn, tables_with_data: list[str]) -> None:
                 pg_conn.rollback()
             except Exception:
                 pass
-            print(f"  [WARN] Could not truncate {table}: {e}")
+            failures.append(f"{table}: {e}")
+
+    if failures:
+        raise RuntimeError("--force truncate failed for " + ", ".join(failures))
 
 
 def migrate_table(table, sqlite_conn, pg_conn):
@@ -268,9 +273,12 @@ def run(sqlite_path: Path, force: bool):
 
     # ── Load .env for DATABASE_URL ────────────────────────────────────────────
     from dotenv import load_dotenv
-    load_dotenv()
+    env_file = Path(__file__).resolve().parents[1] / ".env"
+    load_dotenv(env_file)
 
-    db_url = os.environ.get("DATABASE_URL", "postgresql://localhost/recruiter_pipeline")
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError(f"DATABASE_URL is not set in {env_file}")
     print(f"[INFO] PostgreSQL DSN: {_redact_dsn(db_url)}")
     print()
 
