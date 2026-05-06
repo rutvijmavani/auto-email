@@ -235,10 +235,14 @@ Supporting infrastructure:
 │  • Worker heartbeats│  │                      │
 └─────────────────────┘  └─────────────────────┘
 
-Dynamic worker pool:
-  Calculated at 7 AM: workers = (total_scans × avg_duration) / window_seconds
-  Throughput monitor runs every 30 min, adjusts count up/down
-  Worker count always ≤ DB maxconn - 3 (reserve connections for maintenance)
+Two co-scheduled worker pools (see Section 9 for full design):
+  scan_workers:   calculated at 7 AM from company count + avg listing duration
+  detail_workers: calculated at 7 AM from expected new jobs + avg detail duration
+  Both pools managed by scheduler as multiprocessing.Process children
+  Liveness check every tick (5s) — dead workers replaced immediately
+  Fast error check every 5 min — error-triggered worker reduction
+  Slow throughput check every 30 min — queue-depth-driven scaling
+  DB pool split proportionally between the two pools (combined ≤ DB_POOL_MAXCONN - 3)
 ```
 
 **Key insight:** Adaptive listing scans and full scans are completely decoupled. A full scan for Starbucks (20k jobs) runs independently of an adaptive poll for a small startup. Neither blocks the other.
@@ -387,21 +391,99 @@ Queue: [0, 0, 0, 0, 5]  →  weighted = 1.50  (fresh burst, correctly higher)
 
 ### Converting score to interval
 
+`band_lookup` maps a score to a poll interval using **dynamic thresholds** calibrated daily from the actual portfolio distribution (see [Band Calibration](#band-calibration) below). Scores are compared against three stored threshold values (`low`, `moderate`, `active`) rather than hardcoded numbers:
+
 ```python
-def band_lookup(score):
-    if score is None:
-        return 12 * 3600    # default before 3 polls of history
-    elif score < 0.5:
-        return 12 * 3600    # 12h — dormant
-    elif score < 1.5:
-        return  9 * 3600    # 9h  — low activity
-    elif score < 3.5:
-        return  6 * 3600    # 6h  — moderate
-    elif score < 6.0:
+def band_lookup(score, thresholds):
+    if score is None or score == 0.0:
+        return 12 * 3600    # 12h — no history yet, or no new jobs in window
+
+    if score < thresholds["low"]:
+        return  9 * 3600    # 9h  — below-median activity
+    elif score < thresholds["moderate"]:
+        return  6 * 3600    # 6h  — moderate activity
+    elif score < thresholds["active"]:
         return  4 * 3600    # 4h  — active
     else:
         return  3 * 3600    # 3h  — very active (MIN_INTERVAL)
 ```
+
+`score = None` (fewer than 3 polls of history) and `score = 0.0` (no new jobs across the entire window) both return 12h. These companies are **excluded from ranking** — they always get the default interval regardless of how other companies are performing.
+
+### Band Calibration
+
+**The problem with hardcoded thresholds:** If your portfolio of 50 companies mostly posts 0–1 new jobs per poll (realistic for most markets), scores cluster between 0 and 1.0. With thresholds like `score < 1.5 → 9h` and `score < 3.5 → 6h`, 90% of companies permanently sit in the 12h or 9h band — the 6h, 4h, and 3h bands go unused even when some companies are meaningfully more active than others.
+
+**The fix: rank-based calibration.** Instead of asking "is your score above an arbitrary absolute number?", we ask "are you in the top 10% of your peers?" Thresholds are computed daily from the actual distribution of scores across the live portfolio.
+
+#### Algorithm
+
+Once per day (at cycle start) and at scheduler startup:
+
+1. **Query** `company_poll_stats.adaptive_score` for all companies with `score > 0` polled within the last 30 days. These are the only companies that participate in ranking — dormant companies (score=0) always get 12h and are excluded.
+
+2. **Winsorize** the top 5% of scores (replace with the 95th percentile value). This prevents one mass-hiring outlier from shifting the thresholds upward and penalizing every other company in the portfolio.
+
+3. **Sort descending** and compute the score at each rank boundary:
+
+```
+Rank cut   Target     Band    Meaning
+top 10%  → "active"  → 3h    Exceptional, consistent new postings
+next 15% → "moderate"→ 4h    Clearly above-average hiring activity
+next 25% → "low"     → 6h    Moderate — worth checking twice a day
+bottom 50%            → 9h    Quiet relative to peers, baseline service
+```
+
+4. **Tie-promotion rule:** If multiple companies share the exact score sitting at a band boundary, all of them are promoted to the better (faster) band. Example: if scores at the 10% boundary are `[8.0, 1.8, 1.8, ...]`, both 1.8s join the 3h band.
+
+5. **Store** the three threshold values in Redis (`adaptive:band_thresholds` hash). Workers read from a 5-minute in-process cache backed by this key.
+
+6. **Fallback:** If fewer than 5 active companies exist (cold start or very small portfolio), use `DEFAULT_THRESHOLDS = {low: 1.5, moderate: 3.5, active: 6.0}` — the original hardcoded values. Calibration kicks in automatically once real data accumulates.
+
+#### Concrete example (10 active companies)
+
+```
+Raw scores (ascending):   [0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.2, 1.4, 1.8, 8.0]
+
+Step 1 — Winsorize top 5% (1 company): replace 8.0 → 1.8
+Winsorized:               [0.2, 0.3, 0.4, 0.5, 0.7, 0.9, 1.2, 1.4, 1.8, 1.8]
+
+Step 2 — Rank boundaries (descending sort):
+  top 10%  = rank 1       → boundary score = 8.0  → active  threshold
+  next 15% = ranks 2–3    → boundary score = 1.4  → moderate threshold
+  next 25% = ranks 4–6    → boundary score = 0.7  → low     threshold
+
+Stored:  active=8.0, moderate=1.4, low=0.7
+
+Result:
+  Company  Score  Band
+  Z        8.0    3h   (>= active=8.0)
+  9        1.8    4h   (>= moderate=1.4, < active=8.0)
+  8        1.4    4h   (= moderate threshold, tie-promoted up)
+  7        1.2    6h   (>= low=0.7, < moderate=1.4)
+  6        0.9    6h
+  5        0.7    6h   (= low threshold, tie-promoted up)
+  4–1      0.5    9h   (> 0, < low=0.7)
+  ...      0.0    12h  (not ranked)
+```
+
+#### Spike reactivity — why there is no 24-hour lag
+
+A common concern: "if thresholds only update daily, won't a hiring spike take 24 hours to reflect?"
+
+No — because **thresholds and scores are independent**. Thresholds are fixed within a day; scores update on every single poll. When Company A's score jumps from 0.4 to 5.0 mid-day:
+
+```
+8 AM calibration stored thresholds:  active=8.0, moderate=1.4, low=0.7
+
+10 AM — Company A posts 10 new jobs:
+  Rolling window update: [0, 0, 0, 0, 10] → score = 3.0
+  band_lookup(3.0, thresholds):  3.0 >= moderate(1.4) → 4h  ← immediate
+```
+
+The company moves from 9h to 4h **on the very next poll**, with no recalibration needed. The spike is detected the moment the score crosses a threshold — not at the next calibration window.
+
+The only 24-hour effect is **threshold drift**: if a spike is so extreme it would shift P92 significantly, today's thresholds won't reflect that until tomorrow. But because we Winsorize the top 5%, even an extreme outlier barely moves the stored thresholds. Other companies are not penalized.
 
 ### Asymmetric smoothing — preventing oscillation without dampening reactivation
 
@@ -431,7 +513,7 @@ Symmetric EMA is too slow on reactivation. A dormant company (24h interval) sudd
 ### Full calculation flow
 
 ```python
-def update_poll_interval(company, new_jobs_found):
+def update_poll_interval(company, new_jobs_found, thresholds):
     # Step 1: Update queue
     counts = company.recent_poll_counts or []
     counts.append(min(new_jobs_found, 10))   # cap at 10
@@ -441,14 +523,14 @@ def update_poll_interval(company, new_jobs_found):
     # Step 2: Compute score
     score = compute_score(counts)
     
-    # Step 3: Band lookup
-    computed = band_lookup(score)
+    # Step 3: Band lookup — uses calibrated thresholds (or DEFAULT_THRESHOLDS)
+    computed = band_lookup(score, thresholds)
     
     # Step 4: Asymmetric smoothing
     new_interval = compute_next_interval(computed, company.current_interval_s)
     
     # Step 5: Apply MAX_INTERVAL cap (see Section 8)
-    max_interval = get_max_interval(score)
+    max_interval = get_max_interval(score, thresholds)
     final_interval = min(new_interval, max_interval)
     
     # Step 6: Save
@@ -456,6 +538,9 @@ def update_poll_interval(company, new_jobs_found):
     company.current_interval_s = final_interval
     company.adaptive_score = score or 0.0
     company.next_poll_at = now() + final_interval
+
+# thresholds loaded once per on_adaptive_complete call:
+#   thresholds = get_band_thresholds(r)   ← 5-min in-process cache, Redis-backed
 ```
 
 ---
@@ -574,24 +659,24 @@ def run_full_scan(company):
 
 The adaptive engine can compute very long intervals for dormant companies. The MAX_INTERVAL cap ensures no company goes unpolled for too long — this is what guarantees reactivation detection within a bounded window.
 
-The cap is **score-tiered** — active companies get a tighter cap than dormant ones:
+The cap is **score-tiered** — active companies get a tighter cap than dormant ones. The tier boundary uses the calibrated `moderate` threshold (the P75 of the portfolio), so the cap automatically adjusts as the portfolio's activity level changes:
 
 ```python
-def get_max_interval(score):
-    if score is None or score < 0.5:
-        return 12 * 3600   # 12 hours — dormant/slow company
-    elif score < 1.5:
-        return 12 * 3600   # 12 hours — low activity
-    else:
-        return  6 * 3600   # 6 hours  — active/high-velocity company
+def get_max_interval(score, thresholds):
+    # Companies at or above the moderate threshold (top 25% of active portfolio)
+    # get the tighter 6h cap. All others get 12h.
+    if score is not None and score > 0.0 and score >= thresholds["moderate"]:
+        return  6 * 3600   # 6 hours — moderate+ companies
+    return 12 * 3600       # 12 hours — dormant / low activity
 ```
 
-| Activity Level | Score Range | Natural band | MAX_INTERVAL |
+| Activity level | Threshold position | Natural band | MAX_INTERVAL |
 |---|---|---|---|
-| **Very active** | score ≥ 3.5 | 3–4h | 6h |
-| **Moderate** | 1.5 ≤ score < 3.5 | 6h | 6h |
-| **Low activity** | 0.5 ≤ score < 1.5 | 9h | 12h |
-| **Dormant** | score < 0.5 | 12h | 12h |
+| **Very active** | score >= thresholds["active"] (top 10%) | 3h | 6h |
+| **Active** | thresholds["moderate"] <= score < thresholds["active"] (next 15%) | 4h | 6h |
+| **Moderate** | thresholds["low"] <= score < thresholds["moderate"] (next 25%) | 6h | 6h |
+| **Low activity** | 0 < score < thresholds["low"] (bottom 50%) | 9h | 12h |
+| **Dormant** | score = 0 or None | 12h | 12h |
 
 **24h MAX_INTERVAL is removed entirely.** 12h is the new floor for all companies.
 
@@ -759,25 +844,274 @@ redis.zadd("poll:fullscan", {company.name: time.time() - 1})
 
 ### Dynamic worker scaling
 
-Worker count is calculated at 7 AM cycle start:
+The system manages two independent but co-scheduled worker pools as child processes of the scheduler (`multiprocessing.Process`). Using real processes (not threads) gives full fault isolation and true parallelism — a crashed worker cannot affect the scheduler or other workers. The process manager (systemd) only needs to keep the scheduler alive; the scheduler manages everything else.
+
+`MONITOR_MAX_WORKERS` in `config.py` is a **cold-start fallback ceiling only** — used on day 1 before `api_health` has any historical data. Once averages are available it is never consulted.
+
+#### Startup — calculated at cycle start, not minimal
+
+At `record_cycle_start()` (7 AM, after digest is sent), both pools start at their data-driven counts immediately. Starting at a floor and scaling up wastes the first 30–60 minutes doing catch-up work that was entirely predictable.
 
 ```python
-def calculate_required_workers():
-    total_companies = count_active_companies()
-    avg_scan_duration = get_avg_full_scan_duration_seconds()
-    window_seconds = 23 * 3600   # 7 AM to 6 AM next day
-    
-    required = math.ceil(
-        (total_companies * avg_scan_duration) / window_seconds
-    )
-    
-    max_allowed = DB_POOL_MAXCONN - 3   # reserve 3 for maintenance
-    return min(required, max_allowed)
+window_s = 23 * 3600   # 7 AM to 6 AM next day
+
+# Scan worker pool — based on total polling workload today
+scan_polls_today      = sum(window_s / company.interval_s for company in active_companies)
+avg_listing_scan_s    = get_30day_avg_listing_duration()   # from api_health
+scan_workers_needed   = ceil((scan_polls_today * avg_listing_scan_s) / window_s)
+
+# Detail worker pool — based on expected new-job volume today
+expected_new_jobs     = get_30day_avg_daily_new_jobs()     # from adaptive_poll_metrics
+avg_detail_fetch_s    = get_30day_avg_detail_duration()    # from api_health
+detail_workers_needed = ceil((expected_new_jobs * avg_detail_fetch_s) / window_s)
+
+# Hard ceiling: both pools share the DB connection pool
+hard_ceil_combined = DB_POOL_MAXCONN - 3     # 3 reserved for scheduler + maintenance
+scan_ceil   = floor(hard_ceil_combined * 0.6)
+detail_ceil = floor(hard_ceil_combined * 0.4)
+
+scan_workers_start   = min(scan_workers_needed,   scan_ceil,   MONITOR_MAX_WORKERS)
+detail_workers_start = min(detail_workers_needed, detail_ceil, MONITOR_MAX_WORKERS)
 ```
 
-A throughput monitor runs every 30 minutes:
-- Queue depth growing → add workers (up to max)
-- Queue consistently empty → reduce workers (down to min of 2)
+Fallback when <7 days of `api_health` data: use `MONITOR_MAX_WORKERS` as the startup count for both pools.
+
+#### DB connection pool — combined ceiling, not independent
+
+Scan workers and detail workers share the same PostgreSQL connection pool. The ceiling must apply to their **combined** total. The 60/40 split is a starting point; the slow check recalculates the ratio based on observed queue drain rates each cycle.
+
+#### Three monitoring layers
+
+**Layer 1 — Liveness check (every scheduler tick, ~5 seconds)**
+
+```python
+for proc in all_worker_processes:
+    if not proc.is_alive():
+        spawn_replacement(proc.worker_type)   # immediate, no delay
+```
+
+Dead workers are replaced on the next tick — not at the next 5-minute or 30-minute check.
+
+**Layer 2 — Fast error check (every 5 minutes)**
+
+Reacts to error spikes that the semaphore alone cannot resolve (semaphore already at floor):
+
+```python
+for platform in active_platforms:
+    error_rate   = get_error_rate(r, platform)          # errwin sliding window
+    semaphore_at_floor = get_limit(r, platform) <= CONCURRENCY_FLOOR[platform]
+
+    if error_rate > CONCURRENCY_ERROR_RATE_REDUCE and semaphore_at_floor:
+        # Semaphore can't go lower — workers themselves are the variable
+        reduce_scan_workers(by=1)
+        deprioritise_platform_in_queue(platform)        # push its companies back
+        # Do NOT reduce below floor=2 or remaining_work_minimum, whichever is higher
+```
+
+Worker reduction is **platform-aware**: a Workday spike deprioritises Workday companies in `poll:adaptive` (pushes their scores forward by 300s) rather than killing workers that Greenhouse/Lever/Ashby companies still need.
+
+**Layer 3 — Slow throughput check (every 30 minutes)**
+
+```python
+# Recalculate ceiling from current state (handles mid-cycle company additions)
+scan_ceil   = floor((DB_POOL_MAXCONN - 3 - current_detail_workers) * 0.6)
+detail_ceil = floor((DB_POOL_MAXCONN - 3 - current_scan_workers)   * 0.4)
+
+# Scan worker adjustment
+if scan_queue_growing for 2 consecutive checks:
+    if detail_queue_depth < DETAIL_QUEUE_HIGH_WATERMARK:
+        add_scan_worker()       # production can increase safely
+    else:
+        add_detail_worker()     # drain backlog first, don't add more production
+
+if scan_queue_empty for 2 consecutive checks:
+    remove_scan_worker(floor=max(2, remaining_work_minimum))
+
+# Detail worker adjustment
+if detail_queue_growing for 2 consecutive checks:
+    add_detail_worker()
+
+if detail_queue_empty for 2 consecutive checks:
+    remove_detail_worker(floor=2)
+
+# Cascade: detail ceiling reached AND queue still growing → slow production
+if detail_workers == detail_ceil and detail_queue_still_growing for 2 checks:
+    remove_scan_worker()        # reduce production to match consumption capacity
+```
+
+The **2-consecutive-checks hysteresis** on every add/remove decision prevents thrashing — a single noisy measurement never triggers an action.
+
+`remaining_work_minimum` is recalculated on every slow check:
+```python
+remaining_companies = companies not yet polled this cycle
+remaining_window_s  = seconds until 6 AM
+remaining_work_minimum = ceil((remaining_companies * avg_listing_scan_s) / remaining_window_s)
+```
+The floor shrinks naturally as the day progresses and work completes.
+
+#### Pace mismatch — scan workers producing faster than detail workers consume
+
+One listing scan (~3s) can produce N new jobs for the detail queue in the time a detail worker processes one job (~2s). Left uncoordinated, the detail queue grows permanently.
+
+The full cascade:
+```
+detail queue growing             → add detail worker (first response)
+detail workers at ceil           → do not add scan workers (stop increasing production)
+detail at ceil + queue growing × 2 checks → remove scan worker (slow production)
+errors subside, queues balanced  → both pools recover via slow check
+```
+
+The hard backpressure threshold (`DETAIL_QUEUE_MAX_ADAPTIVE = 5000`) remains as the **emergency brake** — listing scans are delayed 30s when the queue exceeds this depth. Normal operation never reaches it because the cascade above intervenes earlier.
+
+#### Graceful shutdown and mid-cycle worker removal
+
+**Scheduler shutdown (SIGTERM)**
+
+Each worker process receives a `multiprocessing.Event` at spawn. On full scheduler shutdown, all events are set simultaneously. Workers complete their current scan/detail fetch, flush `api_health`, and exit cleanly. Forced SIGKILL after `WORKER_SHUTDOWN_TIMEOUT_S` (30s) for stragglers.
+
+**Error-triggered worker removal (mid-cycle)**
+
+When `_fast_error_check_loop` removes a worker due to platform errors, that worker may be mid-scan when the shutdown event fires. Simply exiting would orphan the company — it was already popped from `SCAN_QUEUE` and removed from `poll:adaptive`, so it exists nowhere. Re-queuing it with `score=now` would be worse: the worker was removed precisely because the ATS is struggling, and an immediate re-dispatch would hammer it again.
+
+The correct behaviour: re-queue with an exponential backoff delay.
+
+The worker checks the shutdown event **after the BLPOP returns but before starting the scan** — the earliest safe checkpoint:
+
+```python
+item = r.blpop(SCAN_QUEUE, timeout=WORKER_BLOCK_SECS)
+if item and shutdown_event.is_set():
+    _, raw   = item
+    company  = json.loads(raw)["company"]
+    delay    = _get_backoff_delay(r, company, op_type="scan")
+    r.zadd(REDIS_POLL_ADAPTIVE, {company: time.time() + delay})
+    logger.info("scan_worker: shutdown re-queue %r with +%ds backoff", company, delay)
+    break
+```
+
+For scans already in progress (past the BLPOP checkpoint), the shutdown event is checked at each **page boundary** inside `_run_listing_scan()`. If set: partial results are discarded, the company is re-queued with backoff, and the worker exits. Partial results are never committed — a full clean re-scan on recovery is safer than a partial write to the DB.
+
+See Section 18 (Exponential Backoff) for the backoff formula and Redis key structure.
+
+---
+
+#### Per-DC dispatch throttling — platform-isolated load control
+
+Worker removal affects all platforms equally since workers are not platform-specific. Reducing total worker count to protect Workday also slows Greenhouse/Lever dispatching — unnecessary when those platforms are healthy.
+
+The correct isolation: track **in-flight scans per platform/DC** and throttle at dispatch time, not at worker-count level.
+
+**In-flight tracking (drift-proof ZSET)**
+
+A Redis sorted set per platform/DC (score = dispatch timestamp) tracks active scans:
+
+```
+ZADD inflight:scans:{dc_key}  {now}  {company}    # adaptive_loop: on dispatch
+ZREM inflight:scans:{dc_key}  {company}            # on_adaptive_complete: on result
+```
+
+Before reading the count: `ZREMRANGEBYSCORE inflight:scans:{dc_key} 0 {now-600}` removes stale entries from crashed workers (auto-cleanup after 10 min = 2× max scan timeout). Counter drift from worker crashes is impossible.
+
+**Dispatch throttle check**
+
+`adaptive_loop` checks the ceiling before dispatching any company:
+
+```python
+dc_key   = get_platform_key(company)   # e.g. workday_wd12, greenhouse
+inflight = count_inflight(r, dc_key)   # ZCARD after stale cleanup
+ceiling  = r.get(f"worker:ceil:learned:{dc_key}")
+
+if ceiling and inflight >= int(ceiling):
+    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})   # hold briefly, retry next tick
+    continue
+```
+
+A Workday DC12 ceiling has **zero effect** on Greenhouse or Lever dispatching. Each DC key is fully independent.
+
+**Learned ceiling — empirical discovery**
+
+The safe in-flight ceiling for each DC is discovered by observing what caused errors and stored permanently in Redis:
+
+```
+worker:ceil:learned:{dc_key}      # max safe concurrent scans (int, no TTL)
+worker:ceil:last_error:{dc_key}   # Unix ts of last error-triggered event
+```
+
+Set when `_fast_error_check_loop` triggers a reduction for that platform. The in-flight count at the moment errors peaked = ceiling + 1, so:
+
+```python
+ceiling = max(WORKER_FLOOR, current_inflight - 1)
+r.set(f"worker:ceil:learned:{dc_key}", ceiling)
+r.set(f"worker:ceil:last_error:{dc_key}", now)
+```
+
+**If no ceiling key exists for a platform**: that platform has never triggered error-based throttling. The only limit is server capacity (`DB_POOL_MAXCONN - 3`). Ceilings are never pre-configured — only discovered.
+
+**Decay — gradual capacity re-testing**
+
+Learned ceilings never expire (ATS capacity changes slowly) but inch upward after sustained clean operation. Checked in `_slow_throughput_check_loop` every 30 minutes:
+
+```python
+last_error = float(r.get(f"worker:ceil:last_error:{dc_key}") or 0)
+if now - last_error > 86400:   # 24h without a new error event
+    new_ceil = min(current_ceil + 1, MONITOR_MAX_WORKERS)
+    r.set(f"worker:ceil:learned:{dc_key}", new_ceil)
+    logger.info("ceil:learned relaxed: %r → %d", dc_key, new_ceil)
+```
+
+The ceiling probes upward +1 per 24h clean window. If the higher count triggers errors, it drops back immediately and the decay clock resets. The system converges on the true safe maximum without manual tuning.
+
+The ceiling is clamped: `max(WORKER_FLOOR, ceiling)` — never stored below the redundancy minimum.
+
+**Scaling lock — preventing fast/slow loop conflicts**
+
+`_fast_error_check_loop` (5 min) and `_slow_throughput_check_loop` (30 min) run on independent timers and can conflict: fast check reduces workers due to errors while slow check simultaneously sees a backlog and adds them back.
+
+After any error-triggered action, the fast check sets:
+```
+worker:scaling_lock:{platform}    TTL = WORKER_SLOW_CHECK_INTERVAL_S (30 min)
+```
+The slow throughput check skips scale-up for any platform with an active scaling lock, preventing it from immediately undoing a deliberate error-driven reduction.
+
+---
+
+#### ATS outage detection
+
+Worker reduction resolves concurrency-induced errors. But if the ATS is experiencing an outage, no amount of reduction helps — errors persist regardless of request volume. Continuing to reduce workers starves other healthy platforms unnecessarily.
+
+**Detection: consecutive ineffective reductions**
+
+Before every worker reduction, snapshot the current state:
+```
+worker:reduction:before_rate:{platform}    # error_rate at time of reduction
+worker:reduction:ts:{platform}             # timestamp of reduction
+```
+
+At the next fast check (5 min later): if `current_error_rate < CONCURRENCY_ERROR_RATE_REDUCE`, the reduction worked — record the learned ceiling, reset the counter. If still high, increment:
+```
+worker:consec_reductions:{platform}    TTL = 3600 (auto-clears after 1h)
+```
+
+At `consec_reductions >= 3`: three reductions, errors still not improving. This is an ATS-level outage.
+
+**Outage mode — platform pause, workers untouched**
+
+```python
+r.set(f"worker:outage:{platform}", "1", ex=3600)   # 60-min dispatch pause
+```
+
+In `adaptive_loop`: companies for a platform in outage mode are skipped and pushed forward by the remaining outage TTL. Workers are **not** reduced further — they continue serving all other healthy platforms at full capacity.
+
+**Canary probe — early recovery detection**
+
+At 30 minutes into the outage window, one canary request is sent for that platform:
+- **Success** → exit outage mode immediately (delete the flag), resume normal dispatch
+- **Failure** → reset the TTL to 3600s (full 60-min extension), increase outage backoff
+
+This prevents a full 60-min blackout when the ATS actually recovered after 20 minutes.
+
+**Scheduler restart during outage**
+
+`worker:outage:{platform}` is a TTL key — a restart mid-outage inherits the remaining window from Redis automatically. `calculate_worker_counts()` excludes companies from platforms in outage mode when estimating today's workload, so over-spawning idle workers is avoided.
 
 ---
 
@@ -789,7 +1123,9 @@ A company that has been silent for 3 months (score ≈ 0, interval = 24 hours) s
 
 ### How reactivation works with asymmetric smoothing
 
-Because we use asymmetric smoothing (no dampening when interval is dropping), reactivation is **immediate** rather than gradual:
+Because we use asymmetric smoothing (no dampening when interval is dropping), reactivation is **immediate** rather than gradual.
+
+> **Note:** The walkthrough below uses `DEFAULT_THRESHOLDS` (`low=1.5, moderate=3.5, active=6.0`) for illustration. In production, `band_lookup` uses the daily-calibrated thresholds from the portfolio distribution (Section 6). The exact interval values will differ, but the asymmetric smoothing behaviour — immediate drop on reactivation — is identical regardless of which thresholds are in use.
 
 ```
 State: dormant company, 3 months silent
@@ -1330,7 +1666,7 @@ Status flow:
 'digested'       → included in digest email
 ```
 
-#### `api_health` — Request tracking with error sub-types
+#### `api_health` — Request tracking with error sub-types and request context
 
 ```sql
 -- Replace single requests_error column with four sub-types (Fix 1)
@@ -1344,6 +1680,91 @@ ALTER TABLE api_health
     ADD COLUMN IF NOT EXISTS requests_other_err INTEGER DEFAULT 0;
     -- parse failures, unexpected responses
 ```
+
+**Phase 10 — `context` column (baseline distortion prevention)**
+
+When a company is in exponential backoff or a platform is in outage/canary mode, the requests made during that period are unusual by design — they are either test probes or heavily throttled retries, not representative of normal ATS behaviour. Including them in the 30-day baseline would drag the "normal" error rate upward, making the spike_factor insensitive to genuine concurrency spikes.
+
+Fix: tag every request with its operational context at write time.
+
+```sql
+ALTER TABLE api_health
+    ADD COLUMN IF NOT EXISTS context TEXT NOT NULL DEFAULT 'normal';
+    -- 'normal'  → standard polling (counts toward baseline)
+    -- 'backoff' → request made while company/platform is in exponential backoff
+    -- 'canary'  → single test request sent during an outage window
+```
+
+`record_request()` in `db/api_health.py` accepts an optional `context` parameter (default `'normal'`). Callers:
+
+| Call site | context value |
+|---|---|
+| Normal adaptive poll / detail fetch | `'normal'` (default — no change needed) |
+| Request made while `retry:backoff:{op}:{company}` is set | `'backoff'` |
+| Canary probe during `worker:outage:{platform}` | `'canary'` |
+
+`query_30day_avg_error_rate()` and `query_30day_avg_response_ms()` both filter `WHERE context = 'normal'` so baselines are computed only from representative traffic. All contexts are still stored — the raw totals remain intact for full observability.
+
+**Response time columns — already tracked**
+
+`total_ms`, `max_response_ms`, and `avg_response_ms` are already present in the `api_health` schema and updated on every request (including errors and timeouts). `max_response_ms` uses `GREATEST()` to track the worst-case response across the day. `avg_response_ms` is recomputed as `total_ms / requests_made` after each write.
+
+Note: timeouts contribute their full elapsed duration (e.g. 30 000 ms) to `total_ms` and `max_response_ms`. This is intentional for the worker-count estimator in `calculate_worker_counts()` — a timed-out worker was genuinely occupied for that duration. A separate `total_ms_ok` column (successful requests only) was considered for a clean ATS-speed baseline, but deferred until real data is available to confirm whether the distortion is material in practice.
+
+---
+
+#### `worker_scaling_events` — Worker scaling decision audit log
+
+```sql
+CREATE TABLE worker_scaling_events (
+    id                    BIGSERIAL   PRIMARY KEY,
+    event_ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- What happened
+    event_type            TEXT        NOT NULL,
+    -- worker_add        : a worker process was spawned
+    -- worker_remove     : a worker process was removed (error-triggered or excess)
+    -- ceiling_learned   : learned ceiling updated for a DC key
+    -- outage_start      : 3 consecutive ineffective reductions → outage declared
+    -- canary_probe      : single test request sent during outage window
+    -- outage_end        : error rate recovered; outage mode cleared
+
+    -- Why it happened
+    trigger_layer         TEXT,
+    -- fast_error        : _fast_error_check_loop (5-min cycle)
+    -- slow_throughput   : _slow_throughput_check_loop (30-min cycle)
+    -- cascade           : detail queue full → scan worker removed
+    -- liveness          : dead worker replaced
+
+    -- Scope
+    platform              TEXT,         -- e.g. "workday", "greenhouse"; NULL = multi-platform
+    dc_key                TEXT,         -- e.g. "workday_wd12"; NULL when not DC-specific
+    worker_type           TEXT,         -- "scan" | "detail"; NULL for outage/canary events
+
+    -- Worker counts at the moment of the event
+    scan_workers_before   INTEGER,
+    scan_workers_after    INTEGER,
+    detail_workers_before INTEGER,
+    detail_workers_after  INTEGER,
+
+    -- Health signals that triggered the decision
+    error_rate            REAL,         -- current sliding-window rate (0.0–1.0)
+    baseline_error_rate   REAL,         -- 30-day baseline from api_health
+    spike_factor          REAL,         -- error_rate / (baseline + 0.001); NULL if no baseline
+    scan_queue_depth      INTEGER,      -- LLEN SCAN_QUEUE at decision time
+    detail_queue_depth    INTEGER,      -- LLEN DETAIL_QUEUE at decision time
+    inflight_count        INTEGER,      -- ZCARD inflight:scans:{dc_key} after stale cleanup
+    learned_ceiling       INTEGER,      -- value stored/read from worker:ceil:learned:{dc_key}
+    consec_reductions     INTEGER,      -- value of worker:consec_reductions:{platform}
+
+    notes                 TEXT          -- free-form debug annotation
+);
+
+CREATE INDEX wse_platform_ts ON worker_scaling_events (platform, event_ts DESC);
+CREATE INDEX wse_type_ts     ON worker_scaling_events (event_type,  event_ts DESC);
+```
+
+The table is **append-only** — no row is ever updated after insert. Write volume is very low (at most one event per 5-minute monitoring cycle per platform), so it uses a lightweight synchronous writer rather than the background queue used by `api_health`. See Section 22 for effectiveness query patterns.
 
 #### `adaptive_poll_metrics` — Daily per-company observability
 
@@ -1535,8 +1956,14 @@ Workers reconnect with exponential backoff. If Redis unreachable for > 2 minutes
 Worker heartbeat with 5-minute TTL. Watchdog process runs every 60 seconds:
 ```
 If heartbeat:{company} expired AND company not in poll queue:
-    → company orphaned → requeue with score=now
+    → company orphaned → re-queue with error-aware delay
 ```
+Re-queue delay is not a flat `score=now`. The watchdog checks the platform's current error rate:
+- `error_rate > CONCURRENCY_ERROR_RATE_REDUCE` → re-queue with exponential backoff delay (platform still struggling — immediate dispatch would repeat the failure)
+- `error_rate healthy` → re-queue with `score=now` (safe to retry immediately)
+
+This is the **last-resort** recovery path. Under normal operation, the graceful shutdown mechanism in `scan_worker.run_worker()` handles re-queuing before the heartbeat ever expires (see Section 9 — Graceful shutdown and mid-cycle worker removal).
+
 Applies to both adaptive workers and full scan workers.
 
 **Hung workers (stuck HTTP request or frozen between requests):**
@@ -1554,6 +1981,56 @@ from a worker frozen waiting on a dead DB connection (no progress updates).
 **Worker process killed by OS (OOM killer, SIGKILL):**
 Supervisor (systemd/supervisord) restarts worker processes automatically.
 Orphaned company detection catches any companies left in limbo.
+
+### Exponential backoff — per-company, per-operation type
+
+Re-queuing a failed company with `score=now` hammers the same endpoint again. Re-queuing with a flat 300s delay still repeats the failure at the same pace for persistent outages. Exponential backoff adapts the retry pace to the severity and duration of the problem.
+
+**Three independent counters** — a listing scan failure and a detail fetch failure are unrelated events (different endpoints, possibly different root causes):
+
+```
+retry:backoff:scan:{company}      TTL = 86400 (auto-expires overnight)
+retry:backoff:detail:{company}    TTL = 86400
+retry:backoff:fullscan:{company}  TTL = 86400
+```
+
+Each stores the **retry count** (int, 0-based). Delay formula:
+
+```python
+delay = min(WORKER_DEPRIORITISE_SECS * (2 ** retry_count), 3600)
+```
+
+| Retry | Delay |
+|-------|-------|
+| 0 (1st failure) | 300s  (5 min) |
+| 1               | 600s  (10 min) |
+| 2               | 1200s (20 min) |
+| 3               | 2400s (40 min) |
+| 4               | 3600s (1h — cap) |
+| 5+ (persistent) | 86400s (24h — give up for today) |
+
+The counter is **reset to 0** on any successful operation of that type (`r.delete(f"retry:backoff:{op_type}:{company}")`). The 86400s TTL means all counters expire overnight automatically — every company starts fresh at the next cycle without any explicit reset at `record_cycle_start()`.
+
+**Applies to all three operation types:**
+- **Scan**: listing scan failure or error-triggered worker removal → re-queue to `poll:adaptive`
+- **Detail**: detail fetch failure → re-queue to `queue:detail:adaptive`
+- **Full scan**: full scan failure → re-queue to `poll:fullscan`
+
+**Full scan suppressed during active scan backoff**
+
+`_should_trigger_full_scan()` checks `r.exists(f"retry:backoff:scan:{company}")`. If the scan backoff key exists, the full scan trigger is suppressed. A full scan makes significantly more requests than a listing scan — triggering one while the ATS is already struggling accelerates the problem.
+
+**Backoff and outage mode — take the maximum, not the sum**
+
+When a platform enters outage mode, companies are pushed forward by the outage TTL. Individual company backoff delays also exist from prior failures. The two are combined by taking the **maximum**:
+
+```python
+actual_delay = max(backoff_delay, outage_remaining_s)
+```
+
+This prevents double-stacking that would push companies unnecessarily into the next day's window.
+
+---
 
 ### PostgreSQL failures
 
@@ -1667,92 +2144,166 @@ cycle_start = eastern.localize(
 
 Hardcoded worker counts per ATS platform caused 32 `requests_error` spikes on Workday. The system was hammering Workday's servers with more concurrent requests than they could handle, producing 404s and connection errors that were indistinguishable from genuine API failures.
 
+A per-process `threading.Semaphore` only limits concurrency within a single process. With N `detail_worker` or `scan_worker` processes each honouring a local limit of L, the total actual concurrency is N×L — the limit is meaningless when workers scale. The fix requires a **cross-process distributed semaphore backed by Redis** so all workers share one global counter.
+
+### Central enforcement — `workers/http_client.py`
+
+All HTTP calls across every ATS module go through a single wrapper:
+
+```python
+# workers/http_client.py
+def ats_get(url, platform, dc_key=None, **kwargs) -> requests.Response:
+    """
+    Drop-in replacement for requests.get() used by all ATS modules.
+
+    1. Acquire distributed semaphore (Redis counter)
+    2. Make HTTP call with standard timeouts
+    3. Classify error type
+    4. Update errwin sliding window in Redis (per-request)
+    5. Record to api_health (PostgreSQL, background writer)
+    6. Run feedback loop to adjust limit
+    7. Release distributed semaphore
+    """
+```
+
+The `dc_key` parameter allows Workday callers to pass a DC-level key instead of the generic platform key, achieving per-DC rate limiting with no special-casing in the semaphore logic.
+
+### Distributed semaphore (Redis counter pair)
+
+For each concurrency key (platform or Workday DC key):
+
+```
+concurrency:active:{key}   ← current in-flight count  (INCR / DECR atomically)
+concurrency:limit:{key}    ← current allowed max       (written by feedback loop)
+```
+
+Before each HTTP call:
+```python
+active = r.incr(f"concurrency:active:{key}")
+limit  = int(r.get(f"concurrency:limit:{key}") or DEFAULT_LIMIT)
+if active > limit:
+    r.decr(f"concurrency:active:{key}")
+    # back off with jitter, retry up to MAX_RETRIES
+```
+
+After each HTTP call (success or failure):
+```python
+r.decr(f"concurrency:active:{key}")
+```
+
+This enforces the limit globally across all worker processes and machines. The Redis round-trip (~0.1 ms) is negligible against HTTP calls of 500–3000 ms.
+
 ### Sliding window rate tracking
 
-A 10-minute sliding window in Redis tracks 429s AND 404s per platform:
+A 10-minute sliding window in Redis is updated on **every single HTTP call**:
 
 ```
-Key: "errwin:{platform}:{10min_bucket}"
-Fields: total_requests, errors_429, errors_404
-
-error_rate = (errors_429 + errors_404) / total_requests (last 10 min)
+Key:    errwin:{key}:{bucket}      bucket = int(time.time() // 600)
+Fields: total_requests, errors_429, errors_404, errors_timeout, errors_5xx
+TTL:    1200s  (covers 2 buckets — current + previous)
 ```
 
-Both 429 (explicit rate limit) and 404 (Workday-specific overload response) are tracked because Workday returns 404 under concurrency overload rather than a standard 429.
+429 (explicit rate limit), 404 (Workday overload), timeout (concurrency queue overflow), and 5xx (server-side instability) are all tracked because each is an early signal of a different failure mode. See Section 20 for the diagnostic table.
+
+To read the current 10-min error rate, sum both buckets across all four error signals:
+```python
+def get_error_rate(r, key) -> float:
+    now    = int(time.time() // 600)
+    totals = {
+        "total_requests": 0,
+        "errors_429":     0,
+        "errors_404":     0,
+        "errors_timeout": 0,
+        "errors_5xx":     0,
+    }
+    for bucket in (now, now - 1):
+        raw = r.hgetall(f"errwin:{key}:{bucket}")
+        for field in totals:
+            totals[field] += int(raw.get(field, 0))
+    if totals["total_requests"] == 0:
+        return 0.0
+    errors = (totals["errors_429"] + totals["errors_404"]
+              + totals["errors_timeout"] + totals["errors_5xx"])
+    return errors / totals["total_requests"]
+```
 
 ### Feedback loop
 
-After each request batch, the concurrency controller adjusts:
+Runs inside `ats_get()` after every HTTP call — no batch delay, no lag:
 
 ```python
-def adjust_concurrency(platform, error_rate):
-    current = get_semaphore_count(platform)
+def adjust_concurrency(r, key, error_rate):
+    current = int(r.get(f"concurrency:limit:{key}") or DEFAULT_LIMIT)
     
     if error_rate > 0.10:    # >10% errors → reduce concurrency
-        new_count = max(current - 1, platform_min[platform])
+        new_limit = max(current - 1, CONCURRENCY_FLOOR[key])
     elif error_rate < 0.02:  # <2% errors → cautiously increase
-        new_count = min(current + 1, platform_max[platform])
+        new_limit = min(current + 1, CONCURRENCY_CEIL[key])
     else:
-        new_count = current  # stable range, no change
+        new_limit = current  # stable range, no change
     
-    set_semaphore_count(platform, new_count)
+    if new_limit != current:
+        r.set(f"concurrency:limit:{key}", new_limit)
 ```
+
+`CONCURRENCY_FLOOR` and `CONCURRENCY_CEIL` are per-platform constants in `config.py`. The floor ensures the system never reaches zero concurrency (minimum 1).
 
 ### Workday DC-level semaphores
 
 Workday uses regional data centers. Requests to different companies may hit different DCs, each with its own rate limits.
 
-DC key is discovered dynamically from `prospective_companies` table — NOT hardcoded:
+DC keys are discovered from the `ats_slug` JSON field in `prospective_companies` — NOT from a `career_page_url` column (which does not exist). The `wd` field in the slug JSON contains the DC identifier directly:
+
+```json
+{"slug": "salesforce", "wd": "wd12", "path": "External_Career_Site"}
+```
 
 ```python
-def _extract_workday_dc_key(career_url):
+def _extract_workday_dc_key(ats_slug: dict) -> str:
     """
-    Extract DC identifier from Workday URL.
-    Handles both myworkdayjobs.com and workdaysites.com variants.
-    
+    Extract DC identifier from the parsed ats_slug JSON for a Workday company.
+
+    The 'wd' field contains the data-center suffix already parsed at
+    ATS detection time.
+
     Examples:
-      https://amazon.myworkdayjobs.com/en-US/...   → "myworkdayjobs_wd5"
-      https://nike.wd1.myworkdayjobs.com/...        → "myworkdayjobs_wd1"
-      https://company.workdaysites.com/...          → "workdaysites_wd3"
+      {"wd": "wd1",  ...}  →  "workday_wd1"
+      {"wd": "wd12", ...}  →  "workday_wd12"
+      {}                   →  "workday_default"
     """
-    import re
-    
-    # Pattern: optional wd{N} subdomain in myworkdayjobs URLs
-    m = re.search(r'(wd\d+)\.myworkdayjobs\.com', career_url)
-    if m:
-        return f"myworkdayjobs_{m.group(1)}"
-    
-    if 'myworkdayjobs.com' in career_url:
-        return "myworkdayjobs_default"
-    
-    m = re.search(r'(wd\d+)\.workdaysites\.com', career_url)
-    if m:
-        return f"workdaysites_{m.group(1)}"
-    
-    if 'workdaysites.com' in career_url:
-        return "workdaysites_default"
-    
-    return None
+    wd = ats_slug.get("wd")
+    if wd:
+        return f"workday_{wd}"
+    return "workday_default"
 ```
 
 At startup, DC keys are discovered by querying the DB:
 ```python
-def discover_workday_dc_keys():
+def discover_workday_dc_keys() -> set:
     rows = db.execute("""
-        SELECT DISTINCT career_page_url FROM prospective_companies
+        SELECT DISTINCT ats_slug FROM prospective_companies
         WHERE ats_platform IN ('workday', 'workdaysites')
+          AND ats_slug IS NOT NULL
     """).fetchall()
-    
+
     dc_keys = set()
     for row in rows:
-        key = _extract_workday_dc_key(row["career_page_url"])
-        if key:
-            dc_keys.add(key)
-    
-    return dc_keys   # e.g. {"myworkdayjobs_wd1", "myworkdayjobs_wd5", "workdaysites_wd3"}
+        try:
+            slug = json.loads(row["ats_slug"])
+            dc_keys.add(_extract_workday_dc_key(slug))
+        except (json.JSONDecodeError, TypeError):
+            dc_keys.add("workday_default")
+
+    return dc_keys   # e.g. {"workday_wd1", "workday_wd5", "workday_wd12"}
 ```
 
-Each discovered DC key gets its own semaphore, starting at a conservative default and adjusting dynamically via the feedback loop.
+Each discovered DC key gets its own Redis semaphore pair, starting at a conservative default (`CONCURRENCY_WORKDAY_DEFAULT = 3`) and adjusting dynamically via the feedback loop.
+
+For scan_worker and detail_worker, Workday calls pass `dc_key` from `ats_slug["wd"]` to `ats_get()`. Non-Workday platforms pass only `platform`.
+
+### Scope
+
+Both `scan_worker` (listing fetches) and `detail_worker` (detail fetches) go through `ats_get()`. All ATS modules replace direct `requests.get()` calls with `ats_get()`. This ensures the limit is enforced regardless of which worker type is making the request.
 
 ---
 
@@ -1793,29 +2344,90 @@ def classify_error(exception):
 
 **Why timeout is a concurrency signal:** When too many parallel requests are sent, the server queues them. Queued requests exceed their timeout. Timeouts are the first symptom of concurrency overload — before 429s, before 5xxs.
 
-### Fix 2 — Baseline deviation detection
+### Fix 2 — Baseline deviation detection (real-time, Redis-cached)
 
-Compare today's error rate against the 30-day historical baseline:
+The errwin sliding window tracks **four error signals**, not just 429 and 404:
 
-```python
-def is_concurrency_induced_error(platform):
-    today_rate    = get_todays_error_rate(platform)
-    baseline_rate = get_30day_avg_error_rate(platform)
-    spike_factor  = today_rate / (baseline_rate + 0.001)
-    return spike_factor > 5   # 5x above 30-day baseline = concurrency problem
+```
+Key:    errwin:{key}:{bucket}
+Fields: total_requests, errors_429, errors_404, errors_timeout, errors_5xx
 ```
 
-Used together:
+Timeouts are included because they are the **earliest** concurrency signal — they appear before 429s or 5xxs when the server is overloaded. The aggregate error rate in the feedback loop becomes:
+
+```python
+error_rate = (errors_429 + errors_404 + errors_timeout + errors_5xx) / total_requests
+```
+
+The 30-day historical baseline is computed from `api_health` and **cached in Redis at `baseline:error_rate:{platform}`** with a 1-hour TTL. This makes it available for real-time feedback loop decisions without a PostgreSQL query on every request.
+
+```python
+def get_baseline_error_rate(r, platform) -> float:
+    """
+    Return 30-day avg error rate for a platform.
+    Read from Redis cache (1h TTL); refresh from api_health on miss.
+    Returns 0.0 if fewer than 7 days of history exist (cold start).
+    """
+    cached = r.get(f"baseline:error_rate:{platform}")
+    if cached is not None:
+        return float(cached)
+    # Cache miss — query PostgreSQL and re-cache
+    rate = query_30day_avg_error_rate(platform)    # from api_health
+    r.set(f"baseline:error_rate:{platform}", rate, ex=3600)
+    return rate
+```
+
+**Safe fallback:** if fewer than 7 days of `api_health` data exist for a platform, `get_baseline_error_rate()` returns 0.0 and the feedback loop skips the spike_factor check entirely — falling back to the raw error_rate threshold only. This prevents a cold-start platform from triggering aggressive reduction on its first day of errors.
+
+**Baseline purity — `context` column filtering**
+
+Managed-error requests (backoff retries, canary probes) have artificially high error rates by design. Including them in the 30-day baseline would make normal variance appear larger, raising the threshold at which a real spike is detected.
+
+`query_30day_avg_error_rate()` therefore filters `WHERE context = 'normal'` — only requests made under normal operating conditions count toward the baseline. Backoff and canary requests are still stored (all contexts persisted for observability) but excluded from the calculation:
+
+```sql
+SELECT
+    SUM(requests_timeout + requests_5xx + requests_429 + requests_404) AS total_errors,
+    SUM(requests_made)                                                  AS total_requests
+FROM api_health
+WHERE platform = ?
+  AND date >= ?
+  AND context = 'normal'       -- exclude backoff and canary requests
+  AND requests_made > 0
+```
+
+The feedback loop in `ats_get()` uses both signals together:
+
+```python
+error_rate   = get_error_rate(r, key)        # errwin: last 10 minutes
+baseline     = get_baseline_error_rate(r, platform)
+spike_factor = error_rate / (baseline + 0.001)
+
+if error_rate > CONCURRENCY_ERROR_RATE_REDUCE:
+    if spike_factor > 5:
+        # Anomalous spike above historical baseline → concurrency-induced
+        # Aggressive: drop by 2 (or to floor if only 1 step away)
+        new_limit = max(current - 2, floor)
+    else:
+        # High error rate but within historical norms → cautious reduction
+        new_limit = max(current - 1, floor)
+elif error_rate < CONCURRENCY_ERROR_RATE_INCREASE:
+    new_limit = min(current + 1, ceil)
+```
+
+**Why spike_factor matters:** a platform with a 5% historical error rate hitting 8% today is normal variance — no action. A platform with a 0.2% historical rate hitting 8% today is a 40× spike — almost certainly concurrency-induced. The raw threshold treats both identically; the spike_factor distinguishes them.
+
+Used together for diagnosis:
 
 | Error sub-type | Spike factor | Diagnosis | Action |
 |---|---|---|---|
-| `requests_timeout` | > 5x | Concurrency overload | Reduce semaphore count |
-| `requests_5xx` | > 5x | Soft rate limit | Reduce concurrency + add delay |
-| `requests_conn_err` | > 5x | Network issue | Check connectivity, not concurrency |
-| `requests_other_err` | > 5x | API structure changed | Check `custom_ats_diagnostics` |
-| Any type | ≤ 5x baseline | Normal noise | No action needed |
+| `errors_timeout` | > 5× | Concurrency overload — server queueing requests | Reduce semaphore + reduce workers (if at floor) |
+| `errors_5xx` | > 5× | Soft rate limit or server instability | Reduce semaphore + add delay |
+| `errors_conn_err` | > 5× | Network issue — not concurrency | Check connectivity, not concurrency |
+| `errors_other` | > 5× | API structure changed | Check `custom_ats_diagnostics` |
+| Any type | ≤ 5× baseline | Normal noise | No action needed |
 
-This is what makes the 32-error Workday spike diagnosable: all 32 were `requests_timeout`, spike factor was ~32x the baseline → concurrency-induced → fix was reducing parallel Workday workers, not investigating the API.
+This is what makes the 32-error Workday spike diagnosable: all 32 were `errors_timeout`, spike_factor was ~32× the baseline → concurrency-induced → fix was reducing parallel Workday workers, not investigating the API.
 
 ---
 
@@ -1834,17 +2446,7 @@ Bloom filters add ~4.5MB total across all 5,000 companies (trivial).
 
 ### Dynamic worker scaling
 
-Workers are not hardcoded. The required count is calculated at each 7 AM cycle:
-
-```python
-required_workers = ceil(
-    (total_companies × avg_scan_duration_s) / (23 × 3600)
-)
-max_workers = DB_POOL_MAXCONN - 3
-actual_workers = min(required_workers, max_workers)
-```
-
-Throughput monitor adjusts every 30 minutes based on actual queue drain rate.
+See Section 9 for the full two-pool design (scan workers + detail workers, co-scheduled, multiprocessing.Process, three monitoring layers, cascade backpressure, pace mismatch handling).
 
 **Graceful degradation:** Full scan queue is ordered score-ascending (dormant first). If workers can't finish all full scans before next 7 AM, active companies are the last to be skipped — and adaptive polling has already been covering them throughout the day.
 
@@ -1943,6 +2545,84 @@ FROM api_health
 GROUP BY platform, date;
 ```
 
+### Response time metrics
+
+`avg_response_ms`, `max_response_ms`, and `total_ms` are tracked per platform per day in `api_health` and updated on every request — including errors and timeouts. `max_response_ms` uses `GREATEST()` (updated on each write). `avg_response_ms` is recomputed as `total_ms / requests_made` after each write.
+
+Timeouts contribute their full elapsed wall-clock duration to both columns (e.g. a 30 s timeout → 30 000 ms). This is intentional for `calculate_worker_counts()`, which uses `avg_response_ms` as a proxy for how long a worker is actually occupied. A separate `total_ms_ok` column tracking only successful-request time was considered but deferred — the distortion from timeout inflation may be acceptable given that timed-out workers are genuinely busy for that duration, and splitting the column adds complexity with no confirmed benefit until real data is available.
+
+---
+
+### Worker scaling health — `worker_scaling_events` table
+
+Every decision made by the three monitoring layers is recorded in `worker_scaling_events` (see Section 16 schema). Because it is append-only, effectiveness is derived by querying adjacent events rather than updating rows.
+
+**Did a worker removal actually fix the problem?**
+
+```sql
+WITH reductions AS (
+    SELECT id, event_ts, platform, error_rate AS rate_before
+    FROM worker_scaling_events
+    WHERE event_type = 'worker_remove'
+),
+next_check AS (
+    SELECT r.id, MIN(e2.error_rate) AS rate_after
+    FROM reductions r
+    JOIN worker_scaling_events e2
+      ON e2.platform = r.platform
+     AND e2.event_ts BETWEEN r.event_ts + INTERVAL '4 min'
+                         AND r.event_ts + INTERVAL '11 min'
+    GROUP BY r.id
+)
+SELECT
+    r.platform,
+    r.event_ts,
+    ROUND(r.rate_before * 100, 1)  AS error_pct_before,
+    ROUND(n.rate_after  * 100, 1)  AS error_pct_after,
+    CASE WHEN n.rate_after < r.rate_before * 0.7
+         THEN 'effective' ELSE 'ineffective' END AS outcome
+FROM reductions r
+LEFT JOIN next_check n USING (id)
+ORDER BY r.event_ts DESC;
+```
+
+**Weekly summary — reductions per platform, escalation rate**
+
+```sql
+SELECT
+    platform,
+    DATE_TRUNC('week', event_ts)                                      AS week,
+    COUNT(*) FILTER (WHERE event_type = 'worker_remove')              AS reductions,
+    COUNT(*) FILTER (WHERE event_type = 'outage_start')               AS outages,
+    ROUND(AVG(error_rate) FILTER (
+        WHERE event_type = 'worker_remove') * 100, 1)                 AS avg_error_pct_at_reduction
+FROM worker_scaling_events
+GROUP BY platform, week
+ORDER BY week DESC, platform;
+```
+
+**Average outage duration**
+
+```sql
+SELECT
+    s.platform,
+    ROUND(AVG(EXTRACT(EPOCH FROM (e.event_ts - s.event_ts)) / 60)) AS avg_outage_min
+FROM worker_scaling_events s
+JOIN LATERAL (
+    SELECT event_ts FROM worker_scaling_events
+    WHERE platform  = s.platform
+      AND event_type = 'outage_end'
+      AND event_ts   > s.event_ts
+    ORDER BY event_ts LIMIT 1
+) e ON true
+WHERE s.event_type = 'outage_start'
+GROUP BY s.platform;
+```
+
+These queries feed directly into the weekly adaptive health report below.
+
+---
+
 ### Weekly adaptive health report
 
 Included in Monday digest:
@@ -1971,6 +2651,12 @@ ERROR HEALTH
   Workday timeouts:         2       ✓  (baseline 1.8, ratio 1.1x — normal)
   iCIMS 5xx errors:         0       ✓
   Greenhouse conn errors:   0       ✓
+
+WORKER SCALING (from worker_scaling_events)
+  Total reductions:         3       workday×2, greenhouse×1
+  Effective reductions:     3/3     ✓  (error rate dropped >30% within 10 min)
+  Outages triggered:        0       ✓
+  Avg response time:      412 ms    workday (baseline 380 ms — within normal range)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -2050,31 +2736,40 @@ ERROR HEALTH
 
 ### Phase 8 — Per-ATS Dynamic Concurrency
 
-**What:** 10-minute sliding window for 429 + 404 per platform. Feedback loop adjusting semaphores. Workday DC-level semaphores discovered dynamically from DB. `_extract_workday_dc_key()` handling both myworkdayjobs and workdaysites variants.
+**What:** `workers/http_client.py` — central HTTP wrapper used by all ATS modules replacing direct `requests.get()` calls. Redis distributed semaphore (counter pair `concurrency:active:{key}` / `concurrency:limit:{key}`) enforced cross-process. Per-request 10-minute sliding window (`errwin:{key}:{bucket}`) for 429 + 404 tracking. Feedback loop adjusting limit after every call. Workday DC-level semaphores keyed from `ats_slug["wd"]` (not career URL). `discover_workday_dc_keys()` queries `prospective_companies.ats_slug` at startup.
 
-**Deliverable:** No more concurrency-induced error spikes. Workday per-DC rate limiting.
+**Deliverable:** No more concurrency-induced error spikes. Workday per-DC rate limiting. Limit enforced globally across all worker processes.
 
 **Estimated effort:** 2 days
 
 ---
 
-### Phase 9 — Error Type Differentiation
+### Phase 9 — Error Type Differentiation + Dynamic Worker Scaling
 
-**What:** Replace `requests_error` with four sub-type columns. Baseline deviation function (30-day average). Per-platform error classification at call site. Weekly health report updated.
+**What (error differentiation):** Fix 1 already complete (4 sub-type columns, `classify_error()`, wired through `ats_get()`). Fix 2: extend `errwin` sliding window to track `errors_timeout` and `errors_5xx` in addition to 429 + 404. Baseline error rate cached in Redis (`baseline:error_rate:{platform}`, 1h TTL) from 30-day `api_health` average. Feedback loop in `ats_get()` uses spike_factor (anomalous vs normal variance) to choose aggressive vs cautious concurrency reduction. Safe fallback when <7 days history: skip spike_factor, use raw error_rate only.
 
-**Deliverable:** Concurrency-induced errors distinguishable from genuine API failures.
+**What (dynamic worker scaling):** Replace fixed thread pools with `multiprocessing.Process` worker pools managed by the scheduler. Both scan and detail worker pools calculated at 7 AM from historical averages — not starting at minimum. Three monitoring layers: (1) liveness check every tick (dead worker replaced immediately), (2) fast error check every 5 min (error-triggered worker reduction, platform-aware deprioritisation), (3) slow throughput check every 30 min (queue-depth-driven scaling with 2-consecutive-checks hysteresis). Cascade backpressure: detail queue growing → add detail workers first; detail at ceiling → stop adding scan workers; detail at ceiling + queue still growing → reduce scan workers. DB pool split proportionally between pools (combined ≤ DB_POOL_MAXCONN - 3). Graceful shutdown via `multiprocessing.Event`.
 
-**Estimated effort:** 1–2 days
+**Deliverable:** Concurrency-induced errors distinguishable from genuine API failures. Worker count self-adjusts from a data-driven starting point and heals under load, including detail/scan pace mismatch.
+
+**Estimated effort:** 3–4 days
 
 ---
 
-### Phase 10 — Resilience Hardening
+### Phase 10 — Adaptive ATS Protection + Resilience Hardening
 
-**What:** Redis `noeviction` policy. Watchdog for orphaned companies. Progress heartbeat for hung worker detection. Cron chain heartbeat + `db:maintenance` flag. `cronchain:alive` auto-resume on expiry. All-ATS failure correlation check. Bloom filter corruption detection.
+**What (ATS protection — Section 9):**
+Exponential backoff for all operation types (scan, detail, fullscan): 300s → 600s → 1200s → 2400s → 3600s → 86400s. Error-triggered worker removal re-queues in-progress company to `poll:adaptive` with backoff delay, not `score=now`. Shutdown event checked after BLPOP and at each page boundary in `_run_listing_scan()`. Per-DC in-flight scan tracking via Redis ZSET (drift-proof: stale-entry auto-cleanup after 10 min). Platform-isolated dispatch throttling in `adaptive_loop` — Workday DC ceiling has zero effect on Greenhouse/Lever. Per-DC learned ceiling (`worker:ceil:learned:{dc_key}`) discovered empirically, stored in Redis indefinitely, decays +1 per 24h of clean operation. ATS outage detection: 3 consecutive ineffective worker reductions → 60-min dispatch pause via `worker:outage:{platform}`. Canary probe at 30-min mark for early recovery. Scaling lock (`worker:scaling_lock:{platform}`) prevents slow throughput check from undoing fast error check interventions. Full scan suppressed while scan backoff is active. Watchdog orphan re-queue updated to use error-rate-aware delay instead of `score=now`.
 
-**Deliverable:** System degrades gracefully under all identified failure modes.
+**What (observability — Sections 16 and 22):**
+`context` column added to `api_health` (`normal` | `backoff` | `canary`). Baseline queries (`query_30day_avg_error_rate`, `query_30day_avg_response_ms`) filter `WHERE context = 'normal'` so managed-error periods do not inflate the historical baseline. `record_request()` accepts an optional `context` parameter; all call sites default to `'normal'` with no change needed unless in backoff or canary path. New `worker_scaling_events` table records every scaling decision (worker add/remove, outage start/end, canary probe, ceiling learned) with full health-signal context. Used for weekly health report and post-incident effectiveness analysis.
 
-**Estimated effort:** 2–3 days
+**What (resilience hardening):**
+Redis `noeviction` policy. Progress heartbeat for hung worker detection. `cronchain:alive` auto-resume on expiry. All-ATS failure correlation check. Bloom filter corruption detection.
+
+**Deliverable:** System never re-hits a known ATS rate limit from scratch. Failed companies back off exponentially and recover proportionally. ATS outages are isolated — healthy platforms continue at full throughput while the affected platform pauses. Every scaling decision is queryable: did reducing workers actually improve error rate, how quickly, how often does it escalate to an outage?
+
+**Estimated effort:** 3–4 days
 
 ---
 
@@ -2114,7 +2809,7 @@ ERROR HEALTH
 
 **Listing fetch:** Fetching just job IDs and metadata. Much faster than detail fetches.
 
-**MAX_INTERVAL / Tier 2 cap:** Score-tiered ceiling on adaptive intervals. 4h for active, 12h for moderate, 24h for dormant companies.
+**MAX_INTERVAL / Tier 2 cap:** Score-tiered ceiling on adaptive intervals. 6h for companies at or above the calibrated `moderate` threshold (top 25% of active portfolio); 12h for all others. The cap boundary adjusts automatically with daily band calibration.
 
 **miss_rate:** `tier2_new_jobs / total_new_jobs`. The headline metric for adaptive polling effectiveness.
 
@@ -2128,7 +2823,13 @@ ERROR HEALTH
 
 **Redis:** Fast in-memory database for the poll queues, seen_ids, rate limiters, and detail queues. Rebuilt from PostgreSQL on restart — not the source of truth.
 
-**Score:** The weighted average of `recent_poll_counts` for a company (0 to 10+). Higher = post more jobs = poll more frequently.
+**Score:** The recency-weighted average of `recent_poll_counts` for a company (0.0 to 10+). Higher = posts more jobs = polls more frequently. A score of 0.0 means either insufficient poll history (< 3 polls) or no new jobs found across the entire rolling window — both result in the default 12h interval. Companies with score > 0 are ranked against each other via daily band calibration.
+
+**Band calibration:** The daily process that computes `low`, `moderate`, and `active` score thresholds from the real distribution of `adaptive_score` values across the live portfolio. Run at cycle start and scheduler startup. Replaces hardcoded absolute thresholds with rank-based boundaries that reflect actual portfolio activity levels. Stored in Redis under `adaptive:band_thresholds`.
+
+**DEFAULT_THRESHOLDS:** The fallback band thresholds used before the first band calibration runs (cold start or portfolio smaller than 5 active companies). Values: `low=1.5, moderate=3.5, active=6.0` — matches the original hardcoded design so behaviour is unchanged until real data is available.
+
+**Winsorization:** Statistical technique used during band calibration. The top 5% of scores are replaced with the 95th-percentile value before computing rank boundaries. Prevents one extreme outlier (a company on a mass-hiring spike) from shifting thresholds upward and unintentionally demoting all other companies to slower polling intervals.
 
 **Score-ascending order:** Full scan scheduling where dormant companies (low score) are processed first. Ensures active companies (already covered by adaptive) are last if workers run out of time.
 
@@ -2142,6 +2843,34 @@ ERROR HEALTH
 
 **Two-tier detail queue:** `queue:detail:adaptive` (high priority) and `queue:detail:fullscan` (low priority). Workers drain adaptive first.
 
+**Pace mismatch:** The condition where scan workers produce new jobs into `queue:detail:adaptive` faster than detail workers can drain it. Resolved by the slow throughput check cascade: add detail workers first; if detail pool is at ceiling, stop adding scan workers; if detail queue still growing, reduce scan workers.
+
+**Spike_factor:** `error_rate / (baseline_rate + 0.001)`. Measures how anomalous today's error rate is relative to the 30-day historical average. > 5× = concurrency-induced (aggressive reduction). ≤ 5× = normal variance (no action or cautious reduction).
+
+**Liveness check:** Per-tick (5s) `process.is_alive()` check on all managed worker processes. Dead workers are replaced immediately — not at the next 5-minute or 30-minute monitoring interval.
+
+**Hysteresis:** Requiring 2 consecutive check intervals showing the same signal before acting on it. Prevents thrashing (add worker → errors spike → remove worker → queue grows → add worker → loop).
+
 **Weighted queue:** The 5-element `recent_poll_counts` array with recency-biased weights `[0.10, 0.15, 0.20, 0.25, 0.30]`. Replaces the composite score formula from earlier designs.
 
-**Watchdog:** Background process checking for expired worker heartbeats. Requeues any orphaned companies.
+**Watchdog:** Background process checking for expired worker heartbeats. Re-queues orphaned companies using an error-rate-aware delay (backoff if the platform is still struggling; `score=now` if healthy).
+
+**Exponential backoff (per-company):** Per-operation retry delay that doubles on each consecutive failure: 300s → 600s → 1200s → 2400s → 3600s → 86400s. Three independent counters per company (`retry:backoff:scan`, `retry:backoff:detail`, `retry:backoff:fullscan`), each with a 24h TTL so they auto-reset overnight.
+
+**Learned ceiling:** The empirically discovered maximum safe in-flight scan count for a platform/DC key. Stored in Redis as `worker:ceil:learned:{dc_key}`. Set when error-triggered worker reduction fires; decays +1 per 24h of clean operation. Never pre-configured — only discovered through observed behaviour.
+
+**In-flight ZSET:** Redis sorted set (`inflight:scans:{dc_key}`) tracking active scans per platform/DC. Score = dispatch timestamp. Stale entries (from crashed workers) auto-cleaned after 10 minutes. Used by `adaptive_loop` to enforce the learned ceiling without affecting other platforms.
+
+**ATS outage mode:** State entered when 3 consecutive worker reductions fail to improve a platform's error rate. All dispatches for that platform are paused for 60 minutes (`worker:outage:{platform}` TTL key). Workers continue serving all other healthy platforms. A canary probe fires at 30 minutes for early recovery detection.
+
+**Canary probe:** A single test request sent to a platform at the halfway point of an outage window. Success → outage mode cleared early. Failure → TTL reset for another full window.
+
+**Scaling lock:** Short-TTL Redis key (`worker:scaling_lock:{platform}`, TTL = 30 min) set by `_fast_error_check_loop` after any error-triggered action. Prevents `_slow_throughput_check_loop` from immediately adding workers back and undoing a deliberate reduction.
+
+**Consecutive reductions counter:** `worker:consec_reductions:{platform}` (TTL = 1h). Incremented each time a worker reduction fires for a platform without improving its error rate. Reaching 3 triggers outage mode detection.
+
+**context (api_health column):** Operational context at the time a request was recorded. Values: `normal` (standard polling — used in baseline calculations), `backoff` (request made while company/platform is in exponential backoff), `canary` (single test probe during an outage window). Backoff and canary requests are stored but excluded from `query_30day_avg_error_rate()` and `query_30day_avg_response_ms()` to prevent managed-error periods from distorting the historical baseline.
+
+**worker_scaling_events:** Append-only PostgreSQL table recording every worker scaling decision with full health context (error rate, baseline, spike factor, queue depths, worker counts before/after). Used for post-incident analysis and weekly health reporting. Effectiveness is derived by joining adjacent events within a time window — no row is ever updated after insert.
+
+**total_ms_ok (deferred):** A proposed `api_health` column tracking cumulative response time for successful (HTTP 200) requests only, separate from `total_ms` which includes all requests including timeouts. Deferred pending real data — the distortion from timeout inflation may be acceptable given that timed-out workers are genuinely occupied for that duration. To be revisited once production data confirms whether the difference is material for baseline accuracy.

@@ -23,7 +23,6 @@ Covers every function in db.py including:
 import sys
 import os
 import json
-import sqlite3
 import unittest
 from datetime import datetime, timedelta
 
@@ -62,7 +61,10 @@ class TestSchema(unittest.TestCase):
     def test_all_tables_created(self):
         conn = db_module.get_conn()
         c = conn.cursor()
-        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        c.execute(
+            "SELECT table_name AS name FROM information_schema.tables"
+            " WHERE table_schema = 'public'"
+        )
         tables = {r["name"] for r in c.fetchall()}
         conn.close()
         expected = {
@@ -75,7 +77,10 @@ class TestSchema(unittest.TestCase):
     def test_recruiters_has_new_columns(self):
         conn = db_module.get_conn()
         c = conn.cursor()
-        c.execute("PRAGMA table_info(recruiters)")
+        c.execute(
+            "SELECT column_name AS name FROM information_schema.columns"
+            " WHERE table_name = 'recruiters'"
+        )
         cols = {r["name"] for r in c.fetchall()}
         conn.close()
         self.assertIn("last_scraped_at", cols)
@@ -84,28 +89,23 @@ class TestSchema(unittest.TestCase):
     def test_quota_alerts_columns(self):
         conn = db_module.get_conn()
         c = conn.cursor()
-        c.execute("PRAGMA table_info(quota_alerts)")
+        c.execute(
+            "SELECT column_name AS name FROM information_schema.columns"
+            " WHERE table_name = 'quota_alerts'"
+        )
         cols = {r["name"] for r in c.fetchall()}
         conn.close()
         for col in ["alert_type", "quota_type", "start_date", "end_date",
                     "avg_used", "avg_remaining", "suggested_cap", "notified"]:
             self.assertIn(col, cols)
 
+    @unittest.skip("PostgreSQL always uses WAL — PRAGMA journal_mode is SQLite-only")
     def test_wal_mode_enabled(self):
-        conn = db_module.get_conn()
-        c = conn.cursor()
-        c.execute("PRAGMA journal_mode")
-        mode = c.fetchone()[0]
-        conn.close()
-        self.assertEqual(mode, "wal")
+        pass
 
+    @unittest.skip("PostgreSQL always enforces foreign keys — PRAGMA foreign_keys is SQLite-only")
     def test_foreign_keys_enabled(self):
-        conn = db_module.get_conn()
-        c = conn.cursor()
-        c.execute("PRAGMA foreign_keys")
-        fk = c.fetchone()[0]
-        conn.close()
-        self.assertEqual(fk, 1)
+        pass
 
     def test_init_db_idempotent(self):
         # Running init_db twice should not raise or duplicate tables
@@ -146,7 +146,7 @@ class TestApplications(unittest.TestCase):
         self.assertEqual(row["company"], "Google")
         self.assertEqual(row["job_url"], "https://g.com/1")
         self.assertEqual(row["job_title"], "Backend Engineer")
-        self.assertEqual(row["applied_date"], "2026-01-15")
+        self.assertEqual(str(row["applied_date"]), "2026-01-15")
         self.assertEqual(row["status"], "active")
 
     def test_duplicate_url_returns_existing_id_and_created_false(self):
@@ -180,7 +180,7 @@ class TestApplications(unittest.TestCase):
         c.execute("SELECT applied_date FROM applications WHERE id = ?", (app_id,))
         row = c.fetchone()
         conn.close()
-        self.assertEqual(row["applied_date"], datetime.now().strftime("%Y-%m-%d"))
+        self.assertEqual(str(row["applied_date"]), datetime.now().strftime("%Y-%m-%d"))
 
     def test_get_all_active_applications(self):
         db_module.add_application("Google", "https://g.com/1", "SWE")
@@ -563,7 +563,7 @@ class TestOutreach(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("SELECT scheduled_for FROM outreach WHERE id = ?", (next_id,))
-        self.assertEqual(c.fetchone()["scheduled_for"], expected)
+        self.assertEqual(str(c.fetchone()["scheduled_for"]), expected)
         conn.close()
 
 
@@ -664,7 +664,7 @@ class TestAICache(unittest.TestCase):
         expires_at = c.fetchone()["expires_at"]
         conn.close()
         expected = (datetime.now() + timedelta(days=21)).strftime("%Y-%m-%d")
-        self.assertTrue(expires_at.startswith(expected))
+        self.assertTrue(str(expires_at).startswith(expected))
 
     def test_get_applications_missing_ai_cache(self):
         import hashlib
@@ -844,8 +844,12 @@ class TestQuotaHealthMonitor(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("""
-            INSERT OR REPLACE INTO careershift_quota (date, total_limit, used, remaining)
+            INSERT INTO careershift_quota (date, total_limit, used, remaining)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT (date) DO UPDATE SET
+                total_limit = EXCLUDED.total_limit,
+                used        = EXCLUDED.used,
+                remaining   = EXCLUDED.remaining
         """, (date, total, used, remaining))
         conn.commit()
         conn.close()
@@ -1068,8 +1072,10 @@ class TestRetentionCleanup(unittest.TestCase):
         old_date = (datetime.now() - timedelta(days=35)).strftime("%Y-%m-%d")
         conn = db_module.get_conn()
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO careershift_quota (date, used, remaining) VALUES (?, 10, 40)",
-                  (old_date,))
+        c.execute("""
+            INSERT INTO careershift_quota (date, used, remaining) VALUES (?, 10, 40)
+            ON CONFLICT (date) DO UPDATE SET used = EXCLUDED.used, remaining = EXCLUDED.remaining
+        """, (old_date,))
         conn.commit()
         conn.close()
         conn = db_module.get_conn()

@@ -42,11 +42,24 @@ def main():
         test_reports,
         test_job_monitor,
         test_location_filter,
+        # Phase 10/11 comprehensive suites
+        test_adaptive_engine,
+        test_adaptive_health,
+        test_fullscan_helpers,
+        test_paginator,
+        test_watchdog,
+        test_pipeline_health,
+        test_phase11_alerts,
     )
 
     unit_tests        = [test_database, test_outreach, test_pipeline,
                          test_validation, test_verify_only, test_prospective,
-                         test_reports, test_job_monitor, test_location_filter]
+                         test_reports, test_job_monitor, test_location_filter,
+                         # Phase 10/11 comprehensive suites
+                         test_adaptive_engine, test_adaptive_health,
+                         test_fullscan_helpers, test_paginator,
+                         test_watchdog, test_pipeline_health,
+                         test_phase11_alerts]
     integration_tests = [test_integration]
     scraper_tests     = [test_job_scraper]
     all_tests         = unit_tests + integration_tests + scraper_tests

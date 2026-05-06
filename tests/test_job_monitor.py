@@ -1272,12 +1272,12 @@ class TestDBDataIntegrity(unittest.TestCase):
         self.assertTrue(r1)
         self.assertFalse(r2)
         conn = db_connection.get_conn()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM job_postings WHERE job_url=?",
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM job_postings WHERE job_url=?",
             ("https://stripe.com/jobs/1",)
-        ).fetchone()[0]
+        ).fetchone()
         conn.close()
-        self.assertEqual(count, 1)
+        self.assertEqual(row["cnt"], 1)
 
     def test_first_seen_always_populated(self):
         db_module.save_job_posting(_make_job())

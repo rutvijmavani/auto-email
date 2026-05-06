@@ -55,7 +55,7 @@ def get_unique_companies_needing_scraping(min_recruiters=2):
         LEFT JOIN recruiters r ON r.id = ar.recruiter_id AND r.recruiter_status = 'active'
         WHERE a.status = 'active'
         GROUP BY a.id, a.company
-        HAVING recruiter_count < ?
+        HAVING COUNT(r.id) < ?
         ORDER BY a.applied_date ASC
     """, (min_recruiters,))
     rows = c.fetchall()

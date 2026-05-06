@@ -28,6 +28,12 @@ ALERT_EXHAUSTION_BLOCKED = "exhaustion_blocked"  # fired when exhaustion is bloc
 ALERT_API_FAILURE   = "api_failure_rate"
 ALERT_COVERAGE_DROP = "coverage_drop"
 
+# Phase 11 — adaptive worker monitoring alert types
+ALERT_ERROR_STREAK       = "error_streak"        # company: N consecutive scan failures
+ALERT_DETAIL_QUEUE_DEPTH = "detail_queue_depth"  # detail queue sustained above watermark
+ALERT_REDIS_MEMORY       = "redis_memory"        # Redis used_memory near maxmemory limit
+ALERT_REACTIVATION_LAG   = "reactivation_lag"    # company dark > threshold after recovery
+
 # Severity
 CRITICAL = "critical"
 WARNING  = "warning"

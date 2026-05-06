@@ -86,10 +86,15 @@ EOF
 cat > "$PROJECT_DIR/run_nightly.sh" << 'EOF'
 #!/bin/bash
 # run_nightly.sh — Tue-Sun 1 AM nightly chain:
-#   sync → backup → find-only → verify-filled
+#   [pause workers] → sync → backup → find-only → verify-filled → [resume workers]
 # Each step only runs if the previous succeeded (&&).
 # Backup failure stops the chain — DB stays safe.
 # Guard: exits on the 1st of the month — run_monthly.sh handles it.
+#
+# Redis coordination (Section 17 of adaptive polling architecture doc):
+#   - pipeline:pause published at start → adaptive workers idle after current op
+#   - cronchain:alive heartbeat refreshed between steps (5-min TTL)
+#   - pipeline:resume published at end → workers restart dispatching
 PROJECT_DIR="/home/opc/mail"
 LOG_DIR="$PROJECT_DIR/logs"
 LOG_FILE="$LOG_DIR/nightly_$(date +%Y-%m-%d).log"
@@ -107,20 +112,32 @@ echo "════════════════════════�
 
 source venv/bin/activate
 
+# Signal adaptive workers to pause and enter idle state
+echo "[REDIS] pipeline:pause at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py pause >> "$LOG_FILE" 2>&1
+
 echo "[STEP 1] sync at $(date '+%H:%M:%S')" >> "$LOG_FILE"
 python pipeline.py --sync-forms       >> "$LOG_FILE" 2>&1 && \
 python pipeline.py --sync-prospective >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 2] backup at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python scripts/backup_db.py           >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 3] find-only at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --find-only        >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 4] verify-filled at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --verify-filled    >> "$LOG_FILE" 2>&1
 
 EXIT_CODE=$?
+
+# Always resume workers regardless of exit code — maintenance is done
+echo "[REDIS] pipeline:resume at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py resume >> "$LOG_FILE" 2>&1
+
 echo "[CRON] nightly finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CODE" >> "$LOG_FILE"
 find "$LOG_DIR" -name "nightly_*.log" -mtime +14 -delete
 exit $EXIT_CODE
@@ -130,7 +147,7 @@ EOF
 cat > "$PROJECT_DIR/run_monday.sh" << 'EOF'
 #!/bin/bash
 # run_monday.sh — Monday 1 AM nightly chain:
-#   sync → backup → verify-only → find-only → verify-filled
+#   [pause workers] → sync → backup → verify-only → find-only → verify-filled → [resume workers]
 # Each step only runs if the previous succeeded (&&).
 # Guard: exits on the 1st of the month — run_monthly.sh handles it.
 PROJECT_DIR="/home/opc/mail"
@@ -150,23 +167,34 @@ echo "════════════════════════�
 
 source venv/bin/activate
 
+echo "[REDIS] pipeline:pause at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py pause >> "$LOG_FILE" 2>&1
+
 echo "[STEP 1] sync at $(date '+%H:%M:%S')" >> "$LOG_FILE"
 python pipeline.py --sync-forms       >> "$LOG_FILE" 2>&1 && \
 python pipeline.py --sync-prospective >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 2] backup at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python scripts/backup_db.py           >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 3] verify-only at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --verify-only      >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 4] find-only at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --find-only        >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 5] verify-filled at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --verify-filled    >> "$LOG_FILE" 2>&1
 
 EXIT_CODE=$?
+
+echo "[REDIS] pipeline:resume at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py resume >> "$LOG_FILE" 2>&1
+
 echo "[CRON] monday nightly finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CODE" >> "$LOG_FILE"
 find "$LOG_DIR" -name "monday_*.log" -mtime +14 -delete
 exit $EXIT_CODE
@@ -192,36 +220,49 @@ echo "════════════════════════�
 
 source venv/bin/activate
 
+echo "[REDIS] pipeline:pause at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py pause >> "$LOG_FILE" 2>&1
+
 echo "[STEP 1] sync at $(date '+%H:%M:%S')" >> "$LOG_FILE"
 python pipeline.py --sync-forms        >> "$LOG_FILE" 2>&1 && \
 python pipeline.py --sync-prospective  >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 2] backup at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python scripts/backup_db.py            >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 3] find-only at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --find-only         >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 4] ATS slug discovery at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python build_ats_slug_list.py          >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 5] enrich at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python enrich_ats_companies.py         >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 6] VACUUM + ANALYZE at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python -c "
-import sqlite3
-conn = sqlite3.connect('data/recruiter_pipeline.db')
+from db.connection import get_conn
+conn = get_conn()
 conn.execute('VACUUM')
 conn.execute('ANALYZE')
 conn.close()
 print('[OK] DB maintenance complete')
 " >> "$LOG_FILE" 2>&1 && \
+python scripts/redis_signal.py heartbeat >> "$LOG_FILE" 2>&1 && \
 
 echo "[STEP 7] verify-filled at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python pipeline.py --verify-filled     >> "$LOG_FILE" 2>&1
 
 EXIT_CODE=$?
+
+echo "[REDIS] pipeline:resume at $(date '+%H:%M:%S')" >> "$LOG_FILE"
+python scripts/redis_signal.py resume >> "$LOG_FILE" 2>&1
+
 echo "[CRON] monthly finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CODE" >> "$LOG_FILE"
 exit $EXIT_CODE
 EOF

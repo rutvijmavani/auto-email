@@ -358,7 +358,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
 
         # Create row if needed
         existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company = ? COLLATE NOCASE",
+            "SELECT id FROM prospective_companies WHERE company = ?",
             (company,)
         ).fetchone()
 
@@ -383,7 +383,7 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
         if parts:
             conn.execute(
                 f"UPDATE prospective_companies "
-                f"SET {', '.join(parts)} WHERE company = ? COLLATE NOCASE",
+                f"SET {', '.join(parts)} WHERE company = ?",
                 vals + [company]
             )
 
@@ -442,7 +442,7 @@ def _save_to_db(company, slug_info):
         conn = get_conn()
 
         existing = conn.execute(
-            "SELECT id FROM prospective_companies WHERE company = ? COLLATE NOCASE",
+            "SELECT id FROM prospective_companies WHERE company = ?",
             (company,)
         ).fetchone()
 
@@ -459,7 +459,7 @@ def _save_to_db(company, slug_info):
                     ats_slug        = ?,
                     ats_detected_at = ?,
                     domain          = ?
-                WHERE company = ? COLLATE NOCASE
+                WHERE company = ?
             """, (slug_json, now, domain, company))
             print(f"  Updated existing company: {company}")
         else:

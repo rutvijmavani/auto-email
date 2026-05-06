@@ -153,17 +153,18 @@ class _Connection:
 
     Or via context manager:
         with get_conn() as conn:
-            conn.execute(...)  # auto-commit on __exit__, rollback on error
+            conn.execute(...)  # commits on clean exit; rollbacks on exception
 
     conn.cursor() returns a _Cursor (RealDictCursor wrapper).
     conn.execute(sql, params) is shorthand for cursor + execute.
     conn.close() returns the connection to the pool — does NOT close the socket.
     """
-    __slots__ = ("_conn", "_pool")
+    __slots__ = ("_conn", "_pool", "_returned")
 
     def __init__(self, conn, pool):
         self._conn = conn
         self._pool = pool
+        self._returned = False
 
     # ── Cursor ──────────────────────────
 
@@ -196,7 +197,13 @@ class _Connection:
 
     def close(self):
         """Return this connection to the pool. Does NOT close the socket."""
-        self._pool.putconn(self._conn)
+        if not self._returned:
+            self._returned = True
+            self._pool.putconn(self._conn)
+
+    def __del__(self):
+        """Safety net: return to pool if caller forgot to call close()."""
+        self.close()
 
     # ── Context manager ───────────────────
 
@@ -205,10 +212,21 @@ class _Connection:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if exc_type:
+            # Exception in the with-block — roll back and let it propagate
             try:
                 self.rollback()
             except Exception:
                 pass
+        else:
+            # Clean exit — commit the transaction
+            try:
+                self.commit()
+            except Exception:
+                try:
+                    self.rollback()
+                except Exception:
+                    pass
+                raise
         self.close()
         return False
 

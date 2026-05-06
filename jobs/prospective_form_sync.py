@@ -850,7 +850,7 @@ def run():
                     # so we have a row to update
                     existing_check = conn.execute(
                         "SELECT id FROM prospective_companies "
-                        "WHERE company = ? COLLATE NOCASE", (company,)
+                        "WHERE company = ?", (company,)
                     ).fetchone()
 
                     if not existing_check:
@@ -874,7 +874,7 @@ def run():
                         conn.execute(
                             f"UPDATE prospective_companies "
                             f"SET {', '.join(update_parts)} "
-                            f"WHERE company = ? COLLATE NOCASE",
+                            f"WHERE company = ?",
                             update_vals + [company]
                         )
                     conn.commit()
@@ -901,7 +901,7 @@ def run():
             try:
                 existing = conn.execute(
                     "SELECT id, status, ats_platform, ats_slug "
-                    "FROM prospective_companies WHERE company = ? COLLATE NOCASE",
+                    "FROM prospective_companies WHERE company = ?",
                     (company,)
                 ).fetchone()
 
@@ -929,7 +929,7 @@ def run():
                             "ats_detected_at=?, "
                             "domain = CASE WHEN domain IS NULL "
                             "  OR domain = '' THEN ? ELSE domain END "
-                            "WHERE company=? COLLATE NOCASE",
+                            "WHERE company=?",
                             (platform, slug, datetime.utcnow(),
                              domain, company)
                         )
@@ -938,7 +938,7 @@ def run():
                             "UPDATE prospective_companies "
                             "SET domain = CASE WHEN domain IS NULL "
                             "  OR domain = '' THEN ? ELSE domain END "
-                            "WHERE company=? COLLATE NOCASE",
+                            "WHERE company=?",
                             (domain, company)
                         )
                     conn.commit()

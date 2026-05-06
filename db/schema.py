@@ -191,6 +191,14 @@ def _cleanup_api_health(c):
     c.execute("DELETE FROM api_health WHERE date < %s", (cutoff,))
 
 
+def _cleanup_worker_scaling_events(c):
+    """Delete worker_scaling_events older than 90 days (Phase 10)."""
+    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+    c.execute(
+        "DELETE FROM worker_scaling_events WHERE occurred_at < %s", (cutoff,)
+    )
+
+
 def _cleanup_pipeline_alerts(c):
     cutoff = (datetime.now() - timedelta(days=RETENTION_PIPELINE_ALERTS)).strftime("%Y-%m-%d")
     c.execute("""
@@ -270,7 +278,7 @@ def init_db():
                 RETURN NULL;
             END IF;
             -- Strip leading '$.' from path (e.g. '$.url' -> 'url')
-            v_key := REGEXP_REPLACE(p_path, '^\$\.', '');
+            v_key := REGEXP_REPLACE(p_path, '^\\$\\.', '');
             RETURN (p_json::jsonb)->>v_key;
         EXCEPTION WHEN OTHERS THEN
             RETURN NULL;
@@ -537,11 +545,17 @@ def init_db():
             platform        TEXT    NOT NULL,
 
             -- Request counts
-            requests_made   INTEGER DEFAULT 0,
-            requests_ok     INTEGER DEFAULT 0,
-            requests_429    INTEGER DEFAULT 0,
-            requests_404    INTEGER DEFAULT 0,
-            requests_error  INTEGER DEFAULT 0,
+            requests_made      INTEGER DEFAULT 0,
+            requests_ok        INTEGER DEFAULT 0,
+            requests_429       INTEGER DEFAULT 0,
+            requests_404       INTEGER DEFAULT 0,
+            requests_error     INTEGER DEFAULT 0,
+
+            -- Error sub-type breakdown (Fix 1 — adaptive polling architecture)
+            requests_timeout   INTEGER DEFAULT 0,
+            requests_conn_err  INTEGER DEFAULT 0,
+            requests_5xx       INTEGER DEFAULT 0,
+            requests_other_err INTEGER DEFAULT 0,
 
             -- Timing (milliseconds)
             avg_response_ms INTEGER DEFAULT 0,
@@ -561,6 +575,46 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_api_health_date_platform
         ON api_health(date, platform)
+    """)
+
+    # worker_scaling_events: append-only audit log for every worker pool
+    # scaling decision (Phase 10 — Section 16).
+    # Effectiveness is derived by querying adjacent events within a time
+    # window — no row is ever updated.
+    # Retention: managed by _cleanup_worker_scaling_events (90 days).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS worker_scaling_events (
+            id                    BIGSERIAL PRIMARY KEY,
+            occurred_at           TIMESTAMP NOT NULL DEFAULT NOW(),
+            event_type            TEXT NOT NULL,
+            trigger_layer         TEXT,
+            platform              TEXT,
+            dc_key                TEXT,
+            worker_type           TEXT,
+            scan_workers_before   INTEGER,
+            scan_workers_after    INTEGER,
+            detail_workers_before INTEGER,
+            detail_workers_after  INTEGER,
+            error_rate            REAL,
+            baseline_error_rate   REAL,
+            spike_factor          REAL,
+            scan_queue_depth      INTEGER,
+            detail_queue_depth    INTEGER,
+            inflight_count        INTEGER,
+            learned_ceiling       INTEGER,
+            consec_reductions     INTEGER,
+            notes                 TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS wse_platform_ts
+        ON worker_scaling_events(platform, occurred_at)
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS wse_type_ts
+        ON worker_scaling_events(event_type, occurred_at)
     """)
 
     c.execute("""
@@ -723,13 +777,22 @@ def init_db():
     # ── Migrations: add columns to existing tables ────────────────────────────
     # PostgreSQL supports ADD COLUMN IF NOT EXISTS — no try/except needed.
 
-    # job_postings: Phase 1 columns (incremental filter + observability)
+    # job_postings: adaptive polling columns (Phase 2 + 3)
     for col, defn in [
-        ("job_id",       "TEXT"),
-        ("ats_platform", "TEXT"),
-        ("found_by",     "TEXT"),
+        ("job_id",          "TEXT"),
+        ("ats_platform",    "TEXT"),
+        ("found_by",        "TEXT"),
+        ("first_published", "DATE"),
+        ("last_updated",    "TIMESTAMP"),
+        ("last_polled",     "TIMESTAMP"),
+        ("_country_code",   "CHAR(2)"),
     ]:
         c.execute(f"ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS {col} {defn}")
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_postings_company_jobid
+        ON job_postings (company, job_id)
+    """)
 
     # prospective_companies: all ATS detection columns (safe to re-run)
     for col, defn in [
@@ -746,6 +809,99 @@ def init_db():
         c.execute(
             f"ALTER TABLE prospective_companies ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
+
+    # company_poll_stats: full adaptive engine columns (Phase 4 + 5 + 6)
+    for col, defn in [
+        # Adaptive interval engine (Phase 5)
+        ("recent_poll_counts",  "TEXT DEFAULT '[]'"),
+        # Full scan state (Phase 6)
+        ("next_full_scan_at",   "TIMESTAMP"),
+        ("last_full_scan_at",   "TIMESTAMP"),
+        ("full_scan_interval_s","INTEGER DEFAULT 86400"),
+        ("full_scan_deferred",  "BOOLEAN DEFAULT FALSE"),
+        ("full_scan_interrupted","BOOLEAN DEFAULT FALSE"),
+        ("interrupted_at_page", "INTEGER"),
+        ("interrupted_at",      "TIMESTAMP"),
+        # Health tracking (Phase 10)
+        ("consecutive_errors",  "INTEGER DEFAULT 0"),
+        ("last_error_at",       "TIMESTAMP"),
+        ("last_success_at",     "TIMESTAMP"),
+    ]:
+        c.execute(
+            f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
+        )
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_poll_stats_next
+        ON company_poll_stats (next_poll_at)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_poll_stats_fullscan
+        ON company_poll_stats (next_full_scan_at)
+    """)
+
+    # company_config: per-company overrides for adaptive engine (Phase 4)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS company_config (
+            id                BIGSERIAL PRIMARY KEY,
+            company           TEXT NOT NULL UNIQUE,
+            sorted_by_recency BOOLEAN,
+            refresh_window_hr INTEGER,
+            min_interval      INTEGER,
+            max_interval      INTEGER,
+            force_interval    INTEGER,
+            is_pinned         BOOLEAN DEFAULT FALSE,
+            is_suspended      BOOLEAN DEFAULT FALSE,
+            notes             TEXT,
+            created_at        TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    # api_health: error sub-type columns (Fix 1 — adaptive polling architecture)
+    for col in ["requests_timeout", "requests_conn_err",
+                "requests_5xx", "requests_other_err"]:
+        c.execute(
+            f"ALTER TABLE api_health ADD COLUMN IF NOT EXISTS {col} INTEGER DEFAULT 0"
+        )
+
+    # api_health: context column (Phase 10 — baseline purity)
+    # Values: 'normal' | 'backoff' | 'canary'
+    # Baseline queries filter WHERE context='normal' so managed-error periods
+    # do not distort the 30-day historical average.
+    c.execute("""
+        ALTER TABLE api_health
+        ADD COLUMN IF NOT EXISTS context TEXT NOT NULL DEFAULT 'normal'
+    """)
+
+    # api_health: migrate unique constraint from (date, platform)
+    #             to (date, platform, context) — Phase 10.
+    # Uses a DO block so the migration is idempotent on repeated init_db() runs.
+    c.execute("""
+        DO $$
+        BEGIN
+            -- Drop the old (date, platform) unique constraint if it still exists.
+            -- PostgreSQL auto-names it 'api_health_date_platform_key'.
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'api_health_date_platform_key'
+                  AND conrelid = 'api_health'::regclass
+            ) THEN
+                ALTER TABLE api_health
+                DROP CONSTRAINT api_health_date_platform_key;
+            END IF;
+
+            -- Add the new (date, platform, context) unique constraint.
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'api_health_date_platform_context_key'
+                  AND conrelid = 'api_health'::regclass
+            ) THEN
+                ALTER TABLE api_health
+                ADD CONSTRAINT api_health_date_platform_context_key
+                UNIQUE (date, platform, context);
+            END IF;
+        END $$
+    """)
 
     # custom_ats_diagnostics: resolved_at for retention measurement
     c.execute("""
@@ -794,6 +950,7 @@ def init_db():
     _cleanup_verify_filled_stats(c)
     _cleanup_coverage_stats(c)
     _cleanup_api_health(c)
+    _cleanup_worker_scaling_events(c)
     _cleanup_pipeline_alerts(c)
     _cleanup_mark_resolved_diagnostics(c)
     _cleanup_resolved_diagnostics(c)

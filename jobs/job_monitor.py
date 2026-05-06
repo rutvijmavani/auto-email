@@ -67,6 +67,29 @@ from config import (
 
 logger = get_logger(__name__)
 
+
+def _record_cycle_start() -> None:
+    """
+    Write cycle:start to Redis after digest email is sent and jobs digested.
+
+    Called immediately after mark_postings_digested() so the adaptive
+    scheduler knows the daily cycle has officially begun. Imported lazily
+    to avoid import loops — workers.scheduler is not loaded unless the
+    scheduler is running.
+    """
+    try:
+        from workers.scheduler import record_cycle_start
+        ts = record_cycle_start()
+        logger.info("cycle:start written (unix=%.0f)", ts)
+    except Exception as exc:
+        # Non-fatal — scheduler may not be running (e.g. daily batch mode)
+        logger.warning(
+            "Could not write cycle:start to Redis: %s "
+            "(scheduler may not be running — this is OK in batch mode)",
+            exc,
+        )
+
+
 # ─────────────────────────────────────────
 # PER-ATS SEMAPHORES
 # Built once at module load from config.
@@ -285,6 +308,7 @@ def run():
                 mark_postings_digested()
                 logger.info("Marked %d posting(s) as digested",
                             len(new_postings))
+                _record_cycle_start()
         except Exception as e:
             logger.error("PDF generation failed: %s", e, exc_info=True)
             print(f"[ERROR] PDF generation failed: {e}")
@@ -292,6 +316,7 @@ def run():
             email_sent = _send_text_fallback(new_postings)
             if email_sent:
                 mark_postings_digested()
+                _record_cycle_start()
     else:
         logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")
