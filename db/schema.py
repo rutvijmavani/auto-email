@@ -839,6 +839,15 @@ def init_db():
         ("consecutive_errors",  "INTEGER DEFAULT 0"),
         ("last_error_at",       "TIMESTAMP"),
         ("last_success_at",     "TIMESTAMP"),
+        # WARMING lifecycle — new company onboarding (Section 25 redesign)
+        # warming_polls_remaining: NULL=STABLE; 3/2/1=WARMING; decremented by
+        #   on_adaptive_complete(). Set to WARMING_POLLS_COUNT by on_fullscan_complete()
+        #   when last_poll_at IS NULL (first full scan done).
+        # initial_slot_offset_s: slot_offset(batch_position) stored at registration.
+        #   Used to schedule first adaptive poll at a deterministic daily slot so
+        #   companies are spread evenly across the 24h window. Survives restarts.
+        ("warming_polls_remaining", "SMALLINT DEFAULT NULL"),
+        ("initial_slot_offset_s",   "INTEGER DEFAULT NULL"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"

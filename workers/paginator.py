@@ -23,7 +23,15 @@ and for platforms whose fetch_jobs() already exposes page-level control.
 
 Usage (post Phase 7, per-page loop):
 
-    seen_ids = r.smembers(f"seen:{company}")
+    # Pass a callable that checks bloom:fullscan:{company} for early exit.
+    # The bloom filter contains ALL job IDs from the last full scan cycle,
+    # making the 80% overlap threshold meaningful (see Section 11).
+    def bloom_check(job_id: str) -> bool:
+        try:
+            return bool(r.execute_command("BF.EXISTS", f"bloom:fullscan:{company}", job_id))
+        except Exception:
+            return bool(r.sismember(f"bloom:fallback:{company}", job_id))
+
     overlap_pages = 0
     page = 0
     all_jobs = []
@@ -34,7 +42,7 @@ Usage (post Phase 7, per-page loop):
             break
 
         should_go_on, overlap_pages = should_continue_paginating(
-            page_jobs, seen_ids, overlap_pages,
+            page_jobs, bloom_check, overlap_pages,
             sorted_by_recency=config.get("sorted_by_recency", False),
         )
 
@@ -60,7 +68,7 @@ from config import (
 
 def should_continue_paginating(
     page_jobs: list,
-    seen_ids: set,
+    seen_ids,
     overlap_pages: int,
     sorted_by_recency: bool,
     id_key: str = "job_id",
@@ -70,8 +78,11 @@ def should_continue_paginating(
 
     Args:
         page_jobs:          Jobs returned from the current listing page.
-        seen_ids:           Set of job IDs already known for this company
-                            (from Redis seen:{company} SET).
+        seen_ids:           Either a set of known job IDs OR a callable
+                            (job_id: str) -> bool that returns True if the
+                            job is already known. Pass the bloom filter check
+                            function (bloom:fullscan:{company}) for adaptive
+                            early exit, or a plain set for backward compat.
         overlap_pages:      Consecutive high-overlap page count so far.
                             Pass 0 for the first page. Carry forward on each call.
         sorted_by_recency:  True  → SORTED platform (80%/2-page algorithm).
@@ -86,11 +97,11 @@ def should_continue_paginating(
         next call (it resets to 0 when new jobs are found).
 
     Examples:
-        # SORTED — stop when 2 consecutive pages are 80%+ seen
-        cont, pages = should_continue_paginating(page, seen, 0, True)
+        # SORTED — stop when 2 consecutive pages are 80%+ in bloom filter
+        cont, pages = should_continue_paginating(page, bloom_check_fn, 0, True)
 
         # NON-SORTED — stop when a full page is 100% seen
-        cont, pages = should_continue_paginating(page, seen, 0, False)
+        cont, pages = should_continue_paginating(page, bloom_check_fn, 0, False)
     """
     if not page_jobs:
         # Genuine empty page — end of results regardless of platform type
@@ -101,7 +112,8 @@ def should_continue_paginating(
         # Page has no identifiable jobs → cannot decide, keep going
         return True, overlap_pages
 
-    seen_count    = sum(1 for jid in ids if jid in seen_ids)
+    _is_seen = seen_ids if callable(seen_ids) else seen_ids.__contains__
+    seen_count    = sum(1 for jid in ids if _is_seen(jid))
     overlap_ratio = seen_count / len(ids)
 
     if sorted_by_recency:
@@ -138,7 +150,7 @@ def should_continue_paginating(
 
 def would_have_exited_at(
     all_pages: list,
-    seen_ids: set,
+    seen_ids,
     sorted_by_recency: bool,
     id_key: str = "job_id",
 ) -> int:
@@ -152,7 +164,8 @@ def would_have_exited_at(
 
     Args:
         all_pages:          List of pages; each page is a list of job dicts.
-        seen_ids:           Set of known job IDs.
+        seen_ids:           Set of known job IDs OR callable (job_id) -> bool.
+                            Pass the bloom filter check fn for accurate results.
         sorted_by_recency:  Platform sort order.
         id_key:             Job ID dict key.
 

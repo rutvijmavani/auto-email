@@ -359,6 +359,13 @@ ADAPTIVE_CALIBRATION_LOOKBACK_DAYS = 30   # ignore scores older than N days
 REDIS_BAND_THRESHOLDS = "adaptive:band_thresholds"
 
 # ── Scheduler (Section 5) ─────────────────────────────────────────────────────
+# Estimated average scan time per company (seconds).
+# Used by rebuild_poll_queues() to compute a dynamic startup/recovery spread
+# window that matches actual worker throughput:
+#   window = ceil(N_companies / N_workers) * STARTUP_AVG_SCAN_TIME_S
+# Tune upward if your ATS calls average > 30s (check api_health.duration_ms).
+STARTUP_AVG_SCAN_TIME_S        = 30         # ~30s per company per scan worker
+
 SCHEDULER_DAWN_PATROL_WINDOW   = 4 * 3600   # redistribute polls due after +4h
 SCHEDULER_DAWN_PATROL_SPREAD   = 2 * 3600   # spread them across 2h window
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan
@@ -520,3 +527,36 @@ INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2× max scan timeout
 # ── Full scan (Section 9) ─────────────────────────────────────────────────────
 FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
 FULLSCAN_BLOOM_ERROR_RATE      = 0.001      # 0.1% false positive rate
+
+# ── Adaptive seen cache (Section 12 / 13) ────────────────────────────────────
+# Per-company Redis SET tracking all job IDs touched by adaptive scan today.
+# Prevents redundant DB lookups across multiple adaptive scans within a day.
+# Cleared explicitly at the start of each full scan; TTL is a safety net.
+REDIS_ADAPTIVE_SEEN_PREFIX     = "adaptive_seen"
+ADAPTIVE_SEEN_TTL              = 24 * 3600  # 24h fixed TTL
+
+# ── Redis Streams — two-layer scheduler (Section 5 / 9 redesign) ──────────────
+# Architecture: ZSET (scheduling ledger, when is each company due?) +
+#               Stream (crash-safe delivery queue, PEL holds in-flight work).
+#
+# If a worker dies mid-scan the stream message stays in the PEL and is
+# reclaimed by XAUTOCLAIM after idle_ms = p95_scan_ms * 3, preventing lost work.
+# No separate heartbeat / watchdog needed for scan workers.
+REDIS_STREAM_ADAPTIVE   = "stream:adaptive"     # adaptive scan delivery stream
+REDIS_STREAM_FULLSCAN   = "stream:fullscan"     # full scan delivery stream
+STREAM_CONSUMER_GROUP   = "scan-workers"        # shared consumer group for all workers
+STREAM_BLOCK_MS         = 500                   # XREADGROUP BLOCK timeout (ms)
+                                                # Short (0.5s) so workers check
+                                                # pause_event within ~1s of signal.
+STREAM_MAXLEN_ADAPTIVE  = 1000                  # XADD MAXLEN ~ (trimmed approximately)
+STREAM_MAXLEN_FULLSCAN  = 500                   # lower — fullscans are slower
+MAX_STREAM_REDELIVERIES = 5                     # XAUTOCLAIM: after this many
+                                                # redeliveries → dead-letter to ZSET
+                                                # with exponential backoff
+
+# ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
+# NEW companies do their first full scan, then WARMING: 3 adaptive polls at a
+# fixed 2h interval so the adaptive engine has enough data before going STABLE.
+# Tracked by company_poll_stats.warming_polls_remaining (NULL = STABLE).
+WARMING_POLLS_COUNT     = 3                     # polls at fixed interval before STABLE
+WARMING_INTERVAL_S      = 2 * 3600             # 2h fixed interval during WARMING

@@ -496,6 +496,65 @@ def query_30day_avg_response_ms(platform: str) -> float:
     return float(row["total_ms"]) / float(row["total_requests"])
 
 
+# Listing-scan platforms (used by query_p95_response_ms)
+_LISTING_SCAN_PLATFORMS = (
+    "greenhouse", "lever", "ashby", "smartrecruiters",
+    "workday", "oracle_hcm", "icims",
+)
+
+
+def query_p95_response_ms(scan_type: str) -> int:
+    """
+    Estimate p95 response time (ms) for XAUTOCLAIM idle-timeout calculation.
+
+    The api_health table stores per-day aggregates, not individual request
+    durations, so a true p95 is not directly computable.  We use a
+    conservative approximation:
+
+        listing_scan: average of max_response_ms across listing platforms
+                      (last 7 days, normal context) × 1.5
+        full_scan:    same × 3 (full scans fetch all pages — much slower)
+
+    The result is used as:  idle_ms = max(p95_ms × 3, 300_000)
+    A moderately wrong p95 estimate is fine — the 5-minute minimum floor
+    and the 3× multiplier give ample crash-recovery time even with a bad
+    estimate.
+
+    Args:
+        scan_type: "listing_scan" (for adaptive) or "full_scan" (for fullscan).
+                   Any other value returns a 30-second default.
+
+    Returns:
+        Estimated p95 in milliseconds (int).  Never 0.
+    """
+    from datetime import date, timedelta
+    from db.connection import get_conn
+
+    since = (date.today() - timedelta(days=7)).isoformat()
+    conn  = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT AVG(max_response_ms) AS avg_max_ms
+            FROM api_health
+            WHERE platform = ANY(%s)
+              AND date >= %s
+              AND context = 'normal'
+              AND max_response_ms > 0
+        """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
+    except Exception:
+        return 30_000
+    finally:
+        conn.close()
+
+    avg_max = (row["avg_max_ms"] or 0) if row else 0
+    if avg_max <= 0:
+        # No data — use safe defaults
+        return 30_000 if scan_type == "listing_scan" else 120_000
+
+    multiplier = 1.5 if scan_type == "listing_scan" else 3.0
+    return max(1_000, int(avg_max * multiplier))
+
+
 # ─────────────────────────────────────────
 # WORKER SCALING EVENTS
 # ─────────────────────────────────────────

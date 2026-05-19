@@ -232,22 +232,18 @@ def stage_scan_incremental():
 
     from workers.redis_client import get_redis
     from workers.scan_worker import _run_listing_scan
-    from workers.rebuild import rebuild_seen_ids
     from db.db import get_conn
 
     r = get_redis()
 
-    # Rebuild seen:{INCR_COMPANY} from DB -- simulates what rebuild_redis() does
-    # at production scheduler startup. Without this, seen: is empty and all
-    # 200+ jobs look "new" to the diff, causing wasteful ON CONFLICT attempts.
-    seen_before = r.scard(f"seen:{INCR_COMPANY}")
-    if seen_before == 0:
-        info(f"seen:{INCR_COMPANY} is empty -- rebuilding from DB (simulating production startup)")
-        rebuilt = rebuild_seen_ids(INCR_COMPANY)
-        seen_after = r.scard(f"seen:{INCR_COMPANY}")
-        ok(f"seen:{INCR_COMPANY} rebuilt: {seen_after} members loaded from DB")
+    # adaptive_seen:{company} is populated naturally by scan_worker runs.
+    # No pre-seeding needed — first run will do DB lookups for all jobs,
+    # subsequent runs within the same day skip via the SET cache.
+    adaptive_seen_count = r.scard(f"adaptive_seen:{INCR_COMPANY}")
+    if adaptive_seen_count > 0:
+        ok(f"adaptive_seen:{INCR_COMPANY} has {adaptive_seen_count} members from earlier runs")
     else:
-        ok(f"seen:{INCR_COMPANY} already has {seen_before} members")
+        info(f"adaptive_seen:{INCR_COMPANY} is empty -- scan_worker will populate it")
 
     result = _run_listing_scan({
         "company":     INCR_COMPANY,
@@ -491,8 +487,7 @@ def stage_fullscan():
     header(6, f"FULLSCAN WORKER -- full scan ({INCR_COMPANY}, Greenhouse)")
 
     from workers.redis_client import get_redis
-    from workers.fullscan import _run_fullscan, _BloomFilter
-    from workers.rebuild import rebuild_seen_ids
+    from workers.fullscan import _run_fullscan, _BloomPair
     from db.db import get_conn
     from db.job_monitor import upsert_poll_stats
 
@@ -516,17 +511,14 @@ def stage_fullscan():
              f"last_full_scan={row['last_full_scan_at']}  "
              f"interval={row['full_scan_interval_s']}s")
 
-    # Ensure seen: is populated (fullscan uses it to skip already-known jobs)
-    seen_count = r.scard(f"seen:{INCR_COMPANY}")
-    if seen_count == 0:
-        info(f"seen:{INCR_COMPANY} empty -- rebuilding from DB before fullscan")
-        rebuild_seen_ids(INCR_COMPANY)
-        ok(f"seen:{INCR_COMPANY} rebuilt: {r.scard(f'seen:{INCR_COMPANY}')} members")
-
-    # Clear bloom filter for a clean full-scan run
-    bloom = _BloomFilter(r, INCR_COMPANY)
-    bloom.delete()
-    info(f"Cleared stale bloom filter for {INCR_COMPANY}")
+    # Clear both OLD and NEW bloom filter keys for a clean full-scan run.
+    # prepare_fresh() does this inside _run_fullscan, but doing it explicitly
+    # here ensures a truly clean slate for the test.
+    bloom = _BloomPair(r, INCR_COMPANY)
+    bloom.prepare_fresh()
+    r.delete(f"bloom:fullscan:{INCR_COMPANY}")   # also wipe OLD key
+    r.delete(f"bloom:fallback:{INCR_COMPANY}")
+    info(f"Cleared stale bloom filters for {INCR_COMPANY}")
 
     info(f"Running _run_fullscan for {INCR_COMPANY} (skip_lock=True for test)...")
     info("Real HTTP calls to Greenhouse API -- may take ~5-15s")
@@ -589,53 +581,50 @@ def stage_fullscan():
 # ===========================================================
 
 def stage_watchdog():
-    header(7, "WATCHDOG -- orphan + hung worker checks")
+    header(7, "WATCHDOG -- hung worker + stream PEL checks")
 
-    from workers.watchdog import check_orphans, check_hung_workers, track_inflight, clear_inflight
+    # NOTE: check_orphans() / track_inflight() / clear_inflight() were removed
+    # in the two-layer scheduler redesign (Section 5).  PEL + claim_stale_work()
+    # (XAUTOCLAIM) in scheduler.py owns crash-recovery for scan workers.
+    # The watchdog now covers:
+    #   1. Hung-worker detection via heartbeat:{company} + progress:{company}
+    #   2. Stream PEL observability via XPENDING (informational; no recovery)
+
+    from workers.watchdog import check_hung_workers, check_pel_stats
     from workers.redis_client import get_redis
+    from config import REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN
 
     r = get_redis()
 
-    # track / clear helpers
-    track_inflight("__e2e_test_company__")
-    if r.sismember("watchdog:inflight", "__e2e_test_company__"):
-        ok("track_inflight: company added to watchdog:inflight SET")
-    else:
-        fail("track_inflight: company NOT in watchdog:inflight SET")
-
-    clear_inflight("__e2e_test_company__")
-    if not r.sismember("watchdog:inflight", "__e2e_test_company__"):
-        ok("clear_inflight: company removed from watchdog:inflight SET")
-    else:
-        fail("clear_inflight: company still in watchdog:inflight SET")
-
-    # Clean-state checks
-    info("Running check_orphans()...")
-    requeued = check_orphans()
-    ok(f"check_orphans returned {requeued} orphans (expected 0 in clean state)")
-
+    # ── 1. Hung-worker detection ──────────────────────────────────────────────
     info("Running check_hung_workers()...")
     hung = check_hung_workers()
     ok(f"check_hung_workers returned {len(hung)} hung workers (expected 0 in clean state)")
+    if hung:
+        warn(f"Hung workers detected: {hung}")
 
-    # Orphan simulation: add to inflight with no heartbeat and not in any queue
-    info("Simulating orphan: in-flight company with expired heartbeat...")
-    track_inflight("__e2e_orphan_sim__")
-    # heartbeat:__e2e_orphan_sim__ is NOT set -> expired
-    # __e2e_orphan_sim__ is NOT in poll:adaptive or poll:fullscan -> orphan
+    # ── 2. Stream PEL stats ───────────────────────────────────────────────────
+    info("Running check_pel_stats()...")
+    pel = check_pel_stats()
 
-    requeued2 = check_orphans()
-    if requeued2 >= 1:
-        ok(f"Orphan correctly detected and re-queued ({requeued2} company)")
-        score = r.zscore("poll:adaptive", "__e2e_orphan_sim__")
-        if score is not None:
-            ok(f"Orphan added to poll:adaptive with score={score:.0f}")
-            r.zrem("poll:adaptive", "__e2e_orphan_sim__")
-        else:
-            warn("Orphan not found in poll:adaptive after re-queue")
-    else:
-        warn("Orphan not detected -- check watchdog:inflight or queue membership")
-        r.srem("watchdog:inflight", "__e2e_orphan_sim__")
+    for stream_key in (REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN):
+        stats = pel.get(stream_key)
+        if stats is None:
+            warn(f"PEL stats missing for {stream_key} (stream may not exist yet)")
+            continue
+        total   = stats.get("total_pending", 0)
+        age_s   = (stats["oldest_age_ms"] // 1000) if stats.get("oldest_age_ms") else 0
+        ok(
+            f"PEL {stream_key}: pending={total} "
+            f"oldest_age={age_s}s "
+            f"consumers={stats.get('consumers', [])}"
+        )
+        if total > 0:
+            warn(
+                f"{stream_key} has {total} pending messages — "
+                "this is normal during active scans; "
+                "claim_stale_work() reclaims them after p95×3 ms idle."
+            )
 
 
 # ===========================================================
@@ -648,7 +637,7 @@ def stage_redis_signal():
     from scripts.redis_signal import cmd_pause, cmd_heartbeat, cmd_resume
     from workers.redis_client import get_redis
     from workers.fullscan import _is_paused
-    from workers.scheduler import _check_auto_resume, _paused
+    from workers.scheduler import _check_auto_resume, _pause_event, _resume_event
     from config import REDIS_CRONCHAIN_ALIVE, REDIS_DB_MAINTENANCE
 
     r = get_redis()
@@ -677,14 +666,18 @@ def stage_redis_signal():
     else:
         fail("fullscan._is_paused() returned False during maintenance")
 
-    # Scheduler auto-resume should NOT fire while cronchain:alive is set
-    _paused.set()
+    # Scheduler auto-resume should NOT fire while cronchain:alive is set.
+    # Two-event pattern: _pause_event.set() = paused, _resume_event.clear() = paused.
+    _pause_event.set()
+    _resume_event.clear()
     _check_auto_resume()
-    if _paused.is_set():
+    if _pause_event.is_set() and not _resume_event.is_set():
         ok("scheduler._check_auto_resume() did NOT auto-resume (cronchain:alive alive)")
     else:
         warn("scheduler._check_auto_resume() fired early -- cronchain:alive may have expired")
-    _paused.clear()
+    # Reset to running state
+    _pause_event.clear()
+    _resume_event.set()
 
     # Resume
     info("Running cmd_resume()...")

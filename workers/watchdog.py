@@ -1,33 +1,47 @@
 """
-workers/watchdog.py — Heartbeat watchdog and orphan detection (Phase 10).
+workers/watchdog.py — Hung-worker detection and stream PEL observability.
 
-Runs every WATCHDOG_INTERVAL_S seconds and checks for companies that have
-been popped from the poll queue (their heartbeat was set) but whose worker
-appears to have crashed before the heartbeat could be cleared.
+─── What changed in the two-layer scheduler redesign ────────────────────────
 
-─── Orphan detection ─────────────────────────────────────────────────────────
+The old watchdog had two responsibilities:
 
-A company is "orphaned" when ALL of these are true:
-    1. heartbeat:{company} key has EXPIRED (TTL elapsed → worker not refreshing)
-    2. Company is NOT currently in poll:adaptive ZSET  (was popped and never rescheduled)
-    3. Company is NOT currently in poll:fullscan ZSET  (ditto for full scan)
+  1. Orphan detection: scan the "watchdog:inflight" SSET for companies whose
+     heartbeat expired and who never made it back into a poll queue.  Workers
+     populated watchdog:inflight via track_inflight() / clear_inflight().
 
-Orphaned companies are re-queued with score=now (immediately due) so they
-are picked up by the next adaptive dispatch tick.
+  2. Hung-worker detection: scan heartbeat:{company} and progress:{company}
+     keys to find workers that are alive but making no progress.
+
+Responsibility (1) is now owned by the scheduler's claim_stale_work()
+(XAUTOCLAIM).  When a scan-worker dies mid-job the message stays in the
+stream PEL.  The scheduler's adaptive_loop() calls claim_stale_work() on
+every tick, which uses XAUTOCLAIM to reclaim messages idle longer than
+p95×3 ms.  Re-queuing orphaned companies is therefore automatic without
+any secondary tracking set.  check_orphans(), track_inflight(),
+clear_inflight(), and _get_orphan_requeue_score() have been removed.
+
+Responsibility (2) is still owned by this watchdog.  Scan workers still
+call set_heartbeat() / set_progress() so the hung-worker check is intact.
 
 ─── Hung worker detection ────────────────────────────────────────────────────
 
 A worker is "hung" when:
-    1. heartbeat:{company} is still alive (worker process is running)
-    2. progress:{company} has EXPIRED (no step update for 120 seconds)
+    1. heartbeat:{company} EXISTS (worker process is alive)
+    2. progress:{company} does NOT EXIST (no step update for 120 seconds)
 
-This distinguishes a frozen worker (stuck between HTTP requests with no
-progress update) from a legitimately slow worker making a large fetch
-(which keeps updating progress:{company} with each page).
+This distinguishes a frozen worker (stuck between HTTP requests) from a
+legitimately slow worker making a large fetch (which keeps updating
+progress:{company} with each page).
 
 The watchdog logs hung workers but does NOT kill them — that requires an
-OS-level signal which is outside the watchdog's scope. An alert is raised
-for operator action.
+OS-level signal.  An alert is raised for operator action.
+
+─── Stream PEL observability ─────────────────────────────────────────────────
+
+check_pel_stats() calls XPENDING on stream:adaptive and stream:fullscan and
+logs summary statistics.  This is purely informational — actual reclaim is
+performed by claim_stale_work() in scheduler.py.  Use this for dashboards or
+alerting on stuck PEL growth.
 
 ─── Usage ────────────────────────────────────────────────────────────────────
 
@@ -36,6 +50,7 @@ for operator action.
 
 ─── Architecture doc reference ──────────────────────────────────────────────
 
+    Section 5  — Two-layer scheduler redesign (Redis Streams + PEL)
     Section 18 — Resilience: Worker failures
     Section 15 — Redis: Worker Heartbeats, Worker Progress
 """
@@ -46,176 +61,19 @@ import logging
 
 from workers.redis_client import get_redis, ping
 from config import (
-    REDIS_POLL_ADAPTIVE,
-    REDIS_POLL_FULLSCAN,
-    CONCURRENCY_ERROR_RATE_REDUCE,
+    REDIS_STREAM_ADAPTIVE,
+    REDIS_STREAM_FULLSCAN,
+    STREAM_CONSUMER_GROUP,
 )
 
 logger = logging.getLogger(__name__)
 
-# How often the watchdog checks for orphaned companies (seconds)
+# How often the watchdog checks (seconds)
 WATCHDOG_INTERVAL_S = 60
 
-
-# ─────────────────────────────────────────
-# BACKOFF HELPER
-# ─────────────────────────────────────────
-
-def _get_orphan_requeue_score(r, company: str, now: float) -> float:
-    """
-    Return the ZADD score (Unix timestamp) for re-queuing an orphaned company.
-
-    If the company's platform is currently above the error-rate reduction
-    threshold, the platform is still struggling — re-dispatching immediately
-    would repeat the failure.  Use exponential backoff (same counter as
-    scan_worker so retries accumulate correctly).
-
-    If the platform is healthy, re-queue immediately (score = now).
-
-    Platform is looked up from prospective_companies; falls back to immediate
-    re-queue on any DB error so orphan recovery is never blocked.
-    """
-    from workers.http_client import get_error_rate
-    from workers.scan_worker import _get_backoff_delay
-
-    try:
-        from db.db import get_conn
-        conn = get_conn()
-        try:
-            row = conn.execute(
-                "SELECT ats_platform FROM prospective_companies WHERE company = %s",
-                (company,),
-            ).fetchone()
-        finally:
-            conn.close()
-        platform = row["ats_platform"] if row else None
-    except Exception as exc:
-        logger.debug("watchdog: platform lookup failed for %r: %s", company, exc)
-        platform = None
-
-    if platform:
-        try:
-            error_rate = get_error_rate(r, platform)
-            if error_rate > CONCURRENCY_ERROR_RATE_REDUCE:
-                delay = _get_backoff_delay(r, company, "scan")
-                return now + delay
-        except Exception as exc:
-            logger.debug("watchdog: error_rate check failed for %r: %s", company, exc)
-
-    return now   # healthy platform — re-queue immediately
-
-
-# ─────────────────────────────────────────
-# ORPHAN DETECTION
-# ─────────────────────────────────────────
-
-def check_orphans() -> int:
-    """
-    Find orphaned companies and re-queue them with score=now.
-
-    A company is orphaned when heartbeat:{company} has expired AND the
-    company is absent from both poll:adaptive and poll:fullscan.
-
-    Orphan detection relies on a Redis SCAN of heartbeat:* keys.
-    Keys that NO LONGER EXIST means the heartbeat expired — we check if
-    the company was ever in-flight by consulting a temporary tracking
-    structure.
-
-    Implementation: we scan for progress:{company} keys (set by workers
-    alongside heartbeat:{company}). If progress: has expired but the company
-    is not in either queue, it was being processed and the worker died.
-
-    Returns count of companies re-queued.
-    """
-    r         = get_redis()
-    now       = time.time()
-    requeued  = 0
-
-    # Scan for heartbeat keys still alive
-    alive_heartbeats = set()
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-        for key in keys:
-            key_str = key.decode() if isinstance(key, (bytes, bytearray)) else key
-            company = key_str.split(":", 1)[1]
-            alive_heartbeats.add(company)
-        if cursor == 0:
-            break
-
-    # Companies with an alive heartbeat are still being processed — skip
-    # Companies whose heartbeat has expired may be orphaned
-    # We detect them by finding companies NOT in either queue and NOT heartbeat-alive
-
-    # Get all companies currently in either poll queue (not orphaned).
-    # r.zrange() returns bytes in redis-py; decode to str for consistent
-    # comparisons with the alive_heartbeats set (also populated with str).
-    def _decode(val):
-        return val.decode() if isinstance(val, (bytes, bytearray)) else val
-
-    in_adaptive = {_decode(m) for m in r.zrange(REDIS_POLL_ADAPTIVE, 0, -1)}
-    in_fullscan = {_decode(m) for m in r.zrange(REDIS_POLL_FULLSCAN, 0, -1)}
-    in_queues   = in_adaptive | in_fullscan
-
-    # Scan for "was recently dispatched" markers — we use progress:{company}
-    # which is set by scan_worker when a job starts (TTL=120s).
-    # A recently-expired progress: key means the company WAS in-flight.
-    # Since we can't scan expired keys, use a secondary "in-flight" tracking set.
-    # See _track_inflight() / _clear_inflight() called by scan_worker.
-    inflight_key = "watchdog:inflight"
-    # r.smembers() also returns bytes; decode for consistent membership tests.
-    in_flight    = {_decode(m) for m in r.smembers(inflight_key)}
-
-    for company in in_flight:
-        if company in alive_heartbeats:
-            # Worker is still running (heartbeat alive) — not an orphan
-            continue
-        if company in in_queues:
-            # Company already back in a queue — scheduler rescheduled it
-            r.srem(inflight_key, company)
-            continue
-
-        # heartbeat expired AND not in queues AND was in-flight → orphaned
-        # Re-queue with error-rate-aware delay: if the platform is still
-        # struggling, use exponential backoff so we don't hammer it again.
-        # If healthy, re-queue immediately (score=now).
-        requeue_score = _get_orphan_requeue_score(r, company, now)
-        logger.warning(
-            "watchdog: ORPHAN detected: company=%r — re-queuing "
-            "(delay=%ds, score=%.0f)",
-            company, max(0, int(requeue_score - now)), requeue_score,
-        )
-        r.zadd(REDIS_POLL_ADAPTIVE, {company: requeue_score})
-        r.srem(inflight_key, company)
-        requeued += 1
-
-    if requeued:
-        logger.info("watchdog: re-queued %d orphaned companies", requeued)
-    else:
-        logger.debug("watchdog: no orphans detected")
-
-    return requeued
-
-
-def track_inflight(company: str) -> None:
-    """
-    Add a company to the watchdog in-flight tracking set.
-
-    Call this from scan_worker when a job starts processing.
-    The set persists across worker crashes — that is the point.
-    """
-    get_redis().sadd("watchdog:inflight", company)
-
-
-def clear_inflight(company: str) -> None:
-    """
-    Remove a company from the watchdog in-flight tracking set.
-
-    Call this from scan_worker on successful completion (or after
-    scheduler has rescheduled the company). Also called by watchdog
-    itself after re-queuing.
-    """
-    get_redis().srem("watchdog:inflight", company)
+# PEL age threshold for logging a warning (informational only — does not
+# trigger recovery; that is claim_stale_work()'s job).
+PEL_WARN_AGE_MS = 10 * 60 * 1000   # 10 minutes
 
 
 # ─────────────────────────────────────────
@@ -227,15 +85,19 @@ def check_hung_workers() -> list:
     Detect workers that have a live heartbeat but no recent progress update.
 
     A worker is "hung" if:
-        - heartbeat:{company} EXISTS (worker process alive)
-        - progress:{company} does NOT EXIST (no step update in 120s)
+        - heartbeat:{company} EXISTS   (worker process is alive)
+        - progress:{company} does NOT  (no step update in 120s)
+
+    This supplementary check catches edge cases that fall outside the
+    PEL reclaim window — e.g. a worker that is still alive (no crash)
+    but has blocked indefinitely inside fetch_jobs().
 
     Returns list of company names with potentially hung workers.
+    Does NOT kill or re-queue — logs a warning for operator action.
     """
     r    = get_redis()
     hung = []
 
-    # Scan all alive heartbeats
     cursor = 0
     while True:
         cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
@@ -247,9 +109,9 @@ def check_hung_workers() -> list:
                 logger.warning(
                     "watchdog: HUNG WORKER suspected: company=%r — "
                     "heartbeat alive but progress key expired "
-                    "(no step update in 120s). "
-                    "Consider killing worker PID and letting orphan "
-                    "detection re-queue.",
+                    "(no step update in 120 s).  "
+                    "claim_stale_work() will reclaim the PEL entry after "
+                    "the p95×3 idle window if the worker is truly stuck.",
                     company,
                 )
                 hung.append(company)
@@ -260,6 +122,97 @@ def check_hung_workers() -> list:
 
 
 # ─────────────────────────────────────────
+# STREAM PEL OBSERVABILITY
+# ─────────────────────────────────────────
+
+def check_pel_stats() -> dict:
+    """
+    Report Pending Entry List (PEL) summary for adaptive and fullscan streams.
+
+    Calls XPENDING stream group - + for up to 50 oldest entries and reports:
+        - total_pending:  overall PEL depth (from the summary XPENDING)
+        - oldest_age_ms:  how long the oldest pending message has been idle
+        - consumers:      list of (consumer_name, count) tuples
+
+    Logs a WARNING if any entry has been pending longer than PEL_WARN_AGE_MS.
+    This is purely informational — actual reclaim is performed by
+    claim_stale_work() (XAUTOCLAIM) inside the scheduler's adaptive_loop().
+
+    Returns:
+        dict keyed by stream name, each value a sub-dict with the stats above.
+        Empty dict if Redis is unreachable.
+    """
+    r   = get_redis()
+    now = int(time.time() * 1000)   # milliseconds
+    stats = {}
+
+    for stream_key in (REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN):
+        try:
+            # Summary form: XPENDING stream group — returns
+            # [total, min_id, max_id, [[consumer, count], ...]]
+            summary = r.xpending(stream_key, STREAM_CONSUMER_GROUP)
+        except Exception as exc:
+            logger.debug("watchdog: xpending %s failed: %s", stream_key, exc)
+            continue
+
+        if not summary or summary.get("pending") == 0:
+            stats[stream_key] = {"total_pending": 0}
+            continue
+
+        total     = summary.get("pending", 0)
+        consumers = [
+            (c["name"] if isinstance(c["name"], str) else c["name"].decode(), c["pending"])
+            for c in summary.get("consumers", [])
+        ]
+
+        # Fetch oldest pending entry to compute age
+        oldest_age_ms = None
+        try:
+            entries = r.xpending_range(
+                stream_key, STREAM_CONSUMER_GROUP,
+                min="-", max="+", count=1,
+            )
+            if entries:
+                entry     = entries[0]
+                msg_id    = entry["message_id"]
+                idle_ms   = entry.get("time_since_delivered", 0)
+                oldest_age_ms = idle_ms
+
+                if idle_ms > PEL_WARN_AGE_MS:
+                    logger.warning(
+                        "watchdog: PEL WARNING stream=%s — oldest message %r "
+                        "has been pending for %d s (threshold %d s). "
+                        "claim_stale_work() should have reclaimed it. "
+                        "Check scheduler adaptive_loop()/fullscan_loop() health.",
+                        stream_key,
+                        msg_id.decode() if isinstance(msg_id, bytes) else msg_id,
+                        idle_ms // 1000,
+                        PEL_WARN_AGE_MS // 1000,
+                    )
+        except Exception as exc:
+            logger.debug(
+                "watchdog: xpending_range %s failed: %s", stream_key, exc,
+            )
+
+        entry_stats = {
+            "total_pending":  total,
+            "oldest_age_ms":  oldest_age_ms,
+            "consumers":      consumers,
+        }
+        stats[stream_key] = entry_stats
+
+        logger.info(
+            "watchdog: PEL stats stream=%s total=%d oldest=%s consumers=%s",
+            stream_key,
+            total,
+            f"{oldest_age_ms // 1000}s" if oldest_age_ms is not None else "n/a",
+            consumers,
+        )
+
+    return stats
+
+
+# ─────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────
 
@@ -267,8 +220,12 @@ def run_watchdog(once: bool = False) -> None:
     """
     Main watchdog loop.
 
-    Runs check_orphans() and check_hung_workers() every WATCHDOG_INTERVAL_S
+    Runs check_hung_workers() and check_pel_stats() every WATCHDOG_INTERVAL_S
     seconds.
+
+    Orphan detection (check_orphans) was removed in the two-layer scheduler
+    redesign — PEL + claim_stale_work() in scheduler.py owns crash recovery
+    for scan workers.
 
     Args:
         once: if True, run one check cycle then exit.
@@ -289,11 +246,20 @@ def run_watchdog(once: bool = False) -> None:
 
     while True:
         try:
-            requeued = check_orphans()
-            hung     = check_hung_workers()
+            hung      = check_hung_workers()
+            pel_stats = check_pel_stats()
 
-            if requeued or hung:
-                print(f"[watchdog] orphans={requeued} hung={len(hung)}")
+            # Build a quick summary line for the console
+            total_pel = sum(
+                v.get("total_pending", 0)
+                for v in pel_stats.values()
+                if isinstance(v, dict)
+            )
+            if hung or total_pel:
+                print(
+                    f"[watchdog] hung_workers={len(hung)} "
+                    f"pel_total={total_pel}"
+                )
 
             if once:
                 break
