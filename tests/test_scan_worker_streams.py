@@ -18,7 +18,7 @@ Coverage map
     · xgroup_create called with REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP,
       id="$", mkstream=True
     · BUSYGROUP exception → silently swallowed
-    · Other exception → warning logged, not re-raised
+    · Other exception → warning logged, then re-raised (fail fast)
     · Success → no exception propagates
 
   TestRunWorkerInitialisation
@@ -40,7 +40,7 @@ Coverage map
     · on_adaptive_complete called with (company, new_jobs, success)
     · on_adaptive_complete receives success=True when scan succeeds
     · on_adaptive_complete receives success=False when scan fails
-    · on_adaptive_complete raising → xack still called (no infinite retry)
+    · on_adaptive_complete raising → xack NOT called (stays in PEL for retry)
     · on_adaptive_complete args: new_jobs=result["new_jobs"], success=result["success"]
 
   TestRunWorkerMessageParsing
@@ -140,13 +140,14 @@ class TestEnsureConsumerGroupScanWorker(unittest.TestCase):
                               or "xgroup_create" in c.lower()]
         self.assertEqual(len(busygroup_warnings), 0)
 
-    def test_other_exception_logs_warning(self):
-        """Non-BUSYGROUP exception → warning logged, not re-raised."""
+    def test_other_exception_logs_warning_and_raises(self):
+        """Non-BUSYGROUP exception → warning logged, then re-raised (fail fast)."""
         r = MagicMock()
         r.xgroup_create.side_effect = Exception("WRONGTYPE Operation against a key")
         with patch("workers.scan_worker.logger") as mock_log:
             from workers.scan_worker import _ensure_consumer_group
-            _ensure_consumer_group(r)
+            with self.assertRaises(Exception):
+                _ensure_consumer_group(r)
         mock_log.warning.assert_called_once()
 
     def test_success_no_exception(self):
@@ -398,8 +399,12 @@ class TestRunWorkerCompletionHandler(unittest.TestCase):
         captured, _ = self._run_with_result(result)
         self.assertFalse(captured[0][2])
 
-    def test_on_adaptive_complete_failure_xack_still_called(self):
-        """on_adaptive_complete raising → xack still called (no infinite retry)."""
+    def test_on_adaptive_complete_failure_no_xack(self):
+        """
+        on_adaptive_complete raising → XACK is NOT called.
+        The message stays in PEL for XAUTOCLAIM to retry (on_adaptive_complete
+        is idempotent so retrying is safe).
+        """
         from config import REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP
         msgs = _make_stream_message(msg_id=b"9999-0")
         r    = _make_redis_mock(stream_messages=msgs)
@@ -417,7 +422,7 @@ class TestRunWorkerCompletionHandler(unittest.TestCase):
             from workers.scan_worker import run_worker
             run_worker(once=True, skip_init_db=True)
 
-        r.xack.assert_called_once()
+        r.xack.assert_not_called()
 
     def test_missing_new_jobs_defaults_to_zero(self):
         """result without 'new_jobs' key → on_adaptive_complete gets 0."""

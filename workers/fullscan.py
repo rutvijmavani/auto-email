@@ -455,7 +455,7 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     if first_poll_at <= now_ts:
         first_poll_at += 86400   # push to tomorrow's slot
 
-    first_poll_dt = _dt.fromtimestamp(first_poll_at)
+    first_poll_dt = _dt.fromtimestamp(first_poll_at, tz=timezone.utc)
 
     conn = get_conn()
     try:

@@ -155,6 +155,7 @@ def _ensure_consumer_group(r) -> None:
     except Exception as exc:
         if "BUSYGROUP" not in str(exc):
             logger.warning("scan_worker: xgroup_create error: %s", exc)
+            raise
 
 
 # ─────────────────────────────────────────
@@ -812,15 +813,16 @@ def run_worker(once: bool = False, shutdown_event=None,
                     result.get("new_jobs", 0),
                     success=result.get("success", False),
                 )
+                # ── XACK: remove from PEL (work complete) ────────────────────
+                # Only XACK on success — if on_adaptive_complete raises, the
+                # message stays in PEL for XAUTOCLAIM to retry (idempotent).
+                r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
             except Exception as oac_exc:
                 logger.error(
                     "scan_worker: on_adaptive_complete failed for %r: %s — "
-                    "XACK anyway to prevent infinite retry loop",
+                    "leaving in PEL for XAUTOCLAIM retry",
                     company, oac_exc, exc_info=True,
                 )
-
-            # ── XACK: remove from PEL (work complete) ────────────────────────
-            r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
 
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""

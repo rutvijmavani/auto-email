@@ -239,9 +239,9 @@ def stage_scan_incremental():
     # adaptive_seen:{company} is populated naturally by scan_worker runs.
     # No pre-seeding needed — first run will do DB lookups for all jobs,
     # subsequent runs within the same day skip via the SET cache.
-    adaptive_seen_count = r.scard(f"adaptive_seen:{INCR_COMPANY}")
-    if adaptive_seen_count > 0:
-        ok(f"adaptive_seen:{INCR_COMPANY} has {adaptive_seen_count} members from earlier runs")
+    pre_seen_count = r.scard(f"adaptive_seen:{INCR_COMPANY}")
+    if pre_seen_count > 0:
+        ok(f"adaptive_seen:{INCR_COMPANY} has {pre_seen_count} members from earlier runs")
     else:
         info(f"adaptive_seen:{INCR_COMPANY} is empty -- scan_worker will populate it")
 
@@ -265,6 +265,14 @@ def stage_scan_incremental():
              "incremental diff not tested. Re-run to test incremental path.")
     else:
         ok("incremental diff ran (not first_scan)")
+
+    post_seen_count = r.scard(f"adaptive_seen:{INCR_COMPANY}")
+    if post_seen_count > pre_seen_count:
+        ok(f"adaptive_seen:{INCR_COMPANY} grew {pre_seen_count}→{post_seen_count} (scan populated cache)")
+    elif post_seen_count > 0:
+        ok(f"adaptive_seen:{INCR_COMPANY} has {post_seen_count} entries (populated by prior or current run)")
+    else:
+        fail(f"adaptive_seen:{INCR_COMPANY} is still empty after scan — cache not populated")
 
     ok(f"fetched={result['fetched']} from Greenhouse API")
     if result["new_jobs"] == 0:

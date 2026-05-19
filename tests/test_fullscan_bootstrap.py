@@ -527,24 +527,18 @@ class TestRunFullscanBootstrapIntegration(unittest.TestCase):
     def test_first_fullscan_calls_bootstrap(self):
         """last_poll_at=None before scan → _bootstrap_warming_adaptive IS called."""
         bootstrap = MagicMock()
-        try:
-            self._run_fullscan_patched(last_poll_at_value=None,
-                                       bootstrap_mock=bootstrap)
-        except Exception:
-            pass   # _run_fullscan may raise due to incomplete mocking — that's OK
+        self._run_fullscan_patched(last_poll_at_value=None,
+                                   bootstrap_mock=bootstrap)
         bootstrap.assert_called_once()
 
     def test_non_first_fullscan_skips_bootstrap(self):
         """last_poll_at is not None → _bootstrap_warming_adaptive NOT called."""
         import datetime
         bootstrap = MagicMock()
-        try:
-            self._run_fullscan_patched(
-                last_poll_at_value=datetime.datetime(2024, 1, 1),
-                bootstrap_mock=bootstrap,
-            )
-        except Exception:
-            pass
+        self._run_fullscan_patched(
+            last_poll_at_value=datetime.datetime(2024, 1, 1),
+            bootstrap_mock=bootstrap,
+        )
         bootstrap.assert_not_called()
 
     def test_bootstrap_failure_does_not_propagate(self):

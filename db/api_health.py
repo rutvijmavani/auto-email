@@ -531,8 +531,9 @@ def query_p95_response_ms(scan_type: str) -> int:
     from db.connection import get_conn
 
     since = (date.today() - timedelta(days=7)).isoformat()
-    conn  = get_conn()
+    conn  = None
     try:
+        conn = get_conn()
         row = conn.execute("""
             SELECT AVG(max_response_ms) AS avg_max_ms
             FROM api_health
@@ -544,7 +545,8 @@ def query_p95_response_ms(scan_type: str) -> int:
     except Exception:
         return 30_000
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
     avg_max = (row["avg_max_ms"] or 0) if row else 0
     if avg_max <= 0:

@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import multiprocessing
+import os
 import random
 import threading
 import time
@@ -867,7 +868,7 @@ def on_fullscan_complete(company: str, new_jobs: int,
         row = conn.execute("""
             SELECT last_poll_at, full_scan_interval_s, full_scan_deferred
             FROM company_poll_stats
-            WHERE company = ?
+            WHERE company = %s
         """, (company,)).fetchone()
     finally:
         conn.close()
@@ -941,12 +942,10 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
     companies are spread deterministically across the day instead of clustering
     at the restart moment.
     """
-    import pytz
-    from datetime import datetime as _dt
     from workers.slot import slot_offset
 
     eastern = pytz.timezone("America/New_York")
-    now_eastern = _dt.now(eastern)
+    now_eastern = datetime.now(eastern)
     today_midnight = now_eastern.replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -981,7 +980,7 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
     if first_poll_at <= now:
         first_poll_at += 86400   # push to tomorrow's slot
 
-    first_poll_dt = _dt.fromtimestamp(first_poll_at)
+    first_poll_dt = datetime.fromtimestamp(first_poll_at)
 
     conn = get_conn()
     try:
