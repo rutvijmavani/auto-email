@@ -223,6 +223,7 @@ def claim_stale_work(r, stream_key: str, group: str,
         p95_ms:      p95 scan duration in ms (from api_health); drives idle timeout
         op_type:     "scan" | "fullscan" — controls which ZSET to use for backoff
     """
+    from workers.scan_worker import _get_backoff_delay   # hoisted — used in dead-letter path
     idle_ms = max(p95_ms * 3, 300_000)   # at least 5 min, scales with p95
 
     try:
@@ -263,7 +264,6 @@ def claim_stale_work(r, stream_key: str, group: str,
 
         if delivery_count >= MAX_STREAM_REDELIVERIES:
             # Dead-letter: move company to scheduling ZSET with backoff, XACK stream
-            from workers.scan_worker import _get_backoff_delay
             delay = _get_backoff_delay(r, company, op_type)
             target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
             r.zadd(target_zset, {company: time.time() + delay})

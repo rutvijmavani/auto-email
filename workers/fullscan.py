@@ -392,6 +392,7 @@ def _ensure_consumer_group(r) -> None:
     except Exception as exc:
         if "BUSYGROUP" not in str(exc):
             logger.warning("fullscan: xgroup_create error: %s", exc)
+            raise
 
 
 # ─────────────────────────────────────────

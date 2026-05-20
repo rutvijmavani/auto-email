@@ -631,7 +631,7 @@ def stage_watchdog():
             warn(
                 f"{stream_key} has {total} pending messages — "
                 "this is normal during active scans; "
-                "claim_stale_work() reclaims them after p95×3 ms idle."
+                "claim_stale_work() reclaims them after p95*3 ms idle."
             )
 
 

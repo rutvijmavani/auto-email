@@ -230,14 +230,14 @@ class TestSlotOffsetDistribution(unittest.TestCase):
         """
         Mean offset across 100 inputs should fall in the middle third of
         [0, 86400) — i.e. between 28800 (8h) and 57600 (16h) — confirming
-        the distribution is not heavily biased toward midnight.
+        the distribution is not heavily biased toward midnight or end-of-day.
         """
         offsets = [slot_offset(i) for i in range(1, 101)]
         mean_offset = sum(offsets) / len(offsets)
-        self.assertGreater(mean_offset, 86400 * 0.2,
-                           msg=f"Mean offset {mean_offset:.0f}s is suspiciously low")
-        self.assertLess(mean_offset, 86400 * 0.8,
-                        msg=f"Mean offset {mean_offset:.0f}s is suspiciously high")
+        self.assertGreater(mean_offset, 86400 // 3,   # > 28800s (8h)
+                           msg=f"Mean offset {mean_offset:.0f}s < 28800s (8h) — biased toward midnight")
+        self.assertLess(mean_offset, 2 * 86400 // 3,  # < 57600s (16h)
+                        msg=f"Mean offset {mean_offset:.0f}s > 57600s (16h) — biased toward end-of-day")
 
     def test_all_100_in_valid_range(self):
         """Sanity: all 100 outputs are still in [0, 86400)."""

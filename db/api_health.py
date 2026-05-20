@@ -543,7 +543,7 @@ def query_p95_response_ms(scan_type: str) -> int:
               AND max_response_ms > 0
         """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
     except Exception:
-        return 30_000
+        return 30_000 if scan_type == "listing_scan" else 120_000
     finally:
         if conn:
             conn.close()

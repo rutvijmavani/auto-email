@@ -259,11 +259,18 @@ class TestQueryP95ErrorHandling(unittest.TestCase):
             result = query_p95_response_ms("listing_scan")
         self.assertEqual(result, 30_000)
 
-    def test_get_conn_exception_returns_30000(self):
-        """Exception in get_conn itself → returns 30 000."""
+    def test_get_conn_exception_full_scan_returns_120000(self):
+        """Exception in get_conn itself with full_scan → returns 120 000 (correct default)."""
         with patch("db.connection.get_conn", side_effect=Exception("DB down")):
             from db.api_health import query_p95_response_ms
             result = query_p95_response_ms("full_scan")
+        self.assertEqual(result, 120_000)
+
+    def test_get_conn_exception_listing_scan_returns_30000(self):
+        """Exception in get_conn itself with listing_scan → returns 30 000."""
+        with patch("db.connection.get_conn", side_effect=Exception("DB down")):
+            from db.api_health import query_p95_response_ms
+            result = query_p95_response_ms("listing_scan")
         self.assertEqual(result, 30_000)
 
     def test_conn_close_called_on_success(self):

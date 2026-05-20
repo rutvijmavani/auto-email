@@ -302,7 +302,7 @@ The two queues are driven independently. A company's position in `poll:fullscan`
 
 Both Tier 1 and Tier 2 use the same **two-layer pattern**: a Redis ZSET as the scheduling ledger (when is each company due?) and a Redis Stream per DC key as the crash-safe delivery queue (in-flight work tracked by PEL).
 
-```
+```text
 At 7 AM cycle start:
   1. Store cycle_start timestamp → redis.set("cycle:start", now)
   2. Dynamic worker count recalculated for this cycle
@@ -879,15 +879,17 @@ def fullscan_dispatcher_loop():
 ```python
 def fullscan_worker(dc_key: str, group: str, consumer: str):
     stream_key = f"stream:fullscan:{dc_key}"
-    redis.xgroup_create(stream_key, group, id="0", mkstream=True)
+    redis.xgroup_create(stream_key, group, id="$", mkstream=True)  # id="$": new messages only; BUSYGROUP ignored
     while True:
-        msgs = redis.xreadgroup(group, consumer, {stream_key: ">"}, count=1, block=5000)
+        msgs = redis.xreadgroup(group, consumer, {stream_key: ">"}, count=1, block=500)
         if not msgs:
             continue
         _, entries = msgs[0]
         msg_id, fields = entries[0]
         run_full_scan(fields["company"])
         redis.xack(stream_key, group, msg_id)
+        # Stale PEL entries (crashed workers) are recovered by claim_stale_work()
+        # via XAUTOCLAIM — idle threshold = max(p95_full_scan_ms × 3, 300 000 ms)
 ```
 
 **Crash recovery and dead-letter handling:**
@@ -3438,9 +3440,9 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 **worker_scaling_events:** Append-only PostgreSQL table recording every worker scaling decision with full health context (error rate, baseline, spike factor, queue depths, worker counts before/after). Used for post-incident analysis and weekly health reporting. Effectiveness is derived by joining adjacent events within a time window — no row is ever updated after insert.
 
-**batch_position:** A company's ordinal position within a single registration event (1, 2, 3 … N). Used exclusively to compute the first adaptive poll slot via `hash(batch_position) % 86400`. Resets to 1 for every new registration batch. Replaced by `hash(company_id) % 86400` after the WARMING phase completes. Not stored in the DB — computed transiently at registration time.
+**batch_position:** A company's ordinal position within a single registration event (1, 2, 3 … N). Used exclusively to compute the first adaptive poll slot via `slot_offset(batch_position)` (see Section 25 for the canonical definition). Resets to 1 for every new registration batch. Replaced by `slot_offset(company_id)` after the WARMING phase completes. Not stored in the DB — computed transiently at registration time.
 
-**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across the 24-hour day. Formula: `today_midnight + hash(identifier) % 86400`. For new companies: identifier = batch_position. For recurring polls: identifier = company_id. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
+**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across the 24-hour day. Formula: `today_midnight + slot_offset(identifier)` where `slot_offset` is defined in Section 25. For new companies during WARMING: identifier = batch_position, so the slot is `slot_offset(batch_position)`. For recurring polls (STABLE): identifier = company_id, so the slot is `slot_offset(company_id)`. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
 
 **Thundering herd:** The condition where many companies become due simultaneously, overloading workers and the ATS concurrency ceiling. Root cause: companies onboarded together drift to the same time-of-day slot. Fixed by hash-based slot assignment (Section 25).
 

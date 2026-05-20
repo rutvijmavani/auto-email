@@ -578,13 +578,14 @@ class TestRunFullscanBootstrapIntegration(unittest.TestCase):
             mock_conn_fn.return_value = mock_conn
 
             from workers.fullscan import _run_fullscan
-            try:
-                _run_fullscan("TestCo", r)
-            except Exception as e:
-                # Only bootstrap-related exceptions should NOT propagate
-                # Other exceptions from incomplete mocks are acceptable
-                if "DB timeout" in str(e):
-                    self.fail("Bootstrap exception propagated from _run_fullscan")
+            _run_fullscan("TestCo", r)   # must not raise — bootstrap exc is non-fatal
+
+        # Verify fallback ZADD to poll:adaptive fired (company not lost)
+        zadd_calls = [c[0][0] for c in r.zadd.call_args_list]
+        self.assertIn(
+            REDIS_POLL_ADAPTIVE, zadd_calls,
+            msg="Fallback r.zadd(poll:adaptive, ...) not called when bootstrap fails",
+        )
 
 
 if __name__ == "__main__":

@@ -587,9 +587,10 @@ def _handle_first_scan(
                     )
                     r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
                     fresh_queued += 1
-                    # Fresh jobs queued for detail — add to adaptive_seen so
-                    # repeat adaptive scans today don't re-check them.
-                    preexisting_ids.append(job_id)
+                # Always mark in adaptive_seen — repeat adaptive scans today
+                # must not re-check this job regardless of whether it was a
+                # new DB insert (inserted=True) or a duplicate (inserted=False).
+                preexisting_ids.append(job_id)
             else:
                 # Filtered by title → treat as pre-existing
                 preexisting_ids.append(job_id)
