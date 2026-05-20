@@ -25,8 +25,8 @@
 21. [Scaling Properties](#21-scaling-properties)
 22. [Observability — Measuring Whether the System is Working](#22-observability--measuring-whether-the-system-is-working)
 23. [Implementation Roadmap](#23-implementation-roadmap)
-24. [Glossary](#24-glossary)
-25. [Thundering Herd Prevention — Hash-Based Slot Distribution](#25-thundering-herd-prevention--hash-based-slot-distribution)
+24. [Thundering Herd Prevention — Hash-Based Slot Distribution](#24-thundering-herd-prevention--hash-based-slot-distribution)
+25. [Glossary](#25-glossary)
 
 ---
 
@@ -689,7 +689,7 @@ Four rules enforce this together:
 No company polls less frequently than every 12 hours. Worst case: a dormant company last polled at 1 AM gets its adaptive poll at 1 PM — full scan follows at 1:05 PM. Covered before end of day.
 
 **Rule 2 — Dawn patrol (RETIRED)**
-Dawn patrol redistributed late adaptive polls into the 7 AM–9 AM window at cycle start. This is no longer needed. Hash-based slot assignment (see Section 25) distributes adaptive polls evenly across the 24-hour day from the very first cycle — there are no clustered late polls to redistribute. Dawn patrol is removed.
+Dawn patrol redistributed late adaptive polls into the 7 AM–9 AM window at cycle start. This is no longer needed. Hash-based slot assignment (see Section 24) distributes adaptive polls evenly across the 24-hour day from the very first cycle — there are no clustered late polls to redistribute. Dawn patrol is removed.
 
 **Rule 3 — Adaptive triggers full scan directly (structural enforcement)**
 When adaptive completes, it checks whether full scan is due and queues it automatically. Full scan can only enter `poll:fullscan` via this path — never independently.
@@ -786,7 +786,7 @@ def run_full_scan(company):
 | Scenario | Rule that handles it |
 |---|---|
 | Dormant company, last polled 11 PM | Rule 1 → 12h cap guarantees adaptive by 11 AM at latest |
-| Many companies with clustered adaptive intervals | Section 25 hash distribution → never cluster in the first place |
+| Many companies with clustered adaptive intervals | Section 24 hash distribution → never cluster in the first place |
 | New company, never polled | Rule 4 → triggers adaptive before allowing full scan |
 | Adaptive keeps erroring | Rule 4 → keeps retrying before allowing full scan |
 | Active company, 4h interval | Rule 3 → full scan triggered once per day naturally |
@@ -840,7 +840,7 @@ Full scan is the **bulletproof safety net**. It exhaustively scans every page of
 
 Full scan uses a **two-layer design**: a ZSET for scheduling (when is each company due?) and a Redis Stream per DC key for crash-safe delivery to workers.
 
-```
+```text
 poll:fullscan  (Redis ZSET — scheduling ledger)
   Score = next_full_scan_at timestamp
   Written by: on_adaptive_complete() — Rules 3 and 5
@@ -1046,7 +1046,7 @@ This is the "bulletproof" guarantee — non-sorted platforms cannot use smart ea
 
 Each company has its own Bloom filter in Redis representing the **complete state of the job board as of the last full scan cycle**:
 
-```
+```text
 Key:  bloom:fullscan:{company}
 TTL:  36 hours (24h cycle + 12h buffer for timing drift)
 Size: ~0.5MB per company at 0.1% error rate
@@ -1058,7 +1058,7 @@ The Bloom filter serves two purposes:
 
 Full scan flow with Bloom filter:
 
-```
+```text
 1. Check if OLD bloom:fullscan:{company} exists
    NO  → cold start, no reference — process everything, build NEW_BLOOM from scratch
    YES → use OLD bloom as "already seen" reference for DB check optimisation
@@ -1561,7 +1561,7 @@ Today the pipeline fetches 146,497 jobs and processes all of them to find 157 ne
 
 For each job ID on a fetched page, adaptive polling checks two layers in order:
 
-```
+```text
 1. adaptive_seen:{company} SET (Redis)
    → Job ID present? Already processed in an earlier adaptive scan today → skip entirely
    → Not present?    Proceed to layer 2, then add to SET regardless of outcome
@@ -1611,7 +1611,7 @@ if job.updated_at > seen_ids[job_id].last_updated + REFRESH_WINDOW:
 
 Deduplication operates at four independent layers, each catching what the layer above it missed:
 
-```
+```text
 Layer 1: In-cycle Python set (per scan run)
   → Catches duplicate job IDs within a single page sequence (pagination overlap)
   → Plain Python set(), lives only for the duration of one scan function call
@@ -1733,7 +1733,7 @@ ZREM poll:adaptive {company}                           — dispatcher removes af
 
 #### 1b. Adaptive Delivery Stream (Redis Stream per DC key)
 
-```
+```text
 Key: "stream:adaptive:{dc_key}"   e.g. stream:adaptive:workday_wd1
 Type: Stream (consumer groups, PEL)
 
@@ -1751,7 +1751,7 @@ XPENDING stream:adaptive:{dc_key} scan-workers                             — i
 
 #### 2. Full Scan Queue (Sorted Set + Stream)
 
-```
+```text
 Key: "poll:fullscan"
 Type: Sorted Set (ZSET)
 Score: Unix timestamp of next full scan time
@@ -1776,7 +1776,7 @@ XAUTOCLAIM stream:fullscan:{dc_key} fullscan-workers {consumer}
 
 #### 3. Detail Fetch Queues (Two-Tier Lists)
 
-```
+```text
 Keys: "queue:detail:adaptive"  (high priority — from listing scan)
       "queue:detail:fullscan"  (low priority  — from full scan)
 Type: List
@@ -1791,7 +1791,7 @@ Backpressure: listing scan checks queue depth before pushing. If depth > MAX_QUE
 
 #### 4. Per-Company Bloom Filters
 
-```
+```text
 Key: "bloom:fullscan:{company}"
 Type: RedisBloom (BF)
 TTL: 36 hours (24h cycle + 12h timing buffer)
@@ -1811,7 +1811,7 @@ Fallback if RedisBloom unavailable: Redis SET at key `bloom:fallback:{company}`.
 
 #### 5. Adaptive Seen Cache (Sets, one per company)
 
-```
+```text
 Key: "adaptive_seen:{company}"
 Type: Set
 TTL: 24 hours (fixed)
@@ -1937,7 +1937,7 @@ CREATE TABLE company_poll_stats (
     last_error_at           TIMESTAMP,
     last_success_at         TIMESTAMP,
 
-    -- Lifecycle phase (Section 25: NEW → WARMING → STABLE)
+    -- Lifecycle phase (Section 24: NEW → WARMING → STABLE)
     warming_polls_remaining SMALLINT DEFAULT NULL,
     -- NULL  = STABLE (adaptive engine fully in control)
     -- 3,2,1 = WARMING (fixed 2h interval; decremented by on_adaptive_complete)
@@ -2207,7 +2207,7 @@ Meanwhile, detail workers:
 
 ### Full scan flow
 
-```
+```text
 Full scan for company Workday_Corp:
 
 1. Full scan dispatcher: ZRANGEBYSCORE poll:fullscan -inf {now} → "Workday_Corp" due
@@ -2306,7 +2306,7 @@ Workers reconnect with exponential backoff. If Redis unreachable for > 2 minutes
 **Crashed workers — Stream PEL recovery (replaces watchdog):**
 Scan worker crashes no longer require a watchdog process. The Stream PEL tracks every message delivered but not yet ACK'd. `XAUTOCLAIM` re-delivers unACK'd messages after the idle timeout to another available worker:
 
-```
+```text
 stream:adaptive:{dc_key}  → XAUTOCLAIM after 10 min idle (adaptive scans)
 stream:fullscan:{dc_key}  → XAUTOCLAIM after 20 min idle (full scans, longer timeout)
 ```
@@ -3048,7 +3048,7 @@ WORKER SCALING (from worker_scaling_events)
 - Watchdog process retired — `XAUTOCLAIM` handles crash recovery (10 min for adaptive, 20 min for full scan)
 - `ZPOPMIN` replaced by `ZRANGEBYSCORE` → `XADD` → `ZREM` pattern (crash between XADD and ZREM is idempotent)
 
-Hash-based slot assignment (Section 25): `slot_offset(batch_position)` for first scan, `slot_offset(company_id)` for all subsequent — using `hashlib.md5`, not Python's `hash()`. WARMING state persisted in `warming_polls_remaining` + `initial_slot_offset_s` columns (survives restarts). `on_fullscan_complete()` defined — bootstraps NEW → WARMING. `on_adaptive_complete()` Rule 5 (pre-7 AM full scan trigger) uses `p95_full_scan_s`, not listing scan p95. Dawn patrol removed.
+Hash-based slot assignment (Section 24): `slot_offset(batch_position)` for first scan, `slot_offset(company_id)` for all subsequent — using `hashlib.md5`, not Python's `hash()`. WARMING state persisted in `warming_polls_remaining` + `initial_slot_offset_s` columns (survives restarts). `on_fullscan_complete()` defined — bootstraps NEW → WARMING. `on_adaptive_complete()` Rule 5 (pre-7 AM full scan trigger) uses `p95_full_scan_s`, not listing scan p95. Dawn patrol removed.
 
 Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Consumer names = `worker-{hostname}-{pid}` (unique; no PEL theft). `XGROUP CREATE id=$` on startup (`BUSYGROUP` → skip). `XREADGROUP BLOCK 500` (not 5000) + Pub/Sub daemon thread for `pipeline:pause` reaction within 1s. `XAUTOCLAIM` idle timeout = `p95_scan_ms × 3` (self-calibrating; full scan uses full scan p95 separately). Dead-letter after 5 re-deliveries → exponential backoff in `poll:*`.
 
@@ -3135,7 +3135,7 @@ Redis `noeviction` policy. Progress heartbeat for hung worker detection. `cronch
 
 ---
 
-## 25. Thundering Herd Prevention — Hash-Based Slot Distribution
+## 24. Thundering Herd Prevention — Hash-Based Slot Distribution
 
 ### The problem
 
@@ -3147,7 +3147,7 @@ This is not a worker-count problem. Adding more workers does not help because th
 
 Each company is assigned a fixed, deterministic time-of-day slot derived from a hash of a stable identifier. The slot distributes companies evenly across the 24-hour window, making clustering structurally impossible regardless of how many companies joined together.
 
-```
+```text
 next_adaptive_at = today_midnight_eastern + slot_offset(identifier)
 ```
 
@@ -3204,7 +3204,7 @@ The switch happens once: when `warming_polls_remaining` reaches 0 in `on_adaptiv
 
 ### New company lifecycle: NEW → WARMING → STABLE
 
-```
+```text
 NEW (last_poll_at IS NULL AND last_full_scan_at IS NULL)
   ─────────────────────────────────────────────────────────────────
   At registration:
@@ -3346,7 +3346,7 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 ---
 
-## 24. Glossary
+## 25. Glossary
 
 **Adaptive interval:** A polling frequency that automatically adjusts based on observed company behavior. Computed from a 5-poll weighted queue with asymmetric smoothing.
 
@@ -3440,11 +3440,11 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 **worker_scaling_events:** Append-only PostgreSQL table recording every worker scaling decision with full health context (error rate, baseline, spike factor, queue depths, worker counts before/after). Used for post-incident analysis and weekly health reporting. Effectiveness is derived by joining adjacent events within a time window — no row is ever updated after insert.
 
-**batch_position:** A company's ordinal position within a single registration event (1, 2, 3 … N). Used exclusively to compute the first adaptive poll slot via `slot_offset(batch_position)` (see Section 25 for the canonical definition). Resets to 1 for every new registration batch. Replaced by `slot_offset(company_id)` after the WARMING phase completes. Not stored in the DB — computed transiently at registration time.
+**batch_position:** A company's ordinal position within a single registration event (1, 2, 3 … N). Used exclusively to compute the first adaptive poll slot via `slot_offset(batch_position)` (see Section 24 for the canonical definition). Resets to 1 for every new registration batch. Replaced by `slot_offset(company_id)` after the WARMING phase completes. Not stored in the DB — computed transiently at registration time.
 
-**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across the 24-hour day. Formula: `today_midnight + slot_offset(identifier)` where `slot_offset` is defined in Section 25. For new companies during WARMING: identifier = batch_position, so the slot is `slot_offset(batch_position)`. For recurring polls (STABLE): identifier = company_id, so the slot is `slot_offset(company_id)`. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
+**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across the 24-hour day. Formula: `today_midnight + slot_offset(identifier)` where `slot_offset` is defined in Section 24. For new companies during WARMING: identifier = batch_position, so the slot is `slot_offset(batch_position)`. For recurring polls (STABLE): identifier = company_id, so the slot is `slot_offset(company_id)`. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
 
-**Thundering herd:** The condition where many companies become due simultaneously, overloading workers and the ATS concurrency ceiling. Root cause: companies onboarded together drift to the same time-of-day slot. Fixed by hash-based slot assignment (Section 25).
+**Thundering herd:** The condition where many companies become due simultaneously, overloading workers and the ATS concurrency ceiling. Root cause: companies onboarded together drift to the same time-of-day slot. Fixed by hash-based slot assignment (Section 24).
 
 **stream:adaptive:{dc_key}:** Redis Stream used as the crash-safe delivery queue for adaptive listing scans. One stream per DC key (e.g. `stream:adaptive:workday_wd1`, `stream:adaptive:greenhouse`). Companies are XADD'd (with `MAXLEN ~ 1000`) by the adaptive dispatcher when their `poll:adaptive` score is due and the DC ceiling allows. Workers consume via XREADGROUP with a 500ms block timeout (short enough to react to `pipeline:pause` within ~1s). PEL + XAUTOCLAIM handle crash recovery — idle timeout = `p95_listing_scan_ms × 3`, self-calibrating. Consumer names are `worker-{hostname}-{pid}` to prevent PEL theft between workers. Consumer group created with `id=$` (new messages only); `BUSYGROUP` error on re-create is ignored. Dead-letter path after `MAX_STREAM_REDELIVERIES` (5) moves company to `poll:adaptive` with exponential backoff. PEL size (`XPENDING`) replaces the retired `inflight:scans:{dc_key}` ZSET for ceiling enforcement.
 

@@ -803,27 +803,42 @@ def run_worker(once: bool = False, shutdown_event=None,
             result = _run_listing_scan(payload, shutdown_event=shutdown_event)
 
             # ── Inline completion handler (replaces result_consumer_loop) ─────
-            # Called before XACK so on_adaptive_complete's DB + ZADD writes
-            # happen atomically from the worker's perspective. If this process
-            # dies here, XAUTOCLAIM will retry — on_adaptive_complete is
-            # idempotent (UPDATE + ZADD overwrite the same row/score).
-            try:
-                from workers.scheduler import on_adaptive_complete
-                on_adaptive_complete(
-                    company,
-                    result.get("new_jobs", 0),
-                    success=result.get("success", False),
+            # Guards:
+            #   • Empty/missing company → malformed message; skip OAC + XACK
+            #     so it stays in PEL for XAUTOCLAIM (prevents DB corruption).
+            #   • shutdown_mid_scan / requeued → work was re-queued elsewhere;
+            #     leave in PEL so the requeued entry is the canonical one.
+            # Normal path: call OAC then XACK. If OAC raises, leave in PEL
+            # (OAC is idempotent — XAUTOCLAIM retry is safe).
+            if not company:
+                logger.warning(
+                    "scan_worker: stream message %r has empty company field — "
+                    "leaving in PEL for XAUTOCLAIM reclaim",
+                    msg_id,
                 )
-                # ── XACK: remove from PEL (work complete) ────────────────────
-                # Only XACK on success — if on_adaptive_complete raises, the
-                # message stays in PEL for XAUTOCLAIM to retry (idempotent).
-                r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
-            except Exception as oac_exc:
-                logger.error(
-                    "scan_worker: on_adaptive_complete failed for %r: %s — "
-                    "leaving in PEL for XAUTOCLAIM retry",
-                    company, oac_exc, exc_info=True,
+            elif result.get("error") == "shutdown_mid_scan" or result.get("requeued"):
+                logger.info(
+                    "scan_worker: %r result=%s — skipping OAC, leaving in PEL",
+                    company, result.get("error") or "requeued",
                 )
+            else:
+                try:
+                    from workers.scheduler import on_adaptive_complete
+                    on_adaptive_complete(
+                        company,
+                        result.get("new_jobs", 0),
+                        success=result.get("success", False),
+                    )
+                    # ── XACK: remove from PEL (work complete) ────────────────
+                    # Only XACK on success — if on_adaptive_complete raises, the
+                    # message stays in PEL for XAUTOCLAIM to retry (idempotent).
+                    r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
+                except Exception as oac_exc:
+                    logger.error(
+                        "scan_worker: on_adaptive_complete failed for %r: %s — "
+                        "leaving in PEL for XAUTOCLAIM retry",
+                        company, oac_exc, exc_info=True,
+                    )
 
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""

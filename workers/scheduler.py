@@ -945,7 +945,9 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
     from workers.slot import slot_offset
 
     eastern = pytz.timezone("America/New_York")
-    now_eastern = datetime.now(eastern)
+    # Derive midnight from caller's `now` so day boundaries align with the
+    # caller's clock (avoids day-boundary mismatches near midnight).
+    now_eastern = datetime.fromtimestamp(now, tz=eastern)
     today_midnight = now_eastern.replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -1121,17 +1123,16 @@ def adaptive_loop() -> None:
                         continue
 
                 # ── Phase 10: per-DC learned ceiling throttle ─────────────────
-                # Use PEL count as primary in-flight signal; inflight ZSET as
-                # secondary (kept for fast_error_check_loop compatibility).
+                # Use the per-DC inflight ZSET (not the global PEL count) so
+                # each DC key is throttled independently.
                 ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
                 if ceiling_raw:
-                    # PEL count = messages delivered but not yet XACK'd
-                    pending_count = _get_stream_pending_count(r, REDIS_STREAM_ADAPTIVE)
-                    # Also clean stale inflight ZSET entries (Phase 10 compat)
+                    inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
+                    # Remove stale entries before counting
                     stale_cutoff = now - INFLIGHT_STALE_WINDOW_S
-                    r.zremrangebyscore(
-                        f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", 0, stale_cutoff
-                    )
+                    r.zremrangebyscore(inflight_key, 0, stale_cutoff)
+                    # Per-DC in-flight count (populated by the XADD dispatch below)
+                    pending_count = r.zcard(inflight_key)
                     if pending_count >= int(ceiling_raw):
                         r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})
                         logger.debug(
@@ -1723,10 +1724,15 @@ def _replace_dead_workers() -> None:
     so the DB write never blocks the pool management lock.
     """
     global _scan_pool, _detail_pool
+    _fullscan_pool = globals().get("_fullscan_pool_ref", [])
     replacements: list = []   # (ptype, old_pid, exitcode) — collected under lock
 
     with _pool_lock:
-        for pool, ptype in ((_scan_pool, "scan"), (_detail_pool, "detail")):
+        for pool, ptype in (
+            (_scan_pool,     "scan"),
+            (_detail_pool,   "detail"),
+            (_fullscan_pool, "fullscan"),
+        ):
             for i, (proc, event) in enumerate(pool):
                 if not proc.is_alive():
                     logger.warning(

@@ -537,13 +537,18 @@ def query_p95_response_ms(scan_type: str) -> int:
         row = conn.execute("""
             SELECT AVG(max_response_ms) AS avg_max_ms
             FROM api_health
-            WHERE platform = ANY(%s)
-              AND date >= %s
+            WHERE platform = ANY(?)
+              AND date >= ?
               AND context = 'normal'
               AND max_response_ms > 0
         """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
-    except Exception:
-        return 30_000 if scan_type == "listing_scan" else 120_000
+    except Exception as _exc:
+        _default = 30_000 if scan_type == "listing_scan" else 120_000
+        logger.warning(
+            "query_p95_response_ms(%r): DB error (%s) — returning default %d ms",
+            scan_type, _exc, _default,
+        )
+        return _default
     finally:
         if conn:
             conn.close()

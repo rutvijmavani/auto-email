@@ -165,8 +165,11 @@ def check_pel_stats() -> dict:
             for c in summary.get("consumers", [])
         ]
 
-        # Fetch oldest pending entry to compute age
-        oldest_age_ms = None
+        # Fetch lowest-ID pending entry to report its idle time.
+        # Note: xpending_range min="-" returns the message with the lowest
+        # stream ID (earliest enqueue time), not necessarily the longest-idle.
+        # claim_stale_work() handles actual reclaim via XAUTOCLAIM.
+        lowest_id_age_ms = None
         try:
             entries = r.xpending_range(
                 stream_key, STREAM_CONSUMER_GROUP,
@@ -176,11 +179,11 @@ def check_pel_stats() -> dict:
                 entry     = entries[0]
                 msg_id    = entry["message_id"]
                 idle_ms   = entry.get("time_since_delivered", 0)
-                oldest_age_ms = idle_ms
+                lowest_id_age_ms = idle_ms
 
                 if idle_ms > PEL_WARN_AGE_MS:
                     logger.warning(
-                        "watchdog: PEL WARNING stream=%s — oldest message %r "
+                        "watchdog: PEL WARNING stream=%s — lowest-ID message %r "
                         "has been pending for %d s (threshold %d s). "
                         "claim_stale_work() should have reclaimed it. "
                         "Check scheduler adaptive_loop()/fullscan_loop() health.",
@@ -196,7 +199,7 @@ def check_pel_stats() -> dict:
 
         entry_stats = {
             "total_pending":  total,
-            "oldest_age_ms":  oldest_age_ms,
+            "oldest_age_ms":  lowest_id_age_ms,
             "consumers":      consumers,
         }
         stats[stream_key] = entry_stats

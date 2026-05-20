@@ -153,9 +153,12 @@ def rebuild_poll_queues() -> dict:
         # Preserve their next full scan if it is still in the future;
         # if the full scan is also overdue, bump it 5 min from now so it
         # doesn't collide with the adaptive startup rush.
+        # If next_full_scan_at is None (never scanned), schedule immediately.
         if row["next_full_scan_at"] is not None:
             fs_ts = row["next_full_scan_at"].timestamp()
             fullscan_entries[row["company"]] = fs_ts if fs_ts > now else now + 300
+        else:
+            fullscan_entries[row["company"]] = now + 300
 
     if overdue_companies:
         logger.info(
@@ -169,6 +172,9 @@ def rebuild_poll_queues() -> dict:
         adaptive_entries[row["company"]] = row["next_poll_at"].timestamp()
         if row["next_full_scan_at"] is not None:
             fullscan_entries[row["company"]] = row["next_full_scan_at"].timestamp()
+        else:
+            # Never had a full scan — schedule alongside adaptive poll time
+            fullscan_entries[row["company"]] = row["next_poll_at"].timestamp()
 
     # ── Write to Redis ─────────────────────────────────────────────────────────
     if adaptive_entries:

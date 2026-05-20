@@ -97,13 +97,14 @@ class TestFullscanEnsureConsumerGroup(unittest.TestCase):
                               or "BUSYGROUP" in c]
         self.assertEqual(len(busygroup_warnings), 0)
 
-    def test_other_exception_logs_warning_not_raised(self):
-        """Non-BUSYGROUP exception → warning logged but not re-raised."""
+    def test_other_exception_logs_warning_and_raises(self):
+        """Non-BUSYGROUP exception → warning logged AND re-raised (fail fast)."""
         r = MagicMock()
         r.xgroup_create.side_effect = Exception("NOAUTH Authentication required")
         with patch("workers.fullscan.logger") as mock_log:
             from workers.fullscan import _ensure_consumer_group
-            _ensure_consumer_group(r)   # must not raise
+            with self.assertRaises(Exception):
+                _ensure_consumer_group(r)
         mock_log.warning.assert_called_once()
 
     def test_success_no_exception(self):

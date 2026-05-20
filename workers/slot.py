@@ -61,5 +61,5 @@ def slot_offset(identifier) -> int:
     Returns:
         int in [0, 86400) — seconds from midnight for this company's daily slot.
     """
-    digest = hashlib.md5(str(identifier).encode()).hexdigest()
+    digest = hashlib.md5(str(identifier).encode(), usedforsecurity=False).hexdigest()
     return int(digest, 16) % 86400

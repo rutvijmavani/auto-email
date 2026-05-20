@@ -682,7 +682,11 @@ def stage_redis_signal():
     if _pause_event.is_set() and not _resume_event.is_set():
         ok("scheduler._check_auto_resume() did NOT auto-resume (cronchain:alive alive)")
     else:
-        warn("scheduler._check_auto_resume() fired early -- cronchain:alive may have expired")
+        fail(
+            "scheduler._check_auto_resume() fired early — cronchain:alive may have expired "
+            f"(pause_event.is_set={_pause_event.is_set()}, "
+            f"resume_event.is_set={_resume_event.is_set()})"
+        )
     # Reset to running state
     _pause_event.clear()
     _resume_event.set()

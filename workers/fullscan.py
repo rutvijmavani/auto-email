@@ -423,10 +423,12 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     from workers.slot import slot_offset
 
     eastern = pytz.timezone("America/New_York")
-    now_eastern = _dt.now(eastern)
+    now_ts = time.time()
+    # Derive midnight from now_ts (not datetime.now) so tests that mock
+    # time.time() get a deterministic today_midnight_ts.
+    now_eastern = _dt.fromtimestamp(now_ts, tz=eastern)
     today_midnight = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0)
     today_midnight_ts = today_midnight.timestamp()
-    now_ts = time.time()
 
     # Fetch initial_slot_offset_s from DB
     conn = get_conn()
@@ -878,10 +880,13 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                     continue
 
                 # Layer 3: OLD bloom — known from last completed scan.
-                # Skip DB check (speedup); still add to NEW bloom below.
+                # Still call save_pending_detail (DB ON CONFLICT is the source
+                # of truth); bloom.old_exists is an optimisation hint only.
+                # False positives (0.1%) would silently drop genuinely new jobs
+                # if we skipped the DB here.
                 if bloom.old_exists(job_id):
                     bloom.new_add(job_id)   # ALL active jobs go into NEW bloom
-                    continue
+                    # Fall through to DB check (no continue) — source of truth.
 
                 # Layer 4: DB check — source of truth for new/known decision.
                 inserted = save_pending_detail(

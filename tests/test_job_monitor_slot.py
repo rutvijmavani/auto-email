@@ -59,13 +59,6 @@ def _run_upsert(company="Stripe", platform="greenhouse",
     if mock_slot is not None:
         slot_patch = patch("workers.slot.slot_offset", return_value=mock_slot)
     else:
-        slot_patch = patch("workers.slot.slot_offset",
-                           side_effect=lambda x: __import__("hashlib").md5(
-                               str(x).encode()).hexdigest()
-                           and __import__("db.job_monitor", fromlist=["upsert_poll_stats"])
-                           # Use the real slot_offset — don't replace it
-                           )
-        # Actually just don't patch slot if mock_slot is None
         slot_patch = None
 
     if slot_patch:
