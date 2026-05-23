@@ -316,15 +316,15 @@ class TestSlotOffsetDocstringExamples(unittest.TestCase):
         expected = _expected(1)
         self.assertEqual(slot_offset(1), expected)
         # The docstring says 27 291 — verify this matches our reference too
-        self.assertEqual(expected, 27291,
-                         msg=f"Docstring example changed: expected 27291, got {expected}")
+        self.assertEqual(expected, 45211,
+                         msg=f"Docstring example changed: expected 45211, got {expected}")
 
     def test_slot_offset_2_matches_docstring(self):
         """slot_offset(2) → 68 104 s as per docstring."""
         expected = _expected(2)
         self.assertEqual(slot_offset(2), expected)
-        self.assertEqual(expected, 68104,
-                         msg=f"Docstring example changed: expected 68104, got {expected}")
+        self.assertEqual(expected, 36012,
+                         msg=f"Docstring example changed: expected 36012, got {expected}")
 
     def test_batch_positions_1_to_5_all_in_range(self):
         """Docstring example: batch_positions 1–5 all in [0, 86400)."""

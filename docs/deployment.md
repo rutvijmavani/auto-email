@@ -926,6 +926,91 @@ Add to weekly checklist:
 
 ---
 
+## Scheduler Workers
+
+The continuous adaptive scheduler runs as three long-lived background processes alongside the existing pipeline cron jobs.
+
+### Starting the workers
+
+```bash
+# 1. Start the scheduler (adaptive + fullscan dispatch loops, runs forever)
+#    rebuild_redis() runs automatically on startup — no manual pre-step needed.
+python -m workers.scheduler
+
+# 2. Start fullscan worker(s) in separate terminal(s) / processes
+python -m workers.fullscan
+```
+
+### How thundering herd is prevented automatically
+
+`rebuild_redis()` runs at scheduler startup and classifies every company using
+the **7 AM cycle boundary** (`CYCLE_START_HOUR = 7`):
+
+| Situation | `next_poll_at` in DB | What happens |
+|---|---|---|
+| Fresh deploy / long outage | Days old (before last 7 AM) | **Recovery spread** — redistributes load evenly across a dynamic window |
+| Normal restart (brief downtime) | Within today's cycle (≥ last 7 AM) | **DB timestamps restored** — existing even distribution is preserved |
+| Brand new company | NULL | **Full scan first**, then `now + slot_offset` bootstrap |
+
+No manual pre-step required. Just start the workers.
+
+### Worker flags
+
+```bash
+# Adaptive scheduler
+python -m workers.scheduler            # run forever (production)
+
+# Fullscan worker
+python -m workers.fullscan             # run forever (production)
+python -m workers.fullscan --once      # process one company then exit (smoke-test)
+python -m workers.fullscan --skip-lock # bypass exclusivity lock (dev only)
+```
+
+### reschedule_on_deploy.py — manual escape hatch only
+
+`rebuild_redis()` handles thundering herd prevention automatically on every
+startup. `reschedule_on_deploy.py` is only needed in exceptional cases where
+Redis scores are corrupted or clustered **while the scheduler is already
+running** (so a restart is not possible or practical):
+
+```bash
+python scripts/reschedule_on_deploy.py --dry-run        # preview — no writes
+python scripts/reschedule_on_deploy.py                  # both queues
+python scripts/reschedule_on_deploy.py --adaptive-only  # skip poll:fullscan
+python scripts/reschedule_on_deploy.py --fullscan-only  # skip poll:adaptive
+```
+
+### Troubleshooting scheduler issues
+
+```
+Workers idle — no companies being dispatched:
+  → Check poll:adaptive and poll:fullscan are populated:
+    redis-cli ZCOUNT poll:adaptive -inf +inf
+    redis-cli ZCOUNT poll:fullscan -inf +inf
+  → If empty: run rebuild_redis() or re-import prospects
+  → If all scores are far in the future: restart the scheduler —
+    rebuild_redis() will reclassify and spread automatically
+
+All companies firing at once (thundering herd on restart):
+  → rebuild_redis() handles this automatically via the 7 AM cycle boundary.
+    STALE companies (next_poll_at before last 7 AM) get recovery spread.
+    CURRENT companies (within today's cycle) use DB timestamps directly.
+  → If still clustered after restart: use reschedule_on_deploy.py as a
+    manual override (scores corrupted while scheduler was running).
+
+Fullscan worker never calls bootstrap for new company:
+  → Check detail queue depth (backpressure):
+    redis-cli LLEN queue:detail:fullscan
+  → If above DETAIL_QUEUE_MAX_FULLSCAN threshold, worker waits for drain
+
+WARMING companies not advancing to STABLE:
+  → Check warming_polls_remaining in company_poll_stats
+  → WARMING decrements on each on_adaptive_complete() success
+  → If stuck at 3: verify adaptive worker is running and polling the company
+```
+
+---
+
 ## First Deployment Checklist
 
 ```
@@ -958,4 +1043,10 @@ Add to weekly checklist:
        ls -lh /mnt/backups/
 □ 16. Test verify-filled manually (after first monitor run):
        python pipeline.py --verify-filled
+□ 17. Redistribute scheduler ZSET scores before starting workers:
+       python scripts/reschedule_on_deploy.py --dry-run  # verify output
+       python scripts/reschedule_on_deploy.py            # apply
+□ 18. Start scheduler workers (in separate terminals or systemd units):
+       python -m workers.scheduler   # adaptive + fullscan dispatch
+       python -m workers.fullscan    # full scan executor
 ```

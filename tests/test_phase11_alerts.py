@@ -905,12 +905,13 @@ class TestOnAdaptiveCompleteAlertIntegration(unittest.TestCase):
     def _make_stats_row(self, consec_errors=0, last_success_at=None):
         """Build a mock company_poll_stats row dict."""
         return {
-            "current_interval_s":  3600,
-            "recent_poll_counts":  None,
-            "last_full_scan_at":   None,
-            "full_scan_interval_s": 86400,
-            "consecutive_errors":  consec_errors,
-            "last_success_at":     last_success_at,
+            "current_interval_s":     3600,
+            "recent_poll_counts":     None,
+            "last_full_scan_at":      None,
+            "full_scan_interval_s":   86400,
+            "consecutive_errors":     consec_errors,
+            "last_success_at":        last_success_at,
+            "warming_polls_remaining": None,
         }
 
     def _run(self, company="TestCo", new_jobs=0, success=True,

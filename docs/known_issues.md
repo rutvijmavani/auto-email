@@ -141,16 +141,18 @@ well-known companies.
 
 ## Job Monitoring (`pipeline.py --monitor-jobs`)
 
-### 🟢 Adaptive scheduling not yet implemented
-**Planned:** When company count reaches 300+
-**Description:** Currently all companies checked every day.
-At 300+ companies, implement adaptive scheduling:
-- Active companies (recent jobs): check daily
-- Quiet companies (14+ empty days): check every 3 days
-- Never-had-jobs companies: check weekly
-**Benefit:** Cuts daily API calls by ~60% at scale.
-**Files:** `db/job_monitor.py` → `get_monitorable_companies()`
-`jobs/job_monitor.py` → main monitoring loop
+### ⚪ Adaptive scheduling not yet implemented — SUPERSEDED
+**Resolved:** Superseded by the two-layer scheduler architecture.
+**Was:** Planned per-company frequency tiers (daily / every-3-days / weekly)
+as a lightweight layer on top of the old `--monitor-jobs` batch loop.
+**Superseded by:** `workers/scheduler.py` + `workers/fullscan.py` — a
+continuous Redis ZSET + Stream scheduler where every company has its own
+individually computed adaptive interval (5–1440 min) driven by observed
+job-posting activity. Companies are never batched together; each is
+scheduled independently. No 300-company threshold needed — the design
+scales to any company count without code changes.
+**Files:** `workers/scheduler.py`, `workers/fullscan.py`,
+`docs/adaptive-polling-architecture.md`
 
 ---
 
@@ -268,6 +270,37 @@ old version may still be tracked.
 ---
 
 ## Resolved Issues ⚪
+
+### ⚪ Thundering herd on scheduler bootstrap / deployment
+**Resolved:** 2026-05-20
+**Was:** `_bootstrap_warming_adaptive()` and `_bootstrap_warming()` used
+`today_midnight_eastern + slot_offset` to compute the first adaptive poll
+time. This created two problems:
+1. If the offset had already passed today, the code added 86400 s ("push to
+   tomorrow") — companies were idle for up to 24 h before their first poll.
+2. All companies bootstrapped at the same moment (e.g. after a deploy) fired
+   at wall-clock-similar times the following midnight → thundering herd.
+**Fix:** Changed to `now + slot_offset` in both workers. The result is always
+in the future, no timezone math, no "push to tomorrow" edge case, and workers
+stay evenly loaded throughout the day instead of spiking at midnight.
+**Files:** `workers/fullscan.py` → `_bootstrap_warming_adaptive()`,
+`workers/scheduler.py` → `_bootstrap_warming()`
+
+### ⚪ Thundering herd on restart / fresh deployment (existing ZSET scores)
+**Resolved:** 2026-05-20
+**Was:** On a fresh deployment or after a long maintenance window, all
+existing `poll:adaptive` and `poll:fullscan` scores could be in the past or
+tightly clustered — workers would immediately try to process all companies
+at once when started.
+**Fix:** `rebuild_redis()` now classifies companies on every startup using
+the 7 AM cycle boundary: STALE companies (schedule predates today's cycle)
+get a recovery spread; CURRENT companies (within today's cycle) have DB
+timestamps restored directly — preserving an already-even distribution.
+No manual intervention needed. `scripts/reschedule_on_deploy.py` remains
+as a manual escape hatch for the rare case where scores become corrupted
+while workers are already running.
+**Files:** `workers/rebuild.py` → `rebuild_poll_queues()`, `config.py` →
+`CYCLE_START_HOUR`; `scripts/reschedule_on_deploy.py` (escape hatch)
 
 ### ⚪ Bing Search API deprecated
 **Resolved:** 2026-03-11

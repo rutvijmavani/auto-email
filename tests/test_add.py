@@ -24,21 +24,19 @@ TEST_DB = "data/test_pipeline.db"
 os.environ["TEST_MODE"] = "1"
 
 import db.db as db_module
+from tests.conftest import cleanup_db
 
 
 class TestAdd(unittest.TestCase):
 
     def setUp(self):
         """Create fresh test DB before each test."""
-        # Remove test DB if exists
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
-        db_module.init_db()
+        cleanup_db()          # Truncate all tables so each test starts clean
+        db_module.init_db()   # Ensure schema is up to date
 
     def tearDown(self):
-        """Clean up test DB after each test."""
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        """Clean up after each test."""
+        cleanup_db()
 
     # ─────────────────────────────────────────
     # TEST 1: Application inserts correctly

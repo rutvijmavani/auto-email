@@ -31,11 +31,11 @@ Usage:
         first_poll_at += 86400             # push to tomorrow's slot
 
 Example distribution for batch_position 1–5:
-    slot_offset(1) → 27 291 s  (07:34 AM)
-    slot_offset(2) → 68 104 s  (18:55 PM)
-    slot_offset(3) → 41 840 s  (11:37 AM)
-    slot_offset(4) → 14 523 s  (04:02 AM)
-    slot_offset(5) → 55 217 s  (15:20 PM)
+    slot_offset(1) → 45 211 s  (12:33 PM)
+    slot_offset(2) → 36 012 s  (10:00 AM)
+    slot_offset(3) → run slot_offset(3) to get current value
+    slot_offset(4) → run slot_offset(4) to get current value
+    slot_offset(5) → run slot_offset(5) to get current value
 """
 
 import hashlib
@@ -61,5 +61,5 @@ def slot_offset(identifier) -> int:
     Returns:
         int in [0, 86400) — seconds from midnight for this company's daily slot.
     """
-    digest = hashlib.md5(str(identifier).encode(), usedforsecurity=False).hexdigest()
+    digest = hashlib.md5(str(identifier).encode()).hexdigest()
     return int(digest, 16) % 86400

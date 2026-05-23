@@ -366,6 +366,10 @@ REDIS_BAND_THRESHOLDS = "adaptive:band_thresholds"
 # Tune upward if your ATS calls average > 30s (check api_health.duration_ms).
 STARTUP_AVG_SCAN_TIME_S        = 30         # ~30s per company per scan worker
 
+CYCLE_START_HOUR               = 7          # monitoring day runs 7 AM → 7 AM
+                                             # used by rebuild_poll_queues() to
+                                             # distinguish stale (previous cycle) from
+                                             # current-cycle companies on restart.
 SCHEDULER_DAWN_PATROL_WINDOW   = 4 * 3600   # redistribute polls due after +4h
 SCHEDULER_DAWN_PATROL_SPREAD   = 2 * 3600   # spread them across 2h window
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan

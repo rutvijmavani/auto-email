@@ -35,8 +35,6 @@ import time
 from datetime import datetime
 from typing import Optional
 
-import pytz
-
 from workers.redis_client import get_redis
 from workers.adaptive import (
     update_poll_interval, load_poll_counts, dump_poll_counts,
@@ -248,6 +246,7 @@ def claim_stale_work(r, stream_key: str, group: str,
 
     for msg_id, fields in claimed:
         if not fields:
+            r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue
         company = fields.get("company", "")
         if not company:
@@ -933,25 +932,13 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
     Steps:
         1. Read initial_slot_offset_s from DB (set at registration time).
            Fall back to slot_offset(company_id) if column is NULL (legacy rows).
-        2. Compute first_poll_at = today_midnight_eastern + initial_slot_offset_s.
-           If that timestamp is already in the past, push to tomorrow's slot.
+        2. first_poll_at = now + initial_slot_offset_s.
+           Spreads new companies across the next 24 h window from now —
+           no midnight anchoring, no daily wave.
         3. Write warming_polls_remaining=WARMING_POLLS_COUNT + next_poll_at to DB.
         4. ZADD company to poll:adaptive at first_poll_at.
-
-    This replaces the old "ZADD with ADAPTIVE_DEFAULT_INTERVAL" logic so new
-    companies are spread deterministically across the day instead of clustering
-    at the restart moment.
     """
     from workers.slot import slot_offset
-
-    eastern = pytz.timezone("America/New_York")
-    # Derive midnight from caller's `now` so day boundaries align with the
-    # caller's clock (avoids day-boundary mismatches near midnight).
-    now_eastern = datetime.fromtimestamp(now, tz=eastern)
-    today_midnight = now_eastern.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    today_midnight_ts = today_midnight.timestamp()
 
     # Fetch initial_slot_offset_s and company id from DB
     conn = get_conn()
@@ -978,10 +965,8 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
         # No stats row yet — use a hash of the company name as fallback
         offset_s = slot_offset(company)
 
-    first_poll_at = today_midnight_ts + offset_s
-    if first_poll_at <= now:
-        first_poll_at += 86400   # push to tomorrow's slot
-
+    # Spread across the next 24 h from now — always in the future.
+    first_poll_at = now + offset_s
     first_poll_dt = datetime.fromtimestamp(first_poll_at)
 
     conn = get_conn()
@@ -1001,11 +986,10 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
 
     logger.info(
         "on_fullscan_complete: WARMING bootstrap for %r — "
-        "warming_polls=%d first_poll_at=%s (offset=%ds, in %.1fh)",
+        "warming_polls=%d first_poll_in=%.1fh (offset=%ds)",
         company, WARMING_POLLS_COUNT,
-        first_poll_dt.strftime("%H:%M"),
+        offset_s / 3600,
         offset_s,
-        (first_poll_at - now) / 3600,
     )
 
 

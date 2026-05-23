@@ -409,26 +409,15 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     Steps:
         1. Read initial_slot_offset_s from DB (set at registration time).
            Falls back to slot_offset(company_id) for legacy rows without it.
-        2. Compute first_poll_at = today_midnight_eastern + initial_slot_offset_s.
-           If that slot has already passed today, push to tomorrow's slot.
+        2. first_poll_at = now + initial_slot_offset_s.
+           This spreads new companies across the next 24 h window from the
+           moment of their first scan — no midnight anchoring, no daily wave.
         3. Write warming_polls_remaining = WARMING_POLLS_COUNT to DB.
         4. ZADD company to poll:adaptive at first_poll_at.
-
-    This replaces the old "ZADD with ADAPTIVE_DEFAULT_INTERVAL at now" logic so
-    new companies are spread deterministically across the day instead of all
-    clustering at the moment their first full scan finishes.
     """
-    import pytz
-    from datetime import datetime as _dt
     from workers.slot import slot_offset
 
-    eastern = pytz.timezone("America/New_York")
     now_ts = time.time()
-    # Derive midnight from now_ts (not datetime.now) so tests that mock
-    # time.time() get a deterministic today_midnight_ts.
-    now_eastern = _dt.fromtimestamp(now_ts, tz=eastern)
-    today_midnight = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_midnight_ts = today_midnight.timestamp()
 
     # Fetch initial_slot_offset_s from DB
     conn = get_conn()
@@ -454,11 +443,9 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     else:
         offset_s = slot_offset(company)   # fallback: hash of company name
 
-    first_poll_at = today_midnight_ts + offset_s
-    if first_poll_at <= now_ts:
-        first_poll_at += 86400   # push to tomorrow's slot
-
-    first_poll_dt = _dt.fromtimestamp(first_poll_at, tz=timezone.utc)
+    # Spread across the next 24 h from now — always in the future.
+    first_poll_at = now_ts + offset_s
+    first_poll_dt = datetime.fromtimestamp(first_poll_at, tz=timezone.utc)
 
     conn = get_conn()
     try:
@@ -477,11 +464,10 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
 
     logger.info(
         "fullscan: WARMING bootstrap for %r — "
-        "warming_polls=%d first_poll_at=%s (offset=%ds, in %.1fh)",
+        "warming_polls=%d first_poll_in=%.1fh (offset=%ds)",
         company, WARMING_POLLS_COUNT,
-        first_poll_dt.strftime("%H:%M"),
+        offset_s / 3600,
         offset_s,
-        (first_poll_at - now_ts) / 3600,
     )
 
 
@@ -815,8 +801,11 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         early_exit    = False
         overlap_pages = 0
 
-        # Backpressure: check detail queue depth before starting
-        queue_depth = r.llen(REDIS_DETAIL_FULLSCAN)
+        # Backpressure: check detail queue depth before starting.
+        # Cast to int explicitly — r.llen() always returns int in production,
+        # but an explicit cast guards against unexpected return types (e.g. in
+        # tests) and keeps the %d log format safe.
+        queue_depth = int(r.llen(REDIS_DETAIL_FULLSCAN) or 0)
         if queue_depth > DETAIL_QUEUE_MAX_FULLSCAN:
             logger.warning(
                 "fullscan [%s]: detail queue backpressure "
@@ -824,7 +813,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 company, queue_depth, DETAIL_QUEUE_MAX_FULLSCAN,
             )
             waited = 0
-            while (r.llen(REDIS_DETAIL_FULLSCAN) > DETAIL_QUEUE_MAX_FULLSCAN
+            while (int(r.llen(REDIS_DETAIL_FULLSCAN) or 0) > DETAIL_QUEUE_MAX_FULLSCAN
                    and waited < 300):
                 time.sleep(10)
                 waited += 10

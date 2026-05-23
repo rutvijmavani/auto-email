@@ -22,17 +22,15 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
+from tests.conftest import cleanup_db
 
 
 class TestOutreachOnly(unittest.TestCase):
 
     def setUp(self):
-        db_module.DB_FILE = TEST_DB
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
-        db_module.init_db()
+        cleanup_db()          # Truncate all tables so each test starts clean
+        db_module.init_db()   # Ensure schema is up to date
 
         # Setup: application + recruiter + link
         self.app_id, _ = db_module.add_application(
@@ -44,8 +42,7 @@ class TestOutreachOnly(unittest.TestCase):
         db_module.link_recruiter_to_application(self.app_id, self.recruiter_id)
 
     def tearDown(self):
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        cleanup_db()
 
     # ─────────────────────────────────────────
     # TEST 1: Initial outreach scheduled for today
@@ -65,7 +62,7 @@ class TestOutreachOnly(unittest.TestCase):
 
         self.assertEqual(row["stage"], "initial")
         self.assertEqual(row["status"], "pending")
-        self.assertEqual(row["scheduled_for"], today)
+        self.assertEqual(str(row["scheduled_for"]), today)
         self.assertEqual(row["replied"], 0)
         print("[OK] TEST 1 PASSED: Initial outreach scheduled for today")
 
@@ -106,7 +103,7 @@ class TestOutreachOnly(unittest.TestCase):
         self.assertEqual(row["stage"], "followup1")
 
         expected_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-        self.assertEqual(row["scheduled_for"], expected_date)
+        self.assertEqual(str(row["scheduled_for"]), expected_date)
         print("[OK] TEST 3 PASSED: followup1 scheduled after initial sent")
 
     # ─────────────────────────────────────────

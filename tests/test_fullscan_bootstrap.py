@@ -146,74 +146,6 @@ def _make_row(initial_slot_offset_s="PRESENT", row_id=42):
     return row
 
 
-def _run_bootstrap(company="Stripe", db_row="PRESENT", row_id=42,
-                   now_ts=None, today_midnight_ts=None):
-    """
-    Run _bootstrap_warming_adaptive with mocked DB + time + pytz.
-
-    db_row: "PRESENT" (has offset), None (offset is NULL), "MISSING" (no row)
-    """
-    from config import REDIS_POLL_ADAPTIVE
-
-    r = MagicMock()
-
-    # Control time
-    fixed_now = now_ts if now_ts is not None else 1_700_000_000.0
-    fixed_midnight = today_midnight_ts if today_midnight_ts is not None else 1_699_920_000.0
-
-    call_count = [0]
-
-    def _make_conn():
-        conn = MagicMock()
-        if db_row == "MISSING":
-            conn.execute.return_value.fetchone.return_value = None
-        elif db_row is None:
-            conn.execute.return_value.fetchone.return_value = _make_row(
-                initial_slot_offset_s=None, row_id=row_id)
-        else:
-            conn.execute.return_value.fetchone.return_value = _make_row(
-                initial_slot_offset_s="PRESENT", row_id=row_id)
-        call_count[0] += 1
-        return conn
-
-    conns_made = []
-
-    def _track_conn():
-        c = _make_conn()
-        conns_made.append(c)
-        return c
-
-    # Build a fake "today_midnight" datetime whose .timestamp() returns fixed_midnight
-    import datetime as _dt_module
-
-    class FakeMidnight:
-        def timestamp(self):
-            return fixed_midnight
-        def replace(self, **kwargs):
-            return self
-
-    class FakeEasternNow:
-        def replace(self, **kwargs):
-            return FakeMidnight()
-
-    fake_tz  = MagicMock()
-    fake_tz_inst = MagicMock()
-
-    with patch("workers.fullscan.get_conn", side_effect=_track_conn), \
-         patch("workers.fullscan.time") as mock_time, \
-         patch("workers.fullscan.pytz") as mock_pytz:
-
-        mock_time.time.return_value = fixed_now
-
-        mock_pytz.timezone.return_value = fake_tz
-        # datetime.now(tz) → FakeEasternNow
-        import workers.fullscan as fs_module
-        # Patch the _dt inside the function's local import
-        with patch("builtins.__import__", wraps=__import__):
-            from workers.fullscan import _bootstrap_warming_adaptive
-            _bootstrap_warming_adaptive(company, r)
-
-    return r, conns_made
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,16 +229,13 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         self.assertIn(company, called_with,
                       msg=f"Expected slot_offset({company!r}) called; got {called_with}")
 
-    def test_future_slot_not_pushed(self):
-        """first_poll_at > now_ts → r.zadd called with first_poll_at (no +86400 added)."""
+    def test_zadd_score_is_now_plus_offset(self):
+        """r.zadd score = now + offset_s — always in the future, no midnight math."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
 
-        midnight_ts = 1_700_000_000.0
-        offset_s    = 3600       # 1h into the day
-        now_ts      = midnight_ts + 1800   # only 30 min into day → slot is future
-
-        first_poll_at_expected = midnight_ts + offset_s  # 2h mark
+        now_ts   = 1_700_000_000.0
+        offset_s = 3600          # 1 h
 
         row = {"initial_slot_offset_s": offset_s, "id": 1}
         conn1 = MagicMock()
@@ -321,24 +250,18 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
             _bootstrap_warming_adaptive("Stripe", r)
 
         r.zadd.assert_called_once()
-        zadd_call = r.zadd.call_args
-        # zadd(REDIS_POLL_ADAPTIVE, {company: first_poll_at})
-        zadd_key   = zadd_call[0][0]
-        zadd_scores = zadd_call[0][1]
+        zadd_key, zadd_scores = r.zadd.call_args[0]
         self.assertEqual(zadd_key, REDIS_POLL_ADAPTIVE)
         score = list(zadd_scores.values())[0]
-        self.assertAlmostEqual(score, first_poll_at_expected, delta=1)
+        self.assertAlmostEqual(score, now_ts + offset_s, delta=1)
 
-    def test_past_slot_pushed_to_tomorrow(self):
-        """first_poll_at <= now_ts → +86400 added to push to tomorrow."""
+    def test_large_offset_still_in_future(self):
+        """A large offset (near 24 h) still lands in the future, never wraps back."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
 
-        midnight_ts = 1_700_000_000.0
-        offset_s    = 3600       # 1h into the day
-        now_ts      = midnight_ts + 7200   # 2h into day → slot already passed
-
-        first_poll_at_expected = midnight_ts + offset_s + 86400
+        now_ts   = 1_700_000_000.0
+        offset_s = 82800         # 23 h — near the top of the [0, 86400) range
 
         row = {"initial_slot_offset_s": offset_s, "id": 1}
         conn1 = MagicMock()
@@ -352,9 +275,11 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
             from workers.fullscan import _bootstrap_warming_adaptive
             _bootstrap_warming_adaptive("Stripe", r)
 
-        zadd_scores = r.zadd.call_args[0][1]
+        _, zadd_scores = r.zadd.call_args[0]
         score = list(zadd_scores.values())[0]
-        self.assertAlmostEqual(score, first_poll_at_expected, delta=1)
+        self.assertGreater(score, now_ts,
+                           msg="Score must be strictly in the future")
+        self.assertAlmostEqual(score, now_ts + offset_s, delta=1)
 
     def test_warming_polls_remaining_set_to_warming_polls_count(self):
         """DB UPDATE sets warming_polls_remaining = WARMING_POLLS_COUNT (3)."""

@@ -3048,7 +3048,7 @@ WORKER SCALING (from worker_scaling_events)
 - Watchdog process retired — `XAUTOCLAIM` handles crash recovery (10 min for adaptive, 20 min for full scan)
 - `ZPOPMIN` replaced by `ZRANGEBYSCORE` → `XADD` → `ZREM` pattern (crash between XADD and ZREM is idempotent)
 
-Hash-based slot assignment (Section 24): `slot_offset(batch_position)` for first scan, `slot_offset(company_id)` for all subsequent — using `hashlib.md5`, not Python's `hash()`. WARMING state persisted in `warming_polls_remaining` + `initial_slot_offset_s` columns (survives restarts). `on_fullscan_complete()` defined — bootstraps NEW → WARMING. `on_adaptive_complete()` Rule 5 (pre-7 AM full scan trigger) uses `p95_full_scan_s`, not listing scan p95. Dawn patrol removed.
+Hash-based slot assignment (Section 24): `now + slot_offset(batch_position)` for NEW → WARMING bootstrap; `now + adaptive_interval` for STABLE recurring polls — using `hashlib.md5`, not Python's `hash()`. No midnight anchoring — `now + offset` is always in the future regardless of time-of-day and distributes load evenly throughout the day. WARMING state persisted in `warming_polls_remaining` + `initial_slot_offset_s` columns (survives restarts). `on_fullscan_complete()` defined — bootstraps NEW → WARMING. `on_adaptive_complete()` Rule 5 (pre-7 AM full scan trigger) uses `p95_full_scan_s`, not listing scan p95. Dawn patrol removed.
 
 Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Consumer names = `worker-{hostname}-{pid}` (unique; no PEL theft). `XGROUP CREATE id=$` on startup (`BUSYGROUP` → skip). `XREADGROUP BLOCK 500` (not 5000) + Pub/Sub daemon thread for `pipeline:pause` reaction within 1s. `XAUTOCLAIM` idle timeout = `p95_scan_ms × 3` (self-calibrating; full scan uses full scan p95 separately). Dead-letter after 5 re-deliveries → exponential backoff in `poll:*`.
 
@@ -3145,14 +3145,19 @@ This is not a worker-count problem. Adding more workers does not help because th
 
 ### The fix: permanent hash-based slot assignment
 
-Each company is assigned a fixed, deterministic time-of-day slot derived from a hash of a stable identifier. The slot distributes companies evenly across the 24-hour window, making clustering structurally impossible regardless of how many companies joined together.
+Each company is assigned a fixed, deterministic offset derived from a hash of a stable identifier. The offset distributes companies evenly across any 24-hour window, making clustering structurally impossible regardless of how many companies joined together.
 
 ```text
-next_adaptive_at = today_midnight_eastern + slot_offset(identifier)
+first_poll_at = time.time() + slot_offset(identifier)
 ```
 
+Using `now + slot_offset` (not `midnight + slot_offset`) means:
+- The first poll is **always in the future** — no timezone math, no "push to tomorrow" edge case.
+- Workers are loaded **evenly throughout the day** rather than hitting a burst at midnight.
+- The deterministic hash ordering is preserved regardless of when the formula runs.
+
 **Critical: must use a proper hash function, not Python's built-in `hash()`.**
-`hash(n) == n` for small integers in CPython — `hash(1) % 86400 = 1`, `hash(2) % 86400 = 2`, etc. All new companies would cluster in the first few seconds after midnight. Use MD5 truncated to an integer instead:
+`hash(n) == n` for small integers in CPython — `hash(1) % 86400 = 1`, `hash(2) % 86400 = 2`, etc. All new companies would cluster in the first few seconds of the window. Use MD5 truncated to an integer instead:
 
 ```python
 import hashlib
@@ -3192,15 +3197,15 @@ slot_offsets = [
 **Why batch_position and not company_id?**
 Sequential company IDs (e.g. 134–138) are close integers. Even with a proper hash, a run of 5 sequential IDs could land within similar ranges by chance. Batch position resets to 1 for every registration event — tomorrow's 3-company batch also uses positions 1, 2, 3 — giving maximum independence between batches. `initial_slot_offset_s` is stored in `company_poll_stats` at registration so the slot survives restarts (see PostgreSQL schema, Section 16).
 
-#### Phase 2: Recurring scans (company_id — stable, restart-safe)
+#### Phase 2: Recurring scans (STABLE — adaptive engine takes over)
 
-After the WARMING phase completes, the slot switches to `slot_offset(company_id)`. The company_id is immutable (assigned once at creation), so this slot survives Redis restarts, scheduler crashes, and re-deploys without any recalculation:
+Once WARMING completes (`warming_polls_remaining` reaches 0), the adaptive engine takes full control. Rescheduling is simply:
 
 ```python
-next_adaptive_at = today_midnight_eastern + slot_offset(company_id)
+next_adaptive_at = time.time() + adaptive_interval   # computed by on_adaptive_complete()
 ```
 
-The switch happens once: when `warming_polls_remaining` reaches 0 in `on_adaptive_complete()`. From that point forward, the slot is fixed for the company's lifetime.
+`slot_offset(company_id)` is no longer used for scheduling — companies naturally spread out over time because their adaptive intervals diverge based on observed posting activity. The switch happens once: when `warming_polls_remaining` is set to NULL in `on_adaptive_complete()`. From that point forward, the interval is fully dynamic for the company's lifetime.
 
 ### New company lifecycle: NEW → WARMING → STABLE
 
@@ -3227,8 +3232,8 @@ WARMING (warming_polls_remaining = 3, 2, 1)
   on_fullscan_complete():
     • Sets warming_polls_remaining = 3 in company_poll_stats.
     • Schedules first adaptive poll:
-        today_midnight + initial_slot_offset_s
-        (if slot already passed today → tomorrow)
+        now + initial_slot_offset_s
+        (always in the future — no midnight anchoring, no daily wave)
     • ZADDs into poll:adaptive with that timestamp.
 
   Each on_adaptive_complete() during WARMING:
@@ -3236,8 +3241,8 @@ WARMING (warming_polls_remaining = 3, 2, 1)
     • Ignores adaptive engine output — always schedules next poll
       at current_slot + 2h.
     • warming_polls_remaining = 0 → transition tick:
-        next slot = today_midnight + slot_offset(company_id)
         SET warming_polls_remaining = NULL  (→ STABLE)
+        Adaptive engine computes next interval normally from this point.
 
   State survives restarts: both warming_polls_remaining and
   initial_slot_offset_s are persisted in company_poll_stats.
@@ -3259,15 +3264,12 @@ def on_fullscan_complete(company):
     if company.last_poll_at is not None:
         return   # not a NEW company — standard rules apply
 
-    # Compute first adaptive slot from stored initial_slot_offset_s
-    eastern = pytz.timezone("America/New_York")
-    today_midnight = eastern.localize(
-        datetime.now(eastern).replace(hour=0, minute=0, second=0, microsecond=0)
-    ).timestamp()
-
-    first_poll_at = today_midnight + company.initial_slot_offset_s
-    if first_poll_at <= time.time():
-        first_poll_at += 86400   # slot already passed today → use tomorrow
+    # Spread first adaptive poll across the next 24 h from now.
+    # Using now + offset means the poll is always in the future regardless
+    # of what time of day this runs — no timezone math, no midnight anchoring,
+    # no "push to tomorrow" edge case.  Workers stay evenly loaded throughout
+    # the day rather than being idle all day and overwhelmed at midnight.
+    first_poll_at = time.time() + company.initial_slot_offset_s
 
     # Persist WARMING state before touching Redis
     db.execute("""
@@ -3275,39 +3277,32 @@ def on_fullscan_complete(company):
            SET warming_polls_remaining = 3,
                next_poll_at = %s
          WHERE company = %s
-    """, (datetime.fromtimestamp(first_poll_at), company.name))
+    """, (datetime.fromtimestamp(first_poll_at, tz=timezone.utc), company.name))
 
     redis.zadd("poll:adaptive", {company.name: first_poll_at})
     logger.info(
-        "on_fullscan_complete: %s → WARMING (first poll at %s, offset=%ds)",
+        "on_fullscan_complete: %s → WARMING (first poll in %.1fh, offset=%ds)",
         company.name,
-        datetime.fromtimestamp(first_poll_at).strftime("%H:%M"),
+        company.initial_slot_offset_s / 3600,
         company.initial_slot_offset_s,
     )
 ```
 
 ### Startup and restart: three-way categorisation
 
-On any restart, `rebuild_redis()` categorises all companies and handles each differently:
+The monitoring day runs from **7 AM → 7 AM** (`CYCLE_START_HOUR = 7`), not midnight → midnight. `rebuild_redis()` uses this boundary to categorise companies:
 
 | Category | Condition | Adaptive action | Full scan action |
 |---|---|---|---|
-| **NEW** | `last_poll_at IS NULL AND last_full_scan_at IS NULL` | NOT added — `on_fullscan_complete()` bootstraps after first full scan | XADD `stream:fullscan:{dc_key}` immediately (spread via batch_position hash) |
-| **OVERDUE** | has history; `next_poll_at` is past or NULL | ZADD `poll:adaptive` spread across recovery window (most-overdue first); dispatcher moves to `stream:adaptive:{dc_key}` as ceiling allows | XADD `stream:fullscan:{dc_key}` immediately if full scan also overdue |
-| **FUTURE** | `next_poll_at` is in the future | ZADD `poll:adaptive` with stored timestamp preserved as-is | ZADD `poll:fullscan` with stored timestamp preserved as-is |
+| **NEW** | `last_poll_at IS NULL AND last_full_scan_at IS NULL` | NOT added — `on_fullscan_complete()` bootstraps after first full scan with `now + slot_offset` | ZADD `poll:fullscan` spread across startup window |
+| **STALE** | has history; `next_poll_at` is NULL or before cycle start (last 7 AM) | ZADD `poll:adaptive` spread across recovery window (most-overdue first) — schedule is from a previous day, may be clustered | Full scan preserved if future; bumped to `now+300` if also stale |
+| **CURRENT** | has history; `next_poll_at ≥ cycle start` | ZADD `poll:adaptive` with **stored DB timestamp** — no spread applied. If slightly past: immediately due. If future: scheduled as-is. | ZADD `poll:fullscan` with stored `next_full_scan_at` |
 
-**Overdue companies are never rescheduled to midnight.** They are added immediately to the stream so workers begin processing at ceiling capacity. If total overdue work exceeds the time remaining until 7 AM, a capacity alert is emitted:
+**Key design principle — DB is the source of truth for within-cycle companies.** The recovery spread is only applied when work is genuinely stale (from a previous monitoring day and potentially clustered). When companies were evenly distributed before the restart, their stored `next_poll_at` values already represent that distribution — restoring them directly preserves it.
 
-```python
-remaining_work_s = len(overdue_companies) * avg_fullscan_s / ceil_concurrency
-time_until_7am   = compute_seconds_until_7am()
-if remaining_work_s > time_until_7am:
-    alert(
-        "CAPACITY: %d overdue full scans (~%.0f min) cannot complete before "
-        "7 AM (%.0f min remaining). Manual intervention may be needed.",
-        len(overdue_companies), remaining_work_s / 60, time_until_7am / 60,
-    )
-```
+The cycle boundary is resolved in this order:
+1. `cycle:start` Redis key — written by `record_cycle_start()` after each `--monitor-jobs` digest. Most accurate.
+2. Computed fallback — most recent `CYCLE_START_HOUR` in local time. Used on first startup before any cycle has completed.
 
 ### Spread window formula
 
@@ -3339,10 +3334,51 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 | Old behaviour | New behaviour |
 |---|---|
 | All companies onboarded together → same slot forever | batch_position hash → spread from day 1 |
-| Restart → all companies overdue → thundering herd | Three-way triage → spread via recovery window |
+| Restart → all companies "overdue" → thundering herd | Three-way triage: STALE (before last 7 AM) → recovery spread; CURRENT (within today's cycle) → DB timestamps restored directly |
 | Dawn patrol redistributing late polls each morning | Not needed — slots never cluster |
+| Midnight anchoring creating daily wave (idle all day, burst at midnight) | `now + offset` — load distributed continuously throughout the day |
 | Full scans all trigger in the same 5-minute window | Full scans trigger throughout the day as adaptive polls complete at different times |
 | Last full scan finishes at 7:35 AM | Last full scan finishes well before 7 AM |
+
+### reschedule_on_deploy.py — manual escape hatch only
+
+> **Normal deployments do not need this script.** `rebuild_redis()` runs
+> automatically at scheduler startup and handles all restart scenarios via
+> the 7 AM cycle boundary — fresh deploys, long outages, and brief rolling
+> restarts alike. See the startup rebuild section above.
+
+`scripts/reschedule_on_deploy.py` exists for one exceptional case: Redis ZSET
+scores have become **corrupted or severely clustered while workers are already
+running** and you cannot afford a full restart to let `rebuild_redis()` fix
+them. It rewrites scores in-place without stopping anything.
+
+```bash
+# Dry run — shows what would change, touches nothing
+python scripts/reschedule_on_deploy.py --dry-run
+
+# Live run — rewrites all ZSET scores
+python scripts/reschedule_on_deploy.py
+
+# Surgical: reset only one queue
+python scripts/reschedule_on_deploy.py --adaptive-only
+python scripts/reschedule_on_deploy.py --fullscan-only
+```
+
+**Algorithm:**
+- `poll:adaptive` — each company's new score = `now + slot_offset(company)` — spreads companies deterministically across the next 24 h from now.
+- `poll:fullscan` — each company's new score = `now + (slot_offset(company) / 86400 × full_scan_interval)` — maps the same [0, 86400) hash range into one full-scan window.
+
+**Safety properties:**
+- Idempotent — safe to run multiple times; companies always get the same relative ordering (scores shift with wall-clock but ordering holds).
+- Does NOT clear the ZSETs — only updates existing member scores.
+- Does NOT touch `company_poll_stats` in the DB — the DB is the historical record; Redis is the scheduling surface.
+- Supports `--adaptive-only` and `--fullscan-only` flags if only one queue needs redistribution.
+- Exits non-zero on any Redis connection failure so CI/CD can gate on it.
+
+**When to reach for it (rare):**
+- A bug or manual Redis edit has left scores clustered while workers are live and you cannot restart.
+- You need to reset one queue surgically without touching the other.
+- Always run `--dry-run` first to verify the scope before committing.
 
 ---
 
@@ -3442,7 +3478,7 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 **batch_position:** A company's ordinal position within a single registration event (1, 2, 3 … N). Used exclusively to compute the first adaptive poll slot via `slot_offset(batch_position)` (see Section 24 for the canonical definition). Resets to 1 for every new registration batch. Replaced by `slot_offset(company_id)` after the WARMING phase completes. Not stored in the DB — computed transiently at registration time.
 
-**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across the 24-hour day. Formula: `today_midnight + slot_offset(identifier)` where `slot_offset` is defined in Section 24. For new companies during WARMING: identifier = batch_position, so the slot is `slot_offset(batch_position)`. For recurring polls (STABLE): identifier = company_id, so the slot is `slot_offset(company_id)`. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
+**Hash-based slot assignment:** The mechanism that distributes adaptive poll times evenly across any 24-hour window. Formula: `now + slot_offset(identifier)` where `slot_offset` is defined in Section 24. For new companies during NEW → WARMING bootstrap: identifier = batch_position, giving `first_poll_at = now + slot_offset(batch_position)`. For STABLE companies: the adaptive engine computes `now + interval` directly. Using `now + offset` (not `midnight + offset`) guarantees the result is always in the future regardless of time-of-day, avoids timezone math, and distributes load evenly throughout the day rather than creating a daily burst at midnight. Eliminates thundering herds permanently without requiring dawn patrol or any periodic redistribution.
 
 **Thundering herd:** The condition where many companies become due simultaneously, overloading workers and the ATS concurrency ceiling. Root cause: companies onboarded together drift to the same time-of-day slot. Fixed by hash-based slot assignment (Section 24).
 
@@ -3458,7 +3494,7 @@ def spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 **initial_slot_offset_s:** Column in `company_poll_stats` storing `slot_offset(batch_position)` computed at registration. Used as the adaptive poll slot during NEW and WARMING phases. Persisted so restart doesn't require knowing the original batch_position. Irrelevant once STABLE (`slot_offset(company_id)` is recomputed on the fly from the immutable company_id).
 
-**on_fullscan_complete():** Callback fired when a company's first-ever full scan finishes. Transitions the company from NEW → WARMING: sets `warming_polls_remaining = 3`, schedules first adaptive poll at `today_midnight + initial_slot_offset_s`, ZADDs to `poll:adaptive`. Not called for subsequent full scans (only for the one that sets `last_full_scan_at` for the first time).
+**on_fullscan_complete():** Callback fired when a company's first-ever full scan finishes. Transitions the company from NEW → WARMING: sets `warming_polls_remaining = 3`, schedules first adaptive poll at `now + initial_slot_offset_s` (always in the future — no midnight anchoring), ZADDs to `poll:adaptive`. Not called for subsequent full scans (only for the one that sets `last_full_scan_at` for the first time).
 
 **Dead-letter (stream):** When `XAUTOCLAIM` re-delivers a stream message more than `MAX_STREAM_REDELIVERIES` (5) times, the message is considered un-processable in-stream. The company is moved to `poll:adaptive` (or `poll:fullscan`) with exponential backoff, and the stream message is `XACK`'d. Prevents broken companies from looping in the PEL indefinitely.
 
