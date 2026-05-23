@@ -30,11 +30,64 @@ from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_ADAPTIVE,
+    REDIS_CYCLE_START,
     WORKER_FLOOR,
     STARTUP_AVG_SCAN_TIME_S,
+    CYCLE_START_HOUR,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────
+# CYCLE BOUNDARY HELPER
+# ─────────────────────────────────────────
+
+def _current_cycle_start_ts(r) -> float:
+    """
+    Unix timestamp of the start of the current monitoring cycle.
+
+    The monitoring day runs CYCLE_START_HOUR → CYCLE_START_HOUR (default 7 AM
+    → 7 AM), not midnight → midnight.  This boundary separates:
+
+        STALE companies  — next_poll_at is before this timestamp.
+                           Their schedule is from a previous monitoring day.
+                           They may be clustered → apply recovery spread.
+
+        CURRENT companies — next_poll_at is on or after this timestamp.
+                            Their schedule is valid for today's cycle — the
+                            DB timestamp is restored directly into the ZSET.
+                            If slightly in the past: immediately due.
+                            If still in the future: scheduled as stored.
+
+    Resolution order:
+        1. cycle:start Redis key — written by record_cycle_start() after each
+           --monitor-jobs digest cycle.  Most accurate (reflects actual run
+           time, not assumed schedule).
+        2. Computed fallback: most recent CYCLE_START_HOUR in local time.
+           Used on first startup before any cycle has completed, or if the
+           Redis key has expired.
+    """
+    # Prefer the Redis key set by record_cycle_start()
+    try:
+        val = r.get(REDIS_CYCLE_START)
+        if val:
+            return float(val)
+    except Exception:
+        pass
+
+    # Fallback: compute most recent CYCLE_START_HOUR in local time
+    now_s = time.time()
+    t     = time.localtime(now_s)
+    today_start = time.mktime((
+        t.tm_year, t.tm_mon, t.tm_mday,
+        CYCLE_START_HOUR, 0, 0,
+        t.tm_wday, t.tm_yday, t.tm_isdst,
+    ))
+    if now_s < today_start:
+        # Before CYCLE_START_HOUR today — current cycle started yesterday
+        return today_start - 86400
+    return today_start
 
 
 # ─────────────────────────────────────────
@@ -65,21 +118,27 @@ def rebuild_poll_queues() -> dict:
     """
     Rebuild poll:adaptive and poll:fullscan ZSETs from company_poll_stats.
 
-    Three-way categorisation replaces the old "all NULLs → now-1" logic:
+    Three-way categorisation based on CYCLE_START_HOUR (default 7 AM):
 
     NEW companies (last_poll_at IS NULL AND last_full_scan_at IS NULL)
         → poll:fullscan only, spread across a dynamic startup window.
           Full scan runs first; on_fullscan_complete() bootstraps them
-          into poll:adaptive afterwards.
+          into poll:adaptive with now + slot_offset afterwards.
 
-    OVERDUE companies (have polling history, next_poll_at in the past or NULL)
-        → poll:adaptive, spread across a dynamic recovery window so workers
-          are not hammered all at once after a restart.
-          Existing next_full_scan_at preserved (or rescheduled +5 min if also
-          overdue).
+    STALE companies (have polling history; next_poll_at before cycle start)
+        → next_poll_at is from a previous monitoring day.  These are
+          genuinely overdue and may be clustered (e.g. long outage, many
+          companies added together).  Spread across a dynamic recovery
+          window, most-overdue first, to avoid thundering herd.
 
-    FUTURE companies (next_poll_at in the future)
-        → poll:adaptive with their stored timestamp; full scan preserved.
+    CURRENT companies (have polling history; next_poll_at >= cycle start)
+        → The DB is the source of truth.  next_poll_at is restored directly
+          into the ZSET — no artificial spread applied.
+          • Slightly past (score <= now): immediately due.  Worker picks
+            them up in their original priority order.
+          • Still future (score > now):  scheduled exactly as stored.
+          This path is the normal restart case when work was already evenly
+          distributed.  Preserving stored timestamps keeps that distribution.
 
     Spread window formula: ceil(N / W) × avg_scan_s
         N = companies in each bucket
@@ -90,6 +149,10 @@ def rebuild_poll_queues() -> dict:
     """
     r   = get_redis()
     now = time.time()
+
+    # Determine cycle boundary: monitoring day starts at CYCLE_START_HOUR.
+    # Companies scheduled before this timestamp are from a previous cycle.
+    cycle_start = _current_cycle_start_ts(r)
 
     adaptive_entries: dict = {}
     fullscan_entries: dict = {}
@@ -106,25 +169,33 @@ def rebuild_poll_queues() -> dict:
 
     # ── Categorise ────────────────────────────────────────────────────────────
     new_companies:     list = []   # never polled AND never full-scanned
-    overdue_companies: list = []   # have history but next_poll_at is past/NULL
-    future_companies:  list = []   # next_poll_at is in the future
+    stale_companies:   list = []   # have history; schedule from a previous cycle
+    current_companies: list = []   # have history; schedule within current cycle
 
     for row in rows:
-        never_polled    = row["last_poll_at"]     is None
-        never_fullscan  = row["last_full_scan_at"] is None
+        never_polled   = row["last_poll_at"]     is None
+        never_fullscan = row["last_full_scan_at"] is None
+
         if never_polled and never_fullscan:
             new_companies.append(row)
-        elif row["next_poll_at"] is None or row["next_poll_at"].timestamp() <= now:
-            overdue_companies.append(row)
-        else:
-            future_companies.append(row)
+            continue
 
-    n_workers = WORKER_FLOOR          # conservative: minimum scan workers
+        next_ts = row["next_poll_at"].timestamp() if row["next_poll_at"] else None
+
+        if next_ts is None or next_ts < cycle_start:
+            # No schedule, or schedule predates the current monitoring day
+            stale_companies.append(row)
+        else:
+            # Scheduled within the current cycle — use DB timestamp directly
+            # (whether slightly past or still future)
+            current_companies.append(row)
+
+    n_workers = WORKER_FLOOR
     avg_s     = STARTUP_AVG_SCAN_TIME_S
 
     # ── 1. NEW companies → poll:fullscan first ────────────────────────────────
-    # Do NOT add to poll:adaptive — on_fullscan_complete() will bootstrap them
-    # into poll:adaptive once their first full scan finishes.
+    # Do NOT add to poll:adaptive — on_fullscan_complete() bootstraps them
+    # into poll:adaptive (with now + slot_offset) once their first scan finishes.
     new_spread = _spread_window_s(len(new_companies), n_workers, avg_s)
     n_new      = max(len(new_companies), 1)
     for i, row in enumerate(new_companies):
@@ -138,45 +209,64 @@ def rebuild_poll_queues() -> dict:
             len(new_companies), new_spread, new_spread / 60,
         )
 
-    # ── 2. OVERDUE companies → poll:adaptive with recovery spread ─────────────
-    # Sort most-overdue first (lowest next_poll_at timestamp) so companies
-    # that missed the most polls are processed earliest in the window.
-    overdue_companies.sort(key=lambda r: (
+    # ── 2. STALE companies → recovery spread ─────────────────────────────────
+    # Sort most-overdue first (lowest next_poll_at) so companies that missed
+    # the most polls are processed earliest in the recovery window.
+    stale_companies.sort(key=lambda r: (
         r["next_poll_at"].timestamp() if r["next_poll_at"] else 0.0
     ))
-    overdue_spread = _spread_window_s(len(overdue_companies), n_workers, avg_s)
-    n_over         = max(len(overdue_companies), 1)
-    for i, row in enumerate(overdue_companies):
-        score = now + (i / n_over) * overdue_spread
+    stale_spread = _spread_window_s(len(stale_companies), n_workers, avg_s)
+    n_stale      = max(len(stale_companies), 1)
+    for i, row in enumerate(stale_companies):
+        score = now + (i / n_stale) * stale_spread
         adaptive_entries[row["company"]] = score
 
-        # Preserve their next full scan if it is still in the future;
-        # if the full scan is also overdue, bump it 5 min from now so it
-        # doesn't collide with the adaptive startup rush.
-        # If next_full_scan_at is None (never scanned), schedule immediately.
+        # Preserve full scan schedule if still in the future;
+        # if also stale, bump to +5 min to avoid collision with adaptive rush.
         if row["next_full_scan_at"] is not None:
             fs_ts = row["next_full_scan_at"].timestamp()
             fullscan_entries[row["company"]] = fs_ts if fs_ts > now else now + 300
         else:
             fullscan_entries[row["company"]] = now + 300
 
-    if overdue_companies:
+    if stale_companies:
         logger.info(
-            "rebuild: %d overdue companies → poll:adaptive "
-            "(spread=%.0fs / %.1f min)",
-            len(overdue_companies), overdue_spread, overdue_spread / 60,
+            "rebuild: %d stale companies (schedule before %s) → "
+            "poll:adaptive recovery spread (spread=%.0fs / %.1f min)",
+            len(stale_companies),
+            time.strftime("%H:%M", time.localtime(cycle_start)),
+            stale_spread, stale_spread / 60,
         )
 
-    # ── 3. FUTURE companies → use stored timestamps as-is ────────────────────
-    for row in future_companies:
-        adaptive_entries[row["company"]] = row["next_poll_at"].timestamp()
+    # ── 3. CURRENT companies → DB timestamps restored directly ───────────────
+    # DB is the source of truth.  Stored next_poll_at goes straight into ZSET.
+    # If score <= now: immediately due (but in their original priority order).
+    # If score > now: scheduled for the future exactly as the DB says.
+    # The ±10% jitter in _reschedule_adaptive() handles ongoing separation;
+    # no additional spread needed here when distribution was already even.
+    n_past = n_future = 0
+    for row in current_companies:
+        score = row["next_poll_at"].timestamp()
+        adaptive_entries[row["company"]] = score
+        if score <= now:
+            n_past += 1
+        else:
+            n_future += 1
+
         if row["next_full_scan_at"] is not None:
             fullscan_entries[row["company"]] = row["next_full_scan_at"].timestamp()
         else:
-            # Never had a full scan — schedule alongside adaptive poll time
-            fullscan_entries[row["company"]] = row["next_poll_at"].timestamp()
+            # Never had a full scan — co-schedule with adaptive
+            fullscan_entries[row["company"]] = score
 
-    # ── Write to Redis ─────────────────────────────────────────────────────────
+    if current_companies:
+        logger.info(
+            "rebuild: %d current-cycle companies → DB timestamps restored "
+            "(%d immediately due, %d future)",
+            len(current_companies), n_past, n_future,
+        )
+
+    # ── Write to Redis ────────────────────────────────────────────────────────
     if adaptive_entries:
         r.zadd(REDIS_POLL_ADAPTIVE, adaptive_entries)
     if fullscan_entries:
@@ -184,16 +274,17 @@ def rebuild_poll_queues() -> dict:
 
     logger.info(
         "rebuild: poll:adaptive=%d poll:fullscan=%d "
-        "(new=%d overdue=%d future=%d)",
+        "(new=%d stale=%d current=%d  cycle_start=%s)",
         len(adaptive_entries), len(fullscan_entries),
-        len(new_companies), len(overdue_companies), len(future_companies),
+        len(new_companies), len(stale_companies), len(current_companies),
+        time.strftime("%H:%M", time.localtime(cycle_start)),
     )
     return {
         "adaptive": len(adaptive_entries),
         "fullscan": len(fullscan_entries),
         "new":      len(new_companies),
-        "overdue":  len(overdue_companies),
-        "future":   len(future_companies),
+        "stale":    len(stale_companies),
+        "current":  len(current_companies),
     }
 
 

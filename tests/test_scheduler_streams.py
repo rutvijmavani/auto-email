@@ -57,8 +57,8 @@ Coverage map
     · initial_slot_offset_s set in DB → uses that value
     · initial_slot_offset_s = NULL → falls back to slot_offset(row["id"])
     · No DB row → falls back to slot_offset(company)
-    · first_poll_at > now → zadd with first_poll_at (no +86400)
-    · first_poll_at <= now → zadd with first_poll_at + 86400 (tomorrow)
+    · zadd score = now + offset_s (always in the future, no midnight anchoring)
+    · Large offset (near 24 h) still lands strictly in the future
     · warming_polls_remaining = WARMING_POLLS_COUNT written to DB
     · r.zadd(REDIS_POLL_ADAPTIVE, ...) called
     · DB UPDATE commits
@@ -378,13 +378,19 @@ class TestWarmingLifecycleOnAdaptiveComplete(unittest.TestCase):
         )
 
         conn = MagicMock()
-        conn.execute.return_value.fetchone.return_value = row
         update_params_captured = []
+
+        # SELECT queries must return a cursor whose .fetchone() yields `row`.
+        # Using a side_effect overrides return_value, so we build a reusable
+        # select cursor and return it for all non-UPDATE calls.
+        select_cursor = MagicMock()
+        select_cursor.fetchone.return_value = row
 
         def _execute(sql, params=None):
             if "UPDATE company_poll_stats" in sql:
                 update_params_captured.append(params)
-            return MagicMock()
+                return MagicMock()
+            return select_cursor
 
         conn.execute.side_effect = _execute
 
@@ -488,15 +494,20 @@ class TestWarmingLifecycleOnAdaptiveComplete(unittest.TestCase):
         self.assertIsNone(new_warming)
 
     def test_update_poll_interval_called_during_warming(self):
-        """During WARMING, update_poll_interval still called (score computed)."""
-        with patch("workers.scheduler.update_poll_interval",
-                   return_value={
-                       "current_interval_s":  3600,
-                       "adaptive_score":      0.3,
-                       "recent_poll_counts":  [],
-                   }) as mock_upi:
-            self._run(warming=3, success=True)
-        mock_upi.assert_called_once()
+        """During WARMING, update_poll_interval still called (score computed).
+
+        Note: _run() internally patches update_poll_interval (returning
+        adaptive_score=0.5), so we verify the call indirectly — if UPI was
+        called, params[1] (adaptive_score) in the DB UPDATE will be 0.5.
+        """
+        params_list, _ = self._run(warming=3, success=True)
+        self.assertTrue(params_list, "DB UPDATE not executed — on_adaptive_complete failed")
+        adaptive_score_written = params_list[0][1]
+        self.assertEqual(
+            adaptive_score_written, 0.5,
+            "update_poll_interval was not called during WARMING — "
+            "adaptive_score not written by it",
+        )
 
     def test_warming_interval_constant_is_7200(self):
         """WARMING_INTERVAL_S = 2 * 3600 = 7200 (sanity check on constant)."""
@@ -509,15 +520,13 @@ class TestWarmingLifecycleOnAdaptiveComplete(unittest.TestCase):
 
 class TestBootstrapWarming(unittest.TestCase):
 
-    def _run(self, company="Stripe", db_row_config=None, now=None,
-             midnight_ts=None):
+    def _run(self, company="Stripe", db_row_config=None, now=None):
         """
-        Run _bootstrap_warming() with mocked DB, time, and pytz.
+        Run _bootstrap_warming() with mocked DB and time.
 
         db_row_config: None = no row; dict with keys "id" and "initial_slot_offset_s"
         """
-        fixed_now      = now if now is not None else 1_700_000_000.0
-        fixed_midnight = midnight_ts if midnight_ts is not None else 1_699_920_000.0
+        fixed_now = now if now is not None else 1_700_000_000.0
 
         r = MagicMock()
 
@@ -527,7 +536,7 @@ class TestBootstrapWarming(unittest.TestCase):
             conn1.execute.return_value.fetchone.return_value = None
         else:
             row = {
-                "id":                   db_row_config.get("id", 1),
+                "id":                    db_row_config.get("id", 1),
                 "initial_slot_offset_s": db_row_config.get("initial_slot_offset_s"),
             }
             conn1.execute.return_value.fetchone.return_value = row
@@ -537,41 +546,12 @@ class TestBootstrapWarming(unittest.TestCase):
 
         conns = iter([conn1, conn2])
 
-        import datetime as _dt_mod
-        import pytz as _pytz_mod
-
-        class FakeMidnight:
-            def timestamp(self):
-                return fixed_midnight
-            def replace(self, **kwargs):
-                return self
-
-        class FakeEasternNow:
-            def replace(self, **kwargs):
-                return FakeMidnight()
-
         with patch("workers.scheduler.get_conn", side_effect=lambda: next(conns)), \
-             patch("workers.scheduler.time") as mock_time, \
-             patch("workers.scheduler.pytz") as mock_pytz:
+             patch("workers.scheduler.time") as mock_time:
             mock_time.time.return_value = fixed_now
 
-            import workers.scheduler as sched_mod
-            # Replace _dt inside the function via patching datetime construction
-            fake_eastern = MagicMock()
-            fake_eastern.replace.return_value = FakeMidnight()
-            mock_tz = MagicMock()
-            mock_tz_inst = MagicMock()
-            mock_pytz.timezone.return_value = mock_tz_inst
-
-            # We need to patch the datetime.now() call inside _bootstrap_warming
-            with patch("workers.scheduler.datetime") as mock_dt:
-                fake_now_eastern = MagicMock()
-                fake_now_eastern.replace.return_value = FakeMidnight()
-                mock_dt.now.return_value = fake_now_eastern
-                mock_dt.fromtimestamp.side_effect = _dt_mod.datetime.fromtimestamp
-
-                from workers.scheduler import _bootstrap_warming
-                _bootstrap_warming(company, r, fixed_now)
+            from workers.scheduler import _bootstrap_warming
+            _bootstrap_warming(company, r, fixed_now)
 
         return r, conn1, conn2, update_params_captured
 
@@ -581,7 +561,7 @@ class TestBootstrapWarming(unittest.TestCase):
             mock_slot.return_value = 99999
             r, _, _, params = self._run(
                 db_row_config={"id": 1, "initial_slot_offset_s": 30000},
-                now=0.0, midnight_ts=0.0,
+                now=0.0,
             )
         mock_slot.assert_not_called()
 
@@ -596,7 +576,7 @@ class TestBootstrapWarming(unittest.TestCase):
         with patch("workers.slot.slot_offset", side_effect=_slot):
             self._run(
                 db_row_config={"id": 77, "initial_slot_offset_s": None},
-                now=0.0, midnight_ts=0.0,
+                now=0.0,
             )
 
         self.assertIn(77, called_with,
@@ -612,51 +592,38 @@ class TestBootstrapWarming(unittest.TestCase):
             return 5555
 
         with patch("workers.slot.slot_offset", side_effect=_slot):
-            self._run(
-                company=company,
-                db_row_config=None,
-                now=0.0, midnight_ts=0.0,
-            )
+            self._run(company=company, db_row_config=None, now=0.0)
 
         self.assertIn(company, called_with)
 
-    def test_future_slot_no_tomorrow_push(self):
-        """Slot in the future → zadd score = midnight + offset (no +86400)."""
-        midnight = 1_700_000_000.0
-        offset   = 3600    # 1h
-        now      = midnight + 1800  # 30min into day — slot is future
+    def test_zadd_score_is_now_plus_offset(self):
+        """zadd score = now + offset_s — always in the future, no midnight math."""
+        now    = 1_700_000_000.0
+        offset = 3600    # 1 h
 
         with patch("workers.slot.slot_offset", return_value=offset):
-            r, _, _, _ = self._run(
-                db_row_config=None,
-                now=now, midnight_ts=midnight,
-            )
+            r, _, _, _ = self._run(db_row_config=None, now=now)
 
         r.zadd.assert_called_once()
         score = list(r.zadd.call_args[0][1].values())[0]
-        self.assertAlmostEqual(score, midnight + offset, delta=1)
+        self.assertAlmostEqual(score, now + offset, delta=1)
 
-    def test_past_slot_pushed_to_tomorrow(self):
-        """Slot already passed today → zadd score = midnight + offset + 86400."""
-        midnight = 1_700_000_000.0
-        offset   = 3600    # 1h
-        now      = midnight + 7200  # 2h into day — slot has passed
+    def test_large_offset_still_in_future(self):
+        """A large offset (near 24 h) is still in the future — no wrap-around."""
+        now    = 1_700_000_000.0
+        offset = 82800   # 23 h
 
         with patch("workers.slot.slot_offset", return_value=offset):
-            r, _, _, _ = self._run(
-                db_row_config=None,
-                now=now, midnight_ts=midnight,
-            )
+            r, _, _, _ = self._run(db_row_config=None, now=now)
 
         score = list(r.zadd.call_args[0][1].values())[0]
-        self.assertAlmostEqual(score, midnight + offset + 86400, delta=1)
+        self.assertGreater(score, now, msg="Score must be strictly in the future")
+        self.assertAlmostEqual(score, now + offset, delta=1)
 
     def test_warming_polls_count_written_to_db(self):
         """DB UPDATE sets warming_polls_remaining = WARMING_POLLS_COUNT."""
         with patch("workers.slot.slot_offset", return_value=3600):
-            _, _, _, update_params = self._run(
-                db_row_config=None, now=0.0, midnight_ts=0.0,
-            )
+            _, _, _, update_params = self._run(db_row_config=None, now=0.0)
         self.assertTrue(len(update_params) > 0,
                         msg="No UPDATE params captured")
         self.assertEqual(update_params[0][0], WARMING_POLLS_COUNT)
@@ -664,9 +631,7 @@ class TestBootstrapWarming(unittest.TestCase):
     def test_zadd_uses_poll_adaptive_key(self):
         """r.zadd is called with REDIS_POLL_ADAPTIVE."""
         with patch("workers.slot.slot_offset", return_value=3600):
-            r, _, _, _ = self._run(
-                db_row_config=None, now=0.0, midnight_ts=0.0,
-            )
+            r, _, _, _ = self._run(db_row_config=None, now=0.0)
         r.zadd.assert_called_once()
         key_used = r.zadd.call_args[0][0]
         self.assertEqual(key_used, REDIS_POLL_ADAPTIVE)
@@ -674,17 +639,13 @@ class TestBootstrapWarming(unittest.TestCase):
     def test_db_update_commits(self):
         """conn.commit() called for the UPDATE connection."""
         with patch("workers.slot.slot_offset", return_value=3600):
-            _, _, conn2, _ = self._run(
-                db_row_config=None, now=0.0, midnight_ts=0.0,
-            )
+            _, _, conn2, _ = self._run(db_row_config=None, now=0.0)
         conn2.commit.assert_called_once()
 
     def test_both_connections_closed(self):
         """Both DB connections (SELECT + UPDATE) are closed in finally blocks."""
         with patch("workers.slot.slot_offset", return_value=3600):
-            _, conn1, conn2, _ = self._run(
-                db_row_config=None, now=0.0, midnight_ts=0.0,
-            )
+            _, conn1, conn2, _ = self._run(db_row_config=None, now=0.0)
         conn1.close.assert_called_once()
         conn2.close.assert_called_once()
 

@@ -806,9 +806,9 @@ def upsert_poll_stats(company: str, platform: str,
                     ELSE company_poll_stats.consecutive_empty + 1
                 END,
                 updated_at        = CURRENT_TIMESTAMP
-                -- NOTE: initial_slot_offset_s deliberately excluded from the
-                -- UPDATE clause so once-set registration slots survive restarts.
         """, (company, platform, new_jobs, offset_s))
+        # NOTE: initial_slot_offset_s deliberately excluded from the
+        # UPDATE clause so once-set registration slots survive restarts.
         conn.commit()
     except Exception as e:
         import logging

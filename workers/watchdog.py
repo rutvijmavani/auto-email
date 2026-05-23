@@ -208,7 +208,7 @@ def check_pel_stats() -> dict:
             "watchdog: PEL stats stream=%s total=%d oldest=%s consumers=%s",
             stream_key,
             total,
-            f"{oldest_age_ms // 1000}s" if oldest_age_ms is not None else "n/a",
+            f"{lowest_id_age_ms // 1000}s" if lowest_id_age_ms is not None else "n/a",
             consumers,
         )
 

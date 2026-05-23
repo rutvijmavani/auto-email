@@ -18,17 +18,15 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-TEST_DB = "data/test_pipeline.db"
 import db.db as db_module
+from tests.conftest import cleanup_db
 
 
 class TestFindOnly(unittest.TestCase):
 
     def setUp(self):
-        db_module.DB_FILE = TEST_DB
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
-        db_module.init_db()
+        cleanup_db()          # Truncate all tables so each test starts clean
+        db_module.init_db()   # Ensure schema is up to date
 
         # Add test applications
         self.app1_id, _ = db_module.add_application("Google", "https://google.com/jobs/1", "Backend Engineer")
@@ -36,8 +34,7 @@ class TestFindOnly(unittest.TestCase):
         self.app3_id, _ = db_module.add_application("Meta", "https://meta.com/jobs/1", "SWE")
 
     def tearDown(self):
-        if os.path.exists(TEST_DB):
-            os.remove(TEST_DB)
+        cleanup_db()
 
     # ─────────────────────────────────────────
     # TEST 1: Recruiter added at company level
