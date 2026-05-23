@@ -776,8 +776,10 @@ def upsert_poll_stats(company: str, platform: str,
 
     On subsequent scans: increments total_polls, total_new_jobs,
     resets or increments consecutive_empty based on whether new_jobs > 0.
-    initial_slot_offset_s is intentionally NOT updated on conflict so the
-    original registration slot survives across restarts.
+    initial_slot_offset_s uses COALESCE on conflict: the existing value is
+    preserved if already set (original registration slot survives restarts),
+    but NULL legacy rows (added before the column existed) are backfilled
+    automatically on the next scan.
 
     duration_ms is stored for scheduler latency tracking but not
     persisted here — the scheduler reads it from the result payload.
@@ -795,20 +797,25 @@ def upsert_poll_stats(company: str, platform: str,
                  consecutive_empty, initial_slot_offset_s, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(company) DO UPDATE SET
-                ats_platform      = EXCLUDED.ats_platform,
-                last_poll_at      = CURRENT_TIMESTAMP,
-                total_polls       = company_poll_stats.total_polls + 1,
-                total_new_jobs    = company_poll_stats.total_new_jobs
-                                    + EXCLUDED.total_new_jobs,
-                consecutive_empty = CASE
+                ats_platform          = EXCLUDED.ats_platform,
+                last_poll_at          = CURRENT_TIMESTAMP,
+                total_polls           = company_poll_stats.total_polls + 1,
+                total_new_jobs        = company_poll_stats.total_new_jobs
+                                        + EXCLUDED.total_new_jobs,
+                consecutive_empty     = CASE
                     WHEN EXCLUDED.total_new_jobs > 0
                     THEN 0
                     ELSE company_poll_stats.consecutive_empty + 1
                 END,
-                updated_at        = CURRENT_TIMESTAMP
+                updated_at            = CURRENT_TIMESTAMP,
+                initial_slot_offset_s = COALESCE(
+                    company_poll_stats.initial_slot_offset_s,
+                    EXCLUDED.initial_slot_offset_s
+                )
         """, (company, platform, new_jobs, offset_s))
-        # NOTE: initial_slot_offset_s deliberately excluded from the
-        # UPDATE clause so once-set registration slots survive restarts.
+        # NOTE: initial_slot_offset_s uses COALESCE so the original
+        # registration slot is preserved once set, but legacy NULL rows
+        # (created before the column existed) are backfilled on next scan.
         conn.commit()
     except Exception as e:
         import logging

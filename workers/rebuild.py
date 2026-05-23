@@ -25,7 +25,7 @@ import math
 import time
 
 from workers.redis_client import get_redis
-from db.db import get_conn, init_db
+from db.db import get_conn, init_db, get_monitorable_companies
 from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
@@ -116,11 +116,19 @@ def _spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
 
 def rebuild_poll_queues() -> dict:
     """
-    Rebuild poll:adaptive and poll:fullscan ZSETs from company_poll_stats.
+    Rebuild poll:adaptive and poll:fullscan ZSETs from company_poll_stats,
+    plus any monitorable companies not yet registered in company_poll_stats.
 
-    Three-way categorisation based on CYCLE_START_HOUR (default 7 AM):
+    Four-way categorisation based on CYCLE_START_HOUR (default 7 AM):
 
-    NEW companies (last_poll_at IS NULL AND last_full_scan_at IS NULL)
+    UNREGISTERED companies (in prospective_companies but no row in company_poll_stats)
+        → Never been scanned by the new scheduler (e.g. fresh deployment or
+          newly added company).  Treated identically to NEW: added to
+          poll:fullscan only, spread across a dynamic startup window.
+          on_fullscan_complete() writes their first company_poll_stats row
+          and bootstraps them into poll:adaptive afterwards.
+
+    NEW companies (row in company_poll_stats; last_poll_at IS NULL AND last_full_scan_at IS NULL)
         → poll:fullscan only, spread across a dynamic startup window.
           Full scan runs first; on_fullscan_complete() bootstraps them
           into poll:adaptive with now + slot_offset afterwards.
@@ -189,6 +197,30 @@ def rebuild_poll_queues() -> dict:
             # Scheduled within the current cycle — use DB timestamp directly
             # (whether slightly past or still future)
             current_companies.append(row)
+
+    # ── Unregistered companies ────────────────────────────────────────────────
+    # Companies in prospective_companies that have no row in company_poll_stats
+    # yet (fresh deployment, or newly added company).  Merge into new_companies
+    # so they get the same fullscan-first treatment and spread window.
+    known = {row["company"] for row in rows}
+    try:
+        monitorable = get_monitorable_companies()
+        unregistered = [
+            {"company": c["company"]}
+            for c in monitorable
+            if c["company"] not in known
+        ]
+    except Exception as exc:
+        logger.warning("rebuild: could not fetch monitorable companies: %s", exc)
+        unregistered = []
+
+    if unregistered:
+        new_companies.extend(unregistered)
+        logger.info(
+            "rebuild: %d unregistered companies found in prospective_companies "
+            "(not yet in company_poll_stats) → merged into NEW bucket",
+            len(unregistered),
+        )
 
     n_workers = WORKER_FLOOR
     avg_s     = STARTUP_AVG_SCAN_TIME_S
@@ -272,19 +304,22 @@ def rebuild_poll_queues() -> dict:
     if fullscan_entries:
         r.zadd(REDIS_POLL_FULLSCAN, fullscan_entries)
 
+    n_unregistered = len(unregistered) if unregistered else 0
     logger.info(
         "rebuild: poll:adaptive=%d poll:fullscan=%d "
-        "(new=%d stale=%d current=%d  cycle_start=%s)",
+        "(new=%d unregistered=%d stale=%d current=%d  cycle_start=%s)",
         len(adaptive_entries), len(fullscan_entries),
-        len(new_companies), len(stale_companies), len(current_companies),
+        len(new_companies) - n_unregistered, n_unregistered,
+        len(stale_companies), len(current_companies),
         time.strftime("%H:%M", time.localtime(cycle_start)),
     )
     return {
-        "adaptive": len(adaptive_entries),
-        "fullscan": len(fullscan_entries),
-        "new":      len(new_companies),
-        "stale":    len(stale_companies),
-        "current":  len(current_companies),
+        "adaptive":     len(adaptive_entries),
+        "fullscan":     len(fullscan_entries),
+        "new":          len(new_companies) - n_unregistered,
+        "unregistered": n_unregistered,
+        "stale":        len(stale_companies),
+        "current":      len(current_companies),
     }
 
 
