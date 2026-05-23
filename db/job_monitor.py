@@ -607,8 +607,8 @@ def save_pending_detail(company: str, platform: str, job: dict,
     """
     Insert a job as status='pending_detail' for the detail queue.
 
-    Called by scan_worker (found_by='tier1_adaptive') after detecting a new
-    job_id via the seen:{company} Redis SET diff, and by fullscan_worker
+    Called by scan_worker (found_by='tier1_adaptive') after a DB check
+    confirms the job_id is new, and by fullscan_worker
     (found_by='tier2_fullscan') for jobs found during a full scan.
 
     The detail_worker will later UPDATE this to 'new' after fetching full
@@ -655,9 +655,9 @@ def save_pre_existing_listing(company: str, platform: str, job: dict) -> bool:
     """
     Persist a job from the first-scan run as status='pre_existing'.
 
-    Called by scan_worker for every job on a company's first ever scan so
-    Redis seen:{company} can be rebuilt correctly on restart (rebuild reads
-    job_postings WHERE job_id IS NOT NULL).
+    Called by scan_worker for every job on a company's first ever scan.
+    The DB is the source of truth; adaptive_seen:{company} is populated
+    directly by _handle_first_scan after all jobs are persisted.
 
     Returns True if inserted, False if job_url already exists.
     """
@@ -750,7 +750,7 @@ def delete_pending_detail(company: str, job_id: str) -> None:
 
     Called by detail_worker when a job is fetched but does not match
     location / freshness filters — so it never enters the digest.
-    The job_id is still in seen:{company} so it won't be re-detected.
+    The job_id remains in the bloom filter / adaptive_seen so it won't be re-detected.
     """
     conn = get_conn()
     try:
@@ -768,22 +768,32 @@ def upsert_poll_stats(company: str, platform: str,
     """
     Create or update the company_poll_stats row after a scan completes.
 
-    On first scan: inserts a new row.
+    On first scan: inserts a new row with initial_slot_offset_s pre-populated
+    using slot_offset(company).  This deterministic MD5-based offset spreads
+    companies evenly across the 24h window so the WARMING bootstrap
+    (on_fullscan_complete) can schedule the first adaptive poll without
+    falling back to a runtime computation.
+
     On subsequent scans: increments total_polls, total_new_jobs,
     resets or increments consecutive_empty based on whether new_jobs > 0.
+    initial_slot_offset_s is intentionally NOT updated on conflict so the
+    original registration slot survives across restarts.
 
     duration_ms is stored for scheduler latency tracking but not
     persisted here — the scheduler reads it from the result payload.
     next_poll_at and adaptive_score are left for the scheduler to set.
     """
+    from workers.slot import slot_offset as _slot_offset
+    offset_s = _slot_offset(company)
+
     conn = get_conn()
     try:
         conn.execute("""
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_poll_at,
                  total_polls, total_new_jobs,
-                 consecutive_empty, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, CURRENT_TIMESTAMP)
+                 consecutive_empty, initial_slot_offset_s, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(company) DO UPDATE SET
                 ats_platform      = EXCLUDED.ats_platform,
                 last_poll_at      = CURRENT_TIMESTAMP,
@@ -796,7 +806,9 @@ def upsert_poll_stats(company: str, platform: str,
                     ELSE company_poll_stats.consecutive_empty + 1
                 END,
                 updated_at        = CURRENT_TIMESTAMP
-        """, (company, platform, new_jobs))
+                -- NOTE: initial_slot_offset_s deliberately excluded from the
+                -- UPDATE clause so once-set registration slots survive restarts.
+        """, (company, platform, new_jobs, offset_s))
         conn.commit()
     except Exception as e:
         import logging

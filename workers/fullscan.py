@@ -23,19 +23,24 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     Full scan jobs → queue:detail:fullscan   (low priority, Tier 2)
     detail_worker drains queue:detail:adaptive FIRST (BRPOP priority)
 
-─── Bloom filter ─────────────────────────────────────────────────────────────
+─── Bloom filter pair ────────────────────────────────────────────────────────
 
-    bloom:fullscan:{company}   — RedisBloom BF.* (if module available)
-    bloom:fallback:{company}   — Regular Redis SET (automatic fallback)
+    OLD bloom  bloom:fullscan:{company}      — authoritative (last completed scan)
+    NEW bloom  bloom:fullscan:new:{company}  — being built this cycle
+    Fallback   bloom:fallback:{company}      — Redis SET if RedisBloom unavailable
     TTL = 36h (FULLSCAN_BLOOM_TTL)
 
-    The Bloom filter tracks job IDs queued during the current full scan cycle
-    so that: (a) intra-scan duplicate IDs are skipped, and (b) a resumed
-    scan after pause can skip already-processed jobs without re-fetching them.
+    OLD bloom: read-only during the scan.  Used to skip DB checks for jobs
+    already known from the last cycle (speedup), and read by adaptive scan
+    workers for early-exit overlap detection (Section 11).
 
-    On a fresh full scan: the filter is deleted and re-created from scratch.
-    On a checkpoint resume: the existing filter is reused — jobs already in
-    it were queued before the pause, so they are correctly skipped.
+    NEW bloom: ALL currently fetched job IDs are added, regardless of whether
+    they were in the OLD bloom or are genuinely new.  Closed/filled jobs fall
+    out naturally — they are no longer fetched so they never enter NEW bloom.
+
+    On completion: NEW bloom is promoted to OLD (DEL old, RENAME new → old).
+    On resume:     both keys are preserved; NEW bloom provides intra-scan dedup
+                   so jobs queued before the pause are not re-queued.
 
 ─── Rule 4 (adaptive-first) ──────────────────────────────────────────────────
 
@@ -106,6 +111,13 @@ from config import (
     FULLSCAN_BLOOM_TTL,
     FULLSCAN_BLOOM_ERROR_RATE,
     DETAIL_QUEUE_MAX_FULLSCAN,
+    REDIS_ADAPTIVE_SEEN_PREFIX,
+    ADAPTIVE_SEEN_TTL,
+    # Stream-based delivery (two-layer scheduler redesign)
+    REDIS_STREAM_FULLSCAN,
+    STREAM_CONSUMER_GROUP,
+    STREAM_BLOCK_MS,
+    WARMING_POLLS_COUNT,
 )
 from workers.redis_client import get_redis, ping
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
@@ -121,7 +133,8 @@ from db.job_monitor import (
 
 logger = get_logger(__name__)
 
-WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
+_CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
 
 # How many jobs to process per "page chunk" before checking for pause.
 # Phase 7 will replace this with actual per-page HTTP fetching.
@@ -141,92 +154,158 @@ FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900   # 15 minutes
 # BLOOM FILTER ABSTRACTION
 # ─────────────────────────────────────────
 
-class _BloomFilter:
+class _BloomPair:
     """
-    Thin wrapper around RedisBloom BF.* commands with automatic Redis SET fallback.
+    Two-key Bloom filter pair for per-company full scan (Section 9 / 13).
 
-    If the RedisBloom module is available:  uses BF.ADD / BF.EXISTS
-    Otherwise:                              falls back to SADD / SISMEMBER
-                                            on a TTL'd key (bloom:fallback:{company})
+    OLD key (bloom:fullscan:{company}):
+        Authoritative state from the last *completed* scan.  Read-only during
+        the current scan — used to skip DB checks for already-known jobs
+        (speedup) and read by adaptive scan for early exit (Section 11).
 
-    The fallback SET is a true exact-match structure (no false positives,
-    but higher memory than a real Bloom filter). For typical fullscan sizes
-    (≤ 10,000 job IDs), the memory difference is negligible.
+    NEW key (bloom:fullscan:new:{company}):
+        Being built fresh during the current scan.  ALL currently active job
+        IDs are added to it regardless of whether they were known.  On scan
+        completion it is promoted to OLD so closed/filled jobs fall out
+        naturally (they were not fetched → not in NEW → absent next cycle).
+
+    Resume behaviour (interrupted scan):
+        OLD key: still present — continues to serve as DB-skip reference.
+        NEW key: partially built — new_exists() used for intra-scan dedup so
+                 jobs processed before the pause are not re-queued.
+
+    RedisBloom / SET fallback:
+        Uses BF.* commands when available; falls back to SADD/SISMEMBER on
+        TTL'd keys (bloom:fallback:{company} / bloom:fallback:new:{company}).
+        The fallback is exact-match (no false positives) but uses more memory.
     """
+
+    # NEW bloom needs a slightly longer TTL than OLD so it survives slow scans.
+    _NEW_TTL = FULLSCAN_BLOOM_TTL + 3600   # 37h
 
     def __init__(self, r, company: str):
-        self.r           = r
-        self._bf_key     = f"bloom:fullscan:{company}"
-        self._fb_key     = f"bloom:fallback:{company}"
-        self._use_bf: Optional[bool] = None   # None = not probed yet
+        self.r        = r
+        self._old_bf  = f"bloom:fullscan:{company}"
+        self._new_bf  = f"bloom:fullscan:new:{company}"
+        self._old_fb  = f"bloom:fallback:{company}"
+        self._new_fb  = f"bloom:fallback:new:{company}"
+        self._use_bf: Optional[bool] = None
+
+    # ── RedisBloom probe ──────────────────────────────────────────────────────
 
     def _probe(self) -> bool:
-        """Detect RedisBloom availability on first call."""
+        """Detect RedisBloom availability (cached after first call)."""
         if self._use_bf is not None:
             return self._use_bf
         try:
-            self.r.execute_command("BF.EXISTS", self._bf_key, "_probe_")
+            self.r.execute_command("BF.EXISTS", self._old_bf, "_probe_")
             self._use_bf = True
         except Exception:
             self._use_bf = False
-            logger.debug(
-                "bloom: RedisBloom unavailable — using SET fallback "
-                "(%s → %s)", self._bf_key, self._fb_key,
-            )
+            logger.debug("bloom: RedisBloom unavailable — using SET fallback")
         return self._use_bf
 
-    def exists(self, job_id: str) -> bool:
-        """Return True if job_id is (probably) in the filter."""
+    # ── OLD bloom reads ───────────────────────────────────────────────────────
+
+    def old_exists(self, job_id: str) -> bool:
+        """True if job_id was in the last completed full scan (old bloom)."""
         if self._probe():
             try:
                 return bool(
-                    self.r.execute_command("BF.EXISTS", self._bf_key, job_id)
+                    self.r.execute_command("BF.EXISTS", self._old_bf, job_id)
                 )
             except Exception:
                 self._use_bf = False
-        return bool(self.r.sismember(self._fb_key, job_id))
+        return bool(self.r.sismember(self._old_fb, job_id))
 
-    def add(self, job_id: str) -> None:
-        """Add job_id to the filter and refresh its TTL."""
+    def old_exists_fn(self):
+        """Return a callable suitable for paginator.should_continue_paginating."""
+        return self.old_exists
+
+    # ── NEW bloom reads + writes ──────────────────────────────────────────────
+
+    def new_exists(self, job_id: str) -> bool:
+        """True if job_id was already processed in this scan cycle (new bloom)."""
         if self._probe():
             try:
-                self.r.execute_command("BF.ADD", self._bf_key, job_id)
-                self.r.expire(self._bf_key, FULLSCAN_BLOOM_TTL)
+                return bool(
+                    self.r.execute_command("BF.EXISTS", self._new_bf, job_id)
+                )
+            except Exception:
+                self._use_bf = False
+        return bool(self.r.sismember(self._new_fb, job_id))
+
+    def new_add(self, job_id: str) -> None:
+        """Add job_id to the NEW bloom (call for EVERY fetched job ID)."""
+        if self._probe():
+            try:
+                self.r.execute_command("BF.ADD", self._new_bf, job_id)
                 return
             except Exception:
                 self._use_bf = False
-        self.r.sadd(self._fb_key, job_id)
-        self.r.expire(self._fb_key, FULLSCAN_BLOOM_TTL)
+        self.r.sadd(self._new_fb, job_id)
 
-    def initialize(self) -> None:
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def prepare_fresh(self) -> None:
         """
-        Pre-create the Bloom filter with estimated capacity.
-        Safe to call on resume (BF.RESERVE fails gracefully if key exists).
+        Prepare for a FRESH full scan (not a resume).
+
+        Keeps OLD key as-is (DB-skip reference for this scan cycle).
+        Wipes NEW key and pre-creates it for the current scan.
         """
+        self.r.delete(self._new_bf)
+        self.r.delete(self._new_fb)
         if self._probe():
             try:
                 self.r.execute_command(
                     "BF.RESERVE",
-                    self._bf_key,
+                    self._new_bf,
                     str(FULLSCAN_BLOOM_ERROR_RATE),
                     str(FULLSCAN_BLOOM_CAPACITY),
                 )
-                self.r.expire(self._bf_key, FULLSCAN_BLOOM_TTL)
-                return
             except Exception:
-                pass   # key may already exist; that's fine on resume
-        # Fallback SET: just ensure TTL is set
-        self.r.expire(self._fb_key, FULLSCAN_BLOOM_TTL)
+                pass  # BF.RESERVE failed — BF.ADD will auto-create
+        self.r.expire(self._new_bf, self._NEW_TTL)
+        self.r.expire(self._new_fb, self._NEW_TTL)
 
-    def delete(self) -> None:
-        """Delete the filter completely (fresh scan — not a resume)."""
-        self.r.delete(self._bf_key)
-        self.r.delete(self._fb_key)
+    def prepare_resume(self) -> None:
+        """
+        Prepare for a RESUMED scan (after pause checkpoint).
 
-    def extend_ttl(self) -> None:
-        """Refresh TTL on both the BF key and its fallback."""
-        self.r.expire(self._bf_key, FULLSCAN_BLOOM_TTL)
-        self.r.expire(self._fb_key, FULLSCAN_BLOOM_TTL)
+        Both OLD and NEW keys are still present; extend TTL so they don't
+        expire during a long-running resumed scan.
+        """
+        self.r.expire(self._old_bf, FULLSCAN_BLOOM_TTL)
+        self.r.expire(self._old_fb, FULLSCAN_BLOOM_TTL)
+        self.r.expire(self._new_bf, self._NEW_TTL)
+        self.r.expire(self._new_fb, self._NEW_TTL)
+        logger.debug(
+            "bloom: resume — OLD=%s NEW=%s TTLs extended",
+            self._old_bf, self._new_bf,
+        )
+
+    def finalize(self) -> None:
+        """
+        Promote NEW bloom → OLD on scan completion.
+
+        DEL old keys, RENAME new keys to old keys, set authoritative TTL.
+        The promoted OLD bloom now represents the complete current board state
+        and will be read by adaptive scans for early exit until the next
+        full scan cycle rebuilds it.
+        """
+        self.r.delete(self._old_bf)
+        self.r.delete(self._old_fb)
+        try:
+            self.r.rename(self._new_bf, self._old_bf)
+            self.r.expire(self._old_bf, FULLSCAN_BLOOM_TTL)
+        except Exception:
+            pass  # new_bf may not exist if scan found 0 jobs
+        try:
+            self.r.rename(self._new_fb, self._old_fb)
+            self.r.expire(self._old_fb, FULLSCAN_BLOOM_TTL)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────
@@ -291,6 +370,119 @@ def _get_cycle_start(r) -> Optional[float]:
     """Return current cycle:start Unix timestamp, or None if not set."""
     val = r.get(REDIS_CYCLE_START)
     return float(val) if val else None
+
+
+# ─────────────────────────────────────────
+# STREAM CONSUMER GROUP INIT
+# ─────────────────────────────────────────
+
+def _ensure_consumer_group(r) -> None:
+    """
+    Ensure the consumer group exists for stream:fullscan (idempotent).
+
+    Uses id='$' so only NEW messages are delivered — never replays history.
+    BUSYGROUP means the group already exists; safe to ignore.
+    MKSTREAM creates the stream key if it doesn't exist yet.
+    """
+    try:
+        r.xgroup_create(
+            REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
+            id="$", mkstream=True,
+        )
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            logger.warning("fullscan: xgroup_create error: %s", exc)
+            raise
+
+
+# ─────────────────────────────────────────
+# WARMING BOOTSTRAP (first full scan)
+# ─────────────────────────────────────────
+
+def _bootstrap_warming_adaptive(company: str, r) -> None:
+    """
+    Bootstrap a brand-new company into the WARMING lifecycle.
+
+    Called after the FIRST successful full scan completes
+    (detected by last_poll_at IS NULL before the scan).
+
+    Steps:
+        1. Read initial_slot_offset_s from DB (set at registration time).
+           Falls back to slot_offset(company_id) for legacy rows without it.
+        2. Compute first_poll_at = today_midnight_eastern + initial_slot_offset_s.
+           If that slot has already passed today, push to tomorrow's slot.
+        3. Write warming_polls_remaining = WARMING_POLLS_COUNT to DB.
+        4. ZADD company to poll:adaptive at first_poll_at.
+
+    This replaces the old "ZADD with ADAPTIVE_DEFAULT_INTERVAL at now" logic so
+    new companies are spread deterministically across the day instead of all
+    clustering at the moment their first full scan finishes.
+    """
+    import pytz
+    from datetime import datetime as _dt
+    from workers.slot import slot_offset
+
+    eastern = pytz.timezone("America/New_York")
+    now_ts = time.time()
+    # Derive midnight from now_ts (not datetime.now) so tests that mock
+    # time.time() get a deterministic today_midnight_ts.
+    now_eastern = _dt.fromtimestamp(now_ts, tz=eastern)
+    today_midnight = now_eastern.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_midnight_ts = today_midnight.timestamp()
+
+    # Fetch initial_slot_offset_s from DB
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT id, initial_slot_offset_s
+            FROM company_poll_stats
+            WHERE company = %s
+        """, (company,)).fetchone()
+    finally:
+        conn.close()
+
+    if row and row["initial_slot_offset_s"] is not None:
+        offset_s = int(row["initial_slot_offset_s"])
+    elif row:
+        # Legacy row — derive offset from company_poll_stats.id
+        offset_s = slot_offset(row["id"])
+        logger.debug(
+            "_bootstrap_warming_adaptive: %r has no initial_slot_offset_s — "
+            "using slot_offset(id=%d) = %ds",
+            company, row["id"], offset_s,
+        )
+    else:
+        offset_s = slot_offset(company)   # fallback: hash of company name
+
+    first_poll_at = today_midnight_ts + offset_s
+    if first_poll_at <= now_ts:
+        first_poll_at += 86400   # push to tomorrow's slot
+
+    first_poll_dt = _dt.fromtimestamp(first_poll_at, tz=timezone.utc)
+
+    conn = get_conn()
+    try:
+        conn.execute("""
+            UPDATE company_poll_stats
+            SET warming_polls_remaining = %s,
+                next_poll_at            = %s,
+                updated_at              = CURRENT_TIMESTAMP
+            WHERE company = %s
+        """, (WARMING_POLLS_COUNT, first_poll_dt, company))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r.zadd(REDIS_POLL_ADAPTIVE, {company: first_poll_at})
+
+    logger.info(
+        "fullscan: WARMING bootstrap for %r — "
+        "warming_polls=%d first_poll_at=%s (offset=%ds, in %.1fh)",
+        company, WARMING_POLLS_COUNT,
+        first_poll_dt.strftime("%H:%M"),
+        offset_s,
+        (first_poll_at - now_ts) / 3600,
+    )
 
 
 # ─────────────────────────────────────────
@@ -456,8 +648,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
     """
     Perform one complete full scan for a company.
 
-    Fetches every job page, compares against the per-company Bloom filter
-    and the seen:{company} SET, and pushes new job IDs to queue:detail:fullscan.
+    Fetches every job page, uses the Bloom filter pair for DB-check speedup,
+    and pushes genuinely new job IDs to queue:detail:fullscan.
 
     Returns a result dict summarising the outcome. Never raises — all
     exceptions are caught and logged.
@@ -561,21 +753,29 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             company, platform, sorted_plat, is_resume,
         )
 
-        # ── 6. Bloom filter setup ─────────────────────────────────────────────
-        bloom = _BloomFilter(r, company)
+        # ── 6. Bloom filter + adaptive_seen setup ────────────────────────────────
+        bloom = _BloomPair(r, company)
+        adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
+
         if is_resume:
-            # Resume: reuse existing Bloom filter — it tracks what was already
-            # queued before the pause. Extend TTL so it doesn't expire mid-run.
-            bloom.initialize()   # no-op if BF already exists; sets TTL on SET
-            bloom.extend_ttl()
+            # Resume: OLD bloom (last completed scan) and NEW bloom (partially
+            # built before pause) are both still present. Extend TTLs.
+            bloom.prepare_resume()
             logger.info(
-                "fullscan [%s]: resuming from page=%s (bloom filter preserved)",
+                "fullscan [%s]: resuming from page=%s "
+                "(old+new bloom preserved)",
                 company, fs_state.get("interrupted_at_page"),
             )
         else:
-            # Fresh scan: delete any stale filter from a previous cycle.
-            bloom.delete()
-            bloom.initialize()
+            # Fresh scan: keep OLD bloom as DB-skip reference, wipe NEW bloom,
+            # and clear today's adaptive_seen cache.
+            bloom.prepare_fresh()
+            r.delete(adaptive_seen_key)
+            logger.info(
+                "fullscan [%s]: fresh scan — NEW bloom cleared, "
+                "adaptive_seen cleared",
+                company,
+            )
 
         # ── 7. Fetch all jobs ─────────────────────────────────────────────────
         # Phase 7 will replace this with page-by-page streaming so we can
@@ -605,18 +805,14 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         else:
             title_matched = filter_jobs(valid_jobs)
 
-        # ── 9. Intra-scan dedup set (catches duplicates across pages) ─────────
+        # ── 9. Intra-scan dedup (Python set — one scan run fits in memory) ───────
         cycle_seen: set = set()
 
-        # Load seen:{company} once for the whole scan.
-        seen_key = f"seen:{company}"
-        seen_ids = r.smembers(seen_key)
-
         # ── 10. Page-chunk processing loop ───────────────────────────────────
-        new_count    = 0
-        page_num     = 0
-        paused       = False
-        early_exit   = False
+        new_count     = 0
+        page_num      = 0
+        paused        = False
+        early_exit    = False
         overlap_pages = 0
 
         # Backpressure: check detail queue depth before starting
@@ -627,7 +823,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 "(depth=%d > max=%d) — pausing until queue drains",
                 company, queue_depth, DETAIL_QUEUE_MAX_FULLSCAN,
             )
-            # Wait until queue has headroom (up to 5 minutes)
             waited = 0
             while (r.llen(REDIS_DETAIL_FULLSCAN) > DETAIL_QUEUE_MAX_FULLSCAN
                    and waited < 300):
@@ -653,15 +848,18 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 break
 
             # ── Smart early exit for SORTED platforms ─────────────────────────
+            # Uses OLD bloom (last completed scan's board state) — contains ALL
+            # jobs that were active then, so the 80% threshold is meaningful.
             if sorted_plat:
                 should_go_on, overlap_pages = should_continue_paginating(
-                    chunk, seen_ids, overlap_pages, sorted_by_recency=True,
+                    chunk, bloom.old_exists_fn(), overlap_pages,
+                    sorted_by_recency=True,
                 )
                 if not should_go_on:
                     early_exit = True
                     logger.debug(
                         "fullscan [%s]: early exit at page=%d "
-                        "(80%%/2-page threshold)",
+                        "(80%%/2-page bloom threshold)",
                         company, page_num,
                     )
                     break
@@ -672,24 +870,28 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 if not job_id:
                     continue
 
-                # Intra-scan dedup
+                # Layer 1: intra-scan dedup (Python set — catches pagination overlap)
                 if job_id in cycle_seen:
                     continue
                 cycle_seen.add(job_id)
 
-                # Skip if already in Bloom filter (queued in this scan cycle)
-                if bloom.exists(job_id):
+                # Layer 2 (resume): already queued before pause → skip re-queuing
+                if bloom.new_exists(job_id):
                     continue
 
-                # Skip if already in seen:{company} (known from adaptive polling)
-                if job_id in seen_ids:
-                    continue
+                # Layer 3: OLD bloom — known from last completed scan.
+                # Still call save_pending_detail (DB ON CONFLICT is the source
+                # of truth); bloom.old_exists is an optimisation hint only.
+                # False positives (0.1%) would silently drop genuinely new jobs
+                # if we skipped the DB here.
+                if bloom.old_exists(job_id):
+                    bloom.new_add(job_id)   # ALL active jobs go into NEW bloom
+                    # Fall through to DB check (no continue) — source of truth.
 
-                # ── Genuinely new job for fullscan ────────────────────────────
+                # Layer 4: DB check — source of truth for new/known decision.
                 inserted = save_pending_detail(
                     company, platform, job, found_by="tier2_fullscan"
                 )
-
                 if inserted:
                     detail_payload = _build_detail_payload(
                         company, platform, job, slug_info,
@@ -697,10 +899,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                     r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
                     new_count += 1
 
-                # Add to Bloom filter regardless of whether DB insert succeeded
-                # (ON CONFLICT DO NOTHING means it was already there — still
-                # should be marked as seen in this scan cycle).
-                bloom.add(job_id)
+                # ALL fetched jobs go into NEW bloom regardless of outcome —
+                # this ensures closed/filled jobs fall out naturally next cycle.
+                bloom.new_add(job_id)
 
             set_progress(company, f"fullscan_page_{page_num}")
             page_num += 1
@@ -747,9 +948,14 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 
         else:
             # ── Successful completion ─────────────────────────────────────────
-            # Extend Bloom filter TTL (it will be reused for dedup if
-            # scan runs again within 36h, e.g. if interval < BLOOM_TTL).
-            bloom.extend_ttl()
+            # Capture whether this is the first full scan BEFORE updating DB
+            # (last_poll_at IS NULL = company has never had an adaptive scan).
+            is_first_fullscan = (fs_state.get("last_poll_at") is None)
+
+            # Promote NEW bloom → OLD (DEL old, RENAME new → old, set TTL).
+            # The promoted OLD bloom now reflects the complete current board
+            # state and will be read by adaptive scans for early exit.
+            bloom.finalize()
 
             # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted
             _complete_fullscan_db(company, platform, new_count, interval_s)
@@ -767,6 +973,23 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 "fullscan [%s]: completed — new=%d next_scan_in=%dh",
                 company, new_count, interval_s // 3600,
             )
+
+            # ── Bootstrap new companies into WARMING adaptive cycle ───────────
+            # is_first_fullscan = last_poll_at was NULL before this scan ran.
+            # Use the deterministic slot-offset approach so companies spread
+            # across the day instead of all bootstrapping at midnight+0.
+            if is_first_fullscan:
+                try:
+                    _bootstrap_warming_adaptive(company, r)
+                except Exception as bw_exc:
+                    # Non-fatal — fall back to immediate ZADD so company isn't lost
+                    logger.error(
+                        "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
+                        "falling back to immediate ZADD",
+                        company, bw_exc,
+                    )
+                    from config import ADAPTIVE_DEFAULT_INTERVAL
+                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
 
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
@@ -789,19 +1012,35 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 # MAIN DISPATCH LOOP
 # ─────────────────────────────────────────
 
-def run_worker(once: bool = False, skip_lock: bool = False) -> None:
+def run_worker(once: bool = False, skip_lock: bool = False,
+               skip_init_db: bool = False) -> None:
     """
-    Main fullscan worker loop.
+    Main fullscan worker loop — stream-based delivery (Section 9 redesign).
 
-    Polls poll:fullscan ZSET for companies whose score <= now (i.e. overdue).
-    Processes one company per iteration (full scans are expensive — no
-    parallel dispatch here). Respects maintenance pauses.
+    Reads full-scan payloads from stream:fullscan via XREADGROUP (crash-safe):
+        1. XREADGROUP COUNT 1 BLOCK 500ms — get next undelivered message
+        2. Check maintenance pause (db:maintenance key)
+        3. Run _run_fullscan() — Bloom filters, checkpoint/resume, detail queue
+        4. XACK — remove from PEL, mark work complete
+
+    _run_fullscan() handles all scheduling internally:
+        - On success: ZADD poll:fullscan at next_scan_at
+                      _bootstrap_warming_adaptive() for first-scan companies
+        - On pause:   _write_checkpoint() + ZADD poll:fullscan at score=now-1
+        - On error:   ZADD poll:fullscan with 1h retry
+
+    If the worker dies between steps 3 and 4, the stream message stays in the
+    PEL.  The scheduler's claim_stale_work() (XAUTOCLAIM with p95×3 idle
+    timeout) reclaims it.  _run_fullscan()'s lock + interrupted_at_page
+    checkpoint ensures the resumed scan doesn't duplicate work.
 
     Args:
-        once:      If True, process at most one company then exit.
-        skip_lock: If True, bypass the exclusivity lock (dev/debug only).
+        once:          If True, process at most one company then exit.
+        skip_lock:     If True, bypass exclusivity lock (dev/debug only).
+        skip_init_db:  If True, skip init_db() (parent process already did it).
     """
-    init_db()
+    if not skip_init_db:
+        init_db()
 
     if not ping():
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -810,11 +1049,16 @@ def run_worker(once: bool = False, skip_lock: bool = False) -> None:
         sys.exit(1)
 
     r = get_redis()
+    _ensure_consumer_group(r)
 
-    logger.info("fullscan worker started | worker_id=%s once=%s skip_lock=%s",
-                WORKER_ID, once, skip_lock)
+    logger.info(
+        "fullscan worker started | worker_id=%s consumer=%s stream=%s "
+        "once=%s skip_lock=%s",
+        WORKER_ID, _CONSUMER_NAME, REDIS_STREAM_FULLSCAN, once, skip_lock,
+    )
     print(f"[fullscan] Ready — worker={WORKER_ID}")
-    print(f"[fullscan] Polling {REDIS_POLL_FULLSCAN!r} (score-ascending)")
+    print(f"[fullscan] Consuming from {REDIS_STREAM_FULLSCAN!r} "
+          f"group={STREAM_CONSUMER_GROUP!r}")
     if once:
         print("[fullscan] --once mode: process one company then exit")
     elif skip_lock:
@@ -827,40 +1071,48 @@ def run_worker(once: bool = False, skip_lock: bool = False) -> None:
     while True:
         try:
             # ── Pause check ───────────────────────────────────────────────────
+            # Full scans are long (minutes); polling db:maintenance every 10s
+            # is fine (cheaper than adding pub/sub to an already-complex module).
             if _is_paused(r):
                 logger.debug("fullscan: maintenance window active — sleeping %ds",
                              FULLSCAN_PAUSE_POLL_SECS)
                 time.sleep(FULLSCAN_PAUSE_POLL_SECS)
                 continue
 
-            # ── Pop next due company (score <= now) ───────────────────────────
-            now = time.time()
-            # ZPOPMIN returns [(member, score), ...] — take 1 entry
-            due = r.zrangebyscore(
-                REDIS_POLL_FULLSCAN, "-inf", now,
-                start=0, num=1, withscores=True,
+            # ── XREADGROUP: block up to STREAM_BLOCK_MS for next message ──────
+            stream_result = r.xreadgroup(
+                STREAM_CONSUMER_GROUP,
+                _CONSUMER_NAME,
+                {REDIS_STREAM_FULLSCAN: ">"},
+                count=1,
+                block=STREAM_BLOCK_MS,
             )
 
-            if not due:
+            if not stream_result:
                 if once and processed == 0:
-                    print("[fullscan] No companies due — exiting (--once)")
+                    print("[fullscan] Stream empty — exiting (--once)")
                     break
                 if once:
                     break
-                # Nothing due — sleep briefly and retry
-                time.sleep(WORKER_BLOCK_SECS)
                 continue
 
-            company, score = due[0]
+            _stream_name, messages = stream_result[0]
+            msg_id, fields = messages[0]
 
-            # Atomic pop — prevent double processing if multiple workers run
-            removed = r.zrem(REDIS_POLL_FULLSCAN, company)
-            if not removed:
-                # Another worker beat us to this company
+            company = fields.get("company", "")
+            if not company:
+                logger.warning("fullscan: received stream message with no company — XACK and skip")
+                r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
                 continue
 
+            # ── Run full scan ─────────────────────────────────────────────────
             result    = _run_fullscan(company, r, skip_lock=skip_lock)
             processed += 1
+
+            # ── XACK: remove from PEL (work complete) ────────────────────────
+            # _run_fullscan() handles all rescheduling internally before we get
+            # here, so XACK unconditionally marks this delivery as done.
+            r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
 
             outcome = result["outcome"]
             icon    = {

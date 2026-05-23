@@ -28,6 +28,7 @@ import json
 import logging
 import math
 import multiprocessing
+import os
 import random
 import threading
 import time
@@ -55,6 +56,9 @@ from config import (
     REDIS_DB_MAINTENANCE,
     REDIS_BAND_THRESHOLDS,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
+    REDIS_DETAIL_FULLSCAN,
+    DETAIL_QUEUE_MAX_FULLSCAN,
+    ADAPTIVE_DEFAULT_INTERVAL,
     SCAN_QUEUE,
     SCHEDULER_TICK_SECS,
     SCHEDULER_DAWN_PATROL_WINDOW,
@@ -94,12 +98,29 @@ from config import (
     WORKER_SCALING_LOCK_TTL,
     REDIS_INFLIGHT_PREFIX,
     INFLIGHT_STALE_WINDOW_S,
+    # Stream-based two-layer scheduler (Section 5 / 9 redesign)
+    REDIS_STREAM_ADAPTIVE,
+    REDIS_STREAM_FULLSCAN,
+    STREAM_CONSUMER_GROUP,
+    STREAM_MAXLEN_ADAPTIVE,
+    STREAM_MAXLEN_FULLSCAN,
+    MAX_STREAM_REDELIVERIES,
+    # WARMING lifecycle
+    WARMING_POLLS_COUNT,
+    WARMING_INTERVAL_S,
 )
 
 logger = logging.getLogger(__name__)
 
-# Shared pause flag — set by pubsub listener, read by dispatch loops
-_paused = threading.Event()
+# Pause / resume events — set by pubsub listener, read by dispatch loops.
+# _pause_event: set when pipeline:pause received; cleared on resume.
+# _resume_event: cleared when paused; set when pipeline:resume received.
+#   Workers call _resume_event.wait(timeout=N) instead of sleep() so they
+#   unblock within ~1s of a resume signal (Section 18 — "never paused forever").
+# Both start clear/set (not paused at startup).
+_pause_event  = threading.Event()   # set = paused
+_resume_event = threading.Event()   # set = running (cleared when paused)
+_resume_event.set()                 # default: running
 
 # ─────────────────────────────────────────
 # BAND THRESHOLD CACHE
@@ -140,6 +161,126 @@ _hysteresis: dict = {
 # adaptive_loop tick.  Keyed by company name; value is the dispatch throttle
 # key (e.g. "greenhouse", "workday_wd12").  Reset on process restart.
 _company_dc_key_cache: dict = {}
+
+
+# ─────────────────────────────────────────
+# STREAM HELPERS
+# ─────────────────────────────────────────
+
+def _init_consumer_group(r, stream_key: str, group: str = STREAM_CONSUMER_GROUP) -> None:
+    """
+    Ensure the consumer group exists for a stream (idempotent).
+
+    Uses id='$' so only NEW messages are delivered to workers — we never
+    want to replay history from before this process started.
+
+    BUSYGROUP means the group already exists — safe to ignore.
+    MKSTREAM creates the stream key itself if it doesn't exist yet.
+    """
+    try:
+        r.xgroup_create(stream_key, group, id="$", mkstream=True)
+        logger.debug("stream: created consumer group %r on %r", group, stream_key)
+    except Exception as exc:
+        if "BUSYGROUP" in str(exc):
+            pass   # group already exists — fine
+        else:
+            logger.warning(
+                "stream: xgroup_create failed for %r/%r: %s",
+                stream_key, group, exc,
+            )
+
+
+def _get_stream_pending_count(r, stream_key: str,
+                               group: str = STREAM_CONSUMER_GROUP) -> int:
+    """Return number of pending (in-flight) messages in the consumer group PEL."""
+    try:
+        info = r.xpending(stream_key, group)
+        return info.get("pending", 0) if isinstance(info, dict) else 0
+    except Exception:
+        return 0
+
+
+def claim_stale_work(r, stream_key: str, group: str,
+                     consumer: str, p95_ms: int,
+                     op_type: str = "scan") -> None:
+    """
+    Reclaim messages stuck in the PEL (worker died mid-scan).
+
+    Called from the scheduler dispatch loops on every tick.  Uses XAUTOCLAIM
+    with an idle timeout of max(p95_ms × 3, 300_000 ms) — self-calibrating so
+    fast scans are reclaimed quickly and slow scans are given proper time.
+
+    Dead-letter logic (Section 9 — Fix 2):
+        After MAX_STREAM_REDELIVERIES failed redeliveries, the company is moved
+        to poll:adaptive or poll:fullscan with exponential backoff, and the
+        stream message is XACK'd to remove it from the PEL.
+
+    Args:
+        r:           Redis client
+        stream_key:  Stream to inspect (e.g. REDIS_STREAM_ADAPTIVE)
+        group:       Consumer group name
+        consumer:    This scheduler instance's consumer name (for XAUTOCLAIM)
+        p95_ms:      p95 scan duration in ms (from api_health); drives idle timeout
+        op_type:     "scan" | "fullscan" — controls which ZSET to use for backoff
+    """
+    from workers.scan_worker import _get_backoff_delay   # hoisted — used in dead-letter path
+    idle_ms = max(p95_ms * 3, 300_000)   # at least 5 min, scales with p95
+
+    try:
+        # XAUTOCLAIM: returns (next_start_id, [(msg_id, fields), ...], [deleted_ids])
+        autoclaim_result = r.xautoclaim(
+            stream_key, group, consumer,
+            min_idle_time=idle_ms,
+            start_id="0-0",
+            count=10,
+        )
+    except Exception as exc:
+        logger.debug("claim_stale_work: xautoclaim error on %r: %s", stream_key, exc)
+        return
+
+    # redis-py returns (next_cursor, [(msg_id, fields), ...], ...)
+    if not autoclaim_result or len(autoclaim_result) < 2:
+        return
+
+    claimed = autoclaim_result[1]
+    if not claimed:
+        return
+
+    for msg_id, fields in claimed:
+        if not fields:
+            continue
+        company = fields.get("company", "")
+        if not company:
+            r.xack(stream_key, group, msg_id)
+            continue
+
+        # Check redelivery count from PEL
+        try:
+            pending = r.xpending_range(stream_key, group,
+                                       min=msg_id, max=msg_id, count=1)
+            delivery_count = pending[0]["times_delivered"] if pending else 0
+        except Exception:
+            delivery_count = 0
+
+        if delivery_count >= MAX_STREAM_REDELIVERIES:
+            # Dead-letter: move company to scheduling ZSET with backoff, XACK stream
+            delay = _get_backoff_delay(r, company, op_type)
+            target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
+            r.zadd(target_zset, {company: time.time() + delay})
+            r.xack(stream_key, group, msg_id)
+            logger.warning(
+                "claim_stale_work: dead-letter %r after %d redeliveries "
+                "(op=%s) → backoff +%ds in %s",
+                company, delivery_count, op_type, delay, target_zset,
+            )
+        else:
+            # Still within retry budget — XAUTOCLAIM transferred ownership.
+            # Worker will pick it up on next XREADGROUP call.
+            logger.info(
+                "claim_stale_work: reclaimed stale %r from %s "
+                "(delivery_count=%d idle_ms=%d)",
+                company, stream_key, delivery_count, idle_ms,
+            )
 
 
 # ─────────────────────────────────────────
@@ -456,9 +597,10 @@ def on_adaptive_complete(company: str, new_jobs: int,
         row = conn.execute("""
             SELECT current_interval_s, recent_poll_counts,
                    last_full_scan_at, full_scan_interval_s,
-                   consecutive_errors, last_success_at
+                   consecutive_errors, last_success_at,
+                   warming_polls_remaining
             FROM company_poll_stats
-            WHERE company = ?
+            WHERE company = %s
         """, (company,)).fetchone()
     finally:
         conn.close()
@@ -468,6 +610,12 @@ def on_adaptive_complete(company: str, new_jobs: int,
         _reschedule_adaptive(company, 86400)
         return
 
+    # ── WARMING lifecycle check ────────────────────────────────────────────────
+    # warming_polls_remaining: NULL=STABLE; 3/2/1=WARMING (new companies).
+    # During WARMING, use a fixed 2h interval regardless of adaptive score so
+    # the engine has enough data before driving scheduling decisions.
+    warming = row["warming_polls_remaining"]
+
     if success:
         counts     = load_poll_counts(row["recent_poll_counts"])
         thresholds = get_band_thresholds(r)
@@ -475,6 +623,10 @@ def on_adaptive_complete(company: str, new_jobs: int,
                                           thresholds=thresholds)
         interval   = result["current_interval_s"]
         consec_errors = 0
+
+        # Override interval during WARMING — still compute score for future use
+        if warming is not None:
+            interval = WARMING_INTERVAL_S
     else:
         # On failure: keep current interval, increment error counter
         interval      = row["current_interval_s"]
@@ -487,25 +639,32 @@ def on_adaptive_complete(company: str, new_jobs: int,
 
     next_poll_at = datetime.fromtimestamp(now + interval)
 
+    # Compute WARMING decrement (only on success; leave unchanged on failure)
+    if success and warming is not None:
+        new_warming = (warming - 1) if warming > 1 else None   # None = STABLE
+    else:
+        new_warming = warming   # unchanged on failure
+
     # Persist to DB
     conn = get_conn()
     try:
         conn.execute("""
             UPDATE company_poll_stats SET
-                recent_poll_counts = ?,
-                adaptive_score     = ?,
-                current_interval_s = ?,
-                last_poll_at       = CURRENT_TIMESTAMP,
-                next_poll_at       = ?,
-                consecutive_empty  = CASE WHEN ? > 0 THEN 0
-                                     ELSE consecutive_empty + 1 END,
-                consecutive_errors = ?,
-                last_success_at    = CASE WHEN ? THEN CURRENT_TIMESTAMP
-                                     ELSE last_success_at END,
-                last_error_at      = CASE WHEN ? THEN CURRENT_TIMESTAMP
-                                     ELSE last_error_at END,
-                updated_at         = CURRENT_TIMESTAMP
-            WHERE company = ?
+                recent_poll_counts      = %s,
+                adaptive_score          = %s,
+                current_interval_s      = %s,
+                last_poll_at            = CURRENT_TIMESTAMP,
+                next_poll_at            = %s,
+                consecutive_empty       = CASE WHEN %s > 0 THEN 0
+                                          ELSE consecutive_empty + 1 END,
+                consecutive_errors      = %s,
+                last_success_at         = CASE WHEN %s THEN CURRENT_TIMESTAMP
+                                          ELSE last_success_at END,
+                last_error_at           = CASE WHEN %s THEN CURRENT_TIMESTAMP
+                                          ELSE last_error_at END,
+                warming_polls_remaining = %s,
+                updated_at              = CURRENT_TIMESTAMP
+            WHERE company = %s
         """, (
             dump_poll_counts(result["recent_poll_counts"]),
             result["adaptive_score"],
@@ -515,11 +674,20 @@ def on_adaptive_complete(company: str, new_jobs: int,
             consec_errors,
             success,              # for last_success_at CASE
             not success,          # for last_error_at CASE
+            new_warming,          # NULL = STABLE, int = still WARMING
             company,
         ))
         conn.commit()
     finally:
         conn.close()
+
+    if success and warming is not None:
+        remaining_after = (warming - 1) if warming > 1 else 0
+        logger.info(
+            "on_adaptive_complete: WARMING company=%r polls_remaining=%d→%d "
+            "interval=%ds (fixed)",
+            company, warming, remaining_after, interval,
+        )
 
     # Update stats cache in Redis
     r.hset(f"stats:{company}", mapping={
@@ -622,8 +790,15 @@ def on_adaptive_complete(company: str, new_jobs: int,
 
 
 def _reschedule_adaptive(company: str, interval_s: int) -> None:
-    """Add company back to poll:adaptive ZSET with its new interval."""
-    score = time.time() + interval_s
+    """
+    Add company back to poll:adaptive ZSET with its new interval.
+
+    A ±10% random jitter is applied to the interval so companies that
+    happen to share the same polling cadence drift apart over successive
+    cycles, preventing thundering-herd clustering from reasserting itself.
+    """
+    jitter = random.uniform(-0.10, 0.10)
+    score  = time.time() + interval_s * (1.0 + jitter)
     get_redis().zadd(REDIS_POLL_ADAPTIVE, {company: score})
 
 
@@ -666,43 +841,238 @@ def _schedule_full_scan(company: str) -> None:
 
 
 # ─────────────────────────────────────────
+# FULL SCAN COMPLETION HANDLER
+# ─────────────────────────────────────────
+
+def on_fullscan_complete(company: str, new_jobs: int,
+                         success: bool = True) -> None:
+    """
+    Called after a full scan worker completes.
+
+    Steps:
+        1. Update last_full_scan_at and schedule next_full_scan_at in DB
+        2. Re-queue company in poll:fullscan for its next cycle
+        3. If this was the FIRST full scan (last_poll_at IS NULL), bootstrap
+           the company into poll:adaptive so incremental scans begin now.
+
+    Args:
+        company:  company name
+        new_jobs: new jobs found in this scan
+        success:  False if scan failed (ATS error)
+    """
+    r   = get_redis()
+    now = time.time()
+
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred
+            FROM company_poll_stats
+            WHERE company = %s
+        """, (company,)).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        logger.warning("on_fullscan_complete: no poll_stats row for %r", company)
+        return
+
+    interval_s = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
+    next_fs    = now + interval_s
+
+    if success:
+        conn = get_conn()
+        try:
+            conn.execute("""
+                UPDATE company_poll_stats
+                SET last_full_scan_at  = CURRENT_TIMESTAMP,
+                    next_full_scan_at  = %s,
+                    full_scan_deferred = FALSE,
+                    updated_at         = CURRENT_TIMESTAMP
+                WHERE company = %s
+            """, (datetime.fromtimestamp(next_fs), company))
+            conn.commit()
+        finally:
+            conn.close()
+
+        # Re-queue for the next full scan cycle
+        r.zadd(REDIS_POLL_FULLSCAN, {company: next_fs})
+        logger.info(
+            "on_fullscan_complete: company=%r new_jobs=%d "
+            "next_fullscan=+%dh success=True",
+            company, new_jobs, interval_s // 3600,
+        )
+
+        # ── Bootstrap new companies into WARMING after their first full scan ────
+        # last_poll_at IS NULL means no adaptive scan has ever run for this
+        # company — it entered through the fullscan-first path.
+        # New design: start WARMING (3 polls at fixed 2h interval) rather than
+        # jumping straight into the adaptive engine with no history.
+        if row["last_poll_at"] is None:
+            _bootstrap_warming(company, r, now)
+    else:
+        # On failure: reschedule full scan with a 1-hour retry
+        retry_delay = 3600
+        r.zadd(REDIS_POLL_FULLSCAN, {company: now + retry_delay})
+        logger.warning(
+            "on_fullscan_complete: company=%r FAILED — "
+            "retrying full scan in %ds",
+            company, retry_delay,
+        )
+
+
+# ─────────────────────────────────────────
+# WARMING BOOTSTRAP
+# ─────────────────────────────────────────
+
+def _bootstrap_warming(company: str, r, now: float) -> None:
+    """
+    Bootstrap a brand-new company into the WARMING lifecycle after its first
+    full scan completes (last_poll_at IS NULL).
+
+    Steps:
+        1. Read initial_slot_offset_s from DB (set at registration time).
+           Fall back to slot_offset(company_id) if column is NULL (legacy rows).
+        2. Compute first_poll_at = today_midnight_eastern + initial_slot_offset_s.
+           If that timestamp is already in the past, push to tomorrow's slot.
+        3. Write warming_polls_remaining=WARMING_POLLS_COUNT + next_poll_at to DB.
+        4. ZADD company to poll:adaptive at first_poll_at.
+
+    This replaces the old "ZADD with ADAPTIVE_DEFAULT_INTERVAL" logic so new
+    companies are spread deterministically across the day instead of clustering
+    at the restart moment.
+    """
+    from workers.slot import slot_offset
+
+    eastern = pytz.timezone("America/New_York")
+    # Derive midnight from caller's `now` so day boundaries align with the
+    # caller's clock (avoids day-boundary mismatches near midnight).
+    now_eastern = datetime.fromtimestamp(now, tz=eastern)
+    today_midnight = now_eastern.replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    today_midnight_ts = today_midnight.timestamp()
+
+    # Fetch initial_slot_offset_s and company id from DB
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT id, initial_slot_offset_s
+            FROM company_poll_stats
+            WHERE company = %s
+        """, (company,)).fetchone()
+    finally:
+        conn.close()
+
+    if row and row["initial_slot_offset_s"] is not None:
+        offset_s = int(row["initial_slot_offset_s"])
+    elif row:
+        # Legacy row without initial_slot_offset_s — compute from company ID
+        offset_s = slot_offset(row["id"])
+        logger.debug(
+            "_bootstrap_warming: %r has no initial_slot_offset_s — "
+            "using slot_offset(id=%d) = %ds",
+            company, row["id"], offset_s,
+        )
+    else:
+        # No stats row yet — use a hash of the company name as fallback
+        offset_s = slot_offset(company)
+
+    first_poll_at = today_midnight_ts + offset_s
+    if first_poll_at <= now:
+        first_poll_at += 86400   # push to tomorrow's slot
+
+    first_poll_dt = datetime.fromtimestamp(first_poll_at)
+
+    conn = get_conn()
+    try:
+        conn.execute("""
+            UPDATE company_poll_stats
+            SET warming_polls_remaining = %s,
+                next_poll_at            = %s,
+                updated_at              = CURRENT_TIMESTAMP
+            WHERE company = %s
+        """, (WARMING_POLLS_COUNT, first_poll_dt, company))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r.zadd(REDIS_POLL_ADAPTIVE, {company: first_poll_at})
+
+    logger.info(
+        "on_fullscan_complete: WARMING bootstrap for %r — "
+        "warming_polls=%d first_poll_at=%s (offset=%ds, in %.1fh)",
+        company, WARMING_POLLS_COUNT,
+        first_poll_dt.strftime("%H:%M"),
+        offset_s,
+        (first_poll_at - now) / 3600,
+    )
+
+
+# ─────────────────────────────────────────
 # ADAPTIVE DISPATCH LOOP
 # ─────────────────────────────────────────
 
 def adaptive_loop() -> None:
     """
-    Continuous adaptive scheduler loop.
+    Continuous adaptive scheduler loop — two-layer dispatch (Section 5).
 
     Every SCHEDULER_TICK_SECS:
-        1. Check if paused (pipeline:pause)
-        2. ZPOPMIN poll:adaptive — get companies due now
-        3. For each: set heartbeat + dispatch to SCAN_QUEUE
-        4. Result consumer reads scan:results and calls on_adaptive_complete
+        1. Check if paused (pipeline:pause signal from pubsub)
+        2. ZRANGEBYSCORE poll:adaptive — non-destructive read of due companies
+        3. For each due company:
+               a. Backpressure / outage / ceiling checks (same as before)
+               b. XADD stream:adaptive   ← crash-safe delivery
+               c. ZREM poll:adaptive     ← remove from scheduling ledger
+               d. ZADD inflight:scans    ← keep for Phase 10 ceiling tracking
+        4. XAUTOCLAIM to reclaim stale messages (worker died mid-scan)
+
+    The ZRANGEBYSCORE→XADD→ZREM ordering is intentional (Section 5):
+        - Crash between XADD and ZREM → duplicate in stream, harmless
+          (adaptive_seen deduplicates job IDs within a day)
+        - ZPOPMIN would lose the company entirely on crash before XADD
+
+    Workers read from REDIS_STREAM_ADAPTIVE via XREADGROUP, call
+    on_adaptive_complete(), then XACK.  The result_consumer_loop pattern
+    is retired — callbacks happen inline in the worker process.
 
     Runs until KeyboardInterrupt or thread stop.
     """
     r = get_redis()
-    logger.info("adaptive_loop: started")
+    _init_consumer_group(r, REDIS_STREAM_ADAPTIVE)
+    logger.info("adaptive_loop: started (stream=%s)", REDIS_STREAM_ADAPTIVE)
+
+    # Stable consumer name for XAUTOCLAIM (scheduler is its own consumer)
+    import socket as _socket
+    scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
     while True:
         try:
-            if _paused.is_set():
+            if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
                 _check_auto_resume()
                 continue
 
             now = time.time()
 
-            # Pop all companies due right now (score <= now)
+            # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
+            # p95 listing scan time (5-min cached from api_health)
+            try:
+                from db.api_health import query_p95_response_ms
+                p95_ms = query_p95_response_ms("listing_scan") or 30_000
+            except Exception:
+                p95_ms = 30_000
+            claim_stale_work(
+                r, REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP,
+                scheduler_consumer, p95_ms, op_type="scan",
+            )
+
+            # ── Two-layer dispatch ────────────────────────────────────────────
+            # Non-destructive read: ZRANGEBYSCORE, then XADD, then ZREM.
             due = r.zrangebyscore(REDIS_POLL_ADAPTIVE, "-inf", now,
                                   withscores=False)
 
             for company in due:
-                # Atomic pop — prevent double dispatch
-                removed = r.zrem(REDIS_POLL_ADAPTIVE, company)
-                if not removed:
-                    continue   # another scheduler instance beat us
-
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
                 if depth > DETAIL_QUEUE_MAX_ADAPTIVE:
@@ -720,17 +1090,12 @@ def adaptive_loop() -> None:
                 outage_key = f"worker:outage:{platform}"
                 if r.exists(outage_key):
                     outage_ttl = r.ttl(outage_key)
-                    # Canary window: dispatch ONE company when outage_ttl has
-                    # dropped below WORKER_CANARY_INTERVAL_S (30 min mark).
-                    # Guard with canary_sent flag so only one fires per window.
-                    canary_sent_key   = f"worker:outage:canary_sent:{platform}"
+                    canary_sent_key    = f"worker:outage:canary_sent:{platform}"
                     canary_company_key = f"worker:outage:canary_company:{platform}"
-                    canary_due        = (0 < outage_ttl < WORKER_CANARY_INTERVAL_S)
-                    canary_sent       = r.exists(canary_sent_key)
+                    canary_due         = (0 < outage_ttl < WORKER_CANARY_INTERVAL_S)
+                    canary_sent        = r.exists(canary_sent_key)
 
                     if canary_due and not canary_sent:
-                        # Let this one company through as the canary probe.
-                        # Record which company so on_adaptive_complete can detect recovery.
                         r.set(canary_sent_key,    "1",     ex=WORKER_OUTAGE_TTL_S)
                         r.set(canary_company_key, company, ex=WORKER_OUTAGE_TTL_S)
                         logger.info(
@@ -753,56 +1118,60 @@ def adaptive_loop() -> None:
                         )
                         # Fall through to dispatch (canary)
                     else:
-                        # Normal outage suppression — push company forward
                         delay = max(outage_ttl, 60) if outage_ttl > 0 else 60
                         r.zadd(REDIS_POLL_ADAPTIVE, {company: now + delay})
                         continue
 
                 # ── Phase 10: per-DC learned ceiling throttle ─────────────────
+                # Use the per-DC inflight ZSET (not the global PEL count) so
+                # each DC key is throttled independently.
                 ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
                 if ceiling_raw:
-                    # Stale cleanup before counting (removes crashed-worker entries)
+                    inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
+                    # Remove stale entries before counting
                     stale_cutoff = now - INFLIGHT_STALE_WINDOW_S
-                    r.zremrangebyscore(
-                        f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", 0, stale_cutoff
-                    )
-                    inflight = r.zcard(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}")
-                    if inflight >= int(ceiling_raw):
-                        # At ceiling — hold briefly, retry next tick
+                    r.zremrangebyscore(inflight_key, 0, stale_cutoff)
+                    # Per-DC in-flight count (populated by the XADD dispatch below)
+                    pending_count = r.zcard(inflight_key)
+                    if pending_count >= int(ceiling_raw):
                         r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})
                         logger.debug(
                             "adaptive_loop: ceiling throttle company=%r dc=%r "
-                            "inflight=%d ceil=%s",
-                            company, dc_key, inflight, ceiling_raw,
+                            "pending=%d ceil=%s",
+                            company, dc_key, pending_count, ceiling_raw,
                         )
                         continue
 
-                set_heartbeat(company)
-
-                # Track in-flight for learned-ceiling enforcement
-                r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
-
-                # context: 'canary' when dispatched as an outage probe so
-                # api_health rows from this scan are tagged separately and
-                # excluded from baseline queries (WHERE context = 'normal').
-                canary_sent_key = f"worker:outage:canary_company:{platform}"
+                # ── Dispatch: XADD → ZREM (two-layer pattern) ────────────────
+                canary_company_key = f"worker:outage:canary_company:{platform}"
                 dispatch_context = (
                     "canary"
-                    if r.get(canary_sent_key) == company
+                    if r.get(canary_company_key) == company
                     else "normal"
                 )
 
-                payload = json.dumps({
-                    "company":     company,
-                    "scan_type":   "adaptive",
-                    "enqueued_at": datetime.utcnow().isoformat(),
-                    "request_id":  f"adp-{int(now)}",
-                    "dc_key":      dc_key,
-                    "context":     dispatch_context,
-                })
-                r.lpush(SCAN_QUEUE, payload)
+                r.xadd(
+                    REDIS_STREAM_ADAPTIVE,
+                    {
+                        "company":     company,
+                        "scan_type":   "adaptive",
+                        "dc_key":      dc_key,
+                        "context":     dispatch_context,
+                        "enqueued_at": datetime.utcnow().isoformat(),
+                        "request_id":  f"adp-{int(now)}",
+                    },
+                    maxlen=STREAM_MAXLEN_ADAPTIVE,
+                    approximate=True,
+                )
+                r.zrem(REDIS_POLL_ADAPTIVE, company)
 
-                logger.debug("adaptive_loop: dispatched %r (dc=%s)", company, dc_key)
+                # Keep inflight ZSET for Phase 10 fast_error_check compatibility
+                r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
+
+                logger.debug(
+                    "adaptive_loop: dispatched %r to %s (dc=%s context=%s)",
+                    company, REDIS_STREAM_ADAPTIVE, dc_key, dispatch_context,
+                )
 
             time.sleep(SCHEDULER_TICK_SECS)
 
@@ -815,12 +1184,115 @@ def adaptive_loop() -> None:
 
 
 # ─────────────────────────────────────────
+# FULL SCAN DISPATCH LOOP
+# ─────────────────────────────────────────
+
+def fullscan_loop() -> None:
+    """
+    Continuous full scan scheduler loop — two-layer dispatch (Section 9).
+
+    Every SCHEDULER_TICK_SECS:
+        1. Check if paused
+        2. ZRANGEBYSCORE poll:fullscan — non-destructive read of due companies
+        3. For each due company:
+               a. Backpressure check (fullscan detail queue depth)
+               b. XADD stream:fullscan   ← crash-safe delivery
+               c. ZREM poll:fullscan     ← remove from scheduling ledger
+        4. XAUTOCLAIM to reclaim stale messages (fullscan worker died mid-scan)
+
+    Fullscan workers read from REDIS_STREAM_FULLSCAN via XREADGROUP, run the
+    complete Bloom-filter-based scan, call on_fullscan_complete() (or handle
+    scheduling directly in fullscan.py), then XACK.
+
+    The old SCAN_QUEUE → scan_worker → result_consumer_loop path for fullscans
+    is retired.  Full scans now go through dedicated fullscan worker processes
+    running workers/fullscan.py.
+
+    Runs until KeyboardInterrupt or thread stop.
+    """
+    r = get_redis()
+    _init_consumer_group(r, REDIS_STREAM_FULLSCAN)
+    logger.info("fullscan_loop: started (stream=%s)", REDIS_STREAM_FULLSCAN)
+
+    import socket as _socket
+    scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
+
+    while True:
+        try:
+            if _pause_event.is_set():
+                time.sleep(SCHEDULER_TICK_SECS)
+                _check_auto_resume()
+                continue
+
+            now = time.time()
+
+            # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
+            try:
+                from db.api_health import query_p95_response_ms
+                p95_ms = query_p95_response_ms("full_scan") or 120_000
+            except Exception:
+                p95_ms = 120_000
+            claim_stale_work(
+                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
+                scheduler_consumer, p95_ms, op_type="fullscan",
+            )
+
+            # ── Two-layer dispatch ────────────────────────────────────────────
+            due = r.zrangebyscore(REDIS_POLL_FULLSCAN, "-inf", now,
+                                  withscores=False)
+
+            for company in due:
+                # Backpressure: fullscan detail queue overloaded
+                depth = r.llen(REDIS_DETAIL_FULLSCAN)
+                if depth > DETAIL_QUEUE_MAX_FULLSCAN:
+                    r.zadd(REDIS_POLL_FULLSCAN, {company: now + 60})
+                    logger.debug(
+                        "fullscan_loop: backpressure company=%r "
+                        "fullscan_queue_depth=%d",
+                        company, depth,
+                    )
+                    continue
+
+                dc_key = _get_dc_key_for_company(company)
+
+                r.xadd(
+                    REDIS_STREAM_FULLSCAN,
+                    {
+                        "company":     company,
+                        "scan_type":   "fullscan",
+                        "dc_key":      dc_key,
+                        "context":     "normal",
+                        "enqueued_at": datetime.utcnow().isoformat(),
+                        "request_id":  f"full-{int(now)}",
+                    },
+                    maxlen=STREAM_MAXLEN_FULLSCAN,
+                    approximate=True,
+                )
+                r.zrem(REDIS_POLL_FULLSCAN, company)
+
+                logger.info(
+                    "fullscan_loop: dispatched %r to %s (dc=%s)",
+                    company, REDIS_STREAM_FULLSCAN, dc_key,
+                )
+
+            time.sleep(SCHEDULER_TICK_SECS)
+
+        except KeyboardInterrupt:
+            logger.info("fullscan_loop: stopping")
+            break
+        except Exception as exc:
+            logger.error("fullscan_loop: error: %s", exc, exc_info=True)
+            time.sleep(5)
+
+
+# ─────────────────────────────────────────
 # RESULT CONSUMER (reads scan:results)
 # ─────────────────────────────────────────
 
 def result_consumer_loop() -> None:
     """
-    Reads completion events from scan:results and calls on_adaptive_complete.
+    Reads completion events from scan:results and routes to the correct
+    completion handler based on scan_type.
 
     Runs continuously alongside the adaptive dispatch loop.
     """
@@ -843,6 +1315,14 @@ def result_consumer_loop() -> None:
 
             if scan_type == "adaptive" and company:
                 on_adaptive_complete(company, new_jobs, success)
+            elif scan_type == "fullscan" and company:
+                on_fullscan_complete(company, new_jobs, success)
+            elif company:
+                logger.warning(
+                    "result_consumer_loop: unknown scan_type=%r company=%r — "
+                    "dropping result",
+                    scan_type, company,
+                )
 
         except KeyboardInterrupt:
             logger.info("result_consumer_loop: stopping")
@@ -859,7 +1339,15 @@ def result_consumer_loop() -> None:
 def pubsub_listener_loop() -> None:
     """
     Listens on pipeline:pause and pipeline:resume channels.
-    Sets/clears the shared _paused Event used by dispatch loops.
+
+    Sets/clears the two shared Events used by dispatch loops and workers:
+        _pause_event  — set on pause; cleared on resume
+        _resume_event — cleared on pause; set on resume
+
+    Workers call _resume_event.wait(timeout=N) when paused so they unblock
+    within ~1s of a resume signal rather than spinning on a fixed sleep.
+    _check_auto_resume() can also clear _pause_event / set _resume_event if
+    the cronchain heartbeat expires (safety net against permanent pause).
     """
     r      = get_redis()
     pubsub = r.pubsub()
@@ -872,10 +1360,12 @@ def pubsub_listener_loop() -> None:
         channel = message["channel"]
         if channel == REDIS_PAUSE_CHANNEL:
             logger.info("pubsub_listener: PAUSE received — halting dispatchers")
-            _paused.set()
+            _pause_event.set()
+            _resume_event.clear()
         elif channel == REDIS_RESUME_CHANNEL:
             logger.info("pubsub_listener: RESUME received — resuming dispatchers")
-            _paused.clear()
+            _resume_event.set()
+            _pause_event.clear()
 
 
 def _check_auto_resume() -> None:
@@ -893,7 +1383,8 @@ def _check_auto_resume() -> None:
             "scheduler: cron chain heartbeat expired and no db:maintenance flag — "
             "auto-resuming workers (cron chain may have crashed)"
         )
-        _paused.clear()
+        _resume_event.set()
+        _pause_event.clear()
 
 
 # ─────────────────────────────────────────
@@ -1160,6 +1651,35 @@ def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
     run_worker(shutdown_event=shutdown_event, skip_init_db=True)
 
 
+def _fullscan_worker_process(shutdown_event: multiprocessing.Event) -> None:
+    """
+    Target function for fullscan worker processes (multiprocessing.Process).
+
+    Runs workers/fullscan.py:run_worker() which reads from stream:fullscan
+    via XREADGROUP, executes the complete Bloom-filter full scan, handles
+    checkpoint/resume on pause, and XACKs on completion.
+
+    Shutdown: watcher injects KeyboardInterrupt into the main thread when
+    shutdown_event fires — fullscan.run_worker()'s KeyboardInterrupt handler
+    exits the XREADGROUP loop cleanly.
+    """
+    _reset_inherited_db_pool()
+
+    def _watcher() -> None:
+        shutdown_event.wait()
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(threading.main_thread().ident),
+            ctypes.py_object(KeyboardInterrupt),
+        )
+
+    threading.Thread(
+        target=_watcher, daemon=True, name="fullscan_shutdown_watcher",
+    ).start()
+
+    from workers.fullscan import run_worker
+    run_worker(skip_init_db=True)
+
+
 # ── Pool management helpers ───────────────────────────────────────────────────
 
 def _spawn_worker(worker_type: str) -> tuple:
@@ -1167,15 +1687,19 @@ def _spawn_worker(worker_type: str) -> tuple:
     Spawn one worker process of the given type.
 
     Args:
-        worker_type: "scan" or "detail"
+        worker_type: "scan", "detail", or "fullscan"
 
     Returns:
         (multiprocessing.Process, multiprocessing.Event) — process handle and
         its shutdown event.  Store this tuple in the pool list.
     """
     shutdown_event = multiprocessing.Event()
-    target         = _scan_worker_process if worker_type == "scan" \
-                     else _detail_worker_process
+    target_map = {
+        "scan":     _scan_worker_process,
+        "detail":   _detail_worker_process,
+        "fullscan": _fullscan_worker_process,
+    }
+    target = target_map.get(worker_type, _scan_worker_process)
     proc = multiprocessing.Process(
         target = target,
         args   = (shutdown_event,),
@@ -1200,10 +1724,15 @@ def _replace_dead_workers() -> None:
     so the DB write never blocks the pool management lock.
     """
     global _scan_pool, _detail_pool
+    _fullscan_pool = globals().get("_fullscan_pool_ref", [])
     replacements: list = []   # (ptype, old_pid, exitcode) — collected under lock
 
     with _pool_lock:
-        for pool, ptype in ((_scan_pool, "scan"), (_detail_pool, "detail")):
+        for pool, ptype in (
+            (_scan_pool,     "scan"),
+            (_detail_pool,   "detail"),
+            (_fullscan_pool, "fullscan"),
+        ):
             for i, (proc, event) in enumerate(pool):
                 if not proc.is_alive():
                     logger.warning(
@@ -1842,14 +2371,20 @@ def _shutdown_worker_pools() -> None:
         2. Join each process with WORKER_SHUTDOWN_TIMEOUT_S deadline.
         3. Force-kill any process that hasn't exited by the deadline.
     """
+    # _fullscan_pool is local to run_scheduler() — access via module-level flag
+    # if available; otherwise handle scan + detail only (safe on partial start).
+    _fp = globals().get("_fullscan_pool_ref", [])
+
     logger.info(
-        "scheduler: initiating graceful shutdown of %d scan + %d detail workers",
-        len(_scan_pool), len(_detail_pool),
+        "scheduler: initiating graceful shutdown of "
+        "%d scan + %d detail + %d fullscan workers",
+        len(_scan_pool), len(_detail_pool), len(_fp),
     )
 
     with _pool_lock:
-        all_entries = [("scan",   _scan_pool),
-                       ("detail", _detail_pool)]
+        all_entries = [("scan",     _scan_pool),
+                       ("detail",   _detail_pool),
+                       ("fullscan", _fp)]
 
         # Pass 1 — signal all workers to stop
         for ptype, pool in all_entries:
@@ -1897,13 +2432,15 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         5. Spawns two co-scheduled multiprocessing.Process pools:
                scan_pool   — listing scan workers
                detail_pool — detail fetch workers
-        6. Starts five daemon threads:
-               adaptive_loop          — dispatches companies from poll:adaptive
-               result_consumer_loop   — calls on_adaptive_complete on results
-               pubsub_listener_loop   — handles pause/resume pub/sub
-               _liveness_check_loop   — Layer 1: replace dead workers every 5s
-               _fast_error_check_loop — Layer 2: error-triggered scaling every 5m
+        6. Starts six daemon threads:
+               adaptive_loop               — dispatches to stream:adaptive (two-layer)
+               fullscan_loop               — dispatches to stream:fullscan (two-layer)
+               pubsub_listener_loop        — handles pause/resume pub/sub
+               _liveness_check_loop        — Layer 1: replace dead workers every 5s
+               _fast_error_check_loop      — Layer 2: error-triggered scaling every 5m
                _slow_throughput_check_loop — Layer 3: throughput scaling every 30m
+           NOTE: result_consumer_loop is retired — on_adaptive_complete() is called
+           inline by scan_worker, and on_fullscan_complete() is handled in fullscan.py.
         7. On Ctrl+C: graceful shutdown → SIGKILL stragglers after 30s
 
     Args:
@@ -1950,24 +2487,46 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         scan_count = detail_count = half
 
     # ── Spawn worker pools ────────────────────────────────────────────────────
+    # Fullscan workers: floor at WORKER_FLOOR, cap at same ceiling as scan pool.
+    # Full scans are expensive (Bloom filters, all pages) — 2 workers is plenty
+    # for most portfolios. Scaling is done by the slow-throughput monitor.
+    fullscan_count = WORKER_FLOOR
+
     global _scan_pool, _detail_pool
+    _fullscan_pool: list = []
+
     with _pool_lock:
         for _ in range(scan_count):
             _scan_pool.append(_spawn_worker("scan"))
         for _ in range(detail_count):
             _detail_pool.append(_spawn_worker("detail"))
+        for _ in range(fullscan_count):
+            _fullscan_pool.append(_spawn_worker("fullscan"))
+
+    # Expose fullscan pool globally so _shutdown_worker_pools can drain it
+    globals()["_fullscan_pool_ref"] = _fullscan_pool
 
     logger.info(
-        "scheduler: spawned %d scan_workers + %d detail_workers",
-        scan_count, detail_count,
+        "scheduler: spawned %d scan_workers + %d detail_workers + %d fullscan_workers",
+        scan_count, detail_count, fullscan_count,
     )
 
+    # ── Initialise stream consumer groups ────────────────────────────────────
+    # Done here (after workers spawn) so the groups exist before any XADD.
+    r_init = get_redis()
+    _init_consumer_group(r_init, REDIS_STREAM_ADAPTIVE)
+    _init_consumer_group(r_init, REDIS_STREAM_FULLSCAN)
+
     # ── Start daemon threads ──────────────────────────────────────────────────
+    # NOTE: result_consumer_loop is retired — on_adaptive_complete() is now
+    # called inline by scan_worker after XREADGROUP, and on_fullscan_complete()
+    # is handled inside fullscan.py.  The XACK replaces the result push/consume
+    # pattern, eliminating a potential message-loss window.
     threads = [
         threading.Thread(target=adaptive_loop,
                          name="adaptive_loop",           daemon=True),
-        threading.Thread(target=result_consumer_loop,
-                         name="result_consumer",         daemon=True),
+        threading.Thread(target=fullscan_loop,
+                         name="fullscan_loop",           daemon=True),
         threading.Thread(target=pubsub_listener_loop,
                          name="pubsub_listener",         daemon=True),
         threading.Thread(target=_liveness_check_loop,
@@ -1982,9 +2541,10 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         t.start()
 
     logger.info("scheduler: all loops started — %d threads + %d processes",
-                len(threads), scan_count + detail_count)
+                len(threads), scan_count + detail_count + fullscan_count)
     print(f"[scheduler] Running — "
-          f"{scan_count} scan + {detail_count} detail workers — Ctrl+C to stop")
+          f"{scan_count} scan + {detail_count} detail + {fullscan_count} fullscan workers "
+          f"— Ctrl+C to stop")
 
     try:
         while True:

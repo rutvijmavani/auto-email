@@ -2,33 +2,39 @@
 workers/scan_worker.py — Adaptive Tier 1 listing scan worker (Phase 3).
 
 Picks up scan payloads from SCAN_QUEUE via BLPOP (dispatched by
-workers/scheduler.py), runs a listing-only fetch for the company,
-diffs the returned job IDs against the Redis seen:{company} SET to find
-only genuinely new IDs, then pushes them to queue:detail:adaptive for the
-detail_worker to hydrate and filter.
+workers/scheduler.py), runs a listing-only fetch for the company, and
+pushes genuinely new job IDs to queue:detail:adaptive for the detail_worker
+to hydrate and filter.
 
 ─── Data flow ───────────────────────────────────────────────────────────────
 
-    Scheduler → LPUSH scan:queue → [this worker] → LPUSH queue:detail:adaptive
-                                                  → LPUSH scan:results
+    Scheduler: ZRANGEBYSCORE poll:adaptive → XADD stream:adaptive → ZREM
+    [this worker]: XREADGROUP stream:adaptive → on_adaptive_complete() → XACK
+                                              → LPUSH queue:detail:adaptive
 
-1. Scheduler: ZPOPMIN poll:adaptive → enqueue to scan:queue
-2. scan_worker: BLPOP scan:queue
+1. Scheduler adaptive_loop():
+       ZRANGEBYSCORE poll:adaptive → XADD stream:adaptive → ZREM
+       (non-destructive: crash between XADD and ZREM = harmless duplicate)
+2. scan_worker: XREADGROUP stream:adaptive BLOCK 500ms
    a. Fetch listing via ats_module.fetch_jobs() (IDs + titles + metadata)
-   b. Diff against seen:{company} Redis SET
-   c. First scan: SADD all, save pre_existing rows, mark first_scanned_at
-   d. Otherwise: for each new ID → INSERT pending_detail + LPUSH to detail queue
+   b. Bloom filter early exit check (sorted platforms, Phase 7+)
+   c. For each job ID: check adaptive_seen:{company} SET → skip if seen today
+   d. DB lookup for unseen IDs → queue new ones for detail fetch
+   e. Add all processed IDs to adaptive_seen:{company} SET
+   f. First scan: save pre_existing rows, mark first_scanned_at
+   g. Call on_adaptive_complete() inline (reschedule + WARMING check)
+   h. XACK stream message (remove from PEL)
 3. detail_worker: BRPOP queue:detail:adaptive → fetch detail → filter → save 'new'
-4. scheduler.result_consumer_loop: BRPOP scan:results → on_adaptive_complete()
+4. Crash recovery: XAUTOCLAIM (scheduler) reclaims PEL messages after p95×3ms
 
-─── Scan payload ────────────────────────────────────────────────────────────
+─── Stream message fields ───────────────────────────────────────────────────
 
-    {
-        "company":     "Stripe",
-        "scan_type":   "adaptive",
-        "enqueued_at": "2026-04-27T07:00:00+00:00",
-        "request_id":  "adp-1745728800"
-    }
+    company      = "Stripe"
+    scan_type    = "adaptive"
+    dc_key       = "greenhouse"
+    context      = "normal" | "canary" | "backoff"
+    enqueued_at  = "2026-04-27T07:00:00+00:00"
+    request_id   = "adp-1745728800"
 
 ─── Result payload ──────────────────────────────────────────────────────────
 
@@ -50,8 +56,8 @@ detail_worker to hydrate and filter.
     listing are "new" from the API's perspective but should be treated as
     pre_existing (they existed before we started monitoring). The worker:
 
-      1. SADDs every returned job_id to seen:{company}
-      2. Saves a minimal pre_existing row to DB (for Redis rebuild on restart)
+      1. SADDs every returned job_id to adaptive_seen:{company} SET
+      2. Saves a minimal pre_existing row to DB (source of truth)
       3. Marks first_scanned_at so subsequent scans do the incremental diff
       4. Returns new_jobs=0 (correct — no new jobs on first scan)
 
@@ -95,6 +101,12 @@ from config import (
     WORKER_BACKOFF_BASE_S,
     WORKER_BACKOFF_CAP_S,
     WORKER_BACKOFF_GIVEUP_S,
+    REDIS_ADAPTIVE_SEEN_PREFIX,
+    ADAPTIVE_SEEN_TTL,
+    # Stream-based delivery (two-layer scheduler redesign)
+    REDIS_STREAM_ADAPTIVE,
+    STREAM_CONSUMER_GROUP,
+    STREAM_BLOCK_MS,
 )
 from workers.redis_client import get_redis, ping
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
@@ -114,12 +126,36 @@ from db.job_monitor import (
 
 logger = get_logger(__name__)
 
-WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
+_CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
 
 # Platform-specific semaphores from job_monitor are not used here — each
 # adaptive scan_worker processes one company sequentially, so there is no
 # within-worker concurrency pressure on the same ATS domain. Cross-worker
 # concurrency is governed by scheduler dispatch rate (1 company per tick).
+
+
+# ─────────────────────────────────────────
+# STREAM CONSUMER GROUP INIT
+# ─────────────────────────────────────────
+
+def _ensure_consumer_group(r) -> None:
+    """
+    Ensure the consumer group exists for stream:adaptive (idempotent).
+
+    Uses id='$' so only NEW messages are delivered — never replays history.
+    BUSYGROUP means the group already exists; MKSTREAM creates the stream if
+    it doesn't exist yet (safe to call repeatedly at worker startup).
+    """
+    try:
+        r.xgroup_create(
+            REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP,
+            id="$", mkstream=True,
+        )
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            logger.warning("scan_worker: xgroup_create error: %s", exc)
+            raise
 
 
 # ─────────────────────────────────────────
@@ -170,8 +206,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
     """
     Perform one adaptive listing scan for a company.
 
-    Fetches the job listing (IDs + metadata), diffs against the Redis
-    seen:{company} SET, and pushes truly new jobs to queue:detail:adaptive.
+    Fetches the job listing (IDs + metadata), checks adaptive_seen:{company}
+    and DB for new jobs, and pushes them to queue:detail:adaptive.
 
     Returns a result dict (same schema as the old _run_one) — always
     well-formed. Never raises; exceptions become success=False.
@@ -350,10 +386,9 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             return result
 
         # ── 6. Incremental diff ───────────────────────────────────────────────
-        seen_key = f"seen:{company}"
-        seen_ids = r.smembers(seen_key)   # returns set of strings
+        adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
 
-        # In-cycle dedup set — catches identical job_ids on multiple pages
+        # In-cycle dedup — catches identical job_ids on multiple pages
         # when fetch_jobs() returns paginated data that has some overlap.
         cycle_seen: set = set()
 
@@ -365,8 +400,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         else:
             title_matched = filter_jobs(valid_jobs)
 
-        new_count  = 0
-        seen_count = 0
+        new_count        = 0
+        adaptive_skipped = 0
 
         # Backpressure: check detail queue depth before pushing
         queue_depth = r.llen(REDIS_DETAIL_ADAPTIVE)
@@ -383,22 +418,24 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             if not job_id:
                 continue
 
-            # In-cycle dedup
+            # Layer 1: in-cycle dedup (pagination overlap within this fetch)
             if job_id in cycle_seen:
                 continue
             cycle_seen.add(job_id)
 
-            # Already known in Redis
-            if job_id in seen_ids:
-                seen_count += 1
+            # Layer 2: adaptive_seen cache — already processed in an earlier
+            # adaptive scan today (DB lookup already done, outcome recorded).
+            # Skip entirely — no DB round-trip needed.
+            if r.sismember(adaptive_seen_key, job_id):
+                adaptive_skipped += 1
                 continue
 
-            # ── Genuinely new job ─────────────────────────────────────────────
-            # Insert pending_detail row so it survives Redis restart
+            # Layer 3: DB check — source of truth.
+            # save_pending_detail returns True only if the row did not exist.
             inserted = save_pending_detail(company, platform, job)
 
             if inserted:
-                # Push to detail queue for full hydration + filtering
+                # Genuinely new job — push to detail queue for full hydration
                 detail_payload = _build_detail_payload(
                     company, platform, job, slug_info,
                     request_id=request_id,
@@ -407,12 +444,13 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
                 new_count += 1
 
-            # Note: SADD to seen:{company} is done by detail_worker after
-            # full detail is fetched and filters applied (per architecture
-            # doc Section 17). This means a second adaptive poll before
-            # detail completes could re-detect the same IDs — safe because
-            # save_pending_detail uses ON CONFLICT DO NOTHING and the DB
-            # remains consistent.
+            # Mark as processed in adaptive_seen regardless of outcome so
+            # subsequent adaptive scans today skip the DB lookup entirely.
+            r.sadd(adaptive_seen_key, job_id)
+
+        # Refresh adaptive_seen TTL after each adaptive scan so it stays alive
+        # until the next full scan (which will DEL it explicitly).
+        r.expire(adaptive_seen_key, ADAPTIVE_SEEN_TTL)
 
         # Log paginator efficiency (Phase 7 prep — full-page analysis)
         depth_stats = estimate_scan_depth(
@@ -422,11 +460,11 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         )
         logger.info(
             "scan_worker [%s] done | company=%r platform=%s "
-            "fetched=%d new=%d seen=%d waste=%.0f%%",
+            "fetched=%d new=%d adaptive_skipped=%d waste=%.0f%%",
             request_id, company, platform,
             depth_stats["total_fetched"],
             depth_stats["new_found"],
-            seen_count,
+            adaptive_skipped,
             depth_stats["waste_ratio"] * 100,
         )
 
@@ -507,19 +545,19 @@ def _handle_first_scan(
     Fresh jobs (posted_at within JOB_MONITOR_DAYS_FRESH days):
         - Apply listing-level title filter
         - Pass  → INSERT pending_detail + LPUSH queue:detail:adaptive
-        - Fail filter → treat as pre-existing (SADD + save_pre_existing)
-        - detail_worker will SADD fresh jobs to seen:{company} on completion.
+        - Fail filter → treat as pre-existing (save_pre_existing + adaptive_seen)
 
     Stale jobs (posted_at older than freshness window, or date missing):
-        - SADD to seen:{company} immediately (bulk pipeline)
-        - INSERT as pre_existing to DB (for rebuild_seen_ids on restart)
+        - INSERT as pre_existing to DB (source of truth)
+        - SADD to adaptive_seen:{company} so subsequent adaptive scans today
+          skip the DB lookup for these already-processed IDs
 
     Returns:
         Count of fresh jobs pushed to the detail queue.
     """
-    seen_key       = f"seen:{company}"
-    config         = config or {}
-    listing_filter = config.get("listing_filter", "full")
+    adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
+    config            = config or {}
+    listing_filter    = config.get("listing_filter", "full")
 
     fresh_queued    = 0
     preexisting_ids: list = []
@@ -549,8 +587,10 @@ def _handle_first_scan(
                     )
                     r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
                     fresh_queued += 1
-                    # NOTE: SADD to seen:{company} is done by detail_worker
-                    # after full detail + filters pass (Section 17).
+                # Always mark in adaptive_seen — repeat adaptive scans today
+                # must not re-check this job regardless of whether it was a
+                # new DB insert (inserted=True) or a duplicate (inserted=False).
+                preexisting_ids.append(job_id)
             else:
                 # Filtered by title → treat as pre-existing
                 preexisting_ids.append(job_id)
@@ -560,12 +600,13 @@ def _handle_first_scan(
             preexisting_ids.append(job_id)
             save_pre_existing_listing(company, platform, job)
 
-    # Bulk SADD all pre-existing IDs in one pipeline
+    # Bulk SADD all processed IDs to adaptive_seen (saves DB lookups today)
     if preexisting_ids:
         pipe = r.pipeline()
         for i in range(0, len(preexisting_ids), 500):
-            pipe.sadd(seen_key, *preexisting_ids[i:i + 500])
+            pipe.sadd(adaptive_seen_key, *preexisting_ids[i:i + 500])
         pipe.execute()
+        r.expire(adaptive_seen_key, ADAPTIVE_SEEN_TTL)
 
     logger.debug(
         "_handle_first_scan [%s]: company=%r fresh_queued=%d pre_existing=%d",
@@ -650,23 +691,32 @@ def _build_detail_payload(
 def run_worker(once: bool = False, shutdown_event=None,
                skip_init_db: bool = False) -> None:
     """
-    Main adaptive scan worker loop.
+    Main adaptive scan worker loop — stream-based delivery (Section 5 redesign).
 
-    BLPOPs payloads from SCAN_QUEUE (dispatched by scheduler.adaptive_loop),
-    runs _run_listing_scan(), and LPUSHes the result onto RESULT_CHANNEL for
-    the scheduler's result_consumer_loop → on_adaptive_complete().
+    Reads scan payloads from stream:adaptive via XREADGROUP (crash-safe):
+        1. XREADGROUP COUNT 1 BLOCK 500ms — get next undelivered message
+        2. Check shutdown / pause before starting scan
+        3. Run _run_listing_scan() → result dict
+        4. Call on_adaptive_complete() inline (replaces result_consumer_loop)
+        5. XACK — remove from PEL, mark work complete
+
+    If the worker dies between step 3 and step 5, the message stays in the PEL.
+    The scheduler's claim_stale_work() (XAUTOCLAIM with p95×3 idle timeout)
+    reclaims it and retries, up to MAX_STREAM_REDELIVERIES times before
+    dead-lettering to poll:adaptive with exponential backoff.
+
+    Shutdown:
+        shutdown_event fired between steps: stop after current job without XACK
+        (message stays in PEL for XAUTOCLAIM reclaim — no data loss).
+        shutdown_event fired during _run_listing_scan: post-fetch checkpoint
+        in _run_listing_scan re-queues with backoff then returns success=False.
+        We still XACK in this case because re-queuing to poll:adaptive means
+        the scheduler will re-dispatch without relying on PEL reclaim.
 
     Args:
         once:           if True, process at most one job then exit.
-        shutdown_event: multiprocessing.Event set by the scheduler when this
-                        worker should stop after finishing its current job.
-                        Checked at two points:
-                          1. After BLPOP returns — before scan starts.
-                             Company is re-queued with exponential backoff.
-                          2. Inside _run_listing_scan() after fetch_jobs()
-                             returns — before any DB writes are committed.
-        skip_init_db:   if True, skip the init_db() call (used when the
-                        scheduler parent process already ran it before fork).
+        shutdown_event: multiprocessing.Event — set by scheduler to request stop.
+        skip_init_db:   if True, skip init_db() (parent process already did it).
     """
     if not skip_init_db:
         init_db()
@@ -679,12 +729,15 @@ def run_worker(once: bool = False, shutdown_event=None,
         sys.exit(1)
 
     r = get_redis()
+    _ensure_consumer_group(r)
 
-    logger.info("scan_worker started | worker_id=%s queue=%s once=%s",
-                WORKER_ID, SCAN_QUEUE, once)
+    logger.info(
+        "scan_worker started | worker_id=%s consumer=%s stream=%s once=%s",
+        WORKER_ID, _CONSUMER_NAME, REDIS_STREAM_ADAPTIVE, once,
+    )
     print(f"[scan_worker] Ready — worker={WORKER_ID}")
-    print(f"[scan_worker] Listening on {SCAN_QUEUE!r}  "
-          f"(results → {RESULT_CHANNEL!r})")
+    print(f"[scan_worker] Consuming from {REDIS_STREAM_ADAPTIVE!r} "
+          f"group={STREAM_CONSUMER_GROUP!r}")
     if once:
         print("[scan_worker] --once mode: processing one job then exiting")
     else:
@@ -692,56 +745,100 @@ def run_worker(once: bool = False, shutdown_event=None,
 
     while True:
         try:
-            item = r.blpop(SCAN_QUEUE, timeout=WORKER_BLOCK_SECS)
-
-            if item is None:
-                # BLPOP timed out — check shutdown before looping
-                if shutdown_event is not None and shutdown_event.is_set():
-                    logger.info("scan_worker: shutdown event set (idle) — exiting")
-                    break
-                if once:
-                    logger.info("scan_worker: --once, queue empty — exiting")
-                    print("[scan_worker] Queue empty — exiting (--once)")
-                    break
-                continue
-
-            _, raw = item
-
-            # ── Shutdown checkpoint 1: after BLPOP, before scan starts ────────
-            # Earliest safe point — company was just popped from SCAN_QUEUE.
-            # Re-queue with exponential backoff so the platform gets breathing
-            # room before the next attempt.
+            # ── Shutdown check (idle) ─────────────────────────────────────────
             if shutdown_event is not None and shutdown_event.is_set():
-                try:
-                    company = json.loads(raw).get("company", "")
-                except Exception:
-                    company = ""
-                if company:
-                    delay = _get_backoff_delay(r, company, "scan")
-                    r.zadd(REDIS_POLL_ADAPTIVE, {company: time.time() + delay})
-                    logger.info(
-                        "scan_worker: shutdown (pre-scan), re-queuing %r "
-                        "with +%ds backoff",
-                        company, delay,
-                    )
+                logger.info("scan_worker: shutdown event set (idle) — exiting")
                 break
 
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                logger.error(
-                    "scan_worker: bad JSON payload: %s | raw=%r",
-                    exc, raw[:200],
-                )
+            # ── XREADGROUP: block up to STREAM_BLOCK_MS for next message ──────
+            # Short block (500ms) so we check shutdown_event ~2× per second.
+            # id=">" = only new undelivered messages (not PEL retries).
+            stream_result = r.xreadgroup(
+                STREAM_CONSUMER_GROUP,
+                _CONSUMER_NAME,
+                {REDIS_STREAM_ADAPTIVE: ">"},
+                count=1,
+                block=STREAM_BLOCK_MS,
+            )
+
+            if not stream_result:
+                # Timeout — no messages available
                 if once:
+                    logger.info("scan_worker: --once, stream empty — exiting")
+                    print("[scan_worker] Stream empty — exiting (--once)")
                     break
                 continue
 
-            # Pass shutdown_event so the scan can self-abort mid-fetch
+            # Unpack: [(stream_name, [(msg_id, fields_dict), ...])]
+            _stream_name, messages = stream_result[0]
+            msg_id, fields = messages[0]
+
+            company      = fields.get("company", "")
+            dc_key       = fields.get("dc_key", "unknown")
+            scan_context = fields.get("context", "normal")
+            enqueued_at  = fields.get("enqueued_at", "")
+            request_id   = fields.get("request_id", f"adp-{int(time.time())}")
+
+            # ── Shutdown checkpoint (after XREADGROUP, before scan) ───────────
+            # Message is in PEL — don't XACK. scheduler's XAUTOCLAIM will
+            # reclaim it after idle_ms and retry. No data loss.
+            if shutdown_event is not None and shutdown_event.is_set():
+                logger.info(
+                    "scan_worker: shutdown (pre-scan) for company=%r — "
+                    "leaving in PEL for XAUTOCLAIM reclaim",
+                    company,
+                )
+                break
+
+            payload = {
+                "company":     company,
+                "scan_type":   "adaptive",
+                "request_id":  request_id,
+                "dc_key":      dc_key,
+                "context":     scan_context,
+                "enqueued_at": enqueued_at,
+            }
+
+            # ── Run listing scan ──────────────────────────────────────────────
             result = _run_listing_scan(payload, shutdown_event=shutdown_event)
 
-            # Publish completion event → scheduler.result_consumer_loop
-            r.lpush(RESULT_CHANNEL, json.dumps(result))
+            # ── Inline completion handler (replaces result_consumer_loop) ─────
+            # Guards:
+            #   • Empty/missing company → malformed message; skip OAC + XACK
+            #     so it stays in PEL for XAUTOCLAIM (prevents DB corruption).
+            #   • shutdown_mid_scan / requeued → work was re-queued elsewhere;
+            #     leave in PEL so the requeued entry is the canonical one.
+            # Normal path: call OAC then XACK. If OAC raises, leave in PEL
+            # (OAC is idempotent — XAUTOCLAIM retry is safe).
+            if not company:
+                logger.warning(
+                    "scan_worker: stream message %r has empty company field — "
+                    "leaving in PEL for XAUTOCLAIM reclaim",
+                    msg_id,
+                )
+            elif result.get("error") == "shutdown_mid_scan" or result.get("requeued"):
+                logger.info(
+                    "scan_worker: %r result=%s — skipping OAC, leaving in PEL",
+                    company, result.get("error") or "requeued",
+                )
+            else:
+                try:
+                    from workers.scheduler import on_adaptive_complete
+                    on_adaptive_complete(
+                        company,
+                        result.get("new_jobs", 0),
+                        success=result.get("success", False),
+                    )
+                    # ── XACK: remove from PEL (work complete) ────────────────
+                    # Only XACK on success — if on_adaptive_complete raises, the
+                    # message stays in PEL for XAUTOCLAIM to retry (idempotent).
+                    r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
+                except Exception as oac_exc:
+                    logger.error(
+                        "scan_worker: on_adaptive_complete failed for %r: %s — "
+                        "leaving in PEL for XAUTOCLAIM retry",
+                        company, oac_exc, exc_info=True,
+                    )
 
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""

@@ -8,24 +8,21 @@ without a live Redis or ATS module.
 
 Coverage map
 ────────────
-  TestBloomFilterFallbackMode  (RedisBloom unavailable → SET fallback)
+  TestBloomPairFallbackMode  (RedisBloom unavailable → SET fallback)
     · _probe() sets _use_bf=False when BF.EXISTS raises
-    · exists() on fallback → calls sismember on fallback key
-    · add() on fallback → calls sadd on fallback key
-    · add() on fallback → refreshes TTL with expire
-    · delete() deletes both bf_key and fb_key
-    · extend_ttl() refreshes both bf and fallback keys
-    · initialize() on fallback → calls expire on fb_key
-    · Fallback key is bloom:fallback:{company}
-    · BF key is bloom:fullscan:{company}
+    · old_exists() on fallback → calls sismember on old fallback key
+    · new_add() on fallback → calls sadd on new fallback key
+    · old/new key naming follows bloom:fullscan:{co} / bloom:fullscan:new:{co}
+    · prepare_fresh() DELs new keys, BF.RESERVE new bf key
+    · finalize() DELs old keys, RENAMEs new → old
 
-  TestBloomFilterBfMode  (RedisBloom available)
+  TestBloomPairBfMode  (RedisBloom available)
     · _probe() sets _use_bf=True when BF.EXISTS succeeds
-    · exists() with BF → calls BF.EXISTS
-    · add() with BF → calls BF.ADD and expire
-    · initialize() with BF → calls BF.RESERVE and expire
-    · BF exception during add() → falls back to SET
-    · BF exception during exists() → falls back to sismember
+    · old_exists() calls BF.EXISTS on old key
+    · new_add() calls BF.ADD on new key
+    · BF exception during new_add() → falls back to SET sadd
+    · BF exception during old_exists() → falls back to sismember
+    · probe result is cached
 
   TestIsPaused
     · Returns True when db:maintenance key exists
@@ -106,159 +103,155 @@ def _make_redis_bf_unavailable():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestBloomFilterFallbackMode
+# TestBloomPairFallbackMode
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestBloomFilterFallbackMode(unittest.TestCase):
-    """Tests for _BloomFilter when RedisBloom is NOT available."""
+class TestBloomPairFallbackMode(unittest.TestCase):
+    """Tests for _BloomPair when RedisBloom is NOT available (SET fallback)."""
 
     def setUp(self):
-        from workers.fullscan import _BloomFilter
+        from workers.fullscan import _BloomPair
         self.r = _make_redis_bf_unavailable()
-        self.bf = _BloomFilter(self.r, "TestCo")
+        self.r.rename = MagicMock()
+        self.bp = _BloomPair(self.r, "TestCo")
 
     def test_probe_sets_use_bf_false_when_bf_unavailable(self):
         """_probe() returns False when BF.EXISTS raises."""
-        result = self.bf._probe()
+        result = self.bp._probe()
         self.assertFalse(result)
-        self.assertFalse(self.bf._use_bf)
+        self.assertFalse(self.bp._use_bf)
 
-    def test_exists_calls_sismember_on_fallback_key(self):
-        """exists() on fallback → sismember on bloom:fallback:{company}."""
-        self.bf.exists("job_123")
+    def test_old_exists_calls_sismember_on_old_fallback_key(self):
+        """old_exists() on fallback → sismember on bloom:fallback:{company}."""
+        self.bp.old_exists("job_123")
         self.r.sismember.assert_called_once_with("bloom:fallback:TestCo", "job_123")
 
-    def test_exists_returns_false_when_not_in_fallback(self):
-        """exists() returns False when sismember returns 0."""
+    def test_old_exists_returns_false_when_not_in_fallback(self):
+        """old_exists() returns False when sismember returns 0."""
         self.r.sismember.return_value = 0
-        self.assertFalse(self.bf.exists("job_xyz"))
+        self.assertFalse(self.bp.old_exists("job_xyz"))
 
-    def test_exists_returns_true_when_in_fallback(self):
-        """exists() returns True when sismember returns 1."""
+    def test_old_exists_returns_true_when_in_fallback(self):
+        """old_exists() returns True when sismember returns 1."""
         self.r.sismember.return_value = 1
-        self.assertTrue(self.bf.exists("job_xyz"))
+        self.assertTrue(self.bp.old_exists("job_xyz"))
 
-    def test_add_calls_sadd_on_fallback_key(self):
-        """add() on fallback → sadd on bloom:fallback:{company}."""
-        self.bf.add("job_456")
-        self.r.sadd.assert_called_once_with("bloom:fallback:TestCo", "job_456")
+    def test_new_add_calls_sadd_on_new_fallback_key(self):
+        """new_add() on fallback → sadd on bloom:fallback:new:{company}."""
+        self.bp.new_add("job_456")
+        self.r.sadd.assert_called_once_with("bloom:fallback:new:TestCo", "job_456")
 
-    def test_add_refreshes_ttl_on_fallback(self):
-        """add() refreshes TTL via expire on fallback key."""
-        from config import FULLSCAN_BLOOM_TTL
-        self.bf.add("job_789")
-        self.r.expire.assert_called_once_with("bloom:fallback:TestCo", FULLSCAN_BLOOM_TTL)
+    def test_old_key_naming(self):
+        """OLD keys follow bloom:fullscan:{company} / bloom:fallback:{company}."""
+        from workers.fullscan import _BloomPair
+        bp = _BloomPair(self.r, "AcmeCorp")
+        self.assertEqual(bp._old_bf, "bloom:fullscan:AcmeCorp")
+        self.assertEqual(bp._old_fb, "bloom:fallback:AcmeCorp")
 
-    def test_delete_removes_both_keys(self):
-        """delete() removes both bloom:fullscan:{co} and bloom:fallback:{co}."""
-        self.bf.delete()
+    def test_new_key_naming(self):
+        """NEW keys follow bloom:fullscan:new:{company} / bloom:fallback:new:{company}."""
+        from workers.fullscan import _BloomPair
+        bp = _BloomPair(self.r, "AcmeCorp")
+        self.assertEqual(bp._new_bf, "bloom:fullscan:new:AcmeCorp")
+        self.assertEqual(bp._new_fb, "bloom:fallback:new:AcmeCorp")
+
+    def test_prepare_fresh_deletes_new_keys(self):
+        """prepare_fresh() DELs new bf and new fb keys."""
+        self.bp.prepare_fresh()
         delete_calls = [c[0][0] for c in self.r.delete.call_args_list]
-        self.assertIn("bloom:fullscan:TestCo",  delete_calls)
-        self.assertIn("bloom:fallback:TestCo",  delete_calls)
+        self.assertIn("bloom:fullscan:new:TestCo", delete_calls)
+        self.assertIn("bloom:fallback:new:TestCo", delete_calls)
 
-    def test_extend_ttl_refreshes_both_keys(self):
-        """extend_ttl() expires both bf_key and fb_key."""
-        from config import FULLSCAN_BLOOM_TTL
-        self.bf.extend_ttl()
-        expire_calls = [c[0][0] for c in self.r.expire.call_args_list]
-        self.assertIn("bloom:fullscan:TestCo",  expire_calls)
-        self.assertIn("bloom:fallback:TestCo",  expire_calls)
+    def test_finalize_deletes_old_keys(self):
+        """finalize() DELs old bf and old fb keys."""
+        self.bp.finalize()
+        delete_calls = [c[0][0] for c in self.r.delete.call_args_list]
+        self.assertIn("bloom:fullscan:TestCo", delete_calls)
+        self.assertIn("bloom:fallback:TestCo", delete_calls)
 
-    def test_bf_key_is_bloom_fullscan_prefix(self):
-        """BF key follows bloom:fullscan:{company} pattern."""
-        from workers.fullscan import _BloomFilter
-        bf = _BloomFilter(self.r, "AcmeCorp")
-        self.assertEqual(bf._bf_key, "bloom:fullscan:AcmeCorp")
-
-    def test_fallback_key_is_bloom_fallback_prefix(self):
-        """Fallback key follows bloom:fallback:{company} pattern."""
-        from workers.fullscan import _BloomFilter
-        bf = _BloomFilter(self.r, "AcmeCorp")
-        self.assertEqual(bf._fb_key, "bloom:fallback:AcmeCorp")
-
-    def test_initialize_on_fallback_calls_expire(self):
-        """initialize() on fallback sets TTL on fallback key."""
-        from config import FULLSCAN_BLOOM_TTL
-        self.bf.initialize()
-        self.r.expire.assert_called_with("bloom:fallback:TestCo", FULLSCAN_BLOOM_TTL)
+    def test_finalize_renames_new_to_old(self):
+        """finalize() RENAMEs new keys to old keys."""
+        self.bp.finalize()
+        rename_calls = [c[0] for c in self.r.rename.call_args_list]
+        self.assertTrue(
+            any(c[0] == "bloom:fullscan:new:TestCo" and c[1] == "bloom:fullscan:TestCo"
+                for c in rename_calls)
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestBloomFilterBfMode
+# TestBloomPairBfMode
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestBloomFilterBfMode(unittest.TestCase):
-    """Tests for _BloomFilter when RedisBloom IS available."""
+class TestBloomPairBfMode(unittest.TestCase):
+    """Tests for _BloomPair when RedisBloom IS available."""
 
     def setUp(self):
-        from workers.fullscan import _BloomFilter
+        from workers.fullscan import _BloomPair
         self.r = _make_redis_bf_available()
-        self.bf = _BloomFilter(self.r, "TestCo")
+        self.r.rename = MagicMock()
+        self.bp = _BloomPair(self.r, "TestCo")
 
     def test_probe_sets_use_bf_true_when_bf_available(self):
         """_probe() returns True when BF.EXISTS succeeds."""
-        result = self.bf._probe()
+        result = self.bp._probe()
         self.assertTrue(result)
-        self.assertTrue(self.bf._use_bf)
+        self.assertTrue(self.bp._use_bf)
 
-    def test_exists_calls_bf_exists(self):
-        """exists() calls BF.EXISTS via execute_command."""
-        self.bf.exists("job_001")
-        self.r.execute_command.assert_called_with("BF.EXISTS", "bloom:fullscan:TestCo", "job_001")
+    def test_old_exists_calls_bf_exists_on_old_key(self):
+        """old_exists() calls BF.EXISTS on bloom:fullscan:{company}."""
+        self.bp.old_exists("job_001")
+        self.r.execute_command.assert_called_with(
+            "BF.EXISTS", "bloom:fullscan:TestCo", "job_001"
+        )
 
-    def test_exists_returns_false_when_bf_returns_0(self):
-        """BF.EXISTS → 0 means job NOT in filter."""
+    def test_old_exists_returns_false_when_bf_returns_0(self):
+        """BF.EXISTS → 0 means job NOT in old bloom."""
         self.r.execute_command.return_value = 0
-        self.assertFalse(self.bf.exists("job_002"))
+        self.assertFalse(self.bp.old_exists("job_002"))
 
-    def test_exists_returns_true_when_bf_returns_1(self):
-        """BF.EXISTS → 1 means job IS in filter (may be false positive)."""
+    def test_old_exists_returns_true_when_bf_returns_1(self):
+        """BF.EXISTS → 1 means job IS in old bloom."""
         self.r.execute_command.return_value = 1
-        self.assertTrue(self.bf.exists("job_002"))
+        self.assertTrue(self.bp.old_exists("job_002"))
 
-    def test_add_calls_bf_add(self):
-        """add() calls BF.ADD via execute_command."""
-        self.bf.add("job_003")
+    def test_new_add_calls_bf_add_on_new_key(self):
+        """new_add() calls BF.ADD on bloom:fullscan:new:{company}."""
+        self.bp.new_add("job_003")
         add_calls = [c[0] for c in self.r.execute_command.call_args_list]
-        self.assertTrue(any(c[0] == "BF.ADD" for c in add_calls))
+        self.assertTrue(
+            any(c[0] == "BF.ADD" and c[1] == "bloom:fullscan:new:TestCo"
+                for c in add_calls)
+        )
 
-    def test_add_calls_expire_on_bf_key(self):
-        """add() refreshes TTL on the BF key."""
-        from config import FULLSCAN_BLOOM_TTL
-        self.bf.add("job_004")
-        self.r.expire.assert_called_with("bloom:fullscan:TestCo", FULLSCAN_BLOOM_TTL)
-
-    def test_bf_exception_in_exists_falls_back_to_sismember(self):
-        """BF.EXISTS exception → fall back to sismember."""
+    def test_bf_exception_in_old_exists_falls_back_to_sismember(self):
+        """BF.EXISTS exception → fall back to sismember on old fallback key."""
         def _cmd(*args):
-            if args[0] in ("BF.EXISTS",):
+            if args[0] == "BF.EXISTS":
                 raise Exception("BF error")
             return 0
         self.r.execute_command.side_effect = _cmd
         self.r.sismember.return_value = 0
-        # Should not raise
-        result = self.bf.exists("job_005")
+        result = self.bp.old_exists("job_005")
         self.assertFalse(result)
         self.r.sismember.assert_called()
 
-    def test_bf_exception_in_add_falls_back_to_sadd(self):
-        """BF.ADD exception → fall back to sadd."""
+    def test_bf_exception_in_new_add_falls_back_to_sadd(self):
+        """BF.ADD exception → fall back to sadd on new fallback key."""
         def _cmd(*args):
             if args[0] in ("BF.EXISTS", "BF.ADD"):
                 raise Exception("BF error")
             return 0
         self.r.execute_command.side_effect = _cmd
         self.r.sadd.return_value = 1
-        # Should not raise
-        self.bf.add("job_006")
+        self.bp.new_add("job_006")
         self.r.sadd.assert_called()
 
     def test_probe_result_cached(self):
         """_probe() result is cached — execute_command called only once for probe."""
-        self.bf._probe()
+        self.bp._probe()
         call_count_after_first = self.r.execute_command.call_count
-        self.bf._probe()
-        # No additional call — cached
+        self.bp._probe()
         self.assertEqual(self.r.execute_command.call_count, call_count_after_first)
 
 

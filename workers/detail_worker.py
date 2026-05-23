@@ -36,14 +36,14 @@ queue:detail:adaptive always takes priority over queue:detail:fullscan.
 
     Jobs passing all filters → status='new' → appear in next digest.
     Jobs failing any filter  → pending_detail row deleted from DB.
-                               job_id still added to seen:{company}.
 
-─── SADD timing ─────────────────────────────────────────────────────────────
+─── Deduplication note ──────────────────────────────────────────────────────
 
-    SADD seen:{company} happens AFTER detail fetch and filter decision.
-    This matches the architecture doc (Section 17). The job_id is added
-    regardless of whether the job passed filters — it was seen by the ATS
-    and should not be re-fetched on the next adaptive poll.
+    detail_worker does NOT write to any Redis dedup structure.
+    Deduplication is handled upstream:
+      - adaptive_seen:{company} SET: written by scan_worker before enqueue.
+      - bloom:fullscan:{company}: written by fullscan worker on completion.
+    detail_worker's sole responsibility is: fetch detail, filter, persist.
 
 ─── Usage ───────────────────────────────────────────────────────────────────
 
@@ -125,7 +125,6 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         2. Call fetch_job_detail() for Mode B platforms
         3. Apply full filter pipeline (title, location, freshness)
         4. Promote to status='new' or delete pending_detail row
-        5. SADD job_id to seen:{company}
 
     Returns a compact result dict for logging.
     Never raises — all exceptions are caught and logged.
@@ -317,10 +316,6 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 company, job_id,
             )
 
-        # ── 5. SADD to seen:{company} ─────────────────────────────────────────
-        r = get_redis()
-        r.sadd(f"seen:{company}", job_id)
-
         result["outcome"]     = "new"
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
 
@@ -351,12 +346,10 @@ def _finish(
     """
     Clean up after a job fails filters.
 
-    Deletes the pending_detail row (it would never be promoted to 'new')
-    and SADDs the job_id to seen:{company} so it is not re-detected on
-    the next adaptive poll.
+    Deletes the pending_detail row (it would never be promoted to 'new').
+    Dedup tracking is handled by adaptive_seen:{company} (written by
+    scan_worker before enqueue) — no Redis write needed here.
     """
-    r = get_redis()
-    r.sadd(f"seen:{company}", job_id)
     delete_pending_detail(company, job_id)
 
 
