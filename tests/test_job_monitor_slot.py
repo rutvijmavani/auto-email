@@ -4,9 +4,10 @@ tests/test_job_monitor_slot.py
 Tests for db/job_monitor.py — upsert_poll_stats() with initial_slot_offset_s.
 
 In the two-layer scheduler redesign, upsert_poll_stats() was updated to set
-initial_slot_offset_s on INSERT using slot_offset(company).  This column is
-deliberately excluded from the ON CONFLICT DO UPDATE SET clause so the
-original registration slot survives across restarts.
+initial_slot_offset_s on INSERT using slot_offset(company).  On conflict,
+the column uses COALESCE so the existing value is preserved when already set
+(original registration slot survives restarts), but legacy NULL rows (created
+before the column existed) are backfilled on the next scan.
 
 All DB interactions mocked; no real DB connection needed.
 
@@ -16,7 +17,7 @@ Coverage map
     · INSERT SQL includes "initial_slot_offset_s" column
     · Value passed equals slot_offset(company) — correct column binding
     · Deterministic: two calls for the same company use the same offset
-    · initial_slot_offset_s NOT in DO UPDATE SET clause (not overwritten on conflict)
+    · DO UPDATE SET uses COALESCE for initial_slot_offset_s (preserves non-NULL, backfills NULL)
     · Correct binding tuple: (company, platform, new_jobs, offset_s) — 4 values
     · conn.commit() called on success
     · conn.close() always called (finally block), even if execute raises
@@ -108,22 +109,27 @@ class TestUpsertPollStatsSlotOffset(unittest.TestCase):
         offset2 = slot_offset(company)
         self.assertEqual(offset1, offset2)
 
-    def test_initial_slot_not_in_do_update_set(self):
+    def test_initial_slot_uses_coalesce_in_do_update_set(self):
         """
-        ON CONFLICT DO UPDATE SET must NOT include initial_slot_offset_s.
-        Once set at registration, the slot survives across restarts.
+        ON CONFLICT DO UPDATE SET must include initial_slot_offset_s with COALESCE
+        so that:
+          - non-NULL existing values are preserved (original registration slot survives)
+          - NULL legacy rows (created before the column existed) are backfilled
         """
         conn, sql, params = _run_upsert()
-        # Find the DO UPDATE SET section
         upper_sql = sql.upper()
+
         update_idx = upper_sql.find("DO UPDATE SET")
         self.assertGreater(update_idx, -1, "SQL missing 'DO UPDATE SET' clause")
 
-        # Everything after DO UPDATE SET is the update body
-        update_body = sql[update_idx:]
-        self.assertNotIn(
-            "initial_slot_offset_s", update_body,
-            msg="initial_slot_offset_s should NOT appear in the DO UPDATE SET clause",
+        update_body = sql[update_idx:].upper()
+        self.assertIn(
+            "INITIAL_SLOT_OFFSET_S", update_body,
+            msg="initial_slot_offset_s should appear in the DO UPDATE SET clause (COALESCE backfill)",
+        )
+        self.assertIn(
+            "COALESCE", update_body,
+            msg="DO UPDATE SET should use COALESCE for initial_slot_offset_s (preserve-or-backfill)",
         )
 
     def test_binding_tuple_has_four_values(self):
