@@ -862,6 +862,32 @@ def init_db():
         ON company_poll_stats (next_full_scan_at)
     """)
 
+    # ── Backfill initial_slot_offset_s for any legacy rows that have NULL ────
+    # This happens when company_poll_stats rows were created before the
+    # initial_slot_offset_s column was introduced (ALTER TABLE gives them NULL).
+    # upsert_poll_stats() uses COALESCE to backfill on next scan, but we also
+    # do it here at startup so no company ever runs with a missing slot offset.
+    null_rows = c.execute("""
+        SELECT company FROM company_poll_stats
+        WHERE initial_slot_offset_s IS NULL
+    """).fetchall()
+    if null_rows:
+        from workers.slot import slot_offset
+        for row in null_rows:
+            co = row["company"] if hasattr(row, "keys") else row[0]
+            offset_s = slot_offset(co)
+            c.execute("""
+                UPDATE company_poll_stats
+                SET initial_slot_offset_s = %s
+                WHERE company = %s AND initial_slot_offset_s IS NULL
+            """, (offset_s, co))
+        import logging
+        logging.getLogger(__name__).info(
+            "init_db: backfilled initial_slot_offset_s for %d legacy companies: %s",
+            len(null_rows),
+            [r["company"] if hasattr(r, "keys") else r[0] for r in null_rows],
+        )
+
     # company_config: per-company overrides for adaptive engine (Phase 4)
     c.execute("""
         CREATE TABLE IF NOT EXISTS company_config (
