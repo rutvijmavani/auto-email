@@ -1043,10 +1043,14 @@ WARMING companies not advancing to STABLE:
        ls -lh /mnt/backups/
 □ 16. Test verify-filled manually (after first monitor run):
        python pipeline.py --verify-filled
-□ 17. Redistribute scheduler ZSET scores before starting workers:
-       python scripts/reschedule_on_deploy.py --dry-run  # verify output
-       python scripts/reschedule_on_deploy.py            # apply
-□ 18. Start scheduler workers (in separate terminals or systemd units):
+□ 17. Start scheduler workers (in separate terminals or systemd units):
        python -m workers.scheduler   # adaptive + fullscan dispatch
        python -m workers.fullscan    # full scan executor
+       # rebuild_redis() runs automatically on startup — no pre-step needed.
+□ 18. (Emergency only) Redistribute ZSET scores — SKIP on normal deploys.
+       # Use ONLY if scores are corrupted while the scheduler is already
+       # running and a restart is not possible. rebuild_redis() handles all
+       # normal cases (fresh deploy, long outage, brief restart) automatically.
+       python scripts/reschedule_on_deploy.py --dry-run  # preview
+       python scripts/reschedule_on_deploy.py            # apply
 ```
