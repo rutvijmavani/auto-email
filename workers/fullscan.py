@@ -88,6 +88,7 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     Section 18 — Checkpoint / resume on pause
 """
 
+import copy
 import json
 import os
 import socket
@@ -768,8 +769,36 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # honour pause signals between HTTP requests. Until then, we fetch
         # all pages in one call and process in FULLSCAN_CHUNK_SIZE chunks.
         set_progress(company, "fullscan_fetching")
+        _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
         raw_jobs = ats_module.fetch_jobs(slug_info, company)
         set_progress(company, "fullscan_processing")
+
+        # ── Persist slug_info mutations made in-place by ATS modules ──────────
+        # e.g. talentbrew updates slug_info["tenant_id"] in-place when the live
+        # sitemap tenant_id differs from the stored value.
+        if _slug_info_before is not None and slug_info != _slug_info_before:
+            _conn = None
+            try:
+                _conn = get_conn()
+                _conn.execute(
+                    "UPDATE prospective_companies SET ats_slug = ? WHERE company = ?",
+                    (json.dumps(slug_info), company),
+                )
+                _conn.commit()
+                logger.info(
+                    "fullscan [%s]: persisted updated slug_info for %r "
+                    "(changed keys: %s)",
+                    company, company,
+                    sorted(k for k in slug_info if slug_info.get(k) != _slug_info_before.get(k)),
+                )
+            except Exception as _slug_exc:
+                logger.warning(
+                    "fullscan [%s]: failed to persist updated slug_info: %s",
+                    company, _slug_exc,
+                )
+            finally:
+                if _conn is not None:
+                    _conn.close()
 
         valid_jobs = [
             j for j in raw_jobs
@@ -897,6 +926,29 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 
         result["pages"]    = page_num
         result["new_jobs"] = new_count
+
+        # ── 10b. Bloom backfill for title-filtered-out jobs ───────────────────
+        # When the title filter eliminates ALL fetched jobs (e.g. a company with
+        # 500 positions but none matching our target roles), the chunk loop above
+        # runs 0 iterations and bloom.new_add() is never called.  finalize()
+        # then has an empty NEW bloom to rename → no bloom key is written.
+        #
+        # The bloom must cover ALL valid job IDs (not just title-matched ones)
+        # so that the next full scan's early-exit overlap check is meaningful
+        # and the adaptive scan can correctly skip already-known job IDs.
+        #
+        # We add any valid_job IDs that weren't already added via the main loop
+        # (bloom.new_exists() guards against double-adding resumes).
+        if valid_jobs and not title_matched:
+            for _job in valid_jobs:
+                _jid = _job.get("job_id")
+                if _jid:
+                    bloom.new_add(_jid)
+            logger.debug(
+                "fullscan [%s]: bloom backfill — added %d title-filtered "
+                "job IDs to NEW bloom (title_matched=0)",
+                company, len(valid_jobs),
+            )
 
         # ── 11. Depth/waste stats ─────────────────────────────────────────────
         depth_stats = estimate_scan_depth(
