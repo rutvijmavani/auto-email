@@ -252,6 +252,16 @@ def _warm_session(slug_info, company):
             "Chrome/124.0.0.0 Safari/537.36"
         )
 
+    # Pre-seed with stored fallback cookies (e.g. Wayfair's JS-set SFSID /
+    # CSN_CSRF that a plain GET can never obtain).  The career-page visit below
+    # will refresh server-set cookies (like _pxhd) while these persist.
+    for _name, _val in (slug_info.get("_fallback_cookies") or {}).items():
+        session.cookies.set(_name, _val)
+    # Also honour the legacy "cookies" key written by the original curl capture
+    for _name, _val in (slug_info.get("cookies") or {}).items():
+        if _name not in session.cookies:
+            session.cookies.set(_name, _val)
+
     # Load career page
     try:
         logger.debug("custom_career: warming session for %r via %s",
@@ -2977,7 +2987,32 @@ def _warm_session_playwright(slug_info, company):
                 locale="en-US",
             )
             page = context.new_page()
+
+            # Step 1: visit the career landing page (sets base cookies like _pxhd)
             page.goto(career_page_url, wait_until="networkidle", timeout=30000)
+
+            # Step 2: navigate to the React SPA job-search page so that JS runs
+            # and sets session cookies (e.g. Wayfair's SFSID / CSN_CSRF).
+            # Derive the SPA URL from the API URL by stripping the last path segment.
+            api_url = slug_info.get("url", "")
+            if api_url:
+                from urllib.parse import urlparse as _up, urlunparse as _uu
+                _p = _up(api_url)
+                _parent = _p.path.rsplit("/", 1)[0] or "/"
+                spa_url = _uu((_p.scheme, _p.netloc, _parent, "", "", ""))
+                if spa_url.rstrip("/") != career_page_url.rstrip("/"):
+                    try:
+                        page.goto(spa_url, wait_until="networkidle", timeout=30000)
+                        logger.debug(
+                            "custom_career: Playwright also visited SPA URL %s for %r",
+                            spa_url, company,
+                        )
+                    except Exception as _spa_exc:
+                        logger.debug(
+                            "custom_career: Playwright SPA navigation failed for %r: %s",
+                            company, _spa_exc,
+                        )
+
             raw_cookies = context.cookies()
             browser.close()
 
@@ -2999,7 +3034,9 @@ def _warm_session_playwright(slug_info, company):
 
         # Persist fresh cookies into slug_info so scan_worker / fullscan
         # writes them back to the DB automatically via slug persistence code.
+        # Mirror to both keys so _warm_session can pick them up on next run.
         slug_info["_fallback_cookies"] = fresh_cookies
+        slug_info["cookies"]           = fresh_cookies
 
         strategy = slug_info.get("session_strategy", "cookie_only")
         logger.info(
