@@ -617,17 +617,29 @@ def fetch_jobs(slug_info, company):
         # Handles JS-set cookies (e.g. Wayfair SFSID/CSN_CSRF) that a plain
         # requests GET cannot obtain.  Fresh cookies are written back into
         # slug_info["_fallback_cookies"] so the caller persists them to DB.
-        pw_session, _ = _warm_session_playwright(slug_info, company)
+        pw_session, _, pw_page1 = _warm_session_playwright(slug_info, company)
         if pw_session is not None:
-            page1_response = _fetch_page(
-                pw_session, slug_info, page=initial_page, offset=0
-            )
-            if page1_response is not None:
+            if pw_page1 is not None:
+                # Playwright made the API call directly inside the browser
+                # context — PerimeterX fingerprint matches, no requests.Session
+                # mismatch.  Use the captured bytes as page 1.
+                page1_response = pw_page1
                 session = pw_session
                 logger.info(
-                    "custom_career: Playwright fallback succeeded for %r",
-                    company,
+                    "custom_career: Playwright fallback succeeded for %r "
+                    "(direct API call — %d bytes)",
+                    company, len(pw_page1),
                 )
+            else:
+                page1_response = _fetch_page(
+                    pw_session, slug_info, page=initial_page, offset=0
+                )
+                if page1_response is not None:
+                    session = pw_session
+                    logger.info(
+                        "custom_career: Playwright fallback succeeded for %r",
+                        company,
+                    )
 
     if page1_response is None:
         logger.warning(
@@ -3024,30 +3036,67 @@ def _warm_session_playwright(slug_info, company):
             # Step 1: visit the career landing page (refreshes _px2 / _pxhd)
             page.goto(career_page_url, wait_until="networkidle", timeout=30000)
 
-            # Step 2: navigate to the React SPA job-search page so that JS runs
-            # and sets session cookies (e.g. Wayfair's SFSID / CSN_CSRF).
-            # Derive the SPA URL from the API URL by stripping the last path segment.
-            api_url = slug_info.get("url", "")
+            # Step 2: make the API call directly from the Playwright browser
+            # context. context.request uses the same cookie jar + browser TLS
+            # fingerprint as the page, so PerimeterX validation passes even
+            # though it would reject a bare requests.Session with the same
+            # cookies (fingerprint mismatch).
+            api_url    = slug_info.get("url", "")
+            method     = (slug_info.get("method") or "GET").upper()
+            body_str   = slug_info.get("body")
+            req_params = slug_info.get("params") or {}
+            extra_hdrs = {
+                k: v for k, v in slug_info.get("headers", {}).items()
+                if k.lower() not in SKIP_HEADERS and k.lower() != "cookie"
+            }
+
+            page1_bytes = None
             if api_url:
-                _p = _up(api_url)
-                _parent = _p.path.rsplit("/", 1)[0] or "/"
-                spa_url = _uu((_p.scheme, _p.netloc, _parent, "", "", ""))
-                if spa_url.rstrip("/") != career_page_url.rstrip("/"):
-                    try:
-                        page.goto(spa_url, wait_until="networkidle", timeout=30000)
-                        logger.debug(
-                            "custom_career: Playwright also visited SPA URL %s for %r",
-                            spa_url, company,
-                        )
-                    except Exception as _spa_exc:
-                        logger.debug(
-                            "custom_career: Playwright SPA navigation failed for %r: %s",
-                            company, _spa_exc,
+                try:
+                    if method == "POST":
+                        if body_str and _is_json(body_str):
+                            _api_resp = context.request.post(
+                                api_url,
+                                json=json.loads(body_str),
+                                params=req_params or None,
+                                headers=extra_hdrs or None,
+                            )
+                        else:
+                            _api_resp = context.request.post(
+                                api_url,
+                                data=body_str,
+                                params=req_params or None,
+                                headers=extra_hdrs or None,
+                            )
+                    else:
+                        _api_resp = context.request.get(
+                            api_url,
+                            params=req_params or None,
+                            headers=extra_hdrs or None,
                         )
 
+                    if _api_resp.ok:
+                        page1_bytes = _api_resp.body()
+                        logger.info(
+                            "custom_career: Playwright API call succeeded "
+                            "for %r — %d bytes",
+                            company, len(page1_bytes),
+                        )
+                    else:
+                        logger.debug(
+                            "custom_career: Playwright API call HTTP %d for %r",
+                            _api_resp.status, company,
+                        )
+                except Exception as _api_exc:
+                    logger.debug(
+                        "custom_career: Playwright API call failed for %r: %s",
+                        company, _api_exc,
+                    )
+
+            # Re-read cookies after the API call (response may have refreshed them)
             raw_cookies = context.cookies()
             logger.debug(
-                "custom_career: Playwright raw cookie names for %r: %s",
+                "custom_career: Playwright cookie names for %r: %s",
                 company, [c["name"] for c in raw_cookies],
             )
             browser.close()
@@ -3059,7 +3108,7 @@ def _warm_session_playwright(slug_info, company):
             logger.warning(
                 "custom_career: Playwright got 0 cookies for %r", company
             )
-            return None, None
+            return None, None, None
 
         # Merge with stored cookies: fresh values take priority, but keep any
         # keys (e.g. SFSID / CSN_CSRF) that Playwright didn't refresh so that
@@ -3067,7 +3116,9 @@ def _warm_session_playwright(slug_info, company):
         merged_cookies = {**(slug_info.get("_fallback_cookies") or {}),
                          **fresh_cookies}
 
-        # Build a requests.Session with the merged cookies
+        # Build a requests.Session seeded with merged cookies for pagination
+        # (subsequent pages — PerimeterX is typically less strict once the
+        # session is established via the first Playwright API call).
         session = requests.Session()
         for k, v in slug_info.get("headers", {}).items():
             if k.lower() not in SKIP_HEADERS and k.lower() != "cookie":
@@ -3086,14 +3137,14 @@ def _warm_session_playwright(slug_info, company):
             "(%d cookies harvested)",
             company, len(fresh_cookies),
         )
-        return session, strategy
+        return session, strategy, page1_bytes
 
     except Exception as exc:
         logger.warning(
             "custom_career: Playwright fallback failed for %r: %s",
             company, exc,
         )
-        return None, None
+        return None, None, None
 
 
 def _flag_expired(company):
