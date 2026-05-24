@@ -2973,6 +2973,12 @@ def _warm_session_playwright(slug_info, company):
         company,
     )
 
+    # Derive the root domain for cookie injection (e.g. ".wayfair.com")
+    from urllib.parse import urlparse as _up, urlunparse as _uu
+    _career_host = _up(career_page_url).hostname or ""
+    # Use eTLD+1 with leading dot so cookies apply to all subdomains
+    _cookie_domain = "." + ".".join(_career_host.rsplit(".", 2)[-2:])
+
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -2986,9 +2992,36 @@ def _warm_session_playwright(slug_info, company):
                 ),
                 locale="en-US",
             )
+
+            # Pre-seed the browser context with long-lived tracking cookies
+            # (e.g. PerimeterX _pxvid / __pxvid / _pxhd) so the bot-detection
+            # layer recognises this as a returning user and re-issues _px2.
+            existing_cookies = slug_info.get("_fallback_cookies") or {}
+            if existing_cookies:
+                seed_cookies = [
+                    {
+                        "name":   name,
+                        "value":  value,
+                        "domain": _cookie_domain,
+                        "path":   "/",
+                    }
+                    for name, value in existing_cookies.items()
+                ]
+                try:
+                    context.add_cookies(seed_cookies)
+                    logger.debug(
+                        "custom_career: Playwright pre-seeded %d cookies for %r",
+                        len(seed_cookies), company,
+                    )
+                except Exception as _seed_exc:
+                    logger.debug(
+                        "custom_career: Playwright cookie pre-seed failed for %r: %s",
+                        company, _seed_exc,
+                    )
+
             page = context.new_page()
 
-            # Step 1: visit the career landing page (sets base cookies like _pxhd)
+            # Step 1: visit the career landing page (refreshes _px2 / _pxhd)
             page.goto(career_page_url, wait_until="networkidle", timeout=30000)
 
             # Step 2: navigate to the React SPA job-search page so that JS runs
@@ -2996,7 +3029,6 @@ def _warm_session_playwright(slug_info, company):
             # Derive the SPA URL from the API URL by stripping the last path segment.
             api_url = slug_info.get("url", "")
             if api_url:
-                from urllib.parse import urlparse as _up, urlunparse as _uu
                 _p = _up(api_url)
                 _parent = _p.path.rsplit("/", 1)[0] or "/"
                 spa_url = _uu((_p.scheme, _p.netloc, _parent, "", "", ""))
@@ -3014,6 +3046,10 @@ def _warm_session_playwright(slug_info, company):
                         )
 
             raw_cookies = context.cookies()
+            logger.debug(
+                "custom_career: Playwright raw cookie names for %r: %s",
+                company, [c["name"] for c in raw_cookies],
+            )
             browser.close()
 
         # Convert Playwright cookie list → {name: value} dict
@@ -3025,18 +3061,24 @@ def _warm_session_playwright(slug_info, company):
             )
             return None, None
 
-        # Build a requests.Session with the fresh cookies
+        # Merge with stored cookies: fresh values take priority, but keep any
+        # keys (e.g. SFSID / CSN_CSRF) that Playwright didn't refresh so that
+        # we never lose cookies by replacing with a smaller set.
+        merged_cookies = {**(slug_info.get("_fallback_cookies") or {}),
+                         **fresh_cookies}
+
+        # Build a requests.Session with the merged cookies
         session = requests.Session()
         for k, v in slug_info.get("headers", {}).items():
             if k.lower() not in SKIP_HEADERS and k.lower() != "cookie":
                 session.headers[k] = v
-        session.cookies.update(fresh_cookies)
+        session.cookies.update(merged_cookies)
 
-        # Persist fresh cookies into slug_info so scan_worker / fullscan
+        # Persist merged cookies into slug_info so scan_worker / fullscan
         # writes them back to the DB automatically via slug persistence code.
         # Mirror to both keys so _warm_session can pick them up on next run.
-        slug_info["_fallback_cookies"] = fresh_cookies
-        slug_info["cookies"]           = fresh_cookies
+        slug_info["_fallback_cookies"] = merged_cookies
+        slug_info["cookies"]           = merged_cookies
 
         strategy = slug_info.get("session_strategy", "cookie_only")
         logger.info(
