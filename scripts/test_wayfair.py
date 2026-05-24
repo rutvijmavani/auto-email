@@ -33,7 +33,7 @@ logging.basicConfig(
 )
 
 from db.db import get_conn, init_db
-from jobs.ats.registry import parse_slug
+from jobs.ats.registry import parse_slug, get_config
 from jobs.ats import custom_career
 
 
@@ -63,7 +63,7 @@ def main():
         print(f"[FAIL] Expected platform=custom, got {platform!r}")
         sys.exit(1)
 
-    slug_info = parse_slug(platform, slug, {})
+    slug_info = parse_slug(platform, slug, get_config(platform))
     if not isinstance(slug_info, dict):
         print("[FAIL] Could not parse slug_info as dict")
         sys.exit(1)
