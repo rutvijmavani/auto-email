@@ -88,6 +88,7 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     Section 18 — Checkpoint / resume on pause
 """
 
+import copy
 import json
 import os
 import socket
@@ -768,7 +769,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # honour pause signals between HTTP requests. Until then, we fetch
         # all pages in one call and process in FULLSCAN_CHUNK_SIZE chunks.
         set_progress(company, "fullscan_fetching")
-        _slug_info_before = dict(slug_info) if isinstance(slug_info, dict) else None
+        _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
         raw_jobs = ats_module.fetch_jobs(slug_info, company)
         set_progress(company, "fullscan_processing")
 
@@ -776,6 +777,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # e.g. talentbrew updates slug_info["tenant_id"] in-place when the live
         # sitemap tenant_id differs from the stored value.
         if _slug_info_before is not None and slug_info != _slug_info_before:
+            _conn = None
             try:
                 _conn = get_conn()
                 _conn.execute(
@@ -783,18 +785,20 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                     (json.dumps(slug_info), company),
                 )
                 _conn.commit()
-                _conn.close()
                 logger.info(
-                    "fullscan [%s]: persisted updated slug_info "
-                    "(was %s now %s)",
-                    company,
-                    json.dumps(_slug_info_before), json.dumps(slug_info),
+                    "fullscan [%s]: persisted updated slug_info for %r "
+                    "(changed keys: %s)",
+                    company, company,
+                    sorted(k for k in slug_info if slug_info.get(k) != _slug_info_before.get(k)),
                 )
             except Exception as _slug_exc:
                 logger.warning(
                     "fullscan [%s]: failed to persist updated slug_info: %s",
                     company, _slug_exc,
                 )
+            finally:
+                if _conn is not None:
+                    _conn.close()
 
         valid_jobs = [
             j for j in raw_jobs
@@ -938,7 +942,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         if valid_jobs and not title_matched:
             for _job in valid_jobs:
                 _jid = _job.get("job_id")
-                if _jid and not bloom.new_exists(_jid):
+                if _jid:
                     bloom.new_add(_jid)
             logger.debug(
                 "fullscan [%s]: bloom backfill — added %d title-filtered "

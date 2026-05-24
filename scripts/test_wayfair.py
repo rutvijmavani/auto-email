@@ -57,7 +57,7 @@ def main():
     slug     = row["ats_slug"]
 
     print(f"[INFO] platform={platform}")
-    print(f"[INFO] slug loaded ({len(slug)} chars)")
+    print(f"[INFO] slug loaded ({len(slug) if slug else '(null)'} chars)")
 
     if platform != "custom":
         print(f"[FAIL] Expected platform=custom, got {platform!r}")
@@ -90,7 +90,7 @@ def main():
         print(f"[OK] Playwright refreshed cookies ({len(cookies_after)} cookies) "
               f"— will be saved to DB automatically on next scan")
     else:
-        print(f"[OK] Existing session was still valid (no Playwright needed)")
+        print("[OK] Existing session was still valid (no Playwright needed)")
 
     # Show sample titles
     titles = [j.get("title", "—") for j in jobs[:5]]

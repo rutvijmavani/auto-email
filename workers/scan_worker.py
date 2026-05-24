@@ -82,6 +82,7 @@ to hydrate and filter.
 """
 
 import json
+import copy
 import os
 import socket
 import sys
@@ -314,7 +315,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             _scan_ctx = "normal"
 
         set_request_context(_scan_ctx)
-        _slug_info_before = dict(slug_info) if isinstance(slug_info, dict) else None
+        _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
         finally:
@@ -326,20 +327,20 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         # corrected value is lost when the process exits and every future scan
         # re-discovers the same mismatch.
         if _slug_info_before is not None and slug_info != _slug_info_before:
+            from db.connection import get_conn as _get_conn
+            _conn = None
             try:
-                from db.connection import get_conn as _get_conn
                 _conn = _get_conn()
                 _conn.execute(
                     "UPDATE prospective_companies SET ats_slug = ? WHERE company = ?",
                     (json.dumps(slug_info), company),
                 )
                 _conn.commit()
-                _conn.close()
                 logger.info(
                     "scan_worker [%s]: persisted updated slug_info for %r "
-                    "(was %s now %s)",
+                    "(changed keys: %s)",
                     request_id, company,
-                    json.dumps(_slug_info_before), json.dumps(slug_info),
+                    sorted(k for k in slug_info if slug_info.get(k) != _slug_info_before.get(k)),
                 )
             except Exception as _slug_exc:
                 logger.warning(
@@ -347,6 +348,9 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                     "for %r: %s",
                     request_id, company, _slug_exc,
                 )
+            finally:
+                if _conn is not None:
+                    _conn.close()
 
         # ── Shutdown checkpoint (post-fetch, pre-DB-write) ────────────────────
         # If the scheduler removed this worker due to errors while fetch_jobs()
