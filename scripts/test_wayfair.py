@@ -1,15 +1,15 @@
 """
 scripts/test_wayfair.py — Verify Wayfair custom ATS scraping works end-to-end.
 
-Tests the full fetch_jobs() path including the Playwright fallback, using
-the slug currently stored in the DB (no manual curl re-capture needed).
+Tests the full fetch_jobs() path using the slug/cookies stored in the DB.
+Run this after a manual curl recapture to confirm the new session works.
 
 Usage:
     python scripts/test_wayfair.py
 
 Expected output on success:
     [OK] Fetched N jobs from Wayfair
-    [OK] Playwright cookies saved back to DB (M cookies)
+    [OK] Existing session was still valid
     Sample titles:
       - Software Engineer, Platform
       - Senior Product Manager
@@ -17,7 +17,8 @@ Expected output on success:
 
 Expected output on failure:
     [FAIL] fetch_jobs returned 0 jobs
-    Check logs above for the specific error.
+    → Session cookies have expired. Recapture curl from a real browser and
+      run: python pipeline.py --set-custom-ats "Wayfair" --curl "..."
 """
 
 import sys
@@ -72,8 +73,8 @@ def main():
     cookies_before = slug_info.get("_fallback_cookies", {})
 
     # ── 3. Run fetch_jobs ─────────────────────────────────────────────────────
-    print("\n[INFO] Running fetch_jobs() — Playwright fallback will trigger "
-          "if stored session is expired...\n")
+    print("\n[INFO] Running fetch_jobs() — will use stored session cookies "
+          "(recapture curl if expired)...\n")
     jobs = custom_career.fetch_jobs(slug_info, "Wayfair")
 
     # ── 4. Results ────────────────────────────────────────────────────────────
