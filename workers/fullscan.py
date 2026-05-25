@@ -91,6 +91,7 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
 import copy
 import json
 import os
+import random
 import socket
 import sys
 import time
@@ -998,11 +999,52 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             # state and will be read by adaptive scans for early exit.
             bloom.finalize()
 
-            # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted
-            _complete_fullscan_db(company, platform, new_count, interval_s)
+            # Reschedule in poll:fullscan ZSET with directionally-aware ±10% jitter.
+            # Base interval is always 24 h (SCHEDULER_FULL_SCAN_INTERVAL_S = 86400 s).
+            #
+            # Safe zone — completion outside 5 AM–7 AM window:
+            #   Full ±10% jitter (±2.4 h on a 24 h interval) → free to spread
+            #   in either direction.  A 36-minute cluster becomes a ~5 h window
+            #   after one cycle, fully broken after 2–3 cycles.
+            #
+            # Danger zone — completion strictly between 5 AM and 7 AM:
+            #   With positive jitter the next scan could be pushed to >7 AM the
+            #   following day, causing the company to miss the digest window.
+            #   Negative-only jitter [−10%, 0] always pulls the schedule earlier,
+            #   guaranteeing the next scan completes before the next 7 AM digest.
+            #   Self-correcting: companies drift toward safer (earlier) times each
+            #   cycle without any hard clamp.
+            #
+            # Completions after 7 AM (e.g. 11 AM) are safe zone even though they
+            # are > 5 AM — their next scan lands ~24 h later (also >7 AM next day),
+            # which is still within the next 7 AM–7 AM monitoring window.
+            #
+            # The jittered interval is also written to DB so rebuild_poll_queues()
+            # restores the same spread after a restart.
+            from config import CYCLE_START_HOUR
+            SAFETY_BUFFER_S   = 2 * 3600   # 2 h before digest = 5 AM
+            safe_cutoff_s     = CYCLE_START_HOUR * 3600 - SAFETY_BUFFER_S
+            digest_cutoff_s   = CYCLE_START_HOUR * 3600               # 7 AM
+            dt_now            = datetime.fromtimestamp(now)
+            completion_time_s = dt_now.hour * 3600 + dt_now.minute * 60 + dt_now.second
 
-            # Reschedule in poll:fullscan ZSET
-            next_scan_at = now + interval_s
+            if safe_cutoff_s <= completion_time_s < digest_cutoff_s:
+                # Danger zone: 5 AM–7 AM — negative-only jitter to stay before digest
+                jitter_s = int(interval_s * random.uniform(-0.10, 0))
+                logger.debug(
+                    "fullscan: danger-zone completion for %r (%s) — "
+                    "negative-only jitter applied (%+ds)",
+                    company, dt_now.strftime("%H:%M"), jitter_s,
+                )
+            else:
+                # Safe zone: full ±10% jitter
+                jitter_s = int(interval_s * random.uniform(-0.10, 0.10))
+
+            next_scan_at = now + interval_s + jitter_s
+
+            # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted
+            _complete_fullscan_db(company, platform, new_count, interval_s + jitter_s)
+
             r.zadd(REDIS_POLL_FULLSCAN, {company: next_scan_at})
 
             result["outcome"]     = "completed"
