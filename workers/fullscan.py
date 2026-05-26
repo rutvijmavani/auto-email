@@ -96,6 +96,10 @@ import socket
 import sys
 import time
 from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 from typing import Optional
 
 from logger import get_logger
@@ -1021,11 +1025,13 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             #
             # The jittered interval is also written to DB so rebuild_poll_queues()
             # restores the same spread after a restart.
-            from config import CYCLE_START_HOUR
+            from config import CYCLE_START_HOUR, SEND_TIMEZONE
             SAFETY_BUFFER_S   = 2 * 3600   # 2 h before digest = 5 AM
             safe_cutoff_s     = CYCLE_START_HOUR * 3600 - SAFETY_BUFFER_S
             digest_cutoff_s   = CYCLE_START_HOUR * 3600               # 7 AM
-            dt_now            = datetime.fromtimestamp(now)
+            # Use SEND_TIMEZONE (America/New_York) so the 5–7 AM window is
+            # evaluated in Eastern time, not server-local UTC.
+            dt_now            = datetime.fromtimestamp(now, tz=ZoneInfo(SEND_TIMEZONE))
             completion_time_s = dt_now.hour * 3600 + dt_now.minute * 60 + dt_now.second
 
             if safe_cutoff_s <= completion_time_s < digest_cutoff_s:
@@ -1053,8 +1059,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             result["completed_at"] = datetime.now(timezone.utc).isoformat()
 
             logger.info(
-                "fullscan [%s]: completed — new=%d next_scan_in=%dh",
-                company, new_count, interval_s // 3600,
+                "fullscan [%s]: completed — new=%d next_scan_in=%dh (jitter=%+ds)",
+                company, new_count, (interval_s + jitter_s) // 3600, jitter_s,
             )
 
             # ── Bootstrap new companies into WARMING adaptive cycle ───────────

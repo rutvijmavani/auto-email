@@ -255,8 +255,9 @@ def run():
               f"unknown/unverified ATS — run --detect-ats to fix")
 
     # ── Split: covered by workers vs missed ───────────────────────────────────
-    missed    = _get_worker_missed_companies(companies)
-    covered   = [c for c in companies if c not in missed]
+    missed       = _get_worker_missed_companies(companies)
+    missed_names = {c["company"] for c in missed}   # O(1) lookups
+    covered      = [c for c in companies if c["company"] not in missed_names]
 
     logger.info(
         "Loaded %d monitorable companies (%d total in DB) | "
@@ -278,7 +279,7 @@ def run():
     # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
         "companies_monitored":    len(covered),   # pre-credit covered companies
-        "companies_with_results": 0,
+        "companies_with_results": len(covered),   # pre-credit: workers already scanned these
         "companies_unknown_ats":  0,
         "api_failures":           0,
         "total_jobs_fetched":     0,
