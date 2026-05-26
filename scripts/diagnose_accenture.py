@@ -236,6 +236,66 @@ try:
 except Exception as e:
     print(f"  ERROR: {e}")
 
+
+# ── 8. Fetch real Accenture listing → see actual _external_path ───────────────
+print(f"\n{'═'*60}")
+print("STEP 8 — Fetch real Accenture listing, show _external_path from API")
+print(SEP)
+try:
+    from jobs.ats_detector import get_ats_module
+    from jobs.ats.registry import get_config, parse_slug
+    from db.db import get_conn, init_db
+
+    ats_module = get_ats_module("workday")
+    config     = get_config("workday")
+
+    conn = get_conn()
+    row  = conn.execute("""
+        SELECT ats_slug FROM prospective_companies WHERE company = %s LIMIT 1
+    """, ("accenture",)).fetchone()
+    conn.close()
+
+    slug_info = parse_slug("workday", row["ats_slug"], config)
+    print(f"  Fetching listing with slug_info: {slug_info}")
+    print("  (fetching first page — may take a few seconds...)")
+
+    raw_jobs = ats_module.fetch_jobs(slug_info, "accenture")
+    print(f"  Total jobs returned by listing: {len(raw_jobs)}")
+
+    # Show first 5 jobs with their _external_path and location
+    for i, job in enumerate(raw_jobs[:5]):
+        print(f"\n  Job {i+1}:")
+        print(f"    title         : {job.get('title')}")
+        print(f"    location      : {job.get('location')!r}")
+        print(f"    _external_path: {job.get('_external_path')!r}")
+        print(f"    _country_code : {job.get('_country_code')!r}")
+        print(f"    job_url       : {job.get('job_url')}")
+
+    # Now try fetch_job_detail with the REAL _external_path from listing
+    print(f"\n  {'─'*50}")
+    print("  Retrying fetch_job_detail with REAL _external_path from listing:")
+    for job in raw_jobs[:3]:
+        if not job.get("_external_path"):
+            print(f"  ⚠  _external_path is EMPTY in listing response for: {job.get('title')}")
+            continue
+        print(f"\n  job_id         : {job.get('job_id')}")
+        print(f"  _external_path : {job.get('_external_path')!r}")
+        print(f"  location (listing): {job.get('location')!r}")
+        try:
+            result = ats_module.fetch_job_detail(dict(job))
+            if result is job or (result.get("_country_code") == job.get("_country_code")
+                                  and result.get("location") == job.get("location")):
+                print("  ⚠  fetch_job_detail still returned original dict (silent fail)")
+            else:
+                print(f"  _country_code (detail): {result.get('_country_code')!r}")
+                print(f"  location (detail)     : {result.get('location')!r}")
+        except Exception as exc:
+            print(f"  ✗ fetch_job_detail RAISED: {exc}")
+
+except Exception as e:
+    print(f"  ERROR: {e}")
+    import traceback; traceback.print_exc()
+
 print(f"\n{'═'*60}")
 print("Diagnostic complete.")
 print("═" * 60)
