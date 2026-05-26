@@ -3,7 +3,7 @@
 #
 # Usage:
 #   python logs/view_logs.py                     # show today's logs (all commands)
-#   python logs/view_logs.py --tail              # live tail pipeline.log
+#   python logs/view_logs.py --tail              # live tail pipeline_YYYY-MM-DD.log
 #   python logs/view_logs.py --cmd monitor       # today's monitor log
 #   python logs/view_logs.py --cmd detect        # today's detect log
 #   python logs/view_logs.py --errors            # errors + warnings only
@@ -228,7 +228,7 @@ Examples:
     # ── --tail ──
     if args.tail:
         path = (get_log_file(args.cmd, date_str)
-                if args.cmd else LOG_DIR / "pipeline.log")
+                if args.cmd else LOG_DIR / f"pipeline_{date_str}.log")
         do_tail(path)
         return
 

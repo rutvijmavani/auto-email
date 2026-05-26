@@ -691,12 +691,36 @@ def _build_detail_payload(
         "slug_info": slug_info if isinstance(slug_info, (str, dict, type(None))) else str(slug_info),
     }
 
-    # Forward platform-specific keys required by fetch_job_detail()
+    # Forward platform-specific keys required by fetch_job_detail().
+    #
+    # Rule: forward EVERY key that fetch_job_detail() reads from the job dict.
+    # Omitting a required key causes a silent fail — the guard clause returns
+    # the original job unchanged with empty location / description.
+    #
+    # Workday:  _slug + _wd + _path + _external_path are ALL checked by the
+    #           guard: if not all([slug, wd, path, external_path]): return job
+    #           _site is optional (myworkdaysite.com tenants).
+    #
+    # Taleo:    _base_url + _contest_no are BOTH checked by the guard:
+    #           if not base_url or not contest_no: return job
+    #           _section defaults to "ex" but some tenants use a different
+    #           section code — forward it to preserve the per-tenant value.
+    #
+    # iCIMS:    guard is only `if not job_url` (job_url is in the base
+    #           payload). _base_url and _feed_type are forwarded as extras;
+    #           _base_url doubles as the should_fetch_detail() gate key.
+    #
+    # Jobvite:  fetch_job_detail only reads job_url (base payload). _slug is
+    #           forwarded solely because should_fetch_detail() gates on it.
+    #
+    # SmartRecruiters: guard checks job_id (base) + _company_slug. ✓
+    # Sitemap:  _feed_type gate: if _feed_type=="xml" return job (skip). ✓
+    # Avature/Phenom/TalentBrew/Eightfold: guard is only `if not job_url`. ✓
     PLATFORM_DETAIL_KEYS = {
-        "workday":         ["_external_path"],
+        "workday":         ["_external_path", "_slug", "_wd", "_path", "_site"],
         "icims":           ["_base_url", "_feed_type"],
         "jobvite":         ["_slug"],
-        "taleo":           ["_contest_no"],
+        "taleo":           ["_base_url", "_contest_no", "_section"],
         "smartrecruiters": ["_company_slug"],
         "sitemap":         ["_feed_type"],
         "avature":         [],

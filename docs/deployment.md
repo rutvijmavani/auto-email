@@ -373,40 +373,159 @@ Gives visibility on healthy runs.
 ```
 
 ### Phase 2 — File logging (implement during Oracle migration)
+
+#### Two-layer log architecture
+
+Every pipeline command produces **two kinds of log output**:
+
 ```
-Python logging module routes output to both:
-  → Terminal (for interactive runs)
-  → Log file (for cron job runs)
+Layer 1 — Shell wrapper logs  (stdout redirect in run_*.sh)
+  Captures: shell echo messages ([CRON], [STEP N], [REDIS])
+            + any Python print() output
+  Written by: run_nightly.sh, run_monitor.sh, etc. via >> "$LOG_FILE"
+  Examples:
+    logs/nightly_YYYY-MM-DD.log
+    logs/monitor_YYYY-MM-DD.log
+    logs/monthly_YYYY-MM.log
 
-Log files:
-  logs/nightly_YYYY-MM-DD.log
-  logs/monday_YYYY-MM-DD.log
-  logs/monthly_YYYY-MM.log
-  logs/outreach_YYYY-MM-DD.log
-  logs/monitor_YYYY-MM-DD.log
-  logs/sync_YYYY-MM-DD.log
-  logs/weekly_YYYY-MM-DD.log
-  logs/enrich_YYYY-MM.log
-  logs/detect_YYYY-MM-DD.log
-  logs/verify_filled_YYYY-MM-DD.log
+Layer 2 — Python logger logs  (logger.py FileHandler)
+  Captures: all logger.debug/info/warning/error/critical calls
+            inside every Python module
+  Written by: init_logging() in each pipeline entry point
+  Examples:
+    logs/monitor_YYYY-MM-DD.log    ← when --monitor-jobs calls init_logging("monitor")
+    logs/pipeline_YYYY-MM-DD.log   ← catch-all alongside every command
 
-Log levels:
-  INFO     → normal operations
-  WARNING  → non-fatal issues (quota low, JD missing)
-  ERROR    → failures (SMTP failed, session expired)
-  CRITICAL → pipeline cannot continue
-
-Retention: 14 days (auto-delete older files, per wrapper scripts)
+Note: under cron the console handler is suppressed (stdout is not a TTY),
+so Python logger output goes ONLY to the file handlers, not into the
+shell wrapper's redirect.  Both layers capture different things.
 ```
 
-### Why both are needed
+#### Log files — daily commands (one file per calendar day, 14-day retention)
+
 ```
-Email report = what happened (summary for healthy runs)
-Log file     = why it happened (forensics for failed runs)
+logs/monitor_YYYY-MM-DD.log          --monitor-jobs
+logs/outreach_YYYY-MM-DD.log         --outreach-only
+logs/sync_YYYY-MM-DD.log             --sync-forms / --sync-prospective
+logs/nightly_YYYY-MM-DD.log          nightly chain (shell layer)
+logs/monday_YYYY-MM-DD.log           Monday chain (shell layer)
+logs/weekly_YYYY-MM-DD.log           --weekly-summary
+logs/detect_YYYY-MM-DD.log           --detect-ats
+logs/verify_filled_YYYY-MM-DD.log    --verify-filled
+logs/enrich_ats_companies_YYYY-MM-DD.log  enrich_ats_companies.py --daily
+logs/scheduler_YYYY-MM-DD.log        scheduler worker (long-running)
+logs/pipeline_YYYY-MM-DD.log         catch-all — every command writes here
+```
+
+#### Log files — monthly commands (one file per calendar month, 35-day retention)
+
+```
+logs/monthly_YYYY-MM.log             run_monthly.sh chain (shell layer)
+logs/enrich_YYYY-MM.log              run_enrich.sh (shell layer)
+logs/build_ats_slug_list_YYYY-MM.log build_ats_slug_list.py
+
+35-day retention = 1 month + 4-day buffer so the next month's log is
+always written before the previous month's is deleted.
+```
+
+#### Log levels
+
+```
+DEBUG    → step-by-step tracing (default, verbose)
+INFO     → normal operations and summaries
+WARNING  → non-fatal issues (API guard fired, key missing, quota low)
+ERROR    → failures (SMTP failed, API returned 5xx)
+CRITICAL → pipeline cannot continue
+```
+
+#### Retention — how it works
+
+```
+Configured in:  config.py
+  LOG_RETENTION_DAILY_DAYS   = 14
+  LOG_RETENTION_MONTHLY_DAYS = 35
+
+Enforced by:  _cleanup_old_logs() in logger.py
+  Runs once per process at startup (inside init_logging()).
+  Uses mtime (last-written time) to classify and delete files:
+
+  Pattern               Retention   Examples
+  ────────────────────────────────────────────────────────────
+  *_YYYY-MM.log         35 days     monthly_2026-05.log
+  *_YYYY-MM-DD.log      14 days     monitor_2026-05-26.log
+  (except build_ats_slug_list_* → 35 days, monthly-run command)
+  *.log.YYYY-MM-DD      14 days     scheduler_X.log.2026-05-10
+                                    (TimedRotatingFileHandler backups)
+  *.log (no date)       14 days     scheduler.log, fullscan.log
+  (only deleted once process stops writing — mtime ages naturally)
+
+Shell wrapper scripts (run_*.sh) also run find … -mtime +14 -delete
+for their own log files as a belt-and-suspenders measure.
+
+No separate cron job needed — cleanup is self-contained.
+```
+
+#### Viewing logs — utils/view_logs.py
+
+```bash
+# Today's logs across all commands
+python utils/view_logs.py
+
+# Live tail today's catch-all (pipeline_YYYY-MM-DD.log)
+python utils/view_logs.py --tail
+
+# Live tail a specific command's log
+python utils/view_logs.py --tail --cmd monitor
+
+# Show only warnings and errors
+python utils/view_logs.py --errors
+
+# Filter by company name
+python utils/view_logs.py --company "Accenture"
+
+# Last 2 hours only
+python utils/view_logs.py --since 2h
+
+# Specific date
+python utils/view_logs.py --date 2026-05-23
+
+# Summary (count per log level)
+python utils/view_logs.py --summary
+
+# Quick manual tail (no viewer)
+tail -f ~/mail/logs/pipeline_$(date +%Y-%m-%d).log
+tail -f ~/mail/logs/monitor_$(date +%Y-%m-%d).log
+```
+
+#### Migration note — old pipeline.log
+
+```
+Before this logging overhaul, a single undated pipeline.log was used
+as the catch-all.  TimedRotatingFileHandler created dated backups
+(pipeline.log.2026-04-26 etc.) only when a long-running process
+(the scheduler) survived past midnight.
+
+After deploying:
+  → pipeline.log stops being written to
+  → pipeline.log and all pipeline.log.* backups age out within 14 days
+  → pipeline_YYYY-MM-DD.log (one per day) replaces it going forward
+
+To clean up the existing backlog immediately after deploy:
+  find ~/mail/logs/ -name "*_????-??-??.log"  -mtime +14 -delete
+  find ~/mail/logs/ -name "*_????-??.log"     -mtime +35 -delete
+  find ~/mail/logs/ -name "*.log.????-??-??"  -mtime +14 -delete
+```
+
+### Why both layers are needed
+```
+Email report  = what happened (summary for healthy runs)
+Shell log     = chain-level trace ([STEP 1], [STEP 2], exit codes)
+Python log    = why it happened (module-level forensics for failures)
 
 If pipeline crashes before email sends:
-  → Log file captures everything
-  → Check logs to understand what went wrong
+  → Python log captures the last thing that ran
+  → Shell log shows which step failed and exit code
+  → Check both to understand what went wrong
 ```
 
 ### Phase 3 — Optional future
@@ -429,7 +548,7 @@ Python packages + Chromium:    ~0.8 GB
 Project code:                  ~0.005 GB
 SQLite DBs (6 months):         ~0.050 GB
 PDF digests (30 day retention):~0.008 GB
-Log files (14 day retention):  ~0.010 GB
+Log files (14/35 day retention):~0.010 GB
 Athena CSV (2 day retention):  ~0.010 GB
 ─────────────────────────────────────────
 Total used:                    ~3.9 GB
