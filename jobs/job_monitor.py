@@ -175,16 +175,89 @@ def _should_fetch_detail(job, platform, config, slug_info=None):
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────
 
+def _get_worker_missed_companies(companies: list) -> list:
+    """
+    Return the subset of companies that background workers have NOT scanned
+    since the start of the current monitoring cycle (default 7 AM ET).
+
+    Used by run() to decide which companies need a fallback re-fetch.
+    Companies covered by scan_worker / fullscan_worker are skipped so
+    --monitor-jobs only does real HTTP work when the workers fell behind.
+
+    Cycle boundary: the most recent CYCLE_START_HOUR (7 AM) in SEND_TIMEZONE
+    (America/New_York).  A company is considered covered if
+    company_poll_stats.last_poll_at is on or after that boundary.
+    Companies with no stats row (never scanned) are always treated as missed.
+
+    Using the fixed 7 AM boundary rather than a rolling now-86400 window
+    avoids a 5-minute edge case where companies polled just after yesterday's
+    7 AM would be falsely flagged as missed when the digest runs a few minutes
+    after 7 AM.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    from datetime import datetime as _dt, timedelta
+    from config import CYCLE_START_HOUR, SEND_TIMEZONE
+    from db.db import get_conn
+
+    tz = ZoneInfo(SEND_TIMEZONE)
+    now_dt = _dt.now(tz)
+    today_cycle = now_dt.replace(
+        hour=CYCLE_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    if now_dt < today_cycle:
+        # Before 7 AM today — cycle started yesterday at 7 AM
+        cycle_start_ts = (today_cycle - timedelta(days=1)).timestamp()
+    else:
+        cycle_start_ts = today_cycle.timestamp()
+
+    company_names = [c["company"] for c in companies]
+
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT company,
+                   EXTRACT(EPOCH FROM last_poll_at) AS last_poll_epoch
+            FROM company_poll_stats
+            WHERE company = ANY(%s)
+        """, (company_names,)).fetchall()
+    finally:
+        conn.close()
+
+    poll_map = {r["company"]: (r["last_poll_epoch"] or 0) for r in rows}
+
+    missed = []
+    for company_row in companies:
+        name      = company_row["company"]
+        last_poll = poll_map.get(name, 0)
+        if last_poll < cycle_start_ts:
+            missed.append(company_row)
+
+    return missed
+
+
 def run():
     """
     Main entry point for --monitor-jobs.
-    Scans all companies in parallel, finds new jobs, generates PDF digest.
-    Returns stats dict.
+
+    Smart hybrid mode:
+      - Companies already scanned by background workers (scan_worker /
+        fullscan_worker) within the last 24 h are skipped — their results
+        are already in the DB as status='new'.
+      - Companies workers missed (crashed, backlog, never started) get a
+        fallback re-fetch so the digest is never incomplete.
+      - Digest is always generated from DB at the end regardless.
+
+    Normal day (workers healthy):   0 re-fetches → email at ~7:02 AM
+    Workers partially failed:       only missed companies re-fetched → still fast
+    Workers completely down:        all companies re-fetched → email at ~7:30 AM
     """
     init_logging("monitor")
     start_time = time.time()
     logger.info("════════════════════════════════════════")
-    logger.info("--monitor-jobs starting (parallel mode, max_workers=%d)",
+    logger.info("--monitor-jobs starting (smart hybrid mode, max_workers=%d)",
                 MONITOR_MAX_WORKERS)
 
     init_db()
@@ -204,19 +277,33 @@ def run():
         print(f"[INFO] Skipping {skipped} company/companies with "
               f"unknown/unverified ATS — run --detect-ats to fix")
 
-    logger.info("Loaded %d monitorable companies (%d total in DB)",
-                len(companies), len(all_companies))
+    # ── Split: covered by workers vs missed ───────────────────────────────────
+    missed       = _get_worker_missed_companies(companies)
+    missed_names = {c["company"] for c in missed}   # O(1) lookups
+    covered      = [c for c in companies if c["company"] not in missed_names]
+
+    logger.info(
+        "Loaded %d monitorable companies (%d total in DB) | "
+        "worker-covered=%d  missed=%d",
+        len(companies), len(all_companies), len(covered), len(missed),
+    )
 
     print(f"\n{'='*55}")
     print(f"[INFO] Job Monitor — {datetime.now().strftime('%B %d, %Y')}")
-    print(f"[INFO] Monitoring {len(companies)} companies "
-          f"(parallel, {MONITOR_MAX_WORKERS} workers)")
+    print(f"[INFO] {len(companies)} companies total | "
+          f"{len(covered)} covered by workers | "
+          f"{len(missed)} need fallback fetch")
+    if missed:
+        print(f"[INFO] Fallback re-fetching: "
+              f"{', '.join(c['company'] for c in missed[:5])}"
+              f"{'...' if len(missed) > 5 else ''}")
     print(f"{'='*55}\n")
 
     # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
-        "companies_monitored":    0,
-        "companies_with_results": 0,
+        "companies_monitored":    len(covered),   # pre-credit covered companies
+        "covered_by_workers":     len(covered),   # for coverage alert numerator
+        "companies_with_results": 0,              # incremented only when fallback fetch returns jobs
         "companies_unknown_ats":  0,
         "api_failures":           0,
         "total_jobs_fetched":     0,
@@ -226,42 +313,46 @@ def run():
     }
     stats_lock = threading.Lock()
 
-    # ── Run companies in parallel ──────────────────────────
-    with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _process_company, company_row, i + 1, len(companies)
-            ): company_row["company"]
-            for i, company_row in enumerate(companies)
-        }
+    # ── Fallback re-fetch (only for companies workers missed) ─────────────────
+    if missed:
+        logger.info("Fallback re-fetching %d companies workers missed", len(missed))
+        with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    _process_company, company_row, i + 1, len(missed)
+                ): company_row["company"]
+                for i, company_row in enumerate(missed)
+            }
 
-        for future in as_completed(futures):
-            company = futures[future]
-            try:
-                company_stats = future.result()
-            except Exception as e:
-                logger.error("Unhandled error in worker for %r: %s",
-                             company, e, exc_info=True)
-                company_stats = {
-                    "monitored": 1, "with_results": 0,
-                    "unknown_ats": 0, "failed": 1,
-                    "fetched": 0, "matched": 0, "new": 0,
-                    "failure_name": company,
-                }
+            for future in as_completed(futures):
+                company = futures[future]
+                try:
+                    company_stats = future.result()
+                except Exception as e:
+                    logger.error("Unhandled error in fallback worker for %r: %s",
+                                 company, e, exc_info=True)
+                    company_stats = {
+                        "monitored": 1, "with_results": 0,
+                        "unknown_ats": 0, "failed": 1,
+                        "fetched": 0, "matched": 0, "new": 0,
+                        "failure_name": company,
+                    }
 
-            # Accumulate stats thread-safely
-            with stats_lock:
-                stats["companies_monitored"]    += company_stats.get("monitored",    0)
-                stats["companies_with_results"] += company_stats.get("with_results", 0)
-                stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",  0)
-                stats["api_failures"]           += company_stats.get("failed",       0)
-                stats["total_jobs_fetched"]     += company_stats.get("fetched",      0)
-                stats["jobs_matched_filters"]   += company_stats.get("matched",      0)
-                stats["new_jobs_found"]         += company_stats.get("new",          0)
-                if company_stats.get("failure_name"):
-                    stats["api_failure_list"].append(
-                        company_stats["failure_name"]
-                    )
+                with stats_lock:
+                    stats["companies_monitored"]    += company_stats.get("monitored",    0)
+                    stats["companies_with_results"] += company_stats.get("with_results", 0)
+                    stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",  0)
+                    stats["api_failures"]           += company_stats.get("failed",       0)
+                    stats["total_jobs_fetched"]     += company_stats.get("fetched",      0)
+                    stats["jobs_matched_filters"]   += company_stats.get("matched",      0)
+                    stats["new_jobs_found"]         += company_stats.get("new",          0)
+                    if company_stats.get("failure_name"):
+                        stats["api_failure_list"].append(
+                            company_stats["failure_name"]
+                        )
+    else:
+        logger.info("All %d companies covered by workers — skipping re-fetch",
+                    len(covered))
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -657,15 +748,20 @@ def _build_alerts(stats, total_companies):
     alerts = []
 
     if total_companies > 0:
-        coverage = stats["companies_with_results"] / total_companies
+        # covered_by_workers: scanned by background workers (data already in DB)
+        # companies_with_results: of the missed companies, those that returned
+        #   jobs in the fallback fetch.  Sum = total companies with any data.
+        covered_count = stats.get("covered_by_workers", 0)
+        companies_with_data = covered_count + stats["companies_with_results"]
+        coverage = companies_with_data / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)
             logger.warning("Coverage alert: %d%%", pct)
             alerts.append({
                 "level":   "warning",
                 "message": f"Coverage {pct}% — only "
-                           f"{stats['companies_with_results']}/"
-                           f"{total_companies} companies returned jobs",
+                           f"{companies_with_data}/"
+                           f"{total_companies} companies have data",
             })
 
         unknown_rate = stats["companies_unknown_ats"] / total_companies
