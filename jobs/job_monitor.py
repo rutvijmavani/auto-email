@@ -175,21 +175,44 @@ def _should_fetch_detail(job, platform, config, slug_info=None):
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────
 
-def _get_worker_missed_companies(companies: list, window_s: int = 86400) -> list:
+def _get_worker_missed_companies(companies: list) -> list:
     """
     Return the subset of companies that background workers have NOT scanned
-    within the last window_s seconds (default 24 h).
+    since the start of the current monitoring cycle (default 7 AM ET).
 
     Used by run() to decide which companies need a fallback re-fetch.
     Companies covered by scan_worker / fullscan_worker are skipped so
     --monitor-jobs only does real HTTP work when the workers fell behind.
 
-    A company is considered covered if company_poll_stats.last_poll_at
-    is recent enough (>= now - window_s).  Companies with no stats row
-    (never scanned) are always treated as missed.
+    Cycle boundary: the most recent CYCLE_START_HOUR (7 AM) in SEND_TIMEZONE
+    (America/New_York).  A company is considered covered if
+    company_poll_stats.last_poll_at is on or after that boundary.
+    Companies with no stats row (never scanned) are always treated as missed.
+
+    Using the fixed 7 AM boundary rather than a rolling now-86400 window
+    avoids a 5-minute edge case where companies polled just after yesterday's
+    7 AM would be falsely flagged as missed when the digest runs a few minutes
+    after 7 AM.
     """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    from datetime import datetime as _dt, timedelta
+    from config import CYCLE_START_HOUR, SEND_TIMEZONE
     from db.db import get_conn
-    cutoff = time.time() - window_s
+
+    tz = ZoneInfo(SEND_TIMEZONE)
+    now_dt = _dt.now(tz)
+    today_cycle = now_dt.replace(
+        hour=CYCLE_START_HOUR, minute=0, second=0, microsecond=0
+    )
+    if now_dt < today_cycle:
+        # Before 7 AM today — cycle started yesterday at 7 AM
+        cycle_start_ts = (today_cycle - timedelta(days=1)).timestamp()
+    else:
+        cycle_start_ts = today_cycle.timestamp()
+
     company_names = [c["company"] for c in companies]
 
     conn = get_conn()
@@ -209,7 +232,7 @@ def _get_worker_missed_companies(companies: list, window_s: int = 86400) -> list
     for company_row in companies:
         name      = company_row["company"]
         last_poll = poll_map.get(name, 0)
-        if last_poll < cutoff:
+        if last_poll < cycle_start_ts:
             missed.append(company_row)
 
     return missed
@@ -279,7 +302,8 @@ def run():
     # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
         "companies_monitored":    len(covered),   # pre-credit covered companies
-        "companies_with_results": len(covered),   # pre-credit: workers already scanned these
+        "covered_by_workers":     len(covered),   # for coverage alert numerator
+        "companies_with_results": 0,              # incremented only when fallback fetch returns jobs
         "companies_unknown_ats":  0,
         "api_failures":           0,
         "total_jobs_fetched":     0,
@@ -724,15 +748,20 @@ def _build_alerts(stats, total_companies):
     alerts = []
 
     if total_companies > 0:
-        coverage = stats["companies_with_results"] / total_companies
+        # covered_by_workers: scanned by background workers (data already in DB)
+        # companies_with_results: of the missed companies, those that returned
+        #   jobs in the fallback fetch.  Sum = total companies with any data.
+        covered_count = stats.get("covered_by_workers", 0)
+        companies_with_data = covered_count + stats["companies_with_results"]
+        coverage = companies_with_data / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)
             logger.warning("Coverage alert: %d%%", pct)
             alerts.append({
                 "level":   "warning",
                 "message": f"Coverage {pct}% — only "
-                           f"{stats['companies_with_results']}/"
-                           f"{total_companies} companies returned jobs",
+                           f"{companies_with_data}/"
+                           f"{total_companies} companies have data",
             })
 
         unknown_rate = stats["companies_unknown_ats"] / total_companies

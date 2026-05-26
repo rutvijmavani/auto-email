@@ -1048,8 +1048,25 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 
             next_scan_at = now + interval_s + jitter_s
 
-            # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted
-            _complete_fullscan_db(company, platform, new_count, interval_s + jitter_s)
+            # Clamp: even after safe-zone ±10% jitter, the scheduled time
+            # can still land in the 5–7 AM danger window.
+            # Example: completion at 3 AM ET + 24h + 10% jitter = 5:24 AM ET.
+            # Pull it back to just before safe_cutoff_s (4:59:59 AM ET).
+            dt_next      = datetime.fromtimestamp(next_scan_at, tz=ZoneInfo(SEND_TIMEZONE))
+            next_time_s  = dt_next.hour * 3600 + dt_next.minute * 60 + dt_next.second
+            if safe_cutoff_s <= next_time_s < digest_cutoff_s:
+                overshoot_s  = next_time_s - safe_cutoff_s + 1   # 1 s margin
+                next_scan_at -= overshoot_s
+                logger.debug(
+                    "fullscan: clamped next_scan_at for %r "
+                    "(was %s ET, inside 5–7 AM danger window — pulled back %ds)",
+                    company, dt_next.strftime("%H:%M"), overshoot_s,
+                )
+
+            # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted.
+            # Pass delta from now so next_full_scan_at reflects the clamped time.
+            # full_scan_interval_s (base 86400) is NOT updated here — it stays clean.
+            _complete_fullscan_db(company, platform, new_count, int(next_scan_at - now))
 
             r.zadd(REDIS_POLL_FULLSCAN, {company: next_scan_at})
 
