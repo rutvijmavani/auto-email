@@ -38,6 +38,31 @@ _US_REMOTE = {"remote", "work from home", "wfh", "anywhere"}
 # the required "new england" exclusion so "Boston, New England" isn't rejected.
 _NON_US_ALIASES = frozenset({"uk", "emea"})
 
+# Cities whose current or common names are NOT reliably present in geonamescache
+# (typically because the city was renamed after geonamescache's data snapshot, or
+# the alternative spelling is in common ATS use).  All entries are unambiguously
+# non-US — no US city shares these names.  Checked at Signal 4.6, after country-
+# name checks (Signal 4) and UK-constituent checks (Signal 4.5), before the
+# SimpleMaps and geonamescache city lookups.
+#
+# Key cases:
+#   bangalore   → official name is now Bengaluru (renamed 2006); geonamescache
+#                 stores "Bengaluru" as primary — "Bangalore" falls through to
+#                 Signal 8 default → True (confirmed leak in diagnostic).
+#   bombay/madras/calcutta → pre-1990s names for Mumbai/Chennai/Kolkata
+#   gurgaon     → former name for Gurugram; may not be in geonamescache
+#   noida       → satellite city near Delhi; primary name, but smaller datasets
+#                 may omit it
+_NON_US_CITY_OVERRIDES = frozenset({
+    "bangalore",    # Bengaluru, India (renamed 2006)
+    "bombay",       # Mumbai, India (renamed 1995)
+    "calcutta",     # Kolkata, India (renamed 2001)
+    "madras",       # Chennai, India (renamed 1996)
+    "gurgaon",      # Gurugram, India (renamed 2016)
+    "trivandrum",   # Thiruvananthapuram, India
+    "noida",        # Gautam Buddha Nagar, India
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lazy-loaded location data (computed once on first use, cached forever)
@@ -209,6 +234,10 @@ def is_us_location(location: str) -> bool:
         4.   Non-US country name           → False  (India, Germany, Canada …)
         4.5. UK constituent nations        → False  (England, Scotland, Wales,
                                                      Northern Ireland; "New England" excluded)
+        4.6. Non-US city name overrides   → False  (Bangalore/Bengaluru, Bombay/Mumbai,
+                                                     Calcutta/Kolkata, Madras/Chennai,
+                                                     Gurgaon/Gurugram, Noida, Trivandrum;
+                                                     renamed cities geonamescache may miss)
         5.   SimpleMaps US city lookup     → True   (San Francisco, Austin …)
         6.   geonamescache city → country  → True/False  (set-based; prefers US when
                                                           city exists in multiple countries)
@@ -317,6 +346,15 @@ def is_us_location(location: str) -> bool:
     if "england" in phrases and "new england" not in phrases:
         return False
     if any(p in {"scotland", "wales", "northern ireland"} for p in phrases):
+        return False
+
+    # ── Signal 4.6: Non-US city name overrides ────────────────────────────
+    # Catches renamed cities (e.g. "Bangalore" → Bengaluru) and other well-
+    # known non-US cities whose alternative names geonamescache may not have
+    # indexed.  Signal 4 already handles country names; this signal covers
+    # city-level gaps.  All entries in _NON_US_CITY_OVERRIDES are unambiguously
+    # non-US so no exclusion logic is needed.
+    if any(p in _NON_US_CITY_OVERRIDES for p in phrases):
         return False
 
     # ── Signal 5: SimpleMaps US city lookup ──────────────────────────────

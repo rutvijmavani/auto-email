@@ -2,16 +2,16 @@
 # logs/view_logs.py — Pipeline log viewer for debugging
 #
 # Usage:
-#   python logs/view_logs.py                     # show today's logs (all commands)
-#   python logs/view_logs.py --tail              # live tail pipeline.log
-#   python logs/view_logs.py --cmd monitor       # today's monitor log
-#   python logs/view_logs.py --cmd detect        # today's detect log
-#   python logs/view_logs.py --errors            # errors + warnings only
-#   python logs/view_logs.py --company "Stripe"  # filter by company name
-#   python logs/view_logs.py --since 2h          # last 2 hours
-#   python logs/view_logs.py --since 30m         # last 30 minutes
-#   python logs/view_logs.py --summary           # run summary (counts per level)
-#   python logs/view_logs.py --date 2026-03-11   # specific date
+#   python utils/view_logs.py                     # show today's logs (all commands)
+#   python utils/view_logs.py --tail              # live tail pipeline_YYYY-MM-DD.log
+#   python utils/view_logs.py --cmd monitor       # today's monitor log
+#   python utils/view_logs.py --cmd detect        # today's detect log
+#   python utils/view_logs.py --errors            # errors + warnings only
+#   python utils/view_logs.py --company "Stripe"  # filter by company name
+#   python utils/view_logs.py --since 2h          # last 2 hours
+#   python utils/view_logs.py --since 30m         # last 30 minutes
+#   python utils/view_logs.py --summary           # run summary (counts per level)
+#   python utils/view_logs.py --date 2026-03-11   # specific date
 
 import argparse
 import os
@@ -189,21 +189,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python logs/view_logs.py                       # today's full log
-  python logs/view_logs.py --tail                # live tail
-  python logs/view_logs.py --cmd monitor         # monitor log only
-  python logs/view_logs.py --cmd detect          # detect log only
-  python logs/view_logs.py --errors              # warnings + errors only
-  python logs/view_logs.py --company "Stripe"    # filter by company
-  python logs/view_logs.py --since 2h            # last 2 hours
-  python logs/view_logs.py --summary             # counts per level
-  python logs/view_logs.py --date 2026-03-11     # specific date
+  python utils/view_logs.py                       # today's full log
+  python utils/view_logs.py --tail                # live tail
+  python utils/view_logs.py --cmd monitor         # monitor log only
+  python utils/view_logs.py --cmd detect          # detect log only
+  python utils/view_logs.py --errors              # warnings + errors only
+  python utils/view_logs.py --company "Stripe"    # filter by company
+  python utils/view_logs.py --since 2h            # last 2 hours
+  python utils/view_logs.py --summary             # counts per level
+  python utils/view_logs.py --date 2026-03-11     # specific date
         """,
     )
     parser.add_argument("--cmd",     choices=["monitor", "detect", "sync", "find"],
                         help="Show only this command's log")
     parser.add_argument("--tail",    action="store_true",
-                        help="Live tail (default: pipeline.log)")
+                        help="Live tail (default: today's pipeline_YYYY-MM-DD.log; use --cmd to tail a specific command log)")
     parser.add_argument("--errors",  action="store_true",
                         help="Show WARNING and ERROR lines only")
     parser.add_argument("--company", type=str,
@@ -228,7 +228,7 @@ Examples:
     # ── --tail ──
     if args.tail:
         path = (get_log_file(args.cmd, date_str)
-                if args.cmd else LOG_DIR / "pipeline.log")
+                if args.cmd else LOG_DIR / f"pipeline_{date_str}.log")
         do_tail(path)
         return
 

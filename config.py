@@ -32,6 +32,17 @@ QUOTA_EXHAUSTED_THRESHOLD     = 0      # alert if remaining = 0
 QUOTA_ALERT_CONSECUTIVE_DAYS  = 3      # consecutive days to trigger alert
 
 # ─────────────────────────────────────────
+# LOG FILE RETENTION (days)
+# ─────────────────────────────────────────
+# Daily command logs (monitor, outreach, sync, verify_filled …)
+LOG_RETENTION_DAILY_DAYS   = 14
+
+# Monthly command logs (monthly, enrich, build_ats_slug_list)
+# 35 days = 1 month + 4-day buffer so the next month's log is always
+# written before the previous month's is deleted.
+LOG_RETENTION_MONTHLY_DAYS = 35
+
+# ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
 # ─────────────────────────────────────────
 RETENTION_OUTREACH_SENT        = 30

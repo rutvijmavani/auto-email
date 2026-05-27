@@ -92,6 +92,30 @@ logger = get_logger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
+# Keys that fetch_job_detail() checks in its guard clause before making any
+# HTTP request.  If any of these are absent from the queue payload, the
+# function returns the original job dict silently — no API call is made,
+# no location or description is filled, and the job may pass location
+# filters with empty strings.
+#
+# Used by the pre-flight audit in _process_detail() to log a WARNING before
+# the call so the gap is visible in logs even when the job ends up "new".
+#
+# Keep in sync with each ATS module's fetch_job_detail() guard clause.
+_REQUIRED_DETAIL_KEYS: dict = {
+    # if not all([slug, wd, path, external_path]): return job
+    "workday":         ["_slug", "_wd", "_path", "_external_path"],
+    # if not base_url or not contest_no: return job
+    "taleo":           ["_base_url", "_contest_no"],
+    # if not job_id or not company_slug: return job
+    "smartrecruiters": ["_company_slug"],
+    # guard is `if not job_url` — but _base_url doubles as the
+    # should_fetch_detail() gate key so we still check it here
+    "icims":           ["_base_url"],
+    # guard is `if not job_url`; _slug is only the gate key
+    "jobvite":         ["_slug"],
+}
+
 # Per-ATS semaphores for detail fetches — each detail_worker makes one
 # HTTP call per job, so semaphores throttle cross-worker pressure on
 # the same ATS domain. Import lazily to avoid circular imports.
@@ -182,6 +206,46 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         detail_attempted = should_fetch_detail(job, platform, config, slug_info)
 
         if detail_attempted:
+            # ── Pre-flight key audit ──────────────────────────────────────────
+            # Each fetch_job_detail() has a guard clause that returns the
+            # original job dict unchanged if required keys are absent.  That
+            # silent return is indistinguishable from a successful fetch in
+            # downstream code — log a WARNING here so we catch payload gaps
+            # before they produce empty-location jobs in the digest.
+            #
+            # Keys that, if missing, cause fetch_job_detail to return immediately
+            # WITHOUT making an HTTP request (derived from each module's guard):
+            #   workday:         not all([_slug, _wd, _path, _external_path])
+            #   taleo:           not _base_url or not _contest_no
+            #   smartrecruiters: not job_id or not _company_slug
+            #   icims:           not job_url  (job_url always in payload — safety)
+            #   jobvite:         not job_url  (same; _slug is only gate key)
+            _missing = [
+                k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
+                if not job.get(k)
+            ]
+            if _missing:
+                logger.warning(
+                    "detail_worker: MISSING required keys — fetch_job_detail "
+                    "guard will fire with NO HTTP request made. "
+                    "platform=%s company=%r job_id=%s missing_keys=%s "
+                    "payload_underscore_keys=%s",
+                    platform, company, job_id, _missing,
+                    [k for k in job if k.startswith("_") and job.get(k)],
+                )
+            else:
+                logger.debug(
+                    "detail_worker: detail fetch starting "
+                    "platform=%s company=%r job_id=%s",
+                    platform, company, job_id,
+                )
+
+            # Snapshot fields that fetch_job_detail() should enrich so we can
+            # detect a silent no-op return after the call completes.
+            _snap_loc  = job.get("location", "")
+            _snap_cc   = job.get("_country_code", "")
+            _snap_desc = job.get("description", "")
+
             # Phase 10 — api_health context tagging:
             # Tag all ats_get() calls inside fetch_job_detail() with the
             # correct context so backoff retries don't pollute the baseline.
@@ -219,6 +283,36 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     return result
                 finally:
                     set_request_context("normal")   # always reset
+
+            # ── Post-fetch enrichment audit ───────────────────────────────────
+            # If none of the key fields changed, fetch_job_detail silently
+            # returned the original job without making an HTTP request (guard
+            # fired) OR the API was called but returned empty data.  Either
+            # way, log at WARNING so it shows up in scheduler_{date}.log.
+            _enriched = (
+                job.get("description",   "") != _snap_desc
+                or job.get("location",   "") != _snap_loc
+                or job.get("_country_code", "") != _snap_cc
+            )
+            if _enriched:
+                logger.debug(
+                    "detail_worker: fetch_job_detail enriched job — "
+                    "location=%r cc=%r desc_chars=%d "
+                    "platform=%s company=%r job_id=%s",
+                    job.get("location"), job.get("_country_code"),
+                    len(job.get("description") or ""),
+                    platform, company, job_id,
+                )
+            else:
+                logger.warning(
+                    "detail_worker: fetch_job_detail returned NO new data "
+                    "(location/cc/description unchanged). "
+                    "Guard may have fired or API returned empty. "
+                    "platform=%s company=%r job_id=%s "
+                    "location=%r cc=%r",
+                    platform, company, job_id,
+                    job.get("location"), job.get("_country_code"),
+                )
 
         # ── 3. Filter pipeline ────────────────────────────────────────────────
 

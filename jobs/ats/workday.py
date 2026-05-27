@@ -2,9 +2,12 @@
 # Date field: postedOn (RELIABLE — original posting date)
 # Risk: undocumented — monitor for structural changes
 
+import logging
 from datetime import datetime
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.utils import clean_html
+
+logger = logging.getLogger(__name__)
 
 
 WD_VARIANTS = [
@@ -188,10 +191,19 @@ def fetch_job_detail(job):
 
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
+        logger.debug(
+            "workday.fetch_job_detail: API returned None/empty for %r | %s | url=%s",
+            job.get("company"), job.get("job_id"), url,
+        )
         return job
 
     info = data.get("jobPostingInfo", {})
     if not info:
+        logger.debug(
+            "workday.fetch_job_detail: jobPostingInfo absent/empty for %r | %s "
+            "| top-level keys=%s",
+            job.get("company"), job.get("job_id"), list(data.keys()),
+        )
         return job
 
     job = dict(job)
@@ -217,6 +229,21 @@ def fetch_job_detail(job):
     location = _build_detail_location(info)
     if location:
         job["location"] = location
+
+    # ── Debug: log when both location and _country_code are absent ────────
+    # This reveals ATCI / non-standard Workday job structures where the detail
+    # API uses different field names than the parser expects.
+    if not alpha2 and not location:
+        logger.debug(
+            "workday.fetch_job_detail: no location/alpha2 extracted for %r | %s "
+            "| jobPostingInfo keys=%s | jobRequisitionLocation=%r "
+            "| info.location=%r | info.country=%r",
+            job.get("company"), job.get("job_id"),
+            list(info.keys()),
+            info.get("jobRequisitionLocation"),
+            info.get("location"),
+            info.get("country"),
+        )
 
     return job
 
