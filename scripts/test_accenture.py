@@ -83,7 +83,7 @@ if not row:
 
 raw_slug = row["ats_slug"]
 platform = row["ats_platform"]
-print(f"  company     : accenture")
+print("  company     : accenture")
 print(f"  ats_platform: {platform}")
 print(f"  raw ats_slug: {raw_slug!r}")
 
@@ -115,7 +115,8 @@ try:
     all_jobs = fetch_jobs(slug_info, "accenture")
 except Exception as e:
     print(f"[ERROR] fetch_jobs raised: {e}")
-    import traceback; traceback.print_exc()
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
 
 sample = all_jobs[:SAMPLE_SIZE]
@@ -125,7 +126,7 @@ print(f"  Testing first       : {len(sample)}")
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 3 — Run each job through both broken and fixed fetch_job_detail
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"\nStep 3 — fetch_job_detail: BROKEN vs FIXED, then is_us_location()")
+print("\nStep 3 — fetch_job_detail: BROKEN vs FIXED, then is_us_location()")
 print(SEP)
 print(
     f"  {'#':<3}  {'job_id':<20}  "
@@ -220,7 +221,7 @@ for i, job in enumerate(sample, 1):
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 4 — Show a few full job details (title + location + filter decision)
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"\nStep 4 — Full detail for first 5 jobs (FIXED path)")
+print("\nStep 4 — Full detail for first 5 jobs (FIXED path)")
 print(SEP)
 
 for i, job in enumerate(sample[:5], 1):
@@ -263,11 +264,11 @@ print("  SUMMARY")
 print(DSEP)
 print(f"  Jobs tested          : {len(sample)}")
 print()
-print(f"  BROKEN (old worker — missing _slug/_wd/_path):")
+print("  BROKEN (old worker — missing _slug/_wd/_path):")
 print(f"    ✗ India/non-US leaked (is_us=True, no real location fetched) : {broken_leaked}")
-print(f"    ✓ US jobs correctly passed                                    : {broken_us_ok}")
+print(f"    ✓ Jobs correctly filtered even on broken path (is_us=False)  : {broken_us_ok}")
 print()
-print(f"  FIXED  (new worker — all four keys present):")
+print("  FIXED  (new worker — all four keys present):")
 print(f"    ✓ India/non-US jobs filtered (is_us=False)                    : {fixed_filtered}")
 print(f"    ✓ US jobs correctly passed   (is_us=True)                     : {fixed_us_ok}")
 if fixed_leaked:

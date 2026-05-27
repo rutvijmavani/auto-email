@@ -442,9 +442,11 @@ class TestClaimStaleWorkP95Safety(unittest.TestCase):
             # Bug already fixed — great
             self.skipTest("p95_ms None-safety already implemented in scheduler.py")
         elif has_unsafe:
-            # Document the known risk (test passes to acknowledge the issue)
-            # Change this to self.fail() to enforce fixing it
-            pass
+            self.fail(
+                "Unsafe 'p95_ms * 3' still present in scheduler.py — "
+                "if p95_ms is None (no api_health data yet) this raises TypeError "
+                "and crashes the claim loop. Fix: replace with '(p95_ms or 0) * 3'."
+            )
         else:
             self.skipTest("p95_ms expression not found in scheduler.py")
 

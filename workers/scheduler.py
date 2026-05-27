@@ -222,7 +222,7 @@ def claim_stale_work(r, stream_key: str, group: str,
         op_type:     "scan" | "fullscan" — controls which ZSET to use for backoff
     """
     from workers.scan_worker import _get_backoff_delay   # hoisted — used in dead-letter path
-    idle_ms = max(p95_ms * 3, 300_000)   # at least 5 min, scales with p95
+    idle_ms = max((p95_ms or 0) * 3, 300_000)   # at least 5 min, scales with p95; guard against None
 
     try:
         # XAUTOCLAIM: returns (next_start_id, [(msg_id, fields), ...], [deleted_ids])

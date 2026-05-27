@@ -194,7 +194,8 @@ if not jobs_to_test:
             sys.exit(0)
     except Exception as e:
         print(f"  [ERROR] DB query failed: {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
@@ -279,7 +280,8 @@ for idx, (source, payload) in enumerate(jobs_to_test, 1):
                 after_job = ats_module.fetch_job_detail(dict(payload))
         except Exception as exc:
             print(f"       [ERROR] fetch_job_detail raised: {exc}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             results.append({"company": company, "job_id": job_id,
                             "platform": platform, "outcome": "exception"})
             continue

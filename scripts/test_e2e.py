@@ -610,7 +610,7 @@ def stage_detail_worker_mode_b():
 
     b_us = is_us_location(b_loc)
     if b_us:
-        info(f"is_us_location('') = True  → broken path leaks non-US jobs as 'US' ✗")
+        info("is_us_location('') = True  → broken path leaks non-US jobs as 'US' ✗")
     else:
         info(f"is_us_location({b_loc!r}) = False  → broken path correctly filtered (unusual)")
 
@@ -674,7 +674,7 @@ def stage_detail_worker_mode_b():
 # ===========================================================
 
 def stage_fullscan():
-    header(6, f"FULLSCAN WORKER -- full scan ({INCR_COMPANY}, Greenhouse)")
+    header(7, f"FULLSCAN WORKER -- full scan ({INCR_COMPANY}, Greenhouse)")
 
     from workers.redis_client import get_redis
     from workers.fullscan import _run_fullscan, _BloomPair
@@ -771,7 +771,7 @@ def stage_fullscan():
 # ===========================================================
 
 def stage_watchdog():
-    header(7, "WATCHDOG -- hung worker + stream PEL checks")
+    header(8, "WATCHDOG -- hung worker + stream PEL checks")
 
     # NOTE: check_orphans() / track_inflight() / clear_inflight() were removed
     # in the two-layer scheduler redesign (Section 5).  PEL + claim_stale_work()
@@ -822,7 +822,7 @@ def stage_watchdog():
 # ===========================================================
 
 def stage_redis_signal():
-    header(8, "REDIS SIGNAL -- pause / heartbeat / resume")
+    header(9, "REDIS SIGNAL -- pause / heartbeat / resume")
 
     from scripts.redis_signal import cmd_pause, cmd_heartbeat, cmd_resume
     from workers.redis_client import get_redis
@@ -895,7 +895,7 @@ def stage_redis_signal():
 # ===========================================================
 
 def stage_cleanup():
-    header(9, "CLEANUP -- remove synthetic test data")
+    header(10, "CLEANUP -- remove synthetic test data")
 
     from db.db import get_conn
     from workers.redis_client import get_redis
