@@ -17,6 +17,7 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 
 from outreach.report_templates.base import send_report_email
+from config import JOB_MONITOR_PDF_RETENTION
 
 # ── Colors ──
 NAVY    = colors.HexColor("#0f172a")
@@ -887,6 +888,41 @@ def _build_adaptive_health_section() -> str:
     return "".join(sections)
 
 
+def _purge_old_digests():
+    """
+    Delete PDF digest files older than JOB_MONITOR_PDF_RETENTION days.
+    Runs once per digest cycle, just before the new PDF is written.
+    Silently skips missing files or permission errors so a cleanup failure
+    never blocks the digest from being sent.
+    """
+    import glob as _glob
+    from datetime import timedelta
+
+    cutoff = datetime.now() - timedelta(days=JOB_MONITOR_PDF_RETENTION)
+    pattern = os.path.join(DIGESTS_DIR, "jobs_digest_*.pdf")
+    deleted = 0
+
+    for pdf_file in _glob.glob(pattern):
+        basename = os.path.basename(pdf_file)
+        # Extract date from filename: jobs_digest_YYYY-MM-DD.pdf
+        try:
+            date_part = basename[len("jobs_digest_"):-len(".pdf")]
+            file_date = datetime.strptime(date_part, "%Y-%m-%d")
+        except ValueError:
+            continue   # filename doesn't match expected pattern — leave it
+
+        if file_date < cutoff:
+            try:
+                os.remove(pdf_file)
+                deleted += 1
+            except OSError as exc:
+                print(f"[WARN] Could not delete old digest {basename}: {exc}")
+
+    if deleted:
+        print(f"[OK] Purged {deleted} digest PDF(s) older than "
+              f"{JOB_MONITOR_PDF_RETENTION} days")
+
+
 def build_monitor_report(new_postings, stats, alerts):
     """
     Build PDF digest and send as email attachment.
@@ -907,6 +943,18 @@ def build_monitor_report(new_postings, stats, alerts):
         DIGESTS_DIR,
         f"jobs_digest_{datetime.now().strftime('%Y-%m-%d')}.pdf"
     )
+
+    # ── Purge old digest PDFs (retention policy) ──────────────────────────────
+    _purge_old_digests()
+
+    # ── Align stats so PDF header matches email body ───────────────────────────
+    # stats["new_jobs_found"] counts only jobs discovered in the foreground
+    # --monitor-jobs fallback scan.  With the background scheduler running,
+    # most jobs arrive via scan_worker/detail_worker before --monitor-jobs
+    # runs, so new_jobs_found << len(new_postings).  Override it here so the
+    # PDF header and the email subject/body all show the same number.
+    stats = dict(stats)   # don't mutate caller's dict
+    stats["new_jobs_found"] = len(new_postings)
 
     # ── Group jobs by company ──
     jobs_by_company = defaultdict(list)

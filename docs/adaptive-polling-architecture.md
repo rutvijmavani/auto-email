@@ -2161,13 +2161,33 @@ CREATE TABLE IF NOT EXISTS adaptive_poll_metrics (
 ### Daily cycle start (7 AM)
 
 ```
-1. Digest email sent with all status='new' jobs
-2. UPDATE job_postings SET status='digested' WHERE status='new'
+1. --monitor-jobs runs (cron at 7:00 AM)
+
+   Smart hybrid mode:
+   a. Query company_poll_stats for each company.
+      "Covered"  = last_full_scan_at >= (now - 24h)   ← fullscan completed overnight
+      "Missed"   = last_full_scan_at <  (now - 24h)   ← fullscan worker fell behind
+      Field: last_full_scan_at (written by on_fullscan_complete — exhaustive all-pages).
+             NOT last_poll_at (adaptive scan — uses smart early exit, may miss pages).
+      Note: the coverage window is 24h rolling, NOT fixed at "today 7:00 AM".
+            Using today_cycle.timestamp() would classify every overnight fullscan as
+            "missed" because last_full_scan_at (e.g. 4 AM) < cycle_start (7:00:00 AM).
+
+   b. Fallback re-fetch — only for missed companies
+      Normal day (workers healthy): 0 re-fetches → digest at ~7:02 AM
+      Workers partially down:       re-fetch only the missed subset → still fast
+      Workers completely down:      re-fetch all companies → digest at ~7:30 AM
+
+   c. PDF digest built from ALL status='new' rows in DB
+      (covers both worker-found and fallback-found jobs)
+
+2. Digest email sent with all status='new' jobs
+3. UPDATE job_postings SET status='digested' WHERE status='new'
    (send FIRST, mark digested AFTER — prevents silent loss if send fails)
-3. cycle_start Unix timestamp written to Redis: SET cycle:start {timestamp}
-4. Dynamic worker count calculated and applied
-5. Adaptive polling workers already running — they continue uninterrupted
-6. Full scan scheduler begins dispatching based on score-ascending order
+4. cycle_start Unix timestamp written to Redis: SET cycle:start {timestamp}
+5. Dynamic worker count calculated and applied
+6. Adaptive polling workers already running — they continue uninterrupted
+7. Full scan scheduler begins dispatching based on score-ascending order
    (after each company's adaptive poll completes for the day)
 ```
 

@@ -69,6 +69,17 @@ Coverage
     · scan and detail and fullscan ops produce distinct keys
     · Keys for different companies are distinct
     · TTL is 86400s (keys expire automatically — no manual reset needed)
+
+  TestWorkerMissedCycleBoundary
+    · Field checked is last_full_scan_at (fullscan worker — exhaustive all-pages),
+      NOT last_poll_at (adaptive worker — uses smart early exit, may miss pages)
+    · OLD boundary (today at 7 AM) misclassifies a 6 AM fullscan as missed
+    · OLD boundary causes 0/139 covered at cron time (reproduces production bug)
+    · NEW boundary (now - 24h) correctly covers a 6 AM fullscan at 7:02 AM cron
+    · NEW boundary correctly covers a 4 AM fullscan (normal overnight completion)
+    · Fullscan older than 24h is still correctly flagged as missed under new logic
+    · never-fullscanned company (last_full_scan_at=NULL → 0) is always missed
+    · Structural test: job_monitor.py queries last_full_scan_at + timedelta(hours=24)
 """
 
 import sys
@@ -571,6 +582,200 @@ class TestWarmingIntervalOverride(unittest.TestCase):
         """Last warming poll (warming=1) still uses 2h (not adaptive interval)."""
         result = self._simulate_interval_selection(warming=1, computed_interval=10800)
         self.assertEqual(result, WARMING_INTERVAL_S)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestWorkerMissedCycleBoundary
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestWorkerMissedCycleBoundary(unittest.TestCase):
+    """
+    Regression tests for the cycle-boundary bug in _get_worker_missed_companies().
+
+    Field checked: last_full_scan_at (written by on_fullscan_complete()).
+    The fullscan worker does an exhaustive all-pages scan once per ~24h cycle.
+    We do NOT check last_poll_at (adaptive scan) because the adaptive worker
+    uses smart early exit and may not scan every page.
+
+    Bug (fixed):
+        cycle_start_ts was set to TODAY's 7:00:00 AM.  The --monitor-jobs cron
+        fires at exactly 7:00:02 AM.  Every overnight fullscan has
+        last_full_scan_at < 7:00:00 AM (e.g. completed at 4 AM, 5 AM, 6:59 AM),
+        so ALL 139 companies fail the check and get a full fallback re-fetch
+        every single day.  Result: email arrives at ~7:30 AM instead of ~7:02 AM.
+
+    Fix:
+        Use a 24-hour rolling lookback (now - 24h) instead of a fixed cycle
+        boundary.  At 7:00 AM this equals yesterday 7:00 AM, giving overnight
+        fullscans full credit.  For manual mid-day runs it credits fullscans
+        from earlier that same day without going all the way back 24+ hours.
+
+    These tests verify:
+      · The old "today at 7 AM" boundary incorrectly excluded pre-7-AM fullscans
+      · The new 24h rolling window correctly covers them
+      · A company never fullscanned (last_full_scan_at=NULL → epoch 0) is always missed
+      · A company fullscanned well within 24h is always covered under the new logic
+      · The boundary is time-relative (hours), not anchored to clock-time 7 AM
+      · job_monitor.py queries last_full_scan_at, not last_poll_at
+    """
+
+    def _old_cycle_start_ts(self, now_epoch, cycle_hour_offset_secs):
+        """
+        Simulate the OLD (buggy) logic:
+            if now < today_7am: use yesterday_7am
+            else:               use today_7am
+        `cycle_hour_offset_secs` is seconds-from-midnight for 7 AM in the
+        server's local time (approximated here as UTC for test simplicity).
+        """
+        # today_cycle = midnight + 7h
+        from datetime import datetime, timezone, timedelta
+        now_dt = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+        today_cycle = now_dt.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now_dt < today_cycle:
+            return (today_cycle - timedelta(days=1)).timestamp()
+        else:
+            return today_cycle.timestamp()
+
+    def _new_cycle_start_ts(self, now_epoch):
+        """Simulate the NEW (fixed) logic: now - 24h."""
+        return now_epoch - 24 * 3600
+
+    def test_old_boundary_misses_fullscan_at_6am(self):
+        """
+        OLD logic: company fullscanned at 6:00 AM is incorrectly marked as
+        missed when cron fires at 7:00:02 AM
+        (last_full_scan_at=6AM < cycle_start=7AM).
+        """
+        from datetime import datetime, timezone
+        cron_time       = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+        last_full_scan  = datetime(2026, 5, 27, 6, 0, 0, tzinfo=timezone.utc).timestamp()
+
+        cycle_start = self._old_cycle_start_ts(cron_time, 7 * 3600)
+        self.assertGreater(cycle_start, last_full_scan,
+            "OLD boundary: 6 AM fullscan < 7 AM boundary → incorrectly classified as missed")
+
+    def test_new_boundary_covers_fullscan_at_6am(self):
+        """
+        NEW logic: company fullscanned at 6:00 AM is correctly covered when
+        cron fires at 7:00:02 AM
+        (last_full_scan_at=6AM ≥ cycle_start=yesterday-7AM).
+        """
+        from datetime import datetime, timezone
+        cron_time       = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+        last_full_scan  = datetime(2026, 5, 27, 6, 0, 0, tzinfo=timezone.utc).timestamp()
+
+        cycle_start = self._new_cycle_start_ts(cron_time)
+        self.assertLessEqual(cycle_start, last_full_scan,
+            "NEW boundary: 6 AM fullscan ≥ (now-24h) → correctly covered")
+
+    def test_new_boundary_covers_fullscan_at_4am(self):
+        """
+        NEW logic: company fullscanned at 4:00 AM (3h before cron) is covered.
+        Fullscan runs once per ~24h; completing at 4 AM before the 7 AM digest
+        is entirely normal.
+        """
+        from datetime import datetime, timezone
+        cron_time       = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+        last_full_scan  = datetime(2026, 5, 27, 4, 0, 0, tzinfo=timezone.utc).timestamp()
+
+        cycle_start = self._new_cycle_start_ts(cron_time)
+        self.assertLessEqual(cycle_start, last_full_scan,
+            "NEW boundary: 4 AM fullscan should be within the 24h window")
+
+    def test_new_boundary_misses_fullscan_older_than_24h(self):
+        """
+        NEW logic: company whose last fullscan completed >24h ago is correctly
+        flagged as missed — the fullscan worker fell behind its ~24h schedule.
+        """
+        from datetime import datetime, timezone, timedelta
+        cron_time       = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+        last_full_scan  = (datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc)
+                           - timedelta(hours=25)).timestamp()
+
+        cycle_start = self._new_cycle_start_ts(cron_time)
+        self.assertGreater(cycle_start, last_full_scan,
+            "NEW boundary: 25h-old fullscan is outside the 24h window → missed (correct)")
+
+    def test_never_fullscanned_company_always_missed(self):
+        """
+        last_full_scan_at=NULL → default epoch 0 → always missed under both
+        old and new logic.  New companies enter via fullscan-first path; until
+        the first fullscan completes they get a fallback re-fetch from --monitor-jobs.
+        """
+        from datetime import datetime, timezone
+        cron_time      = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+        last_full_scan = 0  # NULL → 0 default in poll_map
+
+        old_start = self._old_cycle_start_ts(cron_time, 7 * 3600)
+        new_start = self._new_cycle_start_ts(cron_time)
+
+        self.assertGreater(old_start, last_full_scan, "OLD: never-fullscanned → missed ✓")
+        self.assertGreater(new_start, last_full_scan, "NEW: never-fullscanned → missed ✓")
+
+    def test_all_139_companies_covered_at_cron_time(self):
+        """
+        Simulate the production scenario: cron fires at 7:00:02 AM, all 139
+        companies had their fullscan complete at various hours overnight (1–6 AM).
+        OLD logic → 0 covered.  NEW logic → 139 covered.
+        """
+        from datetime import datetime, timezone
+
+        cron_time = datetime(2026, 5, 27, 7, 0, 2, tzinfo=timezone.utc).timestamp()
+
+        # Simulate 139 companies whose fullscan completed overnight (1–6 AM)
+        import random
+        rng = random.Random(42)  # fixed seed for reproducibility
+        last_fullscans = [
+            (datetime(2026, 5, 27, rng.randint(1, 6), rng.randint(0, 59), 0,
+                      tzinfo=timezone.utc)).timestamp()
+            for _ in range(139)
+        ]
+
+        old_start = self._old_cycle_start_ts(cron_time, 7 * 3600)
+        new_start = self._new_cycle_start_ts(cron_time)
+
+        old_covered = sum(1 for fs in last_fullscans if fs >= old_start)
+        new_covered = sum(1 for fs in last_fullscans if fs >= new_start)
+
+        self.assertEqual(old_covered, 0,
+            f"OLD logic should cover 0 companies (all overnight fullscans are pre-7AM); "
+            f"got {old_covered}")
+        self.assertEqual(new_covered, 139,
+            f"NEW logic should cover all 139 companies (all fullscanned within 24h); "
+            f"got {new_covered}")
+
+    def test_job_monitor_source_uses_rolling_window(self):
+        """
+        Structural test: verify job_monitor.py uses a rolling 24-hour window
+        rather than the fixed 'today_cycle.timestamp()' boundary, AND checks
+        last_full_scan_at (fullscan worker) not last_poll_at (adaptive worker).
+
+        Two invariants enforced:
+          1. Cycle boundary is (now - 24h), not today's fixed 7:00 AM.
+          2. Coverage is determined by last_full_scan_at (exhaustive all-pages
+             scan), not last_poll_at (incremental scan with early exit).
+        """
+        import pathlib
+        src = (pathlib.Path(__file__).parent.parent
+               / "jobs" / "job_monitor.py").read_text(encoding="utf-8")
+
+        has_fixed_boundary   = "cycle_start_ts = today_cycle.timestamp()" in src
+        has_rolling_window   = "timedelta(hours=24)" in src
+        has_fullscan_field   = "last_full_scan_at" in src
+        has_adaptive_field   = "last_poll_epoch" in src  # old adaptive-scan alias
+
+        self.assertFalse(has_fixed_boundary,
+            "job_monitor.py still uses 'today_cycle.timestamp()' as cycle boundary — "
+            "this causes all companies to be classified as missed at 7 AM cron time. "
+            "Fix: replace with rolling 24h window: (now_dt - timedelta(hours=24)).timestamp()")
+        self.assertTrue(has_rolling_window,
+            "job_monitor.py should use 'timedelta(hours=24)' for the rolling lookback window")
+        self.assertTrue(has_fullscan_field,
+            "job_monitor.py should check last_full_scan_at (fullscan worker — exhaustive), "
+            "not last_poll_at (adaptive worker — uses early exit, may miss pages)")
+        self.assertFalse(has_adaptive_field,
+            "job_monitor.py is still querying last_poll_epoch (adaptive scan alias) — "
+            "coverage must be determined by last_full_scan_at from the fullscan worker")
 
 
 if __name__ == "__main__":

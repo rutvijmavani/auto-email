@@ -181,18 +181,23 @@ def _get_worker_missed_companies(companies: list) -> list:
     since the start of the current monitoring cycle (default 7 AM ET).
 
     Used by run() to decide which companies need a fallback re-fetch.
-    Companies covered by scan_worker / fullscan_worker are skipped so
-    --monitor-jobs only does real HTTP work when the workers fell behind.
+    Companies whose fullscan_worker completed within the last 24 hours are
+    skipped — their jobs are already in the DB as status='new'.
+    --monitor-jobs only does real HTTP work when fullscan workers fell behind.
 
-    Cycle boundary: the most recent CYCLE_START_HOUR (7 AM) in SEND_TIMEZONE
-    (America/New_York).  A company is considered covered if
-    company_poll_stats.last_poll_at is on or after that boundary.
-    Companies with no stats row (never scanned) are always treated as missed.
+    Field checked: last_full_scan_at (written by on_fullscan_complete()).
+    We do NOT check last_poll_at (adaptive scan) because the adaptive worker
+    uses smart early exit and may not have scanned every page.  Only a
+    completed fullscan guarantees the DB is comprehensive.
 
-    Using the fixed 7 AM boundary rather than a rolling now-86400 window
-    avoids a 5-minute edge case where companies polled just after yesterday's
-    7 AM would be falsely flagged as missed when the digest runs a few minutes
-    after 7 AM.
+    Cycle boundary: 24 hours before now (rolling window).
+
+    A company is considered covered if company_poll_stats.last_full_scan_at
+    falls within the last 24 hours.  Using a fixed "today at 7 AM" boundary
+    was wrong: the cron fires at exactly 7:00 AM, so every overnight fullscan
+    (last_full_scan_at < 7:00:00) was incorrectly classified as "missed",
+    causing all companies to fall back to a full re-fetch every day and the
+    email to arrive at ~7:30 AM instead of ~7:02 AM.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -204,14 +209,12 @@ def _get_worker_missed_companies(companies: list) -> list:
 
     tz = ZoneInfo(SEND_TIMEZONE)
     now_dt = _dt.now(tz)
-    today_cycle = now_dt.replace(
-        hour=CYCLE_START_HOUR, minute=0, second=0, microsecond=0
-    )
-    if now_dt < today_cycle:
-        # Before 7 AM today — cycle started yesterday at 7 AM
-        cycle_start_ts = (today_cycle - timedelta(days=1)).timestamp()
-    else:
-        cycle_start_ts = today_cycle.timestamp()
+
+    # 24-hour rolling lookback: any scan within the last day counts as covered.
+    # At 7:00 AM this equals yesterday-7-AM, giving overnight worker scans full
+    # credit.  For manual mid-day runs it correctly credits scans from earlier
+    # that same day without going all the way back to the previous morning.
+    cycle_start_ts = (now_dt - timedelta(hours=24)).timestamp()
 
     company_names = [c["company"] for c in companies]
 
@@ -219,20 +222,24 @@ def _get_worker_missed_companies(companies: list) -> list:
     try:
         rows = conn.execute("""
             SELECT company,
-                   EXTRACT(EPOCH FROM last_poll_at) AS last_poll_epoch
+                   EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
             FROM company_poll_stats
             WHERE company = ANY(%s)
         """, (company_names,)).fetchall()
     finally:
         conn.close()
 
-    poll_map = {r["company"]: (r["last_poll_epoch"] or 0) for r in rows}
+    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
+    # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
+    # smart early exit and may not have seen every page.  Only a completed fullscan
+    # guarantees the DB is comprehensive for this company's current board.
+    scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
 
     missed = []
     for company_row in companies:
         name      = company_row["company"]
-        last_poll = poll_map.get(name, 0)
-        if last_poll < cycle_start_ts:
+        last_scan = scan_map.get(name, 0)
+        if last_scan < cycle_start_ts:
             missed.append(company_row)
 
     return missed

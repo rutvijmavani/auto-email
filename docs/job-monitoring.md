@@ -74,6 +74,79 @@ HTTP verification of stale URLs → 404 → status='filled' → deleted after 7 
 
 ---
 
+## Smart Hybrid Mode
+
+`--monitor-jobs` does not blindly re-scan every company each morning.
+It delegates to the background adaptive workers and only falls back for
+companies they genuinely missed.
+
+### How it works
+
+```text
+7:00 AM — --monitor-jobs starts
+       ↓
+_get_worker_missed_companies() queries company_poll_stats
+       ↓
+  For each company:
+    last_poll_at >= (now - 24h)?
+    ├─ YES → "covered" — workers already scanned this company
+    │        results already in DB as status='new'
+    └─ NO  → "missed" — fallback re-fetch needed
+       ↓
+Fallback re-fetch (ThreadPoolExecutor) — only for missed companies
+       ↓
+PDF digest built from ALL status='new' rows in DB
+(covers both worker-found and fallback-found jobs)
+       ↓
+Email sent
+```
+
+### Coverage window
+
+A company is **covered** if `company_poll_stats.last_full_scan_at` is within
+the last **24 hours** of when `--monitor-jobs` runs.
+
+`last_full_scan_at` is written by `on_fullscan_complete()` — the exhaustive
+all-pages scan. We do **not** check `last_poll_at` (adaptive scan) because the
+adaptive worker uses smart early exit and may not have scanned every page.
+
+At 7:00 AM this equals **yesterday's 7:00 AM** — any company whose fullscan
+completed overnight (e.g. at 2 AM, 4 AM, 6:30 AM) counts as covered.
+
+A company is treated as **missed** (and gets a fallback re-fetch) only if:
+- Its `last_full_scan_at` is older than 24 hours, **or**
+- It has never been fullscanned (no row in `company_poll_stats`, or `last_full_scan_at` is NULL)
+
+### Expected outcomes
+
+| Scenario | Result |
+|---|---|
+| Background workers healthy (normal day) | 0 fallback re-fetches → email at ~7:02 AM |
+| Workers partially behind (some companies missed) | Only missed companies re-fetched → still fast |
+| Workers completely down (Redis crash, VM restart) | All companies re-fetched → email at ~7:30 AM |
+| Brand new company, never scanned | Fallback re-fetch on first digest run |
+
+### Key config
+
+```python
+# config.py
+CYCLE_START_HOUR = 7   # monitoring day boundary (used by rebuild_redis + cron)
+# Coverage window is always (now - 24h), not a fixed clock time.
+# This ensures overnight adaptive-worker scans are always credited.
+```
+
+### Why 24 hours, not "today's 7 AM"
+
+Using `today_cycle.timestamp()` (= 7:00:00 AM exactly) as the boundary
+would mean that when the cron fires at 7:00:02 AM, **every** company's
+`last_full_scan_at` is before 7:00:00 AM — causing all 139 companies to
+appear as "missed" and triggering a full 30-minute fallback re-fetch every
+day. The 24-hour rolling window avoids this: any fullscan completed in the
+last 24 hours counts, regardless of whether it finished at 1 AM, 4 AM, or
+6:59 AM.
+
+---
+
 ## Parallel Processing
 
 Companies are processed concurrently using `ThreadPoolExecutor`:

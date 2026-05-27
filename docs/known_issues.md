@@ -271,6 +271,34 @@ old version may still be tracked.
 
 ## Resolved Issues ⚪
 
+### ⚪ --monitor-jobs cycle-boundary bug — all companies always "missed"
+**Resolved:** 2026-05-27
+**Symptom:**
+```
+[INFO] 139 companies total | 0 covered by workers | 139 need fallback fetch
+```
+Every day, all 139 companies were classified as "missed" even when
+background workers were healthy and had scanned all companies overnight.
+Email always arrived at ~7:30 AM instead of ~7:02 AM.
+**Root cause:** Two compounding bugs in `_get_worker_missed_companies()`:
+1. Wrong field: queried `last_poll_at` (adaptive scan — incremental, uses smart
+   early exit) instead of `last_full_scan_at` (fullscan worker — exhaustive,
+   all pages guaranteed).
+2. Wrong boundary: used `today_cycle.timestamp()` (= today 7:00:00 AM).  The
+   cron fires at 7:00:02 AM.  Every overnight fullscan has `last_full_scan_at`
+   before 7:00:00 AM (e.g. completed at 4 AM, 5 AM, 6:59 AM), so all 139
+   companies were flagged as "missed" → full re-fetch every day → 30-minute
+   email.  The fast "0 re-fetches → email at ~7:02 AM" path was unreachable.
+**Fix:**
+1. Changed field from `last_poll_at` → `last_full_scan_at`.
+2. Changed cycle boundary from `today_cycle.timestamp()` to a 24-hour rolling
+   lookback: `(now_dt - timedelta(hours=24)).timestamp()`.  At 7:00 AM this
+   equals yesterday 7:00 AM, giving overnight fullscans full credit.
+**Files:** `jobs/job_monitor.py` → `_get_worker_missed_companies()`
+`tests/test_scheduler_contracts.py` → `TestWorkerMissedCycleBoundary`
+
+---
+
 ### ⚪ Thundering herd on scheduler bootstrap / deployment
 **Resolved:** 2026-05-20
 **Was:** `_bootstrap_warming_adaptive()` and `_bootstrap_warming()` used
