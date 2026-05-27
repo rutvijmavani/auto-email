@@ -257,17 +257,21 @@ def init_logging(command: str = "pipeline") -> None:
     today        = datetime.now().strftime(date_fmt)
     command_file = LOG_DIR / f"{command}_{today}.log"
 
-    file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
-    file_handler.setLevel(LOG_LEVEL)
-    file_handler.setFormatter(formatter)
-    root.addHandler(file_handler)
-
     # ── 3. Catch-all pipeline_YYYY-MM-DD.log ────────────────────────
     # Always-on daily file — useful for grepping across all commands.
     # Dated format ensures it is subject to the same 14-day cleanup
     # as other daily logs.  One file per calendar day.
     today_daily   = datetime.now().strftime("%Y-%m-%d")
     pipeline_file = LOG_DIR / f"pipeline_{today_daily}.log"
+
+    # Guard: when command == "pipeline" both paths resolve to the same file.
+    # Adding two FileHandlers to the same path would duplicate every log line.
+    # In that case skip the command-specific handler and rely on the catchall.
+    if command_file != pipeline_file:
+        file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
+        file_handler.setLevel(LOG_LEVEL)
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
 
     catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
     catchall.setLevel(LOG_LEVEL)

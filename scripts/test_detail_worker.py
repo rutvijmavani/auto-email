@@ -111,8 +111,9 @@ if r and adaptive_depth > 0:
         try:
             payload = json.loads(raw)
             jobs_to_test.append(("queue:detail:adaptive", payload))
-        except Exception:
-            pass
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"  [WARN] Malformed JSON in queue:detail:adaptive — skipping. "
+                  f"error={exc!r}  raw={raw!r:.120}")
     print(f"  Peeked {len(raw_items)} items from queue:detail:adaptive")
 else:
     print("  queue:detail:adaptive is empty — skipping")
@@ -124,8 +125,9 @@ if r and fullscan_depth > 0:
         try:
             payload = json.loads(raw)
             jobs_to_test.append(("queue:detail:fullscan", payload))
-        except Exception:
-            pass
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"  [WARN] Malformed JSON in queue:detail:fullscan — skipping. "
+                  f"error={exc!r}  raw={raw!r:.120}")
     print(f"  Peeked {len(raw_items)} items from queue:detail:fullscan")
 else:
     print("  queue:detail:fullscan is empty — skipping")
@@ -159,8 +161,9 @@ if not jobs_to_test:
                         slug_info = parse_slug(
                             row["ats_platform"], row["ats_slug"], config
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        print(f"  [WARN] parse_slug failed for "
+                              f"{row['company']!r} — {exc!r}")
 
                 payload = {
                     "company":     row["company"],

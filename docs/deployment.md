@@ -11,7 +11,7 @@ and operational maintenance for the Recruiter Outreach Pipeline.
 
 ### Option 1 — Local Machine (current)
 
-```
+```text
 Pros:
   → No cost
   → Full control
@@ -45,7 +45,7 @@ schtasks /create /tn "RecruiterVerify" ^
 ```
 
 **Wake-on-Timer** (run even when laptop is sleeping):
-```
+```text
 Task Scheduler → Task Properties:
   General tab   → "Run whether user is logged in or not" ✓
   Conditions tab → "Wake the computer to run this task" ✓
@@ -65,7 +65,7 @@ Requirements for wake-on-timer to work:
 
 **Most reliable option at zero cost.**
 
-```
+```text
 Service:  Oracle Cloud Infrastructure (OCI)
 Tier:     Always Free (not just 12 months)
 Shape:    VM.Standard.A1.Flex (ARM/Ampere)
@@ -77,7 +77,7 @@ Cost:     $0 forever
 
 **Sign up:** https://www.oracle.com/cloud/free/
 
-```
+```text
 Requirements:
   → Credit card for identity verification only
   → NOT charged — purely for verification
@@ -90,7 +90,7 @@ Requirements:
 
 ### Option 4 — DigitalOcean Droplet ($4/month)
 
-```
+```text
 Specs:    512 MB RAM, 10 GB SSD
 Cost:     $4/month (~$48/year)
 Uptime:   99.99% SLA
@@ -111,7 +111,7 @@ When to choose:
 ## Oracle Cloud VM Setup
 
 ### Step 1 — Create account
-```
+```text
 1. Go to https://www.oracle.com/cloud/free/
 2. Sign up with email + credit card (not charged)
 3. Choose home region closest to you
@@ -119,7 +119,7 @@ When to choose:
 ```
 
 ### Step 2 — Create VM instance
-```
+```text
 OCI Console → Compute → Instances → Create Instance
 
 Settings:
@@ -220,7 +220,7 @@ mkdir -p /home/opc/mail/scripts
 Oracle Always Free includes up to 200 GB of block storage. We use a 50 GB volume
 mounted at `/mnt/backups` exclusively for DB backups.
 
-```
+```text
 OCI Console → Storage → Block Volumes → Create Block Volume
   Name:        pipeline-backups
   Size:        50 GB
@@ -283,7 +283,7 @@ See the **Recommended Deployment Schedule** section for the complete timeline.
 ## Oracle Idle Reclamation — What You Need to Know
 
 ### The risk
-```
+```text
 Oracle monitors free tier VMs for idle usage:
   → If CPU < 10% for 7 consecutive days
   → Oracle sends warning email
@@ -292,7 +292,7 @@ Oracle monitors free tier VMs for idle usage:
 ```
 
 ### Why your VM won't be idle
-```
+```text
 Your daily cron jobs prevent this:
   Daily  9 AM: --outreach-only → Playwright + SMTP = CPU spikes
   Weekly Mon:  --verify-only   → Playwright + CareerShift = CPU spikes
@@ -304,7 +304,7 @@ Risk of reclamation: LOW
 ```
 
 ### Protection measures
-```
+```text
 1. Keep-alive cron (already installed by setup_cron.sh)
    → Runs every 4 days at 12 PM
    → Generates CPU activity
@@ -330,7 +330,7 @@ Risk of reclamation: LOW
 
 **Short answer: Keep SQLite. Don't migrate.**
 
-```
+```text
 Your data scale:
   ~50-200 applications
   ~100-400 recruiters
@@ -363,7 +363,7 @@ Recommended stack:
 ## Logging Strategy
 
 ### Phase 1 — Email reports (implement now)
-```
+```text
 HTML email sent after every pipeline run:
   --outreach-only → Outreach Report email
   --find-only     → Find Report email
@@ -378,7 +378,7 @@ Gives visibility on healthy runs.
 
 Every pipeline command produces **two kinds of log output**:
 
-```
+```text
 Layer 1 — Shell wrapper logs  (stdout redirect in run_*.sh)
   Captures: shell echo messages ([CRON], [STEP N], [REDIS])
             + any Python print() output
@@ -403,7 +403,7 @@ shell wrapper's redirect.  Both layers capture different things.
 
 #### Log files — daily commands (one file per calendar day, 14-day retention)
 
-```
+```text
 logs/monitor_YYYY-MM-DD.log          --monitor-jobs
 logs/outreach_YYYY-MM-DD.log         --outreach-only
 logs/sync_YYYY-MM-DD.log             --sync-forms / --sync-prospective
@@ -419,7 +419,7 @@ logs/pipeline_YYYY-MM-DD.log         catch-all — every command writes here
 
 #### Log files — monthly commands (one file per calendar month, 35-day retention)
 
-```
+```text
 logs/monthly_YYYY-MM.log             run_monthly.sh chain (shell layer)
 logs/enrich_YYYY-MM.log              run_enrich.sh (shell layer)
 logs/build_ats_slug_list_YYYY-MM.log build_ats_slug_list.py
@@ -430,7 +430,7 @@ always written before the previous month's is deleted.
 
 #### Log levels
 
-```
+```text
 DEBUG    → step-by-step tracing (default, verbose)
 INFO     → normal operations and summaries
 WARNING  → non-fatal issues (API guard fired, key missing, quota low)
@@ -440,7 +440,7 @@ CRITICAL → pipeline cannot continue
 
 #### Retention — how it works
 
-```
+```text
 Configured in:  config.py
   LOG_RETENTION_DAILY_DAYS   = 14
   LOG_RETENTION_MONTHLY_DAYS = 35
@@ -499,7 +499,7 @@ tail -f ~/mail/logs/monitor_$(date +%Y-%m-%d).log
 
 #### Migration note — old pipeline.log
 
-```
+```text
 Before this logging overhaul, a single undated pipeline.log was used
 as the catch-all.  TimedRotatingFileHandler created dated backups
 (pipeline.log.2026-04-26 etc.) only when a long-running process
@@ -517,7 +517,7 @@ To clean up the existing backlog immediately after deploy:
 ```
 
 ### Why both layers are needed
-```
+```text
 Email report  = what happened (summary for healthy runs)
 Shell log     = chain-level trace ([STEP 1], [STEP 2], exit codes)
 Python log    = why it happened (module-level forensics for failures)
@@ -529,7 +529,7 @@ If pipeline crashes before email sends:
 ```
 
 ### Phase 3 — Optional future
-```
+```text
 Structured JSON logs for easier parsing
 Log aggregation if needed
 ```
@@ -542,7 +542,7 @@ Log aggregation if needed
 
 #### Boot volume (Oracle free tier: ~47 GB)
 
-```
+```text
 OS + Ubuntu base:              ~3.0 GB
 Python packages + Chromium:    ~0.8 GB
 Project code:                  ~0.005 GB
@@ -557,7 +557,7 @@ Available:                     ~43.1 GB (91% free)
 
 #### Block volume (50 GB at /mnt/backups)
 
-```
+```text
 Both DBs currently:            ~12 MB combined
 7 daily backups × 12 MB:       ~85 MB
 ─────────────────────────────────────────
@@ -569,7 +569,7 @@ Storage is not a concern on either volume.
 
 ### Compute (Oracle free tier: A1.Flex — 2 OCPU + 12 GB RAM)
 
-```
+```text
 Pipeline           RAM Peak   Duration      Risk
 ───────────────────────────────────────────────────
 --monitor-jobs     ~250 MB    20-30 min     None ✓
@@ -591,7 +591,7 @@ No swap file needed.
 ## Recommended Deployment Schedule
 
 ### Key rules
-```
+```text
 --sync-forms and --add: run only between 9 AM and 9 PM
   → Five syncs per day at 9AM 12PM 3PM 6PM 9PM
   → DB is quiet after 9 PM
@@ -617,7 +617,7 @@ Enrichment runs independently:
 
 ### Wrapper scripts (created by setup_cron.sh)
 
-```
+```text
 /home/opc/mail/
   run_sync.sh            ← --sync-forms + --sync-prospective (9AM 12PM 3PM 6PM 9PM)
   run_nightly.sh         ← sync → backup → find-only → verify-filled (Tue-Sun 1AM)
@@ -701,7 +701,7 @@ CRON_TZ=America/New_York
 **Note on `CRON_TZ=America/New_York`:** This line at the top of the crontab tells cron to interpret all times as Eastern Time regardless of the server's system timezone. Oracle Cloud VMs default to UTC — without this setting, "1 AM" would actually fire at 1 AM UTC (which is 9 PM or 10 PM Eastern depending on DST). `setup_cron.sh` sets this automatically so you never need to think about it.
 
 ### Full daily timeline (America/New_York)
-```
+```text
  7:00 AM: --monitor-jobs (tracks URL presence, increments missing counters)
  9:00 AM: --sync-forms + --sync-prospective
  9:00 AM: --outreach-only (Mon-Fri only)
@@ -718,7 +718,7 @@ CRON_TZ=America/New_York
 ```
 
 ### Safety with && chaining
-```
+```text
 backup_db.py fails:
   → verify-only, find-only, and verify-filled do NOT run
   → DB unchanged and safe
@@ -744,7 +744,7 @@ verify-filled fails:
 ```
 
 ### Quick reference
-```
+```text
 Just applied to new jobs?          → fill Google Form (sync runs automatically)
 Regular morning sending?           → --outreach-only (automated 9 AM)
 Overnight processing?              → backup + --find-only → verify-filled (automated 1 AM)
@@ -767,7 +767,7 @@ Run daily enrichment?              → python enrich_ats_companies.py --daily
 ## Backup & Recovery
 
 ### What to backup
-```
+```text
 Critical (must backup):
   data/recruiter_pipeline.db    → all pipeline data
   data/ats_discovery.db         → ATS enrichment data
@@ -786,7 +786,7 @@ Safe on GitHub (no backup needed):
 Both DBs are backed up using SQLite's native backup API which guarantees
 a consistent snapshot even if a write is in progress.
 
-```
+```text
 Source DBs:
   /home/opc/mail/data/recruiter_pipeline.db
   /home/opc/mail/data/ats_discovery.db
@@ -799,7 +799,7 @@ Retention: 7 days (enforced automatically on every backup run)
 ```
 
 **Why SQLite backup API instead of cp:**
-```
+```text
 Plain cp on live SQLite DB:
   → Copies file mid-write → corrupted backup
   → NEVER use cp on a live SQLite DB
@@ -812,7 +812,7 @@ sqlite3.backup():
 ```
 
 **Why block storage instead of local data/backups/:**
-```
+```text
 Boot volume failure → local backups lost too
 Block volume is independent storage:
   → Survives boot volume failure
@@ -822,13 +822,13 @@ Block volume is independent storage:
 ```
 
 **Retention:**
-```
+```text
 Handled inside backup_db.py on every run — no separate cron needed.
 7 days × 2 DBs × ~12 MB = ~170 MB total (negligible on 50 GB volume)
 ```
 
 ### Backup cadence
-```
+```text
 Runs: nightly as first step in each chained job
   Mon 1:00 AM:  before --verify-only and --find-only
   Tue-Sun 1 AM: before --find-only
@@ -841,7 +841,7 @@ DB is always quiet at backup time:
 ```
 
 ### Recovery procedure (VM terminated)
-```
+```text
 1. Create new Oracle VM (Step 2 above)
 2. Attach existing block volume (pipeline-backups) to new VM
    OCI Console → Storage → Block Volumes → pipeline-backups
@@ -868,7 +868,7 @@ Max data loss:       24 hours (daily backup cadence)
 ## Maintenance Checklist
 
 ### Monthly
-```
+```text
 □ Re-run careershift/auth.py if session expired
   (session valid ~30 days)
 □ Check log files for recurring errors
@@ -887,7 +887,7 @@ Max data loss:       24 hours (daily backup cadence)
 ```
 
 ### Quarterly
-```
+```text
 □ Review recruiter data quality
 □ Check pipeline metrics (Metric 1 + Metric 2)
 □ Update CareerShift credentials if changed
@@ -896,7 +896,7 @@ Max data loss:       24 hours (daily backup cadence)
 ```
 
 ### When things go wrong
-```
+```text
 Outreach not sending:
   → Check logs/outreach_YYYY-MM-DD.log
   → Verify GMAIL_APP_PASSWORD still valid
@@ -941,7 +941,7 @@ VM not responding:
 
 ### SQLite is sufficient for this application
 
-```
+```text
 Single user (you):
   → SQLite designed for this use case ✓
   → No concurrent write conflicts ✓
@@ -966,7 +966,7 @@ Query performance with proper indexes:
 
 ### What keeps the DB lean
 
-```
+```text
 Retention policies (automatic):
   → job descriptions cleared on expiry or when position filled
   → filled job rows deleted after 7 days (verify-filled pipeline)
@@ -983,7 +983,7 @@ Monthly VACUUM (run_monthly.sh — 1st of every month):
 
 ### When to consider migrating to PostgreSQL
 
-```
+```text
 Migrate only if:
   □ You share this with multiple users simultaneously
     (SQLite write lock becomes bottleneck)
@@ -1004,7 +1004,7 @@ Migration is straightforward when needed:
 
 ### DB health monitoring
 
-```
+```text
 Add to weekly checklist:
   □ Check DB file size:
     ls -lh data/recruiter_pipeline.db data/ats_discovery.db
@@ -1101,7 +1101,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only  # skip poll:adaptive
 
 ### Troubleshooting scheduler issues
 
-```
+```text
 Workers idle — no companies being dispatched:
   → Check poll:adaptive and poll:fullscan are populated:
     redis-cli ZCOUNT poll:adaptive -inf +inf
@@ -1132,7 +1132,7 @@ WARMING companies not advancing to STABLE:
 
 ## First Deployment Checklist
 
-```
+```text
 □ 1.  Oracle VM created + SSH access working
 □ 2.  Block volume (50 GB) created, attached, formatted, and mounted at /mnt/backups
 □ 3.  Dependencies installed (pip install -r requirements.txt)

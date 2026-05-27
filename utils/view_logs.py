@@ -203,7 +203,7 @@ Examples:
     parser.add_argument("--cmd",     choices=["monitor", "detect", "sync", "find"],
                         help="Show only this command's log")
     parser.add_argument("--tail",    action="store_true",
-                        help="Live tail (default: pipeline.log)")
+                        help="Live tail (default: today's pipeline_YYYY-MM-DD.log; use --cmd to tail a specific command log)")
     parser.add_argument("--errors",  action="store_true",
                         help="Show WARNING and ERROR lines only")
     parser.add_argument("--company", type=str,
