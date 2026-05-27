@@ -88,7 +88,7 @@ companies they genuinely missed.
 _get_worker_missed_companies() queries company_poll_stats
        ↓
   For each company:
-    last_poll_at >= (now - 24h)?
+    last_full_scan_at >= (now - 24h)?
     ├─ YES → "covered" — workers already scanned this company
     │        results already in DB as status='new'
     └─ NO  → "missed" — fallback re-fetch needed
