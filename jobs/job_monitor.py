@@ -235,11 +235,29 @@ def _get_worker_missed_companies(companies: list) -> list:
     # guarantees the DB is comprehensive for this company's current board.
     scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
 
+    # Exclude companies whose fullscan_worker is actively running right now.
+    # A Workday scan can take 20–30 minutes; without this check, --monitor-jobs
+    # would fallback-fetch the same company mid-scan, wasting HTTP calls and
+    # potentially sending duplicate jobs to the detail queue.
+    inflight: set = set()
+    try:
+        from config import REDIS_INFLIGHT_FULLSCAN
+        from workers.redis_client import get_redis
+        raw      = get_redis().zrangebyscore(REDIS_INFLIGHT_FULLSCAN, "-inf", "+inf")
+        inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
+        if inflight:
+            logger.debug(
+                "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
+                len(inflight),
+            )
+    except Exception:
+        pass   # Redis unavailable — proceed without exclusion (conservative: may do extra work)
+
     missed = []
     for company_row in companies:
         name      = company_row["company"]
         last_scan = scan_map.get(name, 0)
-        if last_scan < cycle_start_ts:
+        if last_scan < cycle_start_ts and name not in inflight:
             missed.append(company_row)
 
     return missed

@@ -74,7 +74,8 @@ from config import (
     WORKER_BLOCK_SECS,
     REDIS_BACKOFF_PREFIX,
 )
-from workers.redis_client import get_redis, ping
+from workers.redis_client import get_redis
+from workers.heartbeat import Heartbeat
 from workers.http_client import set_request_context
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
@@ -91,6 +92,99 @@ from db.job_monitor import (
 logger = get_logger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+# ── At-least-once delivery via LMOVE processing lists ────────────────────────
+# BRPOP is destructive: if the worker dies after pop but before the DB write,
+# the job is lost from Redis.  Instead we LMOVE the item into a per-source
+# "processing" list atomically before we touch it, then LREM it afterwards.
+#
+# On startup, _recover_stuck_jobs() moves everything in the processing lists
+# back to the front of their source queues so no job is silently dropped.
+#
+# Layout:
+#   queue:detail:adaptive           ← source (LPUSH by scan_worker/fullscan)
+#   queue:detail:adaptive:inflight  ← in-progress for this worker (LMOVE)
+#   queue:detail:fullscan
+#   queue:detail:fullscan:inflight
+#
+# NOTE: We use one global inflight list per source queue, not per-worker-pid,
+# so that recovery works even when a different worker restarts after a crash.
+# Multiple concurrent detail_workers writing to the same inflight list is safe
+# because LREM removes the first exact match — each raw payload is unique
+# (contains job_id + enqueued_at timestamps).
+
+_INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight"
+_INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight"
+
+# Maps source queue key → its inflight list key
+_INFLIGHT_KEY: dict = {
+    REDIS_DETAIL_ADAPTIVE: _INFLIGHT_ADAPTIVE,
+    REDIS_DETAIL_FULLSCAN: _INFLIGHT_FULLSCAN,
+}
+
+
+def _recover_stuck_jobs(r) -> None:
+    """
+    On worker startup: move any leftover inflight items back to their source
+    queues so they are not permanently lost.
+
+    Called BEFORE the main loop so the recovered items are available
+    immediately for the first LMOVE pick-up.
+
+    Uses LMOVE (source=RIGHT, dest=LEFT) so recovered items go to the FRONT
+    of the source queue — they have already waited long enough.
+    """
+    for inflight_key, source_key in [
+        (_INFLIGHT_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
+        (_INFLIGHT_FULLSCAN, REDIS_DETAIL_FULLSCAN),
+    ]:
+        recovered = 0
+        while True:
+            item = r.lmove(inflight_key, source_key, "RIGHT", "LEFT")
+            if item is None:
+                break
+            recovered += 1
+        if recovered:
+            logger.warning(
+                "detail_worker: recovered %d stuck job(s) from %s → %s",
+                recovered, inflight_key, source_key,
+            )
+
+
+def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
+    """
+    Priority-aware pop with at-least-once guarantee via inflight list.
+
+    1. Try non-blocking LMOVE from adaptive first (high priority).
+    2. If adaptive is empty, try non-blocking LMOVE from fullscan.
+    3. If both empty, sleep briefly and retry until timeout.
+
+    Returns (source_queue_key, raw_payload) or None on timeout.
+
+    LMOVE is atomic: the item is either in the source list or the inflight
+    list — never in neither.  The worker deletes it from inflight only AFTER
+    a successful DB write (LREM in the main loop).
+    """
+    deadline = time.monotonic() + timeout
+    poll_interval = 0.2   # seconds between empty-queue polls
+
+    while time.monotonic() < deadline:
+        # ── Adaptive first (high priority) ───────────────────────────────────
+        raw = r.lmove(REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE, "RIGHT", "LEFT")
+        if raw is not None:
+            return (REDIS_DETAIL_ADAPTIVE, raw)
+
+        # ── Fullscan fallback (low priority) ─────────────────────────────────
+        raw = r.lmove(REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN, "RIGHT", "LEFT")
+        if raw is not None:
+            return (REDIS_DETAIL_FULLSCAN, raw)
+
+        # ── Both empty — wait briefly before next poll ────────────────────────
+        remaining = deadline - time.monotonic()
+        time.sleep(min(poll_interval, max(0, remaining)))
+
+    return None
+
 
 # Keys that fetch_job_detail() checks in its guard clause before making any
 # HTTP request.  If any of these are absent from the queue payload, the
@@ -554,13 +648,17 @@ def run_worker(once: bool = False, shutdown_event=None,
     if not skip_init_db:
         init_db()
 
-    if not ping():
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        logger.error("detail_worker: Redis not reachable at %s — aborting", redis_url)
-        print(f"[detail_worker] ERROR: Redis unreachable ({redis_url})")
-        sys.exit(1)
+    # ── Startup validation (Redis + PostgreSQL + required config) ────────────
+    from workers.startup import validate_startup
+    validate_startup("detail_worker",
+                     check_redis=True,
+                     check_db=not skip_init_db,
+                     check_config=True)
 
     r = get_redis()
+
+    # ── Recover any jobs left in inflight lists from a previous crash ─────────
+    _recover_stuck_jobs(r)
 
     logger.info(
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
@@ -574,16 +672,24 @@ def run_worker(once: bool = False, shutdown_event=None,
     else:
         print("[detail_worker] Press Ctrl+C to stop\n")
 
+    # ── Background heartbeat ─────────────────────────────────────────────────
+    # Daemon thread writes worker:alive:detail_worker every 10s.
+    # Detail fetches are usually fast (1–5s) but the thread approach keeps the
+    # pattern consistent and future-proof if heavier fetches are added.
+    # daemon=True means the thread dies with the process — no ghost heartbeats.
+    _hw = {"count": 0}
+    _hb = Heartbeat(r, "detail_worker", lambda: _hw["count"]).start()
+
     while True:
         try:
-            # BRPOP pops from the first non-empty key → adaptive has priority
-            item = r.brpop(
-                [REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN],
-                timeout=WORKER_BLOCK_SECS,
-            )
+            # ── At-least-once pop via LMOVE inflight list ─────────────────────
+            # Moves item atomically: source_queue → inflight list.
+            # The item is acknowledged (LREM'd) only after a successful DB write.
+            # On crash, _recover_stuck_jobs() restores it on next startup.
+            item = _pop_with_inflight(r, timeout=WORKER_BLOCK_SECS)
 
             if item is None:
-                # BRPOP timed out — check shutdown before looping
+                # Poll timeout — check shutdown before looping
                 if shutdown_event is not None and shutdown_event.is_set():
                     logger.info("detail_worker: shutdown event set (idle) — exiting")
                     break
@@ -594,13 +700,14 @@ def run_worker(once: bool = False, shutdown_event=None,
                 continue
 
             source_queue, raw = item
+            inflight_key = _INFLIGHT_KEY[source_queue]
 
-            # ── Shutdown checkpoint: after BRPOP, before processing ───────────
-            # Push the payload back to the front of its source queue (LPUSH so
-            # it is picked up next) and exit.  No backoff here — the job itself
-            # is fine, the worker count is just being reduced.
+            # ── Shutdown checkpoint: item is already in inflight list ─────────
+            # Move it back to the source queue and exit cleanly.
+            # _recover_stuck_jobs() would also handle this on restart, but
+            # explicit re-queue is cleaner and avoids any startup latency.
             if shutdown_event is not None and shutdown_event.is_set():
-                r.lpush(source_queue, raw)
+                r.lmove(inflight_key, source_queue, "RIGHT", "LEFT")
                 logger.info(
                     "detail_worker: shutdown (pre-process), returned job "
                     "to %s — exiting",
@@ -611,15 +718,23 @@ def run_worker(once: bool = False, shutdown_event=None,
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError as exc:
+                # Malformed payload — can never succeed, remove from inflight
                 logger.error(
                     "detail_worker: bad JSON in %s: %s | raw=%r",
                     source_queue, exc, raw[:200],
                 )
+                r.lrem(inflight_key, 1, raw)   # discard — retrying won't help
                 if once:
                     break
                 continue
 
             result = _process_detail(payload, source_queue)
+            _hw["count"] += 1
+
+            # ── Acknowledge: remove from inflight list ────────────────────────
+            # Only reached on successful processing (exception → loop error handler).
+            # Malformed-JSON path already removed above.
+            r.lrem(inflight_key, 1, raw)
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]
@@ -635,6 +750,7 @@ def run_worker(once: bool = False, shutdown_event=None,
         except KeyboardInterrupt:
             logger.info("detail_worker: KeyboardInterrupt — shutting down")
             print("\n[detail_worker] Shutting down.")
+            _hb.stop()
             break
 
         except Exception as exc:

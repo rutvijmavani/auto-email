@@ -102,17 +102,23 @@ def analyse(queue_name: str, r, bucket_minutes: int):
         print(f"  {GREEN}  (no future polls scheduled){RESET}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    non_empty    = [len(v) for v in buckets.values() if v]
-    max_pct      = max(non_empty) / total * 100 if non_empty else 0
-    ideal_per_bk = total / max(len(buckets), 1)
-    evenness_ok  = max_pct < 20
+    non_empty      = [len(v) for v in buckets.values() if v]
+    max_pct        = max(non_empty) / total * 100 if non_empty else 0
+    # Ideal = total companies spread evenly across ALL slots in a full 24 h
+    # cycle — not just the occupied slots.  Dividing by occupied buckets only
+    # would inflate the "ideal" as companies cluster (fewer occupied buckets →
+    # higher ideal_per_bk), masking the thundering herd.
+    slots_in_cycle = 86400 // (bucket_minutes * 60)
+    ideal_per_bk   = total / max(slots_in_cycle, 1)
+    evenness_ok    = max_pct < 20
 
     print()
     if evenness_ok:
-        print(f"  {GREEN}✓  Distribution looks healthy — max spike = {max_pct:.1f}% per bucket{RESET}")
+        print(f"  {GREEN}✓  Distribution looks healthy — max spike = {max_pct:.1f}% per bucket "
+              f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot){RESET}")
     else:
         print(f"  {RED}✗  Thundering herd detected — {max_pct:.1f}% of companies in one bucket "
-              f"(ideal ≈ {ideal_per_bk:.0f} per bucket){RESET}")
+              f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot across 24 h){RESET}")
 
     # Show top-5 most clustered companies (same minute)
     minute_buckets = defaultdict(list)

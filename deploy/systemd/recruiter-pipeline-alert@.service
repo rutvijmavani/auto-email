@@ -1,0 +1,18 @@
+[Unit]
+Description=Recruiter Pipeline startup failure alert for %i
+# This is a template unit — %i is the name of the failed service.
+# Triggered by OnFailure=recruiter-pipeline-alert@%n.service in other units.
+# Sends a single email saying which service hit its StartLimitBurst.
+
+[Service]
+Type=oneshot
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+
+# %i = the failed service name (e.g. "recruiter-scheduler")
+ExecStart=/home/opc/mail/venv/bin/python scripts/startup_failure_alert.py %i
+
+# Don't restart — this is a one-shot alert, not a long-running service.
+Restart=no

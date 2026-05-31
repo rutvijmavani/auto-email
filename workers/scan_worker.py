@@ -110,6 +110,7 @@ from config import (
     STREAM_BLOCK_MS,
 )
 from workers.redis_client import get_redis, ping
+from workers.heartbeat import Heartbeat
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
 from workers.http_client import set_request_context
 from workers.paginator import estimate_scan_depth
@@ -778,12 +779,12 @@ def run_worker(once: bool = False, shutdown_event=None,
     if not skip_init_db:
         init_db()
 
-    if not ping():
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        logger.error("scan_worker: Redis not reachable at %s — aborting", redis_url)
-        print(f"[scan_worker] ERROR: Redis unreachable ({redis_url}). "
-              "Is Memurai/Redis running?")
-        sys.exit(1)
+    # ── Startup validation (Redis + PostgreSQL + required config) ────────────
+    from workers.startup import validate_startup
+    validate_startup("scan_worker",
+                     check_redis=True,
+                     check_db=not skip_init_db,   # DB already checked by caller if skip_init_db
+                     check_config=True)
 
     r = get_redis()
     _ensure_consumer_group(r)
@@ -799,6 +800,13 @@ def run_worker(once: bool = False, shutdown_event=None,
         print("[scan_worker] --once mode: processing one job then exiting")
     else:
         print("[scan_worker] Press Ctrl+C to stop\n")
+
+    # ── Background heartbeat ─────────────────────────────────────────────────
+    # Daemon thread writes worker:alive:scan_worker every 10s, independent of
+    # how long each listing scan takes (Workday scans can exceed 60s).
+    # daemon=True means the thread dies with the process — no ghost heartbeats.
+    _hw = {"count": 0}
+    _hb = Heartbeat(r, "scan_worker", lambda: _hw["count"]).start()
 
     while True:
         try:
@@ -897,6 +905,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                         company, oac_exc, exc_info=True,
                     )
 
+            _hw["count"] += 1
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""
             print(f"  [{status}] {result['company']}{first} — "
@@ -909,6 +918,7 @@ def run_worker(once: bool = False, shutdown_event=None,
         except KeyboardInterrupt:
             logger.info("scan_worker: KeyboardInterrupt — shutting down")
             print("\n[scan_worker] Shutting down.")
+            _hb.stop()
             break
 
         except Exception as exc:

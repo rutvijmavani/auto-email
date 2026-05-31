@@ -848,6 +848,13 @@ def init_db():
         #   companies are spread evenly across the 24h window. Survives restarts.
         ("warming_polls_remaining", "SMALLINT DEFAULT NULL"),
         ("initial_slot_offset_s",   "INTEGER DEFAULT NULL"),
+        # Phase 2 — fullscan duration EMA for thundering herd prevention.
+        # _pick_schedule_time() uses avg_fullscan_duration_s to skip gap
+        # midpoints where the scan cannot finish before the 7 AM digest:
+        #     skip if midpoint + avg_fullscan_duration_s >= next_7am_deadline
+        # EMA formula (α=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
+        ("last_fullscan_duration_s", "INTEGER"),
+        ("avg_fullscan_duration_s",  "DOUBLE PRECISION DEFAULT 30.0"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"

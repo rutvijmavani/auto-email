@@ -455,7 +455,15 @@ CLEAN_CRON=$(echo "$EXISTING_CRON" \
   | grep -v "backups.*mtime" \
   | grep -v "RECRUITER PIPELINE" \
   | grep -v "All times UTC" \
+  | grep -v "workers.watchdog" \
   || true)
+# NOTE: workers/watchdog.py is intentionally NOT in the crontab.
+# It runs continuously as a systemd service (recruiter-watchdog.service), NOT as a
+# cron job.  If a watchdog cron entry exists from before systemd was set up,
+# the line above removes it.  The correct way to manage the watchdog is:
+#   sudo systemctl status recruiter-watchdog
+#   journalctl -u recruiter-watchdog -f
+# To set up systemd for the first time: sudo bash deploy/install-systemd.sh
 
 NEW_CRON=$(cat << 'CRONTAB'
 CRON_TZ=America/New_York
