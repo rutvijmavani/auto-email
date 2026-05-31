@@ -72,6 +72,23 @@ def main():
         test_ats_payload_contract,
         test_detail_worker_contracts,
         test_scheduler_contracts,
+        # Phase 3 new-feature suites
+        test_detail_worker_inflight,
+        test_heartbeat,
+        test_monitor_report_phase1,
+        test_startup_validation,
+        # Pipeline CLI suites
+        test_add,
+        test_find_only,
+        test_outreach_only,
+        # DB + worker suites
+        test_api_health,
+        test_api_health_p95,
+        test_fullscan_bootstrap,
+        test_job_monitor_slot,
+        test_scan_worker_streams,
+        test_scheduler_streams,
+        test_slot,
     )
 
     unit_tests        = [test_database, test_outreach, test_pipeline,
@@ -85,7 +102,24 @@ def main():
                          # ATS + scheduler contract suites
                          test_ats_payload_contract,
                          test_detail_worker_contracts,
-                         test_scheduler_contracts]
+                         test_scheduler_contracts,
+                         # Phase 3 new-feature suites
+                         test_detail_worker_inflight,
+                         test_heartbeat,
+                         test_monitor_report_phase1,
+                         test_startup_validation,
+                         # Pipeline CLI suites
+                         test_add,
+                         test_find_only,
+                         test_outreach_only,
+                         # DB + worker suites
+                         test_api_health,
+                         test_api_health_p95,
+                         test_fullscan_bootstrap,
+                         test_job_monitor_slot,
+                         test_scan_worker_streams,
+                         test_scheduler_streams,
+                         test_slot]
     integration_tests = [test_integration]
     scraper_tests     = [test_job_scraper]
     all_tests         = unit_tests + integration_tests + scraper_tests

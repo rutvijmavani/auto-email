@@ -788,17 +788,158 @@ def on_adaptive_complete(company: str, new_jobs: int,
         _schedule_full_scan(company)
 
 
+def _next_digest_deadline(now: float) -> float:
+    """
+    Return the Unix timestamp of the next 7 AM Eastern digest boundary.
+
+    Used by _pick_schedule_time() so fullscan scheduling skips gap midpoints
+    where the predicted scan duration would push completion past 7 AM ET.
+
+    Examples:
+        now = 2 PM ET  → returns tomorrow 7 AM ET
+        now = 4 AM ET  → returns today   7 AM ET (3 h away)
+        now = 7 AM ET  → returns tomorrow 7 AM ET (exactly on boundary)
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    from datetime import datetime as _dt, timedelta
+    from config import CYCLE_START_HOUR, SEND_TIMEZONE
+
+    tz       = ZoneInfo(SEND_TIMEZONE)
+    dt       = _dt.fromtimestamp(now, tz=tz)
+    deadline = dt.replace(hour=CYCLE_START_HOUR, minute=0, second=0, microsecond=0)
+    if dt >= deadline:
+        deadline = deadline + timedelta(days=1)
+    return deadline.timestamp()
+
+
+def _pick_schedule_time(
+    target_ts:     float,
+    queue_key:     str,
+    interval_s:    int,
+    tolerance_pct: float,
+    r,
+    *,
+    deadline_ts:    Optional[float] = None,
+    avg_duration_s: float = 0.0,
+) -> float:
+    """
+    Gap-detection scheduling algorithm (Phase 2 — thundering herd prevention).
+
+    Replaces _least_loaded_slot() (20-slot min-heap) with a continuous gap
+    approach that guarantees maximum separation from existing neighbours.
+
+    Algorithm
+    ─────────
+    1. Compute a tolerance window [lo, hi] centred on target_ts:
+           window_s = interval_s × tolerance_pct   (e.g. 20% of 24 h = 4.8 h)
+           lo = target_ts − window_s / 2
+           hi = target_ts + window_s / 2
+
+    2. Fetch all existing ZSET scores within [lo, hi] via ZRANGEBYSCORE.
+
+    3. Build a gap list including sentinel edges at lo and hi:
+           points = sorted([lo] + existing_scores + [hi])
+           gaps   = [(size, gap_lo, gap_hi) for each consecutive pair]
+
+    4. Sort gaps by size descending; tiebreaker = gap midpoint closest to target_ts.
+
+    5. For each gap (largest first), compute midpoint and:
+         - If deadline_ts set and midpoint + avg_duration_s ≥ deadline_ts → skip
+           (scan would not finish before the 7 AM digest boundary)
+         - Otherwise → return midpoint
+
+    6. Fallback: all gaps violate deadline (extremely rare) → return target_ts.
+
+    Comparison with _least_loaded_slot()
+    ──────────────────────────────────────
+    Old approach: divide window into 20 fixed slots, count companies per slot,
+    return centre of the least-loaded slot.  Two companies can still land on
+    the same slot centre.  Slot boundaries create periodic clustering.
+
+    New approach: works at arbitrary resolution.  If 50 companies are already
+    scheduled, the algorithm finds the actual largest gap between them regardless
+    of slot size.  Self-corrects from full clustering in 2–3 cycles:
+        Day 1: all companies at T → all gaps = window_s / n → midpoints spread
+        Day 2: midpoints now fill the window evenly
+        Day 3+: stable, maximum-spread distribution maintained
+
+    Args:
+        target_ts:      Ideal next-poll Unix timestamp (now + interval_s).
+        queue_key:      Redis ZSET to inspect (poll:adaptive or poll:fullscan).
+        interval_s:     Full polling cycle in seconds; sets window width.
+        tolerance_pct:  Fraction of interval_s defining the search window.
+                        0.20 → ±10% (4.8 h on a 24 h cycle).
+        r:              Redis connection.
+        deadline_ts:    Optional Unix timestamp of next digest (7 AM ET).
+                        When set, midpoints that would violate the deadline
+                        are skipped.  Pass _next_digest_deadline(now).
+        avg_duration_s: Predicted scan duration (seconds) for deadline check.
+                        Read from company_poll_stats.avg_fullscan_duration_s.
+
+    Returns:
+        Unix timestamp (float) for the scheduled time.
+    """
+    window_s = interval_s * tolerance_pct
+    lo       = target_ts - window_s / 2
+    hi       = target_ts + window_s / 2
+
+    # All existing scheduled times within the window (one Redis call)
+    raw      = r.zrangebyscore(queue_key, lo, hi, withscores=True)
+    scores   = sorted(float(s) for _, s in raw)
+
+    # Build gaps including window-edge sentinels
+    points = [lo] + scores + [hi]
+    gaps   = [
+        (points[i + 1] - points[i], points[i], points[i + 1])
+        for i in range(len(points) - 1)
+    ]
+
+    # Largest gap first; tiebreaker: midpoint closest to target_ts
+    gaps.sort(key=lambda g: (-g[0], abs((g[1] + g[2]) / 2 - target_ts)))
+
+    for _gap_size, gap_lo, gap_hi in gaps:
+        midpoint = (gap_lo + gap_hi) / 2
+        if deadline_ts and avg_duration_s > 0:
+            if midpoint + avg_duration_s >= deadline_ts:
+                continue   # scan would not finish before 7 AM — try next gap
+        return midpoint
+
+    # All gaps violate deadline (fleet so large that no slot is safe this cycle).
+    # Fall back to target_ts — at least we don't miss the reschedule entirely.
+    logger.warning(
+        "_pick_schedule_time: all gaps in window violate deadline for %r "
+        "(avg_duration=%.0fs deadline=%s) — using target_ts",
+        queue_key, avg_duration_s,
+        datetime.fromtimestamp(deadline_ts).strftime("%H:%M") if deadline_ts else "none",
+    )
+    return target_ts
+
+
 def _reschedule_adaptive(company: str, interval_s: int) -> None:
     """
     Add company back to poll:adaptive ZSET with its new interval.
 
-    A ±10% random jitter is applied to the interval so companies that
-    happen to share the same polling cadence drift apart over successive
-    cycles, preventing thundering-herd clustering from reasserting itself.
+    Uses _pick_schedule_time() to find the largest gap between already-scheduled
+    companies within ±10% of the ideal next-poll time (tolerance_pct=0.20 gives
+    a total window of 20% of the interval centred on target_ts).
+
+    Adaptive scans are short (seconds to a minute) so no deadline check is
+    needed — only fullscan scheduling uses the 7 AM digest deadline guard.
     """
-    jitter = random.uniform(-0.10, 0.10)
-    score  = time.time() + interval_s * (1.0 + jitter)
-    get_redis().zadd(REDIS_POLL_ADAPTIVE, {company: score})
+    r         = get_redis()
+    now       = time.time()
+
+    score = _pick_schedule_time(
+        target_ts     = now + interval_s,
+        queue_key     = REDIS_POLL_ADAPTIVE,
+        interval_s    = interval_s,
+        tolerance_pct = 0.20,
+        r             = r,
+    )
+    r.zadd(REDIS_POLL_ADAPTIVE, {company: score})
 
 
 def _should_trigger_full_scan(company: str, row) -> bool:
@@ -865,7 +1006,8 @@ def on_fullscan_complete(company: str, new_jobs: int,
     conn = get_conn()
     try:
         row = conn.execute("""
-            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred
+            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred,
+                   avg_fullscan_duration_s
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
@@ -876,8 +1018,17 @@ def on_fullscan_complete(company: str, new_jobs: int,
         logger.warning("on_fullscan_complete: no poll_stats row for %r", company)
         return
 
-    interval_s = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
-    next_fs    = now + interval_s
+    interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
+    avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
+    next_fs        = _pick_schedule_time(
+        target_ts      = now + interval_s,
+        queue_key      = REDIS_POLL_FULLSCAN,
+        interval_s     = interval_s,
+        tolerance_pct  = 0.20,
+        r              = r,
+        deadline_ts    = _next_digest_deadline(now),
+        avg_duration_s = avg_duration_s,
+    )
 
     if success:
         conn = get_conn()
@@ -894,12 +1045,14 @@ def on_fullscan_complete(company: str, new_jobs: int,
         finally:
             conn.close()
 
-        # Re-queue for the next full scan cycle
+        # Re-queue for the next full scan cycle (min-heap slot selected)
         r.zadd(REDIS_POLL_FULLSCAN, {company: next_fs})
         logger.info(
             "on_fullscan_complete: company=%r new_jobs=%d "
-            "next_fullscan=+%dh success=True",
-            company, new_jobs, interval_s // 3600,
+            "next_fullscan=+%.1fh (slot offset from ideal: %+.0fs) success=True",
+            company, new_jobs,
+            (next_fs - now) / 3600,
+            next_fs - (now + interval_s),
         )
 
         # ── Bootstrap new companies into WARMING after their first full scan ────
@@ -1030,8 +1183,22 @@ def adaptive_loop() -> None:
     import socket as _socket
     scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
+    _hw_dispatched = 0   # total adaptive dispatches — reported in heartbeat
+
     while True:
         try:
+            # ── Scheduler heartbeat (worker:alive:scheduler) ──────────────────
+            # Tick is 1s; TTL = 15s.  Watchdog alerts if scheduler loop stops
+            # for more than 15 seconds (paused state still writes this key).
+            try:
+                r.set("worker:alive:scheduler", json.dumps({
+                    "pid":        os.getpid(),
+                    "ts":         time.time(),
+                    "dispatched": _hw_dispatched,
+                }), ex=15)
+            except Exception:
+                pass
+
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
                 _check_auto_resume()
@@ -1151,6 +1318,7 @@ def adaptive_loop() -> None:
 
                 # Keep inflight ZSET for Phase 10 fast_error_check compatibility
                 r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
+                _hw_dispatched += 1
 
                 logger.debug(
                     "adaptive_loop: dispatched %r to %s (dc=%s context=%s)",
