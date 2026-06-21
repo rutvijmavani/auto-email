@@ -689,15 +689,19 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
 
         # zcard
         def _zcard(key):
-            if key == REDIS_POLL_ADAPTIVE:  return adp_total
-            if key == REDIS_POLL_FULLSCAN:  return fs_total
+            if key == REDIS_POLL_ADAPTIVE:
+                return adp_total
+            if key == REDIS_POLL_FULLSCAN:
+                return fs_total
             return 0
         r.zcard.side_effect = _zcard
 
         # zcount
         def _zcount(key, lo, hi):
-            if key == REDIS_POLL_ADAPTIVE:  return adp_overdue
-            if key == REDIS_POLL_FULLSCAN:  return fs_overdue
+            if key == REDIS_POLL_ADAPTIVE:
+                return adp_overdue
+            if key == REDIS_POLL_FULLSCAN:
+                return fs_overdue
             return 0
         r.zcount.side_effect = _zcount
 
@@ -728,8 +732,10 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
 
         # llen (detail queues)
         def _llen(key):
-            if key == REDIS_DETAIL_ADAPTIVE: return detail_adp
-            if key == REDIS_DETAIL_FULLSCAN: return detail_fs
+            if key == REDIS_DETAIL_ADAPTIVE:
+                return detail_adp
+            if key == REDIS_DETAIL_FULLSCAN:
+                return detail_fs
             return 0
         r.llen.side_effect = _llen
 
@@ -1225,8 +1231,10 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
         health = json.dumps({"ts": self._NOW - 1, "pool": pool})
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler": return scheduler_payload.encode()
-            if key == "scheduler:health":        return health.encode()
+            if key == "worker:alive:scheduler":
+                return scheduler_payload.encode()
+            if key == "scheduler:health":
+                return health.encode()
             return None
         r.get.side_effect = _get
         r.scan.return_value = (0, [])
@@ -1280,8 +1288,10 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
         })
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler": return scheduler_payload.encode()
-            if key == "scheduler:health":        return health.encode()
+            if key == "worker:alive:scheduler":
+                return scheduler_payload.encode()
+            if key == "scheduler:health":
+                return health.encode()
             return None
         r.get.side_effect = _get
         r.scan.return_value = (0, [])

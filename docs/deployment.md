@@ -1715,6 +1715,65 @@ cat /home/opc/mail/data/log_monitor_state.json | python3 -m json.tool | head -20
 
 ---
 
+### CodeRabbit Review (June 2026) — deploy steps
+
+Security fixes, bug fixes, and architectural hardening from CodeRabbit review.
+Run these **once** on the server after `git pull`.
+
+#### What changed
+
+| File | Change | Needs restart? |
+|---|---|---|
+| `workers/sentry_init.py` | Atomic `SET NX` — fixes race where two concurrent workers could both forward the same new error to Sentry | ✅ Yes |
+| `scripts/health_check.py` | Silent `pass` on Redis RDB check replaced with `WARNING` row; scheduler heartbeat parse failure no longer reported as `OK` | ❌ Auto on next run |
+| `scripts/log_monitor.py` | E741 variable rename (`l` → `line`) — linting fix only | ❌ Auto |
+| `jobs/job_monitor.py` | `zrangebyscore` lower bound changed from `-inf` to `now − 7200` — stops stale killed-worker entries permanently excluding companies from missed-jobs check | ❌ Auto |
+| `workers/startup.py` | Redis URL credentials masked before printing to stderr/journal; `SELECT COUNT(*)` startup check replaced with `SELECT 1 … LIMIT 1` (no full-table scan) | ✅ Yes |
+| `workers/scan_worker.py` | `_hb.stop()` moved to after the loop — now called on all exit paths, not just `KeyboardInterrupt` | ✅ Yes |
+| `workers/detail_worker.py` | **Three architectural fixes:** (1) per-PID inflight keys prevent restarting worker from stealing live peer's job; (2) atomic Lua script for shutdown requeue eliminates crash-loss window; (3) `retryable` flag leaves unexpected-error jobs in inflight for recovery | ✅ Yes |
+| `workers/scheduler.py` | `_worker_spawn_times` entry cleaned up in `_shrink_pool()` — prevents unbounded dict growth | ✅ Yes |
+| `workers/fullscan.py` | Updated EMA passed to `_pick_schedule_time()` — deadline guard now reflects the scan that just completed, not the stale pre-scan value | ✅ Yes |
+| `workers/watchdog.py` | File handle in `_attempt_heal` wrapped in `with` block — closes on `Popen` exception too | ✅ Yes |
+| `scripts/startup_failure_alert.py` | Service name validated against allowlist before use in file paths and subprocess args | ❌ Via systemd |
+| `.github/workflows/deploy.yml` | `systemctl cat` check before restart — masks only "unit not found" errors, fails for real restart failures | ❌ CI only |
+| `tests/` | E701/E702 linting fixes across 3 test files | ❌ Tests only |
+
+#### Step-by-step
+
+```bash
+# ── 1. Pull latest code ───────────────────────────────────────────────────────
+cd /home/opc/mail
+git pull
+
+# ── 2. Restart services ───────────────────────────────────────────────────────
+# All source-code fixes take effect on restart.
+sudo systemctl restart recruiter-scheduler
+sudo systemctl restart recruiter-watchdog
+
+# ── 3. Verify services came back up ──────────────────────────────────────────
+systemctl is-active recruiter-scheduler recruiter-watchdog
+# Both should print "active"
+
+# ── 4. Full health check ──────────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python scripts/health_check.py
+# Redis RDB save should now appear in report (was silently missing before)
+# Scheduler heartbeat parse errors now show as WARNING instead of OK
+```
+
+#### Verifying the detail_worker per-PID inflight keys
+
+After restart you can confirm each worker uses its own inflight key:
+
+```bash
+# List all detail inflight keys (should be one per live worker PID)
+redis-cli KEYS "queue:detail:*:inflight:*"
+
+# Each key should have exactly 0 or 1 items (the currently-in-progress job)
+redis-cli LLEN "queue:detail:adaptive:inflight:<pid>"
+```
+
+---
+
 ### Manual recovery (when the watchdog escalates)
 
 If you receive a `🆘 ESCALATION` email, SSH into the server and run:

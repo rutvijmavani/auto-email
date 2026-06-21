@@ -921,7 +921,6 @@ def run_worker(once: bool = False, shutdown_event=None,
         except KeyboardInterrupt:
             logger.info("scan_worker: KeyboardInterrupt — shutting down")
             print("\n[scan_worker] Shutting down.")
-            _hb.stop()
             break
 
         except Exception as exc:
@@ -931,6 +930,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             if once:
                 break
             time.sleep(1)
+
+    # Stop heartbeat on ALL exit paths (break, KeyboardInterrupt, --once, shutdown event)
+    _hb.stop()
 
     # Flush any pending api_health writes
     try:

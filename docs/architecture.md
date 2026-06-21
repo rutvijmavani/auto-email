@@ -314,6 +314,8 @@ new_avg = 0.3 × last_duration_s + 0.7 × prev_avg
 
 Initial value: 30.0 s (conservative — unknown companies get a safe default until their first scan completes). Updated in `_complete_fullscan_db()` after every successful scan.
 
+**Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 s average, preventing a digest collision on the next cycle.
+
 **DB columns added (idempotent `ADD COLUMN IF NOT EXISTS` in `init_db()`):**
 
 ```sql
@@ -331,7 +333,7 @@ The `inflight:fullscan` ZSET (score = scan start timestamp) tracks every company
 
 - Written: `ZADD inflight:fullscan {company: start_ts}` at scan start, after lock acquisition
 - Removed: `ZREM inflight:fullscan company` in the `finally` block (runs on crash, clean exit, or error)
-- Read: `_get_worker_missed_companies()` reads the full ZSET and excludes those companies
+- Read: `_get_worker_missed_companies()` reads the ZSET with a **2-hour staleness window** — only entries with `score ≥ now − 7200` are considered. Entries older than 2 h come from workers that were killed without cleanup and must not permanently exclude companies from the missed-jobs check.
 
 If Redis is unavailable when `_get_worker_missed_companies()` runs, the inflight exclusion is skipped (the function proceeds without it — conservative: may do extra HTTP work, but no data is lost).
 
@@ -556,7 +558,7 @@ The pipeline uses Redis Streams for crash-safe job delivery to `scan_worker` and
 
 If a worker crashes between `XREADGROUP` and `XACK`, the job is left orphaned in the PEL indefinitely — no other worker picks it up automatically because Redis considers it "in progress."
 
-> **`detail_worker` is not covered here.** It uses Redis LISTs (`queue:detail:adaptive`, `queue:detail:fullscan`) with a separate at-least-once mechanism: `LMOVE` atomically transfers a job to an inflight list before processing, and `LREM` removes it from the inflight list only after the DB write succeeds. If the detail worker crashes mid-job, the job stays in the inflight list and is requeued on next startup. No PEL involved.
+> **`detail_worker` is not covered here.** It uses Redis LISTs (`queue:detail:adaptive`, `queue:detail:fullscan`) with a separate per-PID at-least-once mechanism: `LMOVE` atomically transfers a job into this worker's own inflight list (`queue:detail:*:inflight:{pid}`) before processing, and `LREM` removes it only after the DB write succeeds. On startup, `_recover_stuck_jobs()` drains inflight lists from dead workers (confirmed via heartbeat absence) — never touching live peers' lists. No PEL involved.
 
 **Detection — consumer liveness, not just time:**
 
@@ -752,9 +754,22 @@ If any check fails, the worker exits immediately with a clear, human-readable er
 
 ### At-least-once detail queue
 
-The detail queue (which holds job IDs waiting for full detail fetches) uses a "processing list" pattern rather than a simple pop. Before a worker begins processing a job, it atomically moves the job ID from the queue to a separate in-flight list. The job is only removed from the in-flight list after the database write succeeds.
+The detail queue (which holds job IDs waiting for full detail fetches) uses a "processing list" pattern rather than a simple pop.
 
-In plain terms: if a worker crashes mid-processing, the job is not lost. On the next worker startup, the in-flight list is recovered and the jobs are requeued automatically. A job may be processed more than once in a crash scenario (hence "at-least-once") but it will never be silently dropped.
+**Per-PID inflight keys:** Each `detail_worker` process uses its own inflight list keyed by PID:
+```
+queue:detail:adaptive:inflight:{pid}
+queue:detail:fullscan:inflight:{pid}
+```
+`LMOVE` atomically transfers a job from the source queue into this worker's inflight list before any processing begins. The job is removed from the inflight list (`LREM`) only after the DB write succeeds.
+
+**Crash-safe recovery:** On startup, `_recover_stuck_jobs()` scans for all `:inflight:*` keys, checks each peer's heartbeat (`worker:alive:detail_worker:{pid}`), and drains only the keys whose owner has no active heartbeat (confirmed dead). Keys belonging to live peers are never touched — this prevents a restarting worker from stealing an active peer's in-progress job.
+
+**Atomic shutdown requeue:** When the scheduler sends a shutdown event mid-job, a single Lua script atomically removes the job from the inflight list and pushes it back to the front of the source queue (`LREM` + `LPUSH` in one Redis eval). No crash window exists between the two operations.
+
+**Transient error handling:** `_process_detail()` returns a `retryable` flag. Unexpected errors (outer `except Exception`) set `retryable=True` — the item is left in the inflight list and recovered on next startup. Known-permanent outcomes (filtered, fetch failure where DB row was already cleaned up) set `retryable=False` and the item is acknowledged immediately.
+
+In plain terms: if a worker crashes mid-processing, the job is not lost. On the next worker startup, orphaned inflight items from confirmed-dead workers are requeued automatically. A job may be processed more than once in a crash scenario (hence "at-least-once") but it will never be silently dropped.
 
 ### Redis AOF persistence
 

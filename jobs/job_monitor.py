@@ -243,7 +243,12 @@ def _get_worker_missed_companies(companies: list) -> list:
     try:
         from config import REDIS_INFLIGHT_FULLSCAN
         from workers.redis_client import get_redis
-        raw      = get_redis().zrangebyscore(REDIS_INFLIGHT_FULLSCAN, "-inf", "+inf")
+        # Only consider entries added within the last 2 hours.  The ZSET score
+        # is the unix timestamp when the worker claimed the company.  Entries
+        # older than 2 h come from workers that were killed without cleanup and
+        # should not permanently exclude companies from the missed-jobs check.
+        stale_threshold = time.time() - 7200
+        raw      = get_redis().zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
         inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
         if inflight:
             logger.debug(

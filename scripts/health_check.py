@@ -140,8 +140,9 @@ def run_health_check() -> int:
                 warnings += 1
             else:
                 _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
-    except Exception:
-        pass
+    except Exception as exc:
+        _row("WARNING", "Redis RDB save", f"Persistence check failed: {exc}")
+        warnings += 1
 
     # PostgreSQL
     try:
@@ -187,7 +188,8 @@ def run_health_check() -> int:
             else:
                 _row("OK", "scheduler", status)
         except Exception:
-            _row("OK", "scheduler", "alive (heartbeat key present)")
+            _row("WARNING", "scheduler", "alive but heartbeat payload unparseable")
+            warnings += 1
 
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")

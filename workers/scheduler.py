@@ -2055,6 +2055,7 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
         if len(pool) <= floor_:
             return False
         proc, event = pool.pop()
+        _worker_spawn_times.pop(proc.pid, None)   # prevent stale entry accumulation
 
     event.set()
     logger.info(

@@ -1072,6 +1072,13 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             avg_duration_s = fs_state.get("avg_fullscan_duration_s", 30.0)
             duration_s     = time.monotonic() - start_mono
 
+            # Compute the updated EMA using the same α as _complete_fullscan_db so
+            # the deadline guard in _pick_schedule_time reflects current performance.
+            # Without this, a scan that suddenly took 4 h would still schedule the
+            # next one using the old "30 s" average — risking a digest collision.
+            _EMA_ALPHA           = 0.3   # must match _complete_fullscan_db
+            updated_avg_duration = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * avg_duration_s
+
             next_scan_at = _pick_schedule_time(
                 target_ts      = now + interval_s,
                 queue_key      = REDIS_POLL_FULLSCAN,
@@ -1079,7 +1086,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 tolerance_pct  = 0.20,
                 r              = r,
                 deadline_ts    = _next_digest_deadline(now),
-                avg_duration_s = avg_duration_s,
+                avg_duration_s = updated_avg_duration,
             )
 
             # Update DB: persist scan duration EMA + reschedule time.
@@ -1088,7 +1095,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 company, platform, new_count,
                 interval_s          = int(next_scan_at - now),
                 duration_s          = duration_s,
-                prev_avg_duration_s = avg_duration_s,
+                prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
             )
 
             r.zadd(REDIS_POLL_FULLSCAN, {company: next_scan_at})

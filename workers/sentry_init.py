@@ -175,20 +175,18 @@ def _make_before_send(r):
             act_key = f"{_PFX_ACT}{fp}"
             ts_key  = f"{_PFX_TS}{fp}"
 
-            err_exists = bool(r.exists(err_key))
-
             # Record this occurrence in frequency history (always, new or known)
             _update_frequency(r, ts_key)
             act_ttl = _compute_act_ttl(r, ts_key)
 
-            if err_exists:
-                # Known error — suppress, refresh act with dynamic TTL
-                r.set(act_key, "1", ex=act_ttl)
-                return None               # drop — zero Sentry credits used
-
-            # Brand-new error — forward once and start tracking
-            r.set(err_key, "1", ex=DEDUP_WINDOW_S)
+            # Atomic check-and-set: SET NX returns truthy only when the key
+            # was newly created by *this* call.  Concurrent workers that race
+            # here will all see is_new=None and suppress — no duplicate events.
+            is_new = r.set(err_key, "1", ex=DEDUP_WINDOW_S, nx=True)
             r.set(act_key, "1", ex=act_ttl)
+
+            if not is_new:
+                return None               # Known error — drop, zero Sentry credits
 
         except Exception:
             # Never let dedup logic prevent error reporting

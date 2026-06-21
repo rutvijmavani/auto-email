@@ -310,20 +310,26 @@ class TestQueueHealthSection(unittest.TestCase):
 
         def _llen(key):
             from config import REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN
-            if key == REDIS_DETAIL_ADAPTIVE:  return detail_adp
-            if key == REDIS_DETAIL_FULLSCAN:  return detail_fs
+            if key == REDIS_DETAIL_ADAPTIVE:
+                return detail_adp
+            if key == REDIS_DETAIL_FULLSCAN:
+                return detail_fs
             return 0
 
         def _zcard(key):
             from config import REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN
-            if key == REDIS_POLL_ADAPTIVE: return poll_adp_total
-            if key == REDIS_POLL_FULLSCAN: return poll_fs_total
+            if key == REDIS_POLL_ADAPTIVE:
+                return poll_adp_total
+            if key == REDIS_POLL_FULLSCAN:
+                return poll_fs_total
             return 0
 
         def _zcount(key, lo, hi):
             from config import REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN
-            if key == REDIS_POLL_ADAPTIVE: return poll_adp_overdue
-            if key == REDIS_POLL_FULLSCAN: return poll_fs_overdue
+            if key == REDIS_POLL_ADAPTIVE:
+                return poll_adp_overdue
+            if key == REDIS_POLL_FULLSCAN:
+                return poll_fs_overdue
             return 0
 
         r.llen.side_effect   = _llen

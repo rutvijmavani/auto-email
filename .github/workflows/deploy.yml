@@ -92,8 +92,13 @@ jobs:
             PY
 
             echo "[6/7] Restarting services..."
-            sudo systemctl restart recruiter-scheduler || echo "[WARN] recruiter-scheduler not installed yet — run deploy/install-systemd.sh"
-            sudo systemctl restart recruiter-watchdog  || echo "[WARN] recruiter-watchdog not installed yet — run deploy/install-systemd.sh"
+            for svc in recruiter-scheduler recruiter-watchdog; do
+              if systemctl cat "$svc" &>/dev/null; then
+                sudo systemctl restart "$svc"
+              else
+                echo "[WARN] $svc unit not installed yet — run deploy/install-systemd.sh"
+              fi
+            done
 
             echo "[7/7] Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"

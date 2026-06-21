@@ -226,11 +226,13 @@ Also sets `auto-aof-rewrite-percentage 100` + `auto-aof-rewrite-min-size 64mb`.
 
 ### 3.7 At-least-once delivery for detail queue ✅ DONE
 **File:** `workers/detail_worker.py`  
-Replaced `BRPOP` (destructive) with `LMOVE → inflight list` pattern:
-- `_pop_with_inflight()` atomically moves item from source → `queue:detail:*:inflight`
-- Item is `LREM`'d from inflight ONLY after successful DB write
-- `_recover_stuck_jobs()` called on startup: moves anything leftover in inflight lists
-  back to the front of their source queues (handles crash-between-pop-and-write)
+Replaced `BRPOP` (destructive) with `LMOVE → per-PID inflight list` pattern:
+- `_pop_with_inflight()` atomically moves item from source → `queue:detail:*:inflight:{pid}`
+- Item is `LREM`'d from inflight ONLY after successful DB write (or left in inflight if `retryable=True`)
+- `_recover_stuck_jobs(r, own_pid)` called on startup: scans for all `:inflight:*` keys, checks each
+  peer's heartbeat (`worker:alive:detail_worker:{pid}`), and drains only confirmed-dead peers' items —
+  never touching live workers' active jobs
+- Shutdown requeue is atomic via Lua script (LREM + LPUSH in a single `eval`) — no crash window
 - Priority ordering preserved: adaptive checked first (non-blocking), fullscan second
 
 ---

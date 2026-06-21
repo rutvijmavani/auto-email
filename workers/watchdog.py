@@ -1440,38 +1440,38 @@ def _attempt_heal(issue: Issue, r) -> bool:
     )
 
     try:
-        log_fh = open(log_path, "a")
-        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_fh.write(f"\n[{ts_str}] watchdog auto-heal: {' '.join(cmd_args)}\n")
-        log_fh.flush()
+        with open(log_path, "a") as log_fh:
+            ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_fh.write(f"\n[{ts_str}] watchdog auto-heal: {' '.join(cmd_args)}\n")
+            log_fh.flush()
 
-        if is_fg:
-            # Synchronous — wait up to 60s for rebuild / short commands
-            result = subprocess.run(
-                cmd_args,
-                cwd=_PROJECT_ROOT,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                timeout=60,
-            )
-            log_fh.close()
-            success = (result.returncode == 0)
-            if not success:
-                logger.warning(
-                    "watchdog: foreground heal failed for %r (exit=%d)",
-                    issue.alert_type, result.returncode,
+            if is_fg:
+                # Synchronous — wait up to 60s for rebuild / short commands
+                result = subprocess.run(
+                    cmd_args,
+                    cwd=_PROJECT_ROOT,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
                 )
-                return False
-        else:
-            # Background — detach from watchdog's process group
-            subprocess.Popen(
-                cmd_args,
-                cwd=_PROJECT_ROOT,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,   # detach — survives watchdog exit
-            )
-            log_fh.close()
+                success = (result.returncode == 0)
+                if not success:
+                    logger.warning(
+                        "watchdog: foreground heal failed for %r (exit=%d)",
+                        issue.alert_type, result.returncode,
+                    )
+                    return False
+            else:
+                # Background — detach from watchdog's process group.
+                # log_fh is inherited by the child; the with block closes it
+                # in the parent after Popen returns (even if Popen raises).
+                subprocess.Popen(
+                    cmd_args,
+                    cwd=_PROJECT_ROOT,
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,   # detach — survives watchdog exit
+                )
 
         # Record the attempt
         count_key = _rkey("heal_count", issue.alert_type)

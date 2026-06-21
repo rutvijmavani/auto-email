@@ -100,9 +100,22 @@ def _check_redis(prefix: str) -> None:
         r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
     except Exception as exc:
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        # Mask password so it never appears in systemd/journal logs.
+        try:
+            from urllib.parse import urlparse, urlunparse
+            _p = urlparse(redis_url)
+            if _p.password:
+                safe_url = urlunparse(_p._replace(
+                    netloc=f"{_p.username}:***@{_p.hostname}"
+                           + (f":{_p.port}" if _p.port else "")
+                ))
+            else:
+                safe_url = redis_url
+        except Exception:
+            safe_url = "(could not parse REDIS_URL)"
         msg = (
             f"{prefix} STARTUP FAILED — Redis is unreachable\n"
-            f"  URL: {redis_url}\n"
+            f"  URL: {safe_url}\n"
             f"  Error: {exc}\n"
             f"  Fix: sudo systemctl status redis"
         )
@@ -119,11 +132,11 @@ def _check_postgres(prefix: str) -> None:
         from db.db import init_db, get_conn
         init_db()
         conn = get_conn()
-        # Use a real table query (not just SELECT 1) so we catch schema-not-migrated errors
-        row = conn.execute("SELECT COUNT(*) AS c FROM job_postings").fetchone()
+        # Reference the real table (catches schema-not-migrated errors) but
+        # use LIMIT 1 instead of COUNT(*) to avoid a full-table sequential scan.
+        conn.execute("SELECT 1 FROM job_postings LIMIT 1").fetchone()
         conn.close()
-        job_count = row["c"] if row else 0
-        logger.debug("%s PostgreSQL check passed (%d jobs in DB)", prefix, job_count)
+        logger.debug("%s PostgreSQL check passed (schema accessible)", prefix)
     except Exception as exc:
         db_url_raw = os.getenv("DATABASE_URL", "(not set)")
         # Mask password in log output

@@ -92,7 +92,8 @@ class TestHeartbeatClass(unittest.TestCase):
         # We can only verify the key ends with the current PID; the multi-process
         # guarantee is by construction (os.getpid() differs per process).
         hb1 = Heartbeat(r1, "scan_worker", lambda: 0, interval_s=10)
-        hb1.start(); hb1.stop()
+        hb1.start()
+        hb1.stop()
         key1 = r1.set.call_args[0][0]
         self.assertIn(str(os.getpid()), key1,
                       "Key must embed the current PID so concurrent workers don't collide")

@@ -41,8 +41,25 @@ from config import EMAIL, APP_PASSWORD  # noqa: E402 — after sys.path fix
 _FLAG_FILE_TEMPLATE = "/tmp/startup_failure_alert_{service}.flag"
 _DEDUP_WINDOW_S     = 3600   # suppress duplicate alerts for 1 hour
 
+# Allowlist of services this script may act on.  The service name is used in
+# file paths and subprocess arguments; reject anything not on this list to
+# prevent path-traversal or unintended journal queries.
+_VALID_SERVICES = frozenset({
+    "recruiter-scheduler",
+    "recruiter-watchdog",
+})
+
+
+def _validate_service(service: str) -> None:
+    """Raise ValueError if service is not in the known-good allowlist."""
+    if service not in _VALID_SERVICES:
+        raise ValueError(
+            f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)}"
+        )
+
 
 def _already_sent(service: str) -> bool:
+    _validate_service(service)
     flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
     if not os.path.exists(flag):
         return False
@@ -51,6 +68,7 @@ def _already_sent(service: str) -> bool:
 
 
 def _mark_sent(service: str) -> None:
+    _validate_service(service)
     flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
     with open(flag, "w") as fh:
         fh.write(datetime.now().isoformat())
@@ -64,6 +82,7 @@ def _mark_sent(service: str) -> None:
 
 def _get_journal_tail(service: str, lines: int = 30) -> str:
     """Return the last `lines` journal entries for `service` as plain text."""
+    _validate_service(service)
     try:
         import subprocess
         result = subprocess.run(

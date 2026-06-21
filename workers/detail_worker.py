@@ -95,60 +95,113 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # ── At-least-once delivery via LMOVE processing lists ────────────────────────
 # BRPOP is destructive: if the worker dies after pop but before the DB write,
-# the job is lost from Redis.  Instead we LMOVE the item into a per-source
-# "processing" list atomically before we touch it, then LREM it afterwards.
+# the job is lost from Redis.  Instead we LMOVE the item into a per-worker
+# "inflight" list atomically before we touch it, then LREM it afterwards.
 #
-# On startup, _recover_stuck_jobs() moves everything in the processing lists
-# back to the front of their source queues so no job is silently dropped.
-#
-# Layout:
-#   queue:detail:adaptive           ← source (LPUSH by scan_worker/fullscan)
-#   queue:detail:adaptive:inflight  ← in-progress for this worker (LMOVE)
+# Per-PID inflight key layout (N = os.getpid() of this worker process):
+#   queue:detail:adaptive              ← source (LPUSH by scan_worker/fullscan)
+#   queue:detail:adaptive:inflight:N   ← this worker's in-progress jobs
 #   queue:detail:fullscan
-#   queue:detail:fullscan:inflight
+#   queue:detail:fullscan:inflight:N
 #
-# NOTE: We use one global inflight list per source queue, not per-worker-pid,
-# so that recovery works even when a different worker restarts after a crash.
-# Multiple concurrent detail_workers writing to the same inflight list is safe
-# because LREM removes the first exact match — each raw payload is unique
-# (contains job_id + enqueued_at timestamps).
+# Using per-PID keys prevents _recover_stuck_jobs() from draining a live
+# peer's active items on startup (Bug 1 fix).  Recovery scans for ALL
+# :inflight:* keys, checks the heartbeat of each PID, and only drains keys
+# whose owner has no active heartbeat (confirmed dead).
+#
+# _INFLIGHT_ADAPTIVE / _INFLIGHT_FULLSCAN / _INFLIGHT_KEY are intentionally
+# left empty here — they are set by run_worker() using the child process's
+# own PID (os.getpid() after fork) before the main loop starts.
 
-_INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight"
-_INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight"
+_INFLIGHT_ADAPTIVE: str = ""   # set in run_worker()
+_INFLIGHT_FULLSCAN: str = ""   # set in run_worker()
+_INFLIGHT_KEY: dict     = {}   # set in run_worker()
 
-# Maps source queue key → its inflight list key
-_INFLIGHT_KEY: dict = {
-    REDIS_DETAIL_ADAPTIVE: _INFLIGHT_ADAPTIVE,
-    REDIS_DETAIL_FULLSCAN: _INFLIGHT_FULLSCAN,
-}
+# ── Atomic shutdown requeue (Bug 3 fix) ───────────────────────────────────────
+# Replaces the previous two-call sequence (LREM then LPUSH) which had a crash
+# window where the job could be lost if the process died between the two calls.
+# Lua runs atomically on the Redis server — either both ops complete or neither.
+#
+# KEYS[1] = inflight_key   KEYS[2] = source_queue   ARGV[1] = raw payload
+_ATOMIC_REQUEUE_LUA = """
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if removed > 0 then
+    redis.call('LPUSH', KEYS[2], ARGV[1])
+end
+return removed
+"""
 
 
-def _recover_stuck_jobs(r) -> None:
+def _recover_stuck_jobs(r, own_pid: int) -> None:
     """
-    On worker startup: move any leftover inflight items back to their source
-    queues so they are not permanently lost.
+    On worker startup: scan for per-PID inflight keys belonging to dead workers
+    and drain their items back to the source queues.
 
-    Called BEFORE the main loop so the recovered items are available
-    immediately for the first LMOVE pick-up.
+    Safety contract:
+      • own_pid is always skipped — this worker has no heartbeat yet, so it
+        would look "dead" from the outside; never touch your own key.
+      • A peer whose heartbeat key (worker:alive:detail_worker:{pid}) is still
+        present is considered alive — skip its key entirely.
+      • Only drain keys whose owning PID has NO heartbeat (confirmed dead).
 
-    Uses LMOVE (source=RIGHT, dest=LEFT) so recovered items go to the FRONT
-    of the source queue — they have already waited long enough.
+    This prevents the previous bug where a restarting worker would steal
+    in-progress jobs from live peers that share the same logical queue.
+
+    Uses LMOVE (RIGHT → LEFT) so recovered items land at the FRONT of the
+    source queue — they've already waited long enough.
     """
-    for inflight_key, source_key in [
-        (_INFLIGHT_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
-        (_INFLIGHT_FULLSCAN, REDIS_DETAIL_FULLSCAN),
+    for queue_key, source_key in [
+        (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
+        (REDIS_DETAIL_FULLSCAN, REDIS_DETAIL_FULLSCAN),
     ]:
-        recovered = 0
+        pattern = f"{queue_key}:inflight:*"
+        cursor = 0
         while True:
-            item = r.lmove(inflight_key, source_key, "RIGHT", "LEFT")
-            if item is None:
+            cursor, raw_keys = r.scan(cursor, match=pattern, count=100)
+            for raw_key in raw_keys:
+                key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+
+                # Extract PID from the last colon-separated component
+                try:
+                    peer_pid = int(key.rsplit(":", 1)[-1])
+                except ValueError:
+                    logger.warning(
+                        "detail_worker: unexpected inflight key format %r — skipping",
+                        key,
+                    )
+                    continue
+
+                # Never touch our own in-flight key
+                if peer_pid == own_pid:
+                    continue
+
+                # Skip peers with a live heartbeat
+                hb_key = f"worker:alive:detail_worker:{peer_pid}"
+                if r.exists(hb_key):
+                    logger.debug(
+                        "detail_worker: peer pid=%d heartbeat present — "
+                        "skipping inflight recovery for %s",
+                        peer_pid, key,
+                    )
+                    continue
+
+                # Peer is dead — drain its items to the front of the source queue
+                recovered = 0
+                while True:
+                    item = r.lmove(key, source_key, "RIGHT", "LEFT")
+                    if item is None:
+                        break
+                    recovered += 1
+
+                if recovered:
+                    logger.warning(
+                        "detail_worker: recovered %d stuck job(s) from "
+                        "dead peer pid=%d: %s → %s",
+                        recovered, peer_pid, key, source_key,
+                    )
+
+            if cursor == 0:
                 break
-            recovered += 1
-        if recovered:
-            logger.warning(
-                "detail_worker: recovered %d stuck job(s) from %s → %s",
-                recovered, inflight_key, source_key,
-            )
 
 
 def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
@@ -270,6 +323,11 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         "platform":    platform,
         "outcome":     "error",
         "duration_ms": 0,
+        # retryable=True means leave the Redis item in inflight so
+        # _recover_stuck_jobs restores it for retry on the next worker start.
+        # Defaults False — most errors (filtered, fetch failure, bad payload)
+        # have already cleaned up the DB row and should not be retried.
+        "retryable":   False,
     }
 
     if not company or not job_id:
@@ -550,6 +608,11 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
         result["outcome"]     = "error"
+        # The DB row (status='pending_detail') has NOT been cleaned up by this
+        # path — _finish() was never called.  Mark as retryable so the caller
+        # leaves this item in inflight; _recover_stuck_jobs() on the next
+        # worker startup will restore it for a retry attempt.
+        result["retryable"]   = True
         logger.error(
             "detail_worker: unhandled error company=%r job_id=%s: %s",
             company, job_id, exc, exc_info=True,
@@ -660,8 +723,22 @@ def run_worker(once: bool = False, shutdown_event=None,
 
     r = get_redis()
 
-    # ── Recover any jobs left in inflight lists from a previous crash ─────────
-    _recover_stuck_jobs(r)
+    # ── Set per-PID inflight key names ───────────────────────────────────────
+    # Must use os.getpid() HERE (inside the child process after fork) so each
+    # worker process gets its own inflight namespace.  Module-level constants
+    # were intentionally left empty to prevent accidental shared-key usage
+    # when the scheduler imports this module before spawning workers.
+    global _INFLIGHT_ADAPTIVE, _INFLIGHT_FULLSCAN, _INFLIGHT_KEY
+    own_pid            = os.getpid()
+    _INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{own_pid}"
+    _INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight:{own_pid}"
+    _INFLIGHT_KEY      = {
+        REDIS_DETAIL_ADAPTIVE: _INFLIGHT_ADAPTIVE,
+        REDIS_DETAIL_FULLSCAN: _INFLIGHT_FULLSCAN,
+    }
+
+    # ── Recover any jobs left in inflight lists from dead peer workers ────────
+    _recover_stuck_jobs(r, own_pid)
 
     logger.info(
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
@@ -706,26 +783,18 @@ def run_worker(once: bool = False, shutdown_event=None,
             inflight_key = _INFLIGHT_KEY[source_queue]
 
             # ── Shutdown checkpoint: item is already in inflight list ─────────
-            # Return this specific job to the front of the source queue and exit.
+            # Atomically move our specific job back to the front of the source
+            # queue via Lua script (_ATOMIC_REQUEUE_LUA).  A single Redis eval()
+            # is atomic — no crash window between LREM and LPUSH.
             #
-            # Why lrem + lpush instead of lmove(inflight → source):
-            #   With multiple concurrent detail_workers, ALL workers share one
-            #   inflight list per queue.  lmove pops from the RIGHT end of the
-            #   shared list — which may be a DIFFERENT worker's item, not ours.
-            #   Result: workers swap each other's jobs (no data loss, but wrong
-            #   items get re-queued by the wrong workers on shutdown).
-            #
-            #   lrem(inflight, 1, raw) removes exactly our raw payload by value.
-            #   lpush(source, raw) puts it at the front so it's processed first
-            #   after restart.  If the process crashes between these two calls,
-            #   _recover_stuck_jobs() on the next startup restores it from the
-            #   inflight list — same safety guarantee as before.
+            # We use LREM-by-value (not LMOVE-from-end) because each worker now
+            # has its own per-PID inflight key, so there is only ever one item
+            # in this key at a time.  LREM is semantically clearer and safe.
             if shutdown_event is not None and shutdown_event.is_set():
-                r.lrem(inflight_key, 1, raw)
-                r.lpush(source_queue, raw)
+                r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
                 logger.info(
-                    "detail_worker: shutdown (pre-process), returned job "
-                    "to %s — exiting",
+                    "detail_worker: shutdown (pre-process), atomically returned "
+                    "job to %s — exiting",
                     source_queue,
                 )
                 break
@@ -746,10 +815,22 @@ def run_worker(once: bool = False, shutdown_event=None,
             result = _process_detail(payload, source_queue)
             _hw["count"] += 1
 
-            # ── Acknowledge: remove from inflight list ────────────────────────
-            # Only reached on successful processing (exception → loop error handler).
-            # Malformed-JSON path already removed above.
-            r.lrem(inflight_key, 1, raw)
+            # ── Acknowledge or retain in inflight ─────────────────────────────
+            # retryable=True means _process_detail hit an unexpected exception
+            # WITHOUT cleaning up the DB row — leave the item in inflight so
+            # _recover_stuck_jobs() restores it for a retry on next startup.
+            #
+            # retryable=False (default) covers all other paths: success (new),
+            # filtered, and known-permanent errors where _finish() already
+            # deleted the pending_detail DB row.  These are acknowledged.
+            if result.get("retryable"):
+                logger.warning(
+                    "detail_worker: transient error — leaving job_id=%s "
+                    "company=%r in inflight for recovery on restart",
+                    result.get("job_id"), result.get("company"),
+                )
+            else:
+                r.lrem(inflight_key, 1, raw)
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]
@@ -765,7 +846,6 @@ def run_worker(once: bool = False, shutdown_event=None,
         except KeyboardInterrupt:
             logger.info("detail_worker: KeyboardInterrupt — shutting down")
             print("\n[detail_worker] Shutting down.")
-            _hb.stop()
             break
 
         except Exception as exc:
@@ -775,6 +855,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             if once:
                 break
             time.sleep(1)
+
+    # Stop heartbeat on ALL exit paths (break, KeyboardInterrupt, --once, shutdown event)
+    _hb.stop()
 
     # Flush any pending api_health writes
     try:
