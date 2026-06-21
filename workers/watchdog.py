@@ -331,9 +331,13 @@ def _send_email(subject: str, body_html: str, *, dedup_key: str,
 
     Returns True if sent, False if suppressed by the cooldown window.
     """
-    if r.exists(dedup_key):
-        logger.debug("watchdog: suppressing email (cooldown) key=%r", dedup_key)
-        return False
+    try:
+        if r.exists(dedup_key):
+            logger.debug("watchdog: suppressing email (cooldown) key=%r", dedup_key)
+            return False
+    except Exception as exc:
+        # Redis unavailable — assume key absent and proceed to send
+        logger.warning("watchdog: dedup check failed, proceeding with send: %s", exc)
 
     if not EMAIL or not APP_PASSWORD:
         logger.error("watchdog: EMAIL or APP_PASSWORD not configured — cannot send")
@@ -496,74 +500,154 @@ def check_postgres() -> tuple:
 
 def check_worker_heartbeats(r) -> list:
     """
-    Check liveness of all four workers via their Redis heartbeat keys.
+    Check worker health via two independent signals:
 
-    Two failure modes are detected:
+    1. worker:alive:scheduler  — fast detection (TTL=15s, written every ~1s).
+       Scheduler dead → key expires → ERROR immediately.
 
-    1. Key MISSING (TTL expired) — worker stopped writing entirely.
-       The key's TTL is set to 3 × write_interval, so a missing key means
-       at least two consecutive writes were missed.  Almost certainly dead.
+    2. scheduler:health  — rich pool state published by the scheduler on every
+       pool event (death, respawn, scale up/down).  TTL=10min — also expires
+       if scheduler dies, giving the watchdog a second confirmation signal.
+       Contains per-type alive counts and consecutive_deaths counters, which
+       let the watchdog see "scheduler is alive but struggling to keep workers
+       up" — a situation the heartbeat key alone cannot detect.
 
-    2. Key PRESENT but STALE (ts field too old) — the daemon heartbeat
-       thread is running but the timestamp inside the payload has not been
-       updated within the dead threshold.  This catches a thread that is
-       alive but silently stuck (e.g. a deadlock that blocks the write path
-       without killing the thread).
+    Per-worker per-PID heartbeat keys (worker:alive:{type}:{pid}) are written
+    by individual workers and used for observability/display only.  All alerting
+    decisions come from the two keys above.
 
-    HEARTBEAT_DEAD_AFTER thresholds are generous:
-        scheduler:       20 s  (writes every ~1 s — tight)
-        scan_worker:     45 s  (daemon thread writes every 10 s)
-        detail_worker:   45 s  (daemon thread writes every 10 s)
-        fullscan_worker: 1900 s (daemon thread writes every 60 s;
-                                 scans legitimately take 20–30 min)
+    Responsibility split:
+      Scheduler  — owns worker lifecycle (spawn / replace / scale).
+                   Publishes scheduler:health so the watchdog can see inside.
+      Watchdog   — monitors the scheduler and escalates when it can't recover.
+                   Never tries to manage individual worker processes directly.
     """
-    issues = []
-    now    = time.time()
-    for worker_type, fix_cmd in [
-        ("scheduler",       "python pipeline.py --scheduler"),
-        ("scan_worker",     "python -m workers.scan_worker"),
-        ("detail_worker",   "python -m workers.detail_worker"),
-        ("fullscan_worker", "python -m workers.fullscan"),
-    ]:
-        key        = f"worker:alive:{worker_type}"
-        dead_after = HEARTBEAT_DEAD_AFTER[worker_type]
-        raw        = r.get(key)
+    issues  = []
+    now     = time.time()
+    FIX_CMD = "sudo systemctl restart recruiter-scheduler"
 
-        if raw is None:
-            # Key TTL expired — worker stopped refreshing it
+    # ── 1. Scheduler heartbeat — fast single-key check ───────────────────────
+    dead_after = HEARTBEAT_DEAD_AFTER["scheduler"]
+    raw        = r.get("worker:alive:scheduler")
+
+    if raw is None:
+        issues.append(Issue(
+            Issue.ERROR,
+            "worker:scheduler",
+            "scheduler heartbeat MISSING — scheduler is dead or never started",
+            FIX_CMD,
+            alert_type="worker_scheduler",
+        ))
+        # Scheduler is dead → workers are all dead too → no point reading
+        # scheduler:health (it will also be absent or stale).
+        return issues
+
+    try:
+        d   = json.loads(raw)
+        age = now - d.get("ts", now)
+        if age > dead_after:
             issues.append(Issue(
                 Issue.ERROR,
-                f"worker:{worker_type}",
-                f"{worker_type} heartbeat MISSING — worker is dead or never started",
-                fix_cmd,
-                alert_type=f"worker_{worker_type}",
+                "worker:scheduler",
+                f"scheduler heartbeat STALE — last write {age:.0f}s ago "
+                f"(threshold {dead_after}s). Scheduler may be hung.",
+                FIX_CMD,
+                alert_type="worker_scheduler",
             ))
-            continue
+        else:
+            issues.append(Issue(Issue.OK, "worker:scheduler",
+                f"alive pid={d.get('pid','?')} dispatched={d.get('dispatched',0)} "
+                f"heartbeat {age:.0f}s ago"))
+    except Exception:
+        issues.append(Issue(Issue.OK, "worker:scheduler",
+            "alive (heartbeat key present)"))
 
-        try:
-            d    = json.loads(raw)
-            age  = now - d.get("ts", now)
-            proc = d.get("processed", d.get("dispatched", 0))
+    # ── 2. Pool health from scheduler:health ─────────────────────────────────
+    WARN_DEATHS = 3
+    ERR_DEATHS  = 5
+    health_raw  = r.get("scheduler:health")
 
-            if age > dead_after:
-                # Key is present (not yet expired) but timestamp is stale —
-                # daemon thread may be hung without having exited the process
+    if health_raw is None:
+        # Key expired — scheduler stopped publishing (likely just started or
+        # is about to die; the faster heartbeat check above will catch a death).
+        issues.append(Issue(
+            Issue.WARNING,
+            "worker:pool_health",
+            "scheduler:health key missing — pool state unknown "
+            "(scheduler may have just started)",
+            alert_type="worker_pool_health",
+        ))
+        return issues
+
+    try:
+        health   = json.loads(health_raw)
+        pool     = health.get("pool", {})
+        pool_age = now - health.get("ts", now)
+
+        for ptype, label_suffix in [
+            ("scan",     "scan_worker"),
+            ("detail",   "detail_worker"),
+            ("fullscan", "fullscan_worker"),
+        ]:
+            info   = pool.get(ptype, {})
+            alive  = info.get("alive", 0)
+            consec = info.get("consecutive_deaths", 0)
+            total  = info.get("total_replacements", 0)
+            label  = f"worker:{label_suffix}"
+
+            # ── Collect live PIDs for display (best-effort, non-alerting) ─────
+            try:
+                live_pids = []
+                cursor = 0
+                while True:
+                    cursor, keys = r.scan(
+                        cursor, match=f"worker:alive:{label_suffix}:*", count=50
+                    )
+                    for k in keys:
+                        kraw = r.get(k)
+                        if kraw:
+                            kd = json.loads(kraw)
+                            live_pids.append(str(kd.get("pid", "?")))
+                    if cursor == 0:
+                        break
+            except Exception:
+                live_pids = []
+
+            pid_str    = f"pids=[{','.join(live_pids)}]" if live_pids else ""
+            detail_str = (
+                f"{alive} alive  {pid_str}  "
+                f"total_replacements={total}  pool_age={pool_age:.0f}s"
+            ).strip()
+
+            if consec >= ERR_DEATHS:
                 issues.append(Issue(
                     Issue.ERROR,
-                    f"worker:{worker_type}",
-                    f"{worker_type} heartbeat STALE — last write {age:.0f}s ago "
-                    f"(threshold {dead_after}s). Worker may be hung.",
-                    fix_cmd,
-                    alert_type=f"worker_{worker_type}",
+                    label,
+                    f"{detail_str}  consecutive_rapid_deaths={consec} "
+                    "— workers failing on startup; pool cannot stabilize",
+                    FIX_CMD,
+                    alert_type=f"worker_{label_suffix}",
+                ))
+            elif consec >= WARN_DEATHS:
+                issues.append(Issue(
+                    Issue.WARNING,
+                    label,
+                    f"{detail_str}  consecutive_rapid_deaths={consec} "
+                    "— scheduler struggling to keep workers up",
+                    FIX_CMD,
+                    alert_type=f"worker_{label_suffix}",
                 ))
             else:
-                issues.append(Issue(Issue.OK, f"worker:{worker_type}",
-                    f"alive pid={d.get('pid','?')} processed={proc} "
-                    f"heartbeat {age:.0f}s ago"))
-        except Exception:
-            # Can't parse the payload — key exists, treat as alive
-            issues.append(Issue(Issue.OK, f"worker:{worker_type}",
-                "alive (heartbeat key present)"))
+                note = (
+                    f"  ({consec} recent death(s) — scheduler replacing)"
+                    if consec > 0 else ""
+                )
+                issues.append(Issue(Issue.OK, label,
+                    f"{detail_str}{note}"))
+
+    except Exception as exc:
+        issues.append(Issue(Issue.WARNING, "worker:pool_health",
+            f"Could not parse scheduler:health: {exc}"))
 
     return issues
 
@@ -573,12 +657,30 @@ def check_worker_heartbeats(r) -> list:
 # ─────────────────────────────────────────
 
 def _worker_processed(r, worker_type: str) -> Optional[int]:
-    """Read the 'processed' counter from a worker heartbeat key. None if absent."""
+    """
+    Sum 'processed' counters across all alive instances of a worker type.
+
+    With per-PID heartbeat keys (worker:alive:{type}:{pid}), multiple workers
+    of the same type each maintain their own counter.  Summing gives the total
+    jobs processed by the pool — used by check_queue_stall to detect stalled
+    throughput across worker cycles.
+    """
     try:
-        raw = r.get(f"worker:alive:{worker_type}")
-        if not raw:
-            return None
-        return int(json.loads(raw).get("processed", 0))
+        total  = 0
+        found  = False
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(
+                cursor, match=f"worker:alive:{worker_type}:*", count=100
+            )
+            for key in keys:
+                raw = r.get(key)
+                if raw:
+                    total += int(json.loads(raw).get("processed", 0))
+                    found  = True
+            if cursor == 0:
+                break
+        return total if found else None
     except Exception:
         return None
 
@@ -598,8 +700,14 @@ def _zset_head(r, key: str):
 def _fullscan_lock_active(r) -> bool:
     """True if any fullscan:lock:* key is present — a scan is running right now."""
     try:
-        _, keys = r.scan(0, match="fullscan:lock:*", count=10)
-        return bool(keys)
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="fullscan:lock:*", count=10)
+            if keys:
+                return True
+            if cursor == 0:
+                break
+        return False
     except Exception:
         return False
 
@@ -672,15 +780,45 @@ def _consumer_pid(consumer_name: str) -> Optional[int]:
 
 
 def _heartbeat_pid(r, worker_type: str) -> Optional[int]:
-    """Return the PID recorded in a worker's live heartbeat key, or None if absent."""
+    """
+    Return any live PID for this worker type, or None if no heartbeat keys exist.
+
+    With per-PID keys (worker:alive:{type}:{pid}), we scan for any key matching
+    the worker type prefix and return the first PID found.  Used as a fallback
+    in _check_pel_health; the primary check there is _consumer_pid_alive().
+    """
     try:
-        raw = r.get(f"worker:alive:{worker_type}")
-        if not raw:
-            return None
-        pid = json.loads(raw).get("pid")
-        return int(pid) if pid else None
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(
+                cursor, match=f"worker:alive:{worker_type}:*", count=10
+            )
+            for key in keys:
+                raw = r.get(key)
+                if raw:
+                    pid = json.loads(raw).get("pid")
+                    return int(pid) if pid else None
+            if cursor == 0:
+                break
+        return None
     except Exception:
         return None
+
+
+def _consumer_pid_alive(r, worker_type: str, c_pid: Optional[int]) -> bool:
+    """
+    Return True if a live heartbeat key exists for this specific worker PID.
+
+    With per-PID keys (worker:alive:{type}:{pid}), we can directly test whether
+    the exact consumer that owns a PEL entry is still running — no cross-PID
+    ambiguity from a shared single key.
+    """
+    if c_pid is None:
+        return False
+    try:
+        return bool(r.exists(f"worker:alive:{worker_type}:{c_pid}"))
+    except Exception:
+        return False
 
 
 def _check_pel_health(r, issues: list) -> None:
@@ -733,13 +871,10 @@ def _check_pel_health(r, issues: list) -> None:
                 consumer_name = consumer_name.decode()
 
             # ── Is the consumer that owns this entry still alive? ─────────────
-            c_pid = _consumer_pid(consumer_name)
-            h_pid = _heartbeat_pid(r, worker_type)
-            consumer_alive = (
-                c_pid is not None and
-                h_pid is not None and
-                c_pid == h_pid
-            )
+            # With per-PID heartbeat keys we check the specific consumer's key
+            # directly — no cross-PID ambiguity from a shared single-type key.
+            c_pid          = _consumer_pid(consumer_name)
+            consumer_alive = _consumer_pid_alive(r, worker_type, c_pid)
 
             age_str = (
                 f"{oldest_ms // 60000:.0f}min"
@@ -757,7 +892,8 @@ def _check_pel_health(r, issues: list) -> None:
                 # reclaim it on the next scheduler tick.  Time thresholds
                 # now make sense: we know the consumer is gone.
                 orphan_note = (
-                    f"consumer={consumer_name} DEAD (heartbeat pid={h_pid or '?'})"
+                    f"consumer={consumer_name} DEAD "
+                    f"(pid={c_pid} — no heartbeat key)"
                 )
                 if oldest_ms > PEL_ALERT_AGE_MS:
                     issues.append(Issue(Issue.ERROR, label,
@@ -1116,7 +1252,7 @@ def check_coverage(r) -> list:
 def check_redis_persistence(r) -> list:
     try:
         info     = r.info("persistence")
-        last_s   = info.get("rdb_last_bgsave_time_sec", 0) or r.lastsave()
+        last_s   = info.get("rdb_last_save_time", 0) or r.lastsave()
         if isinstance(last_s, int) and last_s > 0:
             age_min = (time.time() - last_s) / 60
             if age_min > 30:
@@ -1651,6 +1787,9 @@ def run_watchdog(once: bool = False,
         status_only: print status table and exit — no emails, no healing.
         self_heal:   if False, alerts only (no auto-restart commands).
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     # ── Infrastructure check first ────────────────────────────────────────────
     r_ok, r_info = check_redis()
     if not r_ok:

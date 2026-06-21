@@ -645,6 +645,9 @@ def run_worker(once: bool = False, shutdown_event=None,
         skip_init_db:   if True, skip the init_db() call (used when the
                         scheduler parent process already ran it before fork).
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     if not skip_init_db:
         init_db()
 
@@ -703,11 +706,23 @@ def run_worker(once: bool = False, shutdown_event=None,
             inflight_key = _INFLIGHT_KEY[source_queue]
 
             # ── Shutdown checkpoint: item is already in inflight list ─────────
-            # Move it back to the source queue and exit cleanly.
-            # _recover_stuck_jobs() would also handle this on restart, but
-            # explicit re-queue is cleaner and avoids any startup latency.
+            # Return this specific job to the front of the source queue and exit.
+            #
+            # Why lrem + lpush instead of lmove(inflight → source):
+            #   With multiple concurrent detail_workers, ALL workers share one
+            #   inflight list per queue.  lmove pops from the RIGHT end of the
+            #   shared list — which may be a DIFFERENT worker's item, not ours.
+            #   Result: workers swap each other's jobs (no data loss, but wrong
+            #   items get re-queued by the wrong workers on shutdown).
+            #
+            #   lrem(inflight, 1, raw) removes exactly our raw payload by value.
+            #   lpush(source, raw) puts it at the front so it's processed first
+            #   after restart.  If the process crashes between these two calls,
+            #   _recover_stuck_jobs() on the next startup restores it from the
+            #   inflight list — same safety guarantee as before.
             if shutdown_event is not None and shutdown_event.is_set():
-                r.lmove(inflight_key, source_queue, "RIGHT", "LEFT")
+                r.lrem(inflight_key, 1, raw)
+                r.lpush(source_queue, raw)
                 logger.info(
                     "detail_worker: shutdown (pre-process), returned job "
                     "to %s — exiting",

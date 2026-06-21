@@ -552,6 +552,14 @@ def _build_queue_health_section() -> str:
                 return f'<span style="color:#f59e0b;font-weight:700;">{val:,} ⚠</span>'
             return f'<span style="color:#22c55e;">{val:,} ✓</span>'
 
+        def _status_cell(val, warn, crit):
+            """Status label that matches _depth_cell severity — no contradictions."""
+            if val > crit:
+                return "✗ CRITICAL"
+            elif val > warn:
+                return "⚠ backlog"
+            return "OK"
+
         th = (
             "padding:5px 10px;font-size:11px;font-weight:600;color:#64748b;"
             "background:#f1f5f9;border-bottom:1px solid #e2e8f0;text-align:left;"
@@ -574,13 +582,13 @@ def _build_queue_health_section() -> str:
             f'<td style="{td}">detail:adaptive</td>'
             f'<td style="{td}">{_depth_cell(detail_adp, 100, 500)}</td>'
             f'<td style="{td}">—</td>'
-            f'<td style="{td}">{"⚠ backlog" if detail_adp > 100 else "OK"}</td>'
+            f'<td style="{td}">{_status_cell(detail_adp, 100, 500)}</td>'
             f'</tr>'
             f'<tr style="background:#f8fafc;">'
             f'<td style="{td}">detail:fullscan</td>'
             f'<td style="{td}">{_depth_cell(detail_fs, 100, 500)}</td>'
             f'<td style="{td}">—</td>'
-            f'<td style="{td}">{"⚠ backlog" if detail_fs > 100 else "OK"}</td>'
+            f'<td style="{td}">{_status_cell(detail_fs, 100, 500)}</td>'
             f'</tr>'
             f'<tr style="background:#ffffff;">'
             f'<td style="{td}">poll:adaptive</td>'

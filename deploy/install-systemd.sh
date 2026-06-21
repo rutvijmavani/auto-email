@@ -44,16 +44,20 @@ fi
 # The watchdog was previously run via cron (--once every 5 min) as a temporary
 # measure.  Now that it runs continuously under systemd, the cron entry must be
 # removed to avoid both running in parallel (doubled emails + doubled heals).
+#
+# IMPORTANT: this script runs as root (EUID=0).  The old watchdog cron entry
+# lives in the SERVICE_USER (opc) crontab — not root's.  Always pass -u so we
+# read and write the correct user's crontab.
 echo ""
-echo "► Removing watchdog cron entry (now managed by systemd)..."
-if crontab -l 2>/dev/null | grep -q "workers.watchdog"; then
-    crontab -l 2>/dev/null \
+echo "► Removing watchdog cron entry from $SERVICE_USER crontab (now managed by systemd)..."
+if crontab -u "$SERVICE_USER" -l 2>/dev/null | grep -q "workers.watchdog"; then
+    crontab -u "$SERVICE_USER" -l 2>/dev/null \
         | grep -v "workers.watchdog" \
         | grep -v "watchdog.*--once" \
-        | crontab -
-    echo "  Removed watchdog cron entry from crontab"
+        | crontab -u "$SERVICE_USER" -
+    echo "  Removed watchdog cron entry from $SERVICE_USER crontab"
 else
-    echo "  (no watchdog cron entry found — nothing to remove)"
+    echo "  (no watchdog cron entry found in $SERVICE_USER crontab — nothing to remove)"
 fi
 
 # ── Stop existing nohup processes (if any) ───────────────────────────────────
@@ -154,7 +158,20 @@ done
 echo ""
 echo "► Running health check..."
 sleep 8   # wait for worker heartbeats to appear in Redis
-sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python scripts/health_check.py"
+# Run as the service user (not root) so file paths resolve correctly.
+# Health check failure is a WARNING here, not an abort — workers may still be
+# starting up.  set -euo pipefail would otherwise terminate the whole install
+# script on a transient unhealthy state that resolves in seconds.
+if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python scripts/health_check.py"; then
+    echo "  ✓ Health check passed"
+else
+    echo ""
+    echo "  [WARN] Health check reported issues — this is often normal right after startup."
+    echo "         Workers may still be initialising.  Wait 30 s and re-run:"
+    echo "           python scripts/health_check.py"
+    echo "         If issues persist, check:"
+    echo "           journalctl -u recruiter-scheduler -n 50"
+fi
 
 echo ""
 echo "════════════════════════════════════════════════════════════"

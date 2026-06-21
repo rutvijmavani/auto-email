@@ -296,7 +296,7 @@ Oracle monitors free tier VMs for idle usage:
 Your daily cron jobs prevent this:
   Daily  9 AM: --outreach-only → Playwright + SMTP = CPU spikes
   Weekly Mon:  --verify-only   → Playwright + CareerShift = CPU spikes
-  Every 4 days: keep-alive script = CPU activity
+  Every 4 hours: keep-alive script = CPU activity
 
 Playwright launching Chromium = significant CPU usage
 Oracle's monitors will see regular activity
@@ -306,7 +306,7 @@ Risk of reclamation: LOW
 ### Protection measures
 ```text
 1. Keep-alive cron (already installed by setup_cron.sh)
-   → Runs every 4 days at 12 PM
+   → Runs every 4 hours
    → Generates CPU activity
    → Belt-and-suspenders protection
 
@@ -678,8 +678,10 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # MONITOR JOBS — Daily 7 AM
+# 9 AM retry guard in case VM was suspended overnight and 7 AM was missed
 # ─────────────────────────────────────────
 0 7 * * * /home/opc/mail/run_monitor.sh
+0 9 * * * /bin/bash -c 'f=/home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log; [ ! -f "$f" ] && /home/opc/mail/run_monitor.sh'
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -721,9 +723,16 @@ CRON_TZ=America/New_York
 0 3 * * * /home/opc/mail/run_enrich.sh
 
 # ─────────────────────────────────────────
-# KEEP-ALIVE — every 4 days (Oracle idle protection)
+# LOG MONITOR — every 15 minutes
+# Scans log files from last byte offset, emails on new errors (Redis-deduped)
 # ─────────────────────────────────────────
-0 12 */4 * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+
+# ─────────────────────────────────────────
+# KEEP-ALIVE — every 4 hours (Oracle idle protection)
+# Changed from every 4 days — closes the overnight suspension gap
+# ─────────────────────────────────────────
+0 */4 * * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
 # ─────────────────────────────────────────
 # DETECT ATS — currently disabled
@@ -749,6 +758,9 @@ CRON_TZ=America/New_York
  1:00 AM (Tue-Sun): sync → backup → find-only → verify-filled (chained)
  1:00 AM (Mon):     sync → backup → verify-only → find-only → verify-filled (chained)
  1:00 AM (1st):     sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
+
+Every 15 min:  log_monitor.py (scans logs, emails on new errors, Redis-deduped)
+Every 4 hours: keep-alive (Oracle idle protection — was every 4 days)
 ```
 
 ### Safety with && chaining
@@ -1500,9 +1512,11 @@ Stuck `pending_detail` alert:
 
 ```python
 info = r.info("persistence")
-last_save = info.get("rdb_last_bgsave_time_sec", 0)
+last_save = info.get("rdb_last_save_time", 0)  # Unix epoch of last successful RDB save
 age_minutes = (time.time() - last_save) / 60
 ```
+
+> **Note:** `rdb_last_bgsave_time_sec` is the *duration* of the last bgsave (e.g. 3 seconds), not an epoch timestamp. Using it as an epoch produces an age of ~28 million minutes and always shows WARNING. The correct field is `rdb_last_save_time`.
 
 If `age_minutes > 30` → WARNING.
 
@@ -1632,6 +1646,72 @@ If `health_check.py` reports a problem, check the logs:
 ```bash
 journalctl -u recruiter-scheduler -n 50
 ```
+
+---
+
+### June 2026 — Session fixes deploy steps
+
+The following changes were made in this session and require specific deploy actions.
+Run these **once** on the server after `git pull`.
+
+#### What changed
+
+| File | Change | Needs restart? |
+|---|---|---|
+| `workers/scheduler.py` | XAUTOCLAIM `None` msg_id guard (crash fix) | ✅ Yes |
+| `db/pipeline_alerts.py` | `fromisoformat` TypeError fix | ❌ Auto on next run |
+| `scripts/log_monitor.py` | New proactive log scanner (dynamic TTL) | ❌ Via cron |
+| `workers/sentry_init.py` | New Sentry dedup module (dynamic TTL, no re-appear) | ✅ Yes (+ pip + .env) |
+| `pipeline.py` + 5 workers | `init_sentry()` wired in at each entry point | ✅ Yes |
+| Crontab | 9 AM retry guard + keep-alive every 4h + log_monitor/15m | ❌ Via update_crontab.sh |
+
+#### Step-by-step
+
+```bash
+# ── 1. Pull latest code ───────────────────────────────────────────────────────
+cd /home/opc/mail
+git pull
+
+# ── 2. Apply crontab changes (idempotent — safe to run multiple times) ────────
+bash deploy/update_crontab.sh
+
+# Verify the three new entries are present:
+crontab -l | grep -E "(retry|log_monitor|keep-alive|\*/4)"
+
+# ── 3. Install Sentry SDK (one-time) ─────────────────────────────────────────
+/home/opc/mail/venv/bin/pip install sentry-sdk
+
+# ── 4. Add SENTRY_DSN to .env (one-time — get DSN from sentry.io free account)
+#       Skip this step if you haven't set up a Sentry project yet.
+#       init_sentry() is a no-op when SENTRY_DSN is absent — safe to skip.
+echo "SENTRY_DSN=https://xxx@oYYY.ingest.sentry.io/ZZZ" >> /home/opc/mail/.env
+
+# ── 5. Restart services (picks up scheduler.py fix + all sentry_init wiring) ──
+sudo systemctl restart recruiter-scheduler
+sudo systemctl restart recruiter-watchdog
+
+# ── 6. Verify services came back up ──────────────────────────────────────────
+systemctl is-active recruiter-scheduler recruiter-watchdog
+# Both should print "active"
+
+# ── 7. Smoke test log monitor ─────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py
+# Should print "[log_monitor] clean — no issues found" if logs are quiet
+
+# Check that the state file was created (byte offsets per log file):
+cat /home/opc/mail/data/log_monitor_state.json | python3 -m json.tool | head -20
+
+# ── 8. Full health check ──────────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python scripts/health_check.py
+```
+
+#### What takes effect automatically (no action needed)
+
+- `db/pipeline_alerts.py` fix — active on next `run_monitor.sh` execution
+- `scripts/log_monitor.py` — active on next 15-minute cron tick after step 2
+- Dynamic TTL in both `sentry_init.py` and `log_monitor.py` — active immediately
+  after restart (step 5); Redis `ts:{fp}` keys build up over the first few
+  occurrences of each error, then the TTL adapts automatically
 
 ---
 

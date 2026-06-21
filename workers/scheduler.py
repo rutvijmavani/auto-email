@@ -154,6 +154,25 @@ _hysteresis: dict = {
     "detail_alert": 0,   # Phase 11: consecutive cycles with depth > watermark
 }
 
+# ── Pool health tracking (published to scheduler:health Redis key) ────────────
+# Read by the watchdog to make informed alerting decisions without duplicating
+# the scheduler's pool-management logic.
+#
+# _consecutive_deaths:  how many workers of a type died quickly (< _WORKER_STABLE_AFTER_S)
+#                       in a row without a stable worker in between.
+#                       Reset to 0 when a replacement lives ≥ _WORKER_STABLE_AFTER_S.
+# _total_replacements:  total spawns due to unexpected death since scheduler start.
+# _worker_spawn_times:  pid → (ptype, spawn_epoch) — populated in _spawn_worker,
+#                       consumed in _replace_dead_workers to compute worker age.
+# _WORKER_STABLE_AFTER_S: a replacement that lives at least this long is "stable"
+#                          (it survived — next death resets the streak).
+_consecutive_deaths:    dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_total_replacements:    dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_worker_spawn_times:    dict = {}   # pid → (ptype, spawn_epoch)
+_WORKER_STABLE_AFTER_S: int  = 60  # seconds
+_SCHEDULER_HEALTH_KEY   = "scheduler:health"
+_SCHEDULER_HEALTH_TTL   = 600      # 10 min — expires naturally if scheduler dies
+
 # ── Phase 10 — per-company DC key cache ──────────────────────────────────────
 # Populated lazily in _get_dc_key_for_company().  Avoids a DB query on every
 # adaptive_loop tick.  Keyed by company name; value is the dispatch throttle
@@ -245,6 +264,11 @@ def claim_stale_work(r, stream_key: str, group: str,
         return
 
     for msg_id, fields in claimed:
+        if msg_id is None:
+            # Redis 7.0+ XAUTOCLAIM returns (None, None) for PEL entries
+            # whose stream messages were deleted.  The message is already
+            # gone — nothing to XACK; just skip.
+            continue
         if not fields:
             r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue
@@ -1859,8 +1883,59 @@ def _spawn_worker(worker_type: str) -> tuple:
         daemon = False,   # non-daemon: scheduler waits for clean exit at shutdown
     )
     proc.start()
+    _worker_spawn_times[proc.pid] = (worker_type, time.time())
     logger.info("scheduler: spawned %s_worker pid=%d", worker_type, proc.pid)
     return proc, shutdown_event
+
+
+def _write_scheduler_health() -> None:
+    """
+    Publish current pool state and consecutive-death counters to Redis as
+    scheduler:health (TTL = _SCHEDULER_HEALTH_TTL).
+
+    The watchdog reads this key to make informed decisions without duplicating
+    the scheduler's internal pool-management logic:
+
+      - consecutive_deaths ≥ 5  → ERROR  (workers failing on startup repeatedly)
+      - consecutive_deaths ≥ 3  → WARNING (scheduler struggling to stabilize)
+      - consecutive_deaths < 3  → OK     (transient deaths, scheduler handling it)
+
+    The key expires naturally if the scheduler dies — the watchdog treats a
+    missing key as an additional signal that the scheduler is gone (beyond the
+    faster worker:alive:scheduler heartbeat check).
+
+    Called after every pool event: death + respawn, scale up, scale down.
+    Never called under _pool_lock — Redis write must not hold the pool lock.
+    """
+    try:
+        _fp = globals().get("_fullscan_pool_ref", [])
+        payload = {
+            "ts": time.time(),
+            "pool": {
+                "scan": {
+                    "alive":              len(_scan_pool),
+                    "consecutive_deaths": _consecutive_deaths["scan"],
+                    "total_replacements": _total_replacements["scan"],
+                },
+                "detail": {
+                    "alive":              len(_detail_pool),
+                    "consecutive_deaths": _consecutive_deaths["detail"],
+                    "total_replacements": _total_replacements["detail"],
+                },
+                "fullscan": {
+                    "alive":              len(_fp),
+                    "consecutive_deaths": _consecutive_deaths["fullscan"],
+                    "total_replacements": _total_replacements["fullscan"],
+                },
+            },
+        }
+        get_redis().set(
+            _SCHEDULER_HEALTH_KEY,
+            json.dumps(payload),
+            ex=_SCHEDULER_HEALTH_TTL,
+        )
+    except Exception as exc:
+        logger.warning("scheduler: failed to write scheduler:health: %s", exc)
 
 
 def _replace_dead_workers() -> None:
@@ -1893,7 +1968,27 @@ def _replace_dead_workers() -> None:
                         ptype, proc.pid, proc.exitcode,
                     )
                     replacements.append((ptype, proc.pid, proc.exitcode))
+
+                    # ── Consecutive-death tracking ────────────────────────────
+                    # If the dead worker lived ≥ _WORKER_STABLE_AFTER_S we treat
+                    # it as a one-off: reset the streak.  Quick repeated deaths
+                    # increment the counter so the watchdog can escalate.
+                    spawn_info = _worker_spawn_times.pop(proc.pid, None)
+                    if spawn_info:
+                        worker_age = time.time() - spawn_info[1]
+                        if worker_age >= _WORKER_STABLE_AFTER_S:
+                            _consecutive_deaths[ptype] = 0   # stable run — reset
+                        else:
+                            _consecutive_deaths[ptype] += 1  # rapid death — escalate
+                    else:
+                        _consecutive_deaths[ptype] += 1      # no spawn record
+                    _total_replacements[ptype] += 1
+
                     pool[i] = _spawn_worker(ptype)
+
+    # Publish updated pool state AFTER releasing the lock
+    if replacements:
+        _write_scheduler_health()
 
     # Emit scaling events outside the lock — DB write must not hold _pool_lock
     if replacements:
@@ -1934,6 +2029,7 @@ def _add_one_worker(worker_type: str, ceil_: int) -> bool:
             return False
         pool.append(_spawn_worker(worker_type))
 
+    _write_scheduler_health()   # publish updated pool size
     return True
 
 
@@ -1966,6 +2062,7 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
         "waiting for it to finish current job)",
         worker_type, proc.pid,
     )
+    _write_scheduler_health()   # publish updated pool size
     return True
 
 
@@ -2598,6 +2695,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
     Args:
         skip_rebuild: pass True if Redis is already warm (dev restarts)
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     init_db()
 
     if not skip_rebuild:
@@ -2662,6 +2762,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         "scheduler: spawned %d scan_workers + %d detail_workers + %d fullscan_workers",
         scan_count, detail_count, fullscan_count,
     )
+
+    # Publish initial pool state so the watchdog has baseline data immediately
+    _write_scheduler_health()
 
     # ── Initialise stream consumer groups ────────────────────────────────────
     # Done here (after workers spawn) so the groups exist before any XADD.

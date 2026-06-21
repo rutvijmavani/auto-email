@@ -75,7 +75,7 @@ def _get_journal_tail(service: str, lines: int = 30) -> str:
             return result.stdout.strip()
     except Exception:
         pass
-    return "(could not retrieve journal — run: journalctl -u {service} -n 50)"
+    return f"(could not retrieve journal — run: journalctl -u {service} -n 50)"
 
 
 # ─────────────────────────────────────────
@@ -251,6 +251,7 @@ if __name__ == "__main__":
 
     service_name = sys.argv[1]
     # Normalise: systemd passes %n which may include .service suffix
-    service_name = service_name.replace(".service", "")
+    if service_name.endswith(".service"):
+        service_name = service_name[: -len(".service")]
 
     send_startup_failure_alert(service_name)

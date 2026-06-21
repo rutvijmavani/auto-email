@@ -382,7 +382,15 @@ def check_api_health():
         recent = platform_rows[:days]
         try:
             from datetime import date as date_type
-            dates = [date_type.fromisoformat(r["date"]) for r in recent]
+            # psycopg2 returns PostgreSQL `date` columns as datetime.date objects,
+            # not strings.  fromisoformat() only accepts str, so pass through
+            # date objects directly and only call fromisoformat() for strings
+            # (e.g. SQLite fallback, test fixtures, old SQLite-era rows).
+            dates = [
+                r["date"] if isinstance(r["date"], date_type)
+                else date_type.fromisoformat(r["date"])
+                for r in recent
+            ]
             contiguous = all(
                 (dates[i] - dates[i + 1]).days == 1
                 for i in range(len(dates) - 1)
@@ -393,7 +401,7 @@ def check_api_health():
                     platform
                 )
                 continue
-        except (ValueError, KeyError):
+        except (TypeError, ValueError, KeyError):
             continue
 
         # Check if all N consecutive days are above threshold

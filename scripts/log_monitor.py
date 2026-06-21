@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""
+scripts/log_monitor.py — Proactive pipeline log scanner with Redis-backed dedup.
+
+┌─ Every 15 min (cron) ─────────────────────────────────────────────────────┐
+│  1. Scan log files from last byte offset (nothing re-read, nothing missed) │
+│  2. Fingerprint each flagged line (exception type + file + lineno)         │
+│  3. NEW error  (not in Redis)   → immediate alert email + store in Redis   │
+│  4. KNOWN error (in Redis)      → silently drop, just refresh "active" key │
+│  5. Resolution sweep            → any error whose "active" key expired      │
+│     (not seen for 4 h)  →  delete main key so next occurrence = NEW again  │
+│     → append to resolved log for next digest                                │
+│  6. Digest due? (every 3 days)  → send NEW / ACTIVE / RESOLVED summary     │
+└───────────────────────────────────────────────────────────────────────────┘
+
+Redis key schema
+───────────────
+  log_monitor:err:{fp}      JSON error record   TTL = DEDUP_WINDOW   (7 days)
+  log_monitor:act:{fp}      "1"                 TTL = dynamic (5 min – 24 h)
+                            Refreshed on every occurrence with a TTL derived
+                            from the error's own firing frequency:
+                              TTL = clamp(N_CYCLES × avg_IAT, 5 min, 24 h)
+                            When it expires → error is "resolved".
+  log_monitor:ts:{fp}       list of timestamps  TTL = DEDUP_WINDOW   (7 days)
+                            Last HISTORY_SIZE hit timestamps; drives act TTL.
+  log_monitor:resolved      Redis list of JSON records for resolved errors
+                            since the last digest.  Cleared after digest.
+  log_monitor:digest_ts     Float str — Unix timestamp of last digest sent.
+
+Why Redis instead of a local file?
+  Byte offsets (what we've already read) live in a local JSON file so the
+  scanner works even when Redis is briefly down.  Dedup / active / resolved
+  state lives in Redis so TTL-based expiry is handled automatically without
+  any cron cleanup job.  If Redis is unavailable the scanner degrades
+  gracefully: it still reads logs and updates file offsets, but skips the
+  dedup/alert logic rather than crashing.
+
+Cron entry (add via deploy/update_crontab.sh or setup_cron.sh):
+  */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py \
+               >> /home/opc/mail/logs/log_monitor.log 2>&1
+"""
+
+from __future__ import annotations
+
+import hashlib
+import html as html_lib
+import json
+import os
+import re
+import smtplib
+import time
+from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Any
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+LOGS_DIR    = PROJECT_DIR / "logs"
+STATE_FILE  = PROJECT_DIR / "data" / "log_monitor_state.json"   # byte offsets
+
+# ── Tuning ────────────────────────────────────────────────────────────────────
+DEDUP_WINDOW_S    = 7 * 24 * 3600   # suppress the same error for 7 days
+DIGEST_INTERVAL_S = 3 * 24 * 3600   # send digest every 3 days
+MAX_LOG_AGE_HOURS = 48               # only scan logs modified in last 48 h
+CONTEXT_LINES     = 6                # lines of context captured after each hit
+
+# Dynamic active-TTL: act TTL = N_CYCLES × avg inter-arrival time (IAT).
+# Error is "resolved" when it misses N_CYCLES consecutive expected cycles.
+HISTORY_SIZE      = 10    # timestamps to keep per fingerprint
+N_CYCLES          = 3     # consecutive missed cycles → resolved
+MIN_ACT_TTL_S     = 300   # 5 min floor  (very frequent errors)
+MAX_ACT_TTL_S     = 86400 # 24 h ceiling (daily / infrequent errors)
+DEFAULT_ACT_TTL_S = 3600  # 1 h — used until ≥ 2 occurrences are recorded
+
+# ── Redis key prefixes ────────────────────────────────────────────────────────
+_PFX_ERR      = "log_monitor:err:"
+_PFX_ACT      = "log_monitor:act:"
+_PFX_TS       = "log_monitor:ts:"
+_KEY_RESOLVED = "log_monitor:resolved"
+_KEY_DIGEST   = "log_monitor:digest_ts"
+
+# ── Patterns that flag a line as worth alerting on ────────────────────────────
+FLAG_PATTERNS: list[re.Pattern] = [
+    re.compile(r'\|\s*(ERROR|CRITICAL)\s*\|'),
+    re.compile(r'^Traceback \(most recent call last\):'),
+    re.compile(r'^(TypeError|ValueError|AttributeError|KeyError|IndexError'
+               r'|RuntimeError|OSError|IOError|PermissionError'
+               r'|psycopg2\.\w+Error|redis\.exceptions\.\w+Error):'),
+    # Cron wrapper non-zero exit — "[CRON] … | exit=1"
+    re.compile(r'\[CRON\].*\|\s*exit=[^0\s]'),
+]
+
+# ── Patterns that SUPPRESS a line even if it matches FLAG_PATTERNS ────────────
+SUPPRESS_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("Accenture missing_keys (expected Workday behaviour)",
+     re.compile(r'MISSING required keys.*company=.accenture')),
+    ("URL-extracted non-US location (expected filter behaviour)",
+     re.compile(r'non-US location')),
+    ("api_health default fallback (handled internally)",
+     re.compile(r'returning default \d+ ms')),
+    ("Band threshold recalibration failure (non-critical)",
+     re.compile(r'band threshold recalibration failed')),
+    ("Adaptive/fullscan backpressure (intended throttle)",
+     re.compile(r'backpressure.*queue_depth')),
+    ("fetch_job_detail guard fired / no new data (handled)",
+     re.compile(r'fetch_job_detail returned NO new data')),
+    ("ATS outage / canary state (watchdog monitors this)",
+     re.compile(r'worker:outage:')),
+    ("Scheduler auto-pause / auto-resume (expected)",
+     re.compile(r'(auto.paused|auto.resumed)')),
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Redis connection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_redis():
+    """
+    Return a Redis client, or None if unavailable.
+
+    Tries the project's get_redis() first (picks up REDIS_URL / sentinel
+    config from the existing codebase).  Falls back to a plain redis-py
+    client from the REDIS_URL env var.  Returns None rather than raising
+    so the scanner degrades gracefully.
+    """
+    try:
+        from workers.scheduler import get_redis
+        return get_redis()
+    except Exception:
+        pass
+    try:
+        import redis as _redis
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_DIR / ".env")
+        url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        return _redis.from_url(url, decode_responses=True)
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fingerprinting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fingerprint(line: str, context: list[str]) -> str:
+    """
+    Produce a stable, variable-stripped fingerprint for a flagged log entry.
+
+    Priority:
+      1. Exception type + filename + lineno  (most stable — survives log rotation)
+      2. Exception type alone
+      3. Normalised flagged line (strip timestamps, IDs, company names)
+    """
+    all_lines = [line] + context
+
+    exc_type = None
+    location = None
+
+    # Look for bare exception line: "TypeError: fromisoformat…"
+    for l in all_lines:
+        m = re.match(
+            r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning))'
+            r'(?:\s*:|\s*$)',
+            l.strip(),
+        )
+        if m:
+            exc_type = m.group(1).split(".")[-1]   # strip module prefix
+            break
+
+    # Look for traceback frame: '  File "/path/foo.py", line 123, in func'
+    for l in all_lines:
+        m = re.search(r'File "([^"]+)", line (\d+)', l)
+        if m:
+            fname  = Path(m.group(1)).name
+            lineno = m.group(2)
+            location = f"{fname}:{lineno}"
+            break
+
+    if exc_type and location:
+        raw = f"{exc_type}:{location}"
+    elif exc_type:
+        raw = exc_type
+    else:
+        # Normalise: strip timestamps, PIDs, UUIDs, job/company identifiers
+        raw = line
+        raw = re.sub(
+            r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[\d.,]*', 'TS', raw
+        )
+        raw = re.sub(r"\bpid=\d+\b",               "pid=N",   raw)
+        raw = re.sub(r"company=['\"]?[^'\",\s]+",  "company=X", raw)
+        raw = re.sub(r"job_id=\S+",                "job_id=X", raw)
+        raw = re.sub(r"\b[0-9a-f]{8,}\b",          "HASH",    raw)
+        raw = re.sub(r"\b\d{4,}\b",                "N",       raw)
+
+    return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State helpers (byte offsets — kept in a local file, not Redis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_offsets() -> dict[str, int]:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text()).get("offsets", {})
+        except Exception:
+            pass
+    return {}
+
+
+def _save_offsets(offsets: dict[str, int]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"offsets": offsets}, indent=2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log scanning
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_suppressed(line: str) -> bool:
+    return any(pat.search(line) for _, pat in SUPPRESS_PATTERNS)
+
+
+def _is_flagged(line: str) -> bool:
+    return any(pat.search(line) for pat in FLAG_PATTERNS)
+
+
+def scan_file(
+    path: Path, offset: int
+) -> tuple[int, list[tuple[str, list[str]]]]:
+    """
+    Read new content in *path* from *offset*.
+    Returns (new_offset, [(flagged_line, context_lines), ...]).
+    Handles log rotation: if file shrank, resets to 0.
+    """
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return offset, []
+
+    if size < offset:
+        offset = 0           # rotated / truncated
+    if size == offset:
+        return offset, []    # nothing new
+
+    try:
+        with open(path, errors="replace") as fh:
+            fh.seek(offset)
+            lines      = fh.readlines()
+            new_offset = fh.tell()
+    except Exception:
+        return offset, []
+
+    findings: list[tuple[str, list[str]]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        if line and not _is_suppressed(line) and _is_flagged(line):
+            context = [
+                lines[j].rstrip()
+                for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines)))
+                if lines[j].strip()
+            ]
+            findings.append((line, context))
+            i += 1 + CONTEXT_LINES   # skip past captured context
+        else:
+            i += 1
+
+    return new_offset, findings
+
+
+def collect_raw_findings(
+    offsets: dict[str, int],
+) -> tuple[dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
+    """
+    Scan all relevant log files.
+    Returns updated offsets and per-filename raw findings.
+    """
+    cutoff = time.time() - MAX_LOG_AGE_HOURS * 3600
+
+    priority = [
+        LOGS_DIR / "scheduler.log",
+        LOGS_DIR / "detail_worker.log",
+        LOGS_DIR / "scan_worker.log",
+        LOGS_DIR / "fullscan.log",
+    ]
+    recent_dated = [
+        p for p in LOGS_DIR.glob("*.log")
+        if p not in priority and p.stat().st_mtime >= cutoff
+    ]
+
+    new_offsets = dict(offsets)
+    raw: dict[str, list] = {}
+
+    for path in priority + recent_dated:
+        if not path.exists():
+            continue
+        key = str(path)
+        new_off, hits = scan_file(path, offsets.get(key, 0))
+        new_offsets[key] = new_off
+        if hits:
+            raw[path.name] = hits
+
+    return new_offsets, raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dedup + resolution logic (Redis)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _err_key(fp: str) -> str:
+    return f"{_PFX_ERR}{fp}"
+
+
+def _act_key(fp: str) -> str:
+    return f"{_PFX_ACT}{fp}"
+
+
+def _ts_key(fp: str) -> str:
+    return f"{_PFX_TS}{fp}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Frequency tracking helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _update_frequency(r, fp: str, now: float) -> None:
+    """Push current timestamp into the history ring-buffer (newest-first)."""
+    key = _ts_key(fp)
+    r.lpush(key, now)
+    r.ltrim(key, 0, HISTORY_SIZE - 1)
+    r.expire(key, DEDUP_WINDOW_S)   # auto-clean alongside err key
+
+
+def _compute_act_ttl(r, fp: str) -> int:
+    """
+    Derive a dynamic act-key TTL from observed inter-arrival time (IAT).
+
+    TTL = clamp(N_CYCLES × avg_IAT, MIN_ACT_TTL_S, MAX_ACT_TTL_S)
+
+    Examples
+    --------
+    Error every 2 min   → avg_IAT=120 s  → TTL =   360 s  (6 min)
+    Error every 2 h     → avg_IAT=7200 s → TTL = 21600 s  (6 h)
+    Error every 8 h     → avg_IAT=28800s → TTL = 86400 s  (24 h, ceiling)
+
+    Falls back to DEFAULT_ACT_TTL_S while fewer than 2 timestamps are recorded.
+    """
+    raw        = r.lrange(_ts_key(fp), 0, -1)
+    timestamps = sorted(float(t) for t in raw)
+
+    if len(timestamps) < 2:
+        return DEFAULT_ACT_TTL_S
+
+    iats    = [timestamps[i + 1] - timestamps[i] for i in range(len(timestamps) - 1)]
+    avg_iat = sum(iats) / len(iats)
+    ttl     = int(N_CYCLES * avg_iat)
+    return max(MIN_ACT_TTL_S, min(MAX_ACT_TTL_S, ttl))
+
+
+def process_findings(
+    r,
+    raw: dict[str, list[tuple[str, list[str]]]],
+    now: float,
+) -> dict[str, dict]:
+    """
+    Classify each raw finding as NEW or KNOWN using Redis.
+
+    Returns {fp: record} for NEW errors only (the ones to alert on immediately).
+    As a side-effect, refreshes the "active" TTL for all seen errors.
+    """
+    new_errors: dict[str, dict] = {}
+
+    for fname, hits in raw.items():
+        for line, context in hits:
+            fp      = _fingerprint(line, context)
+            err_key = _err_key(fp)
+            act_key = _act_key(fp)
+
+            known = r.exists(err_key)
+
+            record: dict[str, Any] = {
+                "fp":           fp,
+                "first_seen":   now,
+                "last_seen":    now,
+                "count":        1,
+                "log_file":     fname,
+                "sample_line":  line,
+                "sample_context": [c for c in context if c.strip()],
+            }
+
+            if not known:
+                # Brand-new error — store it and mark for immediate alert
+                r.set(err_key, json.dumps(record), ex=DEDUP_WINDOW_S)
+                new_errors[fp] = record
+            else:
+                # Known error — update last_seen + count, don't alert
+                try:
+                    stored = json.loads(r.get(err_key) or "{}")
+                    stored["last_seen"] = now
+                    stored["count"]     = stored.get("count", 1) + 1
+                    # Preserve remaining TTL (don't reset the 7-day clock)
+                    ttl = r.ttl(err_key)
+                    if ttl > 0:
+                        r.set(err_key, json.dumps(stored), ex=ttl)
+                except Exception:
+                    pass
+
+            # Update frequency history + refresh active heartbeat with dynamic TTL
+            _update_frequency(r, fp, now)
+            act_ttl = _compute_act_ttl(r, fp)
+            r.set(act_key, "1", ex=act_ttl)
+
+    return new_errors
+
+
+def sweep_resolved(r, now: float) -> list[dict]:
+    """
+    Find errors whose "active" key has expired (not seen for N_CYCLES × avg_IAT).
+
+    These errors are considered resolved:
+      - Their main err: key is deleted so the next occurrence is treated as NEW.
+      - A summary record is pushed to log_monitor:resolved for the next digest.
+
+    Returns the list of resolved records (for logging).
+    """
+    resolved = []
+
+    try:
+        for err_key in r.scan_iter(f"{_PFX_ERR}*"):
+            fp      = err_key[len(_PFX_ERR):]
+            act_key = _act_key(fp)
+
+            if not r.exists(act_key):
+                # Active key expired → error resolved
+                try:
+                    raw = r.get(err_key)
+                    if raw:
+                        record              = json.loads(raw)
+                        record["resolved_at"] = now
+                        r.rpush(_KEY_RESOLVED, json.dumps(record))
+                        r.ltrim(_KEY_RESOLVED, -200, -1)  # keep last 200
+                except Exception:
+                    pass
+                r.delete(err_key)
+                resolved.append(fp)
+    except Exception:
+        pass
+
+    return resolved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Email helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _esc(s: str) -> str:
+    return html_lib.escape(str(s))
+
+
+def _format_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _error_table_row(record: dict) -> str:
+    line    = _esc(record.get("sample_line", ""))
+    ctx     = "".join(
+        f'<tr><td style="padding:2px 10px 2px 28px;font-family:monospace;'
+        f'font-size:11px;color:#64748b;word-break:break-all">'
+        f'{_esc(c)}</td></tr>'
+        for c in record.get("sample_context", []) if c.strip()
+    )
+    return (
+        f'<tr><td style="padding:5px 10px;font-family:monospace;font-size:12px;'
+        f'color:#dc2626;word-break:break-all">{line}</td></tr>{ctx}'
+        f'<tr><td style="padding:2px 10px 4px;font-size:11px;color:#94a3b8">'
+        f'📄 {_esc(record.get("log_file","?"))} &nbsp;·&nbsp; '
+        f'first seen {_format_ts(record.get("first_seen", 0))} &nbsp;·&nbsp; '
+        f'{record.get("count", 1):,} occurrence(s)</td></tr>'
+    )
+
+
+def _send_email(subject: str, body_html: str) -> bool:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_DIR / ".env")
+    except Exception:
+        pass
+
+    email    = os.environ.get("EMAIL", "")
+    password = os.environ.get("APP_PASSWORD", "")
+    if not email or not password:
+        print("[log_monitor] EMAIL/APP_PASSWORD not set — skipping email")
+        return False
+
+    try:
+        msg = MIMEMultipart("mixed")
+        msg["From"]    = email
+        msg["To"]      = email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as srv:
+            srv.starttls()
+            srv.login(email, password)
+            srv.send_message(msg)
+
+        print(f"[log_monitor] Email sent: {subject}")
+        return True
+    except Exception as exc:
+        print(f"[log_monitor] Email failed: {exc}")
+        return False
+
+
+def send_immediate_alert(new_errors: dict[str, dict]) -> bool:
+    """Send a single batched email for all brand-new errors found in this scan."""
+    total   = len(new_errors)
+    files   = sorted({r["log_file"] for r in new_errors.values()})
+    subject = (
+        f"[Pipeline Alert] {total} new error(s) — "
+        + ", ".join(files[:3])
+        + (" …" if len(files) > 3 else "")
+    )
+
+    rows = "".join(_error_table_row(rec) for rec in new_errors.values())
+    body = f"""<html><body style="font-family:sans-serif;padding:24px;color:#1e293b">
+    <h2 style="color:#dc2626">⚠ New Pipeline Error(s) — {datetime.now().strftime('%Y-%m-%d %H:%M')}</h2>
+    <p>
+      {total} new unique error(s) detected.
+      Repeat occurrences will be suppressed for <strong>7 days</strong>.
+      Auto-resolved when the error goes quiet for 3 consecutive natural cycles
+      (based on its own firing frequency — min 5 min, max 24 h).
+    </p>
+    <table style="width:100%;border-collapse:collapse;background:#fef2f2;
+                  border:1px solid #fecaca;border-radius:4px">
+      {rows}
+    </table>
+    <p style="margin-top:24px;color:#94a3b8;font-size:11px">
+      Sent by scripts/log_monitor.py · duplicates suppressed for 7 days ·
+      digest every 3 days
+    </p>
+    </body></html>"""
+
+    return _send_email(subject, body)
+
+
+def send_digest(r, now: float) -> bool:
+    """
+    Send a 3-day digest: NEW errors, STILL ACTIVE errors, RESOLVED errors.
+    Clears the resolved log after sending.
+    """
+    last_digest = float(r.get(_KEY_DIGEST) or 0)
+
+    # ── Collect active errors from Redis ──────────────────────────────────────
+    new_since_digest: list[dict]  = []
+    still_active:     list[dict]  = []
+
+    try:
+        for err_key in r.scan_iter(f"{_PFX_ERR}*"):
+            fp  = err_key[len(_PFX_ERR):]
+            raw = r.get(err_key)
+            if not raw:
+                continue
+            rec = json.loads(raw)
+            rec["is_active"] = bool(r.exists(_act_key(fp)))
+
+            if rec.get("first_seen", 0) >= last_digest:
+                new_since_digest.append(rec)
+            else:
+                still_active.append(rec)
+    except Exception:
+        pass
+
+    # ── Collect resolved errors ───────────────────────────────────────────────
+    resolved: list[dict] = []
+    try:
+        raw_list = r.lrange(_KEY_RESOLVED, 0, -1)
+        resolved = [json.loads(x) for x in raw_list]
+    except Exception:
+        pass
+
+    if not new_since_digest and not still_active and not resolved:
+        print("[log_monitor] digest: nothing to report — skipping")
+        r.set(_KEY_DIGEST, str(now))
+        return True
+
+    # ── Build email ───────────────────────────────────────────────────────────
+    def _section(title: str, colour: str, icon: str, records: list[dict]) -> str:
+        if not records:
+            return (
+                f'<h3 style="color:{colour};margin-top:24px">{icon} {title}</h3>'
+                f'<p style="color:#64748b;font-size:13px">None.</p>'
+            )
+        rows = "".join(_error_table_row(r) for r in records)
+        return (
+            f'<h3 style="color:{colour};margin-top:24px">{icon} {title} ({len(records)})</h3>'
+            f'<table style="width:100%;border-collapse:collapse;background:#f8fafc;'
+            f'border:1px solid #e2e8f0;border-radius:4px">{rows}</table>'
+        )
+
+    last_str = _format_ts(last_digest) if last_digest else "—"
+    body     = f"""<html><body style="font-family:sans-serif;padding:24px;color:#1e293b">
+    <h2 style="color:#0f172a">📋 Pipeline Log Digest — {datetime.now().strftime('%Y-%m-%d')}</h2>
+    <p style="color:#64748b">Period: {last_str} → now</p>
+
+    {_section("New Errors",         "#dc2626", "🆕", new_since_digest)}
+    {_section("Still Active",       "#b45309", "🔄", still_active)}
+    {_section("Resolved",           "#16a34a", "✅", resolved)}
+
+    <p style="margin-top:32px;color:#94a3b8;font-size:11px">
+      Sent by scripts/log_monitor.py · next digest in ~3 days
+    </p>
+    </body></html>"""
+
+    total_n = len(new_since_digest)
+    total_a = len(still_active)
+    total_r = len(resolved)
+    subject = (
+        f"[Pipeline Digest] "
+        f"{total_n} new · {total_a} active · {total_r} resolved"
+    )
+
+    sent = _send_email(subject, body)
+    if sent:
+        r.set(_KEY_DIGEST, str(now))
+        r.delete(_KEY_RESOLVED)   # clear resolved log after digest
+
+    return sent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    now = time.time()
+    print(f"[log_monitor] scan started at {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # ── 1. Scan log files ────────────────────────────────────────────────────
+    offsets              = _load_offsets()
+    new_offsets, raw     = collect_raw_findings(offsets)
+    _save_offsets(new_offsets)   # persist immediately — safe even if Redis fails
+
+    total_hits = sum(len(v) for v in raw.values())
+    total_new  = sum(new_offsets.get(k, 0) - offsets.get(k, 0) for k in new_offsets)
+    print(f"[log_monitor] scanned {total_new:,} new bytes — {total_hits} flagged line(s)")
+
+    if not raw:
+        print("[log_monitor] clean — no issues found")
+        # Still check if digest is due even on a clean run
+        r = _get_redis()
+        if r:
+            try:
+                last_digest = float(r.get(_KEY_DIGEST) or 0)
+                if now - last_digest >= DIGEST_INTERVAL_S:
+                    send_digest(r, now)
+            except Exception:
+                pass
+        return
+
+    # ── 2. Dedup via Redis ───────────────────────────────────────────────────
+    r = _get_redis()
+    if r is None:
+        # Redis unavailable — log but don't alert (avoid duplicate emails
+        # on next run when Redis comes back).
+        print("[log_monitor] Redis unavailable — skipping dedup/alert this run")
+        return
+
+    try:
+        new_errors = process_findings(r, raw, now)
+    except Exception as exc:
+        print(f"[log_monitor] Redis error during dedup: {exc}")
+        return
+
+    # ── 3. Resolution sweep ──────────────────────────────────────────────────
+    resolved_fps = sweep_resolved(r, now)
+    if resolved_fps:
+        print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
+
+    # ── 4. Immediate alert for brand-new errors ──────────────────────────────
+    if new_errors:
+        print(f"[log_monitor] {len(new_errors)} NEW error(s): {list(new_errors)}")
+        send_immediate_alert(new_errors)
+    else:
+        known = total_hits - len(new_errors)
+        print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
+
+    # ── 5. Periodic digest ───────────────────────────────────────────────────
+    try:
+        last_digest = float(r.get(_KEY_DIGEST) or 0)
+        if now - last_digest >= DIGEST_INTERVAL_S:
+            send_digest(r, now)
+    except Exception as exc:
+        print(f"[log_monitor] digest check failed: {exc}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1035,7 +1035,7 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
             existing_scores=[],
             tolerance_pct=0.20,
             deadline_ts=self._TARGET - 1.0,  # deadline in the past — all gaps violate
-            avg_duration_s=0.0,
+            avg_duration_s=1.0,  # non-zero to exercise the combined guard (mid + dur ≥ deadline)
         )
         # Fallback path: returns target_ts
         self.assertAlmostEqual(result, self._TARGET, places=1)

@@ -15,6 +15,7 @@ Usage:
 
 import sys
 import os
+import math
 import argparse
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -108,7 +109,9 @@ def analyse(queue_name: str, r, bucket_minutes: int):
     # cycle — not just the occupied slots.  Dividing by occupied buckets only
     # would inflate the "ideal" as companies cluster (fewer occupied buckets →
     # higher ideal_per_bk), masking the thundering herd.
-    slots_in_cycle = 86400 // (bucket_minutes * 60)
+    # Use ceiling so a partial trailing bucket counts as a full slot, giving
+    # a conservative (lower) ideal_per_bk that's harder to falsely exceed.
+    slots_in_cycle = math.ceil(86400 / (bucket_minutes * 60))
     ideal_per_bk   = total / max(slots_in_cycle, 1)
     evenness_ok    = max_pct < 20
 

@@ -415,12 +415,14 @@ When the watchdog crashes too many times, systemd fires `recruiter-pipeline-aler
 
 ## 2 · Worker heartbeats
 
-**Detection:**
+**Multi-worker per-PID key architecture:**
 
-Each worker runs a background daemon thread that writes a Redis key `worker:alive:{type}` on a fixed interval, completely independent of what the main thread is doing:
+The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail workers, 3 fullscan workers — counts calculated dynamically from 30-day API health history). Because multiple workers of the same type run simultaneously, a single shared key per type would collapse all of them into one — the last writer would overwrite everyone else's heartbeat, making it impossible to track individual workers.
+
+Each worker writes its own key including its PID:
 
 ```python
-r.set("worker:alive:scan_worker", json.dumps({
+r.set(f"worker:alive:{worker_type}:{os.getpid()}", json.dumps({
     "pid": os.getpid(), "ts": time.time(), "processed": count
 }), ex=30)   # TTL = 30 seconds (3× the 10s write interval)
 ```
@@ -442,11 +444,37 @@ Earlier versions wrote the heartbeat at the top of the main loop. A single Workd
 
 Daemon threads are hard-tied to their process. When the process exits for any reason — clean shutdown, crash, SIGKILL — the OS terminates all daemon threads immediately. The key's TTL then runs out naturally, and the watchdog correctly detects the dead worker. No ghost heartbeats from a dead process are possible.
 
-**Two failure modes — both trigger ERROR:**
+**Two-layer watchdog detection:**
 
-1. **Key missing** — TTL expired. At least 2 consecutive writes were missed. Worker has almost certainly crashed or been killed.
+Because workers are child processes of the scheduler, the watchdog uses a two-layer approach rather than monitoring individual per-PID keys:
 
-2. **Key present but stale** — the key is still in Redis (TTL not yet expired) but the `ts` field inside the payload is older than the `HEARTBEAT_DEAD_AFTER` threshold. This catches a worker that is alive at the OS level but internally deadlocked — the daemon thread exists but is blocked on a Redis write or lock that never resolves. The process hasn't exited, so the key hasn't expired, but nothing is happening.
+**Layer 1 — `worker:alive:scheduler`** (fast, TTL=15s):
+The scheduler writes this key every ~1 second. If missing or stale (age > 20s), the watchdog fires an ERROR immediately and returns early — all workers are presumed dead along with their parent. No point reading pool state when the scheduler is gone.
+
+**Layer 2 — `scheduler:health`** (rich pool state, TTL=10min):
+The scheduler publishes this JSON key on every pool event (worker death, respawn, scale up/down). It contains per-type alive counts and `consecutive_deaths` counters:
+
+```json
+{
+  "ts": 1700000000.0,
+  "pool": {
+    "scan":     {"alive": 3, "consecutive_deaths": 1, "total_replacements": 4},
+    "detail":   {"alive": 4, "consecutive_deaths": 0, "total_replacements": 1},
+    "fullscan": {"alive": 3, "consecutive_deaths": 0, "total_replacements": 2}
+  }
+}
+```
+
+`consecutive_deaths` increments when a replacement worker dies within 60 seconds of being spawned (indicating a startup crash loop). It resets to 0 when a replacement survives ≥ 60 seconds (stable). The watchdog thresholds:
+
+- `consecutive_deaths ≥ 3` → **WARNING** — scheduler struggling to keep workers up
+- `consecutive_deaths ≥ 5` → **ERROR** — pool cannot stabilize; startup crash loop
+
+The per-PID keys (`worker:alive:{type}:{pid}`) are scanned by the watchdog for **display only** — showing which PIDs are live in `health_check.py` output and for PEL consumer-liveness checks. No alerting decisions are made from individual per-PID keys.
+
+**Responsibility split:**
+- **Scheduler** — owns worker lifecycle (spawn / replace / scale). Publishes `scheduler:health` so the watchdog can see inside.
+- **Watchdog** — monitors the scheduler and escalates when it cannot recover. Never tries to manage individual worker processes directly.
 
 **Resolution:**
 
@@ -482,7 +510,7 @@ The watchdog writes a state snapshot to Redis (`watchdog:queue_snapshot`, TTL = 
 |---|---|---|
 | **Overdue count delta** | `ZCOUNT poll:X -inf now` vs previous cycle | Count not shrinking (stable or growing) and overdue > 0 |
 | **Queue head** | `ZRANGE poll:X 0 0 WITHSCORES` — front-of-queue company + score | Same company AND same score as last cycle → nothing was picked up |
-| **Worker processed count** | `processed` field inside `worker:alive:{type}` heartbeat | Unchanged since last cycle → worker completed nothing |
+| **Worker processed count** | Sum of `processed` fields across all `worker:alive:{type}:{pid}` per-PID keys | Unchanged since last cycle → worker pool completed nothing |
 
 **Stall verdict:**
 
@@ -539,14 +567,15 @@ r.xpending(stream_key, STREAM_CONSUMER_GROUP)           # total pending count
 r.xpending_range(stream_key, group, "-", "+", count=1)  # oldest entry details
 ```
 
-`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's PID at launch time. The watchdog also reads the current live heartbeat PID from `worker:alive:{type}`. Comparing them answers the real question directly:
+`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:18432` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
 
 ```
-Consumer name:  worker-myhost-18432
-Heartbeat PID:  18432   → same → worker is alive, job is in progress → OK
-Heartbeat PID:  19001   → different → worker 18432 is dead → entry is orphaned
-Heartbeat PID:  (missing) → worker is dead → entry is orphaned
+Consumer name:     worker-myhost-18432
+EXISTS worker:alive:scan_worker:18432  → 1 → worker is alive, job is in progress → OK
+EXISTS worker:alive:scan_worker:18432  → 0 → worker 18432 is dead → entry is orphaned
 ```
+
+With the old shared single-type key, if worker PID 19001 was running and had overwritten the `worker:alive:scan_worker` key, the watchdog would have incorrectly concluded PID 18432 was alive because a *different* worker of the same type was alive. Per-PID keys eliminate this cross-worker false negative entirely.
 
 **Why not just use time thresholds?**
 
@@ -650,9 +679,11 @@ Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloo
 
 ```python
 info = r.info("persistence")
-last_save = info.get("rdb_last_bgsave_time_sec", 0)  # Unix timestamp of last RDB snapshot
+last_save = info.get("rdb_last_save_time", 0)  # Unix epoch of last successful RDB snapshot
 age_minutes = (time.time() - last_save) / 60
 ```
+
+> **Note:** `rdb_last_bgsave_time_sec` is the *duration* of the last bgsave in seconds (e.g. 3), not an epoch timestamp. Using it as an epoch would compute `time.time() - 3 ≈ 28 million minutes`, causing a permanent false WARNING. The correct field is `rdb_last_save_time`.
 
 If `age_minutes > 30` → WARNING.
 

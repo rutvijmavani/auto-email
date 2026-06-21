@@ -110,7 +110,7 @@ class Heartbeat:
         """Write one heartbeat key to Redis.  Swallows all exceptions."""
         try:
             self._r.set(
-                f"worker:alive:{self._worker_type}",
+                f"worker:alive:{self._worker_type}:{os.getpid()}",
                 json.dumps({
                     "pid":       os.getpid(),
                     "ts":        time.time(),

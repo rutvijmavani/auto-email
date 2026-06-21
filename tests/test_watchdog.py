@@ -41,12 +41,17 @@ Coverage map
     · _worker_processed: key present → int count
     · _worker_processed: unparseable → None
 
-  TestCheckWorkerHeartbeatsStale  (Phase 3 — two failure modes)
-    · Key missing → ERROR ("MISSING" in issue.message)
-    · Key present, ts fresh → OK
-    · Key present, ts stale (age > threshold) → ERROR ("STALE" in issue.message)
-    · Key present, unparseable JSON → OK (key exists, treat alive)
-    · Correct thresholds per worker type (scheduler=20, scan=45, fullscan=1900)
+  TestCheckWorkerHeartbeats  (Phase 3.3 — two-layer detection)
+    · Scheduler key missing → single ERROR (returns early — workers presumed dead too)
+    · Scheduler key stale → ERROR ("STALE" in message)
+    · Scheduler alive, scheduler:health absent → WARNING for pool_health
+    · Scheduler alive + clean health → OK for all 3 pool types
+    · consecutive_deaths ≥ 5 → ERROR for that worker type
+    · consecutive_deaths ≥ 3 → WARNING for that worker type
+    · consecutive_deaths < 3 → OK
+    · Unparseable scheduler:health JSON → WARNING (no crash)
+    · All 4 categories covered when scheduler + health both present
+    · Scheduler threshold 20 s: age 19 s → OK, age 21 s → STALE ERROR
 
   TestStallCount  (Phase 3 — pure stall signal logic)
     · All inputs None → (0, 0)
@@ -97,10 +102,9 @@ Coverage map
     · alert_type uses provided value when explicitly given
 
   TestAdditionalHeartbeatThresholds  (Phase 3 — per-worker thresholds)
-    · scheduler OK at 19s, STALE at 21s (threshold=20s)
-    · detail_worker OK at 44s, STALE at 46s (threshold=45s)
-    · fullscan_worker OK at 1899s (threshold=1900s)
-    · All 4 worker types checked (4 issues returned)
+    · HEARTBEAT_DEAD_AFTER dict still has all 4 worker types (used by scheduler check)
+    · consecutive_deaths thresholds: WARN_DEATHS=3, ERR_DEATHS=5
+    · All 4 worker categories present when scheduler+health both provided
 """
 
 import sys
@@ -282,93 +286,249 @@ class TestWatchdogHelperFunctions(unittest.TestCase):
         self.assertEqual(_trend(3), "↑")
 
     # _worker_processed ────────────────────────────────────────────────────────
+    # _worker_processed now uses SCAN + GET across per-PID keys
+    # (worker:alive:{type}:{pid}) instead of a single shared key.
 
     def test_worker_processed_key_missing(self):
+        """No per-PID keys for this worker type → returns None."""
         from workers.watchdog import _worker_processed
         r = MagicMock()
-        r.get.return_value = None
+        r.scan.return_value = (0, [])   # no keys found
         self.assertIsNone(_worker_processed(r, "scan_worker"))
 
     def test_worker_processed_key_present(self):
+        """One per-PID key present → returns its processed count."""
         from workers.watchdog import _worker_processed
         r = MagicMock()
-        r.get.return_value = json.dumps({"pid": 1, "ts": time.time(), "processed": 42})
+        r.scan.return_value = (0, [b"worker:alive:scan_worker:1234"])
+        r.get.return_value = json.dumps({"pid": 1234, "ts": time.time(), "processed": 42})
         self.assertEqual(_worker_processed(r, "scan_worker"), 42)
 
-    def test_worker_processed_unparseable_returns_none(self):
+    def test_worker_processed_multiple_workers_summed(self):
+        """Multiple per-PID keys → processed counts are summed across all workers."""
         from workers.watchdog import _worker_processed
         r = MagicMock()
+        keys = [b"worker:alive:scan_worker:111", b"worker:alive:scan_worker:222"]
+        r.scan.return_value = (0, keys)
+
+        def _get(key):
+            if b"111" in key or "111" in str(key):
+                return json.dumps({"pid": 111, "ts": time.time(), "processed": 30})
+            return json.dumps({"pid": 222, "ts": time.time(), "processed": 15})
+        r.get.side_effect = _get
+
+        # Total = 30 + 15 = 45
+        self.assertEqual(_worker_processed(r, "scan_worker"), 45)
+
+    def test_worker_processed_unparseable_returns_none(self):
+        """Unparseable payload raises inside the loop → caught → returns None."""
+        from workers.watchdog import _worker_processed
+        r = MagicMock()
+        r.scan.return_value = (0, [b"worker:alive:scan_worker:1234"])
         r.get.return_value = b"not-json"
         self.assertIsNone(_worker_processed(r, "scan_worker"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestCheckWorkerHeartbeatsStale  (Phase 3 — two failure modes)
+# TestCheckWorkerHeartbeats  (Phase 3.3 — two-layer detection model)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestCheckWorkerHeartbeatsStale(unittest.TestCase):
+class TestCheckWorkerHeartbeats(unittest.TestCase):
     """
-    check_worker_heartbeats() detects:
-      1. Key MISSING  → ERROR ("MISSING" in message)
-      2. Key PRESENT but ts too old → ERROR ("STALE" in message)
+    check_worker_heartbeats() uses a two-layer detection model:
+
+    Layer 1 — worker:alive:scheduler
+        Fast single-key check (TTL=15s, written every ~1s).
+        Missing or stale → ERROR immediately, returns early.
+
+    Layer 2 — scheduler:health
+        Rich pool state (JSON, TTL=10min) published by the scheduler on every
+        pool event (death/respawn/scale).  Contains per-type consecutive_deaths
+        counters.  Missing → WARNING.
+
+    Individual per-PID keys (worker:alive:{type}:{pid}) are scanned for
+    display/observability inside check_worker_heartbeats, but NO alerting
+    decisions are made from them — all alerts come from the two keys above.
     """
 
-    def _run(self, get_map):
-        """
-        get_map: {key: value_or_None} — controls what r.get returns.
-        """
+    _NOW = 1_700_000_000.0
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _health_payload(self, scan_deaths=0, detail_deaths=0, fullscan_deaths=0,
+                        scan_alive=3, detail_alive=4, fullscan_alive=3):
+        return json.dumps({
+            "ts": self._NOW - 5,
+            "pool": {
+                "scan":     {"alive": scan_alive,    "consecutive_deaths": scan_deaths,    "total_replacements": 0},
+                "detail":   {"alive": detail_alive,  "consecutive_deaths": detail_deaths,  "total_replacements": 0},
+                "fullscan": {"alive": fullscan_alive, "consecutive_deaths": fullscan_deaths,"total_replacements": 0},
+            },
+        })
+
+    def _make_r(self, scheduler_raw=None, health_raw=None):
         r = MagicMock()
-        r.get.side_effect = lambda k: get_map.get(k)
-        with patch("workers.watchdog.time.time", return_value=1_700_000_000.0):
+        def _get(key):
+            if key == "worker:alive:scheduler":
+                return scheduler_raw
+            if key == "scheduler:health":
+                return health_raw
+            return None
+        r.get.side_effect = _get
+        r.scan.return_value = (0, [])   # per-PID display scan — empty is fine
+        return r
+
+    def _run(self, scheduler_raw=None, health_raw=None):
+        r = self._make_r(scheduler_raw=scheduler_raw, health_raw=health_raw)
+        with patch("workers.watchdog.time.time", return_value=self._NOW):
             from workers.watchdog import check_worker_heartbeats
             return check_worker_heartbeats(r)
 
-    def _issues_for(self, issues, worker_type):
-        return [i for i in issues if worker_type in i.category]
+    def _issues_for(self, issues, keyword):
+        return [i for i in issues if keyword in i.category]
 
-    def test_key_missing_produces_error(self):
+    # ── Layer 1: scheduler key ────────────────────────────────────────────────
+
+    def test_scheduler_key_missing_returns_single_error(self):
+        """
+        Scheduler heartbeat absent → single ERROR, function returns immediately.
+        Workers are all presumed dead — no point reading scheduler:health.
+        """
         from workers.watchdog import Issue
-        issues = self._run({"worker:alive:scan_worker": None})
-        worker_issues = self._issues_for(issues, "scan_worker")
-        self.assertTrue(any(i.level == Issue.ERROR for i in worker_issues))
-        self.assertTrue(any("MISSING" in i.message for i in worker_issues))
+        issues = self._run(scheduler_raw=None)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].level, Issue.ERROR)
+        self.assertIn("MISSING", issues[0].message)
 
-    def test_key_present_ts_fresh_produces_ok(self):
+    def test_scheduler_key_stale_returns_error(self):
+        """Scheduler key present but ts older than threshold → ERROR STALE."""
         from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
-        now = 1_700_000_000.0
-        # ts = now - 5 s → well within 45s threshold
-        payload = json.dumps({"pid": 1, "ts": now - 5, "processed": 0})
-        issues = self._run({"worker:alive:scan_worker": payload.encode()})
-        worker_issues = self._issues_for(issues, "scan_worker")
-        self.assertTrue(any(i.level == Issue.OK for i in worker_issues))
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        payload = json.dumps({"pid": 1, "ts": self._NOW - (threshold + 10), "dispatched": 0})
+        issues = self._run(scheduler_raw=payload.encode())
+        sched_issues = self._issues_for(issues, "scheduler")
+        self.assertTrue(any(i.level == Issue.ERROR and "STALE" in i.message
+                            for i in sched_issues),
+                        f"Expected STALE ERROR, got: {sched_issues}")
 
-    def test_key_present_ts_stale_produces_error(self):
-        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
-        now = 1_700_000_000.0
-        threshold = HEARTBEAT_DEAD_AFTER["scan_worker"]  # 45 s
-        # ts = now - (threshold + 10) → stale
-        payload = json.dumps({"pid": 1, "ts": now - (threshold + 10), "processed": 0})
-        issues = self._run({"worker:alive:scan_worker": payload.encode()})
-        worker_issues = self._issues_for(issues, "scan_worker")
-        self.assertTrue(any(i.level == Issue.ERROR for i in worker_issues))
-        self.assertTrue(any("STALE" in i.message for i in worker_issues))
-
-    def test_unparseable_json_treated_as_ok(self):
+    def test_scheduler_ok_at_19_seconds(self):
+        """scheduler threshold=20s: key age 19s → OK."""
         from workers.watchdog import Issue
-        issues = self._run({"worker:alive:scan_worker": b"bad-json"})
-        worker_issues = self._issues_for(issues, "scan_worker")
-        self.assertTrue(any(i.level == Issue.OK for i in worker_issues))
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 19, "dispatched": 0})
+        health  = self._health_payload()
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
+        self.assertTrue(any(i.level == Issue.OK for i in sched_issues),
+                        f"Expected OK at 19s, got: {sched_issues}")
 
-    def test_fullscan_threshold_is_generous(self):
-        """fullscan_worker stays OK up to 1900 s stale (scans take 20-30 min)."""
-        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
-        now = 1_700_000_000.0
-        threshold = HEARTBEAT_DEAD_AFTER["fullscan_worker"]  # 1900 s
-        # ts = now - (threshold - 10) → still within threshold → OK
-        payload = json.dumps({"pid": 1, "ts": now - (threshold - 10), "processed": 0})
-        issues = self._run({"worker:alive:fullscan_worker": payload.encode()})
-        worker_issues = self._issues_for(issues, "fullscan_worker")
-        self.assertTrue(any(i.level == Issue.OK for i in worker_issues))
+    def test_scheduler_stale_at_21_seconds(self):
+        """scheduler threshold=20s: key age 21s → STALE ERROR."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 21, "dispatched": 0})
+        # Even if health key exists, stale scheduler is an error
+        issues = self._run(scheduler_raw=payload.encode())
+        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
+        self.assertTrue(any(i.level == Issue.ERROR for i in sched_issues),
+                        f"Expected ERROR at 21s, got: {sched_issues}")
+
+    def test_unparseable_scheduler_payload_treated_as_ok(self):
+        """Unparseable scheduler key JSON (key exists) → treated as alive (OK)."""
+        from workers.watchdog import Issue
+        health = self._health_payload()
+        issues = self._run(scheduler_raw=b"bad-json", health_raw=health.encode())
+        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
+        self.assertTrue(any(i.level == Issue.OK for i in sched_issues))
+
+    # ── Layer 2: scheduler:health pool state ─────────────────────────────────
+
+    def test_health_key_missing_returns_warning(self):
+        """Scheduler alive but scheduler:health absent → WARNING for pool_health."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=None)
+        pool_issues = self._issues_for(issues, "pool_health")
+        self.assertTrue(any(i.level == Issue.WARNING for i in pool_issues))
+
+    def test_pool_healthy_all_ok(self):
+        """Scheduler alive + zero consecutive_deaths → OK for all 3 pool types."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health  = self._health_payload()
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        pool_issues = [i for i in issues
+                       if "worker:" in i.category
+                       and "scheduler" not in i.category
+                       and "pool_health" not in i.category]
+        self.assertTrue(
+            all(i.level == Issue.OK for i in pool_issues),
+            f"Expected all OK with zero deaths, got: {pool_issues}",
+        )
+
+    def test_consecutive_deaths_5_produces_error(self):
+        """consecutive_deaths ≥ 5 for scan → ERROR (pool cannot stabilize)."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health  = self._health_payload(scan_deaths=5)
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        scan_issues = self._issues_for(issues, "scan_worker")
+        self.assertTrue(any(i.level == Issue.ERROR for i in scan_issues),
+                        f"Expected ERROR at deaths=5, got: {scan_issues}")
+
+    def test_consecutive_deaths_3_produces_warning(self):
+        """consecutive_deaths = 3 → WARNING (scheduler struggling)."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health  = self._health_payload(scan_deaths=3)
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        scan_issues = self._issues_for(issues, "scan_worker")
+        self.assertTrue(any(i.level == Issue.WARNING for i in scan_issues),
+                        f"Expected WARNING at deaths=3, got: {scan_issues}")
+
+    def test_consecutive_deaths_2_is_ok(self):
+        """consecutive_deaths = 2 → OK (within noise tolerance, scheduler recovering)."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health  = self._health_payload(scan_deaths=2)
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        scan_issues = self._issues_for(issues, "scan_worker")
+        self.assertTrue(any(i.level == Issue.OK for i in scan_issues),
+                        f"Expected OK at deaths=2, got: {scan_issues}")
+
+    def test_detail_consecutive_deaths_threshold(self):
+        """consecutive_deaths tracked independently per worker type."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        # detail deaths = 5 (ERROR), others clean
+        health  = self._health_payload(detail_deaths=5)
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        detail_issues = self._issues_for(issues, "detail_worker")
+        scan_issues   = self._issues_for(issues, "scan_worker")
+        self.assertTrue(any(i.level == Issue.ERROR for i in detail_issues))
+        self.assertTrue(any(i.level == Issue.OK    for i in scan_issues))
+
+    def test_unparseable_health_returns_warning(self):
+        """Unparseable scheduler:health JSON → WARNING, not a crash."""
+        from workers.watchdog import Issue
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=b"not-json")
+        pool_issues = self._issues_for(issues, "pool_health")
+        self.assertTrue(any(i.level == Issue.WARNING for i in pool_issues))
+
+    def test_all_4_worker_categories_covered(self):
+        """
+        With scheduler alive and scheduler:health present, issues cover all
+        4 worker categories: scheduler + scan_worker + detail_worker + fullscan_worker.
+        """
+        payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health  = self._health_payload()
+        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
+        self.assertGreaterEqual(len(issues), 4,
+            f"Expected ≥4 issues (scheduler + 3 pool types), got {len(issues)}: {issues}")
+        categories = {i.category for i in issues}
+        for expected in ("worker:scheduler", "worker:scan_worker",
+                         "worker:detail_worker", "worker:fullscan_worker"):
+            self.assertTrue(any(expected in c for c in categories),
+                            f"Missing issue category containing '{expected}'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,8 +710,21 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             return []
         r.zrange.side_effect = _zrange
 
-        # scan (fullscan lock)
-        r.scan.return_value = (0, [b"fullscan:lock:Co"] if fs_lock else [])
+        # scan — _worker_processed now uses per-PID keys; _fullscan_lock_active
+        # uses the lock key.  Use side_effect (not return_value) so different
+        # match= patterns return the right keys.
+        now = self._NOW
+        def _scan(cursor, match="*", count=100):
+            if "fullscan:lock:" in match:
+                return (0, [b"fullscan:lock:Co"] if fs_lock else [])
+            if "worker:alive:scan_worker:" in match:
+                return (0, [b"worker:alive:scan_worker:1"])
+            if "worker:alive:fullscan_worker:" in match:
+                return (0, [b"worker:alive:fullscan_worker:2"])
+            if "worker:alive:detail_worker:" in match:
+                return (0, [b"worker:alive:detail_worker:3"])
+            return (0, [])
+        r.scan.side_effect = _scan
 
         # llen (detail queues)
         def _llen(key):
@@ -560,17 +733,18 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             return 0
         r.llen.side_effect = _llen
 
-        # get (heartbeats + snapshot)
-        now = self._NOW
+        # get — snapshot key + per-PID worker keys for _worker_processed
         def _get(key):
-            if key == WATCHDOG_SNAPSHOT_KEY:
+            key_s = key.decode() if isinstance(key, bytes) else key
+            if key_s == WATCHDOG_SNAPSHOT_KEY:
                 return json.dumps(snap).encode() if snap else None
-            if key == "worker:alive:scan_worker":
-                return json.dumps({"pid": 1, "ts": now - 5, "processed": scan_proc})
-            if key == "worker:alive:fullscan_worker":
-                return json.dumps({"pid": 2, "ts": now - 5, "processed": fs_proc})
-            if key == "worker:alive:detail_worker":
-                return json.dumps({"pid": 3, "ts": now - 5, "processed": detail_proc})
+            # per-PID heartbeat keys returned by _scan above
+            if "worker:alive:scan_worker:" in key_s:
+                return json.dumps({"pid": 1, "ts": now - 5, "processed": scan_proc}).encode()
+            if "worker:alive:fullscan_worker:" in key_s:
+                return json.dumps({"pid": 2, "ts": now - 5, "processed": fs_proc}).encode()
+            if "worker:alive:detail_worker:" in key_s:
+                return json.dumps({"pid": 3, "ts": now - 5, "processed": detail_proc}).encode()
             return None
         r.get.side_effect = _get
 
@@ -770,14 +944,20 @@ class TestCheckPelHealthPID(unittest.TestCase):
             }] if pending > 0 else []
         r.xpending_range.side_effect = _xpending_range
 
-        def _get(key):
-            if "scan_worker" in key or "fullscan_worker" in key:
-                if heartbeat_pid is None:
-                    return None
-                return json.dumps({"pid": heartbeat_pid, "ts": self._NOW - 1,
-                                   "processed": 0})
-            return None
-        r.get.side_effect = _get
+        # _consumer_pid_alive() calls r.exists(f"worker:alive:{type}:{c_pid}")
+        # — NOT r.get.  Return 1 if the PID in the key matches heartbeat_pid.
+        def _exists(key):
+            key_s = key.decode() if isinstance(key, bytes) else key
+            if heartbeat_pid is None:
+                return 0
+            if "worker:alive:" in key_s:
+                try:
+                    pid_in_key = int(key_s.rsplit(":", 1)[-1])
+                    return 1 if pid_in_key == heartbeat_pid else 0
+                except (ValueError, IndexError):
+                    return 0
+            return 0
+        r.exists.side_effect = _exists
         return r
 
     def _run(self, **kwargs):
@@ -969,21 +1149,48 @@ class TestIssueClass(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestAdditionalHeartbeatThresholds  (Phase 3 — per-worker dead thresholds)
+# TestAdditionalHeartbeatThresholds  (Phase 3 — threshold and death constants)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestAdditionalHeartbeatThresholds(unittest.TestCase):
-    """Extra coverage for check_worker_heartbeats() per-worker threshold values."""
+    """
+    Validates the threshold constants and boundary conditions for
+    check_worker_heartbeats() under the two-layer detection model.
+
+    Notes
+    ─────
+    · HEARTBEAT_DEAD_AFTER is still defined for all 4 worker types and is used
+      directly for the scheduler heartbeat age check.
+    · Worker pool (scan/detail/fullscan) liveness is now determined by
+      consecutive_deaths in scheduler:health, not by per-worker key age.
+      Those constants live inside check_worker_heartbeats() as WARN_DEATHS=3
+      and ERR_DEATHS=5.
+    """
 
     _NOW = 1_700_000_000.0
 
-    def _run(self, worker_type, age_s):
-        """Run heartbeat check for one worker with the given key age."""
-        payload = json.dumps({"pid": 1, "ts": self._NOW - age_s, "processed": 0})
+    # ── Scheduler heartbeat age threshold ─────────────────────────────────────
+
+    def _run_scheduler_age(self, age_s):
+        """Run heartbeat check with scheduler key at a specific age."""
+        payload = json.dumps({"pid": 1, "ts": self._NOW - age_s, "dispatched": 0})
         r = MagicMock()
-        r.get.side_effect = lambda k: (
-            payload.encode() if worker_type in k else None
-        )
+        def _get(key):
+            if key == "worker:alive:scheduler":
+                return payload.encode()
+            if key == "scheduler:health":
+                # Provide valid health so function doesn't return WARNING early
+                return json.dumps({
+                    "ts": self._NOW - 1,
+                    "pool": {
+                        "scan":     {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+                        "detail":   {"alive": 4, "consecutive_deaths": 0, "total_replacements": 0},
+                        "fullscan": {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+                    },
+                }).encode()
+            return None
+        r.get.side_effect = _get
+        r.scan.return_value = (0, [])
         with patch("workers.watchdog.time.time", return_value=self._NOW):
             from workers.watchdog import check_worker_heartbeats
             return check_worker_heartbeats(r)
@@ -991,50 +1198,101 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
     def test_scheduler_ok_at_19_seconds(self):
         """scheduler threshold=20s: key age 19s → OK."""
         from workers.watchdog import Issue
-        issues = self._run("scheduler", age_s=19)
-        scheduler_issues = [i for i in issues if "scheduler" in i.category]
-        self.assertTrue(any(i.level == Issue.OK for i in scheduler_issues))
+        issues = self._run_scheduler_age(19)
+        sched = [i for i in issues if i.category == "worker:scheduler"]
+        self.assertTrue(any(i.level == Issue.OK for i in sched),
+                        f"Expected OK at 19s, got: {sched}")
 
     def test_scheduler_stale_at_21_seconds(self):
         """scheduler threshold=20s: key age 21s → STALE ERROR."""
         from workers.watchdog import Issue
-        issues = self._run("scheduler", age_s=21)
-        scheduler_issues = [i for i in issues if "scheduler" in i.category
-                            and "scan" not in i.category]
-        self.assertTrue(any(i.level == Issue.ERROR for i in scheduler_issues))
+        issues = self._run_scheduler_age(21)
+        sched = [i for i in issues if i.category == "worker:scheduler"]
+        self.assertTrue(any(i.level == Issue.ERROR for i in sched),
+                        f"Expected STALE ERROR at 21s, got: {sched}")
 
-    def test_detail_worker_ok_at_44_seconds(self):
-        """detail_worker threshold=45s: key age 44s → OK."""
-        from workers.watchdog import Issue
-        issues = self._run("detail_worker", age_s=44)
-        dw_issues = [i for i in issues if "detail_worker" in i.category]
-        self.assertTrue(any(i.level == Issue.OK for i in dw_issues))
+    # ── Pool consecutive_deaths threshold boundary ────────────────────────────
 
-    def test_detail_worker_stale_at_46_seconds(self):
-        """detail_worker threshold=45s: key age 46s → STALE ERROR."""
-        from workers.watchdog import Issue
-        issues = self._run("detail_worker", age_s=46)
-        dw_issues = [i for i in issues if "detail_worker" in i.category]
-        self.assertTrue(any(i.level == Issue.ERROR for i in dw_issues))
-
-    def test_fullscan_ok_at_1899_seconds(self):
-        """fullscan_worker threshold=1900s: key age 1899s → OK."""
-        from workers.watchdog import Issue
-        issues = self._run("fullscan_worker", age_s=1899)
-        fs_issues = [i for i in issues if "fullscan_worker" in i.category]
-        self.assertTrue(any(i.level == Issue.OK for i in fs_issues))
-
-    def test_all_4_workers_checked(self):
-        """check_worker_heartbeats returns issues for all 4 worker types."""
+    def _run_deaths(self, ptype="scan", deaths=0):
+        """Run heartbeat check with scheduler alive and given deaths count."""
+        scheduler_payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        pool = {
+            "scan":     {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+            "detail":   {"alive": 4, "consecutive_deaths": 0, "total_replacements": 0},
+            "fullscan": {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+        }
+        pool[ptype]["consecutive_deaths"] = deaths
+        health = json.dumps({"ts": self._NOW - 1, "pool": pool})
         r = MagicMock()
-        r.get.return_value = None  # all keys missing → all ERROR
+        def _get(key):
+            if key == "worker:alive:scheduler": return scheduler_payload.encode()
+            if key == "scheduler:health":        return health.encode()
+            return None
+        r.get.side_effect = _get
+        r.scan.return_value = (0, [])
+        with patch("workers.watchdog.time.time", return_value=self._NOW):
+            from workers.watchdog import check_worker_heartbeats
+            return check_worker_heartbeats(r)
+
+    def test_warn_deaths_boundary_at_2(self):
+        """deaths=2 → OK (below WARN threshold of 3)."""
+        from workers.watchdog import Issue
+        issues = self._run_deaths(ptype="scan", deaths=2)
+        scan = [i for i in issues if "scan_worker" in i.category]
+        self.assertTrue(any(i.level == Issue.OK for i in scan))
+
+    def test_warn_deaths_boundary_at_3(self):
+        """deaths=3 → WARNING (at WARN_DEATHS threshold)."""
+        from workers.watchdog import Issue
+        issues = self._run_deaths(ptype="scan", deaths=3)
+        scan = [i for i in issues if "scan_worker" in i.category]
+        self.assertTrue(any(i.level == Issue.WARNING for i in scan))
+
+    def test_err_deaths_boundary_at_4(self):
+        """deaths=4 → WARNING (below ERR_DEATHS=5)."""
+        from workers.watchdog import Issue
+        issues = self._run_deaths(ptype="scan", deaths=4)
+        scan = [i for i in issues if "scan_worker" in i.category]
+        self.assertTrue(any(i.level == Issue.WARNING for i in scan))
+
+    def test_err_deaths_boundary_at_5(self):
+        """deaths=5 → ERROR (at ERR_DEATHS threshold)."""
+        from workers.watchdog import Issue
+        issues = self._run_deaths(ptype="scan", deaths=5)
+        scan = [i for i in issues if "scan_worker" in i.category]
+        self.assertTrue(any(i.level == Issue.ERROR for i in scan))
+
+    # ── All 4 categories present ──────────────────────────────────────────────
+
+    def test_all_4_worker_categories_with_scheduler_alive(self):
+        """
+        When scheduler is alive and scheduler:health is present, check_worker_heartbeats
+        returns issues covering all 4 categories (scheduler + 3 pool types).
+        """
+        scheduler_payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
+        health = json.dumps({
+            "ts": self._NOW - 1,
+            "pool": {
+                "scan":     {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+                "detail":   {"alive": 4, "consecutive_deaths": 0, "total_replacements": 0},
+                "fullscan": {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
+            },
+        })
+        r = MagicMock()
+        def _get(key):
+            if key == "worker:alive:scheduler": return scheduler_payload.encode()
+            if key == "scheduler:health":        return health.encode()
+            return None
+        r.get.side_effect = _get
+        r.scan.return_value = (0, [])
         with patch("workers.watchdog.time.time", return_value=self._NOW):
             from workers.watchdog import check_worker_heartbeats
             issues = check_worker_heartbeats(r)
-        self.assertEqual(len(issues), 4)
         categories = {i.category for i in issues}
-        for wt in ("scheduler", "scan_worker", "detail_worker", "fullscan_worker"):
-            self.assertTrue(any(wt in c for c in categories))
+        for expected in ("worker:scheduler", "worker:scan_worker",
+                         "worker:detail_worker", "worker:fullscan_worker"):
+            self.assertTrue(any(expected in c for c in categories),
+                            f"Missing category containing '{expected}' — got: {categories}")
 
 
 if __name__ == "__main__":

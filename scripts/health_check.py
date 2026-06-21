@@ -132,7 +132,7 @@ def run_health_check() -> int:
 
     try:
         persist = r.info("persistence")
-        last_s  = persist.get("rdb_last_bgsave_time_sec", 0) or r.lastsave()
+        last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
         if isinstance(last_s, int) and last_s > 0:
             age_min = (now - last_s) / 60
             if age_min > 30:
@@ -160,32 +160,103 @@ def run_health_check() -> int:
         errors += 1
 
     # ── WORKER LIVENESS ───────────────────────────────────────────────────────
-    _section("WORKER LIVENESS  (via worker:alive:* heartbeat keys)")
+    _section("WORKER LIVENESS")
 
-    workers = [
-        ("scheduler",       15,   "worker:alive:scheduler"),
-        ("scan_worker",     45,   "worker:alive:scan_worker"),
-        ("detail_worker",   45,   "worker:alive:detail_worker"),
-        ("fullscan_worker", 1900, "worker:alive:fullscan_worker"),
-    ]
+    # ── Scheduler — single heartbeat key ─────────────────────────────────────
+    raw = r.get("worker:alive:scheduler")
+    if raw is None:
+        _row("ERROR", "scheduler", "DEAD — heartbeat key missing")
+        errors += 1
+    else:
+        try:
+            d     = json.loads(raw)
+            age_s = now - d.get("ts", now)
+            status = (
+                f"pid={d.get('pid','?')}  "
+                f"dispatched={d.get('dispatched',0)}  "
+                f"heartbeat {age_s:.0f}s ago"
+            )
+            # Scheduler writes this key every SCHEDULER_TICK_SECS (~1 s) with
+            # ex=15.  The TTL is 15 s, so the key expires before age_s can
+            # reach 20 — making "age_s > 20" unreachable dead code.
+            # Use 5 s instead: reachable within the 15 s TTL window, and a
+            # meaningful signal that the scheduler main loop is delayed.
+            if age_s > 5:
+                _row("WARNING", "scheduler", status + "  (STALE)")
+                warnings += 1
+            else:
+                _row("OK", "scheduler", status)
+        except Exception:
+            _row("OK", "scheduler", "alive (heartbeat key present)")
 
-    for label, threshold, key in workers:
-        raw = r.get(key)
-        if raw is None:
-            _row("ERROR", label, "DEAD — heartbeat key missing")
-            errors += 1
-        else:
-            try:
-                d       = json.loads(raw)
-                age_s   = now - d.get("ts", now)
-                pid     = d.get("pid", "?")
-                proc    = d.get("processed", 0)
-                extra   = d.get("dispatched", proc)  # scheduler uses 'dispatched'
-                _row("OK", label,
-                     f"pid={pid}  processed={extra}  "
-                     f"heartbeat {age_s:.0f}s ago")
-            except Exception:
-                _row("OK", label, "alive (heartbeat key present)")
+    # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
+    health_raw = r.get("scheduler:health")
+    if health_raw is None:
+        _row("WARNING", "worker pools", "scheduler:health missing — pool state unknown")
+        warnings += 1
+    else:
+        try:
+            health = json.loads(health_raw)
+            pool   = health.get("pool", {})
+
+            for ptype, label_suffix in [
+                ("scan",     "scan_worker"),
+                ("detail",   "detail_worker"),
+                ("fullscan", "fullscan_worker"),
+            ]:
+                info   = pool.get(ptype, {})
+                alive  = info.get("alive", 0)
+                consec = info.get("consecutive_deaths", 0)
+                total  = info.get("total_replacements", 0)
+
+                # Collect per-PID details
+                pid_details = []
+                try:
+                    cursor = 0
+                    while True:
+                        cursor, keys = r.scan(
+                            cursor,
+                            match=f"worker:alive:{label_suffix}:*",
+                            count=50,
+                        )
+                        for key in keys:
+                            kraw = r.get(key)
+                            if kraw:
+                                kd = json.loads(kraw)
+                                pid_details.append(
+                                    f"pid={kd.get('pid','?')} "
+                                    f"proc={kd.get('processed',0)}"
+                                )
+                        if cursor == 0:
+                            break
+                except Exception:
+                    pass
+
+                pid_str = f"  [{' | '.join(pid_details)}]" if pid_details else ""
+                base    = (
+                    f"{alive} alive{pid_str}  "
+                    f"total_replacements={total}"
+                )
+
+                if consec >= 5:
+                    _row("ERROR", label_suffix,
+                         f"{base}  consecutive_rapid_deaths={consec}")
+                    errors += 1
+                elif consec >= 3:
+                    _row("WARNING", label_suffix,
+                         f"{base}  consecutive_rapid_deaths={consec}")
+                    warnings += 1
+                else:
+                    note = (
+                        f"  ({consec} recent death(s) — replacing)"
+                        if consec > 0 else ""
+                    )
+                    _row("OK", label_suffix, f"{base}{note}")
+
+        except Exception as exc:
+            _row("WARNING", "worker pools",
+                 f"Could not parse scheduler:health: {exc}")
+            warnings += 1
 
     # ── QUEUE HEALTH ──────────────────────────────────────────────────────────
     _section("QUEUE HEALTH")

@@ -250,8 +250,12 @@ def _get_worker_missed_companies(companies: list) -> list:
                 "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
                 len(inflight),
             )
-    except Exception:
-        pass   # Redis unavailable — proceed without exclusion (conservative: may do extra work)
+    except Exception as exc:
+        logger.warning(
+            "_get_worker_missed_companies: Redis unavailable for inflight exclusion "
+            "(%s) — proceeding without exclusion (may do extra work)",
+            exc,
+        )
 
     missed = []
     for company_row in companies:

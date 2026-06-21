@@ -28,6 +28,10 @@ row  = conn.execute("SELECT ats_slug FROM prospective_companies WHERE company = 
                     ("accenture",)).fetchone()
 conn.close()
 
+if row is None:
+    print("[ERROR] 'accenture' not found in prospective_companies — nothing to diagnose.")
+    sys.exit(1)
+
 slug_info = parse_slug("workday", row["ats_slug"], config)
 slug = slug_info["slug"]
 wd   = slug_info["wd"]

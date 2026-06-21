@@ -776,6 +776,9 @@ def run_worker(once: bool = False, shutdown_event=None,
         shutdown_event: multiprocessing.Event — set by scheduler to request stop.
         skip_init_db:   if True, skip init_db() (parent process already did it).
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     if not skip_init_db:
         init_db()
 

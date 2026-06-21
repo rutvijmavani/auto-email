@@ -58,12 +58,16 @@ echo "  Current auto-aof-rewrite-min-size  : $current_rwmin"
 
 # Check all four settings — a partial previous run may have set only
 # appendonly+appendfsync but skipped the rewrite thresholds.
+AOF_CHANGED=0
+
 if [[ "$current_aof"   == "yes"     &&
       "$current_fsync" == "everysec" &&
       "$current_rwpct" == "100"      &&
       "$current_rwmin" == "64mb"     ]]; then
     echo "  ✓ AOF already fully configured — nothing to change."
 else
+    AOF_CHANGED=1
+
     $REDIS_CLI CONFIG SET appendonly yes
     echo "  Set appendonly                     = yes"
 
@@ -146,12 +150,20 @@ else
     $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1 || true   # flush in-memory config → file
 fi
 
-# ── Trigger immediate AOF rewrite to create the .aof file now ────────────────
-echo ""
-echo "► Triggering initial AOF rewrite (BGREWRITEAOF)..."
-$REDIS_CLI BGREWRITEAOF
-echo "  AOF rewrite started in background."
-sleep 2
+# ── Trigger AOF rewrite only when we just enabled AOF ────────────────────────
+# BGREWRITEAOF creates the initial .aof file after appendonly is turned on.
+# Skipped when AOF was already active — the existing .aof file is up to date
+# and an unnecessary rewrite wastes CPU on a large dataset.
+if [[ "$AOF_CHANGED" -eq 1 ]]; then
+    echo ""
+    echo "► Triggering initial AOF rewrite (BGREWRITEAOF)..."
+    $REDIS_CLI BGREWRITEAOF
+    echo "  AOF rewrite started in background."
+    sleep 2
+else
+    echo ""
+    echo "► Skipping BGREWRITEAOF — AOF was already active, existing file is current."
+fi
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo ""

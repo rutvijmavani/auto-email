@@ -2876,7 +2876,18 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
     """
 
     _STALE_EPOCH = 1_000_000.0    # definitely older than 24 h
-    _RECENT_EPOCH = 1_700_000_000.0 - 3600  # 1 h ago — within 24 h window
+    # _RECENT_EPOCH is computed in setUp() so it is always genuinely "1 hour ago"
+    # relative to the current wall clock.  A hardcoded 2023 epoch would be > 24 h
+    # ago by now, making _get_worker_missed_companies() classify it as "missed"
+    # and causing test_recent_scan_not_in_missed_regardless_of_inflight to pass
+    # for the wrong reason (inflight exclusion, not recency).
+
+    def setUp(self):
+        from datetime import datetime, timezone, timedelta
+        # Always 1 hour ago — genuinely within the 24-hour rolling window.
+        self._RECENT_EPOCH = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).timestamp()
 
     def _run(self, companies, scan_map, inflight_companies=None, redis_error=False):
         """
@@ -2984,10 +2995,15 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         self.assertIn("Acme", names)
 
     def test_recent_scan_not_in_missed_regardless_of_inflight(self):
-        """Company with recent scan is covered regardless of inflight status."""
+        """
+        Company with a recent scan (within 24 h) must NOT appear in missed
+        even when it is NOT in the inflight ZSET.  This verifies the recency
+        branch of _get_worker_missed_companies(), not just inflight exclusion.
+        """
         companies = [{"company": "Stripe"}]
         scan_map  = {"Stripe": self._RECENT_EPOCH}
-        result = self._simple_run(companies, scan_map, inflight=["Stripe"])
+        # inflight=[] so the only reason Stripe is excluded is recency.
+        result = self._simple_run(companies, scan_map, inflight=[])
         names = [c["company"] for c in result]
         self.assertNotIn("Stripe", names)
 

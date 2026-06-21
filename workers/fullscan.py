@@ -1175,6 +1175,9 @@ def run_worker(once: bool = False, skip_lock: bool = False,
         skip_lock:     If True, bypass exclusivity lock (dev/debug only).
         skip_init_db:  If True, skip init_db() (parent process already did it).
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     if not skip_init_db:
         init_db()
 

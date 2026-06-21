@@ -906,6 +906,9 @@ def run_quota_report(silent_if_healthy=False):
 
 
 def main():
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
     init_db()
     args = sys.argv[1:]
 

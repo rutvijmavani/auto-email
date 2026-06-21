@@ -4,12 +4,16 @@ tests/test_heartbeat.py
 Tests for workers/heartbeat.py — Heartbeat daemon thread.
 
 Phase 3.2 — Worker heartbeat in Redis.
+Phase 3.3 — Per-PID key format (multi-worker architecture).
+
+Each worker instance writes its own key: worker:alive:{worker_type}:{pid}
+so multiple workers of the same type do not overwrite each other's heartbeat.
 
 Coverage map
 ────────────
   TestHeartbeatClass
     · start() writes the heartbeat key immediately (synchronous, before thread)
-    · Key format is worker:alive:{worker_type}
+    · Key format is worker:alive:{worker_type}:{pid}
     · TTL = 3 × interval_s
     · Payload JSON contains pid, ts, processed fields
     · pid field matches os.getpid()
@@ -53,25 +57,45 @@ class TestHeartbeatClass(unittest.TestCase):
 
     # ── Key format ────────────────────────────────────────────────────────────
 
-    def test_key_format_is_worker_alive_type(self):
-        """Written key is 'worker:alive:{worker_type}'."""
+    def test_key_format_is_worker_alive_type_pid(self):
+        """Written key is 'worker:alive:{worker_type}:{pid}' — per-PID for multi-worker."""
         r = self._make_r()
         from workers.heartbeat import Heartbeat
         hb = Heartbeat(r, "scan_worker", lambda: 0, interval_s=10)
         hb.start()
         hb.stop()
         key = r.set.call_args[0][0]
-        self.assertEqual(key, "worker:alive:scan_worker")
+        self.assertEqual(key, f"worker:alive:scan_worker:{os.getpid()}")
 
     def test_fullscan_worker_key_format(self):
-        """Key uses the exact worker_type string supplied."""
+        """Key uses the exact worker_type string supplied, plus the process PID."""
         r = self._make_r()
         from workers.heartbeat import Heartbeat
         hb = Heartbeat(r, "fullscan_worker", lambda: 0, interval_s=60)
         hb.start()
         hb.stop()
         key = r.set.call_args[0][0]
-        self.assertEqual(key, "worker:alive:fullscan_worker")
+        self.assertEqual(key, f"worker:alive:fullscan_worker:{os.getpid()}")
+
+    def test_two_workers_same_type_write_different_keys(self):
+        """
+        Simulate two workers of the same type: each uses its own PID as the
+        key suffix, so they never overwrite each other's heartbeat.
+
+        In production they run in separate processes; here we verify the key
+        template includes os.getpid() so different processes get different keys.
+        """
+        r1 = self._make_r()
+        r2 = self._make_r()
+        from workers.heartbeat import Heartbeat
+        # Both use "scan_worker" but in separate processes they'd have different PIDs.
+        # We can only verify the key ends with the current PID; the multi-process
+        # guarantee is by construction (os.getpid() differs per process).
+        hb1 = Heartbeat(r1, "scan_worker", lambda: 0, interval_s=10)
+        hb1.start(); hb1.stop()
+        key1 = r1.set.call_args[0][0]
+        self.assertIn(str(os.getpid()), key1,
+                      "Key must embed the current PID so concurrent workers don't collide")
 
     # ── TTL ───────────────────────────────────────────────────────────────────
 
