@@ -85,18 +85,18 @@ if atci_with_path:
     if not raw_data:
         print("  ✗ fetch_json returned None/empty — API call failed")
     else:
-        info = raw_data.get("jobPostingInfo", {})
+        atci_info = raw_data.get("jobPostingInfo", {})
         print("── jobPostingInfo keys present ──")
-        print(f"  {list(info.keys())}")
+        print(f"  {list(atci_info.keys())}")
         print()
         print("── Fields the parser reads ──")
-        print(f"  info['location']              : {info.get('location')!r}")
-        print(f"  info['additionalLocations']   : {info.get('additionalLocations')!r}")
-        print(f"  info['country']               : {info.get('country')!r}")
-        print(f"  info['jobRequisitionLocation']: {info.get('jobRequisitionLocation')!r}")
+        print(f"  atci_info['location']              : {atci_info.get('location')!r}")
+        print(f"  atci_info['additionalLocations']   : {atci_info.get('additionalLocations')!r}")
+        print(f"  atci_info['country']               : {atci_info.get('country')!r}")
+        print(f"  atci_info['jobRequisitionLocation']: {atci_info.get('jobRequisitionLocation')!r}")
         print()
         print("── Full jobPostingInfo (pretty-printed) ──")
-        print(json.dumps(info, indent=2, default=str)[:4000])  # cap at 4000 chars
+        print(json.dumps(atci_info, indent=2, default=str)[:4000])  # cap at 4000 chars
 else:
     print("No ATCI jobs have _external_path — all will fail at the guard clause.")
 
@@ -121,18 +121,18 @@ if r00_with_path:
     if not raw_data:
         print("  ✗ fetch_json returned None/empty — API call failed")
     else:
-        info = raw_data.get("jobPostingInfo", {})
+        r00_info = raw_data.get("jobPostingInfo", {})
         print("── jobPostingInfo keys present ──")
-        print(f"  {list(info.keys())}")
+        print(f"  {list(r00_info.keys())}")
         print()
         print("── Fields the parser reads ──")
-        print(f"  info['location']              : {info.get('location')!r}")
-        print(f"  info['additionalLocations']   : {info.get('additionalLocations')!r}")
-        print(f"  info['country']               : {info.get('country')!r}")
-        print(f"  info['jobRequisitionLocation']: {info.get('jobRequisitionLocation')!r}")
+        print(f"  r00_info['location']              : {r00_info.get('location')!r}")
+        print(f"  r00_info['additionalLocations']   : {r00_info.get('additionalLocations')!r}")
+        print(f"  r00_info['country']               : {r00_info.get('country')!r}")
+        print(f"  r00_info['jobRequisitionLocation']: {r00_info.get('jobRequisitionLocation')!r}")
         print()
         print("── Full jobPostingInfo (pretty-printed) ──")
-        print(json.dumps(info, indent=2, default=str)[:4000])
+        print(json.dumps(r00_info, indent=2, default=str)[:4000])
 else:
     print("No R00 jobs with _external_path found.")
 
@@ -145,8 +145,8 @@ print(f"  ATCI without _external_path: {len(atci_no_path)}")
 if atci_no_path:
     print(f"  → ATCI jobs missing path will ALWAYS return original job unchanged")
     print(f"    (guard clause at fetch_job_detail line 174)")
-if atci_with_path and 'info' in dir():
-    alpha2 = ((info.get("jobRequisitionLocation") or {}).get("country") or {}).get("alpha2Code","")
-    loc    = info.get("location","")
+if atci_with_path and 'atci_info' in dir():
+    alpha2 = ((atci_info.get("jobRequisitionLocation") or {}).get("country") or {}).get("alpha2Code","")
+    loc    = atci_info.get("location","")
     print(f"  → For ATCI jobs WITH path: alpha2Code={alpha2!r}, location={loc!r}")
 print("=" * 70)

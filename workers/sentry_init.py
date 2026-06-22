@@ -92,8 +92,11 @@ def _fingerprint(event: dict) -> Optional[str]:
         frames   = (exc.get("stacktrace") or {}).get("frames") or []
 
         if frames:
-            last     = frames[-1]
-            filename = Path(last.get("filename") or "?").name
+            last = frames[-1]
+            # Use the full relative path from the frame, not just the basename.
+            # Path.name would make workers/utils.py and scripts/utils.py generate
+            # identical fingerprints at the same line number.
+            filename = last.get("filename") or "?"
             lineno   = last.get("lineno") or "?"
             location = f"{filename}:{lineno}"
         else:

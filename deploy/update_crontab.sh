@@ -36,9 +36,12 @@ CLEANED=$(echo "$EXISTING" \
 # ── Build the new crontab ─────────────────────────────────────────────────────
 # We inject the retry guard immediately after the 7 AM monitor line and append
 # the updated keep-alive at the end.
+# The awk pattern matches on the two essential components (time "0 7" and script
+# name "run_monitor.sh") rather than the exact full-line format, so minor spacing
+# variations in the existing crontab still trigger the insertion.
 
 NEW_CRON=$(echo "$CLEANED" | awk '
-/^0 7 \* \* \* \/home\/opc\/mail\/run_monitor\.sh/ {
+/^0 7[[:space:]].*run_monitor\.sh/ {
     print
     print ""
     print "# ─────────────────────────────────────────"
@@ -76,6 +79,17 @@ NEW_CRON="${NEW_CRON}
 # ── Install ───────────────────────────────────────────────────────────────────
 echo "$NEW_CRON" | crontab -
 echo "  [OK] Crontab updated"
+
+# ── Validate 9 AM retry entry was inserted ────────────────────────────────────
+if ! crontab -l | grep -q "0 9.*run_monitor\.sh"; then
+    echo ""
+    echo "  [WARN] 9 AM retry job was NOT inserted — the 7 AM monitor line"
+    echo "         did not match the expected pattern."
+    echo "         Expected format: 0 7 * * * /home/opc/mail/run_monitor.sh"
+    echo "         Add the 9 AM retry job manually:"
+    echo "           0 9 * * * test -f /home/opc/mail/logs/monitor_\$(date +\\%Y-\\%m-\\%d).log || /home/opc/mail/run_monitor.sh"
+    exit 1
+fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 echo ""

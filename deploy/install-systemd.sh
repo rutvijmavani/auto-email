@@ -51,10 +51,13 @@ fi
 echo ""
 echo "► Removing watchdog cron entry from $SERVICE_USER crontab (now managed by systemd)..."
 if crontab -u "$SERVICE_USER" -l 2>/dev/null | grep -q "workers.watchdog"; then
-    crontab -u "$SERVICE_USER" -l 2>/dev/null \
+    # Under set -o pipefail, grep -v exits 1 when ALL lines are filtered (empty
+    # crontab result).  Wrap in a subshell with || true so the pipeline always
+    # succeeds and crontab receives stdin even if every line was removed.
+    (crontab -u "$SERVICE_USER" -l 2>/dev/null \
         | grep -v "workers.watchdog" \
         | grep -v "watchdog.*--once" \
-        | crontab -u "$SERVICE_USER" -
+        || true) | crontab -u "$SERVICE_USER" -
     echo "  Removed watchdog cron entry from $SERVICE_USER crontab"
 else
     echo "  (no watchdog cron entry found in $SERVICE_USER crontab — nothing to remove)"

@@ -465,8 +465,9 @@ def _build_queue_health_section() -> str:
     never blocks the digest from sending.
     """
     try:
-        from workers.redis_client import get_redis
+        import redis as _redis_lib
         from config import (
+            REDIS_URL,
             REDIS_POLL_ADAPTIVE,
             REDIS_POLL_FULLSCAN,
             REDIS_DETAIL_ADAPTIVE,
@@ -474,7 +475,14 @@ def _build_queue_health_section() -> str:
         )
         import time as _time
 
-        r = get_redis()
+        # Use a local client with a short socket timeout so a Redis hang never
+        # blocks digest email generation indefinitely.  The shared get_redis()
+        # client has no socket timeout configured.
+        r = _redis_lib.from_url(
+            REDIS_URL,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+        )
 
         # ── Gather metrics ────────────────────────────────────────────────────
         detail_adp   = r.llen(REDIS_DETAIL_ADAPTIVE)

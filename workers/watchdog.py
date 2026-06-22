@@ -260,6 +260,11 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
             # Restart the scheduler (which manages detail_worker pool) via systemd.
             "queue_detail_adaptive": worker_via_systemd,
             "queue_detail_fullscan": worker_via_systemd,
+            # Orphaned PEL entries — consumer died before XAUTOCLAIM reclaimed the
+            # message.  Restarting the scheduler re-triggers adaptive_loop which
+            # runs XAUTOCLAIM and also respawns the workers.
+            "stream_adaptive_pel": worker_via_systemd,
+            "stream_fullscan_pel": worker_via_systemd,
         }
     else:
         # ── Subprocess path — dev / cron mode ────────────────────────────
@@ -1158,7 +1163,10 @@ def check_queue_health(r) -> list:
          detail_fs_depth,  prev_detail_fs),
     ]:
         delta   = depth - prev_depth
-        draining = delta < 0 or (detail_proc_delta is not None and detail_proc_delta > 0)
+        # Use only this queue's own depth delta to determine if it is draining.
+        # The pool-wide detail_proc_delta is not queue-specific: workers processing
+        # adaptive jobs would make a growing fullscan queue falsely appear as draining.
+        draining = delta < 0
 
         if depth == 0:
             issues.append(Issue(Issue.OK, label, f"depth=0 — idle{proc_note}"))

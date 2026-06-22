@@ -657,9 +657,17 @@ def main() -> None:
 
     if not raw:
         print("[log_monitor] clean — no issues found")
-        # Still check if digest is due even on a clean run
+        # Still run the resolution sweep and digest check even on a clean run.
+        # Without the sweep, expired action keys accumulate and errors that
+        # recur after a quiet period are not treated as NEW.
         r = _get_redis()
         if r:
+            try:
+                resolved_fps = sweep_resolved(r, now)
+                if resolved_fps:
+                    print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
+            except Exception:
+                pass
             try:
                 last_digest = float(r.get(_KEY_DIGEST) or 0)
                 if now - last_digest >= DIGEST_INTERVAL_S:

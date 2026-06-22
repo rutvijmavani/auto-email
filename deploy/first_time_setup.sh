@@ -240,3 +240,7 @@ echo ""
 echo "  This script does not need to be run again unless you set up a"
 echo "  brand-new server. For code updates, use deploy/deploy.sh."
 echo "════════════════════════════════════════════════════════════"
+
+# Propagate health check failure so calling CI/CD systems see a non-zero exit
+# code when setup completes but workers are not yet healthy.
+$HEALTH_OK || exit 1

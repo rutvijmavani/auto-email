@@ -111,7 +111,7 @@ _DIAGNOSE_HINTS = {
     "recruiter-scheduler": [
         "Check Redis is running: <code>systemctl status redis</code>",
         "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
-        "Check .env secrets are correct: <code>cat /home/opc/mail/.env</code>",
+        "Check .env file exists and is readable: <code>ls -la /home/opc/mail/.env</code>",
         "Check for Python errors: <code>journalctl -u recruiter-scheduler -n 50</code>",
         "Try starting manually: <code>cd /home/opc/mail && source venv/bin/activate "
         "&amp;&amp; python pipeline.py --scheduler</code>",
@@ -120,7 +120,7 @@ _DIAGNOSE_HINTS = {
     ],
     "recruiter-watchdog": [
         "Check Redis is running: <code>systemctl status redis</code>",
-        "Check .env secrets are correct: <code>cat /home/opc/mail/.env</code>",
+        "Check .env file exists and is readable: <code>ls -la /home/opc/mail/.env</code>",
         "Check for Python errors: <code>journalctl -u recruiter-watchdog -n 50</code>",
         "Try starting manually: <code>cd /home/opc/mail && source venv/bin/activate "
         "&amp;&amp; python -m workers.watchdog</code>",

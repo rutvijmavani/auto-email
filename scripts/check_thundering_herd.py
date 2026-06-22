@@ -145,6 +145,9 @@ def main():
                         help="Bucket size in minutes (default: 60)")
     args = parser.parse_args()
 
+    if args.bucket <= 0:
+        parser.error("--bucket must be a positive integer")
+
     r = redis_lib.from_url(REDIS_URL, decode_responses=False)
 
     print(f"\n{'═'*60}")

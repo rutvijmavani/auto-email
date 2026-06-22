@@ -20,7 +20,7 @@ Coverage map
     · Dead peer adaptive items → LMOVE back to adaptive source
     · Dead peer fullscan items → LMOVE back to fullscan source
     · Live peer items (heartbeat present) → never touched
-    · LMOVE direction is RIGHT → LEFT (item goes to FRONT of source queue)
+    · LMOVE direction is RIGHT → RIGHT (item goes to TAIL of source queue)
     · Multiple items → all recovered until list exhausted (while-loop)
     · Loop stops when lmove returns None (no infinite loop)
 
@@ -304,8 +304,8 @@ class TestRecoverStuckJobs(unittest.TestCase):
         self.assertEqual(recovery[0][1], REDIS_DETAIL_FULLSCAN,
                          "Items must be moved to the fullscan source queue")
 
-    def test_lmove_direction_is_right_to_left(self):
-        """LMOVE from dead peer inflight uses RIGHT → LEFT (item goes to FRONT)."""
+    def test_lmove_direction_is_right_to_right(self):
+        """LMOVE from dead peer inflight uses RIGHT → RIGHT (item goes to TAIL of source queue)."""
         r, dead_adp_key, _, _ = self._build_redis_mock(
             dead_adaptive_items=[b"item"]
         )
@@ -316,7 +316,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
                     if c[0][0] == dead_adp_key]
         self.assertTrue(len(recovery) >= 1)
         self.assertEqual(recovery[0][2], "RIGHT")
-        self.assertEqual(recovery[0][3], "LEFT")
+        self.assertEqual(recovery[0][3], "RIGHT")
 
     def test_multiple_items_all_recovered(self):
         """All items in a dead peer's inflight are drained (loop runs until None)."""

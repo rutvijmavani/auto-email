@@ -112,6 +112,7 @@ sleep 5
 # ── Quick status check ────────────────────────────────────────────────────────
 echo ""
 echo "► Service status:"
+_svc_fail=0
 for svc in recruiter-scheduler recruiter-watchdog; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
@@ -119,8 +120,16 @@ for svc in recruiter-scheduler recruiter-watchdog; do
         echo "  ✓ $svc: $status (pid=$pid)"
     else
         echo "  ✗ $svc: $status (pid=$pid)  ← PROBLEM"
+        _svc_fail=1
     fi
 done
+if [[ $_svc_fail -ne 0 ]]; then
+    echo ""
+    echo "  [ERROR] One or more services failed to start — check logs:"
+    echo "          journalctl -u recruiter-scheduler -n 50"
+    echo "          journalctl -u recruiter-watchdog  -n 20"
+    exit 1
+fi
 
 # ── Health check ─────────────────────────────────────────────────────────────
 if $SKIP_HEALTH; then
