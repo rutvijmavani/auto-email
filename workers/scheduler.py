@@ -942,28 +942,92 @@ def _pick_schedule_time(
     return target_ts
 
 
+# ── Atomic scheduling lock ─────────────────────────────────────────────────────
+# _pick_schedule_time() reads the ZSET and _then_ we ZADD.  When multiple
+# scan-worker processes call _reschedule_adaptive() concurrently (all completing
+# around the same time), they all read the same gap and write the same score —
+# re-creating the thundering-herd problem the algorithm is designed to prevent.
+#
+# Fix: hold a short Redis lock (500 ms TTL) around the ZRANGEBYSCORE → ZADD pair
+# so at most one process selects a slot at a time.  If the lock is contended, the
+# caller falls back to scheduling at target_ts directly — still correct, just
+# without gap detection for that one call; the next reschedule call rebalances.
+#
+# KEYS[1] = lock key    ARGV[1] = owner token
+_SCHEDULING_UNLOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def _atomic_schedule(
+    r,
+    queue_key:     str,
+    company:       str,
+    target_ts:     float,
+    interval_s:    float,
+    tolerance_pct: float,
+    *,
+    deadline_ts:    Optional[float] = None,
+    avg_duration_s: float           = 30.0,
+) -> float:
+    """
+    Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
+    short-lived Redis lock so concurrent processes cannot select the same gap.
+
+    Returns the scheduled Unix timestamp.
+    """
+    lock_key = f"scheduling:lock:{queue_key}"
+    token    = f"{os.getpid()}:{time.monotonic_ns()}"
+    acquired = r.set(lock_key, token, px=500, nx=True)
+    try:
+        if acquired:
+            score = _pick_schedule_time(
+                target_ts      = target_ts,
+                queue_key      = queue_key,
+                interval_s     = interval_s,
+                tolerance_pct  = tolerance_pct,
+                r              = r,
+                deadline_ts    = deadline_ts,
+                avg_duration_s = avg_duration_s,
+            )
+        else:
+            # Another process is scheduling — use target_ts directly.
+            # The next rescheduling call will see all entries and pick a real gap.
+            logger.debug(
+                "_atomic_schedule: lock busy for %r — scheduling %r at target_ts",
+                queue_key, company,
+            )
+            score = target_ts
+        r.zadd(queue_key, {company: score})
+        return score
+    finally:
+        if acquired:
+            try:
+                r.eval(_SCHEDULING_UNLOCK_LUA, 1, lock_key, token)
+            except Exception:
+                pass   # TTL expires the lock automatically — safe to ignore
+
+
 def _reschedule_adaptive(company: str, interval_s: int) -> None:
     """
     Add company back to poll:adaptive ZSET with its new interval.
 
-    Uses _pick_schedule_time() to find the largest gap between already-scheduled
-    companies within ±10% of the ideal next-poll time (tolerance_pct=0.20 gives
-    a total window of 20% of the interval centred on target_ts).
+    Uses _atomic_schedule() which wraps _pick_schedule_time() + ZADD under a
+    short Redis lock so concurrent scan_worker processes do not all read the
+    same gap and schedule at the same slot (would recreate thundering herd).
 
     Adaptive scans are short (seconds to a minute) so no deadline check is
     needed — only fullscan scheduling uses the 7 AM digest deadline guard.
     """
-    r         = get_redis()
-    now       = time.time()
-
-    score = _pick_schedule_time(
-        target_ts     = now + interval_s,
-        queue_key     = REDIS_POLL_ADAPTIVE,
-        interval_s    = interval_s,
-        tolerance_pct = 0.20,
-        r             = r,
+    r   = get_redis()
+    now = time.time()
+    _atomic_schedule(
+        r, REDIS_POLL_ADAPTIVE, company,
+        now + interval_s, interval_s, 0.20,
     )
-    r.zadd(REDIS_POLL_ADAPTIVE, {company: score})
 
 
 def _should_trigger_full_scan(company: str, row) -> bool:
@@ -1044,13 +1108,15 @@ def on_fullscan_complete(company: str, new_jobs: int,
 
     interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
     avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
-    next_fs        = _pick_schedule_time(
-        target_ts      = now + interval_s,
-        queue_key      = REDIS_POLL_FULLSCAN,
-        interval_s     = interval_s,
-        tolerance_pct  = 0.20,
-        r              = r,
-        deadline_ts    = _next_digest_deadline(now),
+
+    # _atomic_schedule: gap-detection + ZADD under a short Redis lock.
+    # Prevents two simultaneous fullscan completions from selecting the same slot.
+    # Also stores the score in next_fs so the DB update below can reference it.
+    next_fs = _atomic_schedule(
+        r, REDIS_POLL_FULLSCAN, company,
+        now + interval_s, interval_s, 0.20,
+        # Deadline relative to target_ts: the 7 AM that follows the scheduled slot.
+        deadline_ts    = _next_digest_deadline(now + interval_s),
         avg_duration_s = avg_duration_s,
     )
 
@@ -1068,9 +1134,7 @@ def on_fullscan_complete(company: str, new_jobs: int,
             conn.commit()
         finally:
             conn.close()
-
-        # Re-queue for the next full scan cycle (min-heap slot selected)
-        r.zadd(REDIS_POLL_FULLSCAN, {company: next_fs})
+        # Note: r.zadd already done inside _atomic_schedule above
         logger.info(
             "on_fullscan_complete: company=%r new_jobs=%d "
             "next_fullscan=+%.1fh (slot offset from ideal: %+.0fs) success=True",
@@ -1220,8 +1284,9 @@ def adaptive_loop() -> None:
                     "ts":         time.time(),
                     "dispatched": _hw_dispatched,
                 }), ex=15)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Non-fatal — heartbeat key will expire and watchdog will alert.
+                logger.debug("scheduler: heartbeat write failed: %s", exc)
 
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
@@ -1985,6 +2050,25 @@ def _replace_dead_workers() -> None:
                     _total_replacements[ptype] += 1
 
                     pool[i] = _spawn_worker(ptype)
+
+        # ── Stable-worker pre-reset ───────────────────────────────────────────
+        # The dead-worker branch above resets consecutive_deaths only when a
+        # stable worker eventually dies.  If a replacement is still running and
+        # has already reached stability (alive ≥ _WORKER_STABLE_AFTER_S), reset
+        # the counter now so the watchdog stops emitting false WARNING/ERROR
+        # while the system is actually healthy.
+        #
+        # _worker_spawn_times at this point contains only LIVING workers — dead
+        # workers were popped in the loop above.
+        _now_ts = time.time()
+        for _pid, (_wtype, _spawn_ts) in list(_worker_spawn_times.items()):
+            if (_now_ts - _spawn_ts) >= _WORKER_STABLE_AFTER_S and _consecutive_deaths[_wtype] > 0:
+                logger.info(
+                    "scheduler: %s_worker pid=%d stable for %ds — "
+                    "resetting consecutive_deaths from %d to 0",
+                    _wtype, _pid, int(_now_ts - _spawn_ts), _consecutive_deaths[_wtype],
+                )
+                _consecutive_deaths[_wtype] = 0
 
     # Publish updated pool state AFTER releasing the lock
     if replacements:

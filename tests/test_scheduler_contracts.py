@@ -946,7 +946,7 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         has_fixed_boundary   = "cycle_start_ts = today_cycle.timestamp()" in src
         has_rolling_window   = "timedelta(hours=24)" in src
         has_fullscan_field   = "last_full_scan_at" in src
-        has_adaptive_field   = "last_poll_epoch" in src  # old adaptive-scan alias
+        has_adaptive_field   = "last_poll_at" in src   # adaptive-scan field (wrong alias)
 
         self.assertFalse(has_fixed_boundary,
             "job_monitor.py still uses 'today_cycle.timestamp()' as cycle boundary — "

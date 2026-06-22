@@ -123,10 +123,15 @@ _INFLIGHT_KEY: dict     = {}   # set in run_worker()
 # Lua runs atomically on the Redis server — either both ops complete or neither.
 #
 # KEYS[1] = inflight_key   KEYS[2] = source_queue   ARGV[1] = raw payload
+#
+# RPUSH (not LPUSH): producers use LPUSH (head/left); consumers pop from the
+# tail/right with LMOVE "RIGHT".  RPUSH places the requeued job at the tail so
+# it is consumed next — giving it high priority rather than sending it to the
+# back of the line.
 _ATOMIC_REQUEUE_LUA = """
 local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
 if removed > 0 then
-    redis.call('LPUSH', KEYS[2], ARGV[1])
+    redis.call('RPUSH', KEYS[2], ARGV[1])
 end
 return removed
 """
@@ -147,8 +152,9 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
     This prevents the previous bug where a restarting worker would steal
     in-progress jobs from live peers that share the same logical queue.
 
-    Uses LMOVE (RIGHT → LEFT) so recovered items land at the FRONT of the
-    source queue — they've already waited long enough.
+    Uses LMOVE (RIGHT → RIGHT) to push recovered items to the tail/right of the
+    source queue — the same end that consumers pop from — so they are consumed
+    next (high priority) rather than sent to the back of the line.
     """
     for queue_key, source_key in [
         (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
@@ -185,10 +191,11 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                     )
                     continue
 
-                # Peer is dead — drain its items to the front of the source queue
+                # Peer is dead — drain its items to the tail of the source queue
+                # (RIGHT→RIGHT: consumers pop from RIGHT so these are consumed next)
                 recovered = 0
                 while True:
-                    item = r.lmove(key, source_key, "RIGHT", "LEFT")
+                    item = r.lmove(key, source_key, "RIGHT", "RIGHT")
                     if item is None:
                         break
                     recovered += 1

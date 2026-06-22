@@ -19,6 +19,7 @@ Trigger condition:
      one-off glitch — always worth a human looking at it.
 """
 
+import html
 import os
 import smtplib
 import sys
@@ -190,7 +191,7 @@ def send_startup_failure_alert(service: str) -> None:
 </p>
 <pre style="background:#0f172a;color:#e2e8f0;padding:14px;border-radius:6px;
             font-size:11px;line-height:1.5;overflow:auto;
-            white-space:pre-wrap;word-break:break-all;">{journal_text}</pre>
+            white-space:pre-wrap;word-break:break-all;">{html.escape(journal_text)}</pre>
 
 <p style="color:#64748b;font-size:12px;margin-top:16px;">
   ⚠ The watchdog's self-healing (5-minute restart loop) cannot help here —

@@ -63,7 +63,9 @@ AOF_CHANGED=0
 if [[ "$current_aof"   == "yes"     &&
       "$current_fsync" == "everysec" &&
       "$current_rwpct" == "100"      &&
-      "$current_rwmin" == "64mb"     ]]; then
+      # Redis < 7 returns bytes ("67108864"); Redis 7+ returns "64mb".
+      # Accept either form so the idempotence check works on all versions.
+      ( "$current_rwmin" == "64mb" || "$current_rwmin" == "67108864" ) ]]; then
     echo "  ✓ AOF already fully configured — nothing to change."
 else
     AOF_CHANGED=1
@@ -183,7 +185,7 @@ echo "  AOF file                      : $aof_file"
 if [[ "$aof_enabled" == "yes"     &&
       "$aof_fsync"   == "everysec" &&
       "$aof_rwpct"   == "100"      &&
-      "$aof_rwmin"   == "64mb"     ]]; then
+      ( "$aof_rwmin" == "64mb" || "$aof_rwmin" == "67108864" ) ]]; then
     echo ""
     echo "  ✓ AOF persistence is ACTIVE"
     echo "  ✓ Data-loss window: ~1 second (AOF fsync everysec)"

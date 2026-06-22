@@ -129,7 +129,7 @@ from workers.redis_client import get_redis, ping
 from workers.heartbeat import Heartbeat
 from workers.scheduler import (
     set_heartbeat, clear_heartbeat, set_progress,
-    _pick_schedule_time, _next_digest_deadline,
+    _pick_schedule_time, _next_digest_deadline, _atomic_schedule,
 )
 from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
@@ -784,8 +784,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # ZREM is called in the finally block regardless of outcome.
         try:
             r.zadd(REDIS_INFLIGHT_FULLSCAN, {company: time.time()})
-        except Exception:
-            pass   # non-fatal — missed inflight write at most delays 7 AM fallback exclusion
+        except Exception as exc:
+            # Non-fatal — missed inflight write at most delays 7 AM fallback exclusion.
+            logger.debug("fullscan [%s]: inflight ZADD failed (non-fatal): %s", company, exc)
         set_progress(company, "fullscan_start")
 
         is_resume    = fs_state.get("full_scan_interrupted", False)
@@ -1079,15 +1080,16 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             _EMA_ALPHA           = 0.3   # must match _complete_fullscan_db
             updated_avg_duration = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * avg_duration_s
 
-            next_scan_at = _pick_schedule_time(
-                target_ts      = now + interval_s,
-                queue_key      = REDIS_POLL_FULLSCAN,
-                interval_s     = interval_s,
-                tolerance_pct  = 0.20,
-                r              = r,
-                deadline_ts    = _next_digest_deadline(now),
+            # _atomic_schedule: gap-detection + ZADD under a short Redis lock so
+            # concurrent fullscan completions don't both pick the same slot.
+            # Deadline relative to target_ts (see scheduler.py's _atomic_schedule).
+            next_scan_at = _atomic_schedule(
+                r, REDIS_POLL_FULLSCAN, company,
+                now + interval_s, interval_s, 0.20,
+                deadline_ts    = _next_digest_deadline(now + interval_s),
                 avg_duration_s = updated_avg_duration,
             )
+            # _atomic_schedule already did r.zadd(REDIS_POLL_FULLSCAN, ...)
 
             # Update DB: persist scan duration EMA + reschedule time.
             # full_scan_interval_s (base 86400) stays clean — not overwritten here.
@@ -1097,8 +1099,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
             )
-
-            r.zadd(REDIS_POLL_FULLSCAN, {company: next_scan_at})
 
             result["outcome"]      = "completed"
             result["success"]      = True
@@ -1142,8 +1142,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
     finally:
         try:
             r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("fullscan [%s]: inflight ZREM failed (non-fatal): %s", company, exc)
         clear_heartbeat(company)
         if not skip_lock:
             _release_lock(company, r)
@@ -1296,7 +1296,6 @@ def run_worker(once: bool = False, skip_lock: bool = False,
         except KeyboardInterrupt:
             logger.info("fullscan: KeyboardInterrupt — shutting down")
             print("\n[fullscan] Shutting down.")
-            _hb.stop()
             break
 
         except Exception as exc:
@@ -1307,6 +1306,10 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 break
             time.sleep(5)
 
+    # Stop heartbeat on ALL exit paths (KeyboardInterrupt, once-flag break,
+    # unhandled exception with once=True, or stream-empty condition).
+    # Matches the pattern already used in scan_worker.
+    _hb.stop()
     logger.info("fullscan worker shutdown | processed=%d worker_id=%s",
                 _hw["count"], WORKER_ID)
 

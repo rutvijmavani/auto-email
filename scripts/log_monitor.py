@@ -287,9 +287,16 @@ def collect_raw_findings(
         LOGS_DIR / "scan_worker.log",
         LOGS_DIR / "fullscan.log",
     ]
+    def _mtime_safe(p) -> float:
+        """Return mtime, or -inf when the file disappears between glob and stat."""
+        try:
+            return p.stat().st_mtime
+        except FileNotFoundError:
+            return float("-inf")
+
     recent_dated = [
         p for p in LOGS_DIR.glob("*.log")
-        if p not in priority and p.stat().st_mtime >= cutoff
+        if p not in priority and _mtime_safe(p) >= cutoff
     ]
 
     new_offsets = dict(offsets)

@@ -97,7 +97,10 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PYTHON_EXE      = sys.executable   # same interpreter / venv as this watchdog
-_LOG_DIR         = "/tmp"           # worker restart logs go here
+# Use a project-owned logs directory rather than world-writable /tmp to avoid
+# symlink attacks on shared hosts.  Directory is created if it doesn't exist.
+_LOG_DIR         = os.path.join(_PROJECT_ROOT, "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
 
 # When running under systemd the scheduler unit manages all workers.
 # Prefer `sudo systemctl restart recruiter-scheduler` over spawning a raw process —
@@ -253,6 +256,10 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "foreground":  True,
             },
             "queue_poll_fullscan_stall": worker_via_systemd,
+            # Detail queues — depth growing/stalled at CRITICAL level.
+            # Restart the scheduler (which manages detail_worker pool) via systemd.
+            "queue_detail_adaptive": worker_via_systemd,
+            "queue_detail_fullscan": worker_via_systemd,
         }
     else:
         # ── Subprocess path — dev / cron mode ────────────────────────────
@@ -300,6 +307,17 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:fullscan stalled)",
+            },
+            # Detail queues — depth growing/stalled at CRITICAL level.
+            "queue_detail_adaptive": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.detail_worker"],
+                "log_file":    f"{_LOG_DIR}/detail_worker.log",
+                "description": "Restarted detail_worker (detail:adaptive critically elevated)",
+            },
+            "queue_detail_fullscan": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.detail_worker"],
+                "log_file":    f"{_LOG_DIR}/detail_worker.log",
+                "description": "Restarted detail_worker (detail:fullscan critically elevated)",
             },
         }
     return actions.get(alert_type)
@@ -491,8 +509,10 @@ def check_postgres() -> tuple:
         from db.db import init_db, get_conn
         init_db()
         conn = get_conn()
-        row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
+        finally:
+            conn.close()
         return True, f"{row['cnt']:,} jobs in DB"
     except Exception as exc:
         return False, str(exc)
@@ -1207,20 +1227,22 @@ def check_coverage(r) -> list:
     try:
         from db.db import init_db, get_conn
         init_db()
-        conn   = get_conn()
-        total  = conn.execute(
-            "SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
-        missed = conn.execute("""
-            SELECT COUNT(*) AS c FROM company_poll_stats
-            WHERE last_full_scan_at IS NULL
-               OR last_full_scan_at < NOW() - INTERVAL '26 hours'
-        """).fetchone()["c"]
-        stuck  = conn.execute("""
-            SELECT COUNT(*) AS c FROM job_postings
-            WHERE status = 'pending_detail'
-              AND created_at < NOW() - INTERVAL '1 hour'
-        """).fetchone()["c"]
-        conn.close()
+        conn = get_conn()
+        try:
+            total  = conn.execute(
+                "SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
+            missed = conn.execute("""
+                SELECT COUNT(*) AS c FROM company_poll_stats
+                WHERE last_full_scan_at IS NULL
+                   OR last_full_scan_at < NOW() - INTERVAL '26 hours'
+            """).fetchone()["c"]
+            stuck  = conn.execute("""
+                SELECT COUNT(*) AS c FROM job_postings
+                WHERE status = 'pending_detail'
+                  AND created_at < NOW() - INTERVAL '1 hour'
+            """).fetchone()["c"]
+        finally:
+            conn.close()
 
         if total == 0:
             issues.append(Issue(Issue.WARNING, "coverage",
@@ -1252,15 +1274,20 @@ def check_coverage(r) -> list:
 def check_redis_persistence(r) -> list:
     try:
         info     = r.info("persistence")
+        aof_on   = info.get("aof_enabled") in (1, "1", True)
         last_s   = info.get("rdb_last_save_time", 0) or r.lastsave()
         if isinstance(last_s, int) and last_s > 0:
             age_min = (time.time() - last_s) / 60
-            if age_min > 30:
+            if age_min > 30 and not aof_on:
+                # Only warn about stale RDB when AOF is disabled.  With AOF
+                # (appendfsync everysec) the data-loss window is ~1 second
+                # regardless of how long ago the last RDB snapshot ran.
                 return [Issue(Issue.WARNING, "redis_persistence",
                     f"Last RDB save {age_min:.0f} min ago — "
                     "data loss window is large. Consider enabling AOF.")]
+            suffix = " [AOF active — data safe]" if aof_on else ""
             return [Issue(Issue.OK, "redis_persistence",
-                f"Last RDB save {age_min:.0f} min ago")]
+                f"Last RDB save {age_min:.0f} min ago{suffix}")]
     except Exception as exc:
         return [Issue(Issue.WARNING, "redis_persistence", f"Could not check: {exc}")]
     return []
@@ -1323,7 +1350,7 @@ def check_systemd_services() -> list:
 
             if state == "active":
                 issues.append(Issue(Issue.OK, f"systemd:{unit}",
-                    f"service is active (systemd managed)"))
+                    "service is active (systemd managed)"))
             elif state == "activating":
                 # Briefly starting — not an error, just note it
                 issues.append(Issue(Issue.OK, f"systemd:{unit}",

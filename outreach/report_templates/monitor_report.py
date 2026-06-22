@@ -236,18 +236,28 @@ def _build_health_section(stats, alerts, styles):
     total = stats.get("companies_monitored", 0)
     known_ats = total - stats.get("companies_unknown_ats", 0)
     # covered_by_workers = companies whose full scan completed before job_monitor ran.
-    # companies_with_results = missed companies re-fetched by job_monitor fallback.
-    # Together they represent total successfully scanned companies.
+    # fallback_scanned   = missed companies whose fallback ATS fetch succeeded
+    #                      (0 or more jobs).  Use this for coverage so zero-job
+    #                      scans are not wrongly excluded.
+    #                      Falls back to companies_with_results for old stat rows.
     worker_covered  = stats.get("covered_by_workers", 0)
-    fallback_hits   = stats.get("companies_with_results", 0)
+    fallback_hits   = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
     total_covered   = worker_covered + fallback_hits
     coverage_pct = int(total_covered / total * 100) if total else 0
     ats_pct = int(known_ats / total * 100) if total else 0
 
-    # Coverage value string: "111/139 (80%)  [111 by workers + 0 by fallback]"
+    # Coverage value string:
+    #   "111/139 (80%)  [111 by workers + 9 by fallback (6 with jobs, 3 empty)]"
+    # The "(X empty)" sub-count is an early warning: if it's suddenly large,
+    # some ATS integrations may have gone stale (returning HTTP 200 but 0 jobs).
     coverage_detail = f"{worker_covered} by workers"
     if fallback_hits:
-        coverage_detail += f" + {fallback_hits} by job monitor"
+        fallback_with_jobs = stats.get("companies_with_results", 0)
+        fallback_empty     = fallback_hits - fallback_with_jobs
+        breakdown = f"{fallback_with_jobs} with jobs"
+        if fallback_empty:
+            breakdown += f", {fallback_empty} empty"
+        coverage_detail += f" + {fallback_hits} by job monitor ({breakdown})"
     coverage_val = f"{total_covered}/{total} ({coverage_pct}%)  [{coverage_detail}]"
 
     health_data = [
@@ -1246,13 +1256,18 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
 
     # Brief HTML body
     _worker_covered = stats.get("covered_by_workers", 0)
-    _fallback_hits  = stats.get("companies_with_results", 0)
+    _fallback_hits  = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
     _total_covered  = _worker_covered + _fallback_hits
     _total          = stats.get("companies_monitored", 0)
     _cov_pct        = int(_total_covered / _total * 100) if _total else 0
-    _cov_detail     = f"{_worker_covered} by workers"
+    _cov_detail = f"{_worker_covered} by workers"
     if _fallback_hits:
-        _cov_detail += f", {_fallback_hits} by job monitor fallback"
+        _fb_with_jobs = stats.get("companies_with_results", 0)
+        _fb_empty     = _fallback_hits - _fb_with_jobs
+        _breakdown    = f"{_fb_with_jobs} with jobs"
+        if _fb_empty:
+            _breakdown += f", {_fb_empty} empty"
+        _cov_detail += f", {_fallback_hits} by fallback ({_breakdown})"
     coverage = f"{_total_covered}/{_total} ({_cov_pct}%)"
 
     body_html = f"""

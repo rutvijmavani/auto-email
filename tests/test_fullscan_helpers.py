@@ -629,7 +629,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
     _complete_fullscan_db() now computes an EMA of scan durations and writes
     two new columns: last_fullscan_duration_s and avg_fullscan_duration_s.
 
-    Formula: new_avg = 0.3 × duration_s + 0.7 × prev_avg_duration_s
+    Formula: new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
     Default prev_avg = 30.0 s (for companies with no prior scan history).
     """
 
@@ -668,7 +668,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
 
     def test_first_scan_ema_from_default_prev(self):
         """
-        First scan (prev_avg=30.0): new_avg = 0.3 × duration + 0.7 × 30.
+        First scan (prev_avg=30.0): new_avg = 0.3 * duration + 0.7 * 30.
         """
         duration = 600.0
         expected = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * 30.0
@@ -680,7 +680,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
 
     def test_subsequent_scan_ema_from_prev(self):
         """
-        Subsequent scan: new_avg = 0.3 × duration + 0.7 × prev_avg.
+        Subsequent scan: new_avg = 0.3 * duration + 0.7 * prev_avg.
         """
         duration = 1200.0
         prev_avg = 900.0
@@ -704,17 +704,17 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         self.assertIn("avg_fullscan_duration_s", sql)
 
     def test_alpha_is_0_3(self):
-        """Verify α=0.3 by checking a known computation."""
+        """Verify a=0.3 by checking a known computation."""
         duration = 1000.0
         prev_avg = 500.0
-        # 0.3 × 1000 + 0.7 × 500 = 300 + 350 = 650
+        # 0.3 * 1000 + 0.7 * 500 = 300 + 350 = 650
         expected = 650.0
         result = self._run(duration_s=duration, prev_avg=prev_avg)
         actual_avg = result["params"][3]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
     def test_zero_duration_valid(self):
-        """Duration=0 is valid (very fast scan). EMA = 0.3×0 + 0.7×prev = 0.7×prev."""
+        """Duration=0 is valid (very fast scan). EMA = 0.3*0 + 0.7*prev = 0.7*prev."""
         prev_avg = 60.0
         expected = 0.7 * prev_avg
         result = self._run(duration_s=0.0, prev_avg=prev_avg)

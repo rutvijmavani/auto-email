@@ -561,7 +561,7 @@ class TestStallCount(unittest.TestCase):
         self.assertEqual(stall, 1)
 
     def test_s1_growing_stalls(self):
-        stall, valid = self._call(cur_ov=7, prev_ov=5)
+        stall, _ = self._call(cur_ov=7, prev_ov=5)
         self.assertEqual(stall, 1)
 
     def test_s1_shrinking_no_stall(self):
@@ -580,7 +580,7 @@ class TestStallCount(unittest.TestCase):
         self.assertEqual(stall, 1)
 
     def test_s2_different_company_no_stall(self):
-        stall, valid = self._call(
+        stall, _ = self._call(
             cur_hc="Stripe", cur_hs=1_000_000.0,
             prev_hc="Acme",  prev_hs=1_000_000.0,
         )

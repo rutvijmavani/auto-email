@@ -75,6 +75,11 @@ class Heartbeat:
         *,
         interval_s: int = 10,
     ) -> None:
+        if interval_s <= 0:
+            raise ValueError(
+                f"Heartbeat interval_s must be > 0, got {interval_s!r}. "
+                "Zero or negative values cause a busy-spin that hammers Redis."
+            )
         self._r           = r
         self._worker_type = worker_type
         self._get_count   = get_count

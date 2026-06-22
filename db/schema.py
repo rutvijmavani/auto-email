@@ -852,7 +852,7 @@ def init_db():
         # _pick_schedule_time() uses avg_fullscan_duration_s to skip gap
         # midpoints where the scan cannot finish before the 7 AM digest:
         #     skip if midpoint + avg_fullscan_duration_s >= next_7am_deadline
-        # EMA formula (α=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
+        # EMA formula (a=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
         ("last_fullscan_duration_s", "INTEGER"),
         ("avg_fullscan_duration_s",  "DOUBLE PRECISION DEFAULT 30.0"),
     ]:

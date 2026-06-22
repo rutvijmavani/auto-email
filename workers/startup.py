@@ -8,7 +8,7 @@ immediately rather than the worker crashing on first DB/Redis operation.
 Checks:
     1. Redis reachability — PING test (existing per-worker check consolidated here)
     2. PostgreSQL connectivity — SELECT 1 to verify the connection pool is live
-    3. Required config keys — EMAIL, APP_PASSWORD, REDIS_URL, DATABASE_URL present
+    3. Required config keys — GMAIL_EMAIL, GMAIL_APP_PASSWORD, REDIS_URL, DATABASE_URL present
 
 Usage:
     from workers.startup import validate_startup
@@ -105,8 +105,9 @@ def _check_redis(prefix: str) -> None:
             from urllib.parse import urlparse, urlunparse
             _p = urlparse(redis_url)
             if _p.password:
+                user_prefix = f"{_p.username}:" if _p.username else ""
                 safe_url = urlunparse(_p._replace(
-                    netloc=f"{_p.username}:***@{_p.hostname}"
+                    netloc=f"{user_prefix}***@{_p.hostname}"
                            + (f":{_p.port}" if _p.port else "")
                 ))
             else:
@@ -143,8 +144,9 @@ def _check_postgres(prefix: str) -> None:
         try:
             from urllib.parse import urlparse, urlunparse
             parsed = urlparse(db_url_raw)
+            db_user_prefix = f"{parsed.username}:" if parsed.username else ""
             safe_url = urlunparse(parsed._replace(
-                netloc=f"{parsed.username}:***@{parsed.hostname}"
+                netloc=f"{db_user_prefix}***@{parsed.hostname}"
                        + (f":{parsed.port}" if parsed.port else "")
             ))
         except Exception:

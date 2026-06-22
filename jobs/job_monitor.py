@@ -337,7 +337,9 @@ def run():
     stats = {
         "companies_monitored":    len(covered),   # pre-credit covered companies
         "covered_by_workers":     len(covered),   # for coverage alert numerator
-        "companies_with_results": 0,              # incremented only when fallback fetch returns jobs
+        "fallback_scanned":       0,              # fallback companies whose ATS was successfully queried
+                                                  # (regardless of whether jobs were found)
+        "companies_with_results": 0,              # subset of fallback_scanned that returned ≥1 job
         "companies_unknown_ats":  0,
         "api_failures":           0,
         "total_jobs_fetched":     0,
@@ -373,13 +375,14 @@ def run():
                     }
 
                 with stats_lock:
-                    stats["companies_monitored"]    += company_stats.get("monitored",    0)
-                    stats["companies_with_results"] += company_stats.get("with_results", 0)
-                    stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",  0)
-                    stats["api_failures"]           += company_stats.get("failed",       0)
-                    stats["total_jobs_fetched"]     += company_stats.get("fetched",      0)
-                    stats["jobs_matched_filters"]   += company_stats.get("matched",      0)
-                    stats["new_jobs_found"]         += company_stats.get("new",          0)
+                    stats["companies_monitored"]    += company_stats.get("monitored",      0)
+                    stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
+                    stats["companies_with_results"] += company_stats.get("with_results",   0)
+                    stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)
+                    stats["api_failures"]           += company_stats.get("failed",         0)
+                    stats["total_jobs_fetched"]     += company_stats.get("fetched",        0)
+                    stats["jobs_matched_filters"]   += company_stats.get("matched",        0)
+                    stats["new_jobs_found"]         += company_stats.get("new",            0)
                     if company_stats.get("failure_name"):
                         stats["api_failure_list"].append(
                             company_stats["failure_name"]
@@ -489,14 +492,15 @@ def _process_company(company_row, position, total):
     slug     = company_row.get("ats_slug")
 
     result = {
-        "monitored":    1,
-        "with_results": 0,
-        "unknown_ats":  0,
-        "failed":       0,
-        "fetched":      0,
-        "matched":      0,
-        "new":          0,
-        "failure_name": None,
+        "monitored":        1,
+        "fallback_scanned": 0,   # set to 1 when ATS fetch succeeds (0 or more jobs)
+        "with_results":     0,   # set to 1 when fetch returns ≥1 job
+        "unknown_ats":      0,
+        "failed":           0,
+        "fetched":          0,
+        "matched":          0,
+        "new":              0,
+        "failure_name":     None,
     }
 
     logger.info("── [%d/%d] %r  platform=%s",
@@ -572,7 +576,8 @@ def _process_company(company_row, position, total):
         logger.warning("Dropped %d jobs missing job_url for %r",
                       dropped_count, company)
 
-    result["fetched"] = len(raw_jobs)
+    result["fetched"]          = len(raw_jobs)
+    result["fallback_scanned"] = 1  # ATS responded — counts as scanned even if 0 jobs
 
     # URL presence tracking (DB reads — fast, no HTTP)
     fetched_urls = {job["job_url"] for job in raw_jobs}
@@ -783,10 +788,11 @@ def _build_alerts(stats, total_companies):
 
     if total_companies > 0:
         # covered_by_workers: scanned by background workers (data already in DB)
-        # companies_with_results: of the missed companies, those that returned
-        #   jobs in the fallback fetch.  Sum = total companies with any data.
+        # fallback_scanned: of the missed companies, those whose ATS fetch
+        #   completed (0 or more jobs).  Use this (not companies_with_results)
+        #   for coverage — a 0-job result is still a successful scan.
         covered_count = stats.get("covered_by_workers", 0)
-        companies_with_data = covered_count + stats["companies_with_results"]
+        companies_with_data = covered_count + stats.get("fallback_scanned", 0)
         coverage = companies_with_data / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)
