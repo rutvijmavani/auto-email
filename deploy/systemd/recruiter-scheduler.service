@@ -21,6 +21,14 @@ After=redis.service
 # Restart watchdog AFTER scheduler so watchdog doesn't false-alarm on boot
 Before=recruiter-watchdog.service
 
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+# StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
+# If the service starts and dies 5 times within 5 minutes, systemd marks it
+# as "failed" and stops retrying.  OnFailure fires to send an alert email.
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%n.service
+
 [Service]
 Type=simple
 User=opc
@@ -43,13 +51,6 @@ RestartSec=30s
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=60s
-
-# ── Escalation — repeated rapid failures ─────────────────────────────────────
-# If the service starts and dies 5 times within 5 minutes, systemd marks it
-# as "failed" and stops retrying.  OnFailure fires to send an alert email.
-StartLimitBurst=5
-StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
 
 # ── Resource limits ───────────────────────────────────────────────────────────
 # Prevent a runaway scheduler from taking down the whole server.

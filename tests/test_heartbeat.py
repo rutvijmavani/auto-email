@@ -14,7 +14,7 @@ Coverage map
   TestHeartbeatClass
     · start() writes the heartbeat key immediately (synchronous, before thread)
     · Key format is worker:alive:{worker_type}:{pid}
-    · TTL = 3 × interval_s
+    · TTL = 3 x interval_s
     · Payload JSON contains pid, ts, processed fields
     · pid field matches os.getpid()
     · processed field comes from get_count lambda
@@ -101,7 +101,7 @@ class TestHeartbeatClass(unittest.TestCase):
     # ── TTL ───────────────────────────────────────────────────────────────────
 
     def test_ttl_is_3x_interval_s(self):
-        """TTL (ex=) is 3 × interval_s."""
+        """TTL (ex=) is 3 x interval_s."""
         r = self._make_r()
         from workers.heartbeat import Heartbeat
         interval = 15

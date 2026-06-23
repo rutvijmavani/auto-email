@@ -166,9 +166,14 @@ _hysteresis: dict = {
 #                       consumed in _replace_dead_workers to compute worker age.
 # _WORKER_STABLE_AFTER_S: a replacement that lives at least this long is "stable"
 #                          (it survived — next death resets the streak).
-_consecutive_deaths:    dict = {"scan": 0, "detail": 0, "fullscan": 0}
-_total_replacements:    dict = {"scan": 0, "detail": 0, "fullscan": 0}
-_worker_spawn_times:    dict = {}   # pid → (ptype, spawn_epoch)
+_consecutive_deaths:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_total_replacements:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_worker_spawn_times:      dict = {}   # pid → (ptype, spawn_epoch)
+_death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
+# Timestamp (epoch) when the current consecutive-death streak began.
+# A replacement must have been spawned AFTER this time and lived >=
+# _WORKER_STABLE_AFTER_S before we reset the streak.  This prevents a
+# long-lived "old" worker from masking a sibling that keeps rapid-crashing.
 _WORKER_STABLE_AFTER_S: int  = 60  # seconds
 _SCHEDULER_HEALTH_KEY   = "scheduler:health"
 _SCHEDULER_HEALTH_TTL   = 600      # 10 min — expires naturally if scheduler dies
@@ -2042,10 +2047,16 @@ def _replace_dead_workers() -> None:
                     if spawn_info:
                         worker_age = time.time() - spawn_info[1]
                         if worker_age >= _WORKER_STABLE_AFTER_S:
-                            _consecutive_deaths[ptype] = 0   # stable run — reset
+                            _consecutive_deaths[ptype]      = 0    # stable run — reset
+                            _death_streak_started_at[ptype] = 0.0  # streak cleared
                         else:
+                            if _consecutive_deaths[ptype] == 0:
+                                # First rapid death — record when the streak began
+                                _death_streak_started_at[ptype] = time.time()
                             _consecutive_deaths[ptype] += 1  # rapid death — escalate
                     else:
+                        if _consecutive_deaths[ptype] == 0:
+                            _death_streak_started_at[ptype] = time.time()
                         _consecutive_deaths[ptype] += 1      # no spawn record
                     _total_replacements[ptype] += 1
 
@@ -2062,13 +2073,21 @@ def _replace_dead_workers() -> None:
         # workers were popped in the loop above.
         _now_ts = time.time()
         for _pid, (_wtype, _spawn_ts) in list(_worker_spawn_times.items()):
-            if (_now_ts - _spawn_ts) >= _WORKER_STABLE_AFTER_S and _consecutive_deaths[_wtype] > 0:
+            if (
+                (_now_ts - _spawn_ts) >= _WORKER_STABLE_AFTER_S
+                and _consecutive_deaths[_wtype] > 0
+                # Only reset if this worker was spawned AFTER the death streak
+                # began.  An old pre-streak worker being alive does not mean
+                # the streak workers are now healthy.
+                and _spawn_ts > _death_streak_started_at[_wtype]
+            ):
                 logger.info(
-                    "scheduler: %s_worker pid=%d stable for %ds — "
+                    "scheduler: %s_worker pid=%d (spawned after streak) stable for %ds — "
                     "resetting consecutive_deaths from %d to 0",
                     _wtype, _pid, int(_now_ts - _spawn_ts), _consecutive_deaths[_wtype],
                 )
-                _consecutive_deaths[_wtype] = 0
+                _consecutive_deaths[_wtype]      = 0
+                _death_streak_started_at[_wtype] = 0.0
 
     # Publish updated pool state AFTER releasing the lock
     if replacements:

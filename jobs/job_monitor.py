@@ -175,15 +175,19 @@ def _should_fetch_detail(job, platform, config, slug_info=None):
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────
 
-def _get_worker_missed_companies(companies: list) -> list:
+def _get_worker_missed_companies(companies: list) -> tuple:
     """
-    Return the subset of companies that background workers have NOT scanned
-    since the start of the current monitoring cycle (default 7 AM ET).
+    Return (missed, in_flight_names) for the given company list.
 
-    Used by run() to decide which companies need a fallback re-fetch.
-    Companies whose fullscan_worker completed within the last 24 hours are
-    skipped — their jobs are already in the DB as status='new'.
-    --monitor-jobs only does real HTTP work when fullscan workers fell behind.
+    missed:          companies that background workers have NOT scanned within
+                     the last 24 hours AND are not actively scanning right now.
+                     These need a fallback re-fetch.
+
+    in_flight_names: companies currently being scanned by a fullscan_worker.
+                     They are excluded from `missed` (don't double-fetch) but
+                     are also NOT considered "covered" yet — the scan is still
+                     running.  Callers must track these separately so they are
+                     not counted in the covered_by_workers coverage metric.
 
     Field checked: last_full_scan_at (written by on_fullscan_complete()).
     We do NOT check last_poll_at (adaptive scan) because the adaptive worker
@@ -191,13 +195,6 @@ def _get_worker_missed_companies(companies: list) -> list:
     completed fullscan guarantees the DB is comprehensive.
 
     Cycle boundary: 24 hours before now (rolling window).
-
-    A company is considered covered if company_poll_stats.last_full_scan_at
-    falls within the last 24 hours.  Using a fixed "today at 7 AM" boundary
-    was wrong: the cron fires at exactly 7:00 AM, so every overnight fullscan
-    (last_full_scan_at < 7:00:00) was incorrectly classified as "missed",
-    causing all companies to fall back to a full re-fetch every day and the
-    email to arrive at ~7:30 AM instead of ~7:02 AM.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -262,14 +259,20 @@ def _get_worker_missed_companies(companies: list) -> list:
             exc,
         )
 
-    missed = []
+    missed          = []
+    in_flight_names = set()
     for company_row in companies:
         name      = company_row["company"]
         last_scan = scan_map.get(name, 0)
-        if last_scan < cycle_start_ts and name not in inflight:
-            missed.append(company_row)
+        if last_scan < cycle_start_ts:
+            if name in inflight:
+                # Active scan in progress — don't double-fetch, but also NOT
+                # confirmed done yet.  Track separately for coverage accounting.
+                in_flight_names.add(name)
+            else:
+                missed.append(company_row)
 
-    return missed
+    return missed, in_flight_names
 
 
 def run():
@@ -311,21 +314,31 @@ def run():
         print(f"[INFO] Skipping {skipped} company/companies with "
               f"unknown/unverified ATS — run --detect-ats to fix")
 
-    # ── Split: covered by workers vs missed ───────────────────────────────────
-    missed       = _get_worker_missed_companies(companies)
+    # ── Split: covered by workers vs missed vs in-flight ─────────────────────
+    missed, in_flight_names = _get_worker_missed_companies(companies)
     missed_names = {c["company"] for c in missed}   # O(1) lookups
-    covered      = [c for c in companies if c["company"] not in missed_names]
+    # covered = confirmed done (last_full_scan_at within 24 h)
+    # in-flight companies are NOT in missed and NOT in covered — they are
+    # actively scanning and not yet confirmed complete.  Counting them in
+    # covered_by_workers inflates the metric and can suppress the coverage alert.
+    covered = [
+        c for c in companies
+        if c["company"] not in missed_names
+        and c["company"] not in in_flight_names
+    ]
 
     logger.info(
         "Loaded %d monitorable companies (%d total in DB) | "
-        "worker-covered=%d  missed=%d",
-        len(companies), len(all_companies), len(covered), len(missed),
+        "worker-covered=%d  in-flight=%d  missed=%d",
+        len(companies), len(all_companies), len(covered),
+        len(in_flight_names), len(missed),
     )
 
     print(f"\n{'='*55}")
     print(f"[INFO] Job Monitor — {datetime.now().strftime('%B %d, %Y')}")
     print(f"[INFO] {len(companies)} companies total | "
           f"{len(covered)} covered by workers | "
+          f"{len(in_flight_names)} in-flight | "
           f"{len(missed)} need fallback fetch")
     if missed:
         print(f"[INFO] Fallback re-fetching: "
@@ -335,8 +348,9 @@ def run():
 
     # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
-        "companies_monitored":    len(covered),   # pre-credit covered companies
-        "covered_by_workers":     len(covered),   # for coverage alert numerator
+        "companies_monitored":    len(covered),        # pre-credit covered companies
+        "covered_by_workers":     len(covered),        # confirmed-done by workers
+        "in_flight":              len(in_flight_names),# scanning now — not confirmed yet
         "fallback_scanned":       0,              # fallback companies whose ATS was successfully queried
                                                   # (regardless of whether jobs were found)
         "companies_with_results": 0,              # subset of fallback_scanned that returned ≥1 job
@@ -787,12 +801,15 @@ def _build_alerts(stats, total_companies):
     alerts = []
 
     if total_companies > 0:
-        # covered_by_workers: scanned by background workers (data already in DB)
+        # covered_by_workers: confirmed done by background workers (data in DB)
+        # in_flight: actively scanning right now — counted optimistically since
+        #            the scan will likely complete before the digest is emailed.
         # fallback_scanned: of the missed companies, those whose ATS fetch
         #   completed (0 or more jobs).  Use this (not companies_with_results)
         #   for coverage — a 0-job result is still a successful scan.
         covered_count = stats.get("covered_by_workers", 0)
-        companies_with_data = covered_count + stats.get("fallback_scanned", 0)
+        in_flight_count = stats.get("in_flight", 0)
+        companies_with_data = covered_count + in_flight_count + stats.get("fallback_scanned", 0)
         coverage = companies_with_data / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)

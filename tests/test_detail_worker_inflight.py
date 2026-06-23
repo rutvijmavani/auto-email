@@ -347,7 +347,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
 
     def test_heartbeat_check_performed_per_pid(self):
         """r.exists is called for each peer PID found, not for own PID."""
-        r, dead_adp_key, dead_fs_key, _ = self._build_redis_mock()
+        r, _, _, _ = self._build_redis_mock()
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 

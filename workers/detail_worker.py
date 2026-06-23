@@ -767,8 +767,26 @@ def run_worker(once: bool = False, shutdown_event=None,
     _hw = {"count": 0}
     _hb = Heartbeat(r, "detail_worker", lambda: _hw["count"]).start()
 
+    # Periodic peer-recovery — also runs at startup (line above).
+    # A peer can die at any time, not just before we start.  Check every
+    # _PEER_RECOVERY_INTERVAL_S so stranded inflight jobs are reclaimed quickly
+    # without adding meaningful overhead (SCAN returns empty in the common case).
+    _PEER_RECOVERY_INTERVAL_S = 300   # 5 minutes
+    _last_peer_recovery = time.time()
+
     while True:
         try:
+            # ── Periodic dead-peer recovery ───────────────────────────────────
+            _now_mono = time.time()
+            if _now_mono - _last_peer_recovery >= _PEER_RECOVERY_INTERVAL_S:
+                try:
+                    _recover_stuck_jobs(r, own_pid)
+                except Exception as _rec_exc:
+                    logger.warning(
+                        "detail_worker: periodic peer recovery failed: %s", _rec_exc
+                    )
+                _last_peer_recovery = _now_mono
+
             # ── At-least-once pop via LMOVE inflight list ─────────────────────
             # Moves item atomically: source_queue → inflight list.
             # The item is acknowledged (LREM'd) only after a successful DB write.

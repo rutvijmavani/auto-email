@@ -169,8 +169,9 @@ ELAPSED=0
 while true; do
     MISSING=()
     for worker in "${WORKERS[@]}"; do
-        if ! redis-cli GET "worker:alive:$worker" > /dev/null 2>&1 || \
-           [[ -z "$(redis-cli GET "worker:alive:$worker" 2>/dev/null)" ]]; then
+        # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
+        # Use KEYS to find any live key matching the pattern.
+        if [[ -z "$(redis-cli KEYS "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
             MISSING+=("$worker")
         fi
     done

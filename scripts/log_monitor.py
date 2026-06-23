@@ -183,6 +183,10 @@ def _fingerprint(line: str, context: list[str]) -> str:
         raw = f"{exc_type}:{location}"
     elif exc_type:
         raw = exc_type
+    elif location:
+        # Traceback frame found without a recognisable exception type line —
+        # use the file+lineno so the fingerprint is still stable.
+        raw = location
     else:
         # Normalise: strip timestamps, PIDs, UUIDs, job/company identifiers
         raw = line
@@ -400,8 +404,10 @@ def process_findings(
             }
 
             if not known:
-                # Brand-new error — store it and mark for immediate alert
-                r.set(err_key, json.dumps(record), ex=DEDUP_WINDOW_S)
+                # Brand-new error — collect for immediate alert.
+                # Do NOT write err_key to Redis here: writing before the email
+                # is sent would suppress the alert for 7 days if the send fails.
+                # err_key is written in main() after a successful send.
                 new_errors[fp] = record
             else:
                 # Known error — update last_seen + count, don't alert
@@ -698,7 +704,19 @@ def main() -> None:
     # ── 4. Immediate alert for brand-new errors ──────────────────────────────
     if new_errors:
         print(f"[log_monitor] {len(new_errors)} NEW error(s): {list(new_errors)}")
-        send_immediate_alert(new_errors)
+        sent = send_immediate_alert(new_errors)
+        if sent:
+            # Email delivered — now persist to Redis so next run suppresses these.
+            for fp, record in new_errors.items():
+                try:
+                    r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
+                except Exception as _we:
+                    print(f"[log_monitor] Redis write failed for {fp}: {_we}")
+        else:
+            # Email failed — do NOT mark as known.  The next run will re-alert,
+            # which is correct: the operator must be notified.
+            print("[log_monitor] Email send failed — errors NOT marked as known "
+                  "(will retry next run)")
     else:
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")

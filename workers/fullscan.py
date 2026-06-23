@@ -1192,7 +1192,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     from workers.startup import validate_startup
     validate_startup("fullscan_worker",
                      check_redis=True,
-                     check_db=not skip_init_db,
+                     check_db=True,          # always verify DB reachability even when
+                                             # skip_init_db=True (scheduler-managed run)
                      check_config=True)
 
     r = get_redis()

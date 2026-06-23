@@ -23,6 +23,10 @@ row  = conn.execute("SELECT ats_slug FROM prospective_companies WHERE company = 
                     ("accenture",)).fetchone()
 conn.close()
 
+if row is None:
+    print("ERROR: 'accenture' not found in prospective_companies — check company name.")
+    sys.exit(1)
+
 slug_info = parse_slug("workday", row["ats_slug"], config)
 
 print("Fetching Accenture listing (2000 jobs)...")
@@ -34,7 +38,7 @@ atci_jobs = [j for j in raw_jobs if str(j.get("job_id","")).startswith("ATCI")]
 r00_jobs  = [j for j in raw_jobs if str(j.get("job_id","")).startswith("R00")]
 other     = [j for j in raw_jobs if j not in atci_jobs and j not in r00_jobs]
 
-print(f"Job ID breakdown:")
+print("Job ID breakdown:")
 print(f"  ATCI-* jobs : {len(atci_jobs)}")
 print(f"  R00*  jobs  : {len(r00_jobs)}")
 print(f"  Other       : {len(other)}")
@@ -110,5 +114,5 @@ print(f"  ATCI missing _external_path    : {len(atci_without_path)}")
 if atci_without_path:
     pct = len(atci_without_path) / len(atci_jobs) * 100 if atci_jobs else 0
     print(f"  → {pct:.0f}% of ATCI jobs have no path → detail fetch skipped →")
-    print(f"    location stays '' → is_us_location('') = True → LEAK")
+    print("    location stays '' → is_us_location('') = True → LEAK")
 print("═" * 60)

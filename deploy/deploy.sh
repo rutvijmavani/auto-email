@@ -144,6 +144,7 @@ else
         echo "  [WARN] Health check reported issues — check logs:"
         echo "         journalctl -u recruiter-scheduler -n 50"
         echo "         journalctl -u recruiter-watchdog  -n 20"
+        exit 1
     }
 fi
 

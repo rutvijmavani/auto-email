@@ -103,8 +103,6 @@ $SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN status recruiter-scheduler
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN status recruiter-watchdog
 EOF
 chmod 440 "$SUDOERS_FILE"
 

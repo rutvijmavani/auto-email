@@ -62,6 +62,7 @@ Every WATCHDOG_INTERVAL_S (5 min):
   pending_work.md Phase 3 — Reliability Layer
 """
 
+import html as _html_lib
 import json
 import os
 import shutil
@@ -433,10 +434,12 @@ def _html_issue_table(issues: list) -> str:
     for issue in issues:
         color = {"CRITICAL": "#ef4444", "ERROR": "#ef4444",
                  "WARNING": "#f59e0b", "OK": "#22c55e"}.get(issue.level, "#64748b")
+        _esc_cat = _html_lib.escape(issue.category)
+        _esc_msg = _html_lib.escape(issue.message)
         fix_html = (
             f'<div style="margin-top:4px;font-family:monospace;font-size:12px;'
             f'color:#475569;background:#f1f5f9;padding:4px 8px;border-radius:4px;">'
-            f'Fix: {issue.fix}</div>'
+            f'Fix: {_html_lib.escape(issue.fix)}</div>'
         ) if issue.fix else ""
 
         rows += f"""<tr>
@@ -447,10 +450,10 @@ def _html_issue_table(issues: list) -> str:
           </td>
           <td style="padding:8px 12px;vertical-align:top;">
             <span style="font-weight:600;color:#1e293b;font-size:13px;">
-              {issue.category}
+              {_esc_cat}
             </span>
             <div style="color:#475569;font-size:13px;margin-top:2px;">
-              {issue.message}
+              {_esc_msg}
             </div>{fix_html}
           </td>
         </tr>"""
@@ -1474,6 +1477,24 @@ def _attempt_heal(issue: Issue, r) -> bool:
         issue.alert_type, mode, action["description"],
     )
 
+    # ── Atomic exclusive lock — prevent concurrent watchdog instances from
+    # both healing the same issue simultaneously (service + cron overlap).
+    # NX ensures only the first caller proceeds; EX auto-expires if we crash.
+    _heal_lock_key = _rkey("heal_lock", issue.alert_type)
+    _heal_lock_val = f"{os.getpid()}:{time.time()}"
+    try:
+        _lock_acquired = r.set(_heal_lock_key, _heal_lock_val,
+                               nx=True, ex=HEAL_COOLDOWN_S)
+    except Exception:
+        _lock_acquired = True   # Redis error — optimistically proceed (single-instance)
+    if not _lock_acquired:
+        logger.info(
+            "watchdog: heal lock already held for %r — "
+            "another watchdog instance is handling this, skipping",
+            issue.alert_type,
+        )
+        return False
+
     try:
         with open(log_path, "a") as log_fh:
             ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1489,6 +1510,14 @@ def _attempt_heal(issue: Issue, r) -> bool:
                     stderr=subprocess.STDOUT,
                     timeout=60,
                 )
+                # Record attempt BEFORE checking success so failed foreground
+                # heals count toward the cooldown / max-attempt limits — otherwise
+                # a consistently failing command retries on every watchdog cycle.
+                count_key = _rkey("heal_count", issue.alert_type)
+                r.incr(count_key)
+                r.expire(count_key, HEAL_ATTEMPT_WINDOW)
+                r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
+                      ex=HEAL_ATTEMPT_WINDOW)
                 success = (result.returncode == 0)
                 if not success:
                     logger.warning(
@@ -1508,12 +1537,13 @@ def _attempt_heal(issue: Issue, r) -> bool:
                     start_new_session=True,   # detach — survives watchdog exit
                 )
 
-        # Record the attempt
-        count_key = _rkey("heal_count", issue.alert_type)
-        r.incr(count_key)
-        r.expire(count_key, HEAL_ATTEMPT_WINDOW)
-        r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
-              ex=HEAL_ATTEMPT_WINDOW)
+        # Record the attempt (background path — foreground recorded it inline above)
+        if not is_fg:
+            count_key = _rkey("heal_count", issue.alert_type)
+            r.incr(count_key)
+            r.expire(count_key, HEAL_ATTEMPT_WINDOW)
+            r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
+                  ex=HEAL_ATTEMPT_WINDOW)
 
         logger.info(
             "watchdog: heal initiated for %r (attempt %d/%d) log=%s",
@@ -1569,7 +1599,14 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
     r.set("watchdog:active_issues", json.dumps(list(current_alertable)), ex=86400)
 
     # ── RESOLVED: was broken last cycle, is OK now ────────────────────────────
+    # Only treat as resolved if the alert_type is completely absent (or at OK
+    # level) this cycle.  A downgrade from ERROR → WARNING must NOT fire a
+    # "resolved" email because the issue is still present — just at lower severity.
+    current_all_types = {i.alert_type for i in issues if i.level != "OK"}
     for alert_type in last_active - current_alertable:
+        if alert_type in current_all_types:
+            # Downgraded to WARNING — still present, not yet resolved
+            continue
         # Check if this was actually a heal success (heal_last key still in window)
         was_being_healed = r.exists(_rkey("heal_last", alert_type))
         if was_being_healed:
@@ -1752,7 +1789,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         alertable_all = [i for i in issues if i.is_alertable()]
         _send_email(
             f"⚠ Pipeline Alert: {len(alertable_all)} issues detected simultaneously",
-            f'<p style="color:#ef4444;font-weight:700;">Multiple issues detected:</p>'
+            '<p style="color:#ef4444;font-weight:700;">Multiple issues detected:</p>'
             + _html_issue_table(alertable_all),
             dedup_key="watchdog:alert:summary_multi",
             dedup_ttl=ALERT_COOLDOWN_S,
@@ -1776,7 +1813,7 @@ def _print_status(r_ok, r_info, pg_ok, pg_info, issues: list) -> None:
     def sym(lvl):
         return {"OK": "✓", "WARNING": "!", "ERROR": "✗", "CRITICAL": "✗"}.get(lvl, "?")
 
-    print(f"\n  INFRASTRUCTURE")
+    print("\n  INFRASTRUCTURE")
     print(f"  {SEP}")
     print(f"  [{'✓' if r_ok else '✗'}] Redis       {r_info}")
     print(f"  [{'✓' if pg_ok else '✗'}] PostgreSQL  {pg_info}")
@@ -1861,6 +1898,10 @@ def run_watchdog(once: bool = False,
     print(f"[watchdog] Running — interval={WATCHDOG_INTERVAL_S}s  "
           f"self_heal={self_heal}  once={once}")
 
+    # In-process dedup for mid-loop Redis-down emails: avoid an email every
+    # WATCHDOG_INTERVAL_S seconds during a sustained Redis outage.
+    _last_redis_down_email_ts: float = 0.0
+
     while True:
         try:
             issues = _run_all_checks(r)
@@ -1889,6 +1930,18 @@ def run_watchdog(once: bool = False,
             break
         except Exception as exc:
             logger.error("watchdog: loop error: %s", exc, exc_info=True)
+            # If Redis went down mid-loop the operator would be blind — all
+            # dedup keys are in Redis and can't be written.  Send a last-resort
+            # email (no Redis dedup) at most once per ALERT_COOLDOWN_S to avoid
+            # an email storm during a sustained outage.
+            try:
+                _r_ok, _r_info = check_redis()
+                if not _r_ok:
+                    if time.time() - _last_redis_down_email_ts > ALERT_COOLDOWN_S:
+                        _try_redis_down_email(_r_info)
+                        _last_redis_down_email_ts = time.time()
+            except Exception:
+                pass
             if once:
                 break
             time.sleep(WATCHDOG_INTERVAL_S)

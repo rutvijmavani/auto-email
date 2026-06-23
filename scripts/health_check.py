@@ -131,18 +131,29 @@ def run_health_check() -> int:
         warnings += 1
 
     try:
-        persist = r.info("persistence")
-        last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
-        if isinstance(last_s, int) and last_s > 0:
-            age_min = (now - last_s) / 60
-            if age_min > 30:
-                _row("WARNING", "Redis RDB save", f"Last save {age_min:.0f} min ago — data loss window is large")
+        from workers.watchdog import check_redis_persistence, Issue as _WdgIssue
+        for _pi in check_redis_persistence(r):
+            _row(_pi.level, _pi.category, _pi.message)
+            if _pi.level in ("ERROR", "CRITICAL"):
+                errors += 1
+            elif _pi.level == "WARNING":
                 warnings += 1
-            else:
-                _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
     except Exception as exc:
-        _row("WARNING", "Redis RDB save", f"Persistence check failed: {exc}")
-        warnings += 1
+        # Fallback: direct RDB-save check if watchdog module is unavailable
+        try:
+            persist = r.info("persistence")
+            last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
+            if isinstance(last_s, int) and last_s > 0:
+                age_min = (now - last_s) / 60
+                if age_min > 30:
+                    _row("WARNING", "Redis RDB save",
+                         f"Last save {age_min:.0f} min ago — data loss window is large")
+                    warnings += 1
+                else:
+                    _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
+        except Exception as exc2:
+            _row("WARNING", "Redis persistence", f"Persistence check failed: {exc2}")
+            warnings += 1
 
     # PostgreSQL
     try:
@@ -261,79 +272,28 @@ def run_health_check() -> int:
             warnings += 1
 
     # ── QUEUE HEALTH ──────────────────────────────────────────────────────────
+    # Delegate to the watchdog's check_queue_health() so both tools agree on
+    # health status.  The watchdog uses velocity-based stall detection (trend
+    # across cycles stored in Redis); this CLI reads the same saved snapshot
+    # and runs the same logic, ensuring no "false ERROR/OK" discrepancy.
     _section("QUEUE HEALTH")
 
-    # poll:adaptive
-    adp_total   = r.zcard(REDIS_POLL_ADAPTIVE)
-    adp_overdue = r.zcount(REDIS_POLL_ADAPTIVE, "-inf", now - 1800)
-    if adp_total == 0:
-        _row("ERROR", "poll:adaptive (ZSET)", "EMPTY — rebuild needed")
-        errors += 1
-    elif adp_overdue > 10:
-        _row("ERROR", "poll:adaptive (ZSET)",
-             f"{adp_total} total  {adp_overdue} overdue >30min")
-        errors += 1
-    elif adp_overdue > 3:
-        _row("WARNING", "poll:adaptive (ZSET)",
-             f"{adp_total} total  {adp_overdue} overdue >30min")
+    try:
+        from workers.watchdog import check_queue_health, _check_pel_health, Issue
+        _wdg_queue_issues = check_queue_health(r)
+        # _check_pel_health appends directly to the list
+        _check_pel_health(r, _wdg_queue_issues)
+        for _issue in _wdg_queue_issues:
+            _lbl = _issue.category.replace("queue:", "").replace("stream:", "stream:")
+            _row(_issue.level, _lbl, _issue.message)
+            if _issue.level in ("ERROR", "CRITICAL"):
+                errors += 1
+            elif _issue.level == "WARNING":
+                warnings += 1
+    except Exception as _exc:
+        # Fallback to static counts if the watchdog module is unavailable
+        _row("WARNING", "queue health", f"Could not run watchdog checks: {_exc}")
         warnings += 1
-    else:
-        _row("OK", "poll:adaptive (ZSET)", f"{adp_total} companies  {adp_overdue} overdue")
-
-    # poll:fullscan
-    fs_total   = r.zcard(REDIS_POLL_FULLSCAN)
-    fs_overdue = r.zcount(REDIS_POLL_FULLSCAN, "-inf", now - 7200)
-    if fs_total == 0:
-        _row("WARNING", "poll:fullscan (ZSET)",
-             "EMPTY — normal after rebuild, alert if > 1h")
-        warnings += 1
-    elif fs_overdue > 5:
-        _row("ERROR", "poll:fullscan (ZSET)",
-             f"{fs_total} total  {fs_overdue} overdue >2h")
-        errors += 1
-    else:
-        _row("OK", "poll:fullscan (ZSET)", f"{fs_total} companies  {fs_overdue} overdue")
-
-    # detail queues
-    for key, label in [(REDIS_DETAIL_ADAPTIVE, "detail:adaptive (LIST)"),
-                       (REDIS_DETAIL_FULLSCAN,  "detail:fullscan (LIST)")]:
-        depth = r.llen(key)
-        if depth > 500:
-            _row("ERROR", label, f"depth={depth:,} — CRITICAL backlog")
-            errors += 1
-        elif depth > 100:
-            _row("WARNING", label, f"depth={depth:,} — elevated")
-            warnings += 1
-        else:
-            _row("OK", label, f"depth={depth}")
-
-    # Stream PEL
-    for stream_key, label in [(REDIS_STREAM_ADAPTIVE, "stream:adaptive (PEL)"),
-                               (REDIS_STREAM_FULLSCAN,  "stream:fullscan (PEL)")]:
-        try:
-            summary = r.xpending(stream_key, STREAM_CONSUMER_GROUP)
-            total   = summary.get("pending", 0) if summary else 0
-            if total == 0:
-                _row("OK", label, "0 pending entries")
-            else:
-                entries  = r.xpending_range(
-                    stream_key, STREAM_CONSUMER_GROUP, min="-", max="+", count=1,
-                )
-                oldest_ms = entries[0].get("time_since_delivered", 0) if entries else 0
-                oldest_s  = oldest_ms // 1000
-                if oldest_s > 1800:
-                    _row("ERROR", label,
-                         f"{total} pending  oldest={oldest_s//60}min — XAUTOCLAIM may be stuck")
-                    errors += 1
-                elif oldest_s > 600:
-                    _row("WARNING", label,
-                         f"{total} pending  oldest={oldest_s//60}min")
-                    warnings += 1
-                else:
-                    _row("OK", label, f"{total} pending  oldest={oldest_s}s")
-        except Exception as exc:
-            _row("WARNING", label, f"Could not query: {exc}")
-            warnings += 1
 
     # ── BLOOM FILTERS ─────────────────────────────────────────────────────────
     _section("BLOOM FILTERS")

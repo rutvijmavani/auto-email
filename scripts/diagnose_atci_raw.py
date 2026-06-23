@@ -143,8 +143,8 @@ print("SUMMARY")
 print(f"  ATCI with _external_path : {len(atci_with_path)}")
 print(f"  ATCI without _external_path: {len(atci_no_path)}")
 if atci_no_path:
-    print(f"  → ATCI jobs missing path will ALWAYS return original job unchanged")
-    print(f"    (guard clause at fetch_job_detail line 174)")
+    print("  → ATCI jobs missing path will ALWAYS return original job unchanged")
+    print("    (guard clause at fetch_job_detail line 174)")
 if atci_with_path and 'atci_info' in dir():
     alpha2 = ((atci_info.get("jobRequisitionLocation") or {}).get("country") or {}).get("alpha2Code","")
     loc    = atci_info.get("location","")

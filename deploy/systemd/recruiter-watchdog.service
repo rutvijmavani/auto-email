@@ -9,6 +9,12 @@ After=network-online.target
 # Watchdog is intentionally NOT After=recruiter-scheduler.service so it keeps
 # running and alerting even when the scheduler is down.
 
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+# StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%n.service
+
 [Service]
 Type=simple
 User=opc
@@ -23,9 +29,6 @@ ExecStart=/home/opc/mail/venv/bin/python -m workers.watchdog
 # always be running to catch scheduler failures.
 Restart=always
 RestartSec=10s
-StartLimitBurst=5
-StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
