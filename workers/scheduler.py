@@ -931,8 +931,14 @@ def _pick_schedule_time(
 
     for _gap_size, gap_lo, gap_hi in gaps:
         midpoint = (gap_lo + gap_hi) / 2
-        if deadline_ts and avg_duration_s > 0:
-            if midpoint + avg_duration_s >= deadline_ts:
+        if avg_duration_s > 0:
+            # Compute the correct deadline for THIS candidate: the 7 AM that
+            # immediately follows the midpoint's local clock (not target_ts's).
+            # A candidate before midnight uses today's 7 AM; one after midnight
+            # uses the same day's 7 AM — which is different from target_ts's
+            # deadline when the window straddles midnight.
+            candidate_deadline = _next_digest_deadline(midpoint)
+            if midpoint + avg_duration_s >= candidate_deadline:
                 continue   # scan would not finish before 7 AM — try next gap
         return midpoint
 
@@ -1007,6 +1013,8 @@ def _atomic_schedule(
             _hash_int = int(_hashlib.md5(company.encode(), usedforsecurity=False).hexdigest(), 16)
             _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
             score = target_ts + _jitter_s
+            if deadline_ts:
+                score = min(score, deadline_ts)
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,

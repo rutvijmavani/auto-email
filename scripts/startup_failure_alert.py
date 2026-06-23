@@ -96,7 +96,7 @@ def _get_journal_tail(service: str, lines: int = 30) -> str:
     try:
         import subprocess
         result = subprocess.run(
-            ["journalctl", "-u", service, "-n", str(lines), "--no-pager",
+            ["/usr/bin/journalctl", "-u", service, "-n", str(lines), "--no-pager",
              "--output=short-precise"],
             capture_output=True, text=True, timeout=10,
         )

@@ -137,6 +137,11 @@ return removed
 """
 
 
+_MAX_DETAIL_RETRIES  = 5
+_RETRY_KEY_PREFIX    = "detail:retry:"
+_RETRY_KEY_TTL       = 86400 * 7   # 7 days — auto-expires if job never comes back
+
+
 def _recover_stuck_jobs(r, own_pid: int) -> None:
     """
     On worker startup: scan for per-PID inflight keys belonging to dead workers
@@ -192,19 +197,63 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                     continue
 
                 # Peer is dead — drain its items to the tail of the source queue
-                # (RIGHT→RIGHT: consumers pop from RIGHT so these are consumed next)
+                # (consumers pop from RIGHT so RPUSH puts them next in line).
+                # Enforce a hard retry cap: permanently discard jobs that have
+                # already failed _MAX_DETAIL_RETRIES times so a poisoned job
+                # cannot occupy the queue across indefinite restarts.
                 recovered = 0
+                discarded = 0
                 while True:
-                    item = r.lmove(key, source_key, "RIGHT", "RIGHT")
-                    if item is None:
+                    raw = r.rpop(key)
+                    if raw is None:
                         break
+
+                    # Parse job_id to track per-job attempt count
+                    try:
+                        _payload = json.loads(raw)
+                        _job_id  = _payload.get("job_id", "")
+                        _company = _payload.get("company", "")
+                    except Exception:
+                        _job_id = _company = ""
+
+                    if _job_id:
+                        _rkey = f"{_RETRY_KEY_PREFIX}{_job_id}"
+                        try:
+                            _attempt = int(r.incr(_rkey))
+                            r.expire(_rkey, _RETRY_KEY_TTL)
+                        except Exception:
+                            _attempt = 1   # safe default: allow retry
+
+                        if _attempt > _MAX_DETAIL_RETRIES:
+                            logger.error(
+                                "detail_worker: job_id=%s company=%r exceeded "
+                                "%d retries — discarding permanently",
+                                _job_id, _company, _MAX_DETAIL_RETRIES,
+                            )
+                            try:
+                                delete_pending_detail(_company, _job_id)
+                            except Exception as _db_err:
+                                logger.error(
+                                    "detail_worker: delete_pending_detail "
+                                    "failed for %s: %s", _job_id, _db_err,
+                                )
+                            discarded += 1
+                            continue
+
+                    r.rpush(source_key, raw)
                     recovered += 1
 
                 if recovered:
                     logger.warning(
                         "detail_worker: recovered %d stuck job(s) from "
-                        "dead peer pid=%d: %s → %s",
+                        "dead peer pid=%d: %s -> %s",
                         recovered, peer_pid, key, source_key,
+                    )
+                if discarded:
+                    logger.error(
+                        "detail_worker: permanently discarded %d job(s) from "
+                        "dead peer pid=%d (exceeded %d retries)",
+                        discarded, peer_pid, _MAX_DETAIL_RETRIES,
                     )
 
             if cursor == 0:

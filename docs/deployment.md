@@ -1766,7 +1766,7 @@ After restart you can confirm each worker uses its own inflight key:
 
 ```bash
 # List all detail inflight keys (should be one per live worker PID)
-redis-cli KEYS "queue:detail:*:inflight:*"
+redis-cli --scan --pattern "queue:detail:*:inflight:*"
 
 # Each key should have exactly 0 or 1 items (the currently-in-progress job)
 redis-cli LLEN "queue:detail:adaptive:inflight:<pid>"
@@ -1800,7 +1800,7 @@ If the scheduler is up but workers are missing:
 
 ```bash
 # Check worker heartbeats in Redis
-redis-cli KEYS "heartbeat:*"
+redis-cli --scan --pattern "heartbeat:*"
 
 # If queues are empty, rebuild from PostgreSQL
 python pipeline.py --rebuild

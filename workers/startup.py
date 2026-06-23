@@ -128,10 +128,9 @@ def _check_redis(prefix: str) -> None:
 
 
 def _check_postgres(prefix: str) -> None:
-    """Verify PostgreSQL is reachable and the schema is initialized."""
+    """Verify PostgreSQL is reachable and the schema is accessible."""
     try:
-        from db.db import init_db, get_conn
-        init_db()
+        from db.db import get_conn
         conn = get_conn()
         # Reference the real table (catches schema-not-migrated errors) but
         # use LIMIT 1 instead of COUNT(*) to avoid a full-table sequential scan.

@@ -2971,11 +2971,7 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
             mock_redis.zrangebyscore.return_value = inflight_encoded
 
         with patch("db.db.get_conn", return_value=mock_conn):
-            # Patch the inner imports that _get_worker_missed_companies does
-            import sys
-            fake_redis_module = MagicMock()
-            fake_redis_module.get_redis.return_value = mock_redis
-            with patch.dict("sys.modules", {"workers.redis_client": fake_redis_module}):
+            with patch("redis.from_url", return_value=mock_redis):
                 from jobs.job_monitor import _get_worker_missed_companies
                 missed, _ = _get_worker_missed_companies(companies)
                 return missed

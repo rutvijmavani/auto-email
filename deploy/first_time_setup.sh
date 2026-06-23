@@ -169,10 +169,16 @@ ELAPSED=0
 while true; do
     MISSING=()
     for worker in "${WORKERS[@]}"; do
-        # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
-        # Use KEYS to find any live key matching the pattern.
-        if [[ -z "$(redis-cli KEYS "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
-            MISSING+=("$worker")
+        # scheduler uses a single key (no PID suffix); other workers use per-PID keys.
+        if [[ "$worker" == "scheduler" ]]; then
+            if [[ -z "$(redis-cli GET "worker:alive:scheduler" 2>/dev/null)" ]]; then
+                MISSING+=("$worker")
+            fi
+        else
+            # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
+            if [[ -z "$(redis-cli KEYS "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
+                MISSING+=("$worker")
+            fi
         fi
     done
 

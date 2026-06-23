@@ -674,9 +674,9 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         expected = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * 30.0
         result = self._run(duration_s=duration, prev_avg=30.0)
         params = result["params"]
-        # params = (company, interval_s, new_jobs, int(duration_s), new_avg, ...)
-        # avg_fullscan_duration_s (EMA) is at index 4
-        actual_avg = params[4]
+        # params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg, ...)
+        # avg_fullscan_duration_s (EMA) is at index 5
+        actual_avg = params[5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
     def test_subsequent_scan_ema_from_prev(self):
@@ -687,14 +687,14 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         prev_avg = 900.0
         expected = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * prev_avg
         result = self._run(duration_s=duration, prev_avg=prev_avg)
-        actual_avg = result["params"][4]
+        actual_avg = result["params"][5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
     def test_last_duration_written_as_int(self):
         """last_fullscan_duration_s is written as int(duration_s)."""
         duration = 123.7
         result = self._run(duration_s=duration)
-        actual_last = result["params"][3]
+        actual_last = result["params"][4]
         self.assertEqual(actual_last, int(duration))
 
     def test_both_ema_columns_in_sql(self):
@@ -711,7 +711,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         # 0.3 * 1000 + 0.7 * 500 = 300 + 350 = 650
         expected = 650.0
         result = self._run(duration_s=duration, prev_avg=prev_avg)
-        actual_avg = result["params"][3]
+        actual_avg = result["params"][5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
     def test_zero_duration_valid(self):
@@ -719,7 +719,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         prev_avg = 60.0
         expected = 0.7 * prev_avg
         result = self._run(duration_s=0.0, prev_avg=prev_avg)
-        actual_avg = result["params"][3]
+        actual_avg = result["params"][5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
 

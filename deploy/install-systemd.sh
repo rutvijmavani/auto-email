@@ -66,11 +66,11 @@ fi
 # ── Stop existing nohup processes (if any) ───────────────────────────────────
 echo ""
 echo "► Stopping any existing nohup worker processes..."
-pkill -f "pipeline.py --scheduler" 2>/dev/null && echo "  Stopped scheduler" || echo "  (no scheduler running)"
-pkill -f "workers.scan_worker"     2>/dev/null && echo "  Stopped scan_worker" || true
-pkill -f "workers.detail_worker"   2>/dev/null && echo "  Stopped detail_worker" || true
-pkill -f "workers.fullscan"        2>/dev/null && echo "  Stopped fullscan" || true
-pkill -f "workers.watchdog"        2>/dev/null && echo "  Stopped watchdog" || true
+pkill -u "$SERVICE_USER" -f "pipeline.py --scheduler" 2>/dev/null && echo "  Stopped scheduler" || echo "  (no scheduler running)"
+pkill -u "$SERVICE_USER" -f "workers.scan_worker"     2>/dev/null && echo "  Stopped scan_worker" || true
+pkill -u "$SERVICE_USER" -f "workers.detail_worker"   2>/dev/null && echo "  Stopped detail_worker" || true
+pkill -u "$SERVICE_USER" -f "workers.fullscan"        2>/dev/null && echo "  Stopped fullscan" || true
+pkill -u "$SERVICE_USER" -f "workers.watchdog"        2>/dev/null && echo "  Stopped watchdog" || true
 sleep 2
 
 # ── Fix .env permissions (must not be world-readable — contains secrets) ─────

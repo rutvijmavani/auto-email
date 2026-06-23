@@ -273,10 +273,10 @@ class TestPickScheduleTime(unittest.TestCase):
             (f"co{i}".encode(), float(s)) for i, s in enumerate(existing_scores)
         ]
         return _pick_schedule_time(
-            target_ts      = target or self._TARGET,
+            target_ts      = target if target is not None else self._TARGET,
             queue_key      = "poll:fullscan",
-            interval_s     = interval or self._INTERVAL,
-            tolerance_pct  = tol or self._TOL,
+            interval_s     = interval if interval is not None else self._INTERVAL,
+            tolerance_pct  = tol if tol is not None else self._TOL,
             r              = r,
             deadline_ts    = deadline_ts,
             avg_duration_s = avg_duration_s,

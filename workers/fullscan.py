@@ -558,11 +558,11 @@ def _complete_fullscan_db(
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
     increments total_new_jobs, and updates the scan duration EMA.
 
-    EMA formula (α=0.3):
-        new_avg = 0.3 × duration_s + 0.7 × prev_avg_duration_s
+    EMA formula (alpha=0.3):
+        new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
 
     The EMA is read by _pick_schedule_time() to skip gap midpoints where
-        midpoint + avg_fullscan_duration_s ≥ next 7 AM deadline
+        midpoint + avg_fullscan_duration_s >= next 7 AM deadline
     ensuring every scheduled scan can finish before the daily digest.
     """
     _EMA_ALPHA = 0.3
@@ -572,16 +572,17 @@ def _complete_fullscan_db(
     try:
         conn.execute("""
             INSERT INTO company_poll_stats
-                (company, last_full_scan_at, next_full_scan_at,
+                (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
                  total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
                  updated_at)
             VALUES
-                (%s, NOW(), NOW() + (%s * INTERVAL '1 second'),
+                (%s, %s, NOW(), NOW() + (%s * INTERVAL '1 second'),
                  FALSE, NULL, NULL,
                  %s, %s, %s,
                  NOW())
             ON CONFLICT (company) DO UPDATE SET
+                ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
                 full_scan_interrupted    = FALSE,
@@ -591,7 +592,7 @@ def _complete_fullscan_db(
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-        """, (company, interval_s, new_jobs, int(duration_s), new_avg,
+        """, (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
               interval_s, new_jobs, int(duration_s), new_avg))
         conn.commit()
         return True
@@ -1078,14 +1079,14 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             # falls before the next 7 AM ET digest — replacing the old danger-zone
             # jitter + clamping logic with a single principled constraint.
             #
-            # Self-correcting in 2–3 cycles:
-            #   Day 1: all companies in a tight cluster → each gets a different gap midpoint
-            #   Day 2: midpoints now spread across the window → gaps rebalance further
+            # Self-correcting in 2-3 cycles:
+            #   Day 1: all companies in a tight cluster -> each gets a different gap midpoint
+            #   Day 2: midpoints now spread across the window -> gaps rebalance further
             #   Day 3+: stable maximum-spread distribution maintained automatically
             avg_duration_s = fs_state.get("avg_fullscan_duration_s", 30.0)
             duration_s     = time.monotonic() - start_mono
 
-            # Compute the updated EMA using the same α as _complete_fullscan_db so
+            # Compute the updated EMA using the same alpha as _complete_fullscan_db so
             # the deadline guard in _pick_schedule_time reflects current performance.
             # Without this, a scan that suddenly took 4 h would still schedule the
             # next one using the old "30 s" average — risking a digest collision.
@@ -1120,6 +1121,23 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             else:
                 result["outcome"] = "error"
                 result["success"] = False
+                # DB write failed — reschedule sooner so stats get persisted on
+                # the next attempt rather than waiting a full interval.
+                _retry_s = min(3600, interval_s // 4)
+                try:
+                    _atomic_schedule(
+                        r, REDIS_POLL_FULLSCAN, company,
+                        now + _retry_s, _retry_s, 0.20,
+                    )
+                    logger.warning(
+                        "fullscan [%s]: DB write failed — rescheduled retry in %ds",
+                        company, _retry_s,
+                    )
+                except Exception as _sched_err:
+                    logger.error(
+                        "fullscan [%s]: DB write failed and reschedule failed: %s",
+                        company, _sched_err,
+                    )
 
             logger.info(
                 "fullscan [%s]: completed — new=%d duration=%.0fs "
@@ -1231,7 +1249,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
         print("[fullscan] Press Ctrl+C to stop\n")
 
     # ── Background heartbeat ─────────────────────────────────────────────────
-    # Full scans can legitimately take 20–30 minutes for large Workday tenants.
+    # Full scans can legitimately take 20-30 minutes for large Workday tenants.
     # Writing the heartbeat at the top of the loop (old approach) created a
     # gap equal to the scan duration — a 30-minute scan meant the key was absent
     # for ~29 minutes, which the watchdog misread as a dead worker.

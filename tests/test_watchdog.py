@@ -256,12 +256,9 @@ class TestWatchdogHelperFunctions(unittest.TestCase):
         self.assertEqual(_consumer_pid("worker-host-name-99"), 99)
 
     def test_consumer_pid_bytes_input(self):
-        # _consumer_pid is typed as `str`.  _check_pel_health always decodes bytes
-        # before calling it, so bytes never reach this function in production.
-        # Passing raw bytes is unsupported: str(b"...") wraps the repr, causing
-        # int() to fail, and the function returns None.
+        # _consumer_pid accepts bytes and decodes them before extracting the PID.
         from workers.watchdog import _consumer_pid
-        self.assertIsNone(_consumer_pid(b"worker-host-42"))
+        self.assertEqual(_consumer_pid(b"worker-host-42"), 42)
 
     def test_consumer_pid_no_trailing_int(self):
         from workers.watchdog import _consumer_pid
