@@ -429,16 +429,31 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                         "platform=%s company=%r job_id=%s: %s",
                         platform, company, job_id, exc, exc_info=True,
                     )
-                    # Delete the pending_detail row so it does not linger as a
-                    # zombie — rebuild_detail_queue() re-queues ALL pending_detail
-                    # rows on restart, and without slug_info the rebuilt payload
-                    # would skip the actual fetch and promote with empty location.
-                    _finish(job_id, company, job, platform,
-                            outcome="error", found_by=found_by)
                     result["duration_ms"] = int(
                         (time.monotonic() - start_mono) * 1000
                     )
                     result["outcome"] = "error"
+                    # Transient network/ATS errors: leave the pending_detail row
+                    # intact and signal retryable so _recover_stuck_jobs() can
+                    # reclaim the inflight item on the next worker start.
+                    # Permanent errors (bad payload, unknown platform) call
+                    # _finish() to clean up the DB row immediately.
+                    _transient = isinstance(exc, (OSError, TimeoutError))
+                    if not _transient:
+                        try:
+                            import requests as _req
+                            _transient = isinstance(exc, _req.exceptions.RequestException)
+                        except ImportError:
+                            pass
+                    if _transient:
+                        result["retryable"] = True
+                    else:
+                        # Delete the pending_detail row so it does not linger as a
+                        # zombie — rebuild_detail_queue() re-queues ALL pending_detail
+                        # rows on restart, and without slug_info the rebuilt payload
+                        # would skip the actual fetch and promote with empty location.
+                        _finish(job_id, company, job, platform,
+                                outcome="error", found_by=found_by)
                     return result
                 finally:
                     set_request_context("normal")   # always reset
@@ -725,7 +740,7 @@ def run_worker(once: bool = False, shutdown_event=None,
     from workers.startup import validate_startup
     validate_startup("detail_worker",
                      check_redis=True,
-                     check_db=not skip_init_db,
+                     check_db=True,
                      check_config=True)
 
     r = get_redis()

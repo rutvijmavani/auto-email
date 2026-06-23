@@ -248,6 +248,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/rebuild.log",
                 "description": "Ran pipeline.py --rebuild (poll:adaptive was empty)",
                 "foreground":  True,
+                "timeout_s":   300,  # rebuild can take several minutes
             },
             "queue_poll_adaptive_stall": worker_via_systemd,
             "queue_poll_fullscan_empty": {
@@ -255,6 +256,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/rebuild.log",
                 "description": "Ran pipeline.py --rebuild (poll:fullscan was empty)",
                 "foreground":  True,
+                "timeout_s":   300,
             },
             "queue_poll_fullscan_stall": worker_via_systemd,
             # Detail queues — depth growing/stalled at CRITICAL level.
@@ -297,6 +299,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/rebuild.log",
                 "description": "Ran pipeline.py --rebuild (poll:adaptive was empty)",
                 "foreground":  True,
+                "timeout_s":   300,
             },
             "queue_poll_adaptive_stall": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
@@ -308,6 +311,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/rebuild.log",
                 "description": "Ran pipeline.py --rebuild (poll:fullscan was empty)",
                 "foreground":  True,
+                "timeout_s":   300,
             },
             "queue_poll_fullscan_stall": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
@@ -355,17 +359,23 @@ def _send_email(subject: str, body_html: str, *, dedup_key: str,
 
     Returns True if sent, False if suppressed by the cooldown window.
     """
-    try:
-        if r.exists(dedup_key):
-            logger.debug("watchdog: suppressing email (cooldown) key=%r", dedup_key)
-            return False
-    except Exception as exc:
-        # Redis unavailable — assume key absent and proceed to send
-        logger.warning("watchdog: dedup check failed, proceeding with send: %s", exc)
-
     if not EMAIL or not APP_PASSWORD:
         logger.error("watchdog: EMAIL or APP_PASSWORD not configured — cannot send")
         return False
+
+    # Reserve the dedup key atomically (NX) BEFORE sending so concurrent
+    # watchdog processes cannot both pass the check and send duplicate emails.
+    # If another process already set the key, suppress immediately.
+    # On send failure we delete the key so the alert can be retried.
+    _reserved = None
+    try:
+        _reserved = r.set(dedup_key, "1", ex=dedup_ttl, nx=True)
+        if _reserved is None:
+            logger.debug("watchdog: suppressing email (cooldown) key=%r", dedup_key)
+            return False
+    except Exception as exc:
+        # Redis unavailable — proceed optimistically (single-instance dev mode)
+        logger.warning("watchdog: dedup reserve failed, proceeding with send: %s", exc)
 
     try:
         now_str  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -419,12 +429,17 @@ def _send_email(subject: str, body_html: str, *, dedup_key: str,
             srv.login(EMAIL, APP_PASSWORD)
             srv.send_message(msg)
 
-        r.set(dedup_key, "1", ex=dedup_ttl)
         logger.info("watchdog: email sent — subject=%r", subject)
         return True
 
     except Exception as exc:
         logger.error("watchdog: email send failed: %s", exc)
+        # Release the reserved dedup key so the alert can be retried next cycle.
+        if _reserved is not None:
+            try:
+                r.delete(dedup_key)
+            except Exception:
+                pass
         return False
 
 
@@ -590,21 +605,34 @@ def check_worker_heartbeats(r) -> list:
             "alive (heartbeat key present)"))
 
     # ── 2. Pool health from scheduler:health ─────────────────────────────────
-    WARN_DEATHS = 3
-    ERR_DEATHS  = 5
-    health_raw  = r.get("scheduler:health")
+    WARN_DEATHS  = 3
+    ERR_DEATHS   = 5
+    _HEALTH_MISS_KEY       = _rkey("pool_health_miss_count")
+    _HEALTH_MISS_THRESHOLD = 3   # consecutive misses before escalating to ERROR
+    health_raw   = r.get("scheduler:health")
 
     if health_raw is None:
         # Key expired — scheduler stopped publishing (likely just started or
         # is about to die; the faster heartbeat check above will catch a death).
+        try:
+            miss_count = int(r.incr(_HEALTH_MISS_KEY))
+            r.expire(_HEALTH_MISS_KEY, 3600)
+        except Exception:
+            miss_count = 1
+        severity = Issue.ERROR if miss_count >= _HEALTH_MISS_THRESHOLD else Issue.WARNING
         issues.append(Issue(
-            Issue.WARNING,
+            severity,
             "worker:pool_health",
-            "scheduler:health key missing — pool state unknown "
-            "(scheduler may have just started)",
+            f"scheduler:health key missing for {miss_count} consecutive cycle(s) — "
+            "pool state unknown (scheduler may have just started or died)",
             alert_type="worker_pool_health",
         ))
         return issues
+    # Key present — reset consecutive miss counter
+    try:
+        r.delete(_HEALTH_MISS_KEY)
+    except Exception:
+        pass
 
     try:
         health   = json.loads(health_raw)
@@ -794,15 +822,17 @@ def _stall_count(
     return stall, valid
 
 
-def _consumer_pid(consumer_name: str) -> Optional[int]:
+def _consumer_pid(consumer_name) -> Optional[int]:
     """
     Extract the PID from a consumer name of the form 'worker-{hostname}-{pid}'.
 
     Returns None if the name doesn't match the expected format.
     """
     try:
-        return int(str(consumer_name).rsplit("-", 1)[-1])
-    except (ValueError, AttributeError):
+        if isinstance(consumer_name, bytes):
+            consumer_name = consumer_name.decode()
+        return int(consumer_name.rsplit("-", 1)[-1])
+    except (ValueError, AttributeError, UnicodeDecodeError):
         return None
 
 
@@ -885,44 +915,57 @@ def _check_pel_health(r, issues: list) -> None:
                 issues.append(Issue(Issue.OK, label, "0 pending entries"))
                 continue
 
-            entries  = r.xpending_range(stream_key, STREAM_CONSUMER_GROUP,
-                                        min="-", max="+", count=10)
-            if not entries:
-                issues.append(Issue(Issue.OK, label, f"{total} pending (no detail)"))
-                continue
-
-            # Scan the batch for the worst orphaned entry (dead consumer + oldest age).
-            # Checking only entries[0] could miss orphans deeper in the PEL if the
-            # oldest entry's consumer happens to be alive.
+            # Paginate through all PEL entries in batches so orphans beyond
+            # position 10 are not silently ignored.
+            _BATCH = 100
             worst_ms      = 0
             worst_orphan  = None
             alive_entries = []
-            for entry in entries:
-                e_consumer = entry.get("consumer", "")
-                if isinstance(e_consumer, bytes):
-                    e_consumer = e_consumer.decode()
-                e_pid   = _consumer_pid(e_consumer)
-                e_alive = _consumer_pid_alive(r, worker_type, e_pid)
-                e_ms    = entry.get("time_since_delivered", 0)
-                if e_alive:
-                    alive_entries.append((e_consumer, e_pid, e_ms))
-                else:
-                    if e_ms > worst_ms:
-                        worst_ms     = e_ms
-                        worst_orphan = (e_consumer, e_pid, e_ms)
+            first_entry   = None
+            _min_id       = "-"
+            while True:
+                batch = r.xpending_range(stream_key, STREAM_CONSUMER_GROUP,
+                                         min=_min_id, max="+", count=_BATCH)
+                if not batch:
+                    break
+                if first_entry is None:
+                    first_entry = batch[0]
+                for entry in batch:
+                    e_consumer = entry.get("consumer", "")
+                    if isinstance(e_consumer, bytes):
+                        e_consumer = e_consumer.decode()
+                    e_pid   = _consumer_pid(e_consumer)
+                    e_alive = _consumer_pid_alive(r, worker_type, e_pid)
+                    e_ms    = entry.get("time_since_delivered", 0)
+                    if e_alive:
+                        alive_entries.append((e_consumer, e_pid, e_ms))
+                    else:
+                        if e_ms > worst_ms:
+                            worst_ms     = e_ms
+                            worst_orphan = (e_consumer, e_pid, e_ms)
+                if len(batch) < _BATCH:
+                    break
+                last_id = batch[-1].get("message_id", b"")
+                if isinstance(last_id, bytes):
+                    last_id = last_id.decode()
+                _min_id = f"({last_id}"
 
-            oldest_ms = entries[0].get("time_since_delivered", 0)
+            if first_entry is None:
+                issues.append(Issue(Issue.OK, label, f"{total} pending (no detail)"))
+                continue
+
+            oldest_ms = first_entry.get("time_since_delivered", 0)
             age_str = (
                 f"{oldest_ms // 60000:.0f}min"
                 if oldest_ms >= 60000 else f"{oldest_ms // 1000:.0f}s"
             )
 
             if worst_orphan is None:
-                # All sampled entries have alive consumers.
-                consumer_name, c_pid, _ = alive_entries[0]
+                # All PEL entries have alive consumers.
+                _rep_consumer, _rep_pid, _ = alive_entries[0] if alive_entries else ("?", None, 0)
                 issues.append(Issue(Issue.OK, label,
                     f"{total} pending  oldest={age_str}  "
-                    f"consumer={consumer_name} alive (pid={c_pid}) — in progress"))
+                    f"consumer={_rep_consumer} alive (pid={_rep_pid}) — in progress"))
             else:
                 consumer_name, c_pid, _ = worst_orphan
                 worst_age_str = (
@@ -1082,7 +1125,15 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             ("queue:detail:adaptive", detail_adp_depth),
             ("queue:detail:fullscan", detail_fs_depth),
         ]:
-            issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
+            if depth > DETAIL_QUEUE_ALERT:
+                issues.append(Issue(Issue.ERROR, label,
+                    f"depth={depth:,} (baseline) — CRITICAL threshold exceeded",
+                    "python -m workers.detail_worker"))
+            elif depth > DETAIL_QUEUE_WARN:
+                issues.append(Issue(Issue.WARNING, label,
+                    f"depth={depth:,} (baseline) — elevated, delta tracking starts next cycle"))
+            else:
+                issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
         _check_pel_health(r, issues)
         return issues
 
@@ -1090,6 +1141,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     prev_adp_overdue = snap.get("adp_overdue", 0)
     prev_adp_head_c  = snap.get("adp_head_c")
     prev_adp_head_s  = snap.get("adp_head_s")
+    prev_fs_total    = snap.get("fs_total")   # None means unknown (first real cycle)
     prev_fs_overdue  = snap.get("fs_overdue", 0)
     prev_fs_head_c   = snap.get("fs_head_c")
     prev_fs_head_s   = snap.get("fs_head_s")
@@ -1140,8 +1192,15 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     fs_delta = fs_overdue - prev_fs_overdue
 
     if fs_total == 0:
-        issues.append(Issue(Issue.WARNING, "queue:poll:fullscan",
-            "EMPTY — normal right after rebuild; alert if persists",
+        # Escalate to ERROR if the queue was also empty last cycle (persistent
+        # empty is not normal — only the immediate post-rebuild cycle should be).
+        _fs_was_empty = (prev_fs_total is not None and prev_fs_total == 0)
+        issues.append(Issue(
+            Issue.ERROR if _fs_was_empty else Issue.WARNING,
+            "queue:poll:fullscan",
+            ("EMPTY (2nd consecutive cycle) — rebuild required"
+             if _fs_was_empty
+             else "EMPTY — normal right after rebuild; alert if persists"),
             "python pipeline.py --rebuild",
             alert_type="queue_poll_fullscan_empty",
         ))
@@ -1268,8 +1327,7 @@ def check_bloom_health(r) -> list:
 def check_coverage(r) -> list:
     issues = []
     try:
-        from db.db import init_db, get_conn
-        init_db()
+        from db.db import get_conn
         conn = get_conn()
         try:
             total  = conn.execute(
@@ -1546,13 +1604,15 @@ def _attempt_heal(issue: Issue, r) -> bool:
             log_fh.flush()
 
             if is_fg:
-                # Synchronous — wait up to 60s for rebuild / short commands
+                # Synchronous — use per-action timeout (default 60 s);
+                # rebuild actions need more time so they specify timeout_s=300.
+                _timeout = action.get("timeout_s", 60)
                 result = subprocess.run(
                     cmd_args,
                     cwd=_PROJECT_ROOT,
                     stdout=log_fh,
                     stderr=subprocess.STDOUT,
-                    timeout=60,
+                    timeout=_timeout,
                 )
                 success = (result.returncode == 0)
                 if not success:
@@ -1717,8 +1777,8 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
               <strong>{issue.category}</strong> could not be automatically recovered
               after <strong>{HEAL_MAX_ATTEMPTS} restart attempts</strong>.
             </p>
-            <p style="color:#374151;"><strong>Issue:</strong> {issue.message}</p>
-            {"<p style='font-family:monospace;background:#fef2f2;padding:10px;border-radius:6px;color:#991b1b;'><strong>Manual fix:</strong><br>" + issue.fix + "</p>" if issue.fix else ""}
+            <p style="color:#374151;"><strong>Issue:</strong> {_html_lib.escape(issue.message)}</p>
+            {"<p style='font-family:monospace;background:#fef2f2;padding:10px;border-radius:6px;color:#991b1b;'><strong>Manual fix:</strong><br>" + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
             <p style="color:#64748b;font-size:12px;">
               Auto-heal will retry after {ESCALATION_COOLDOWN // 3600}h.
               Worker restart logs: <code>{_LOG_DIR}/{atype.replace('worker_','')}.log</code>
@@ -1746,7 +1806,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             subj = f"⚠ Pipeline Alert: {issue.category} — {issue.level}"
             body = f"""
             <p style="color:#f59e0b;font-weight:700;">{issue.emoji()} {issue.level}: {issue.category}</p>
-            <p style="color:#374151;">{issue.message}</p>
+            <p style="color:#374151;">{_html_lib.escape(issue.message)}</p>
             <p style="color:#64748b;font-size:13px;">
               ℹ Scheduler is also dead — healing scheduler first.
               Workers will be spawned automatically by the revived scheduler.
@@ -1769,7 +1829,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
                   ⚠ Issue detected — attempting automatic recovery
                 </p>
                 <p style="color:#374151;">
-                  <strong>{issue.category}</strong>: {issue.message}
+                  <strong>{_html_lib.escape(issue.category)}</strong>: {_html_lib.escape(issue.message)}
                 </p>
                 <div style="background:#fefce8;border:1px solid #fde68a;
                             border-radius:6px;padding:12px;margin:12px 0;">
@@ -1801,8 +1861,8 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         subj = f"⚠ Pipeline Alert: {issue.category} — {issue.level}"
         body = f"""
         <p style="color:#ef4444;font-weight:700;">{issue.emoji()} {issue.level}: {issue.category}</p>
-        <p style="color:#374151;">{issue.message}</p>
-        {"<p style='font-family:monospace;background:#f1f5f9;padding:8px;border-radius:4px;color:#475569;font-size:13px;'><strong>Fix:</strong> " + issue.fix + "</p>" if issue.fix else ""}
+        <p style="color:#374151;">{_html_lib.escape(issue.message)}</p>
+        {"<p style='font-family:monospace;background:#f1f5f9;padding:8px;border-radius:4px;color:#475569;font-size:13px;'><strong>Fix:</strong> " + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
         <p style="color:#64748b;font-size:12px;">
           Auto-heal is not configured for this issue type.
           Manual intervention required.
@@ -1971,7 +2031,8 @@ def run_watchdog(once: bool = False,
             except Exception:
                 pass
             if once:
-                break
+                import sys as _sys
+                _sys.exit(1)
             time.sleep(WATCHDOG_INTERVAL_S)
 
     logger.info("watchdog shutdown")

@@ -241,10 +241,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
         r = MagicMock()
         r.scan.return_value = (0, [])
         from workers.detail_worker import _recover_stuck_jobs
-        try:
-            _recover_stuck_jobs(r, self._OWN_PID)
-        except Exception as exc:
-            self.fail(f"Unexpected exception with no inflight keys: {exc}")
+        _recover_stuck_jobs(r, self._OWN_PID)
 
     def test_no_inflight_keys_lmove_never_called(self):
         """No inflight keys → lmove is never called."""

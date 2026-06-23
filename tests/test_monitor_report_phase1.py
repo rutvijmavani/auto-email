@@ -429,7 +429,7 @@ class TestQueueHealthSection(unittest.TestCase):
 
     def test_redis_exception_returns_empty_string(self):
         """Any Redis exception inside the function → returns '' (non-fatal)."""
-        with patch("workers.redis_client.get_redis",
+        with patch("redis.from_url",
                    side_effect=Exception("Redis connection failed")):
             import outreach.report_templates.monitor_report as mrep
             result = mrep._build_queue_health_section()
@@ -440,7 +440,7 @@ class TestQueueHealthSection(unittest.TestCase):
         """Redis llen() raising mid-call → returns '' (non-fatal)."""
         r = MagicMock()
         r.llen.side_effect = ConnectionError("timeout")
-        with patch("workers.redis_client.get_redis", return_value=r):
+        with patch("redis.from_url", return_value=r):
             import outreach.report_templates.monitor_report as mrep
             result = mrep._build_queue_health_section()
         self.assertEqual(result, "")

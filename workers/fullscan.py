@@ -551,7 +551,7 @@ def _complete_fullscan_db(
     interval_s: int,
     duration_s: float,
     prev_avg_duration_s: float = 30.0,
-) -> None:
+) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
@@ -594,11 +594,13 @@ def _complete_fullscan_db(
         """, (company, interval_s, new_jobs, int(duration_s), new_avg,
               interval_s, new_jobs, int(duration_s), new_avg))
         conn.commit()
+        return True
     except Exception as exc:
         logger.error(
             "fullscan: _complete_fullscan_db failed for %r: %s",
             company, exc, exc_info=True,
         )
+        return False
     finally:
         conn.close()
 
@@ -1103,17 +1105,21 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 
             # Update DB: persist scan duration EMA + reschedule time.
             # full_scan_interval_s (base 86400) stays clean — not overwritten here.
-            _complete_fullscan_db(
+            db_ok = _complete_fullscan_db(
                 company, platform, new_count,
                 interval_s          = int(next_scan_at - now),
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
             )
 
-            result["outcome"]      = "completed"
-            result["success"]      = True
-            result["duration_ms"]  = int(duration_s * 1000)
-            result["completed_at"] = datetime.now(timezone.utc).isoformat()
+            if db_ok:
+                result["outcome"]      = "completed"
+                result["success"]      = True
+                result["duration_ms"]  = int(duration_s * 1000)
+                result["completed_at"] = datetime.now(timezone.utc).isoformat()
+            else:
+                result["outcome"] = "error"
+                result["success"] = False
 
             logger.info(
                 "fullscan [%s]: completed — new=%d duration=%.0fs "

@@ -233,19 +233,23 @@ def _get_worker_missed_companies(companies: list) -> tuple:
     scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
 
     # Exclude companies whose fullscan_worker is actively running right now.
-    # A Workday scan can take 20–30 minutes; without this check, --monitor-jobs
+    # A Workday scan can take 20-30 minutes; without this check, --monitor-jobs
     # would fallback-fetch the same company mid-scan, wasting HTTP calls and
     # potentially sending duplicate jobs to the detail queue.
     inflight: set = set()
     try:
-        from config import REDIS_INFLIGHT_FULLSCAN
-        from workers.redis_client import get_redis
+        from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
+        import redis as _redis_lib_jm
         # Only consider entries added within the last 2 hours.  The ZSET score
         # is the unix timestamp when the worker claimed the company.  Entries
         # older than 2 h come from workers that were killed without cleanup and
         # should not permanently exclude companies from the missed-jobs check.
+        # Use a timeout-bound client so a Redis hang never blocks the monitor.
+        _r_inflight = _redis_lib_jm.from_url(
+            REDIS_URL, socket_timeout=5, socket_connect_timeout=3
+        )
         stale_threshold = time.time() - 7200
-        raw      = get_redis().zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+        raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
         inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
         if inflight:
             logger.debug(
@@ -348,7 +352,7 @@ def run():
 
     # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
-        "companies_monitored":    len(covered),        # pre-credit covered companies
+        "companies_monitored":    len(companies),      # fixed total denominator (covered + in_flight + missed)
         "covered_by_workers":     len(covered),        # confirmed-done by workers
         "in_flight":              len(in_flight_names),# scanning now — not confirmed yet
         "fallback_scanned":       0,              # fallback companies whose ATS was successfully queried
@@ -389,7 +393,6 @@ def run():
                     }
 
                 with stats_lock:
-                    stats["companies_monitored"]    += company_stats.get("monitored",      0)
                     stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
                     stats["companies_with_results"] += company_stats.get("with_results",   0)
                     stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)

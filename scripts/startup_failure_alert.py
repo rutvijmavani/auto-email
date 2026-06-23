@@ -76,6 +76,9 @@ def _already_sent(service: str) -> bool:
 def _mark_sent(service: str) -> None:
     _validate_service(service)
     os.makedirs(_RUN_DIR, mode=0o700, exist_ok=True)
+    # Enforce permissions even if the directory already existed (exist_ok=True
+    # silently ignores the mode argument when the dir is pre-created).
+    os.chmod(_RUN_DIR, 0o700)
     flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
     with open(flag, "w") as fh:
         fh.write(datetime.now().isoformat())
@@ -137,9 +140,11 @@ _DIAGNOSE_HINTS = {
 
 
 def send_startup_failure_alert(service: str) -> None:
+    _validate_service(service)   # validate before any I/O so invalid service fails fast
+
     if not EMAIL or not APP_PASSWORD:
         print(f"[startup-alert] EMAIL or APP_PASSWORD not set — cannot send alert for {service}")
-        sys.exit(0)
+        sys.exit(1)   # non-zero so systemd knows alerting is misconfigured
 
     if _already_sent(service):
         print(f"[startup-alert] Duplicate suppressed for {service} (within {_DEDUP_WINDOW_S//60}min window)")

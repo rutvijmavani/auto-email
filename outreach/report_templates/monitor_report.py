@@ -1268,7 +1268,8 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
     # Brief HTML body
     _worker_covered = stats.get("covered_by_workers", 0)
     _fallback_hits  = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
-    _total_covered  = _worker_covered + _fallback_hits
+    _in_flight      = stats.get("in_flight", 0)
+    _total_covered  = _worker_covered + _fallback_hits + _in_flight
     _total          = stats.get("companies_monitored", 0)
     _cov_pct        = int(_total_covered / _total * 100) if _total else 0
     _cov_detail = f"{_worker_covered} by workers"

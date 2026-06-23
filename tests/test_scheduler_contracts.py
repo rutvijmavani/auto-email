@@ -1111,8 +1111,7 @@ class TestInflightExclusionStructural(unittest.TestCase):
         has_zset_read = (
             "zrange" in self.src or
             "zrangebyscore" in self.src or
-            "zscan" in self.src or
-            "zcard" in self.src
+            "zscan" in self.src
         )
         self.assertTrue(has_zset_read,
                         "job_monitor.py must use a ZSET read operation for inflight:fullscan")
