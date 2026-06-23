@@ -655,7 +655,10 @@ def main() -> None:
     # ── 1. Scan log files ────────────────────────────────────────────────────
     offsets              = _load_offsets()
     new_offsets, raw     = collect_raw_findings(offsets)
-    _save_offsets(new_offsets)   # persist immediately — safe even if Redis fails
+    # Do NOT save offsets yet — wait until we have confirmed the alert was sent
+    # (or that there were no new errors to alert on).  Saving early would cause
+    # the log lines to be permanently skipped if email or Redis fail, since the
+    # next run would start from the advanced offset but the dedup key is not set.
 
     total_hits = sum(len(v) for v in raw.values())
     total_new  = sum(new_offsets.get(k, 0) - offsets.get(k, 0) for k in new_offsets)
@@ -663,6 +666,8 @@ def main() -> None:
 
     if not raw:
         print("[log_monitor] clean — no issues found")
+        # Nothing to alert on — safe to advance offsets now.
+        _save_offsets(new_offsets)
         # Still run the resolution sweep and digest check even on a clean run.
         # Without the sweep, expired action keys accumulate and errors that
         # recur after a quiet period are not treated as NEW.
@@ -685,8 +690,8 @@ def main() -> None:
     # ── 2. Dedup via Redis ───────────────────────────────────────────────────
     r = _get_redis()
     if r is None:
-        # Redis unavailable — log but don't alert (avoid duplicate emails
-        # on next run when Redis comes back).
+        # Redis unavailable — can't dedup or alert.  Don't advance offsets so
+        # the next run can try again once Redis recovers.
         print("[log_monitor] Redis unavailable — skipping dedup/alert this run")
         return
 
@@ -712,12 +717,16 @@ def main() -> None:
                     r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
+            # Offsets safe to advance now that the operator has been notified.
+            _save_offsets(new_offsets)
         else:
-            # Email failed — do NOT mark as known.  The next run will re-alert,
-            # which is correct: the operator must be notified.
+            # Email failed — do NOT mark as known and do NOT advance offsets.
+            # The next run will re-scan from the same position and retry.
             print("[log_monitor] Email send failed — errors NOT marked as known "
                   "(will retry next run)")
     else:
+        # All errors already known/deduped — no new alert needed.
+        _save_offsets(new_offsets)
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
 

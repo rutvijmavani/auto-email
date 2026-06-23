@@ -1741,13 +1741,16 @@ class TestMetricCalculations(unittest.TestCase):
 
     def _stats(self, **kw):
         base = {
-            "companies_monitored": 137,
+            "companies_monitored":   137,
+            "covered_by_workers":    120,  # new field used by _build_alerts
+            "fallback_scanned":        0,
+            "in_flight":               0,
             "companies_with_results": 120,
-            "companies_unknown_ats": 10,
-            "api_failures": 0,
-            "api_failure_list": [],
-            "total_jobs_fetched": 500,
-            "jobs_matched_filters": 50,
+            "companies_unknown_ats":   10,
+            "api_failures":             0,
+            "api_failure_list":        [],
+            "total_jobs_fetched":     500,
+            "jobs_matched_filters":    50,
         }
         base.update(kw)
         return base
@@ -1756,12 +1759,13 @@ class TestMetricCalculations(unittest.TestCase):
         self.assertEqual(len(self.build_alerts(self._stats(), 137)), 0)
 
     def test_coverage_alert_below_70_pct(self):
-        stats = self._stats(companies_with_results=50)
+        # _build_alerts uses covered_by_workers (not companies_with_results)
+        stats = self._stats(covered_by_workers=50)
         alerts = self.build_alerts(stats, 137)
         self.assertTrue(any("Coverage" in a["message"] for a in alerts))
 
     def test_no_coverage_alert_above_70_pct(self):
-        stats = self._stats(companies_with_results=100)
+        stats = self._stats(covered_by_workers=100)
         alerts = self.build_alerts(stats, 137)
         self.assertFalse(any("Coverage" in a["message"] for a in alerts))
 
@@ -1808,6 +1812,7 @@ class TestMetricCalculations(unittest.TestCase):
 
     def test_multiple_alerts_simultaneously(self):
         stats = self._stats(
+            covered_by_workers=50,
             companies_with_results=50,
             companies_unknown_ats=40,
             api_failures=5,
@@ -2972,7 +2977,8 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
             fake_redis_module.get_redis.return_value = mock_redis
             with patch.dict("sys.modules", {"workers.redis_client": fake_redis_module}):
                 from jobs.job_monitor import _get_worker_missed_companies
-                return _get_worker_missed_companies(companies)
+                missed, _ = _get_worker_missed_companies(companies)
+                return missed
 
     def test_inflight_company_excluded_even_if_stale(self):
         """

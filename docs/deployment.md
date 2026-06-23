@@ -1294,7 +1294,7 @@ The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `fail
 
 **What it checks:**
 
-Each worker runs a background daemon thread that writes `worker:alive:{type}` to Redis on a fixed interval, independent of what the main thread is doing:
+Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
 
 ```
 scheduler:       writes every ~1s  TTL=15s   dead after 20s
@@ -1388,7 +1388,7 @@ Detail queues have no auto-heal because a growing detail queue usually means the
 - Poll queue alerts → none unless escalated (auto-heal fires first)
 - Detail queue alerts → check if detail_worker is alive:
   ```bash
-  redis-cli GET worker:alive:detail_worker
+  redis-cli KEYS "worker:alive:detail_worker:*"
   ```
   Missing or stale → `sudo systemctl restart recruiter-scheduler`
   Alive but queue growing → workers overloaded, check logs: `journalctl -u recruiter-scheduler -n 100`
@@ -1500,7 +1500,7 @@ Coverage alert:
 - If a specific ATS is down → scheduler puts that platform in outage mode automatically; wait for it to recover
 
 Stuck `pending_detail` alert:
-- Check detail_worker heartbeat: `redis-cli GET worker:alive:detail_worker`
+- Check detail_worker heartbeat: `redis-cli KEYS "worker:alive:detail_worker:*"`
 - If missing → `sudo systemctl restart recruiter-scheduler`
 - If alive but queue growing → detail workers overloaded; check logs
 

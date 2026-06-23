@@ -151,7 +151,7 @@ python scripts/health_check.py             # instant full status
 ### 3.2 Worker heartbeat in Redis ✅ DONE
 **Files:** `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`,
 `workers/scheduler.py`  
-**Key:** `worker:alive:{type}` with appropriate TTL per worker  
+**Key:** `worker:alive:{type}:{pid}` with appropriate TTL per worker  
 **Payload:** `{"pid": os.getpid(), "processed": count, "ts": time.time()}`  
 **TTLs:** scheduler=15s, scan_worker=30s, detail_worker=30s, fullscan_worker=1800s
 
@@ -172,7 +172,7 @@ sends email alerts, auto-heals via systemctl, escalates after 3 failed attempts.
 **scripts/health_check.py** ✅ DONE — instant color-coded CLI status tool.  
 
 **Self-healing state machine:**
-```
+```text
 NEW issue detected
   → healable? → attempt_heal() → email "⚠ Auto-heal attempted (1/3)"
   → not healable? → email "⚠ Issue detected — manual fix needed"
@@ -268,7 +268,7 @@ all slots in a full 24h cycle (`slots_in_cycle = 86400 // (bucket_minutes * 60)`
 
 ## Deployment Order
 
-```
+```text
 Phase 1  →  Phase 2  →  Phase 3  →  Phase 4 monitoring
 (fix + cleanup)  (thundering herd)  (reliability)  (observe)
 

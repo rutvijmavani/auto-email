@@ -157,8 +157,7 @@ def run_health_check() -> int:
 
     # PostgreSQL
     try:
-        from db.db import init_db, get_conn
-        init_db()
+        from db.db import get_conn
         conn = get_conn()
         row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
         jobs = row["cnt"] if row else 0
@@ -279,10 +278,8 @@ def run_health_check() -> int:
     _section("QUEUE HEALTH")
 
     try:
-        from workers.watchdog import check_queue_health, _check_pel_health, Issue
-        _wdg_queue_issues = check_queue_health(r)
-        # _check_pel_health appends directly to the list
-        _check_pel_health(r, _wdg_queue_issues)
+        from workers.watchdog import check_queue_health, Issue
+        _wdg_queue_issues = check_queue_health(r, persist_snapshot=False)
         for _issue in _wdg_queue_issues:
             _lbl = _issue.category.replace("queue:", "").replace("stream:", "stream:")
             _row(_issue.level, _lbl, _issue.message)

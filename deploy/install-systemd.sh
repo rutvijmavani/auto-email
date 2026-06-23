@@ -98,11 +98,11 @@ cat > "$SUDOERS_FILE" << EOF
 # Allow opc user to restart/query pipeline services without password.
 # Required by workers/watchdog.py self-healing (uses sudo systemctl).
 # Path = $(which systemctl) → resolved to $SYSTEMCTL_BIN
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
-$SERVICE_USER ALL=(ALL) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
 EOF
 chmod 440 "$SUDOERS_FILE"
 

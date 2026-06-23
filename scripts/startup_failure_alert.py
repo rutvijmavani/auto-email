@@ -39,7 +39,12 @@ from config import EMAIL, APP_PASSWORD  # noqa: E402 — after sys.path fix
 # Dedup via a flag file — Redis may be
 # unavailable if the service is crashing
 # ─────────────────────────────────────────
-_FLAG_FILE_TEMPLATE = "/tmp/startup_failure_alert_{service}.flag"
+# Store dedup flag files under the project's run/ directory, not /tmp.
+# /tmp is world-writable: a local attacker could pre-create the flag file to
+# suppress alerts.  A project-owned directory with mode 700 is not accessible
+# to other users.
+_RUN_DIR            = os.path.join(_PROJECT_DIR, "run")
+_FLAG_FILE_TEMPLATE = os.path.join(_RUN_DIR, "startup_failure_alert_{service}.flag")
 _DEDUP_WINDOW_S     = 3600   # suppress duplicate alerts for 1 hour
 
 # Allowlist of services this script may act on.  The service name is used in
@@ -70,6 +75,7 @@ def _already_sent(service: str) -> bool:
 
 def _mark_sent(service: str) -> None:
     _validate_service(service)
+    os.makedirs(_RUN_DIR, mode=0o700, exist_ok=True)
     flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
     with open(flag, "w") as fh:
         fh.write(datetime.now().isoformat())

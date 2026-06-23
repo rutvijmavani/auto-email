@@ -851,9 +851,17 @@ def run_worker(once: bool = False, shutdown_event=None,
             if result.get("retryable"):
                 logger.warning(
                     "detail_worker: transient error — leaving job_id=%s "
-                    "company=%r in inflight for recovery on restart",
+                    "company=%r in inflight; exiting so _recover_stuck_jobs() "
+                    "can reclaim it on the next startup (heartbeat must expire "
+                    "first for recovery to trigger)",
                     result.get("job_id"), result.get("company"),
                 )
+                # Stop the worker so the scheduler respawns it.  The new worker
+                # calls _recover_stuck_jobs() at startup, finds this inflight
+                # item (heartbeat TTL will have expired), and requeues it.
+                # Staying alive would keep the heartbeat fresh, preventing
+                # _recover_stuck_jobs() from ever reclaiming the stuck item.
+                break
             else:
                 r.lrem(inflight_key, 1, raw)
 

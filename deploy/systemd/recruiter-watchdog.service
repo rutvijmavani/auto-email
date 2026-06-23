@@ -1,10 +1,11 @@
 [Unit]
 Description=Recruiter Pipeline Watchdog (health monitoring + alerts + self-healing)
-Documentation=https://github.com/your-repo/mail
+Documentation=https://github.com/rutvijmavani/auto-email
 # See recruiter-scheduler.service for the network-online.target prerequisite note.
 # Same requirement applies here: verify systemd-networkd-wait-online or
 # NetworkManager-wait-online is enabled before relying on this ordering.
 After=network-online.target
+Wants=network-online.target
 
 # Watchdog is intentionally NOT After=recruiter-scheduler.service so it keeps
 # running and alerting even when the scheduler is down.

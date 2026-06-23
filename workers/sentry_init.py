@@ -103,7 +103,7 @@ def _fingerprint(event: dict) -> Optional[str]:
             location = "unknown"
 
         raw = f"{exc_type}:{location}"
-        return hashlib.md5(raw.encode()).hexdigest()[:16]
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     except Exception:
         return None

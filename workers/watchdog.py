@@ -514,8 +514,7 @@ def check_redis() -> tuple:
 
 def check_postgres() -> tuple:
     try:
-        from db.db import init_db, get_conn
-        init_db()
+        from db.db import get_conn
         conn = get_conn()
         try:
             row = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
@@ -887,50 +886,64 @@ def _check_pel_health(r, issues: list) -> None:
                 continue
 
             entries  = r.xpending_range(stream_key, STREAM_CONSUMER_GROUP,
-                                        min="-", max="+", count=1)
+                                        min="-", max="+", count=10)
             if not entries:
                 issues.append(Issue(Issue.OK, label, f"{total} pending (no detail)"))
                 continue
 
-            entry         = entries[0]
-            oldest_ms     = entry.get("time_since_delivered", 0)
-            consumer_name = entry.get("consumer", "")
-            if isinstance(consumer_name, bytes):
-                consumer_name = consumer_name.decode()
+            # Scan the batch for the worst orphaned entry (dead consumer + oldest age).
+            # Checking only entries[0] could miss orphans deeper in the PEL if the
+            # oldest entry's consumer happens to be alive.
+            worst_ms      = 0
+            worst_orphan  = None
+            alive_entries = []
+            for entry in entries:
+                e_consumer = entry.get("consumer", "")
+                if isinstance(e_consumer, bytes):
+                    e_consumer = e_consumer.decode()
+                e_pid   = _consumer_pid(e_consumer)
+                e_alive = _consumer_pid_alive(r, worker_type, e_pid)
+                e_ms    = entry.get("time_since_delivered", 0)
+                if e_alive:
+                    alive_entries.append((e_consumer, e_pid, e_ms))
+                else:
+                    if e_ms > worst_ms:
+                        worst_ms     = e_ms
+                        worst_orphan = (e_consumer, e_pid, e_ms)
 
-            # ── Is the consumer that owns this entry still alive? ─────────────
-            # With per-PID heartbeat keys we check the specific consumer's key
-            # directly — no cross-PID ambiguity from a shared single-type key.
-            c_pid          = _consumer_pid(consumer_name)
-            consumer_alive = _consumer_pid_alive(r, worker_type, c_pid)
-
+            oldest_ms = entries[0].get("time_since_delivered", 0)
             age_str = (
                 f"{oldest_ms // 60000:.0f}min"
                 if oldest_ms >= 60000 else f"{oldest_ms // 1000:.0f}s"
             )
 
-            if consumer_alive:
-                # Worker is alive and holds this entry — it is actively
-                # processing the job right now.  No alarm regardless of age.
+            if worst_orphan is None:
+                # All sampled entries have alive consumers.
+                consumer_name, c_pid, _ = alive_entries[0]
                 issues.append(Issue(Issue.OK, label,
                     f"{total} pending  oldest={age_str}  "
                     f"consumer={consumer_name} alive (pid={c_pid}) — in progress"))
             else:
+                consumer_name, c_pid, _ = worst_orphan
+                worst_age_str = (
+                    f"{worst_ms // 60000:.0f}min"
+                    if worst_ms >= 60000 else f"{worst_ms // 1000:.0f}s"
+                )
                 # Consumer is dead — entry is orphaned.  XAUTOCLAIM should
                 # reclaim it on the next scheduler tick.  Time thresholds
                 # now make sense: we know the consumer is gone.
                 orphan_note = (
                     f"consumer={consumer_name} DEAD "
-                    f"(pid={c_pid} — no heartbeat key)"
+                    f"(pid={c_pid} — no heartbeat key)  worst_age={worst_age_str}"
                 )
-                if oldest_ms > PEL_ALERT_AGE_MS:
+                if worst_ms > PEL_ALERT_AGE_MS:
                     issues.append(Issue(Issue.ERROR, label,
                         f"{total} pending  oldest={age_str}  {orphan_note}  "
                         "— XAUTOCLAIM may be stuck; restart scheduler",
                         "python pipeline.py --scheduler",
                         alert_type=atype,
                     ))
-                elif oldest_ms > PEL_WARN_AGE_MS:
+                elif worst_ms > PEL_WARN_AGE_MS:
                     issues.append(Issue(Issue.WARNING, label,
                         f"{total} pending  oldest={age_str}  {orphan_note}  "
                         "— awaiting XAUTOCLAIM reclaim"))
@@ -947,7 +960,7 @@ def _check_pel_health(r, issues: list) -> None:
 # QUEUE HEALTH — MAIN CHECK
 # ─────────────────────────────────────────
 
-def check_queue_health(r) -> list:
+def check_queue_health(r, persist_snapshot: bool = True) -> list:
     """
     Detect queue stalls via velocity/delta tracking across watchdog cycles.
 
@@ -1018,34 +1031,53 @@ def check_queue_health(r) -> list:
         pass
 
     # ── 3. Persist current state for next cycle ───────────────────────────────
-    try:
-        r.set(WATCHDOG_SNAPSHOT_KEY, json.dumps({
-            "ts":               now,
-            "adp_total":        adp_total,
-            "adp_overdue":      adp_overdue,
-            "adp_head_c":       adp_head_c,
-            "adp_head_s":       adp_head_s,
-            "fs_total":         fs_total,
-            "fs_overdue":       fs_overdue,
-            "fs_head_c":        fs_head_c,
-            "fs_head_s":        fs_head_s,
-            "detail_adp_depth": detail_adp_depth,
-            "detail_fs_depth":  detail_fs_depth,
-            "scan_proc":        scan_proc,
-            "fs_proc":          fs_proc,
-            "detail_proc":      detail_proc,
-        }), ex=WATCHDOG_SNAPSHOT_TTL)
-    except Exception:
-        pass   # Redis write failure — don't crash; next cycle will try again
+    # Skip when called from --status / health_check.py so manual checks do not
+    # overwrite the snapshot the continuous watchdog uses for delta analysis.
+    if persist_snapshot:
+        try:
+            r.set(WATCHDOG_SNAPSHOT_KEY, json.dumps({
+                "ts":               now,
+                "adp_total":        adp_total,
+                "adp_overdue":      adp_overdue,
+                "adp_head_c":       adp_head_c,
+                "adp_head_s":       adp_head_s,
+                "fs_total":         fs_total,
+                "fs_overdue":       fs_overdue,
+                "fs_head_c":        fs_head_c,
+                "fs_head_s":        fs_head_s,
+                "detail_adp_depth": detail_adp_depth,
+                "detail_fs_depth":  detail_fs_depth,
+                "scan_proc":        scan_proc,
+                "fs_proc":          fs_proc,
+                "detail_proc":      detail_proc,
+            }), ex=WATCHDOG_SNAPSHOT_TTL)
+        except Exception:
+            pass   # Redis write failure — don't crash; next cycle will try again
 
     # ── 4. No prior snapshot → baseline cycle, no delta analysis ─────────────
     if snap is None:
-        issues.append(Issue(Issue.OK, "queue:poll:adaptive",
-            f"baseline — {adp_total} scheduled  {adp_overdue} overdue "
-            "(velocity tracking starts next cycle)"))
-        issues.append(Issue(Issue.OK, "queue:poll:fullscan",
-            f"baseline — {fs_total} scheduled  {fs_overdue} overdue"
-            + (" [lock active]" if fs_lock else "")))
+        # Even on the first cycle, an empty poll queue is unambiguously wrong —
+        # alert immediately rather than masking it as "baseline OK".
+        if adp_total == 0:
+            issues.append(Issue(Issue.ERROR, "queue:poll:adaptive",
+                "EMPTY on baseline — no companies scheduled; Redis may have been wiped.",
+                "python pipeline.py --rebuild",
+                alert_type="queue_poll_adaptive_empty",
+            ))
+        else:
+            issues.append(Issue(Issue.OK, "queue:poll:adaptive",
+                f"baseline — {adp_total} scheduled  {adp_overdue} overdue "
+                "(velocity tracking starts next cycle)"))
+        if fs_total == 0:
+            issues.append(Issue(Issue.ERROR, "queue:poll:fullscan",
+                "EMPTY on baseline — no fullscan companies scheduled.",
+                "python pipeline.py --rebuild",
+                alert_type="queue_poll_fullscan_empty",
+            ))
+        else:
+            issues.append(Issue(Issue.OK, "queue:poll:fullscan",
+                f"baseline — {fs_total} scheduled  {fs_overdue} overdue"
+                + (" [lock active]" if fs_lock else "")))
         for label, depth in [
             ("queue:detail:adaptive", detail_adp_depth),
             ("queue:detail:fullscan", detail_fs_depth),
@@ -1404,7 +1436,7 @@ def check_systemd_services() -> list:
     return issues
 
 
-def _run_all_checks(r) -> list:
+def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     issues = []
     # ── systemd service state (first — most direct signal) ────────────────────
     # check_systemd_services() is a no-op on non-systemd systems.
@@ -1412,7 +1444,7 @@ def _run_all_checks(r) -> list:
     # can miss during the heartbeat TTL grace period after a crash.
     issues.extend(check_systemd_services())
     issues.extend(check_worker_heartbeats(r))
-    issues.extend(check_queue_health(r))
+    issues.extend(check_queue_health(r, persist_snapshot=persist_snapshot))
     issues.extend(check_bloom_health(r))
     issues.extend(check_coverage(r))
     issues.extend(check_hung_workers(r))
@@ -1495,6 +1527,18 @@ def _attempt_heal(issue: Issue, r) -> bool:
         )
         return False
 
+    # Record the attempt BEFORE running the subprocess so a timeout or spawn
+    # error still counts toward the cooldown / max-attempt limits.  Without
+    # this, a consistently timing-out command would retry indefinitely.
+    count_key = _rkey("heal_count", issue.alert_type)
+    try:
+        r.incr(count_key)
+        r.expire(count_key, HEAL_ATTEMPT_WINDOW)
+        r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
+              ex=HEAL_ATTEMPT_WINDOW)
+    except Exception as _re:
+        logger.warning("watchdog: could not record heal attempt in Redis: %s", _re)
+
     try:
         with open(log_path, "a") as log_fh:
             ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1510,14 +1554,6 @@ def _attempt_heal(issue: Issue, r) -> bool:
                     stderr=subprocess.STDOUT,
                     timeout=60,
                 )
-                # Record attempt BEFORE checking success so failed foreground
-                # heals count toward the cooldown / max-attempt limits — otherwise
-                # a consistently failing command retries on every watchdog cycle.
-                count_key = _rkey("heal_count", issue.alert_type)
-                r.incr(count_key)
-                r.expire(count_key, HEAL_ATTEMPT_WINDOW)
-                r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
-                      ex=HEAL_ATTEMPT_WINDOW)
                 success = (result.returncode == 0)
                 if not success:
                     logger.warning(
@@ -1536,14 +1572,6 @@ def _attempt_heal(issue: Issue, r) -> bool:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,   # detach — survives watchdog exit
                 )
-
-        # Record the attempt (background path — foreground recorded it inline above)
-        if not is_fg:
-            count_key = _rkey("heal_count", issue.alert_type)
-            r.incr(count_key)
-            r.expire(count_key, HEAL_ATTEMPT_WINDOW)
-            r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
-                  ex=HEAL_ATTEMPT_WINDOW)
 
         logger.info(
             "watchdog: heal initiated for %r (attempt %d/%d) log=%s",
@@ -1887,7 +1915,7 @@ def run_watchdog(once: bool = False,
         )
 
     if status_only:
-        issues = _run_all_checks(r)
+        issues = _run_all_checks(r, persist_snapshot=False)
         _print_status(r_ok, r_info, pg_ok, pg_info, issues)
         return
 

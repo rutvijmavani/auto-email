@@ -242,7 +242,10 @@ def _build_health_section(stats, alerts, styles):
     #                      Falls back to companies_with_results for old stat rows.
     worker_covered  = stats.get("covered_by_workers", 0)
     fallback_hits   = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
-    total_covered   = worker_covered + fallback_hits
+    in_flight       = stats.get("in_flight", 0)
+    # Include in-flight scans optimistically so they don't vanish from coverage
+    # while actively running (consistent with _build_alerts in job_monitor.py).
+    total_covered   = worker_covered + fallback_hits + in_flight
     coverage_pct = int(total_covered / total * 100) if total else 0
     ats_pct = int(known_ats / total * 100) if total else 0
 

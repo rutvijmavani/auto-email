@@ -2089,9 +2089,12 @@ def _replace_dead_workers() -> None:
                 _consecutive_deaths[_wtype]      = 0
                 _death_streak_started_at[_wtype] = 0.0
 
-    # Publish updated pool state AFTER releasing the lock
-    if replacements:
-        _write_scheduler_health()
+    # Publish updated pool state AFTER releasing the lock.
+    # Always refresh — not just on replacements — so the key stays alive during
+    # stable periods (TTL = 10 min; liveness check runs every ~5 s).  Without
+    # periodic refresh the key expires when no workers die, making the watchdog
+    # report "scheduler:health missing — pool state unknown" on a healthy system.
+    _write_scheduler_health()
 
     # Emit scaling events outside the lock — DB write must not hold _pool_lock
     if replacements:

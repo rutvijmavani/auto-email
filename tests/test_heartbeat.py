@@ -98,6 +98,16 @@ class TestHeartbeatClass(unittest.TestCase):
         self.assertIn(str(os.getpid()), key1,
                       "Key must embed the current PID so concurrent workers don't collide")
 
+        hb2 = Heartbeat(r2, "scan_worker", lambda: 0, interval_s=10)
+        hb2.start()
+        hb2.stop()
+        key2 = r2.set.call_args[0][0]
+        self.assertIn(str(os.getpid()), key2,
+                      "Second worker key must also embed the PID")
+        # Both in the same process → same key format (per-PID multi-process isolation
+        # is by construction; different processes get different PIDs → different keys).
+        self.assertEqual(key1, key2)
+
     # ── TTL ───────────────────────────────────────────────────────────────────
 
     def test_ttl_is_3x_interval_s(self):

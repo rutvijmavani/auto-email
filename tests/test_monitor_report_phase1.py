@@ -340,7 +340,9 @@ class TestQueueHealthSection(unittest.TestCase):
     def _run(self, **kwargs):
         """Call _build_queue_health_section() with mocked Redis."""
         r = self._make_redis(**kwargs)
-        with patch("workers.redis_client.get_redis", return_value=r):
+        # _build_queue_health_section() uses `import redis as _redis_lib` locally
+        # and calls _redis_lib.from_url() — patch at the redis module level.
+        with patch("redis.from_url", return_value=r):
             import outreach.report_templates.monitor_report as mrep
             return mrep._build_queue_health_section()
 

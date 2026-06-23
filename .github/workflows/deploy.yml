@@ -93,10 +93,15 @@ jobs:
 
             echo "[6/7] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do
-              if systemctl cat "$svc" &>/dev/null; then
+              _cat_err=$(systemctl cat "$svc" 2>&1 >/dev/null)
+              _cat_exit=$?
+              if [[ $_cat_exit -eq 0 ]]; then
                 sudo systemctl restart "$svc"
-              else
+              elif echo "$_cat_err" | grep -qiE "No files found|not found|No such file"; then
                 echo "[WARN] $svc unit not installed yet — run deploy/install-systemd.sh"
+              else
+                echo "[ERROR] systemctl cat $svc failed (exit=$_cat_exit): $_cat_err"
+                exit 1
               fi
             done
 

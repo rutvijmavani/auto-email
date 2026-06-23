@@ -103,7 +103,11 @@ def analyse(queue_name: str, r, bucket_minutes: int):
         print(f"  {GREEN}  (no future polls scheduled){RESET}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
+    # Include the overdue bucket in max_pct so that 100%-overdue queues are
+    # not misreported as "healthy distribution" (all entries in future buckets=0).
     non_empty      = [len(v) for v in buckets.values() if v]
+    if overdue:
+        non_empty.append(len(overdue))
     max_pct        = max(non_empty) / total * 100 if non_empty else 0
     # Ideal = total companies spread evenly across ALL slots in a full 24 h
     # cycle — not just the occupied slots.  Dividing by occupied buckets only

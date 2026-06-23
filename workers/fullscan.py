@@ -571,18 +571,28 @@ def _complete_fullscan_db(
     conn = get_conn()
     try:
         conn.execute("""
-            UPDATE company_poll_stats SET
+            INSERT INTO company_poll_stats
+                (company, last_full_scan_at, next_full_scan_at,
+                 full_scan_interrupted, interrupted_at_page, interrupted_at,
+                 total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
+                 updated_at)
+            VALUES
+                (%s, NOW(), NOW() + (%s * INTERVAL '1 second'),
+                 FALSE, NULL, NULL,
+                 %s, %s, %s,
+                 NOW())
+            ON CONFLICT (company) DO UPDATE SET
                 last_full_scan_at        = NOW(),
                 next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
                 full_scan_interrupted    = FALSE,
                 interrupted_at_page      = NULL,
                 interrupted_at           = NULL,
-                total_new_jobs           = total_new_jobs + %s,
+                total_new_jobs           = company_poll_stats.total_new_jobs + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-            WHERE company = %s
-        """, (interval_s, new_jobs, int(duration_s), new_avg, company))
+        """, (company, interval_s, new_jobs, int(duration_s), new_avg,
+              interval_s, new_jobs, int(duration_s), new_avg))
         conn.commit()
     except Exception as exc:
         logger.error(
