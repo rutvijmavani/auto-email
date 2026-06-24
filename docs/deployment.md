@@ -1130,7 +1130,7 @@ No manual pre-step required. Just start the workers.
 
 Every time a company is rescheduled after a scan, the new time is chosen by the gap-detection algorithm rather than `now + interval` or random jitter:
 
-```
+```text
 window = interval × 20%  (e.g. 4.8 h on a 24 h fullscan cycle)
 fetch all existing scheduled times within the window from Redis
 find the largest gap between them
@@ -1143,7 +1143,7 @@ The algorithm guarantees maximum separation from the nearest scheduled neighbour
 
 For `poll:fullscan`, the algorithm also skips gap midpoints where the predicted scan duration (`avg_fullscan_duration_s` per-company EMA) would push completion past 7 AM ET. This ensures no scan is scheduled so late it cannot finish before the daily digest fires.
 
-```
+```text
 Skip gap midpoint if: midpoint + avg_fullscan_duration_s ≥ next 7 AM ET
 ```
 
@@ -1296,7 +1296,7 @@ The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `fail
 
 Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
 
-```
+```text
 scheduler:       writes every ~1s  TTL=15s   dead after 20s
 scan_worker:     writes every 10s  TTL=30s   dead after 45s
 detail_worker:   writes every 10s  TTL=30s   dead after 45s
@@ -1352,13 +1352,13 @@ An absolute count ("more than 10 overdue") doesn't scale — 10 out of 139 compa
 
 The watchdog saves a state snapshot to Redis at the end of every cycle. On the next cycle it compares three signals:
 
-```
+```text
 Signal 1 — Overdue count delta:      shrinking ↓ = draining, stable/growing → ↑ = problem
 Signal 2 — Queue head (company+score): changed = job was picked up; same = nothing moved
 Signal 3 — Worker processed count:   increased = worker completed jobs; same = worker idle
 ```
 
-```
+```text
 3/3 signals stalling → ERROR   (all agree: nothing moved → auto-restart)
 2/3 signals stalling → WARNING (likely stalling, watch next cycle)
 0-1 signals stalling → OK      (making progress, even if running behind)
@@ -1372,7 +1372,7 @@ A Workday full scan legitimately takes 20–30 minutes. During that time the pro
 
 **Alert triggers and auto-heal:**
 
-```
+```text
 poll:adaptive EMPTY  → ERROR   → auto-heal: python pipeline.py --rebuild
 poll:adaptive STALL  → ERROR   → auto-heal: restart recruiter-scheduler
 poll:fullscan EMPTY  → WARNING (normal briefly after rebuild, ignored if transient)
@@ -1411,7 +1411,7 @@ The old approach was: oldest PEL entry >10 min = WARNING, >30 min = ERROR. This 
 
 Each PEL entry records the consumer name, which embeds the worker's PID (e.g. `worker-myhost-18432`). The watchdog reads the current live heartbeat PID for that worker type and compares:
 
-```
+```text
 Consumer: worker-myhost-18432
 Heartbeat PID: 18432  → same  → worker is alive, job is in progress → OK (no alarm, ever)
 Heartbeat PID: 19001  → different → worker 18432 is dead → entry is orphaned
@@ -1420,7 +1420,7 @@ Heartbeat PID: missing  → worker is dead → entry is orphaned
 
 Time thresholds only apply once the consumer is **confirmed dead**:
 
-```
+```text
 Orphaned entry < 10 min  → OK      (XAUTOCLAIM will reclaim it shortly)
 Orphaned entry > 10 min  → WARNING (XAUTOCLAIM should have caught this by now)
 Orphaned entry > 30 min  → ERROR   (XAUTOCLAIM itself may be stuck)
@@ -1889,7 +1889,7 @@ The scripts in `deploy/` handle all server-side setup. Run these once when setti
        #
        # After this script completes successfully, use deploy/deploy.sh
        # for every subsequent code update — never run first_time_setup.sh again.
-□ 19. (Emergency only) Redistribute ZSET scores — SKIP on normal deploys.
+□ 18. (Emergency only) Redistribute ZSET scores — SKIP on normal deploys.
        # Use ONLY if scores are corrupted while the scheduler is already
        # running and a restart is not possible. rebuild_redis() handles all
        # normal cases (fresh deploy, long outage, brief restart) automatically.

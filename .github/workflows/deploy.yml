@@ -93,7 +93,7 @@ jobs:
 
             echo "[6/7] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do
-              _cat_err=$(systemctl cat "$svc" 2>&1 >/dev/null)
+              _cat_err=$(systemctl cat "$svc" 2>&1 >/dev/null) || true
               _cat_exit=$?
               if [[ $_cat_exit -eq 0 ]]; then
                 sudo systemctl restart "$svc"

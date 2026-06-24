@@ -214,11 +214,8 @@ class TestHeartbeatClass(unittest.TestCase):
         r.set.side_effect = ConnectionError("Redis down")
         from workers.heartbeat import Heartbeat
         hb = Heartbeat(r, "scan_worker", lambda: 0, interval_s=10)
-        try:
-            hb.start()
-            hb.stop()
-        except Exception as exc:
-            self.fail(f"Redis failure should be swallowed, got: {exc}")
+        hb.start()
+        hb.stop()
 
     def test_write_exception_does_not_kill_thread(self):
         """Even if _write() raises, calling it again works (swallows each time)."""

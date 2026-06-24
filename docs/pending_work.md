@@ -1,6 +1,6 @@
 # Pending Work — Job Pipeline
 
-Last updated: 2026-05-28
+Last updated: 2026-06-23
 
 Everything that needs to be implemented, in priority order.
 Items marked ✅ are done locally but not yet deployed.

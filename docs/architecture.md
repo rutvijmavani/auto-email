@@ -150,7 +150,7 @@ verify_filled_stats table (daily run metrics)
 
 ### Continuous adaptive polling flow
 
-```
+```text
 PostgreSQL (company list)
     ↓ rebuild_redis() at startup
 poll:adaptive ZSET (scored by next_poll_at timestamp)
@@ -260,7 +260,7 @@ Every time a company is rescheduled — after an adaptive scan (`_reschedule_ada
 
 **Algorithm:**
 
-```
+```text
 window_s = interval_s × tolerance_pct     # e.g. 20% of 86400 s = 17,280 s = 4.8 h
 lo       = target_ts − window_s / 2
 hi       = target_ts + window_s / 2
@@ -282,7 +282,7 @@ The gap algorithm works at arbitrary resolution. If 50 companies are already sch
 
 **Self-correction from full clustering:**
 
-```
+```text
 Day 1: 139 companies all at T  →  all gaps = window_s / 139 ≈ 125 s
        Each gets a different midpoint → 139 evenly spaced times
 Day 2: window now has 139 points spread evenly → gaps are equal → any midpoint is fine
@@ -308,7 +308,7 @@ A Workday scan can take 20–30 minutes. If a company is scheduled at 6:45 AM ET
 
 `avg_fullscan_duration_s` is a per-company EMA stored in `company_poll_stats`:
 
-```
+```text
 new_avg = 0.3 × last_duration_s + 0.7 × prev_avg
 ```
 
@@ -571,7 +571,7 @@ r.xpending_range(stream_key, group, "-", "+", count=1)  # oldest entry details
 
 `xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:18432` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
 
-```
+```text
 Consumer name:     worker-myhost-18432
 EXISTS worker:alive:scan_worker:18432  → 1 → worker is alive, job is in progress → OK
 EXISTS worker:alive:scan_worker:18432  → 0 → worker 18432 is dead → entry is orphaned
@@ -713,7 +713,7 @@ Redis forks a background process that looks at the current in-memory state and w
 
 Two control knobs set by `configure-redis.sh`:
 
-```
+```text
 auto-aof-rewrite-percentage 100   # rewrite when AOF doubles vs post-rewrite baseline
 auto-aof-rewrite-min-size   64mb  # but not until the file is at least this large
 ```
@@ -757,7 +757,7 @@ If any check fails, the worker exits immediately with a clear, human-readable er
 The detail queue (which holds job IDs waiting for full detail fetches) uses a "processing list" pattern rather than a simple pop.
 
 **Per-PID inflight keys:** Each `detail_worker` process uses its own inflight list keyed by PID:
-```
+```text
 queue:detail:adaptive:inflight:{pid}
 queue:detail:fullscan:inflight:{pid}
 ```

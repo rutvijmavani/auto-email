@@ -29,10 +29,13 @@ Exit code is 0 if everything is OK or WARNING-only; 1 if any ERROR or CRITICAL.
 """
 
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bootstrap — ensure project root is on sys.path

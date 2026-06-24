@@ -51,7 +51,7 @@ CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
 # Count commits we're about to pull in
-BEHIND=$(git rev-list --count HEAD..origin/$(git rev-parse --abbrev-ref HEAD) 2>/dev/null || echo "?")
+BEHIND=$(git rev-list --count "HEAD..origin/$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || echo "?")
 echo "  Current commit : $CURRENT_SHA"
 echo "  Commits behind : $BEHIND"
 

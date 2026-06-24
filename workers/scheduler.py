@@ -931,12 +931,14 @@ def _pick_schedule_time(
 
     for _gap_size, gap_lo, gap_hi in gaps:
         midpoint = (gap_lo + gap_hi) / 2
-        if avg_duration_s > 0:
+        if deadline_ts and avg_duration_s > 0:
             # Compute the correct deadline for THIS candidate: the 7 AM that
             # immediately follows the midpoint's local clock (not target_ts's).
             # A candidate before midnight uses today's 7 AM; one after midnight
             # uses the same day's 7 AM — which is different from target_ts's
             # deadline when the window straddles midnight.
+            # Only checked when deadline_ts was explicitly passed by the caller
+            # (fullscan callers) — adaptive callers never pass deadline_ts.
             candidate_deadline = _next_digest_deadline(midpoint)
             if midpoint + avg_duration_s >= candidate_deadline:
                 continue   # scan would not finish before 7 AM — try next gap
@@ -1429,6 +1431,18 @@ def adaptive_loop() -> None:
                 # Keep inflight ZSET for Phase 10 fast_error_check compatibility
                 r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
                 _hw_dispatched += 1
+
+                # Refresh heartbeat mid-loop so a large backlog (many companies
+                # due at once) doesn't let the 15s TTL expire before the outer
+                # loop iteration writes it again.
+                try:
+                    r.set("worker:alive:scheduler", json.dumps({
+                        "pid":        os.getpid(),
+                        "ts":         time.time(),
+                        "dispatched": _hw_dispatched,
+                    }), ex=15)
+                except Exception:
+                    pass
 
                 logger.debug(
                     "adaptive_loop: dispatched %r to %s (dc=%s context=%s)",

@@ -588,7 +588,7 @@ def _complete_fullscan_db(
                 full_scan_interrupted    = FALSE,
                 interrupted_at_page      = NULL,
                 interrupted_at           = NULL,
-                total_new_jobs           = company_poll_stats.total_new_jobs + %s,
+                total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
@@ -1120,6 +1120,14 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 result["duration_ms"]  = int(duration_s * 1000)
                 result["completed_at"] = datetime.now(timezone.utc).isoformat()
 
+                logger.info(
+                    "fullscan [%s]: completed — new=%d duration=%.0fs "
+                    "next_scan_in=%.1fh avg_duration=%.0fs",
+                    company, new_count, duration_s,
+                    (next_scan_at - now) / 3600,
+                    0.3 * duration_s + 0.7 * avg_duration_s,
+                )
+
                 # ── Bootstrap new companies into WARMING adaptive cycle ───────
                 # Only after successful DB write — adaptive polling must start
                 # from a persisted baseline, not an in-memory-only scan result.
@@ -1155,14 +1163,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                         "fullscan [%s]: DB write failed and reschedule failed: %s",
                         company, _sched_err,
                     )
-
-            logger.info(
-                "fullscan [%s]: completed — new=%d duration=%.0fs "
-                "next_scan_in=%.1fh avg_duration=%.0fs",
-                company, new_count, duration_s,
-                (next_scan_at - now) / 3600,
-                0.3 * duration_s + 0.7 * avg_duration_s,
-            )
 
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)

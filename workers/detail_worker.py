@@ -400,6 +400,13 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 "detail_worker: no ATS module for platform=%s company=%r job_id=%s",
                 platform, company, job_id,
             )
+            try:
+                delete_pending_detail(company, job_id)
+            except Exception as _del_err:
+                logger.error(
+                    "detail_worker: delete_pending_detail failed for %s: %s",
+                    job_id, _del_err,
+                )
             return result
 
         # slug_info comes serialized in the queue payload (str or dict)
@@ -916,15 +923,16 @@ def run_worker(once: bool = False, shutdown_event=None,
                 logger.warning(
                     "detail_worker: transient error — leaving job_id=%s "
                     "company=%r in inflight; exiting so _recover_stuck_jobs() "
-                    "can reclaim it on the next startup (heartbeat must expire "
-                    "first for recovery to trigger)",
+                    "can reclaim it on the next startup",
                     result.get("job_id"), result.get("company"),
                 )
-                # Stop the worker so the scheduler respawns it.  The new worker
-                # calls _recover_stuck_jobs() at startup, finds this inflight
-                # item (heartbeat TTL will have expired), and requeues it.
-                # Staying alive would keep the heartbeat fresh, preventing
-                # _recover_stuck_jobs() from ever reclaiming the stuck item.
+                # Delete our heartbeat key immediately so a respawned worker
+                # that starts before the TTL expires can still reclaim this
+                # inflight item via _recover_stuck_jobs() without waiting 30s.
+                try:
+                    r.delete(f"worker:alive:detail_worker:{os.getpid()}")
+                except Exception:
+                    pass
                 break
             else:
                 r.lrem(inflight_key, 1, raw)

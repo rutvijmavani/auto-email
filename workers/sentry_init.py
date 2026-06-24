@@ -67,6 +67,8 @@ _PFX_ERR = "sentry:err:"
 _PFX_ACT = "sentry:act:"
 _PFX_TS  = "sentry:ts:"
 
+logger = logging.getLogger(__name__)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fingerprinting
