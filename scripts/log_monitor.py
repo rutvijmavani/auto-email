@@ -128,7 +128,7 @@ def _get_redis():
     so the scanner degrades gracefully.
     """
     try:
-        from workers.scheduler import get_redis
+        from workers.redis_client import get_redis
         return get_redis()
     except Exception:
         pass
@@ -175,7 +175,10 @@ def _fingerprint(line: str, context: list[str]) -> str:
     for _check_line in all_lines:
         m = re.search(r'File "([^"]+)", line (\d+)', _check_line)
         if m:
-            fname  = Path(m.group(1)).name
+            _p     = Path(m.group(1))
+            # Preserve parent dir so files with the same basename in different
+            # modules (e.g. workers/utils.py vs jobs/utils.py) don't collide.
+            fname  = f"{_p.parent.name}/{_p.name}"
             lineno = m.group(2)
             location = f"{fname}:{lineno}"
             break

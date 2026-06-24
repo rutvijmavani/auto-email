@@ -1219,16 +1219,17 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     from workers.sentry_init import init_sentry
     init_sentry()
 
-    if not skip_init_db:
-        init_db()
-
-    # ── Startup validation (Redis + PostgreSQL + required config) ────────────
+    # ── Startup validation before init_db() so infra failures produce a clear
+    # STARTUP FAILED message rather than an opaque DB initialisation error.
     from workers.startup import validate_startup
     validate_startup("fullscan_worker",
                      check_redis=True,
                      check_db=True,          # always verify DB reachability even when
                                              # skip_init_db=True (scheduler-managed run)
                      check_config=True)
+
+    if not skip_init_db:
+        init_db()
 
     r = get_redis()
     _ensure_consumer_group(r)

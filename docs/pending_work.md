@@ -17,8 +17,8 @@ is done so we don't ship a half-broken file.
 **Problem:** Email/PDF showed "Coverage: 28/139 (20%)" instead of "111/139 (80%)".
 `companies_with_results` was only counting fallback-fetched missed companies,
 not the 111 already covered by scan workers.  
-**Fix applied:** `total_covered = covered_by_workers + companies_with_results`.
-Email now shows breakdown: "111 by workers + 0 by job monitor fallback".
+**Fix applied:** `total_covered = covered_by_workers + fallback_scanned + in_flight`.
+Email now shows breakdown: "111 by workers + 9 by job monitor (6 with jobs, 3 empty) + 2 in-flight".
 
 ### 1.2 Remove premature _least_loaded_slot() from scheduler.py ✅ DONE
 **File:** `workers/scheduler.py`  

@@ -1025,7 +1025,7 @@ class TestCheckPelHealthPID(unittest.TestCase):
         self.assertTrue(any(i.level == Issue.ERROR for i in stream_issues))
 
     def test_unparseable_consumer_name_treated_as_dead(self):
-        """Consumer name without trailing PID → _consumer_pid returns None → treated as dead."""
+        """Consumer name without trailing PID → _consumer_pid returns None → treated as dead → ERROR."""
         from workers.watchdog import Issue, PEL_ALERT_AGE_MS
         issues = self._run(
             pending=1,
@@ -1034,8 +1034,9 @@ class TestCheckPelHealthPID(unittest.TestCase):
             heartbeat_pid=1234,
         )
         stream_issues = [i for i in issues if "PEL" in i.category]
-        # Should NOT be OK (dead consumer path)
-        self.assertFalse(all(i.level == Issue.OK for i in stream_issues))
+        # Orphaned entry past PEL_ALERT_AGE_MS must escalate to ERROR
+        self.assertTrue(any(i.level == Issue.ERROR for i in stream_issues),
+                        f"Expected ERROR for dead consumer past PEL_ALERT_AGE_MS; got {[i.level for i in stream_issues]}")
 
     def test_xpending_error_produces_warning_not_crash(self):
         from workers.watchdog import Issue

@@ -288,18 +288,18 @@ class TestValidateStartup(unittest.TestCase):
         self.assertIn("STARTUP FAILED", err_buf.getvalue())
 
     def test_check_redis_false_skips_redis(self):
-        """check_redis=False → Redis not touched even if it would fail."""
+        """check_redis=False → ping is never called, even if it would fail."""
         mock_conn = MagicMock()
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", return_value=mock_conn):
-            # ping is NOT mocked — if called it would hit real Redis or fail
-            # check_redis=False must prevent any Redis call
+             patch("db.db.get_conn", return_value=mock_conn), \
+             patch("workers.redis_client.ping",
+                   side_effect=AssertionError("ping must not be called when check_redis=False")) as mock_ping:
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_redis=False, check_config=False)
             except SystemExit as exc:
                 self.fail(f"Should not exit when check_redis=False, got exit({exc.code})")
+            mock_ping.assert_not_called()
 
     # ── DB check ─────────────────────────────────────────────────────────────
 

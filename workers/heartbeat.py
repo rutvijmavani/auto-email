@@ -106,8 +106,12 @@ class Heartbeat:
         return self
 
     def stop(self) -> None:
-        """Signal the thread to stop.  Returns immediately (thread is daemon)."""
+        """Signal the thread to stop and delete the heartbeat key immediately."""
         self._stop.set()        # unblocks _stop.wait() on the next sleep boundary
+        try:
+            self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
+        except Exception:
+            pass    # best-effort; TTL will expire the key if Redis is unavailable
 
     # ── internals ─────────────────────────────────────────────────────────────
 

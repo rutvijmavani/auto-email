@@ -1409,13 +1409,12 @@ The old approach was: oldest PEL entry >10 min = WARNING, >30 min = ERROR. This 
 
 **How it actually works — consumer liveness:**
 
-Each PEL entry records the consumer name, which embeds the worker's PID (e.g. `worker-myhost-18432`). The watchdog reads the current live heartbeat PID for that worker type and compares:
+Each PEL entry records the consumer name, which embeds the worker's PID (e.g. `worker-myhost-18432`). The watchdog extracts the PID from the consumer name and checks whether the per-PID heartbeat key `worker:alive:{type}:{pid}` is present in Redis:
 
 ```text
 Consumer: worker-myhost-18432
-Heartbeat PID: 18432  → same  → worker is alive, job is in progress → OK (no alarm, ever)
-Heartbeat PID: 19001  → different → worker 18432 is dead → entry is orphaned
-Heartbeat PID: missing  → worker is dead → entry is orphaned
+worker:alive:fullscan_worker:18432 → exists   → worker is alive, job is in progress → OK (no alarm, ever)
+worker:alive:fullscan_worker:18432 → missing  → worker 18432 is dead → entry is orphaned
 ```
 
 Time thresholds only apply once the consumer is **confirmed dead**:

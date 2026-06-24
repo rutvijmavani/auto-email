@@ -1013,10 +1013,20 @@ def _atomic_schedule(
             # reproducible, unique spread within ±(interval_s * 5%) of target_ts.
             import hashlib as _hashlib
             _hash_int = int(_hashlib.md5(company.encode(), usedforsecurity=False).hexdigest(), 16)
-            _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
-            score = target_ts + _jitter_s
-            if deadline_ts:
-                score = min(score, deadline_ts - avg_duration_s)
+            if deadline_ts and (deadline_ts - avg_duration_s) > target_ts:
+                # Spread jitter within the remaining safe window so multiple
+                # concurrent lock-busy callers don't all clamp to the same score.
+                _safe_window = (deadline_ts - avg_duration_s) - target_ts
+                _jitter_s = int(
+                    (_hash_int % max(1, int(_safe_window * 0.10)))
+                    - _safe_window * 0.05
+                )
+                score = target_ts + _jitter_s
+            else:
+                _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
+                score = target_ts + _jitter_s
+                if deadline_ts:
+                    score = min(score, deadline_ts - avg_duration_s)
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,

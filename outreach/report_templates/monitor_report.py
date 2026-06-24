@@ -616,13 +616,19 @@ def _build_queue_health_section() -> str:
             f'<td style="{td}">detail:adaptive</td>'
             f'<td style="{td}">{_depth_cell(detail_adp, 100, 500)}</td>'
             f'<td style="{td}">—</td>'
-            f'<td style="{td}">{_status_cell(detail_adp, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
             f'</tr>'
             f'<tr style="background:#f8fafc;">'
             f'<td style="{td}">detail:fullscan</td>'
             f'<td style="{td}">{_depth_cell(detail_fs, 100, 500)}</td>'
             f'<td style="{td}">—</td>'
-            f'<td style="{td}">{_status_cell(detail_fs, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
+            f'</tr>'
+            f'<tr style="background:#eff6ff;">'
+            f'<td style="{td}"><strong>detail total</strong></td>'
+            f'<td style="{td}">{_depth_cell(detail_total, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
+            f'<td style="{td}">{_status_cell(detail_total, 100, 500)}</td>'
             f'</tr>'
             f'<tr style="background:#ffffff;">'
             f'<td style="{td}">poll:adaptive</td>'
@@ -1289,6 +1295,8 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         if _fb_empty:
             _breakdown += f", {_fb_empty} empty"
         _cov_detail += f", {_fallback_hits} by fallback ({_breakdown})"
+    if _in_flight:
+        _cov_detail += f" + {_in_flight} in-flight"
     coverage = f"{_total_covered}/{_total} ({_cov_pct}%)"
 
     body_html = f"""

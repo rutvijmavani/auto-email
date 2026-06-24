@@ -148,6 +148,16 @@ def _compute_act_ttl(r, ts_key: str) -> int:
     return max(MIN_ACT_TTL_S, min(MAX_ACT_TTL_S, ttl))
 
 
+# Atomic dedup: SET NX err_key, EXISTS act_key, SET act_key — all in one call
+# so concurrent workers cannot both forward the same error.
+# Returns [{OK|nil}, {0|1}] — is_new and act_active.
+_DEDUP_LUA = """
+local is_new     = redis.call('SET', KEYS[1], '1', 'EX', tonumber(ARGV[1]), 'NX')
+local act_active = redis.call('EXISTS', KEYS[2])
+redis.call('SET', KEYS[2], '1', 'EX', tonumber(ARGV[2]))
+return {is_new, act_active}
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # before_send hook
 # ─────────────────────────────────────────────────────────────────────────────
@@ -184,12 +194,13 @@ def _make_before_send(r):
             _update_frequency(r, ts_key)
             act_ttl = _compute_act_ttl(r, ts_key)
 
-            # Atomic check-and-set: SET NX returns truthy only when the key
-            # was newly created by *this* call.  Concurrent workers that race
-            # here will all see is_new=None and suppress — no duplicate events.
-            is_new = r.set(err_key, "1", ex=DEDUP_WINDOW_S, nx=True)
-            act_active = r.exists(act_key)   # check BEFORE refreshing
-            r.set(act_key, "1", ex=act_ttl)
+            # Atomic dedup via Lua script — SET NX err_key, EXISTS act_key,
+            # SET act_key all in one round-trip so concurrent workers cannot
+            # both see act_active=False and forward the same event.
+            _res       = r.eval(_DEDUP_LUA, 2, err_key, act_key,
+                                DEDUP_WINDOW_S, act_ttl)
+            is_new     = _res[0]   # 'OK' if newly created, None if already existed
+            act_active = _res[1]   # 1 if act_key existed, 0 if not
 
             if not is_new and act_active:
                 return None               # Known active error — drop, zero Sentry credits

@@ -928,7 +928,19 @@ def run_worker(once: bool = False, shutdown_event=None,
                     )
                 break
             else:
-                r.lrem(inflight_key, 1, raw)
+                try:
+                    r.lrem(inflight_key, 1, raw)
+                except Exception as _lrem_err:
+                    # If ack fails the item stays in inflight indefinitely while
+                    # this worker is alive (recover_stuck_jobs skips live PIDs).
+                    # Safest: exit so the next startup can reclaim the item.
+                    logger.error(
+                        "detail_worker: lrem failed for job_id=%s — "
+                        "leaving in inflight; exiting for recovery: %s",
+                        payload.get("job_id"), _lrem_err,
+                    )
+                    _hb.stop()
+                    break
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]
