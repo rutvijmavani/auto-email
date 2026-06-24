@@ -507,9 +507,9 @@ class TestRescheduleAdaptiveGapBased(unittest.TestCase):
         try:
             _reschedule_adaptive(company, interval_s)
         finally:
-            for p, c in zip(reversed(patches), reversed(ctx)):
+            for p, _ in zip(reversed(patches), reversed(ctx), strict=True):
                 p.__exit__(None, None, None)
-        score = list(r.zadd.call_args[0][1].values())[0]
+        score = next(iter(r.zadd.call_args[0][1].values()))
         return r, score
 
     def test_zadd_called_exactly_once(self):

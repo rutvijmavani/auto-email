@@ -33,7 +33,7 @@ Coverage map
   TestWatchdogHelperFunctions
     · _consumer_pid("worker-host-12345") → 12345
     · _consumer_pid("bad-format") → None
-    · _consumer_pid(bytes) → None (bytes not supported; call site always decodes first)
+    · _consumer_pid(bytes) → int  (bytes are decoded within the function)
     · _trend(-5) → "↓"
     · _trend(0)  → "→"
     · _trend(3)  → "↑"

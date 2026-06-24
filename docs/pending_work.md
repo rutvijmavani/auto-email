@@ -153,7 +153,7 @@ python scripts/health_check.py             # instant full status
 `workers/scheduler.py`  
 **Key:** `worker:alive:{type}:{pid}` with appropriate TTL per worker  
 **Payload:** `{"pid": os.getpid(), "processed": count, "ts": time.time()}`  
-**TTLs:** scheduler=15s, scan_worker=30s, detail_worker=30s, fullscan_worker=1800s
+**TTLs:** scheduler=15s, scan_worker=30s, detail_worker=30s, fullscan_worker=180s
 
 ### 3.3 workers/watchdog.py ✅ DONE (complete rewrite + systemd wired)
 **Purpose:** Runs continuously under systemd. Checks all components every 5 min,

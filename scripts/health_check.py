@@ -241,8 +241,8 @@ def run_health_check() -> int:
                                 )
                         if cursor == 0:
                             break
-                except Exception:
-                    pass
+                except Exception as _scan_err:
+                    logger.debug("health_check: Redis scan/parse failed: %s", _scan_err)
 
                 pid_str = f"  [{' | '.join(pid_details)}]" if pid_details else ""
                 base    = (

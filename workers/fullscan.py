@@ -601,6 +601,7 @@ def _complete_fullscan_db(
             "fullscan: _complete_fullscan_db failed for %r: %s",
             company, exc, exc_info=True,
         )
+        conn.rollback()
         return False
     finally:
         conn.close()
@@ -1118,6 +1119,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 result["success"]      = True
                 result["duration_ms"]  = int(duration_s * 1000)
                 result["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+                # ── Bootstrap new companies into WARMING adaptive cycle ───────
+                # Only after successful DB write — adaptive polling must start
+                # from a persisted baseline, not an in-memory-only scan result.
+                if is_first_fullscan:
+                    try:
+                        _bootstrap_warming_adaptive(company, r)
+                    except Exception as bw_exc:
+                        # Non-fatal — fall back to immediate ZADD so company isn't lost
+                        logger.error(
+                            "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
+                            "falling back to immediate ZADD",
+                            company, bw_exc,
+                        )
+                        from config import ADAPTIVE_DEFAULT_INTERVAL
+                        r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
             else:
                 result["outcome"] = "error"
                 result["success"] = False
@@ -1146,23 +1163,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 (next_scan_at - now) / 3600,
                 0.3 * duration_s + 0.7 * avg_duration_s,
             )
-
-            # ── Bootstrap new companies into WARMING adaptive cycle ───────────
-            # is_first_fullscan = last_poll_at was NULL before this scan ran.
-            # Use the deterministic slot-offset approach so companies spread
-            # across the day instead of all bootstrapping at midnight+0.
-            if is_first_fullscan:
-                try:
-                    _bootstrap_warming_adaptive(company, r)
-                except Exception as bw_exc:
-                    # Non-fatal — fall back to immediate ZADD so company isn't lost
-                    logger.error(
-                        "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
-                        "falling back to immediate ZADD",
-                        company, bw_exc,
-                    )
-                    from config import ADAPTIVE_DEFAULT_INTERVAL
-                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
 
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)

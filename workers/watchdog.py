@@ -607,7 +607,7 @@ def check_worker_heartbeats(r) -> list:
     # ── 2. Pool health from scheduler:health ─────────────────────────────────
     WARN_DEATHS  = 3
     ERR_DEATHS   = 5
-    _HEALTH_MISS_KEY       = _rkey("pool_health_miss_count")
+    _HEALTH_MISS_KEY       = _rkey("pool_health_miss_count", "worker_pool_health")
     _HEALTH_MISS_THRESHOLD = 3   # consecutive misses before escalating to ERROR
     health_raw   = r.get("scheduler:health")
 

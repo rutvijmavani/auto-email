@@ -186,14 +186,15 @@ def _make_before_send(r):
             # was newly created by *this* call.  Concurrent workers that race
             # here will all see is_new=None and suppress — no duplicate events.
             is_new = r.set(err_key, "1", ex=DEDUP_WINDOW_S, nx=True)
+            act_active = r.exists(act_key)   # check BEFORE refreshing
             r.set(act_key, "1", ex=act_ttl)
 
-            if not is_new:
-                return None               # Known error — drop, zero Sentry credits
+            if not is_new and act_active:
+                return None               # Known active error — drop, zero Sentry credits
 
-        except Exception:
+        except Exception as _dedup_err:
             # Never let dedup logic prevent error reporting
-            pass
+            logger.debug("sentry dedup error (ignored): %s", _dedup_err, exc_info=True)
 
         return event
 
@@ -228,8 +229,8 @@ def init_sentry(
     try:
         from dotenv import load_dotenv
         load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-    except Exception:
-        pass
+    except Exception as _env_err:
+        logger.debug("sentry .env load failed (ignored): %s", _env_err, exc_info=True)
 
     dsn = os.environ.get("SENTRY_DSN", "").strip()
     if not dsn:

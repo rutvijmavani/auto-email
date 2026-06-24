@@ -722,6 +722,28 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         actual_avg = result["params"][5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
 
+    def test_persistence_contract(self):
+        """_complete_fullscan_db returns True, commits, and INSERT/UPDATE share the same EMA."""
+        mock_conn = MagicMock()
+        captured = {}
+        mock_conn.execute.side_effect = lambda sql, params=None: captured.update(
+            {"sql": sql, "params": params}
+        )
+
+        with patch("workers.fullscan.get_conn", return_value=mock_conn):
+            from workers.fullscan import _complete_fullscan_db
+            ok = _complete_fullscan_db(
+                company="Acme", platform="workday",
+                new_jobs=5, interval_s=86400,
+                duration_s=600.0, prev_avg_duration_s=30.0,
+            )
+
+        self.assertTrue(ok)
+        mock_conn.commit.assert_called_once()
+        params = captured["params"]
+        # INSERT new_avg at index 5 must equal UPDATE new_avg at index 9
+        self.assertEqual(params[5], params[9])
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestInflightFullscanLifecycle  (Phase 2 — inflight:fullscan ZSET tracking)

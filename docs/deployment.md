@@ -1388,7 +1388,7 @@ Detail queues have no auto-heal because a growing detail queue usually means the
 - Poll queue alerts → none unless escalated (auto-heal fires first)
 - Detail queue alerts → check if detail_worker is alive:
   ```bash
-  redis-cli KEYS "worker:alive:detail_worker:*"
+  redis-cli --scan --pattern "worker:alive:detail_worker:*"
   ```
   Missing or stale → `sudo systemctl restart recruiter-scheduler`
   Alive but queue growing → workers overloaded, check logs: `journalctl -u recruiter-scheduler -n 100`
@@ -1500,7 +1500,7 @@ Coverage alert:
 - If a specific ATS is down → scheduler puts that platform in outage mode automatically; wait for it to recover
 
 Stuck `pending_detail` alert:
-- Check detail_worker heartbeat: `redis-cli KEYS "worker:alive:detail_worker:*"`
+- Check detail_worker heartbeat: `redis-cli --scan --pattern "worker:alive:detail_worker:*"`
 - If missing → `sudo systemctl restart recruiter-scheduler`
 - If alive but queue growing → detail workers overloaded; check logs
 
@@ -1800,7 +1800,7 @@ If the scheduler is up but workers are missing:
 
 ```bash
 # Check worker heartbeats in Redis
-redis-cli --scan --pattern "heartbeat:*"
+redis-cli --scan --pattern "worker:alive:*"
 
 # If queues are empty, rebuild from PostgreSQL
 python pipeline.py --rebuild
