@@ -145,11 +145,11 @@ def _check_redis(prefix: str) -> None:
 
 def _check_postgres(prefix: str) -> None:
     """Verify PostgreSQL is reachable and the schema is accessible."""
+    conn = None
     try:
         from db.db import get_conn
         conn = get_conn()
         conn.execute("SELECT 1").fetchone()
-        conn.close()
         logger.debug("%s PostgreSQL check passed", prefix)
     except Exception as exc:
         db_url_raw = os.getenv("DATABASE_URL", "(not set)")
@@ -174,3 +174,9 @@ def _check_postgres(prefix: str) -> None:
         print(msg, file=sys.stderr)
         logger.error("%s startup: PostgreSQL check failed: %s", prefix, exc)
         sys.exit(1)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass

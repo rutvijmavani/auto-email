@@ -196,15 +196,19 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                     )
                     continue
 
-                # Peer is dead — drain its items to the tail of the source queue
-                # (consumers pop from RIGHT so RPUSH puts them next in line).
-                # Enforce a hard retry cap: permanently discard jobs that have
-                # already failed _MAX_DETAIL_RETRIES times so a poisoned job
-                # cannot occupy the queue across indefinite restarts.
+                # Peer is dead — drain its items to the tail of the source queue.
+                # Use LMOVE for the pop so the item is never absent from both
+                # queues simultaneously; a crash between rpop+rpush would have
+                # lost the job permanently (Bug: non-atomic drain).
+                # LMOVE RIGHT→RIGHT: source list = inflight key (right pop),
+                # destination = source_queue (right push, consumed next).
+                # Retry-cap check runs after the atomic move; if over the limit
+                # we remove the item from source_queue with lrem (best-effort,
+                # the processing window is tiny).
                 recovered = 0
                 discarded = 0
                 while True:
-                    raw = r.rpop(key)
+                    raw = r.lmove(key, source_key, "RIGHT", "RIGHT")
                     if raw is None:
                         break
 
@@ -230,6 +234,14 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                                 "%d retries — discarding permanently",
                                 _job_id, _company, _MAX_DETAIL_RETRIES,
                             )
+                            # Item was already moved to source_key by LMOVE;
+                            # remove it (best-effort — another worker could grab
+                            # it first, but that worker will also discard on
+                            # the retry check).
+                            try:
+                                r.lrem(source_key, 1, raw)
+                            except Exception:
+                                pass
                             try:
                                 delete_pending_detail(_company, _job_id)
                             except Exception as _db_err:
@@ -240,8 +252,7 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                             discarded += 1
                             continue
 
-                    r.rpush(source_key, raw)
-                    recovered += 1
+                    recovered += 1  # item already in source_key via LMOVE
 
                 if recovered:
                     logger.warning(

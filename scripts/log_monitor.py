@@ -128,10 +128,19 @@ def _get_redis():
     so the scanner degrades gracefully.
     """
     try:
-        from workers.redis_client import get_redis
-        return get_redis()
-    except Exception:
+        from workers.redis_client import get_redis as _project_get_redis
+    except ImportError:
         pass
+    else:
+        # workers.redis_client is available — use its singleton client.
+        # Do NOT swallow runtime errors here: if the import succeeds but
+        # get_redis() fails, the direct fallback below may point to a
+        # different Redis backend (e.g. different REDIS_URL resolution).
+        try:
+            return _project_get_redis()
+        except Exception:
+            return None   # Redis unavailable — degrade gracefully, no fallback client
+    # workers.redis_client not importable (standalone / outside project tree)
     try:
         import redis as _redis
         from dotenv import load_dotenv
@@ -273,9 +282,7 @@ def scan_file(
                 if lines[j].strip() and not _is_suppressed(lines[j])
             ]
             findings.append((line, context))
-            i += 1 + CONTEXT_LINES   # skip past captured context
-        else:
-            i += 1
+        i += 1
 
     return new_offset, findings
 

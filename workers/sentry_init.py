@@ -162,6 +162,62 @@ return {is_new, act_active}
 # before_send hook
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _make_lazy_before_send():
+    """
+    Return a before_send that acquires (or re-acquires) a Redis client on
+    demand, so dedup works even when Redis is unavailable at init_sentry() time
+    and recovers later in the worker's lifetime.
+
+    The client is cached after the first successful ping; on any Redis error the
+    cache is cleared so the next event triggers a fresh connection attempt.
+    """
+    _state: dict = {"r": None}
+
+    def before_send(event: dict, hint: dict) -> Optional[dict]:
+        # Try to get / reconnect Redis
+        if _state["r"] is None:
+            try:
+                from config import REDIS_URL
+                import redis as _redis_mod
+                _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
+                                          socket_timeout=1)
+                _r.ping()
+                _state["r"] = _r
+            except Exception as _conn_err:
+                logger.debug(
+                    "sentry_init: Redis unavailable, dedup skipped: %s", _conn_err
+                )
+                return event   # forward without dedup until Redis is back
+
+        try:
+            fp = _fingerprint(event)
+            if fp is None:
+                return event
+
+            err_key = f"{_PFX_ERR}{fp}"
+            act_key = f"{_PFX_ACT}{fp}"
+            ts_key  = f"{_PFX_TS}{fp}"
+
+            _update_frequency(_state["r"], ts_key)
+            act_ttl = _compute_act_ttl(_state["r"], ts_key)
+
+            _res       = _state["r"].eval(_DEDUP_LUA, 2, err_key, act_key,
+                                           DEDUP_WINDOW_S, act_ttl)
+            is_new     = _res[0]
+            act_active = _res[1]
+
+            if not is_new and act_active:
+                return None
+
+        except Exception as _dedup_err:
+            _state["r"] = None   # reset so next event reconnects
+            logger.debug("sentry dedup error (ignored): %s", _dedup_err, exc_info=True)
+
+        return event
+
+    return before_send
+
+
 def _make_before_send(r):
     """
     Return a Sentry before_send callback wired to Redis client *r*.
@@ -256,25 +312,13 @@ def init_sentry(
         # sentry-sdk not installed — silently skip rather than crashing workers
         return False
 
-    # ── Try to get a Redis client for dedup ───────────────────────────────────
-    r              = None
-    before_send_fn = _noop_before_send
-
-    try:
-        from config import REDIS_URL
-        import redis as _redis
-        r = _redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=1)
-        r.ping()   # verify connection before wiring into before_send
-        before_send_fn = _make_before_send(r)
-    except Exception as exc:
-        # Redis unavailable at startup — Sentry still works, just no dedup.
-        # Workers will log this but continue normally.
-        import sys
-        print(
-            f"[sentry_init] Redis unavailable — Sentry initialised WITHOUT "
-            f"dedup (all errors forwarded): {exc}",
-            file=sys.stderr,
-        )
+    # ── Wire up before_send with lazy Redis reconnection ─────────────────────
+    # Do NOT permanently fall back to _noop_before_send if Redis is briefly
+    # unavailable at startup — the worker runs for hours and Redis usually
+    # recovers quickly.  Instead, use a closure that tries to acquire (or
+    # re-acquire) the Redis client on the first event after each failure, so
+    # dedup re-activates automatically once Redis comes back.
+    before_send_fn = _make_lazy_before_send()
 
     # ── Integrations ──────────────────────────────────────────────────────────
     integrations = [

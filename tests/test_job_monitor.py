@@ -2973,26 +2973,28 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         with patch("db.db.get_conn", return_value=mock_conn):
             with patch("redis.from_url", return_value=mock_redis):
                 from jobs.job_monitor import _get_worker_missed_companies
-                missed, _ = _get_worker_missed_companies(companies)
-                return missed
+                missed, in_flight_names = _get_worker_missed_companies(companies)
+                return missed, in_flight_names
 
     def test_inflight_company_excluded_even_if_stale(self):
         """
         A company with a stale scan (>24 h ago) that is currently in
-        inflight:fullscan must NOT appear in missed.
+        inflight:fullscan must NOT appear in missed and MUST appear in in_flight.
         """
         companies = [{"company": "Workday Co"}]
         scan_map  = {"Workday Co": self._STALE_EPOCH}
-        result = self._simple_run(companies, scan_map, inflight=["Workday Co"])
+        result, in_flight = self._simple_run(companies, scan_map, inflight=["Workday Co"])
         names = [c["company"] for c in result]
         self.assertNotIn("Workday Co", names,
                          "In-flight company should not appear in missed list")
+        self.assertIn("Workday Co", in_flight,
+                      "In-flight company should appear in in_flight_names")
 
     def test_non_inflight_stale_company_in_missed(self):
         """Company with stale scan and NOT in inflight → appears in missed."""
         companies = [{"company": "Acme"}]
         scan_map  = {"Acme": self._STALE_EPOCH}
-        result = self._simple_run(companies, scan_map, inflight=[])
+        result, _ = self._simple_run(companies, scan_map, inflight=[])
         names = [c["company"] for c in result]
         self.assertIn("Acme", names)
 
@@ -3005,7 +3007,7 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         companies = [{"company": "Stripe"}]
         scan_map  = {"Stripe": self._RECENT_EPOCH}
         # inflight=[] so the only reason Stripe is excluded is recency.
-        result = self._simple_run(companies, scan_map, inflight=[])
+        result, _ = self._simple_run(companies, scan_map, inflight=[])
         names = [c["company"] for c in result]
         self.assertNotIn("Stripe", names)
 
@@ -3016,7 +3018,7 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         """
         companies = [{"company": "BigCorp"}]
         scan_map  = {"BigCorp": self._STALE_EPOCH}
-        result = self._simple_run(companies, scan_map, redis_error=True)
+        result, _ = self._simple_run(companies, scan_map, redis_error=True)
         names = [c["company"] for c in result]
         self.assertIn("BigCorp", names,
                       "When Redis is unavailable, company should still appear in missed")
@@ -3025,7 +3027,7 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         """Only the non-inflight stale company appears in missed."""
         companies = [{"company": "A"}, {"company": "B"}]
         scan_map  = {"A": self._STALE_EPOCH, "B": self._STALE_EPOCH}
-        result = self._simple_run(companies, scan_map, inflight=["A"])
+        result, _ = self._simple_run(companies, scan_map, inflight=["A"])
         names = [c["company"] for c in result]
         self.assertNotIn("A", names)
         self.assertIn("B", names)

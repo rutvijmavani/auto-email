@@ -16,6 +16,16 @@ PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
 SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_USER="${SUDO_USER:-opc}"
 
+# Reject root as the service user — pipeline processes must not run as root.
+# This happens when the script is invoked directly as root (not via sudo <user>),
+# making SUDO_USER empty so the fallback "opc" applies, or when SUDO_USER=root.
+if [[ "$SERVICE_USER" == "root" ]]; then
+    echo "[ERROR] SERVICE_USER resolved to 'root'."
+    echo "        Run with sudo as a non-root user: sudo bash deploy/install-systemd.sh"
+    echo "        Or export SUDO_USER=opc before running."
+    exit 1
+fi
+
 echo "════════════════════════════════════════════════════════════"
 echo "  Mail Pipeline — systemd setup"
 echo "  Project : $PROJECT_DIR"

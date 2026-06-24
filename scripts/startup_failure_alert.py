@@ -64,24 +64,54 @@ def _validate_service(service: str) -> None:
         )
 
 
-def _already_sent(service: str) -> bool:
+def _claim_alert_slot(service: str) -> bool:
+    """
+    Atomically claim the right to send an alert for *service*.
+
+    Returns True if this call should proceed with sending; False if a recent
+    alert was already sent (or concurrently claimed).
+
+    Uses O_CREAT | O_EXCL so only ONE concurrent invocation can succeed even
+    when systemd fires multiple OnFailure= processes simultaneously.  Expired
+    flag files (age ≥ _DEDUP_WINDOW_S) are replaced atomically with rename.
+    """
     _validate_service(service)
     flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
-    if not os.path.exists(flag):
-        return False
-    age = time.time() - os.path.getmtime(flag)
-    return age < _DEDUP_WINDOW_S
 
-
-def _mark_sent(service: str) -> None:
-    _validate_service(service)
     os.makedirs(_RUN_DIR, mode=0o700, exist_ok=True)
-    # Enforce permissions even if the directory already existed (exist_ok=True
-    # silently ignores the mode argument when the dir is pre-created).
-    os.chmod(_RUN_DIR, 0o700)
-    flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
-    with open(flag, "w") as fh:
-        fh.write(datetime.now().isoformat())
+    os.chmod(_RUN_DIR, 0o700)  # enforce even when dir already existed
+
+    # Fast path: file does not exist → create atomically
+    try:
+        fd = os.open(flag, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(datetime.now().isoformat())
+        return True
+    except FileExistsError:
+        pass   # fall through to age check
+
+    # File exists — check if it has expired
+    try:
+        age = time.time() - os.path.getmtime(flag)
+    except OSError:
+        return False  # can't stat → assume recent → suppress
+
+    if age < _DEDUP_WINDOW_S:
+        return False  # still within dedup window → suppress
+
+    # Flag expired → atomically replace it so only one caller wins
+    tmp = flag + f".{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.write(datetime.now().isoformat())
+        os.rename(tmp, flag)   # atomic on POSIX (Linux/macOS)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        return False
 
 
 # ─────────────────────────────────────────
@@ -146,7 +176,7 @@ def send_startup_failure_alert(service: str) -> None:
         print(f"[startup-alert] EMAIL or APP_PASSWORD not set — cannot send alert for {service}")
         sys.exit(1)   # non-zero so systemd knows alerting is misconfigured
 
-    if _already_sent(service):
+    if not _claim_alert_slot(service):
         print(f"[startup-alert] Duplicate suppressed for {service} (within {_DEDUP_WINDOW_S//60}min window)")
         sys.exit(0)
 
@@ -261,7 +291,6 @@ def send_startup_failure_alert(service: str) -> None:
             srv.starttls()
             srv.login(EMAIL, APP_PASSWORD)
             srv.send_message(msg)
-        _mark_sent(service)
         print(f"[startup-alert] Alert sent for {service}")
     except Exception as exc:
         print(f"[startup-alert] Failed to send email: {exc}", file=sys.stderr)

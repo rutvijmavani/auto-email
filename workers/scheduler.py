@@ -1026,7 +1026,10 @@ def _atomic_schedule(
                 _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
                 score = target_ts + _jitter_s
                 if deadline_ts:
-                    score = min(score, deadline_ts - avg_duration_s)
+                    # Guard: never clamp score before target_ts — that would
+                    # violate the interval contract when the deadline is already
+                    # past (deadline_ts - avg_duration_s < target_ts).
+                    score = min(score, max(target_ts, deadline_ts - avg_duration_s))
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,
@@ -2853,6 +2856,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
     """
     from workers.sentry_init import init_sentry
     init_sentry()
+
+    from workers.startup import validate_startup
+    validate_startup("scheduler", check_redis=True, check_db=True, check_config=True)
 
     init_db()
 

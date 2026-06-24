@@ -106,8 +106,14 @@ class Heartbeat:
         return self
 
     def stop(self) -> None:
-        """Signal the thread to stop and delete the heartbeat key immediately."""
+        """Signal the thread to stop, wait for it to exit, then delete the key.
+
+        The join ensures the background thread cannot recreate the key after we
+        delete it (possible if stop() signals the event while _write() is about
+        to run on the next loop iteration).
+        """
         self._stop.set()        # unblocks _stop.wait() on the next sleep boundary
+        self._thread.join(timeout=self._interval_s + 2)   # wait for thread exit
         try:
             self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
         except Exception:

@@ -106,9 +106,13 @@ class TestValidateStartup(unittest.TestCase):
     def test_all_checks_pass_no_exit(self):
         """All checks pass → validate_startup returns without calling sys.exit."""
         mock_conn = MagicMock()
+        mock_r = MagicMock()
+        # _check_redis calls r.info("server") and parses "redis_version".
+        # Return a proper dict so the Redis ≥6.2 version check passes.
+        mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, _full_env()), \
              patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=MagicMock()), \
+             patch("workers.redis_client.get_redis", return_value=mock_r), \
              patch("db.db.init_db"), \
              patch("db.db.get_conn", return_value=mock_conn):
             from workers.startup import validate_startup
@@ -244,9 +248,11 @@ class TestValidateStartup(unittest.TestCase):
         """check_config=False → missing env vars not checked (no exit)."""
         env_missing = {k: "" for k in
                        ["REDIS_URL", "DATABASE_URL", "GMAIL_EMAIL", "GMAIL_APP_PASSWORD"]}
+        _mock_r = MagicMock()
+        _mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, env_missing), \
              patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=MagicMock()), \
+             patch("workers.redis_client.get_redis", return_value=_mock_r), \
              patch("db.db.init_db"), \
              patch("db.db.get_conn", return_value=MagicMock()):
             from workers.startup import validate_startup
@@ -339,9 +345,11 @@ class TestValidateStartup(unittest.TestCase):
 
     def test_check_db_false_skips_db(self):
         """check_db=False → PostgreSQL not checked (no exit even if DB would fail)."""
+        _mock_r = MagicMock()
+        _mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, _full_env()), \
              patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=MagicMock()):
+             patch("workers.redis_client.get_redis", return_value=_mock_r):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_db=False, check_config=False)

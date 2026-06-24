@@ -332,7 +332,7 @@ When `--monitor-jobs` runs at 7 AM, it calls `_get_worker_missed_companies()` to
 The `inflight:fullscan` ZSET (score = scan start timestamp) tracks every company currently being scanned:
 
 - Written: `ZADD inflight:fullscan {company: start_ts}` at scan start, after lock acquisition
-- Removed: `ZREM inflight:fullscan company` in the `finally` block (runs on crash, clean exit, or error)
+- Removed: `ZREM inflight:fullscan company` in the `finally` block (runs on clean exit or Python-raised error; SIGKILL bypasses `finally` — stale entries are handled by the 2-hour staleness window below)
 - Read: `_get_worker_missed_companies()` reads the ZSET with a **2-hour staleness window** — only entries with `score ≥ now − 7200` are considered. Entries older than 2 h come from workers that were killed without cleanup and must not permanently exclude companies from the missed-jobs check.
 
 If Redis is unavailable when `_get_worker_missed_companies()` runs, the inflight exclusion is skipped (the function proceeds without it — conservative: may do extra HTTP work, but no data is lost).

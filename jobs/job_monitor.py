@@ -96,6 +96,12 @@ def _record_cycle_start() -> None:
 # Each semaphore limits how many threads can fetch from
 # the same ATS domain simultaneously.
 # ─────────────────────────────────────────
+# Bounded wait for in-flight fullscans before building the digest.
+# Companies actively scanning when --monitor-jobs starts may finish soon;
+# waiting for them avoids missing their results in the digest.
+_IN_FLIGHT_WAIT_S   = 5 * 60   # max wait: 5 minutes
+_IN_FLIGHT_POLL_S   = 15        # check Redis every 15 seconds
+
 _DEFAULT_CONCURRENCY = 10
 _PLATFORM_SEMAPHORES = {
     platform: threading.Semaphore(limit)
@@ -407,6 +413,76 @@ def run():
     else:
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
+
+    # ── Bounded wait for in-flight scans ─────────────────────────────────────
+    # Companies that were mid-scan when --monitor-jobs started may finish before
+    # the digest is built.  Poll inflight:fullscan for up to _IN_FLIGHT_WAIT_S
+    # seconds so their results are included rather than silently skipped.
+    if in_flight_names:
+        _remaining_inflight = set(in_flight_names)
+        logger.info(
+            "Waiting up to %ds for %d in-flight scan(s): %s%s",
+            _IN_FLIGHT_WAIT_S,
+            len(_remaining_inflight),
+            ", ".join(sorted(_remaining_inflight)[:5]),
+            "..." if len(_remaining_inflight) > 5 else "",
+        )
+        print(f"[INFO] Waiting up to {_IN_FLIGHT_WAIT_S}s for "
+              f"{len(_remaining_inflight)} in-flight scan(s) to finish...")
+
+        _wait_start = time.time()
+        try:
+            from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
+            import redis as _redis_lib_wait
+            _r_wait = _redis_lib_wait.from_url(
+                REDIS_URL, socket_timeout=5, socket_connect_timeout=3
+            )
+
+            while _remaining_inflight and (time.time() - _wait_start) < _IN_FLIGHT_WAIT_S:
+                _stale_ts    = time.time() - 7200
+                _active_raw  = _r_wait.zrangebyscore(
+                    REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
+                )
+                _still_active = {
+                    c.decode() if isinstance(c, bytes) else c
+                    for c in (_active_raw or [])
+                }
+                _newly_done = _remaining_inflight - _still_active
+                if _newly_done:
+                    _remaining_inflight -= _newly_done
+                    with stats_lock:
+                        stats["covered_by_workers"] += len(_newly_done)
+                        stats["in_flight"]           -= len(_newly_done)
+                    logger.info(
+                        "In-flight scans completed: %s (%d still waiting)",
+                        ", ".join(sorted(_newly_done)), len(_remaining_inflight),
+                    )
+                    print(f"[INFO] {len(_newly_done)} scan(s) done: "
+                          f"{', '.join(sorted(_newly_done))[:120]}"
+                          f"{'...' if len(_newly_done) > 5 else ''}")
+
+                if _remaining_inflight:
+                    time.sleep(_IN_FLIGHT_POLL_S)
+
+        except Exception as _wait_exc:
+            logger.warning(
+                "In-flight wait: Redis unavailable (%s) — proceeding with "
+                "%d companies still counted as in-flight",
+                _wait_exc, len(_remaining_inflight),
+            )
+
+        if _remaining_inflight:
+            logger.info(
+                "In-flight wait expired: %d scan(s) still active — "
+                "their results may miss this digest",
+                len(_remaining_inflight),
+            )
+            print(f"[INFO] {len(_remaining_inflight)} scan(s) still running "
+                  f"after {int(time.time() - _wait_start)}s wait — may miss digest.")
+        else:
+            _elapsed = int(time.time() - _wait_start)
+            logger.info("All in-flight scans completed within %ds.", _elapsed)
+            print(f"[INFO] All in-flight scans completed in {_elapsed}s.")
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()

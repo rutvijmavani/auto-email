@@ -131,8 +131,10 @@ else
         local conf="$3"
 
         if grep -qE "^[[:space:]]*${key}[[:space:]]" "$conf"; then
-            # Replace existing line (handles commented-out versions too)
-            sed -i "s|^[[:space:]#]*${key}[[:space:]].*|${key} ${val}|" "$conf"
+            # Replace the active directive only — do NOT match commented examples
+            # (the old pattern used [[:space:]#]* which turned "# appendonly no"
+            # into a second active directive whenever the real one was present).
+            sed -i "s|^[[:space:]]*${key}[[:space:]].*|${key} ${val}|" "$conf"
             echo "  Updated: $key $val"
         else
             # Append at end of file
@@ -159,8 +161,17 @@ fi
 if [[ "$AOF_CHANGED" -eq 1 ]]; then
     echo ""
     echo "► Triggering initial AOF rewrite (BGREWRITEAOF)..."
-    $REDIS_CLI BGREWRITEAOF
-    echo "  AOF rewrite started in background."
+    # CONFIG SET appendonly yes can start an automatic rewrite; check before
+    # issuing a second BGREWRITEAOF to avoid the BUSY error.
+    _aof_rw_active=$($REDIS_CLI INFO persistence 2>/dev/null \
+        | grep -E "^aof_rewrite_in_progress:|^aof_rewrite_scheduled:" \
+        | awk -F: '{s+=$2} END {print s+0}')
+    if [[ "${_aof_rw_active:-0}" -gt 0 ]]; then
+        echo "  AOF rewrite already in progress — skipping BGREWRITEAOF."
+    else
+        $REDIS_CLI BGREWRITEAOF
+        echo "  AOF rewrite started in background."
+    fi
     sleep 2
 else
     echo ""
