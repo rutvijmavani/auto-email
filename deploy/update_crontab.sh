@@ -12,6 +12,13 @@
 
 set -euo pipefail
 
+# Guard: running as root would update root's crontab, not opc's.
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    echo "[ERROR] Do not run this script as root / with sudo."
+    echo "        Run as the opc user directly: bash deploy/update_crontab.sh"
+    exit 1
+fi
+
 echo "► Updating crontab (monitor retry + keep-alive frequency)..."
 
 # ── Capture existing crontab ──────────────────────────────────────────────────

@@ -532,7 +532,7 @@ The `fullscan:lock:{company}` key is written at the start of every full scan and
 
 **Empty queue — handled separately:**
 
-`ZCARD = 0` means no companies are scheduled at all — Redis was wiped or the scheduler never ran. This is unambiguous and always fires an ERROR, triggering `--rebuild` immediately regardless of velocity state.
+`ZCARD = 0` means no companies are scheduled at all — Redis was wiped or the scheduler never ran. This fires an ERROR and triggers `--rebuild` immediately, **except** for `poll:fullscan`: an empty fullscan queue is expected right after a rebuild (companies haven't been rescheduled yet) so it starts as WARNING and only escalates to ERROR if the queue remains empty beyond the expected rebuild window.
 
 **Detail queues — different metric, same principle:**
 

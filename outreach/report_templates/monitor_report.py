@@ -261,6 +261,8 @@ def _build_health_section(stats, alerts, styles):
         if fallback_empty:
             breakdown += f", {fallback_empty} empty"
         coverage_detail += f" + {fallback_hits} by job monitor ({breakdown})"
+    if in_flight:
+        coverage_detail += f" + {in_flight} in-flight"
     coverage_val = f"{total_covered}/{total} ({coverage_pct}%)  [{coverage_detail}]"
 
     health_data = [

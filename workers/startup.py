@@ -106,6 +106,14 @@ def _check_redis(prefix: str) -> None:
         # Also verify we can actually write (catches auth errors that ping misses)
         r = get_redis()
         r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
+        # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
+        _info = r.info("server")
+        _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
+        if _ver < (6, 2):
+            raise RuntimeError(
+                f"Redis {_info.get('redis_version')} is too old — "
+                "pipeline requires Redis ≥6.2 (LMOVE command)"
+            )
     except Exception as exc:
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         # Mask password so it never appears in systemd/journal logs.

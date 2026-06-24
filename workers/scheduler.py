@@ -1344,8 +1344,8 @@ def adaptive_loop() -> None:
                         "ts":         time.time(),
                         "dispatched": _hw_dispatched,
                     }), ex=15)
-                except Exception:
-                    pass
+                except Exception as _hb_err:
+                    logger.warning("adaptive_loop: heartbeat refresh failed: %s", _hb_err)
 
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
@@ -1524,8 +1524,8 @@ def fullscan_loop() -> None:
                         "pid": os.getpid(),
                         "ts":  time.time(),
                     }), ex=15)
-                except Exception:
-                    pass
+                except Exception as _hb_err:
+                    logger.warning("fullscan_loop: heartbeat refresh failed: %s", _hb_err)
 
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)

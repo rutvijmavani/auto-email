@@ -28,6 +28,12 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+if ! id "$SERVICE_USER" &>/dev/null; then
+    echo "[ERROR] Service user '$SERVICE_USER' does not exist on this host."
+    echo "        Create the user or set SUDO_USER to the correct account."
+    exit 1
+fi
+
 if [[ ! -f "$PROJECT_DIR/.env" ]]; then
     echo "[ERROR] .env file not found at $PROJECT_DIR/.env"
     echo "        Create it with your secrets before continuing."

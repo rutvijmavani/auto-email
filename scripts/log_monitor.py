@@ -161,19 +161,19 @@ def _fingerprint(line: str, context: list[str]) -> str:
     location = None
 
     # Look for bare exception line: "TypeError: fromisoformat…"
-    for line in all_lines:
+    for _check_line in all_lines:
         m = re.match(
             r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning))'
             r'(?:\s*:|\s*$)',
-            line.strip(),
+            _check_line.strip(),
         )
         if m:
             exc_type = m.group(1).split(".")[-1]   # strip module prefix
             break
 
     # Look for traceback frame: '  File "/path/foo.py", line 123, in func'
-    for line in all_lines:
-        m = re.search(r'File "([^"]+)", line (\d+)', line)
+    for _check_line in all_lines:
+        m = re.search(r'File "([^"]+)", line (\d+)', _check_line)
         if m:
             fname  = Path(m.group(1)).name
             lineno = m.group(2)

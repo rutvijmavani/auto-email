@@ -774,15 +774,17 @@ def run_worker(once: bool = False, shutdown_event=None,
     from workers.sentry_init import init_sentry
     init_sentry()
 
-    if not skip_init_db:
-        init_db()
-
     # ── Startup validation (Redis + PostgreSQL + required config) ────────────
+    # Must run before init_db() so infrastructure failures produce a clear
+    # STARTUP FAILED message rather than an opaque DB initialisation error.
     from workers.startup import validate_startup
     validate_startup("detail_worker",
                      check_redis=True,
                      check_db=True,
                      check_config=True)
+
+    if not skip_init_db:
+        init_db()
 
     r = get_redis()
 

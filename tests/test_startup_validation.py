@@ -327,8 +327,10 @@ class TestValidateStartup(unittest.TestCase):
     def test_db_failure_error_to_stderr(self):
         """DB failure → STARTUP FAILED written to stderr."""
         err_buf = io.StringIO()
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("DB down")
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.init_db", side_effect=Exception("DB down")), \
+             patch("db.db.get_conn", return_value=mock_conn), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):

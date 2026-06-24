@@ -176,7 +176,7 @@ while true; do
             fi
         else
             # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
-            if [[ -z "$(redis-cli KEYS "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
+            if [[ -z "$(redis-cli --scan --pattern "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
                 MISSING+=("$worker")
             fi
         fi
