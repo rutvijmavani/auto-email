@@ -125,9 +125,10 @@ def run_health_check() -> int:
     r = get_redis()
 
     try:
-        info    = r.info("server")
-        version = info.get("redis_version", "?")
-        mem     = info.get("used_memory_human", "?")
+        info     = r.info("server")
+        mem_info = r.info("memory")
+        version  = info.get("redis_version", "?")
+        mem      = mem_info.get("used_memory_human", "?")
         _row("OK", "Redis", f"v{version}  memory={mem}")
     except Exception as exc:
         _row("WARNING", "Redis", f"Connected but info failed: {exc}")

@@ -256,7 +256,7 @@ def _build_health_section(stats, alerts, styles):
     coverage_detail = f"{worker_covered} by workers"
     if fallback_hits:
         fallback_with_jobs = stats.get("companies_with_results", 0)
-        fallback_empty     = fallback_hits - fallback_with_jobs
+        fallback_empty     = max(0, fallback_hits - fallback_with_jobs)
         breakdown = f"{fallback_with_jobs} with jobs"
         if fallback_empty:
             breakdown += f", {fallback_empty} empty"
@@ -590,6 +590,17 @@ def _build_queue_health_section() -> str:
             "border-bottom:1px solid #f1f5f9;"
         )
 
+        # Precompute overdue cells — backslashes are not allowed inside f-string
+        # expression braces in Python < 3.12, so build these strings separately.
+        _adp_overdue_cell = (
+            f'<span style="color:#f59e0b;font-weight:600;">{poll_adp_overdue} ⚠</span>'
+            if poll_adp_overdue > 10 else str(poll_adp_overdue)
+        )
+        _fs_overdue_cell = (
+            f'<span style="color:#f59e0b;font-weight:600;">{poll_fs_overdue} ⚠</span>'
+            if poll_fs_overdue > 5 else str(poll_fs_overdue)
+        )
+
         table_html = (
             f'<table width="100%" cellpadding="0" cellspacing="0" '
             f'style="border-collapse:collapse;font-size:12px;">'
@@ -614,17 +625,13 @@ def _build_queue_health_section() -> str:
             f'<tr style="background:#ffffff;">'
             f'<td style="{td}">poll:adaptive</td>'
             f'<td style="{td}">{poll_adp_total:,} scheduled</td>'
-            f'<td style="{td}">'
-            f'{"<span style=\'color:#f59e0b;font-weight:600;\'>" + str(poll_adp_overdue) + " ⚠</span>" if poll_adp_overdue > 10 else str(poll_adp_overdue)}'
-            f'</td>'
+            f'<td style="{td}">{_adp_overdue_cell}</td>'
             f'<td style="{td}">{"⚠ overdue" if poll_adp_overdue > 10 else ("✗ EMPTY" if poll_adp_total == 0 else "OK")}</td>'
             f'</tr>'
             f'<tr style="background:#f8fafc;">'
             f'<td style="{td}">poll:fullscan</td>'
             f'<td style="{td}">{poll_fs_total:,} scheduled</td>'
-            f'<td style="{td}">'
-            f'{"<span style=\'color:#f59e0b;font-weight:600;\'>" + str(poll_fs_overdue) + " ⚠</span>" if poll_fs_overdue > 5 else str(poll_fs_overdue)}'
-            f'</td>'
+            f'<td style="{td}">{_fs_overdue_cell}</td>'
             f'<td style="{td}">{"⚠ overdue" if poll_fs_overdue > 5 else ("⚠ empty" if poll_fs_total == 0 else "OK")}</td>'
             f'</tr>'
             f'</table>'
@@ -1275,7 +1282,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
     _cov_detail = f"{_worker_covered} by workers"
     if _fallback_hits:
         _fb_with_jobs = stats.get("companies_with_results", 0)
-        _fb_empty     = _fallback_hits - _fb_with_jobs
+        _fb_empty     = max(0, _fallback_hits - _fb_with_jobs)
         _breakdown    = f"{_fb_with_jobs} with jobs"
         if _fb_empty:
             _breakdown += f", {_fb_empty} empty"

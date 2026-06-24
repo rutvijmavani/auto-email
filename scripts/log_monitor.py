@@ -43,6 +43,7 @@ Cron entry (add via deploy/update_crontab.sh or setup_cron.sh):
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import html as html_lib
 import json
 import os
@@ -266,7 +267,7 @@ def scan_file(
             context = [
                 lines[j].rstrip()
                 for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines)))
-                if lines[j].strip()
+                if lines[j].strip() and not _is_suppressed(lines[j])
             ]
             findings.append((line, context))
             i += 1 + CONTEXT_LINES   # skip past captured context
@@ -649,6 +650,18 @@ def send_digest(r, now: float) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Non-blocking lock: exit immediately if another instance is running.
+    # Prevents duplicate alerts and state-file races on 15-min cron overlaps.
+    _lock_path = PROJECT_DIR / "data" / "log_monitor.lock"
+    _lock_path.parent.mkdir(parents=True, exist_ok=True)
+    _lock_fh = open(_lock_path, "w")  # noqa: WPS515
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[log_monitor] another instance is running — exiting")
+        _lock_fh.close()
+        return
+
     now = time.time()
     print(f"[log_monitor] scan started at {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
 

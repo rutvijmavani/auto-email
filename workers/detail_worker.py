@@ -217,7 +217,7 @@ def _recover_stuck_jobs(r, own_pid: int) -> None:
                         _job_id = _company = ""
 
                     if _job_id:
-                        _rkey = f"{_RETRY_KEY_PREFIX}{_job_id}"
+                        _rkey = f"{_RETRY_KEY_PREFIX}{_company}:{_job_id}" if _company else f"{_RETRY_KEY_PREFIX}{_job_id}"
                         try:
                             _attempt = int(r.incr(_rkey))
                             r.expire(_rkey, _RETRY_KEY_TTL)
@@ -489,27 +489,12 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                         (time.monotonic() - start_mono) * 1000
                     )
                     result["outcome"] = "error"
-                    # Transient network/ATS errors: leave the pending_detail row
-                    # intact and signal retryable so _recover_stuck_jobs() can
-                    # reclaim the inflight item on the next worker start.
-                    # Permanent errors (bad payload, unknown platform) call
-                    # _finish() to clean up the DB row immediately.
-                    _transient = isinstance(exc, (OSError, TimeoutError))
-                    if not _transient:
-                        try:
-                            import requests as _req
-                            _transient = isinstance(exc, _req.exceptions.RequestException)
-                        except ImportError:
-                            pass
-                    if _transient:
-                        result["retryable"] = True
-                    else:
-                        # Delete the pending_detail row so it does not linger as a
-                        # zombie — rebuild_detail_queue() re-queues ALL pending_detail
-                        # rows on restart, and without slug_info the rebuilt payload
-                        # would skip the actual fetch and promote with empty location.
-                        _finish(job_id, company, job, platform,
-                                outcome="error", found_by=found_by)
+                    # Default all unknown exceptions to retryable so transient
+                    # issues (rate limits, unexpected ATS responses, parser
+                    # hiccups) get a retry rather than permanent deletion.
+                    # The bounded retry cap (_MAX_DETAIL_RETRIES) prevents
+                    # poisoned jobs from looping forever.
+                    result["retryable"] = True
                     return result
                 finally:
                     set_request_context("normal")   # always reset
@@ -926,13 +911,19 @@ def run_worker(once: bool = False, shutdown_event=None,
                     "can reclaim it on the next startup",
                     result.get("job_id"), result.get("company"),
                 )
+                # Stop the heartbeat daemon BEFORE deleting the key so the
+                # thread cannot recreate it after deletion (race window).
+                _hb.stop()
                 # Delete our heartbeat key immediately so a respawned worker
                 # that starts before the TTL expires can still reclaim this
                 # inflight item via _recover_stuck_jobs() without waiting 30s.
                 try:
                     r.delete(f"worker:alive:detail_worker:{os.getpid()}")
-                except Exception:
-                    pass
+                except Exception as _hb_del_err:
+                    logger.error(
+                        "detail_worker: failed to delete heartbeat key: %s",
+                        _hb_del_err,
+                    )
                 break
             else:
                 r.lrem(inflight_key, 1, raw)

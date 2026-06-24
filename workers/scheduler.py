@@ -1336,6 +1336,17 @@ def adaptive_loop() -> None:
                                   withscores=False)
 
             for company in due:
+                # Refresh heartbeat at the start of each iteration so backpressure
+                # or outage `continue` branches don't let the 15s TTL expire.
+                try:
+                    r.set("worker:alive:scheduler", json.dumps({
+                        "pid":        os.getpid(),
+                        "ts":         time.time(),
+                        "dispatched": _hw_dispatched,
+                    }), ex=15)
+                except Exception:
+                    pass
+
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
                 if depth > DETAIL_QUEUE_MAX_ADAPTIVE:
@@ -1432,18 +1443,6 @@ def adaptive_loop() -> None:
                 r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
                 _hw_dispatched += 1
 
-                # Refresh heartbeat mid-loop so a large backlog (many companies
-                # due at once) doesn't let the 15s TTL expire before the outer
-                # loop iteration writes it again.
-                try:
-                    r.set("worker:alive:scheduler", json.dumps({
-                        "pid":        os.getpid(),
-                        "ts":         time.time(),
-                        "dispatched": _hw_dispatched,
-                    }), ex=15)
-                except Exception:
-                    pass
-
                 logger.debug(
                     "adaptive_loop: dispatched %r to %s (dc=%s context=%s)",
                     company, REDIS_STREAM_ADAPTIVE, dc_key, dispatch_context,
@@ -1518,6 +1517,16 @@ def fullscan_loop() -> None:
                                   withscores=False)
 
             for company in due:
+                # Refresh heartbeat so backpressure `continue` branches don't
+                # let the 15s TTL expire when many companies are due at once.
+                try:
+                    r.set("worker:alive:scheduler", json.dumps({
+                        "pid": os.getpid(),
+                        "ts":  time.time(),
+                    }), ex=15)
+                except Exception:
+                    pass
+
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)
                 if depth > DETAIL_QUEUE_MAX_FULLSCAN:

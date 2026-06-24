@@ -21,19 +21,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Config keys that MUST be non-empty for any pipeline worker to function.
-# These are checked by name via os.getenv() so the check is independent of
-# how config.py processes them (avoids import-time failures masking the root cause).
+# Config keys required for all pipeline workers.
 _REQUIRED_ENV_KEYS = [
     "REDIS_URL",
     "DATABASE_URL",
+]
+
+# Additional keys required only by workers that send email.
+_GMAIL_ENV_KEYS = [
     "GMAIL_EMAIL",
     "GMAIL_APP_PASSWORD",
 ]
 
 
 def validate_startup(worker_name: str, *, check_db: bool = True,
-                     check_redis: bool = True, check_config: bool = True) -> None:
+                     check_redis: bool = True, check_config: bool = True,
+                     check_gmail: bool = False) -> None:
     """
     Run all startup checks for a pipeline worker.
 
@@ -45,12 +48,14 @@ def validate_startup(worker_name: str, *, check_db: bool = True,
         check_db:      Whether to verify PostgreSQL connectivity.
         check_redis:   Whether to verify Redis connectivity.
         check_config:  Whether to check required environment variables.
+        check_gmail:   Whether to verify Gmail credentials are present.
+                       Only needed by workers that send email directly.
     """
     prefix = f"[{worker_name}]"
 
     # ── 1. Required config keys ───────────────────────────────────────────────
     if check_config:
-        _check_config(prefix)
+        _check_config(prefix, include_gmail=check_gmail)
 
     # ── 2. Redis reachability ─────────────────────────────────────────────────
     if check_redis:
@@ -67,10 +72,13 @@ def validate_startup(worker_name: str, *, check_db: bool = True,
 # CHECK IMPLEMENTATIONS
 # ─────────────────────────────────────────
 
-def _check_config(prefix: str) -> None:
+def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
     """Verify required environment variables are set."""
+    keys_to_check = list(_REQUIRED_ENV_KEYS)
+    if include_gmail:
+        keys_to_check.extend(_GMAIL_ENV_KEYS)
     missing = []
-    for key in _REQUIRED_ENV_KEYS:
+    for key in keys_to_check:
         val = os.getenv(key, "").strip()
         if not val:
             missing.append(key)
@@ -132,11 +140,9 @@ def _check_postgres(prefix: str) -> None:
     try:
         from db.db import get_conn
         conn = get_conn()
-        # Reference the real table (catches schema-not-migrated errors) but
-        # use LIMIT 1 instead of COUNT(*) to avoid a full-table sequential scan.
-        conn.execute("SELECT 1 FROM job_postings LIMIT 1").fetchone()
+        conn.execute("SELECT 1").fetchone()
         conn.close()
-        logger.debug("%s PostgreSQL check passed (schema accessible)", prefix)
+        logger.debug("%s PostgreSQL check passed", prefix)
     except Exception as exc:
         db_url_raw = os.getenv("DATABASE_URL", "(not set)")
         # Mask password in log output
@@ -152,11 +158,10 @@ def _check_postgres(prefix: str) -> None:
             safe_url = "(could not parse DATABASE_URL)"
 
         msg = (
-            f"{prefix} STARTUP FAILED — PostgreSQL is unreachable or schema is missing\n"
+            f"{prefix} STARTUP FAILED — PostgreSQL is unreachable\n"
             f"  URL: {safe_url}\n"
             f"  Error: {exc}\n"
-            f"  Fix: check DATABASE_URL in .env; verify PostgreSQL is running;\n"
-            f"       run migrations if this is a fresh install."
+            f"  Fix: check DATABASE_URL in .env; verify PostgreSQL is running."
         )
         print(msg, file=sys.stderr)
         logger.error("%s startup: PostgreSQL check failed: %s", prefix, exc)

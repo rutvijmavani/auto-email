@@ -17,12 +17,11 @@ Coverage map
   TestRecoverStuckJobs
     · No inflight keys found → no crash, no unnecessary work
     · Own PID key is always skipped (even if heartbeat absent)
-    · Dead peer adaptive items → LMOVE back to adaptive source
-    · Dead peer fullscan items → LMOVE back to fullscan source
+    · Dead peer adaptive items → rpop/rpush back to adaptive source
+    · Dead peer fullscan items → rpop/rpush back to fullscan source
     · Live peer items (heartbeat present) → never touched
-    · LMOVE direction is RIGHT → RIGHT (item goes to TAIL of source queue)
     · Multiple items → all recovered until list exhausted (while-loop)
-    · Loop stops when lmove returns None (no infinite loop)
+    · Loop stops when rpop returns None (no infinite loop)
 
   TestPopWithInflight
     · Both queues empty → returns None after timeout expires
@@ -219,18 +218,19 @@ class TestRecoverStuckJobs(unittest.TestCase):
             return 0
         r.exists.side_effect = _exists
 
-        # lmove: simulate draining dead peer's inflight items
+        # rpop: simulate draining dead peer's inflight items one at a time,
+        # returning None when the list is exhausted.
         adp_items = list(dead_adaptive_items)
         fs_items  = list(dead_fullscan_items)
 
-        def _lmove(src, dst, src_dir, dst_dir):
-            src_s = src.decode() if isinstance(src, bytes) else src
-            if src_s == dead_adp_key and adp_items:
+        def _rpop(key):
+            key_s = key.decode() if isinstance(key, bytes) else key
+            if key_s == dead_adp_key and adp_items:
                 return adp_items.pop(0)
-            if src_s == dead_fs_key and fs_items:
+            if key_s == dead_fs_key and fs_items:
                 return fs_items.pop(0)
             return None
-        r.lmove.side_effect = _lmove
+        r.rpop.side_effect = _rpop
 
         return r, dead_adp_key, dead_fs_key, live_adp_key
 
@@ -243,13 +243,13 @@ class TestRecoverStuckJobs(unittest.TestCase):
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-    def test_no_inflight_keys_lmove_never_called(self):
-        """No inflight keys → lmove is never called."""
+    def test_no_inflight_keys_rpop_never_called(self):
+        """No inflight keys → rpop is never called."""
         r = MagicMock()
         r.scan.return_value = (0, [])
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
-        r.lmove.assert_not_called()
+        r.rpop.assert_not_called()
 
     # ── Own PID is always skipped ─────────────────────────────────────────────
 
@@ -261,7 +261,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-        own_calls = [c for c in r.lmove.call_args_list
+        own_calls = [c for c in r.rpop.call_args_list
                      if (c[0][0].decode() if isinstance(c[0][0], bytes)
                          else c[0][0]) == own_key]
         self.assertEqual(len(own_calls), 0,
@@ -270,7 +270,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
     # ── Dead peer recovery ────────────────────────────────────────────────────
 
     def test_dead_peer_adaptive_item_moved_to_adaptive_source(self):
-        """Dead peer's adaptive inflight item → LMOVE to adaptive source."""
+        """Dead peer's adaptive inflight item → rpop + rpush to adaptive source."""
         from config import REDIS_DETAIL_ADAPTIVE
         r, dead_adp_key, _, _ = self._build_redis_mock(
             dead_adaptive_items=[b"job1"]
@@ -278,15 +278,20 @@ class TestRecoverStuckJobs(unittest.TestCase):
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-        calls = [(c[0][0], c[0][1]) for c in r.lmove.call_args_list]
-        recovery = [(s, d) for s, d in calls if s == dead_adp_key]
-        self.assertTrue(len(recovery) >= 1,
-                        "Expected at least one lmove from dead peer adaptive key")
-        self.assertEqual(recovery[0][1], REDIS_DETAIL_ADAPTIVE,
-                         "Items must be moved to the adaptive source queue")
+        rpop_calls = [c[0][0] for c in r.rpop.call_args_list]
+        self.assertTrue(any(
+            (k.decode() if isinstance(k, bytes) else k) == dead_adp_key
+            for k in rpop_calls
+        ), "Expected rpop called on dead peer adaptive key")
+
+        rpush_calls = [(c[0][0], c[0][1]) for c in r.rpush.call_args_list]
+        self.assertTrue(any(
+            dst == REDIS_DETAIL_ADAPTIVE and payload == b"job1"
+            for dst, payload in rpush_calls
+        ), "Items must be rpush'd to the adaptive source queue")
 
     def test_dead_peer_fullscan_item_moved_to_fullscan_source(self):
-        """Dead peer's fullscan inflight item → LMOVE to fullscan source."""
+        """Dead peer's fullscan inflight item → rpop + rpush to fullscan source."""
         from config import REDIS_DETAIL_FULLSCAN
         r, _, dead_fs_key, _ = self._build_redis_mock(
             dead_fullscan_items=[b"job2"]
@@ -294,26 +299,17 @@ class TestRecoverStuckJobs(unittest.TestCase):
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-        calls = [(c[0][0], c[0][1]) for c in r.lmove.call_args_list]
-        recovery = [(s, d) for s, d in calls if s == dead_fs_key]
-        self.assertTrue(len(recovery) >= 1,
-                        "Expected at least one lmove from dead peer fullscan key")
-        self.assertEqual(recovery[0][1], REDIS_DETAIL_FULLSCAN,
-                         "Items must be moved to the fullscan source queue")
+        rpop_calls = [c[0][0] for c in r.rpop.call_args_list]
+        self.assertTrue(any(
+            (k.decode() if isinstance(k, bytes) else k) == dead_fs_key
+            for k in rpop_calls
+        ), "Expected rpop called on dead peer fullscan key")
 
-    def test_lmove_direction_is_right_to_right(self):
-        """LMOVE from dead peer inflight uses RIGHT → RIGHT (item goes to TAIL of source queue)."""
-        r, dead_adp_key, _, _ = self._build_redis_mock(
-            dead_adaptive_items=[b"item"]
-        )
-        from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
-
-        recovery = [c[0] for c in r.lmove.call_args_list
-                    if c[0][0] == dead_adp_key]
-        self.assertTrue(len(recovery) >= 1)
-        self.assertEqual(recovery[0][2], "RIGHT")
-        self.assertEqual(recovery[0][3], "RIGHT")
+        rpush_calls = [(c[0][0], c[0][1]) for c in r.rpush.call_args_list]
+        self.assertTrue(any(
+            dst == REDIS_DETAIL_FULLSCAN and payload == b"job2"
+            for dst, payload in rpush_calls
+        ), "Items must be rpush'd to the fullscan source queue")
 
     def test_multiple_items_all_recovered(self):
         """All items in a dead peer's inflight are drained (loop runs until None)."""
@@ -323,22 +319,24 @@ class TestRecoverStuckJobs(unittest.TestCase):
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-        adp_calls = [c for c in r.lmove.call_args_list
-                     if c[0][0] == dead_adp_key]
+        adp_rpop_calls = [c for c in r.rpop.call_args_list
+                          if (c[0][0].decode() if isinstance(c[0][0], bytes)
+                              else c[0][0]) == dead_adp_key]
         # 3 items popped + 1 final None check = 4 calls
-        self.assertEqual(len(adp_calls), 4,
-                         "Drain loop must run until lmove returns None")
+        self.assertEqual(len(adp_rpop_calls), 4,
+                         "Drain loop must run until rpop returns None")
 
     # ── Live peer is never touched ────────────────────────────────────────────
 
     def test_live_peer_items_not_touched(self):
-        """Live peer's inflight key (heartbeat present) → lmove never called on it."""
+        """Live peer's inflight key (heartbeat present) → rpop never called on it."""
         r, _, _, live_adp_key = self._build_redis_mock(include_live_peer=True)
         from workers.detail_worker import _recover_stuck_jobs
         _recover_stuck_jobs(r, self._OWN_PID)
 
-        live_calls = [c for c in r.lmove.call_args_list
-                      if c[0][0] == live_adp_key]
+        live_calls = [c for c in r.rpop.call_args_list
+                      if (c[0][0].decode() if isinstance(c[0][0], bytes)
+                          else c[0][0]) == live_adp_key]
         self.assertEqual(len(live_calls), 0,
                          "Must not drain a live peer's inflight items")
 

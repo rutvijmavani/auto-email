@@ -31,9 +31,11 @@ if config is None:
     sys.exit(1)
 
 conn = get_conn()
-row  = conn.execute("SELECT ats_slug FROM prospective_companies WHERE company = %s LIMIT 1",
-                    ("accenture",)).fetchone()
-conn.close()
+try:
+    row = conn.execute("SELECT ats_slug FROM prospective_companies WHERE company = %s LIMIT 1",
+                       ("accenture",)).fetchone()
+finally:
+    conn.close()
 
 if row is None:
     print("[ERROR] 'accenture' not found in prospective_companies — nothing to diagnose.")

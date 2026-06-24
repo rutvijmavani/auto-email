@@ -8,8 +8,9 @@ Phase 3.4 — Startup validation in each worker.
 Coverage map
 ────────────
   TestRequiredEnvKeys
-    · _REQUIRED_ENV_KEYS contains REDIS_URL, DATABASE_URL, GMAIL_EMAIL, GMAIL_APP_PASSWORD
-    · _REQUIRED_ENV_KEYS has exactly 4 entries
+    · _REQUIRED_ENV_KEYS contains REDIS_URL, DATABASE_URL (universal keys)
+    · _GMAIL_ENV_KEYS contains GMAIL_EMAIL, GMAIL_APP_PASSWORD (email-only keys)
+    · _REQUIRED_ENV_KEYS has exactly 2 entries; _GMAIL_ENV_KEYS has exactly 2 entries
 
   TestValidateStartup
     · All checks pass → no sys.exit called
@@ -64,11 +65,12 @@ def _missing_env(key):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRequiredEnvKeys(unittest.TestCase):
-    """_REQUIRED_ENV_KEYS constant contains exactly the four required keys."""
+    """_REQUIRED_ENV_KEYS has universal keys; _GMAIL_ENV_KEYS has email-only keys."""
 
     def setUp(self):
-        from workers.startup import _REQUIRED_ENV_KEYS
-        self.keys = _REQUIRED_ENV_KEYS
+        from workers.startup import _REQUIRED_ENV_KEYS, _GMAIL_ENV_KEYS
+        self.keys      = _REQUIRED_ENV_KEYS
+        self.gmail_keys = _GMAIL_ENV_KEYS
 
     def test_contains_redis_url(self):
         self.assertIn("REDIS_URL", self.keys)
@@ -76,14 +78,17 @@ class TestRequiredEnvKeys(unittest.TestCase):
     def test_contains_database_url(self):
         self.assertIn("DATABASE_URL", self.keys)
 
-    def test_contains_gmail_email(self):
-        self.assertIn("GMAIL_EMAIL", self.keys)
+    def test_gmail_email_in_gmail_keys(self):
+        self.assertIn("GMAIL_EMAIL", self.gmail_keys)
 
-    def test_contains_gmail_app_password(self):
-        self.assertIn("GMAIL_APP_PASSWORD", self.keys)
+    def test_gmail_app_password_in_gmail_keys(self):
+        self.assertIn("GMAIL_APP_PASSWORD", self.gmail_keys)
 
-    def test_exactly_four_keys(self):
-        self.assertEqual(len(self.keys), 4)
+    def test_exactly_two_universal_keys(self):
+        self.assertEqual(len(self.keys), 2)
+
+    def test_exactly_two_gmail_keys(self):
+        self.assertEqual(len(self.gmail_keys), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,20 +145,31 @@ class TestValidateStartup(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
 
     def test_missing_gmail_email_exits_1(self):
-        """GMAIL_EMAIL missing → sys.exit(1)."""
+        """GMAIL_EMAIL missing → sys.exit(1) when check_gmail=True."""
         with patch.dict(os.environ, _missing_env("GMAIL_EMAIL")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
-                validate_startup("test_worker", check_db=False, check_redis=False)
+                validate_startup("test_worker",
+                                 check_db=False, check_redis=False, check_gmail=True)
             self.assertEqual(ctx.exception.code, 1)
 
     def test_missing_gmail_app_password_exits_1(self):
-        """GMAIL_APP_PASSWORD missing → sys.exit(1)."""
+        """GMAIL_APP_PASSWORD missing → sys.exit(1) when check_gmail=True."""
         with patch.dict(os.environ, _missing_env("GMAIL_APP_PASSWORD")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
-                validate_startup("test_worker", check_db=False, check_redis=False)
+                validate_startup("test_worker",
+                                 check_db=False, check_redis=False, check_gmail=True)
             self.assertEqual(ctx.exception.code, 1)
+
+    def test_missing_gmail_email_no_exit_when_check_gmail_false(self):
+        """GMAIL_EMAIL missing → no exit when check_gmail=False (default)."""
+        with patch.dict(os.environ, _missing_env("GMAIL_EMAIL")):
+            from workers.startup import validate_startup
+            try:
+                validate_startup("test_worker", check_db=False, check_redis=False)
+            except SystemExit as exc:
+                self.fail(f"Should not exit when check_gmail=False, got exit({exc.code})")
 
     def test_missing_env_var_error_to_stderr(self):
         """Missing env var → error message written to stderr, not stdout."""
@@ -183,7 +199,8 @@ class TestValidateStartup(unittest.TestCase):
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
-                validate_startup("test_worker", check_db=False, check_redis=False)
+                validate_startup("test_worker",
+                                 check_db=False, check_redis=False, check_gmail=True)
         self.assertIn("GMAIL_EMAIL", err_buf.getvalue())
 
     def test_worker_name_in_error_message(self):
@@ -207,7 +224,7 @@ class TestValidateStartup(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
 
     def test_multiple_missing_vars_all_listed(self):
-        """All missing keys appear in the single error message."""
+        """All missing keys appear in the single error message when check_gmail=True."""
         err_buf = io.StringIO()
         env = {
             "REDIS_URL": "", "DATABASE_URL": "",
@@ -217,7 +234,8 @@ class TestValidateStartup(unittest.TestCase):
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
-                validate_startup("test_worker", check_db=False, check_redis=False)
+                validate_startup("test_worker",
+                                 check_db=False, check_redis=False, check_gmail=True)
         output = err_buf.getvalue()
         for key in ("REDIS_URL", "DATABASE_URL", "GMAIL_EMAIL", "GMAIL_APP_PASSWORD"):
             self.assertIn(key, output, f"Expected {key!r} in error message")
@@ -285,10 +303,12 @@ class TestValidateStartup(unittest.TestCase):
 
     # ── DB check ─────────────────────────────────────────────────────────────
 
-    def test_db_init_db_exception_exits_1(self):
-        """init_db() raises → sys.exit(1)."""
+    def test_db_execute_exception_exits_1(self):
+        """conn.execute() raises → sys.exit(1) (_check_postgres uses SELECT 1)."""
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("connection refused")
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.init_db", side_effect=Exception("connection refused")):
+             patch("db.db.get_conn", return_value=mock_conn):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_redis=False, check_config=False)

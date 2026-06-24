@@ -262,7 +262,7 @@ across the monitoring window so all complete before 7 AM.
 
 ### 4.4 check_thundering_herd.py ideal_per_bk formula
 **Status:** ✅ Fixed. Was dividing by occupied buckets only; now divides by
-all slots in a full 24h cycle (`slots_in_cycle = 86400 // (bucket_minutes * 60)`).
+all slots in a full 24h cycle (`slots_in_cycle = math.ceil(86400 / (bucket_minutes * 60))`).
 
 ---
 
