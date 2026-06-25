@@ -54,21 +54,21 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# ── Install ReportLab stubs if library is absent ──────────────────────────────
-# sys.modules.setdefault only inserts when the key is NOT already present,
-# so a real ReportLab install takes priority automatically.
-_RL_STUB_MODS = [
-    "reportlab",
-    "reportlab.lib",
-    "reportlab.lib.pagesizes",
-    "reportlab.lib.styles",
-    "reportlab.lib.units",
-    "reportlab.lib.colors",
-    "reportlab.lib.enums",
-    "reportlab.platypus",
-]
-for _mod in _RL_STUB_MODS:
-    sys.modules.setdefault(_mod, MagicMock())
+# ── Install ReportLab stubs only when the library is not installed ────────────
+import importlib.util as _ilu
+if _ilu.find_spec("reportlab") is None:
+    _RL_STUB_MODS = [
+        "reportlab",
+        "reportlab.lib",
+        "reportlab.lib.pagesizes",
+        "reportlab.lib.styles",
+        "reportlab.lib.units",
+        "reportlab.lib.colors",
+        "reportlab.lib.enums",
+        "reportlab.platypus",
+    ]
+    for _mod in _RL_STUB_MODS:
+        sys.modules.setdefault(_mod, MagicMock())
 # ─────────────────────────────────────────────────────────────────────────────
 
 

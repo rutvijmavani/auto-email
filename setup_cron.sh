@@ -435,32 +435,9 @@ echo "[OK] All wrapper scripts created"
 # To verify: date && timedatectl
 # ═══════════════════════════════════════════════════════════════
 
-EXISTING_CRON=$(crontab -l 2>/dev/null || echo "")
-
-CLEAN_CRON=$(echo "$EXISTING_CRON" \
-  | grep -v "run_sync.sh" \
-  | grep -v "run_nightly.sh" \
-  | grep -v "run_monday.sh" \
-  | grep -v "run_monthly.sh" \
-  | grep -v "run_outreach.sh" \
-  | grep -v "run_monitor.sh" \
-  | grep -v "run_detect.sh" \
-  | grep -v "run_weekly_summary.sh" \
-  | grep -v "run_enrich.sh" \
-  | grep -v "run_verify_filled.sh" \
-  | grep -v "run_ats_discovery.sh" \
-  | grep -v "run_db_maintenance.sh" \
-  | grep -v "keep-alive" \
-  | grep -v "hashlib" \
-  | grep -v "backups.*mtime" \
-  | grep -v "RECRUITER PIPELINE" \
-  | grep -v "All times UTC" \
-  | grep -v "workers.watchdog" \
-  || true)
 # NOTE: workers/watchdog.py is intentionally NOT in the crontab.
 # It runs continuously as a systemd service (recruiter-watchdog.service), NOT as a
-# cron job.  If a watchdog cron entry exists from before systemd was set up,
-# the line above removes it.  The correct way to manage the watchdog is:
+# cron job.  The correct way to manage the watchdog is:
 #   sudo systemctl status recruiter-watchdog
 #   journalctl -u recruiter-watchdog -f
 # To set up systemd for the first time: sudo bash deploy/install-systemd.sh

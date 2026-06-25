@@ -107,7 +107,6 @@ fi
 # Run this before restart so the updated definitions are always active.
 echo ""
 echo "► Syncing systemd unit files..."
-DEPLOY_DIR="$(dirname "$0")"
 for unit_file in "$DEPLOY_DIR/systemd/"*.service; do
     unit_name=$(basename "$unit_file")
     sudo cp "$unit_file" /etc/systemd/system/"$unit_name"

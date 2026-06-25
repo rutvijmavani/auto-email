@@ -83,20 +83,18 @@ NEW_CRON="${NEW_CRON}
 # ─────────────────────────────────────────
 0 */4 * * * python3 -c \"import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]\" >> /dev/null 2>&1"
 
+# ── Validate 9 AM retry entry before installing ───────────────────────────────
+if ! echo "$NEW_CRON" | grep -q "0 9.*run_monitor\.sh"; then
+    echo ""
+    echo "  [WARN] 9 AM retry job is missing from the new crontab template."
+    echo "         Expected format: 0 9 * * * .../run_monitor.sh"
+    echo "         Aborting — crontab was NOT changed."
+    exit 1
+fi
+
 # ── Install ───────────────────────────────────────────────────────────────────
 echo "$NEW_CRON" | crontab -
 echo "  [OK] Crontab updated"
-
-# ── Validate 9 AM retry entry was inserted ────────────────────────────────────
-if ! crontab -l | grep -q "0 9.*run_monitor\.sh"; then
-    echo ""
-    echo "  [WARN] 9 AM retry job was NOT inserted — the 7 AM monitor line"
-    echo "         did not match the expected pattern."
-    echo "         Expected format: 0 7 * * * /home/opc/mail/run_monitor.sh"
-    echo "         Add the 9 AM retry job manually:"
-    echo "           0 9 * * * test -f /home/opc/mail/logs/monitor_\$(date +\\%Y-\\%m-\\%d).log || /home/opc/mail/run_monitor.sh"
-    exit 1
-fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 echo ""

@@ -345,36 +345,56 @@ class TestPickScheduleTime(unittest.TestCase):
 
     def test_deadline_guard_skips_late_gaps(self):
         """
-        Largest gap midpoint + avg_duration_s ≥ deadline → skipped.
-        Second-largest gap (without deadline issue) is returned instead.
+        Gap whose midpoint + avg_duration_s ≥ _next_digest_deadline(midpoint) is
+        skipped; the safe gap is returned instead.  deadline_ts is only an enable
+        flag — the actual threshold is always _next_digest_deadline(midpoint).
         """
+        from unittest.mock import patch as _patch
         lo, hi = self._window()
-        # Entry at target: left gap mid = (lo+target)/2, right gap mid = (target+hi)/2
-        avg_duration = 1800   # 30 min
+        avg_duration = 1800
         right_mid = (self._TARGET + hi) / 2
-        # Set deadline so right gap just fails
-        deadline = right_mid + avg_duration - 1
+        left_mid  = (lo + self._TARGET) / 2
 
-        result = self._call([self._TARGET], deadline_ts=deadline,
-                            avg_duration_s=avg_duration)
-        # Right gap fails → left gap chosen
-        left_mid = (lo + self._TARGET) / 2
+        def _mock_nd(ts):
+            # Force right_mid to fail (ts + avg >= ts + avg - 1); left_mid is safe.
+            if abs(ts - right_mid) < 1:
+                return ts + avg_duration - 1
+            return ts + avg_duration + 10_000
+
+        with _patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call([self._TARGET],
+                                deadline_ts=self._TARGET,  # any non-None value enables the check
+                                avg_duration_s=avg_duration)
         self.assertAlmostEqual(result, left_mid, places=0)
 
     def test_deadline_guard_all_gaps_fail_target_safe_returns_target(self):
-        """All gaps violate deadline, but target_ts itself is safe → returns target_ts."""
-        # avg_duration=1s: target_ts+1 < next 7AM ET (~46 000s away) → target is safe
-        deadline = self._TARGET - 1  # past deadline so all gaps fail
-        result = self._call([], deadline_ts=deadline, avg_duration_s=1.0)
+        """All gap midpoints violate deadline, but target_ts itself is safe → returns target_ts."""
+        from unittest.mock import patch as _patch
+        avg_duration = 1800
+
+        def _mock_nd(ts):
+            # target_ts: plenty of time (safe); gap midpoints (≠ target): barely fail.
+            if abs(ts - self._TARGET) < 1:
+                return ts + avg_duration + 10_000
+            return ts + avg_duration - 1
+
+        # Entry at target splits window into two gaps whose midpoints ≠ target_ts,
+        # so _mock_nd returns different values for midpoints vs target_ts.
+        with _patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call([self._TARGET],
+                                deadline_ts=self._TARGET,
+                                avg_duration_s=avg_duration)
         self.assertAlmostEqual(result, self._TARGET, places=0)
 
     def test_deadline_guard_all_gaps_fail_target_also_violates_returns_post_digest(self):
-        """All gaps AND target_ts violate deadline → next_digest_deadline(target_ts) + 900."""
-        from workers.scheduler import _next_digest_deadline
-        avg_duration = 86400   # 24 h: target_ts + 86400 > next 7 AM ET → target also violates
-        deadline = self._TARGET - 1  # past deadline so all gaps fail
-        result = self._call([], deadline_ts=deadline, avg_duration_s=avg_duration)
-        expected = _next_digest_deadline(self._TARGET) + 900
+        """All gaps AND target_ts violate deadline → _next_digest_deadline(target_ts) + 900."""
+        from unittest.mock import patch as _patch
+        avg_duration = 1800
+        fixed_deadline = self._TARGET + avg_duration - 1  # ts + avg >= fixed for all ts ≈ target
+
+        with _patch("workers.scheduler._next_digest_deadline", return_value=fixed_deadline):
+            result = self._call([], deadline_ts=self._TARGET, avg_duration_s=avg_duration)
+        expected = fixed_deadline + 900
         self.assertAlmostEqual(result, expected, places=0)
 
     def test_no_deadline_avg_duration_has_no_effect(self):

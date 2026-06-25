@@ -855,15 +855,15 @@ def run_worker(once: bool = False, shutdown_event=None,
     # _PEER_RECOVERY_INTERVAL_S so stranded inflight jobs are reclaimed quickly
     # without adding meaningful overhead (SCAN returns empty in the common case).
     _PEER_RECOVERY_INTERVAL_S = 300   # 5 minutes
-    _last_peer_recovery = time.time()
+    _last_peer_recovery = time.monotonic()
 
     while True:
         try:
             # ── Periodic dead-peer recovery ───────────────────────────────────
-            _now_mono = time.time()
+            _now_mono = time.monotonic()
             if _now_mono - _last_peer_recovery >= _PEER_RECOVERY_INTERVAL_S:
                 try:
-                    _recover_stuck_jobs(r, own_pid)
+                    _recover_stuck_jobs(r, own_token)
                 except Exception as _rec_exc:
                     logger.warning(
                         "detail_worker: periodic peer recovery failed: %s", _rec_exc

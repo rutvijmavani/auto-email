@@ -106,7 +106,7 @@ echo "  .env permissions: 600 (owner read-only)"
 # This script detects the same path and writes it into sudoers so they match.
 echo ""
 echo "► Adding sudoers rule for watchdog self-healing..."
-SYSTEMCTL_BIN="$(readlink -f "$(which systemctl)")"
+SYSTEMCTL_BIN="$(which systemctl)"
 echo "  systemctl resolved to: $SYSTEMCTL_BIN"
 
 SUDOERS_FILE="/etc/sudoers.d/mail-pipeline"

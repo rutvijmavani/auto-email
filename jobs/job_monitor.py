@@ -424,6 +424,7 @@ def run():
     # seconds so their results are included rather than silently skipped.
     if in_flight_names:
         _remaining_inflight = set(in_flight_names)
+        _wait_start = time.time()   # elapsed-time gate for the polling loop below
         logger.info(
             "Waiting up to %ds for %d in-flight scan(s): %s%s",
             _IN_FLIGHT_WAIT_S,
