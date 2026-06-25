@@ -61,23 +61,23 @@ jobs:
             set -e
             cd ${{ secrets.VM_PATH }}
 
-            echo "[1/6] Upgrading pip..."
+            echo "[1/8] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
             python --version
 
-            echo "[2/6] Fetching latest code..."
+            echo "[2/8] Fetching latest code..."
             git fetch --all
             git config advice.detachedHead false
 
-            echo "[3/6] Checking out exact validated commit..."
+            echo "[3/8] Checking out exact validated commit..."
             git reset --hard HEAD
             git checkout ${{ github.sha }}
 
-            echo "[4/6] Installing dependencies..."
+            echo "[4/8] Installing dependencies..."
             pip install -r requirements.txt --quiet
 
-            echo "[5/6] Verifying PostgreSQL connection..."
+            echo "[5/8] Verifying PostgreSQL connection..."
 
             python - <<'PY'
             import sys
@@ -94,7 +94,8 @@ jobs:
             echo "[6/8] Syncing systemd unit files..."
             for unit_file in ${{ secrets.VM_PATH }}/deploy/systemd/*.service; do
               unit_name=$(basename "$unit_file")
-              sudo cp "$unit_file" /etc/systemd/system/"$unit_name"
+              sed "s|User=opc|User=${{ secrets.VM_USER }}|g; s|Group=opc|Group=${{ secrets.VM_USER }}|g; s|/home/opc/mail|${{ secrets.VM_PATH }}|g" \
+                "$unit_file" | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
               echo "  Installed: $unit_name"
             done
             sudo systemctl daemon-reload
@@ -126,6 +127,6 @@ jobs:
               fi
             done
 
-            echo "[8/8] Deploy complete ✓"
+            echo "Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"

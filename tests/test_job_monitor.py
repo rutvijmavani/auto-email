@@ -2914,11 +2914,6 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         """
         from datetime import datetime, timezone, timedelta
 
-        # Build the cycle_start_ts the function will compute (now - 24h)
-        # We'll freeze time so it's deterministic.
-        fixed_now_epoch = 1_700_000_000.0
-        cycle_start = fixed_now_epoch - 24 * 3600
-
         mock_rows = [{"company": name, "last_full_scan_epoch": epoch}
                      for name, epoch in scan_map.items()]
 

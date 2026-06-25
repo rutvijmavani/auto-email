@@ -208,19 +208,10 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                 if peer_token == own_token:
                     continue
 
-                # Extract PID for heartbeat lookup (last colon component)
-                try:
-                    peer_pid = int(peer_token.rsplit(":", 1)[-1])
-                except ValueError:
-                    logger.warning(
-                        "detail_worker: cannot extract PID from inflight key %r "
-                        "— skipping",
-                        key,
-                    )
-                    continue
-
-                # Skip peers with a live heartbeat
-                hb_key = f"worker:alive:detail_worker:{peer_pid}"
+                # Skip peers with a live heartbeat.
+                # Heartbeat key is host-qualified ({hostname}:{pid}) to prevent
+                # false skips when two hosts share the same PID.
+                hb_key = f"worker:alive:detail_worker:{peer_token}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "
@@ -778,18 +769,19 @@ def run_worker(once: bool = False, shutdown_event=None,
     """
     Main detail fetch worker loop.
 
-    BRPOPs payloads from [queue:detail:adaptive, queue:detail:fullscan].
-    Redis BRPOP with a list of keys pops from the first non-empty key —
-    adaptive queue is listed first so it always has priority.
+    Pops payloads from queue:detail:adaptive and queue:detail:fullscan using
+    _pop_with_inflight(), which atomically moves each item into a per-worker
+    inflight list (inflight:detail_worker:{hostname}:{pid}) before processing.
+
+    On shutdown, _ATOMIC_REQUEUE_LUA moves any in-progress item back to the
+    front of its source queue so it is not lost.  On startup,
+    _recover_stuck_jobs() scans peer inflight keys and requeues items from
+    workers whose heartbeat has expired.
 
     Args:
         once:           if True, process at most one job then exit.
         shutdown_event: multiprocessing.Event set by the scheduler when this
-                        worker should stop. Checked after BRPOP returns.
-                        If set, the payload is pushed back to the front of the
-                        source queue (LPUSH) so it is not lost — detail jobs
-                        do not use exponential backoff since the issue is
-                        worker count, not a platform error for this job.
+                        worker should stop. Checked after each pop attempt.
         skip_init_db:   if True, skip the init_db() call (used when the
                         scheduler parent process already ran it before fork).
     """

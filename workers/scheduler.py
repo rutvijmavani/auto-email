@@ -1035,7 +1035,7 @@ def _atomic_schedule(
                     (_hash_int % max(1, int(_safe_window * 0.10)))
                     - _safe_window * 0.05
                 )
-                score = target_ts + _jitter_s
+                score = max(target_ts, target_ts + _jitter_s)
             else:
                 _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
                 score = target_ts + _jitter_s

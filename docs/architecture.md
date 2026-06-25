@@ -603,7 +603,7 @@ The scheduler's `claim_stale_work()` function calls `XAUTOCLAIM` on every tick. 
 
 Every completed full scan builds a Redis Bloom filter (`bloom:fullscan:{company}`) containing all job IDs seen on that company's board. On the next full scan, each fetched job ID is checked against the filter before hitting PostgreSQL — if it is already in the filter, the DB check is skipped entirely. Without these filters, every full scan would need to compare tens of thousands of job IDs against the database on every cycle.
 
-Two keys per company:
+Three keys per company:
 - `bloom:fullscan:{company}` — the authoritative filter from the last *completed* scan (read-only during the current scan)
 - `bloom:fullscan:new:{company}` — being built during the current scan; promoted to the authoritative key on completion
 - `bloom:fallback:{company}` — Redis SET fallback when RedisBloom module is unavailable (exact match, more memory)

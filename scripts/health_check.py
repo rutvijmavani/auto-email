@@ -302,28 +302,32 @@ def run_health_check() -> int:
     # ── BLOOM FILTERS ─────────────────────────────────────────────────────────
     _section("BLOOM FILTERS")
 
-    bloom_count = fallback_count = 0
-    cursor = 0
-    for _ in range(10):
-        cursor, keys = r.scan(cursor, match="bloom:fullscan:*", count=200)
-        bloom_count += len(keys)
-        if cursor == 0:
-            break
-    cursor = 0
-    for _ in range(10):
-        cursor, keys = r.scan(cursor, match="bloom:fallback:*", count=200)
-        fallback_count += len(keys)
-        if cursor == 0:
-            break
+    try:
+        bloom_count = fallback_count = 0
+        cursor = 0
+        for _ in range(10):
+            cursor, keys = r.scan(cursor, match="bloom:fullscan:*", count=200)
+            bloom_count += len(keys)
+            if cursor == 0:
+                break
+        cursor = 0
+        for _ in range(10):
+            cursor, keys = r.scan(cursor, match="bloom:fallback:*", count=200)
+            fallback_count += len(keys)
+            if cursor == 0:
+                break
 
-    total_bloom = bloom_count + fallback_count
-    if total_bloom == 0:
-        _row("WARNING", "bloom filters",
-             "No bloom:fullscan:* keys found — Redis may have restarted without saving")
+        total_bloom = bloom_count + fallback_count
+        if total_bloom == 0:
+            _row("WARNING", "bloom filters",
+                 "No bloom:fullscan:* keys found — Redis may have restarted without saving")
+            warnings += 1
+        else:
+            _row("OK", "bloom filters",
+                 f"~{total_bloom} keys  (RedisBloom={bloom_count}  fallback={fallback_count})")
+    except Exception as _bloom_err:
+        _row("DEGRADED", "bloom filters", f"Redis scan error: {_bloom_err}")
         warnings += 1
-    else:
-        _row("OK", "bloom filters",
-             f"~{total_bloom} keys  (RedisBloom={bloom_count}  fallback={fallback_count})")
 
     # ── COVERAGE ──────────────────────────────────────────────────────────────
     _section("COVERAGE (last 26h)")
@@ -409,25 +413,30 @@ def run_health_check() -> int:
         warnings += 1
 
     # ── HUNG WORKERS ─────────────────────────────────────────────────────────
-    hung = []
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-        for key in keys:
-            ks = key.decode() if isinstance(key, bytes) else key
-            company = ks.split(":", 1)[1]
-            if not r.exists(f"progress:{company}"):
-                hung.append(company)
-        if cursor == 0:
-            break
+    try:
+        hung = []
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
+            for key in keys:
+                ks = key.decode() if isinstance(key, bytes) else key
+                company = ks.split(":", 1)[1]
+                if not r.exists(f"progress:{company}"):
+                    hung.append(company)
+            if cursor == 0:
+                break
 
-    _section("HUNG WORKERS  (heartbeat alive, no progress update)")
-    if hung:
-        _row("WARNING", "hung workers",
-             f"{len(hung)}: {', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")
+        _section("HUNG WORKERS  (heartbeat alive, no progress update)")
+        if hung:
+            _row("WARNING", "hung workers",
+                 f"{len(hung)}: {', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")
+            warnings += 1
+        else:
+            _row("OK", "hung workers", "none detected")
+    except Exception as _hung_err:
+        _section("HUNG WORKERS  (heartbeat alive, no progress update)")
+        _row("DEGRADED", "hung workers", f"Redis scan error: {_hung_err}")
         warnings += 1
-    else:
-        _row("OK", "hung workers", "none detected")
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print(f"\n  {'─' * 60}")

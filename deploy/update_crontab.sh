@@ -71,7 +71,7 @@ NEW_CRON="${NEW_CRON}
 # Sends a batched email alert (max once per hour) if anything actionable
 # is found.  State tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_\$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)
