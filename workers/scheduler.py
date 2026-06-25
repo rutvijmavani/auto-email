@@ -1989,7 +1989,7 @@ def _fullscan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     ).start()
 
     from workers.fullscan import run_worker
-    run_worker(skip_init_db=True)
+    run_worker(shutdown_event=shutdown_event, skip_init_db=True)
 
 
 # ── Pool management helpers ───────────────────────────────────────────────────

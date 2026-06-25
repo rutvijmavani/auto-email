@@ -1190,7 +1190,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 # ─────────────────────────────────────────
 
 def run_worker(once: bool = False, skip_lock: bool = False,
-               skip_init_db: bool = False) -> None:
+               skip_init_db: bool = False,
+               shutdown_event=None) -> None:
     """
     Main fullscan worker loop — stream-based delivery (Section 9 redesign).
 
@@ -1212,9 +1213,12 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     checkpoint ensures the resumed scan doesn't duplicate work.
 
     Args:
-        once:          If True, process at most one company then exit.
-        skip_lock:     If True, bypass exclusivity lock (dev/debug only).
-        skip_init_db:  If True, skip init_db() (parent process already did it).
+        once:           If True, process at most one company then exit.
+        skip_lock:      If True, bypass exclusivity lock (dev/debug only).
+        skip_init_db:   If True, skip init_db() (parent process already did it).
+        shutdown_event: Optional multiprocessing.Event; when set the worker exits
+                        cleanly after the current XREADGROUP poll completes.
+                        Unacked messages remain in the PEL for XAUTOCLAIM recovery.
     """
     from workers.sentry_init import init_sentry
     init_sentry()
@@ -1267,6 +1271,10 @@ def run_worker(once: bool = False, skip_lock: bool = False,
 
     while True:
         try:
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan: shutdown_event set — stopping cleanly")
+                break
+
             # ── Pause check ───────────────────────────────────────────────────
             # Full scans are long (minutes); polling db:maintenance every 10s
             # is fine (cheaper than adding pub/sub to an already-complex module).
@@ -1284,6 +1292,10 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 count=1,
                 block=STREAM_BLOCK_MS,
             )
+
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan: shutdown_event set after xreadgroup — stopping")
+                break
 
             if not stream_result:
                 if once and _hw["count"] == 0:

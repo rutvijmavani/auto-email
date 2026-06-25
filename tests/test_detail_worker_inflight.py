@@ -46,18 +46,20 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_FAKE_PID = 77777   # synthetic PID used by all tests that need globals set
+_FAKE_PID   = 77777                        # synthetic PID used across tests
+_FAKE_TOKEN = f"testhost:{_FAKE_PID}"     # host:pid token — mirrors run_worker()
 
 
-def _init_inflight_globals(pid=_FAKE_PID):
+def _init_inflight_globals(token=_FAKE_TOKEN):
     """
-    Simulate what run_worker() does: set per-PID inflight globals on the module.
+    Simulate what run_worker() does: set per-worker inflight globals on the module.
+    The token is "{hostname}:{pid}" — guards against PID reuse across hosts.
     Call this in setUp(); call _reset_inflight_globals() in tearDown().
     """
     import workers.detail_worker as dw
     from config import REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN
-    dw._INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{pid}"
-    dw._INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight:{pid}"
+    dw._INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{token}"
+    dw._INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight:{token}"
     dw._INFLIGHT_KEY = {
         REDIS_DETAIL_ADAPTIVE: dw._INFLIGHT_ADAPTIVE,
         REDIS_DETAIL_FULLSCAN: dw._INFLIGHT_FULLSCAN,
@@ -84,13 +86,13 @@ class TestInflightKeyConstants(unittest.TestCase):
     """
 
     def setUp(self):
-        _init_inflight_globals(_FAKE_PID)
+        _init_inflight_globals()   # uses _FAKE_TOKEN = "testhost:{_FAKE_PID}"
 
     def tearDown(self):
         _reset_inflight_globals()
 
     def test_inflight_adaptive_contains_pid(self):
-        """_INFLIGHT_ADAPTIVE embeds the worker PID after initialisation."""
+        """_INFLIGHT_ADAPTIVE embeds the worker PID (part of the host:pid token)."""
         from workers.detail_worker import _INFLIGHT_ADAPTIVE
         self.assertIn(str(_FAKE_PID), _INFLIGHT_ADAPTIVE,
                       "_INFLIGHT_ADAPTIVE must contain the worker PID")
@@ -160,13 +162,19 @@ class TestInflightKeyConstants(unittest.TestCase):
 
 class TestRecoverStuckJobs(unittest.TestCase):
     """
-    _recover_stuck_jobs(r, own_pid) scans for per-PID inflight keys, skips
+    _recover_stuck_jobs(r, own_token) scans for per-worker inflight keys, skips
     live peers (heartbeat present) and own key, and drains dead peers' items.
+
+    Token format is "{hostname}:{pid}" — guards against PID reuse across hosts.
+    The drain loop uses lindex (peek) + eval (Lua atomic pop) instead of lmove,
+    so over-retry items are discarded directly from the inflight list without
+    ever being exposed to live workers through the source queue.
     """
 
-    _OWN_PID  = 1000
-    _DEAD_PID = 9001   # peer with no heartbeat
-    _LIVE_PID = 9002   # peer with active heartbeat
+    _OWN_PID   = 1000
+    _DEAD_PID  = 9001   # peer with no heartbeat
+    _LIVE_PID  = 9002   # peer with active heartbeat
+    _OWN_TOKEN = f"testhost:{_OWN_PID}"    # host:pid token for own worker
 
     def _build_redis_mock(
         self,
@@ -178,21 +186,36 @@ class TestRecoverStuckJobs(unittest.TestCase):
         """
         Build a Redis mock for _recover_stuck_jobs tests.
 
+        Dead/live peer keys use bare-PID format (tests backward compat).
+        Own key uses the host:pid token format (new).
+
+        The drain loop calls lindex (peek) then eval (Lua pop+push/discard).
+        The mock maintains mutable item lists so successive lindex/eval calls
+        simulate draining the list one item at a time.
+
         Returns (r, dead_adp_key, dead_fs_key, live_adp_key).
         """
         from config import REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN
 
-        dead_adaptive_items = list(dead_adaptive_items or [])
-        dead_fullscan_items = list(dead_fullscan_items or [])
+        adp_items = [
+            (item if isinstance(item, bytes) else item.encode())
+            for item in (dead_adaptive_items or [])
+        ]
+        fs_items = [
+            (item if isinstance(item, bytes) else item.encode())
+            for item in (dead_fullscan_items or [])
+        ]
 
+        # Dead/live peers: bare PID (legacy format — backward compat test)
         dead_adp_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._DEAD_PID}"
         dead_fs_key  = f"{REDIS_DETAIL_FULLSCAN}:inflight:{self._DEAD_PID}"
         live_adp_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._LIVE_PID}"
-        own_adp_key  = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._OWN_PID}"
+        # Own key: new host:pid token format
+        own_adp_key  = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._OWN_TOKEN}"
 
         r = MagicMock()
 
-        # scan: return per-PID keys appropriate to each pattern
+        # scan: return per-worker keys appropriate to each pattern
         def _scan(cursor, match="*", count=100):
             adp_pat = f"{REDIS_DETAIL_ADAPTIVE}:inflight:"
             fs_pat  = f"{REDIS_DETAIL_FULLSCAN}:inflight:"
@@ -218,19 +241,35 @@ class TestRecoverStuckJobs(unittest.TestCase):
             return 0
         r.exists.side_effect = _exists
 
-        # lmove: simulate draining dead peer's inflight items one at a time,
-        # returning None when the list is exhausted.
-        adp_items = list(dead_adaptive_items)
-        fs_items  = list(dead_fullscan_items)
-
-        def _lmove(src, dst, src_dir, dst_dir):
-            src_s = src.decode() if isinstance(src, bytes) else src
-            if src_s == dead_adp_key and adp_items:
-                return adp_items.pop(0)
-            if src_s == dead_fs_key and fs_items:
-                return fs_items.pop(0)
+        # lindex: non-destructive peek at the right end of the inflight list.
+        # Returns the current first item (without removing it), or None when empty.
+        def _lindex(key, idx):
+            key_s = key.decode() if isinstance(key, bytes) else key
+            if key_s == dead_adp_key:
+                return adp_items[0] if adp_items else None
+            if key_s == dead_fs_key:
+                return fs_items[0] if fs_items else None
             return None
-        r.lmove.side_effect = _lmove
+        r.lindex.side_effect = _lindex
+
+        # eval: atomic Lua drain — pops matching item from inflight.
+        # Signature: eval(script, numkeys, inflight_key, source_key, item, mode)
+        # Returns 1 on success, 0 if item was not at the right end.
+        def _eval(script, numkeys, inflight_key, source_key, item, mode):
+            key_s  = inflight_key.decode() if isinstance(inflight_key, bytes) else inflight_key
+            item_s = item.decode() if isinstance(item, bytes) else item
+            if key_s == dead_adp_key and adp_items:
+                top_s = adp_items[0].decode() if isinstance(adp_items[0], bytes) else adp_items[0]
+                if top_s == item_s:
+                    adp_items.pop(0)
+                    return 1
+            if key_s == dead_fs_key and fs_items:
+                top_s = fs_items[0].decode() if isinstance(fs_items[0], bytes) else fs_items[0]
+                if top_s == item_s:
+                    fs_items.pop(0)
+                    return 1
+            return 0
+        r.eval.side_effect = _eval
 
         return r, dead_adp_key, dead_fs_key, live_adp_key
 
@@ -241,65 +280,70 @@ class TestRecoverStuckJobs(unittest.TestCase):
         r = MagicMock()
         r.scan.return_value = (0, [])
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
     def test_no_inflight_keys_lmove_never_called(self):
-        """No inflight keys → lmove is never called."""
+        """No inflight keys → lindex and eval are never called."""
         r = MagicMock()
         r.scan.return_value = (0, [])
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
-        r.lmove.assert_not_called()
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
+        r.lindex.assert_not_called()
+        r.eval.assert_not_called()
 
-    # ── Own PID is always skipped ─────────────────────────────────────────────
+    # ── Own token key is always skipped ──────────────────────────────────────
 
     def test_own_pid_key_never_drained(self):
-        """Own PID inflight key is skipped — even when heartbeat is absent."""
+        """Own worker's inflight key is skipped — even when heartbeat is absent."""
         r, _, _, _ = self._build_redis_mock(include_own_key=True)
         from config import REDIS_DETAIL_ADAPTIVE
-        own_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._OWN_PID}"
+        own_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{self._OWN_TOKEN}"
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        own_calls = [c for c in r.lmove.call_args_list
-                     if (c[0][0].decode() if isinstance(c[0][0], bytes)
-                         else c[0][0]) == own_key]
-        self.assertEqual(len(own_calls), 0,
-                         "Must never drain own PID's inflight key")
+        own_lindex_calls = [c for c in r.lindex.call_args_list
+                            if (c[0][0].decode() if isinstance(c[0][0], bytes)
+                                else c[0][0]) == own_key]
+        self.assertEqual(len(own_lindex_calls), 0,
+                         "Must never peek at own worker's inflight key")
 
     # ── Dead peer recovery ────────────────────────────────────────────────────
 
     def test_dead_peer_adaptive_item_moved_to_adaptive_source(self):
-        """Dead peer's adaptive inflight item → lmove back to adaptive source."""
+        """Dead peer's adaptive inflight item → eval recovers it to adaptive source."""
         from config import REDIS_DETAIL_ADAPTIVE
         r, dead_adp_key, _, _ = self._build_redis_mock(
             dead_adaptive_items=[b"job1"]
         )
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        lmove_calls = [(c[0][0], c[0][1]) for c in r.lmove.call_args_list]
+        # eval(script, numkeys, inflight_key, source_key, item, mode)
+        # mode="1" means recover (push to source_key)
+        eval_calls = r.eval.call_args_list
         self.assertTrue(any(
-            (src.decode() if isinstance(src, bytes) else src) == dead_adp_key
-            and dst == REDIS_DETAIL_ADAPTIVE
-            for src, dst in lmove_calls
-        ), "Expected lmove(dead_adp_key → adaptive source) for dead peer item")
+            (c[0][2].decode() if isinstance(c[0][2], bytes) else c[0][2]) == dead_adp_key
+            and c[0][3] == REDIS_DETAIL_ADAPTIVE
+            and c[0][5] == "1"
+            for c in eval_calls
+        ), "Expected eval(dead_adp_key → adaptive source, mode=recover)")
 
     def test_dead_peer_fullscan_item_moved_to_fullscan_source(self):
-        """Dead peer's fullscan inflight item → lmove back to fullscan source."""
+        """Dead peer's fullscan inflight item → eval recovers it to fullscan source."""
         from config import REDIS_DETAIL_FULLSCAN
         r, _, dead_fs_key, _ = self._build_redis_mock(
             dead_fullscan_items=[b"job2"]
         )
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        lmove_calls = [(c[0][0], c[0][1]) for c in r.lmove.call_args_list]
+        eval_calls = r.eval.call_args_list
         self.assertTrue(any(
-            (src.decode() if isinstance(src, bytes) else src) == dead_fs_key
-            and dst == REDIS_DETAIL_FULLSCAN
-            for src, dst in lmove_calls
-        ), "Expected lmove(dead_fs_key → fullscan source) for dead peer item")
+            (c[0][2].decode() if isinstance(c[0][2], bytes) else c[0][2]) == dead_fs_key
+            and c[0][3] == REDIS_DETAIL_FULLSCAN
+            and c[0][5] == "1"
+            for c in eval_calls
+        ), "Expected eval(dead_fs_key → fullscan source, mode=recover)")
 
     def test_multiple_items_all_recovered(self):
         """All items in a dead peer's inflight are drained (loop runs until None)."""
@@ -307,34 +351,34 @@ class TestRecoverStuckJobs(unittest.TestCase):
             dead_adaptive_items=[b"j1", b"j2", b"j3"]
         )
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        adp_lmove_calls = [c for c in r.lmove.call_args_list
-                           if (c[0][0].decode() if isinstance(c[0][0], bytes)
-                               else c[0][0]) == dead_adp_key]
-        # 3 items moved + 1 final None check = 4 calls
-        self.assertEqual(len(adp_lmove_calls), 4,
-                         "Drain loop must run until lmove returns None")
+        # 3 items recovered + 1 final lindex returning None = 4 lindex calls
+        adp_lindex_calls = [c for c in r.lindex.call_args_list
+                            if (c[0][0].decode() if isinstance(c[0][0], bytes)
+                                else c[0][0]) == dead_adp_key]
+        self.assertEqual(len(adp_lindex_calls), 4,
+                         "Drain loop must call lindex until None is returned")
 
     # ── Live peer is never touched ────────────────────────────────────────────
 
     def test_live_peer_items_not_touched(self):
-        """Live peer's inflight key (heartbeat present) → rpop never called on it."""
+        """Live peer's inflight key (heartbeat present) → lindex never called on it."""
         r, _, _, live_adp_key = self._build_redis_mock(include_live_peer=True)
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        live_calls = [c for c in r.lmove.call_args_list
-                      if (c[0][0].decode() if isinstance(c[0][0], bytes)
-                          else c[0][0]) == live_adp_key]
-        self.assertEqual(len(live_calls), 0,
-                         "Must not drain a live peer's inflight items")
+        live_lindex_calls = [c for c in r.lindex.call_args_list
+                             if (c[0][0].decode() if isinstance(c[0][0], bytes)
+                                 else c[0][0]) == live_adp_key]
+        self.assertEqual(len(live_lindex_calls), 0,
+                         "Must not peek at a live peer's inflight items")
 
     def test_heartbeat_check_performed_per_pid(self):
-        """r.exists is called for each peer PID found, not for own PID."""
+        """r.exists is called for each peer PID found, not for own token."""
         r, _, _, _ = self._build_redis_mock()
         from workers.detail_worker import _recover_stuck_jobs
-        _recover_stuck_jobs(r, self._OWN_PID)
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
 
         exists_calls = [c[0][0] for c in r.exists.call_args_list]
         # Should have checked heartbeat for the dead peer
@@ -342,10 +386,10 @@ class TestRecoverStuckJobs(unittest.TestCase):
             any(str(self._DEAD_PID) in str(k) for k in exists_calls),
             "exists() must be called to check the dead peer's heartbeat",
         )
-        # Must NOT have checked own PID (it's excluded before exists() is called)
+        # Must NOT have checked own PID (excluded before exists() is called)
         self.assertFalse(
             any(str(self._OWN_PID) in str(k) for k in exists_calls),
-            "exists() must not be called for own PID",
+            "exists() must not be called for own worker token",
         )
 
 
@@ -362,8 +406,8 @@ class TestPopWithInflight(unittest.TestCase):
     """
 
     def setUp(self):
-        """Initialise per-PID inflight globals as run_worker() would."""
-        _init_inflight_globals(_FAKE_PID)
+        """Initialise per-worker inflight globals as run_worker() would."""
+        _init_inflight_globals()   # uses _FAKE_TOKEN = "testhost:{_FAKE_PID}"
 
     def tearDown(self):
         _reset_inflight_globals()
