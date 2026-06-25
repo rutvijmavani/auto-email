@@ -834,7 +834,7 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         self.assertEqual(self._level(issues, "poll:adaptive"), Issue.WARNING)
 
     def test_queue_making_progress_is_ok(self):
-        """Overdue shrinking → queue is moving → OK."""
+        """Overdue shrinking (s1=False) + proc increasing (s3=False) → stall=1/3 < 2 → OK."""
         from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 5,
@@ -845,11 +845,10 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         }
         issues, _ = self._run(
             snap=snap,
-            adp_overdue=3,   # SHRINKING → s1 progresses → at most WARNING, likely OK
-            scan_proc=55,    # INCREASED
+            adp_overdue=3,   # SHRINKING → s1=False
+            scan_proc=55,    # INCREASED → s3=False; s2=True (head same) → stall=1 < 2 → OK
         )
-        level = self._level(issues, "poll:adaptive")
-        self.assertNotEqual(level, "ERROR")
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.OK)
 
     # ── Fullscan lock exoneration ─────────────────────────────────────────────
 

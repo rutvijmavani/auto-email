@@ -373,6 +373,10 @@ def run():
     }
     stats_lock = threading.Lock()
 
+    # Capture horizon before fallback work so any inflight scan that completes
+    # during the fallback phase is still credited via DB verification below.
+    _scan_horizon = time.time()
+
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
@@ -430,7 +434,6 @@ def run():
         print(f"[INFO] Waiting up to {_IN_FLIGHT_WAIT_S}s for "
               f"{len(_remaining_inflight)} in-flight scan(s) to finish...")
 
-        _wait_start = time.time()
         try:
             from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
             import redis as _redis_lib_wait
@@ -452,24 +455,28 @@ def run():
                     _remaining_inflight -= _newly_done
 
                     # Verify via DB: only credit companies whose last_full_scan_at
-                    # was actually updated since the wait began.  A scan that failed
-                    # or was aborted may also disappear from the inflight ZSET, so
-                    # membership disappearance alone is not proof of completion.
+                    # was actually updated since before the fallback phase began.
+                    # A scan that failed or was aborted may also disappear from
+                    # the inflight ZSET, so membership disappearance alone is not
+                    # proof of completion.  Use _scan_horizon (captured before the
+                    # fallback fetch) so scans that finished during fallback are
+                    # also credited correctly.
                     _confirmed_done: set = set()
                     try:
-                        _vconn = get_conn()
+                        from db.connection import get_conn as _vget_conn
+                        _vconn = _vget_conn()
                         try:
                             _vrows = _vconn.execute(
                                 "SELECT company FROM company_poll_stats "
                                 "WHERE company = ANY(%s) "
                                 "AND last_full_scan_at >= "
                                 "    to_timestamp(%s::double precision)",
-                                (list(_newly_done), _wait_start),
+                                (list(_newly_done), _scan_horizon),
                             ).fetchall()
                             _confirmed_done = {r["company"] for r in _vrows}
                         finally:
                             _vconn.close()
-                    except Exception as _db_ver_err:
+                    except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
                             "In-flight wait: DB verification failed (%s) — "
                             "crediting all %d newly-done conservatively",

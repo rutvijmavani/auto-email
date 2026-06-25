@@ -1286,7 +1286,8 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
     _worker_covered = stats.get("covered_by_workers", 0)
     _fallback_hits  = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
     _in_flight      = stats.get("in_flight", 0)
-    _total_covered  = _worker_covered + _fallback_hits + _in_flight
+    # in_flight scans are unconfirmed — exclude from coverage to match the PDF.
+    _total_covered  = _worker_covered + _fallback_hits
     _total          = stats.get("companies_monitored", 0)
     _cov_pct        = int(_total_covered / _total * 100) if _total else 0
     _cov_detail = f"{_worker_covered} by workers"
@@ -1298,7 +1299,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
             _breakdown += f", {_fb_empty} empty"
         _cov_detail += f", {_fallback_hits} by fallback ({_breakdown})"
     if _in_flight:
-        _cov_detail += f" + {_in_flight} in-flight"
+        _cov_detail += f" + {_in_flight} pending (in-flight)"
     coverage = f"{_total_covered}/{_total} ({_cov_pct}%)"
 
     body_html = f"""

@@ -91,7 +91,16 @@ jobs:
             conn.close()
             PY
 
-            echo "[6/7] Restarting services..."
+            echo "[6/8] Syncing systemd unit files..."
+            for unit_file in ${{ secrets.VM_PATH }}/deploy/systemd/*.service; do
+              unit_name=$(basename "$unit_file")
+              sudo cp "$unit_file" /etc/systemd/system/"$unit_name"
+              echo "  Installed: $unit_name"
+            done
+            sudo systemctl daemon-reload
+            echo "  systemd daemon reloaded"
+
+            echo "[7/8] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do
               _cat_exit=0
               _cat_err=$(systemctl cat "$svc" 2>&1 >/dev/null) || _cat_exit=$?
@@ -105,7 +114,7 @@ jobs:
               fi
             done
 
-            echo "[7/7] Verifying services are active..."
+            echo "[8/8] Verifying services are active..."
             for svc in recruiter-scheduler recruiter-watchdog; do
               if systemctl cat "$svc" &>/dev/null; then
                 if ! systemctl is-active --quiet "$svc"; then

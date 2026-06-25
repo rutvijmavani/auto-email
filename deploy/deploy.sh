@@ -50,8 +50,17 @@ cd "$PROJECT_DIR"
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
+# Detect detached HEAD (e.g. after 'git checkout <sha>') — rev-parse returns
+# the literal string "HEAD" in that state, making 'git pull origin HEAD' fail.
+_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$_BRANCH" == "HEAD" ]]; then
+    echo "[ERROR] Repository is in detached HEAD state — cannot pull."
+    echo "  Run: git checkout main   (or the appropriate branch)"
+    exit 1
+fi
+
 # Count commits we're about to pull in
-BEHIND=$(git rev-list --count "HEAD..origin/$(git rev-parse --abbrev-ref HEAD)" 2>/dev/null || echo "?")
+BEHIND=$(git rev-list --count "HEAD..origin/${_BRANCH}" 2>/dev/null || echo "?")
 echo "  Current commit : $CURRENT_SHA"
 echo "  Commits behind : $BEHIND"
 
@@ -65,7 +74,7 @@ if [[ "$BEHIND" == "0" ]]; then
         exit 0
     fi
 else
-    git pull origin "$(git rev-parse --abbrev-ref HEAD)"
+    git pull origin "${_BRANCH}"
     NEW_SHA=$(git rev-parse --short HEAD)
     echo "  Updated to : $NEW_SHA"
     echo ""
@@ -91,6 +100,21 @@ if $NO_RESTART; then
     echo "════════════════════════════════════════════════════════════"
     exit 0
 fi
+
+# ── Sync systemd unit files ───────────────────────────────────────────────────
+# Unit file changes (OnFailure=, ordering, env vars) are only picked up after
+# the unit files on disk are refreshed and systemd reloads its unit graph.
+# Run this before restart so the updated definitions are always active.
+echo ""
+echo "► Syncing systemd unit files..."
+DEPLOY_DIR="$(dirname "$0")"
+for unit_file in "$DEPLOY_DIR/systemd/"*.service; do
+    unit_name=$(basename "$unit_file")
+    sudo cp "$unit_file" /etc/systemd/system/"$unit_name"
+    echo "  Installed: $unit_name"
+done
+sudo systemctl daemon-reload
+echo "  systemd daemon reloaded"
 
 # ── Restart systemd services ──────────────────────────────────────────────────
 # Restarting recruiter-scheduler is enough — it spawns all workers (scan_worker,

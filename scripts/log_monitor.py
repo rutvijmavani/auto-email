@@ -230,7 +230,9 @@ def _load_offsets() -> dict[str, int]:
 
 def _save_offsets(offsets: dict[str, int]) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"offsets": offsets}, indent=2))
+    _tmp = STATE_FILE.with_suffix(".tmp")
+    _tmp.write_text(json.dumps({"offsets": offsets}, indent=2))
+    _tmp.replace(STATE_FILE)   # atomic rename — no partial-write corruption
 
 
 # ─────────────────────────────────────────────────────────────────────────────

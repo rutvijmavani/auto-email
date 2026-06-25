@@ -178,5 +178,5 @@ def _check_postgres(prefix: str) -> None:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as _close_err:
+                logger.debug("startup: PostgreSQL connection close failed: %s", _close_err)

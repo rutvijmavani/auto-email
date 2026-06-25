@@ -1769,6 +1769,19 @@ class TestMetricCalculations(unittest.TestCase):
         alerts = self.build_alerts(stats, 137)
         self.assertFalse(any("Coverage" in a["message"] for a in alerts))
 
+    def test_coverage_alert_low_combined_with_zero_fallback(self):
+        """Low worker coverage + no fallback → combined below 70 % → alert."""
+        stats = self._stats(covered_by_workers=50, fallback_scanned=0)
+        alerts = self.build_alerts(stats, 137)
+        self.assertTrue(any("Coverage" in a["message"] for a in alerts))
+
+    def test_no_coverage_alert_when_fallback_scanned_contributes(self):
+        """Worker coverage alone below 70 %, but fallback brings combined above threshold → no alert."""
+        # 50 by workers + 50 fallback = 100/137 ≈ 73 % → no alert
+        stats = self._stats(covered_by_workers=50, fallback_scanned=50)
+        alerts = self.build_alerts(stats, 137)
+        self.assertFalse(any("Coverage" in a["message"] for a in alerts))
+
     def test_unknown_ats_alert_above_20_pct(self):
         stats = self._stats(companies_unknown_ats=30)
         alerts = self.build_alerts(stats, 137)

@@ -17,7 +17,8 @@ TestRescheduleJitter has been replaced with:
     · Multiple clustered entries → picks midpoint of the largest gap
     · Result always within the tolerance window [lo, hi]
     · Deadline guard: gap whose midpoint + avg_duration_s ≥ deadline is skipped
-    · Deadline guard: all gaps violate deadline → fallback to target_ts
+    · Deadline guard: all gaps violate deadline → fallback to target_ts (if target_ts is safe)
+    · Deadline guard: all gaps AND target_ts violate deadline → next_digest + 900
     · No deadline set → avg_duration_s has no effect
     · Tiebreaker: equal-size gaps → closest midpoint to target_ts wins
     · Self-correction: 3 calls from a full cluster produce 3 distinct times
@@ -88,7 +89,8 @@ Coverage
     · entries outside window → treated as empty window → midpoint = target
     · result always within [lo, hi] tolerance window
     · deadline with avg_duration=0 → never skipped
-    · all gaps violate deadline → fallback to target_ts
+    · all gaps violate deadline, target_ts safe → fallback to target_ts
+    · all gaps AND target_ts violate deadline → next_digest + 900
     · large cluster (20 entries) → still returns a finite result
     · single entry at center → splits into equal halves, returns valid midpoint
 
@@ -359,12 +361,21 @@ class TestPickScheduleTime(unittest.TestCase):
         left_mid = (lo + self._TARGET) / 2
         self.assertAlmostEqual(result, left_mid, places=0)
 
-    def test_deadline_guard_all_gaps_fail_returns_target(self):
-        """All gaps violate deadline → fallback to target_ts."""
-        avg_duration = 86400   # 24 h — always exceeds any gap midpoint
-        deadline = self._TARGET - 1  # deadline already in the past → everything fails
-        result = self._call([], deadline_ts=deadline, avg_duration_s=avg_duration)
+    def test_deadline_guard_all_gaps_fail_target_safe_returns_target(self):
+        """All gaps violate deadline, but target_ts itself is safe → returns target_ts."""
+        # avg_duration=1s: target_ts+1 < next 7AM ET (~46 000s away) → target is safe
+        deadline = self._TARGET - 1  # past deadline so all gaps fail
+        result = self._call([], deadline_ts=deadline, avg_duration_s=1.0)
         self.assertAlmostEqual(result, self._TARGET, places=0)
+
+    def test_deadline_guard_all_gaps_fail_target_also_violates_returns_post_digest(self):
+        """All gaps AND target_ts violate deadline → next_digest_deadline(target_ts) + 900."""
+        from workers.scheduler import _next_digest_deadline
+        avg_duration = 86400   # 24 h: target_ts + 86400 > next 7 AM ET → target also violates
+        deadline = self._TARGET - 1  # past deadline so all gaps fail
+        result = self._call([], deadline_ts=deadline, avg_duration_s=avg_duration)
+        expected = _next_digest_deadline(self._TARGET) + 900
+        self.assertAlmostEqual(result, expected, places=0)
 
     def test_no_deadline_avg_duration_has_no_effect(self):
         """With deadline_ts=None, avg_duration_s is ignored."""
@@ -1037,16 +1048,29 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
         self.assertLess(result + 0.0, deadline,
                         "Result with avg_duration=0 must be before deadline")
 
-    def test_all_gaps_violate_deadline_fallback_to_target(self):
-        """If every gap midpoint + avg_duration ≥ deadline, falls back to target_ts."""
+    def test_all_gaps_violate_deadline_target_safe_fallback_to_target(self):
+        """All gaps fail, target_ts+avg is before next digest → returns target_ts."""
+        # avg_duration=1s is tiny: target_ts+1 << next 7 AM ET, so target is safe.
         result = self._call(
             existing_scores=[],
             tolerance_pct=0.20,
-            deadline_ts=self._TARGET - 1.0,  # deadline in the past — all gaps violate
-            avg_duration_s=1.0,  # non-zero to exercise the combined guard (mid + dur ≥ deadline)
+            deadline_ts=self._TARGET - 1.0,
+            avg_duration_s=1.0,
         )
-        # Fallback path: returns target_ts
         self.assertAlmostEqual(result, self._TARGET, places=1)
+
+    def test_all_gaps_violate_deadline_target_also_violates_returns_post_digest(self):
+        """All gaps AND target_ts violate deadline → next_digest + 900."""
+        from workers.scheduler import _next_digest_deadline
+        # 24h avg: target_ts+86400 > next 7 AM ET → target also violates.
+        result = self._call(
+            existing_scores=[],
+            tolerance_pct=0.20,
+            deadline_ts=self._TARGET - 1.0,
+            avg_duration_s=86400.0,
+        )
+        expected = _next_digest_deadline(self._TARGET) + 900
+        self.assertAlmostEqual(result, expected, places=1)
 
     def test_large_cluster_still_finds_a_result(self):
         """Even with 20 entries spread across the window, returns a finite result."""

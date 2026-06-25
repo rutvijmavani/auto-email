@@ -551,12 +551,18 @@ def _complete_fullscan_db(
     interval_s: int,
     duration_s: float,
     prev_avg_duration_s: float = 30.0,
+    next_scan_ts: float = 0.0,
 ) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
     increments total_new_jobs, and updates the scan duration EMA.
+
+    next_scan_ts: exact Unix timestamp written to Redis by _atomic_schedule.
+        When provided (non-zero), it is persisted directly so the DB and Redis
+        ZSET agree on the scheduled time.  If omitted, falls back to
+        NOW() + interval_s seconds (legacy behaviour).
 
     EMA formula (alpha=0.3):
         new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
@@ -570,21 +576,31 @@ def _complete_fullscan_db(
 
     conn = get_conn()
     try:
-        conn.execute("""
+        # Use the exact Redis-scheduled timestamp when available so the DB and
+        # the ZSET always agree on next_full_scan_at.  Fall back to NOW()+interval
+        # if next_scan_ts was not supplied (e.g. called from a test or legacy path).
+        _next_ts_expr = (
+            "to_timestamp(%s::double precision)"
+            if next_scan_ts else
+            "NOW() + (%s * INTERVAL '1 second')"
+        )
+        _next_ts_val = next_scan_ts if next_scan_ts else interval_s
+
+        conn.execute(f"""
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
                  total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
                  updated_at)
             VALUES
-                (%s, %s, NOW(), NOW() + (%s * INTERVAL '1 second'),
+                (%s, %s, NOW(), {_next_ts_expr},
                  FALSE, NULL, NULL,
                  %s, %s, %s,
                  NOW())
             ON CONFLICT (company) DO UPDATE SET
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
-                next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
+                next_full_scan_at        = {_next_ts_expr},
                 full_scan_interrupted    = FALSE,
                 interrupted_at_page      = NULL,
                 interrupted_at           = NULL,
@@ -592,8 +608,8 @@ def _complete_fullscan_db(
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-        """, (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
-              interval_s, new_jobs, int(duration_s), new_avg))
+        """, (company, platform, _next_ts_val, new_jobs, int(duration_s), new_avg,
+              _next_ts_val, new_jobs, int(duration_s), new_avg))
         conn.commit()
         return True
     except Exception as exc:
@@ -1112,6 +1128,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 interval_s          = int(next_scan_at - now),
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
+                next_scan_ts        = next_scan_at,     # exact Redis score → no drift
             )
 
             if db_ok:

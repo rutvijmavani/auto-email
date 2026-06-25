@@ -180,7 +180,8 @@ def _make_lazy_before_send():
                 from config import REDIS_URL
                 import redis as _redis_mod
                 _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
-                                          socket_timeout=1)
+                                          socket_timeout=1,
+                                          socket_connect_timeout=1)
                 _r.ping()
                 _state["r"] = _r
             except Exception as _conn_err:
@@ -287,16 +288,23 @@ def init_sentry(
     except ImportError:
         pass   # standard logging integration above already covers this
 
-    sentry_sdk.init(
-        dsn           = dsn,
-        integrations  = integrations,
-        before_send   = before_send_fn,
-        environment   = os.environ.get("ENVIRONMENT", "production"),
-        release       = release or os.environ.get("GIT_COMMIT", ""),
-        # Don't send PII (email addresses, IP addresses) by default
-        send_default_pii = False,
-        # Sample rate for performance tracing (set to 0 to disable tracing)
-        traces_sample_rate = 0.0,
-    )
+    try:
+        sentry_sdk.init(
+            dsn           = dsn,
+            integrations  = integrations,
+            before_send   = before_send_fn,
+            environment   = os.environ.get("ENVIRONMENT", "production"),
+            release       = release or os.environ.get("GIT_COMMIT", ""),
+            # Don't send PII (email addresses, IP addresses) by default
+            send_default_pii = False,
+            # Sample rate for performance tracing (set to 0 to disable tracing)
+            traces_sample_rate = 0.0,
+        )
+    except Exception as _init_err:
+        logger.warning(
+            "sentry_init: sentry_sdk.init() failed (invalid DSN or integration "
+            "error) — Sentry disabled for this process: %s", _init_err,
+        )
+        return False
 
     return True

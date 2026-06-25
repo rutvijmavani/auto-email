@@ -117,8 +117,11 @@ class Heartbeat:
             self._thread.join(timeout=self._interval_s + 2)
         try:
             self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
-        except Exception:
-            pass    # best-effort; TTL will expire the key if Redis is unavailable
+        except Exception as _del_err:
+            logger.debug(
+                "heartbeat: cleanup delete failed for %s:%s — TTL will expire: %s",
+                self._worker_type, os.getpid(), _del_err,
+            )
 
     # ── internals ─────────────────────────────────────────────────────────────
 

@@ -66,7 +66,7 @@ fi
 # read and write the correct user's crontab.
 echo ""
 echo "► Removing watchdog cron entry from $SERVICE_USER crontab (now managed by systemd)..."
-if crontab -u "$SERVICE_USER" -l 2>/dev/null | grep -q "workers.watchdog"; then
+if crontab -u "$SERVICE_USER" -l 2>/dev/null | grep -qE "workers\.watchdog|watchdog.*--once"; then
     # Under set -o pipefail, grep -v exits 1 when ALL lines are filtered (empty
     # crontab result).  Wrap in a subshell with || true so the pipeline always
     # succeeds and crontab receives stdin even if every line was removed.

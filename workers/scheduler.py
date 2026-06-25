@@ -1040,10 +1040,12 @@ def _atomic_schedule(
                 _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
                 score = target_ts + _jitter_s
                 if deadline_ts:
-                    # Guard: never clamp score before target_ts — that would
-                    # violate the interval contract when the deadline is already
-                    # past (deadline_ts - avg_duration_s < target_ts).
-                    score = min(score, max(target_ts, deadline_ts - avg_duration_s))
+                    # Clamp score into [target_ts, max(target_ts, deadline_ts - avg)].
+                    # Upper cap: never schedule so late the scan can't finish before
+                    # the digest.  Lower bound: jitter must not push score before
+                    # target_ts (that would violate the interval contract).
+                    _upper = max(target_ts, deadline_ts - avg_duration_s)
+                    score  = max(target_ts, min(score, _upper))
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,

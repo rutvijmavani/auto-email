@@ -99,18 +99,38 @@ def _claim_alert_slot(service: str) -> bool:
     if age < _DEDUP_WINDOW_S:
         return False  # still within dedup window → suppress
 
-    # Flag expired → atomically replace it so only one caller wins
-    tmp = flag + f".{os.getpid()}.tmp"
+    # Flag expired → serialize via flock so only one concurrent caller wins.
+    # os.rename is individually atomic on POSIX, but two concurrent processes can
+    # both see the same stale mtime, create separate tmp files, and both rename
+    # successfully — both returning True and both sending the alert.
+    # A lock file shared by all callers serialises the check+rename into one
+    # critical section so only the first caller wins.
+    lock_path = flag + ".lock"
     try:
-        with open(tmp, "w") as fh:
-            fh.write(datetime.now().isoformat())
-        os.rename(tmp, flag)   # atomic on POSIX (Linux/macOS)
-        return True
+        import fcntl
+        with open(lock_path, "w") as _lf:
+            fcntl.flock(_lf, fcntl.LOCK_EX)
+            # Re-check age inside the lock — a concurrent caller may have
+            # already renewed the flag while we were waiting.
+            try:
+                _age_now = time.time() - os.path.getmtime(flag)
+            except OSError:
+                return False
+            if _age_now < _DEDUP_WINDOW_S:
+                return False   # another caller already renewed it
+            tmp = flag + f".{os.getpid()}.tmp"
+            try:
+                with open(tmp, "w") as fh:
+                    fh.write(datetime.now().isoformat())
+                os.rename(tmp, flag)
+                return True
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return False
     except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
         return False
 
 

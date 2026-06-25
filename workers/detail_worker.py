@@ -252,61 +252,30 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     except Exception:
                         _job_id = _company = ""
 
+                    # Recovery from a dead peer's inflight is not a retry attempt —
+                    # the job was never actually processed.  Always requeue so the
+                    # retry budget is only charged in the main run_worker loop when
+                    # _process_detail() actually fails with retryable=True.
                     should_recover = True
-                    if _job_id:
-                        _rkey = (
-                            f"{_RETRY_KEY_PREFIX}{_company}:{_job_id}"
-                            if _company else
-                            f"{_RETRY_KEY_PREFIX}{_job_id}"
-                        )
-                        try:
-                            _attempt = int(r.incr(_rkey))
-                            r.expire(_rkey, _RETRY_KEY_TTL)
-                        except Exception:
-                            _attempt = 1   # safe default: allow retry
-
-                        if _attempt > _MAX_DETAIL_RETRIES:
-                            logger.error(
-                                "detail_worker: job_id=%s company=%r exceeded "
-                                "%d retries — discarding permanently",
-                                _job_id, _company, _MAX_DETAIL_RETRIES,
-                            )
-                            should_recover = False
 
                     # Atomically pop from inflight; push to source only if recovering.
                     # If another drain worker already consumed this item, Lua returns 0
                     # and we re-loop to pick up the next item.
                     _moved = r.eval(
                         _ATOMIC_DRAIN_LUA, 2, key, source_key,
-                        raw_peek, "1" if should_recover else "0",
+                        raw_peek, "1",   # always recover (mode=1 → RPUSH to source)
                     )
                     if not _moved:
                         # Concurrent drain took the item — re-loop to get next
                         continue
 
-                    if not should_recover:
-                        try:
-                            delete_pending_detail(_company, _job_id)
-                        except Exception as _db_err:
-                            logger.error(
-                                "detail_worker: delete_pending_detail "
-                                "failed for %s: %s", _job_id, _db_err,
-                            )
-                        discarded += 1
-                    else:
-                        recovered += 1
+                    recovered += 1
 
                 if recovered:
                     logger.warning(
                         "detail_worker: recovered %d stuck job(s) from "
                         "dead peer token=%s: %s -> %s",
                         recovered, peer_token, key, source_key,
-                    )
-                if discarded:
-                    logger.error(
-                        "detail_worker: permanently discarded %d job(s) from "
-                        "dead peer token=%s (exceeded %d retries)",
-                        discarded, peer_token, _MAX_DETAIL_RETRIES,
                     )
 
             if cursor == 0:
@@ -963,11 +932,51 @@ def run_worker(once: bool = False, shutdown_event=None,
             # filtered, and known-permanent errors where _finish() already
             # deleted the pending_detail DB row.  These are acknowledged.
             if result.get("retryable"):
+                # Charge the retry budget here — not in recovery — so only real
+                # processing failures count against the limit.
+                _r_job_id  = result.get("job_id", "")
+                _r_company = result.get("company", "")
+                _r_discard = False
+                if _r_job_id:
+                    _rkey = (
+                        f"{_RETRY_KEY_PREFIX}{_r_company}:{_r_job_id}"
+                        if _r_company else
+                        f"{_RETRY_KEY_PREFIX}{_r_job_id}"
+                    )
+                    try:
+                        _attempt = int(r.incr(_rkey))
+                        r.expire(_rkey, _RETRY_KEY_TTL)
+                        if _attempt > _MAX_DETAIL_RETRIES:
+                            logger.error(
+                                "detail_worker: job_id=%s company=%r exceeded "
+                                "%d retries — discarding permanently",
+                                _r_job_id, _r_company, _MAX_DETAIL_RETRIES,
+                            )
+                            r.lrem(inflight_key, 1, raw)
+                            try:
+                                delete_pending_detail(_r_company, _r_job_id)
+                            except Exception as _dp_err:
+                                logger.error(
+                                    "detail_worker: delete_pending_detail "
+                                    "failed for %s: %s", _r_job_id, _dp_err,
+                                )
+                            _r_discard = True
+                    except Exception as _cnt_err:
+                        logger.warning(
+                            "detail_worker: retry counter failed for %s: %s "
+                            "— allowing retry",
+                            _r_job_id, _cnt_err,
+                        )
+                if _r_discard:
+                    if once:
+                        break
+                    continue
+
                 logger.warning(
                     "detail_worker: transient error — leaving job_id=%s "
                     "company=%r in inflight; exiting so _recover_stuck_jobs() "
                     "can reclaim it on the next startup",
-                    result.get("job_id"), result.get("company"),
+                    _r_job_id, _r_company,
                 )
                 # Stop the heartbeat daemon BEFORE deleting the key so the
                 # thread cannot recreate it after deletion (race window).
