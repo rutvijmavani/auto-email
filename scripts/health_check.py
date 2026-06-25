@@ -254,7 +254,10 @@ def run_health_check() -> int:
                     f"total_replacements={total}"
                 )
 
-                if consec >= 5:
+                if alive == 0:
+                    _row("ERROR", label_suffix, f"{base}  no live workers")
+                    errors += 1
+                elif consec >= 5:
                     _row("ERROR", label_suffix,
                          f"{base}  consecutive_rapid_deaths={consec}")
                     errors += 1
@@ -327,28 +330,47 @@ def run_health_check() -> int:
 
     try:
         from db.db import get_conn
-        conn   = get_conn()
-        total  = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
-        missed = conn.execute("""
-            SELECT COUNT(*) AS c FROM company_poll_stats
-            WHERE last_full_scan_at IS NULL
-               OR last_full_scan_at < NOW() - INTERVAL '26 hours'
-        """).fetchone()["c"]
-        stuck  = conn.execute("""
-            SELECT COUNT(*) AS c FROM job_postings
-            WHERE status = 'pending_detail'
-              AND created_at < NOW() - INTERVAL '1 hour'
-        """).fetchone()["c"]
-        # Show the worst 3 missed companies
-        missed_names = conn.execute("""
+        from config import REDIS_INFLIGHT_FULLSCAN
+
+        # Companies mid-scan are not missed — exclude them from the stale count
+        # so the health check matches the contract used by the monitor layer.
+        inflight_names: set = set()
+        try:
+            _stale_cutoff = now - 7200   # 2-hour inflight TTL (same as job_monitor)
+            _raw_inflight = r.zrangebyscore(
+                REDIS_INFLIGHT_FULLSCAN, _stale_cutoff, "+inf"
+            )
+            inflight_names = {
+                (c.decode() if isinstance(c, bytes) else c)
+                for c in (_raw_inflight or [])
+            }
+        except Exception as _inf_err:
+            logger.debug("health_check: inflight ZSET unavailable: %s", _inf_err)
+
+        conn  = get_conn()
+        total = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
+
+        # Fetch all stale companies so we can filter out inflight in Python
+        _stale_rows = conn.execute("""
             SELECT company, last_full_scan_at
             FROM company_poll_stats
             WHERE last_full_scan_at IS NULL
                OR last_full_scan_at < NOW() - INTERVAL '26 hours'
             ORDER BY last_full_scan_at ASC NULLS FIRST
-            LIMIT 3
         """).fetchall()
+
+        stuck = conn.execute("""
+            SELECT COUNT(*) AS c FROM job_postings
+            WHERE status = 'pending_detail'
+              AND created_at < NOW() - INTERVAL '1 hour'
+        """).fetchone()["c"]
         conn.close()
+
+        # Exclude actively-scanning companies from the missed count
+        _stale_set    = {r2["company"] for r2 in _stale_rows}
+        _effective_missed = _stale_set - inflight_names
+        missed        = len(_effective_missed)
+        missed_names  = [r2 for r2 in _stale_rows if r2["company"] in _effective_missed][:3]
 
         scanned = total - missed
         pct     = scanned / total * 100 if total else 0

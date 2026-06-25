@@ -212,7 +212,7 @@ def _fingerprint(line: str, context: list[str]) -> str:
         raw = re.sub(r"\b[0-9a-f]{8,}\b",          "HASH",    raw)
         raw = re.sub(r"\b\d{4,}\b",                "N",       raw)
 
-    return hashlib.md5(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -664,7 +664,7 @@ def main() -> None:
     # Prevents duplicate alerts and state-file races on 15-min cron overlaps.
     _lock_path = PROJECT_DIR / "data" / "log_monitor.lock"
     _lock_path.parent.mkdir(parents=True, exist_ok=True)
-    _lock_fh = open(_lock_path, "w")  # noqa: WPS515
+    _lock_fh = open(_lock_path, "w")  # noqa: SIM115 — must stay open for flock lifetime
     try:
         fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

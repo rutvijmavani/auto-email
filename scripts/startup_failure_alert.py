@@ -294,6 +294,12 @@ def send_startup_failure_alert(service: str) -> None:
         print(f"[startup-alert] Alert sent for {service}")
     except Exception as exc:
         print(f"[startup-alert] Failed to send email: {exc}", file=sys.stderr)
+        # Release the dedup slot so the next invocation can retry delivery.
+        _flag = _FLAG_FILE_TEMPLATE.format(service=service.replace("-", "_"))
+        try:
+            os.unlink(_flag)
+        except OSError:
+            pass
         sys.exit(1)
 
 

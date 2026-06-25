@@ -105,6 +105,18 @@ jobs:
               fi
             done
 
-            echo "[7/7] Deploy complete ✓"
+            echo "[7/7] Verifying services are active..."
+            for svc in recruiter-scheduler recruiter-watchdog; do
+              if systemctl cat "$svc" &>/dev/null; then
+                if ! systemctl is-active --quiet "$svc"; then
+                  echo "[ERROR] $svc failed to start after restart:"
+                  journalctl -u "$svc" -n 30 --no-pager || true
+                  exit 1
+                fi
+                echo "[OK] $svc is active"
+              fi
+            done
+
+            echo "[8/8] Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"

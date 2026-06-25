@@ -18,6 +18,13 @@ init_db()
 ats_module = get_ats_module("workday")
 config     = get_config("workday")
 
+if ats_module is None:
+    print("ERROR: get_ats_module('workday') returned None — check ATS registry.")
+    sys.exit(1)
+if config is None:
+    print("ERROR: get_config('workday') returned None — check ATS registry.")
+    sys.exit(1)
+
 conn = get_conn()
 try:
     row = conn.execute("SELECT ats_slug FROM prospective_companies WHERE company = %s LIMIT 1",

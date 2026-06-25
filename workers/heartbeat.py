@@ -113,7 +113,8 @@ class Heartbeat:
         to run on the next loop iteration).
         """
         self._stop.set()        # unblocks _stop.wait() on the next sleep boundary
-        self._thread.join(timeout=self._interval_s + 2)   # wait for thread exit
+        if self._thread.ident is not None:                 # only join if started
+            self._thread.join(timeout=self._interval_s + 2)
         try:
             self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
         except Exception:

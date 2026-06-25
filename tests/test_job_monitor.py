@@ -2894,50 +2894,6 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
             datetime.now(timezone.utc) - timedelta(hours=1)
         ).timestamp()
 
-    def _run(self, companies, scan_map, inflight_companies=None, redis_error=False):
-        """
-        Call _get_worker_missed_companies with mocked DB and Redis.
-
-        companies:          list of dicts with "company" key
-        scan_map:           {name: last_full_scan_epoch} (0 = never scanned)
-        inflight_companies: list of company names currently being scanned
-        redis_error:        if True, Redis raises ConnectionError
-        """
-        mock_rows = [{"company": name, "last_full_scan_epoch": epoch}
-                     for name, epoch in scan_map.items()]
-
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_cursor.fetchall.return_value = mock_rows
-        mock_conn.execute.return_value = mock_cursor
-        mock_conn.close = MagicMock()
-
-        mock_redis = MagicMock()
-        if redis_error:
-            mock_redis.zrangebyscore.side_effect = ConnectionError("Redis down")
-        else:
-            inflight_encoded = [
-                c.encode() if isinstance(c, str) else c
-                for c in (inflight_companies or [])
-            ]
-            mock_redis.zrangebyscore.return_value = inflight_encoded
-
-        with patch("db.db.get_conn", return_value=mock_conn), \
-             patch("jobs.job_monitor.get_redis", return_value=mock_redis,
-                   create=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_redis):
-            from jobs.job_monitor import _get_worker_missed_companies
-            import unittest.mock
-            with unittest.mock.patch(
-                "jobs.job_monitor._get_worker_missed_companies.__globals__"
-                if False else "builtins.__import__",
-                side_effect=lambda name, *a, **kw: mock_redis
-                if name == "workers.redis_client" else __builtins__.__import__(name, *a, **kw)
-                if hasattr(__builtins__, "__import__") else None,
-            ):
-                pass
-            return _get_worker_missed_companies(companies)
-
     def _simple_run(self, companies, scan_map, inflight=None, redis_error=False):
         """
         Simpler runner: directly patches the Redis call inside

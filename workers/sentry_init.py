@@ -218,63 +218,6 @@ def _make_lazy_before_send():
     return before_send
 
 
-def _make_before_send(r):
-    """
-    Return a Sentry before_send callback wired to Redis client *r*.
-
-    State machine per fingerprint fp:
-      ┌───────────────┬──────────────────────────────────────────────────────┐
-      │  err:{fp}     │  Decision                                            │
-      ├───────────────┼──────────────────────────────────────────────────────┤
-      │  not exists   │  NEW   → forward to Sentry, set err + act keys      │
-      │  exists       │  KNOWN → suppress (return None), refresh act TTL    │
-      └───────────────┴──────────────────────────────────────────────────────┘
-
-    act TTL is dynamic: N_CYCLES × avg inter-arrival time, clamped to
-    [MIN_ACT_TTL_S, MAX_ACT_TTL_S].  When act expires the error is
-    "resolved"; err also expires after DEDUP_WINDOW_S.  The next occurrence
-    after both expire is treated as brand-new (1 Sentry credit per
-    unique error per 7-day window, regardless of firing frequency).
-    """
-    def before_send(event: dict, hint: dict) -> Optional[dict]:
-        try:
-            fp = _fingerprint(event)
-            if fp is None:
-                return event               # can't fingerprint → always forward
-
-            err_key = f"{_PFX_ERR}{fp}"
-            act_key = f"{_PFX_ACT}{fp}"
-            ts_key  = f"{_PFX_TS}{fp}"
-
-            # Record this occurrence in frequency history (always, new or known)
-            _update_frequency(r, ts_key)
-            act_ttl = _compute_act_ttl(r, ts_key)
-
-            # Atomic dedup via Lua script — SET NX err_key, EXISTS act_key,
-            # SET act_key all in one round-trip so concurrent workers cannot
-            # both see act_active=False and forward the same event.
-            _res       = r.eval(_DEDUP_LUA, 2, err_key, act_key,
-                                DEDUP_WINDOW_S, act_ttl)
-            is_new     = _res[0]   # 'OK' if newly created, None if already existed
-            act_active = _res[1]   # 1 if act_key existed, 0 if not
-
-            if not is_new and act_active:
-                return None               # Known active error — drop, zero Sentry credits
-
-        except Exception as _dedup_err:
-            # Never let dedup logic prevent error reporting
-            logger.debug("sentry dedup error (ignored): %s", _dedup_err, exc_info=True)
-
-        return event
-
-    return before_send
-
-
-def _noop_before_send(event: dict, hint: dict) -> dict:
-    """Fallback used when Redis is unavailable — forwards everything."""
-    return event
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────

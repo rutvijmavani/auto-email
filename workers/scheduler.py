@@ -945,13 +945,27 @@ def _pick_schedule_time(
         return midpoint
 
     # All gaps violate deadline (fleet so large that no slot is safe this cycle).
-    # Fall back to target_ts — at least we don't miss the reschedule entirely.
     logger.warning(
         "_pick_schedule_time: all gaps in window violate deadline for %r "
-        "(avg_duration=%.0fs deadline=%s) — using target_ts",
+        "(avg_duration=%.0fs deadline=%s) — using target_ts fallback",
         queue_key, avg_duration_s,
         datetime.fromtimestamp(deadline_ts).strftime("%H:%M") if deadline_ts else "none",
     )
+    if deadline_ts and avg_duration_s > 0:
+        # Apply the same deadline guard to the fallback: if target_ts itself would
+        # miss the digest, schedule after the next digest so the scan runs in the
+        # following cycle rather than starting too close to the cutoff.
+        _fallback_deadline = _next_digest_deadline(target_ts)
+        if target_ts + avg_duration_s >= _fallback_deadline:
+            # 15-min buffer after the digest lets the email send before scanning
+            _post_digest = _fallback_deadline + 900
+            logger.warning(
+                "_pick_schedule_time: target_ts also violates deadline for %r "
+                "— scheduling after digest at %s",
+                queue_key,
+                datetime.fromtimestamp(_post_digest).strftime("%H:%M"),
+            )
+            return _post_digest
     return target_ts
 
 

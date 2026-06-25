@@ -450,16 +450,53 @@ def run():
                 _newly_done = _remaining_inflight - _still_active
                 if _newly_done:
                     _remaining_inflight -= _newly_done
-                    with stats_lock:
-                        stats["covered_by_workers"] += len(_newly_done)
-                        stats["in_flight"]           -= len(_newly_done)
-                    logger.info(
-                        "In-flight scans completed: %s (%d still waiting)",
-                        ", ".join(sorted(_newly_done)), len(_remaining_inflight),
-                    )
-                    print(f"[INFO] {len(_newly_done)} scan(s) done: "
-                          f"{', '.join(sorted(_newly_done))[:120]}"
-                          f"{'...' if len(_newly_done) > 5 else ''}")
+
+                    # Verify via DB: only credit companies whose last_full_scan_at
+                    # was actually updated since the wait began.  A scan that failed
+                    # or was aborted may also disappear from the inflight ZSET, so
+                    # membership disappearance alone is not proof of completion.
+                    _confirmed_done: set = set()
+                    try:
+                        _vconn = get_conn()
+                        try:
+                            _vrows = _vconn.execute(
+                                "SELECT company FROM company_poll_stats "
+                                "WHERE company = ANY(%s) "
+                                "AND last_full_scan_at >= "
+                                "    to_timestamp(%s::double precision)",
+                                (list(_newly_done), _wait_start),
+                            ).fetchall()
+                            _confirmed_done = {r["company"] for r in _vrows}
+                        finally:
+                            _vconn.close()
+                    except Exception as _db_ver_err:
+                        logger.warning(
+                            "In-flight wait: DB verification failed (%s) — "
+                            "crediting all %d newly-done conservatively",
+                            _db_ver_err, len(_newly_done),
+                        )
+                        _confirmed_done = _newly_done  # safe fallback
+
+                    _unconfirmed = _newly_done - _confirmed_done
+                    if _confirmed_done:
+                        with stats_lock:
+                            stats["covered_by_workers"] += len(_confirmed_done)
+                            stats["in_flight"]           -= len(_confirmed_done)
+                        logger.info(
+                            "In-flight scans confirmed complete: %s (%d still waiting)",
+                            ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
+                        )
+                        print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
+                              f"{', '.join(sorted(_confirmed_done))[:120]}"
+                              f"{'...' if len(_confirmed_done) > 5 else ''}")
+                    if _unconfirmed:
+                        logger.warning(
+                            "In-flight scans left ZSET without DB update "
+                            "(possible failures): %s",
+                            ", ".join(sorted(_unconfirmed)),
+                        )
+                        with stats_lock:
+                            stats["in_flight"] -= len(_unconfirmed)
 
                 if _remaining_inflight:
                     time.sleep(_IN_FLIGHT_POLL_S)
@@ -887,8 +924,7 @@ def _build_alerts(stats, total_companies):
         #   completed (0 or more jobs).  Use this (not companies_with_results)
         #   for coverage — a 0-job result is still a successful scan.
         covered_count = stats.get("covered_by_workers", 0)
-        in_flight_count = stats.get("in_flight", 0)
-        companies_with_data = covered_count + in_flight_count + stats.get("fallback_scanned", 0)
+        companies_with_data = covered_count + stats.get("fallback_scanned", 0)
         coverage = companies_with_data / total_companies
         if coverage < MONITOR_COVERAGE_ALERT:
             pct = int(coverage * 100)

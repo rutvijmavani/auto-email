@@ -243,9 +243,7 @@ def _build_health_section(stats, alerts, styles):
     worker_covered  = stats.get("covered_by_workers", 0)
     fallback_hits   = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
     in_flight       = stats.get("in_flight", 0)
-    # Include in-flight scans optimistically so they don't vanish from coverage
-    # while actively running (consistent with _build_alerts in job_monitor.py).
-    total_covered   = worker_covered + fallback_hits + in_flight
+    total_covered   = worker_covered + fallback_hits
     coverage_pct = int(total_covered / total * 100) if total else 0
     ats_pct = int(known_ats / total * 100) if total else 0
 
@@ -262,7 +260,7 @@ def _build_health_section(stats, alerts, styles):
             breakdown += f", {fallback_empty} empty"
         coverage_detail += f" + {fallback_hits} by job monitor ({breakdown})"
     if in_flight:
-        coverage_detail += f" + {in_flight} in-flight"
+        coverage_detail += f" + {in_flight} pending (in-flight)"
     coverage_val = f"{total_covered}/{total} ({coverage_pct}%)  [{coverage_detail}]"
 
     health_data = [
@@ -662,7 +660,11 @@ def _build_queue_health_section() -> str:
             f'{issue_html}'
         )
 
-    except Exception:
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "monitor_report: queue health section failed: %s", _exc, exc_info=True
+        )
         return ""
 
 
