@@ -455,7 +455,15 @@ CLEAN_CRON=$(echo "$EXISTING_CRON" \
   | grep -v "backups.*mtime" \
   | grep -v "RECRUITER PIPELINE" \
   | grep -v "All times UTC" \
+  | grep -v "workers.watchdog" \
   || true)
+# NOTE: workers/watchdog.py is intentionally NOT in the crontab.
+# It runs continuously as a systemd service (recruiter-watchdog.service), NOT as a
+# cron job.  If a watchdog cron entry exists from before systemd was set up,
+# the line above removes it.  The correct way to manage the watchdog is:
+#   sudo systemctl status recruiter-watchdog
+#   journalctl -u recruiter-watchdog -f
+# To set up systemd for the first time: sudo bash deploy/install-systemd.sh
 
 NEW_CRON=$(cat << 'CRONTAB'
 CRON_TZ=America/New_York
@@ -474,6 +482,14 @@ CRON_TZ=America/New_York
 # MONITOR JOBS — Daily 7 AM
 # ─────────────────────────────────────────
 0 7 * * * /home/opc/mail/run_monitor.sh
+
+# ─────────────────────────────────────────
+# MONITOR RETRY — 9 AM fallback
+# Runs only if the 7 AM job was missed (e.g. VM suspension by Oracle Cloud).
+# Checks for today's monitor log; if absent, runs the monitor now so the
+# digest arrives at most 2 hours late rather than not at all.
+# ─────────────────────────────────────────
+0 9 * * * test -f /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -510,15 +526,28 @@ CRON_TZ=America/New_York
 0 3 * * * /home/opc/mail/run_enrich.sh
 
 # ─────────────────────────────────────────
+# LOG MONITOR — every 15 minutes
+# Scans log files for new ERRORs / tracebacks since last run.
+# Sends a batched email alert (max once per hour) if anything actionable
+# is found.  State tracked in data/log_monitor_state.json.
+# ─────────────────────────────────────────
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+
+# ─────────────────────────────────────────
 # DETECT ATS — currently disabled
 # Uncomment when needed:
 # 30 8 * * * /home/opc/mail/run_detect.sh
 # ─────────────────────────────────────────
 
 # ─────────────────────────────────────────
-# KEEP-ALIVE — every 4 days (Oracle idle protection)
+# KEEP-ALIVE — every 4 hours (Oracle idle protection)
+# Prevents Oracle Cloud from suspending the VM overnight.
+# Previously ran once every 4 days at noon; the VM was being suspended during
+# the ~10-hour overnight window which caused the 7 AM monitor cron to be
+# missed.  Running every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
+# ensures no idle window exceeds 4 hours.
 # ─────────────────────────────────────────
-0 12 */4 * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
+0 */4 * * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
 CRONTAB
 )

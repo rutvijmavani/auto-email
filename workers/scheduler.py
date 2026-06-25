@@ -154,6 +154,30 @@ _hysteresis: dict = {
     "detail_alert": 0,   # Phase 11: consecutive cycles with depth > watermark
 }
 
+# ── Pool health tracking (published to scheduler:health Redis key) ────────────
+# Read by the watchdog to make informed alerting decisions without duplicating
+# the scheduler's pool-management logic.
+#
+# _consecutive_deaths:  how many workers of a type died quickly (< _WORKER_STABLE_AFTER_S)
+#                       in a row without a stable worker in between.
+#                       Reset to 0 when a replacement lives ≥ _WORKER_STABLE_AFTER_S.
+# _total_replacements:  total spawns due to unexpected death since scheduler start.
+# _worker_spawn_times:  pid → (ptype, spawn_epoch) — populated in _spawn_worker,
+#                       consumed in _replace_dead_workers to compute worker age.
+# _WORKER_STABLE_AFTER_S: a replacement that lives at least this long is "stable"
+#                          (it survived — next death resets the streak).
+_consecutive_deaths:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_total_replacements:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_worker_spawn_times:      dict = {}   # pid → (ptype, spawn_epoch)
+_death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
+# Timestamp (epoch) when the current consecutive-death streak began.
+# A replacement must have been spawned AFTER this time and lived >=
+# _WORKER_STABLE_AFTER_S before we reset the streak.  This prevents a
+# long-lived "old" worker from masking a sibling that keeps rapid-crashing.
+_WORKER_STABLE_AFTER_S: int  = 60  # seconds
+_SCHEDULER_HEALTH_KEY   = "scheduler:health"
+_SCHEDULER_HEALTH_TTL   = 600      # 10 min — expires naturally if scheduler dies
+
 # ── Phase 10 — per-company DC key cache ──────────────────────────────────────
 # Populated lazily in _get_dc_key_for_company().  Avoids a DB query on every
 # adaptive_loop tick.  Keyed by company name; value is the dispatch throttle
@@ -245,6 +269,11 @@ def claim_stale_work(r, stream_key: str, group: str,
         return
 
     for msg_id, fields in claimed:
+        if msg_id is None:
+            # Redis 7.0+ XAUTOCLAIM returns (None, None) for PEL entries
+            # whose stream messages were deleted.  The message is already
+            # gone — nothing to XACK; just skip.
+            continue
         if not fields:
             r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue
@@ -788,17 +817,267 @@ def on_adaptive_complete(company: str, new_jobs: int,
         _schedule_full_scan(company)
 
 
+def _next_digest_deadline(now: float) -> float:
+    """
+    Return the Unix timestamp of the next 7 AM Eastern digest boundary.
+
+    Used by _pick_schedule_time() so fullscan scheduling skips gap midpoints
+    where the predicted scan duration would push completion past 7 AM ET.
+
+    Examples:
+        now = 2 PM ET  → returns tomorrow 7 AM ET
+        now = 4 AM ET  → returns today   7 AM ET (3 h away)
+        now = 7 AM ET  → returns tomorrow 7 AM ET (exactly on boundary)
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        from backports.zoneinfo import ZoneInfo
+    from datetime import datetime as _dt, timedelta
+    from config import CYCLE_START_HOUR, SEND_TIMEZONE
+
+    tz       = ZoneInfo(SEND_TIMEZONE)
+    dt       = _dt.fromtimestamp(now, tz=tz)
+    deadline = dt.replace(hour=CYCLE_START_HOUR, minute=0, second=0, microsecond=0)
+    if dt >= deadline:
+        deadline = deadline + timedelta(days=1)
+    return deadline.timestamp()
+
+
+def _pick_schedule_time(
+    target_ts:     float,
+    queue_key:     str,
+    interval_s:    int,
+    tolerance_pct: float,
+    r,
+    *,
+    deadline_ts:    Optional[float] = None,
+    avg_duration_s: float = 0.0,
+) -> float:
+    """
+    Gap-detection scheduling algorithm (Phase 2 — thundering herd prevention).
+
+    Replaces _least_loaded_slot() (20-slot min-heap) with a continuous gap
+    approach that guarantees maximum separation from existing neighbours.
+
+    Algorithm
+    ─────────
+    1. Compute a tolerance window [lo, hi] centred on target_ts:
+           window_s = interval_s × tolerance_pct   (e.g. 20% of 24 h = 4.8 h)
+           lo = target_ts − window_s / 2
+           hi = target_ts + window_s / 2
+
+    2. Fetch all existing ZSET scores within [lo, hi] via ZRANGEBYSCORE.
+
+    3. Build a gap list including sentinel edges at lo and hi:
+           points = sorted([lo] + existing_scores + [hi])
+           gaps   = [(size, gap_lo, gap_hi) for each consecutive pair]
+
+    4. Sort gaps by size descending; tiebreaker = gap midpoint closest to target_ts.
+
+    5. For each gap (largest first), compute midpoint and:
+         - If deadline_ts set and midpoint + avg_duration_s ≥ deadline_ts → skip
+           (scan would not finish before the 7 AM digest boundary)
+         - Otherwise → return midpoint
+
+    6. Fallback: all gaps violate deadline (extremely rare) → return target_ts.
+
+    Comparison with _least_loaded_slot()
+    ──────────────────────────────────────
+    Old approach: divide window into 20 fixed slots, count companies per slot,
+    return centre of the least-loaded slot.  Two companies can still land on
+    the same slot centre.  Slot boundaries create periodic clustering.
+
+    New approach: works at arbitrary resolution.  If 50 companies are already
+    scheduled, the algorithm finds the actual largest gap between them regardless
+    of slot size.  Self-corrects from full clustering in 2–3 cycles:
+        Day 1: all companies at T → all gaps = window_s / n → midpoints spread
+        Day 2: midpoints now fill the window evenly
+        Day 3+: stable, maximum-spread distribution maintained
+
+    Args:
+        target_ts:      Ideal next-poll Unix timestamp (now + interval_s).
+        queue_key:      Redis ZSET to inspect (poll:adaptive or poll:fullscan).
+        interval_s:     Full polling cycle in seconds; sets window width.
+        tolerance_pct:  Fraction of interval_s defining the search window.
+                        0.20 → ±10% (4.8 h on a 24 h cycle).
+        r:              Redis connection.
+        deadline_ts:    Optional Unix timestamp of next digest (7 AM ET).
+                        When set, midpoints that would violate the deadline
+                        are skipped.  Pass _next_digest_deadline(now).
+        avg_duration_s: Predicted scan duration (seconds) for deadline check.
+                        Read from company_poll_stats.avg_fullscan_duration_s.
+
+    Returns:
+        Unix timestamp (float) for the scheduled time.
+    """
+    window_s = interval_s * tolerance_pct
+    lo       = target_ts - window_s / 2
+    hi       = target_ts + window_s / 2
+
+    # All existing scheduled times within the window (one Redis call)
+    raw      = r.zrangebyscore(queue_key, lo, hi, withscores=True)
+    scores   = sorted(float(s) for _, s in raw)
+
+    # Build gaps including window-edge sentinels
+    points = [lo] + scores + [hi]
+    gaps   = [
+        (points[i + 1] - points[i], points[i], points[i + 1])
+        for i in range(len(points) - 1)
+    ]
+
+    # Largest gap first; tiebreaker: midpoint closest to target_ts
+    gaps.sort(key=lambda g: (-g[0], abs((g[1] + g[2]) / 2 - target_ts)))
+
+    for _gap_size, gap_lo, gap_hi in gaps:
+        midpoint = (gap_lo + gap_hi) / 2
+        if deadline_ts and avg_duration_s > 0:
+            # Compute the correct deadline for THIS candidate: the 7 AM that
+            # immediately follows the midpoint's local clock (not target_ts's).
+            # A candidate before midnight uses today's 7 AM; one after midnight
+            # uses the same day's 7 AM — which is different from target_ts's
+            # deadline when the window straddles midnight.
+            # Only checked when deadline_ts was explicitly passed by the caller
+            # (fullscan callers) — adaptive callers never pass deadline_ts.
+            candidate_deadline = _next_digest_deadline(midpoint)
+            if midpoint + avg_duration_s >= candidate_deadline:
+                continue   # scan would not finish before 7 AM — try next gap
+        return midpoint
+
+    # All gaps violate deadline (fleet so large that no slot is safe this cycle).
+    logger.warning(
+        "_pick_schedule_time: all gaps in window violate deadline for %r "
+        "(avg_duration=%.0fs deadline=%s) — using target_ts fallback",
+        queue_key, avg_duration_s,
+        datetime.fromtimestamp(deadline_ts).strftime("%H:%M") if deadline_ts else "none",
+    )
+    if deadline_ts and avg_duration_s > 0:
+        # Apply the same deadline guard to the fallback: if target_ts itself would
+        # miss the digest, schedule after the next digest so the scan runs in the
+        # following cycle rather than starting too close to the cutoff.
+        _fallback_deadline = _next_digest_deadline(target_ts)
+        if target_ts + avg_duration_s >= _fallback_deadline:
+            # 15-min buffer after the digest lets the email send before scanning
+            _post_digest = _fallback_deadline + 900
+            logger.warning(
+                "_pick_schedule_time: target_ts also violates deadline for %r "
+                "— scheduling after digest at %s",
+                queue_key,
+                datetime.fromtimestamp(_post_digest).strftime("%H:%M"),
+            )
+            return _post_digest
+    return target_ts
+
+
+# ── Atomic scheduling lock ─────────────────────────────────────────────────────
+# _pick_schedule_time() reads the ZSET and _then_ we ZADD.  When multiple
+# scan-worker processes call _reschedule_adaptive() concurrently (all completing
+# around the same time), they all read the same gap and write the same score —
+# re-creating the thundering-herd problem the algorithm is designed to prevent.
+#
+# Fix: hold a short Redis lock (500 ms TTL) around the ZRANGEBYSCORE → ZADD pair
+# so at most one process selects a slot at a time.  If the lock is contended, the
+# caller falls back to scheduling at target_ts directly — still correct, just
+# without gap detection for that one call; the next reschedule call rebalances.
+#
+# KEYS[1] = lock key    ARGV[1] = owner token
+_SCHEDULING_UNLOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def _atomic_schedule(
+    r,
+    queue_key:     str,
+    company:       str,
+    target_ts:     float,
+    interval_s:    float,
+    tolerance_pct: float,
+    *,
+    deadline_ts:    Optional[float] = None,
+    avg_duration_s: float           = 30.0,
+) -> float:
+    """
+    Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
+    short-lived Redis lock so concurrent processes cannot select the same gap.
+
+    Returns the scheduled Unix timestamp.
+    """
+    lock_key = f"scheduling:lock:{queue_key}"
+    token    = f"{os.getpid()}:{time.monotonic_ns()}"
+    acquired = r.set(lock_key, token, px=500, nx=True)
+    try:
+        if acquired:
+            score = _pick_schedule_time(
+                target_ts      = target_ts,
+                queue_key      = queue_key,
+                interval_s     = interval_s,
+                tolerance_pct  = tolerance_pct,
+                r              = r,
+                deadline_ts    = deadline_ts,
+                avg_duration_s = avg_duration_s,
+            )
+        else:
+            # Another process is scheduling — apply a deterministic per-company
+            # offset so concurrent callers don't all land on the same timestamp
+            # (thundering herd).  Use a hash of the company string to produce a
+            # reproducible, unique spread within ±(interval_s * 5%) of target_ts.
+            import hashlib as _hashlib
+            _hash_int = int(_hashlib.md5(company.encode(), usedforsecurity=False).hexdigest(), 16)
+            if deadline_ts and (deadline_ts - avg_duration_s) > target_ts:
+                # Spread jitter within the remaining safe window so multiple
+                # concurrent lock-busy callers don't all clamp to the same score.
+                _safe_window = (deadline_ts - avg_duration_s) - target_ts
+                _jitter_s = int(
+                    (_hash_int % max(1, int(_safe_window * 0.10)))
+                    - _safe_window * 0.05
+                )
+                score = target_ts + _jitter_s
+            else:
+                _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
+                score = target_ts + _jitter_s
+                if deadline_ts:
+                    # Guard: never clamp score before target_ts — that would
+                    # violate the interval contract when the deadline is already
+                    # past (deadline_ts - avg_duration_s < target_ts).
+                    score = min(score, max(target_ts, deadline_ts - avg_duration_s))
+            logger.debug(
+                "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
+                queue_key, company, _jitter_s,
+            )
+        r.zadd(queue_key, {company: score})
+        return score
+    finally:
+        if acquired:
+            try:
+                r.eval(_SCHEDULING_UNLOCK_LUA, 1, lock_key, token)
+            except Exception as _unlock_err:
+                logger.debug(
+                    "_atomic_schedule: unlock failed for %r: %s — TTL will expire it",
+                    lock_key, _unlock_err,
+                )
+
+
 def _reschedule_adaptive(company: str, interval_s: int) -> None:
     """
     Add company back to poll:adaptive ZSET with its new interval.
 
-    A ±10% random jitter is applied to the interval so companies that
-    happen to share the same polling cadence drift apart over successive
-    cycles, preventing thundering-herd clustering from reasserting itself.
+    Uses _atomic_schedule() which wraps _pick_schedule_time() + ZADD under a
+    short Redis lock so concurrent scan_worker processes do not all read the
+    same gap and schedule at the same slot (would recreate thundering herd).
+
+    Adaptive scans are short (seconds to a minute) so no deadline check is
+    needed — only fullscan scheduling uses the 7 AM digest deadline guard.
     """
-    jitter = random.uniform(-0.10, 0.10)
-    score  = time.time() + interval_s * (1.0 + jitter)
-    get_redis().zadd(REDIS_POLL_ADAPTIVE, {company: score})
+    r   = get_redis()
+    now = time.time()
+    _atomic_schedule(
+        r, REDIS_POLL_ADAPTIVE, company,
+        now + interval_s, interval_s, 0.20,
+    )
 
 
 def _should_trigger_full_scan(company: str, row) -> bool:
@@ -865,7 +1144,8 @@ def on_fullscan_complete(company: str, new_jobs: int,
     conn = get_conn()
     try:
         row = conn.execute("""
-            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred
+            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred,
+                   avg_fullscan_duration_s
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
@@ -876,8 +1156,19 @@ def on_fullscan_complete(company: str, new_jobs: int,
         logger.warning("on_fullscan_complete: no poll_stats row for %r", company)
         return
 
-    interval_s = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
-    next_fs    = now + interval_s
+    interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
+    avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
+
+    # _atomic_schedule: gap-detection + ZADD under a short Redis lock.
+    # Prevents two simultaneous fullscan completions from selecting the same slot.
+    # Also stores the score in next_fs so the DB update below can reference it.
+    next_fs = _atomic_schedule(
+        r, REDIS_POLL_FULLSCAN, company,
+        now + interval_s, interval_s, 0.20,
+        # Deadline relative to target_ts: the 7 AM that follows the scheduled slot.
+        deadline_ts    = _next_digest_deadline(now + interval_s),
+        avg_duration_s = avg_duration_s,
+    )
 
     if success:
         conn = get_conn()
@@ -893,13 +1184,13 @@ def on_fullscan_complete(company: str, new_jobs: int,
             conn.commit()
         finally:
             conn.close()
-
-        # Re-queue for the next full scan cycle
-        r.zadd(REDIS_POLL_FULLSCAN, {company: next_fs})
+        # Note: r.zadd already done inside _atomic_schedule above
         logger.info(
             "on_fullscan_complete: company=%r new_jobs=%d "
-            "next_fullscan=+%dh success=True",
-            company, new_jobs, interval_s // 3600,
+            "next_fullscan=+%.1fh (slot offset from ideal: %+.0fs) success=True",
+            company, new_jobs,
+            (next_fs - now) / 3600,
+            next_fs - (now + interval_s),
         )
 
         # ── Bootstrap new companies into WARMING after their first full scan ────
@@ -1030,8 +1321,23 @@ def adaptive_loop() -> None:
     import socket as _socket
     scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
+    _hw_dispatched = 0   # total adaptive dispatches — reported in heartbeat
+
     while True:
         try:
+            # ── Scheduler heartbeat (worker:alive:scheduler) ──────────────────
+            # Tick is 1s; TTL = 15s.  Watchdog alerts if scheduler loop stops
+            # for more than 15 seconds (paused state still writes this key).
+            try:
+                r.set("worker:alive:scheduler", json.dumps({
+                    "pid":        os.getpid(),
+                    "ts":         time.time(),
+                    "dispatched": _hw_dispatched,
+                }), ex=15)
+            except Exception as exc:
+                # Non-fatal — heartbeat key will expire and watchdog will alert.
+                logger.debug("scheduler: heartbeat write failed: %s", exc)
+
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
                 _check_auto_resume()
@@ -1057,6 +1363,17 @@ def adaptive_loop() -> None:
                                   withscores=False)
 
             for company in due:
+                # Refresh heartbeat at the start of each iteration so backpressure
+                # or outage `continue` branches don't let the 15s TTL expire.
+                try:
+                    r.set("worker:alive:scheduler", json.dumps({
+                        "pid":        os.getpid(),
+                        "ts":         time.time(),
+                        "dispatched": _hw_dispatched,
+                    }), ex=15)
+                except Exception as _hb_err:
+                    logger.warning("adaptive_loop: heartbeat refresh failed: %s", _hb_err)
+
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
                 if depth > DETAIL_QUEUE_MAX_ADAPTIVE:
@@ -1151,6 +1468,7 @@ def adaptive_loop() -> None:
 
                 # Keep inflight ZSET for Phase 10 fast_error_check compatibility
                 r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
+                _hw_dispatched += 1
 
                 logger.debug(
                     "adaptive_loop: dispatched %r to %s (dc=%s context=%s)",
@@ -1226,6 +1544,16 @@ def fullscan_loop() -> None:
                                   withscores=False)
 
             for company in due:
+                # Refresh heartbeat so backpressure `continue` branches don't
+                # let the 15s TTL expire when many companies are due at once.
+                try:
+                    r.set("worker:alive:scheduler", json.dumps({
+                        "pid": os.getpid(),
+                        "ts":  time.time(),
+                    }), ex=15)
+                except Exception as _hb_err:
+                    logger.warning("fullscan_loop: heartbeat refresh failed: %s", _hb_err)
+
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)
                 if depth > DETAIL_QUEUE_MAX_FULLSCAN:
@@ -1661,7 +1989,7 @@ def _fullscan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     ).start()
 
     from workers.fullscan import run_worker
-    run_worker(skip_init_db=True)
+    run_worker(shutdown_event=shutdown_event, skip_init_db=True)
 
 
 # ── Pool management helpers ───────────────────────────────────────────────────
@@ -1691,8 +2019,59 @@ def _spawn_worker(worker_type: str) -> tuple:
         daemon = False,   # non-daemon: scheduler waits for clean exit at shutdown
     )
     proc.start()
+    _worker_spawn_times[proc.pid] = (worker_type, time.time())
     logger.info("scheduler: spawned %s_worker pid=%d", worker_type, proc.pid)
     return proc, shutdown_event
+
+
+def _write_scheduler_health() -> None:
+    """
+    Publish current pool state and consecutive-death counters to Redis as
+    scheduler:health (TTL = _SCHEDULER_HEALTH_TTL).
+
+    The watchdog reads this key to make informed decisions without duplicating
+    the scheduler's internal pool-management logic:
+
+      - consecutive_deaths ≥ 5  → ERROR  (workers failing on startup repeatedly)
+      - consecutive_deaths ≥ 3  → WARNING (scheduler struggling to stabilize)
+      - consecutive_deaths < 3  → OK     (transient deaths, scheduler handling it)
+
+    The key expires naturally if the scheduler dies — the watchdog treats a
+    missing key as an additional signal that the scheduler is gone (beyond the
+    faster worker:alive:scheduler heartbeat check).
+
+    Called after every pool event: death + respawn, scale up, scale down.
+    Never called under _pool_lock — Redis write must not hold the pool lock.
+    """
+    try:
+        _fp = globals().get("_fullscan_pool_ref", [])
+        payload = {
+            "ts": time.time(),
+            "pool": {
+                "scan": {
+                    "alive":              len(_scan_pool),
+                    "consecutive_deaths": _consecutive_deaths["scan"],
+                    "total_replacements": _total_replacements["scan"],
+                },
+                "detail": {
+                    "alive":              len(_detail_pool),
+                    "consecutive_deaths": _consecutive_deaths["detail"],
+                    "total_replacements": _total_replacements["detail"],
+                },
+                "fullscan": {
+                    "alive":              len(_fp),
+                    "consecutive_deaths": _consecutive_deaths["fullscan"],
+                    "total_replacements": _total_replacements["fullscan"],
+                },
+            },
+        }
+        get_redis().set(
+            _SCHEDULER_HEALTH_KEY,
+            json.dumps(payload),
+            ex=_SCHEDULER_HEALTH_TTL,
+        )
+    except Exception as exc:
+        logger.warning("scheduler: failed to write scheduler:health: %s", exc)
 
 
 def _replace_dead_workers() -> None:
@@ -1725,7 +2104,63 @@ def _replace_dead_workers() -> None:
                         ptype, proc.pid, proc.exitcode,
                     )
                     replacements.append((ptype, proc.pid, proc.exitcode))
+
+                    # ── Consecutive-death tracking ────────────────────────────
+                    # If the dead worker lived ≥ _WORKER_STABLE_AFTER_S we treat
+                    # it as a one-off: reset the streak.  Quick repeated deaths
+                    # increment the counter so the watchdog can escalate.
+                    spawn_info = _worker_spawn_times.pop(proc.pid, None)
+                    if spawn_info:
+                        worker_age = time.time() - spawn_info[1]
+                        if worker_age >= _WORKER_STABLE_AFTER_S:
+                            _consecutive_deaths[ptype]      = 0    # stable run — reset
+                            _death_streak_started_at[ptype] = 0.0  # streak cleared
+                        else:
+                            if _consecutive_deaths[ptype] == 0:
+                                # First rapid death — record when the streak began
+                                _death_streak_started_at[ptype] = time.time()
+                            _consecutive_deaths[ptype] += 1  # rapid death — escalate
+                    else:
+                        if _consecutive_deaths[ptype] == 0:
+                            _death_streak_started_at[ptype] = time.time()
+                        _consecutive_deaths[ptype] += 1      # no spawn record
+                    _total_replacements[ptype] += 1
+
                     pool[i] = _spawn_worker(ptype)
+
+        # ── Stable-worker pre-reset ───────────────────────────────────────────
+        # The dead-worker branch above resets consecutive_deaths only when a
+        # stable worker eventually dies.  If a replacement is still running and
+        # has already reached stability (alive ≥ _WORKER_STABLE_AFTER_S), reset
+        # the counter now so the watchdog stops emitting false WARNING/ERROR
+        # while the system is actually healthy.
+        #
+        # _worker_spawn_times at this point contains only LIVING workers — dead
+        # workers were popped in the loop above.
+        _now_ts = time.time()
+        for _pid, (_wtype, _spawn_ts) in list(_worker_spawn_times.items()):
+            if (
+                (_now_ts - _spawn_ts) >= _WORKER_STABLE_AFTER_S
+                and _consecutive_deaths[_wtype] > 0
+                # Only reset if this worker was spawned AFTER the death streak
+                # began.  An old pre-streak worker being alive does not mean
+                # the streak workers are now healthy.
+                and _spawn_ts > _death_streak_started_at[_wtype]
+            ):
+                logger.info(
+                    "scheduler: %s_worker pid=%d (spawned after streak) stable for %ds — "
+                    "resetting consecutive_deaths from %d to 0",
+                    _wtype, _pid, int(_now_ts - _spawn_ts), _consecutive_deaths[_wtype],
+                )
+                _consecutive_deaths[_wtype]      = 0
+                _death_streak_started_at[_wtype] = 0.0
+
+    # Publish updated pool state AFTER releasing the lock.
+    # Always refresh — not just on replacements — so the key stays alive during
+    # stable periods (TTL = 10 min; liveness check runs every ~5 s).  Without
+    # periodic refresh the key expires when no workers die, making the watchdog
+    # report "scheduler:health missing — pool state unknown" on a healthy system.
+    _write_scheduler_health()
 
     # Emit scaling events outside the lock — DB write must not hold _pool_lock
     if replacements:
@@ -1766,6 +2201,7 @@ def _add_one_worker(worker_type: str, ceil_: int) -> bool:
             return False
         pool.append(_spawn_worker(worker_type))
 
+    _write_scheduler_health()   # publish updated pool size
     return True
 
 
@@ -1791,6 +2227,7 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
         if len(pool) <= floor_:
             return False
         proc, event = pool.pop()
+        _worker_spawn_times.pop(proc.pid, None)   # prevent stale entry accumulation
 
     event.set()
     logger.info(
@@ -1798,6 +2235,7 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
         "waiting for it to finish current job)",
         worker_type, proc.pid,
     )
+    _write_scheduler_health()   # publish updated pool size
     return True
 
 
@@ -2430,6 +2868,12 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
     Args:
         skip_rebuild: pass True if Redis is already warm (dev restarts)
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
+    from workers.startup import validate_startup
+    validate_startup("scheduler", check_redis=True, check_db=True, check_config=True)
+
     init_db()
 
     if not skip_rebuild:
@@ -2494,6 +2938,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         "scheduler: spawned %d scan_workers + %d detail_workers + %d fullscan_workers",
         scan_count, detail_count, fullscan_count,
     )
+
+    # Publish initial pool state so the watchdog has baseline data immediately
+    _write_scheduler_health()
 
     # ── Initialise stream consumer groups ────────────────────────────────────
     # Done here (after workers spawn) so the groups exist before any XADD.

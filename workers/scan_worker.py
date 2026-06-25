@@ -110,6 +110,7 @@ from config import (
     STREAM_BLOCK_MS,
 )
 from workers.redis_client import get_redis, ping
+from workers.heartbeat import Heartbeat
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
 from workers.http_client import set_request_context
 from workers.paginator import estimate_scan_depth
@@ -775,15 +776,20 @@ def run_worker(once: bool = False, shutdown_event=None,
         shutdown_event: multiprocessing.Event — set by scheduler to request stop.
         skip_init_db:   if True, skip init_db() (parent process already did it).
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
+    # ── Startup validation (Redis + PostgreSQL + required config) ────────────
+    # Run before init_db so config/connectivity issues are caught before any
+    # schema initialization work.
+    from workers.startup import validate_startup
+    validate_startup("scan_worker",
+                     check_redis=True,
+                     check_db=True,
+                     check_config=True)
+
     if not skip_init_db:
         init_db()
-
-    if not ping():
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        logger.error("scan_worker: Redis not reachable at %s — aborting", redis_url)
-        print(f"[scan_worker] ERROR: Redis unreachable ({redis_url}). "
-              "Is Memurai/Redis running?")
-        sys.exit(1)
 
     r = get_redis()
     _ensure_consumer_group(r)
@@ -799,6 +805,13 @@ def run_worker(once: bool = False, shutdown_event=None,
         print("[scan_worker] --once mode: processing one job then exiting")
     else:
         print("[scan_worker] Press Ctrl+C to stop\n")
+
+    # ── Background heartbeat ─────────────────────────────────────────────────
+    # Daemon thread writes worker:alive:scan_worker every 10s, independent of
+    # how long each listing scan takes (Workday scans can exceed 60s).
+    # daemon=True means the thread dies with the process — no ghost heartbeats.
+    _hw = {"count": 0}
+    _hb = Heartbeat(r, "scan_worker", lambda: _hw["count"]).start()
 
     while True:
         try:
@@ -897,6 +910,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                         company, oac_exc, exc_info=True,
                     )
 
+            _hw["count"] += 1
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""
             print(f"  [{status}] {result['company']}{first} — "
@@ -918,6 +932,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             if once:
                 break
             time.sleep(1)
+
+    # Stop heartbeat on ALL exit paths (break, KeyboardInterrupt, --once, shutdown event)
+    _hb.stop()
 
     # Flush any pending api_health writes
     try:

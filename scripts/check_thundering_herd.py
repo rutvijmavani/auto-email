@@ -15,6 +15,7 @@ Usage:
 
 import sys
 import os
+import math
 import argparse
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -102,17 +103,29 @@ def analyse(queue_name: str, r, bucket_minutes: int):
         print(f"  {GREEN}  (no future polls scheduled){RESET}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    non_empty    = [len(v) for v in buckets.values() if v]
-    max_pct      = max(non_empty) / total * 100 if non_empty else 0
-    ideal_per_bk = total / max(len(buckets), 1)
-    evenness_ok  = max_pct < 20
+    # Include the overdue bucket in max_pct so that 100%-overdue queues are
+    # not misreported as "healthy distribution" (all entries in future buckets=0).
+    non_empty      = [len(v) for v in buckets.values() if v]
+    if overdue:
+        non_empty.append(len(overdue))
+    max_pct        = max(non_empty) / total * 100 if non_empty else 0
+    # Ideal = total companies spread evenly across ALL slots in a full 24 h
+    # cycle — not just the occupied slots.  Dividing by occupied buckets only
+    # would inflate the "ideal" as companies cluster (fewer occupied buckets →
+    # higher ideal_per_bk), masking the thundering herd.
+    # Use ceiling so a partial trailing bucket counts as a full slot, giving
+    # a conservative (lower) ideal_per_bk that's harder to falsely exceed.
+    slots_in_cycle = math.ceil(86400 / (bucket_minutes * 60))
+    ideal_per_bk   = total / max(slots_in_cycle, 1)
+    evenness_ok    = max_pct < 20
 
     print()
     if evenness_ok:
-        print(f"  {GREEN}✓  Distribution looks healthy — max spike = {max_pct:.1f}% per bucket{RESET}")
+        print(f"  {GREEN}✓  Distribution looks healthy — max spike = {max_pct:.1f}% per bucket "
+              f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot){RESET}")
     else:
         print(f"  {RED}✗  Thundering herd detected — {max_pct:.1f}% of companies in one bucket "
-              f"(ideal ≈ {ideal_per_bk:.0f} per bucket){RESET}")
+              f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot across 24 h){RESET}")
 
     # Show top-5 most clustered companies (same minute)
     minute_buckets = defaultdict(list)
@@ -135,6 +148,9 @@ def main():
     parser.add_argument("--bucket", type=int, default=60,
                         help="Bucket size in minutes (default: 60)")
     args = parser.parse_args()
+
+    if args.bucket <= 0:
+        parser.error("--bucket must be a positive integer")
 
     r = redis_lib.from_url(REDIS_URL, decode_responses=False)
 

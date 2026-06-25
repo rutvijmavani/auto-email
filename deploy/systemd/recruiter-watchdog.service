@@ -1,0 +1,40 @@
+[Unit]
+Description=Recruiter Pipeline Watchdog (health monitoring + alerts + self-healing)
+Documentation=https://github.com/rutvijmavani/auto-email
+# See recruiter-scheduler.service for the network-online.target prerequisite note.
+# Same requirement applies here: verify systemd-networkd-wait-online or
+# NetworkManager-wait-online is enabled before relying on this ordering.
+After=network-online.target
+Wants=network-online.target
+
+# Watchdog is intentionally NOT After=recruiter-scheduler.service so it keeps
+# running and alerting even when the scheduler is down.
+
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+# StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%n.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+
+ExecStart=/home/opc/mail/venv/bin/python -m workers.watchdog
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# Faster restart than scheduler — watchdog is lightweight and should
+# always be running to catch scheduler failures.
+Restart=always
+RestartSec=10s
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recruiter-watchdog
+
+[Install]
+WantedBy=multi-user.target

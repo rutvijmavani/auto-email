@@ -235,16 +235,38 @@ def _build_health_section(stats, alerts, styles):
 
     total = stats.get("companies_monitored", 0)
     known_ats = total - stats.get("companies_unknown_ats", 0)
-    coverage_pct = (
-        int(stats.get("companies_with_results", 0) / total * 100)
-        if total else 0
-    )
+    # covered_by_workers = companies whose full scan completed before job_monitor ran.
+    # fallback_scanned   = missed companies whose fallback ATS fetch succeeded
+    #                      (0 or more jobs).  Use this for coverage so zero-job
+    #                      scans are not wrongly excluded.
+    #                      Falls back to companies_with_results for old stat rows.
+    worker_covered  = stats.get("covered_by_workers", 0)
+    fallback_hits   = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
+    in_flight       = stats.get("in_flight", 0)
+    total_covered   = worker_covered + fallback_hits
+    coverage_pct = int(total_covered / total * 100) if total else 0
     ats_pct = int(known_ats / total * 100) if total else 0
+
+    # Coverage value string:
+    #   "111/139 (80%)  [111 by workers + 9 by fallback (6 with jobs, 3 empty)]"
+    # The "(X empty)" sub-count is an early warning: if it's suddenly large,
+    # some ATS integrations may have gone stale (returning HTTP 200 but 0 jobs).
+    coverage_detail = f"{worker_covered} by workers"
+    if fallback_hits:
+        fallback_with_jobs = stats.get("companies_with_results", 0)
+        fallback_empty     = max(0, fallback_hits - fallback_with_jobs)
+        breakdown = f"{fallback_with_jobs} with jobs"
+        if fallback_empty:
+            breakdown += f", {fallback_empty} empty"
+        coverage_detail += f" + {fallback_hits} by job monitor ({breakdown})"
+    if in_flight:
+        coverage_detail += f" + {in_flight} pending (in-flight)"
+    coverage_val = f"{total_covered}/{total} ({coverage_pct}%)  [{coverage_detail}]"
 
     health_data = [
         ["Metric",          "Value",          "Status"],
         ["Coverage",
-         f"{stats.get('companies_with_results',0)}/{total} ({coverage_pct}%)",
+         coverage_val,
          "OK" if coverage_pct >= 70 else "WARNING"],
         ["ATS Detected",
          f"{known_ats}/{total} ({ats_pct}%)",
@@ -426,6 +448,223 @@ def _build_api_warning_section():
             f'{rows}'
         )
     except Exception:
+        return ""
+
+
+def _build_queue_health_section() -> str:
+    """
+    Build a queue-depth health HTML section for the daily digest email.
+
+    Checks Redis detail queues and poll queues so a backlog is visible in the
+    daily email even if the watchdog alert email was missed.
+
+    Thresholds:
+        detail queues combined > 100  → WARNING
+        detail queues combined > 500  → ERROR
+        poll:adaptive empty           → ERROR
+        poll:fullscan empty           → WARNING
+
+    Returns an HTML string.  Empty string on any failure so a Redis hiccup
+    never blocks the digest from sending.
+    """
+    try:
+        import redis as _redis_lib
+        from config import (
+            REDIS_URL,
+            REDIS_POLL_ADAPTIVE,
+            REDIS_POLL_FULLSCAN,
+            REDIS_DETAIL_ADAPTIVE,
+            REDIS_DETAIL_FULLSCAN,
+        )
+        import time as _time
+
+        # Use a local client with a short socket timeout so a Redis hang never
+        # blocks digest email generation indefinitely.  The shared get_redis()
+        # client has no socket timeout configured.
+        r = _redis_lib.from_url(
+            REDIS_URL,
+            socket_timeout=5,
+            socket_connect_timeout=5,
+        )
+
+        # ── Gather metrics ────────────────────────────────────────────────────
+        detail_adp   = r.llen(REDIS_DETAIL_ADAPTIVE)
+        detail_fs    = r.llen(REDIS_DETAIL_FULLSCAN)
+        detail_total = detail_adp + detail_fs
+
+        poll_adp_total   = r.zcard(REDIS_POLL_ADAPTIVE)
+        poll_adp_overdue = r.zcount(REDIS_POLL_ADAPTIVE, "-inf", _time.time() - 1800)
+        poll_fs_total    = r.zcard(REDIS_POLL_FULLSCAN)
+        poll_fs_overdue  = r.zcount(REDIS_POLL_FULLSCAN, "-inf", _time.time() - 7200)
+
+        # ── Determine overall health ──────────────────────────────────────────
+        issues = []
+
+        if detail_total > 500:
+            issues.append({
+                "level": "error",
+                "msg": (
+                    f"Detail queue backlog CRITICAL: {detail_total:,} jobs pending "
+                    f"({detail_adp:,} adaptive + {detail_fs:,} fullscan). "
+                    "detail_worker may be dead or severely lagging."
+                ),
+            })
+        elif detail_total > 100:
+            issues.append({
+                "level": "warning",
+                "msg": (
+                    f"Detail queue elevated: {detail_total:,} jobs pending "
+                    f"({detail_adp:,} adaptive + {detail_fs:,} fullscan). "
+                    "Monitor — may indicate detail_worker slowdown."
+                ),
+            })
+
+        if poll_adp_total == 0:
+            issues.append({
+                "level": "error",
+                "msg": (
+                    "poll:adaptive queue is EMPTY — no companies scheduled. "
+                    "Run: python pipeline.py --rebuild"
+                ),
+            })
+        elif poll_adp_overdue > 10:
+            issues.append({
+                "level": "warning",
+                "msg": (
+                    f"{poll_adp_overdue}/{poll_adp_total} companies overdue >30 min "
+                    "in poll:adaptive — scan_worker may be lagging."
+                ),
+            })
+
+        if poll_fs_total == 0:
+            issues.append({
+                "level": "warning",
+                "msg": (
+                    "poll:fullscan queue is EMPTY — fullscans may not be scheduled. "
+                    "Run: python pipeline.py --rebuild"
+                ),
+            })
+        elif poll_fs_overdue > 5:
+            issues.append({
+                "level": "warning",
+                "msg": (
+                    f"{poll_fs_overdue}/{poll_fs_total} fullscans overdue >2h — "
+                    "fullscan_worker may be lagging."
+                ),
+            })
+
+        # ── Build HTML ────────────────────────────────────────────────────────
+        # Determine status colour for the section header dot
+        if any(i["level"] == "error" for i in issues):
+            header_color  = "#ef4444"
+            header_symbol = "✗"
+        elif issues:
+            header_color  = "#f59e0b"
+            header_symbol = "⚠"
+        else:
+            header_color  = "#22c55e"
+            header_symbol = "✓"
+
+        # Summary row values
+        def _depth_cell(val, warn, crit):
+            if val > crit:
+                return f'<span style="color:#ef4444;font-weight:700;">{val:,} ✗</span>'
+            elif val > warn:
+                return f'<span style="color:#f59e0b;font-weight:700;">{val:,} ⚠</span>'
+            return f'<span style="color:#22c55e;">{val:,} ✓</span>'
+
+        def _status_cell(val, warn, crit):
+            """Status label that matches _depth_cell severity — no contradictions."""
+            if val > crit:
+                return "✗ CRITICAL"
+            elif val > warn:
+                return "⚠ backlog"
+            return "OK"
+
+        th = (
+            "padding:5px 10px;font-size:11px;font-weight:600;color:#64748b;"
+            "background:#f1f5f9;border-bottom:1px solid #e2e8f0;text-align:left;"
+        )
+        td = (
+            "padding:5px 10px;font-size:12px;color:#1e293b;"
+            "border-bottom:1px solid #f1f5f9;"
+        )
+
+        # Precompute overdue cells — backslashes are not allowed inside f-string
+        # expression braces in Python < 3.12, so build these strings separately.
+        _adp_overdue_cell = (
+            f'<span style="color:#f59e0b;font-weight:600;">{poll_adp_overdue} ⚠</span>'
+            if poll_adp_overdue > 10 else str(poll_adp_overdue)
+        )
+        _fs_overdue_cell = (
+            f'<span style="color:#f59e0b;font-weight:600;">{poll_fs_overdue} ⚠</span>'
+            if poll_fs_overdue > 5 else str(poll_fs_overdue)
+        )
+
+        table_html = (
+            f'<table width="100%" cellpadding="0" cellspacing="0" '
+            f'style="border-collapse:collapse;font-size:12px;">'
+            f'<tr>'
+            f'<th style="{th}">Queue</th>'
+            f'<th style="{th}">Depth</th>'
+            f'<th style="{th}">Overdue</th>'
+            f'<th style="{th}">Status</th>'
+            f'</tr>'
+            f'<tr style="background:#ffffff;">'
+            f'<td style="{td}">detail:adaptive</td>'
+            f'<td style="{td}">{_depth_cell(detail_adp, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
+            f'<td style="{td}">—</td>'
+            f'</tr>'
+            f'<tr style="background:#f8fafc;">'
+            f'<td style="{td}">detail:fullscan</td>'
+            f'<td style="{td}">{_depth_cell(detail_fs, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
+            f'<td style="{td}">—</td>'
+            f'</tr>'
+            f'<tr style="background:#eff6ff;">'
+            f'<td style="{td}"><strong>detail total</strong></td>'
+            f'<td style="{td}">{_depth_cell(detail_total, 100, 500)}</td>'
+            f'<td style="{td}">—</td>'
+            f'<td style="{td}">{_status_cell(detail_total, 100, 500)}</td>'
+            f'</tr>'
+            f'<tr style="background:#ffffff;">'
+            f'<td style="{td}">poll:adaptive</td>'
+            f'<td style="{td}">{poll_adp_total:,} scheduled</td>'
+            f'<td style="{td}">{_adp_overdue_cell}</td>'
+            f'<td style="{td}">{"⚠ overdue" if poll_adp_overdue > 10 else ("✗ EMPTY" if poll_adp_total == 0 else "OK")}</td>'
+            f'</tr>'
+            f'<tr style="background:#f8fafc;">'
+            f'<td style="{td}">poll:fullscan</td>'
+            f'<td style="{td}">{poll_fs_total:,} scheduled</td>'
+            f'<td style="{td}">{_fs_overdue_cell}</td>'
+            f'<td style="{td}">{"⚠ overdue" if poll_fs_overdue > 5 else ("⚠ empty" if poll_fs_total == 0 else "OK")}</td>'
+            f'</tr>'
+            f'</table>'
+        )
+
+        issue_html = "".join(
+            f'<p style="color:{"#991b1b" if i["level"] == "error" else "#92400e"};'
+            f'background:{"#fee2e2" if i["level"] == "error" else "#fffbeb"};'
+            f'padding:8px 10px;border-radius:4px;font-size:12px;margin:4px 0;">'
+            f'{"✗" if i["level"] == "error" else "⚠"} {i["msg"]}</p>'
+            for i in issues
+        )
+
+        return (
+            f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;">'
+            f'<p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:6px;">'
+            f'<span style="color:{header_color};">{header_symbol}</span>'
+            f'&nbsp;Queue Health</p>'
+            f'{table_html}'
+            f'{issue_html}'
+        )
+
+    except Exception as _exc:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "monitor_report: queue health section failed: %s", _exc, exc_info=True
+        )
         return ""
 
 
@@ -1044,17 +1283,31 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
     )
 
     # Brief HTML body
-    coverage = (
-        f"{stats.get('companies_with_results',0)}/"
-        f"{stats.get('companies_monitored',0)}"
-    )
+    _worker_covered = stats.get("covered_by_workers", 0)
+    _fallback_hits  = stats.get("fallback_scanned", stats.get("companies_with_results", 0))
+    _in_flight      = stats.get("in_flight", 0)
+    _total_covered  = _worker_covered + _fallback_hits + _in_flight
+    _total          = stats.get("companies_monitored", 0)
+    _cov_pct        = int(_total_covered / _total * 100) if _total else 0
+    _cov_detail = f"{_worker_covered} by workers"
+    if _fallback_hits:
+        _fb_with_jobs = stats.get("companies_with_results", 0)
+        _fb_empty     = max(0, _fallback_hits - _fb_with_jobs)
+        _breakdown    = f"{_fb_with_jobs} with jobs"
+        if _fb_empty:
+            _breakdown += f", {_fb_empty} empty"
+        _cov_detail += f", {_fallback_hits} by fallback ({_breakdown})"
+    if _in_flight:
+        _cov_detail += f" + {_in_flight} in-flight"
+    coverage = f"{_total_covered}/{_total} ({_cov_pct}%)"
+
     body_html = f"""
     <html><body style="font-family:sans-serif;padding:24px;
                        color:#1e293b;">
       <h2 style="color:#0f172a;">Job Digest — {date_str}</h2>
       <p><strong>{job_count}</strong> new jobs matching your profile.</p>
       <p style="color:#64748b;font-size:13px;">
-        Coverage: {coverage} companies &nbsp;&bull;&nbsp;
+        Coverage: {coverage} &mdash; {_cov_detail} &nbsp;&bull;&nbsp;
         See attached PDF for full details.
       </p>
       {"".join(
@@ -1063,6 +1316,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         f'⚠ {html_lib.escape(str(a["message"]))}</p>'
         for a in alerts if a["level"] in ("warning","error")
       )}
+      {_build_queue_health_section()}
       {_build_api_warning_section()}
       {_build_adaptive_health_section() if datetime.now().weekday() == 0 else ""}
     </body></html>

@@ -1,0 +1,68 @@
+[Unit]
+Description=Recruiter Pipeline Scheduler (dispatch + worker pool manager)
+Documentation=https://github.com/rutvijmavani/auto-email
+# network-online.target waits until full TCP connectivity is available
+# (not just "interfaces configured"), so Redis/Postgres connections succeed
+# on the first try instead of relying on Restart=always to recover.
+#
+# PREREQUISITE: network-online.target only works if the wait-online service
+# is enabled on this host.  Check with:
+#   systemctl is-enabled systemd-networkd-wait-online.service
+#   systemctl is-enabled NetworkManager-wait-online.service
+# If neither is enabled, revert to After=network.target — the Restart=always
+# policy will handle transient startup failures either way.
+After=network-online.target
+Wants=network-online.target
+
+# Soft-require Redis and Postgres — if they're not systemd-managed (e.g. managed
+# by the cloud provider), remove these Wants/After lines.
+Wants=redis.service
+After=redis.service
+
+# Restart watchdog AFTER scheduler so watchdog doesn't false-alarm on boot
+Before=recruiter-watchdog.service
+
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+# StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
+# If the service starts and dies 5 times within 5 minutes, systemd marks it
+# as "failed" and stops retrying.  OnFailure fires to send an alert email.
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%n.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+
+# Load all secrets from .env — avoids hard-coding credentials in unit file
+EnvironmentFile=/home/opc/mail/.env
+
+ExecStart=/home/opc/mail/venv/bin/python pipeline.py --scheduler
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# Restart on any exit (crash, OOM, clean exit) — the scheduler should ALWAYS run.
+Restart=always
+RestartSec=30s
+
+# Kill mode: SIGTERM to the scheduler process first (it has graceful shutdown
+# logic that signals its worker children).  After TimeoutStopSec, SIGKILL the
+# entire control group so orphaned workers don't linger.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+
+# ── Resource limits ───────────────────────────────────────────────────────────
+# Prevent a runaway scheduler from taking down the whole server.
+LimitNOFILE=65536
+MemoryMax=2G
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+# Logs go to journald.  To view: journalctl -u recruiter-scheduler -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recruiter-scheduler
+
+[Install]
+WantedBy=multi-user.target

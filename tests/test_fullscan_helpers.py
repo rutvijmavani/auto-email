@@ -620,5 +620,300 @@ class TestFullscanConstants(unittest.TestCase):
         self.assertGreater(FULLSCAN_BLOOM_CAPACITY, 0)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TestCompleteFullscanDbEMA  (Phase 2 — duration EMA persisted to DB)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCompleteFullscanDbEMA(unittest.TestCase):
+    """
+    _complete_fullscan_db() now computes an EMA of scan durations and writes
+    two new columns: last_fullscan_duration_s and avg_fullscan_duration_s.
+
+    Formula: new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
+    Default prev_avg = 30.0 s (for companies with no prior scan history).
+    """
+
+    _EMA_ALPHA = 0.3
+
+    def _run(self, duration_s, prev_avg=30.0, new_jobs=0, company="Acme"):
+        """
+        Call _complete_fullscan_db() with a mocked DB connection.
+        Returns the SQL params passed to conn.execute().
+        """
+        captured = {}
+
+        mock_cursor = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value = mock_cursor
+        mock_conn.__enter__ = lambda s: s
+        mock_conn.__exit__ = MagicMock(return_value=False)
+
+        def _capture_execute(sql, params=None):
+            captured["sql"]    = sql
+            captured["params"] = params
+            return mock_cursor
+
+        mock_conn.execute.side_effect = _capture_execute
+
+        with patch("workers.fullscan.get_conn", return_value=mock_conn):
+            from workers.fullscan import _complete_fullscan_db
+            _complete_fullscan_db(
+                company=company, platform="workday",
+                new_jobs=new_jobs, interval_s=86400,
+                duration_s=duration_s,
+                prev_avg_duration_s=prev_avg,
+            )
+
+        return captured
+
+    def test_first_scan_ema_from_default_prev(self):
+        """
+        First scan (prev_avg=30.0): new_avg = 0.3 * duration + 0.7 * 30.
+        """
+        duration = 600.0
+        expected = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * 30.0
+        result = self._run(duration_s=duration, prev_avg=30.0)
+        params = result["params"]
+        # params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg, ...)
+        # avg_fullscan_duration_s (EMA) is at index 5
+        actual_avg = params[5]
+        self.assertAlmostEqual(actual_avg, expected, places=3)
+
+    def test_subsequent_scan_ema_from_prev(self):
+        """
+        Subsequent scan: new_avg = 0.3 * duration + 0.7 * prev_avg.
+        """
+        duration = 1200.0
+        prev_avg = 900.0
+        expected = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * prev_avg
+        result = self._run(duration_s=duration, prev_avg=prev_avg)
+        actual_avg = result["params"][5]
+        self.assertAlmostEqual(actual_avg, expected, places=3)
+
+    def test_last_duration_written_as_int(self):
+        """last_fullscan_duration_s is written as int(duration_s)."""
+        duration = 123.7
+        result = self._run(duration_s=duration)
+        actual_last = result["params"][4]
+        self.assertEqual(actual_last, int(duration))
+
+    def test_both_ema_columns_in_sql(self):
+        """SQL UPDATE includes both last_fullscan_duration_s and avg_fullscan_duration_s."""
+        result = self._run(duration_s=500.0)
+        sql = result["sql"]
+        self.assertIn("last_fullscan_duration_s", sql)
+        self.assertIn("avg_fullscan_duration_s", sql)
+
+    def test_alpha_is_0_3(self):
+        """Verify a=0.3 by checking a known computation."""
+        duration = 1000.0
+        prev_avg = 500.0
+        # 0.3 * 1000 + 0.7 * 500 = 300 + 350 = 650
+        expected = 650.0
+        result = self._run(duration_s=duration, prev_avg=prev_avg)
+        actual_avg = result["params"][5]
+        self.assertAlmostEqual(actual_avg, expected, places=3)
+
+    def test_zero_duration_valid(self):
+        """Duration=0 is valid (very fast scan). EMA = 0.3*0 + 0.7*prev = 0.7*prev."""
+        prev_avg = 60.0
+        expected = 0.7 * prev_avg
+        result = self._run(duration_s=0.0, prev_avg=prev_avg)
+        actual_avg = result["params"][5]
+        self.assertAlmostEqual(actual_avg, expected, places=3)
+
+    def test_persistence_contract(self):
+        """_complete_fullscan_db returns True, commits, and INSERT/UPDATE share the same EMA."""
+        mock_conn = MagicMock()
+        captured = {}
+        mock_conn.execute.side_effect = lambda sql, params=None: captured.update(
+            {"sql": sql, "params": params}
+        )
+
+        with patch("workers.fullscan.get_conn", return_value=mock_conn):
+            from workers.fullscan import _complete_fullscan_db
+            ok = _complete_fullscan_db(
+                company="Acme", platform="workday",
+                new_jobs=5, interval_s=86400,
+                duration_s=600.0, prev_avg_duration_s=30.0,
+            )
+
+        self.assertTrue(ok)
+        mock_conn.commit.assert_called_once()
+        params = captured["params"]
+        # INSERT new_avg at index 5 must equal UPDATE new_avg at index 9
+        self.assertEqual(params[5], params[9])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestInflightFullscanLifecycle  (Phase 2 — inflight:fullscan ZSET tracking)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInflightFullscanLifecycle(unittest.TestCase):
+    """
+    _run_fullscan() writes company to inflight:fullscan ZSET at scan start
+    and removes it in the finally block regardless of outcome.
+    """
+
+    def _make_minimal_r(self):
+        """Redis mock that makes _run_fullscan() bail out early (lock failure)."""
+        r = MagicMock()
+        # SET NX EX → returns None (lock already held) → scan returns "skipped"
+        r.set.return_value = None
+        r.exists.return_value = False
+        return r
+
+    def test_inflight_zadd_written_at_scan_start(self):
+        """
+        ZADD to inflight:fullscan is called when the scan actually starts
+        (after lock is acquired).  get_ats_module must return a non-None module
+        so the scan proceeds past the early-exit at Step 2 and enters the
+        try block where the inflight ZADD lives.
+        """
+        from config import REDIS_INFLIGHT_FULLSCAN
+
+        r = MagicMock()
+        r.set.return_value = True   # lock acquired
+        r.exists.return_value = False  # maintenance not active
+        r.zrangebyscore.return_value = []
+
+        captured_zadd_calls = []
+
+        original_zadd = r.zadd
+        def _capture_zadd(key, mapping, **kw):
+            captured_zadd_calls.append((key, mapping))
+            return original_zadd(key, mapping, **kw)
+        r.zadd = _capture_zadd
+
+        # last_poll_at must be non-None to prevent _bootstrap_warming_adaptive DB call
+        minimal_state = {
+            "full_scan_interrupted": False,
+            "interrupted_at_page": None,
+            "full_scan_interval_s": 86400,
+            "last_poll_at": 1_700_000_000.0 - 86400,
+            "last_full_scan_at": None,
+            "avg_fullscan_duration_s": 30.0,
+        }
+        company_row = {"ats_platform": "greenhouse", "ats_slug": "testco"}
+        mock_ats = MagicMock()
+        mock_ats.fetch_jobs.return_value = []
+
+        with patch("workers.fullscan._get_fullscan_state", return_value=minimal_state), \
+             patch("workers.fullscan.get_company_row", return_value=company_row), \
+             patch("workers.fullscan.get_ats_module", return_value=mock_ats), \
+             patch("workers.fullscan.parse_slug", return_value={}), \
+             patch("workers.fullscan.get_config", return_value={}), \
+             patch("workers.fullscan._complete_fullscan_db"), \
+             patch("workers.fullscan._get_cycle_start", return_value=None), \
+             patch("workers.fullscan.set_heartbeat"), \
+             patch("workers.fullscan.set_progress"), \
+             patch("workers.fullscan.clear_heartbeat"), \
+             patch("workers.fullscan._release_lock"):
+            from workers.fullscan import _run_fullscan
+            _run_fullscan("TestCo", r)
+
+        inflight_adds = [(k, m) for k, m in captured_zadd_calls
+                         if k == REDIS_INFLIGHT_FULLSCAN]
+        self.assertTrue(len(inflight_adds) >= 1,
+                        "Expected at least one ZADD to inflight:fullscan")
+
+    def test_inflight_zrem_called_in_finally(self):
+        """
+        ZREM from inflight:fullscan must be called in the finally block even
+        when the scan completes normally.  get_ats_module must be non-None so
+        the scan enters the try/finally block where ZADD and ZREM happen.
+        """
+        from config import REDIS_INFLIGHT_FULLSCAN
+
+        r = MagicMock()
+        r.set.return_value = True   # lock acquired
+        r.exists.return_value = False
+        r.zrangebyscore.return_value = []
+
+        minimal_state = {
+            "full_scan_interrupted": False, "interrupted_at_page": None,
+            "full_scan_interval_s": 86400,
+            "last_poll_at": 1_700_000_000.0 - 86400,
+            "last_full_scan_at": None, "avg_fullscan_duration_s": 30.0,
+        }
+        mock_ats = MagicMock()
+        mock_ats.fetch_jobs.return_value = []
+
+        with patch("workers.fullscan._get_fullscan_state", return_value=minimal_state), \
+             patch("workers.fullscan.get_company_row",
+                   return_value={"ats_platform": "greenhouse", "ats_slug": "testco"}), \
+             patch("workers.fullscan.get_ats_module", return_value=mock_ats), \
+             patch("workers.fullscan.parse_slug", return_value={}), \
+             patch("workers.fullscan.get_config", return_value={}), \
+             patch("workers.fullscan._complete_fullscan_db"), \
+             patch("workers.fullscan._get_cycle_start", return_value=None), \
+             patch("workers.fullscan.set_heartbeat"), \
+             patch("workers.fullscan.set_progress"), \
+             patch("workers.fullscan.clear_heartbeat"), \
+             patch("workers.fullscan._release_lock"):
+            from workers.fullscan import _run_fullscan
+            _run_fullscan("TestCo", r)
+
+        # ZREM should have been called on REDIS_INFLIGHT_FULLSCAN
+        zrem_calls = [c for c in r.zrem.call_args_list
+                      if c[0][0] == REDIS_INFLIGHT_FULLSCAN]
+        self.assertTrue(len(zrem_calls) >= 1,
+                        "Expected ZREM on inflight:fullscan in finally block")
+
+    def test_redis_unavailable_for_zadd_non_fatal(self):
+        """
+        If Redis ZADD raises for inflight tracking, the outer except block in
+        _run_fullscan catches it and returns a result dict — no propagation.
+        get_ats_module must be non-None to reach the try block.
+        """
+        from config import REDIS_INFLIGHT_FULLSCAN
+
+        r = MagicMock()
+        r.set.return_value = True
+        r.exists.return_value = False
+        r.zrangebyscore.return_value = []
+
+        original_zadd = MagicMock()
+        def _zadd(key, mapping, **kw):
+            if key == REDIS_INFLIGHT_FULLSCAN:
+                raise ConnectionError("Redis unavailable")
+            return original_zadd(key, mapping, **kw)
+        r.zadd.side_effect = _zadd
+
+        minimal_state = {
+            "full_scan_interrupted": False, "interrupted_at_page": None,
+            "full_scan_interval_s": 86400,
+            "last_poll_at": 1_700_000_000.0 - 86400,
+            "last_full_scan_at": None, "avg_fullscan_duration_s": 30.0,
+        }
+        mock_ats = MagicMock()
+        mock_ats.fetch_jobs.return_value = []
+
+        try:
+            with patch("workers.fullscan._get_fullscan_state", return_value=minimal_state), \
+                 patch("workers.fullscan.get_company_row",
+                       return_value={"ats_platform": "greenhouse", "ats_slug": "testco"}), \
+                 patch("workers.fullscan.get_ats_module", return_value=mock_ats), \
+                 patch("workers.fullscan.parse_slug", return_value={}), \
+                 patch("workers.fullscan.get_config", return_value={}), \
+                 patch("workers.fullscan._complete_fullscan_db"), \
+                 patch("workers.fullscan._get_cycle_start", return_value=None), \
+                 patch("workers.fullscan.set_heartbeat"), \
+                 patch("workers.fullscan.set_progress"), \
+                 patch("workers.fullscan.clear_heartbeat"), \
+                 patch("workers.fullscan._release_lock"):
+                from workers.fullscan import _run_fullscan
+                result = _run_fullscan("TestCo", r)
+            # Outer except catches the ConnectionError → returns result dict
+            self.assertIsInstance(result, dict)
+        except ConnectionError:
+            self.fail("ConnectionError from ZADD should be caught by _run_fullscan")
+
+    def test_inflight_key_name_matches_config(self):
+        """REDIS_INFLIGHT_FULLSCAN constant is 'inflight:fullscan'."""
+        from config import REDIS_INFLIGHT_FULLSCAN
+        self.assertEqual(REDIS_INFLIGHT_FULLSCAN, "inflight:fullscan")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

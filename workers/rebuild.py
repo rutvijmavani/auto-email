@@ -274,8 +274,9 @@ def rebuild_poll_queues() -> dict:
     # DB is the source of truth.  Stored next_poll_at goes straight into ZSET.
     # If score <= now: immediately due (but in their original priority order).
     # If score > now: scheduled for the future exactly as the DB says.
-    # The ±10% jitter in _reschedule_adaptive() handles ongoing separation;
-    # no additional spread needed here when distribution was already even.
+    # _reschedule_adaptive() and fullscan scheduling use _pick_schedule_time()
+    # (gap-detection algorithm) to maintain even distribution on every reschedule
+    # — no spread needed here when the stored distribution is already healthy.
     n_past = n_future = 0
     for row in current_companies:
         score = row["next_poll_at"].timestamp()

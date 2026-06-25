@@ -310,6 +310,11 @@ REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintena
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume
 REDIS_CRONCHAIN_ALIVE  = "cronchain:alive"         # STRING TTL=300 — cron chain heartbeat
 REDIS_DB_MAINTENANCE   = "db:maintenance"          # STRING no-TTL — maintenance flag
+REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currently being full-scanned
+                                                   # score = scan start Unix timestamp
+                                                   # written at scan start, removed on completion/error
+                                                   # read by _get_worker_missed_companies() to exclude
+                                                   # in-progress scans from fallback re-fetch
 
 # Scan queue (scan_worker skeleton → replaced by scheduler in Phase 4)
 SCAN_QUEUE        = "scan:queue"

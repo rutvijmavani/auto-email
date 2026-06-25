@@ -296,7 +296,7 @@ Oracle monitors free tier VMs for idle usage:
 Your daily cron jobs prevent this:
   Daily  9 AM: --outreach-only → Playwright + SMTP = CPU spikes
   Weekly Mon:  --verify-only   → Playwright + CareerShift = CPU spikes
-  Every 4 days: keep-alive script = CPU activity
+  Every 4 hours: keep-alive script = CPU activity
 
 Playwright launching Chromium = significant CPU usage
 Oracle's monitors will see regular activity
@@ -306,7 +306,7 @@ Risk of reclamation: LOW
 ### Protection measures
 ```text
 1. Keep-alive cron (already installed by setup_cron.sh)
-   → Runs every 4 days at 12 PM
+   → Runs every 4 hours
    → Generates CPU activity
    → Belt-and-suspenders protection
 
@@ -497,6 +497,40 @@ tail -f ~/mail/logs/pipeline_$(date +%Y-%m-%d).log
 tail -f ~/mail/logs/monitor_$(date +%Y-%m-%d).log
 ```
 
+#### Viewing logs — systemd journal (scheduler and watchdog)
+
+The scheduler and watchdog workers are managed by systemd and log to the systemd
+journal in addition to the file logs above. The journal is often the fastest way
+to see what is happening right now:
+
+```bash
+# Live log stream for the scheduler (Ctrl+C to stop)
+journalctl -u recruiter-scheduler -f
+
+# Live log stream for the watchdog
+journalctl -u recruiter-watchdog -f
+
+# Last 100 lines of scheduler logs
+journalctl -u recruiter-scheduler -n 100
+
+# Last 100 lines of watchdog logs
+journalctl -u recruiter-watchdog -n 100
+
+# Logs from the last hour for both services
+journalctl -u recruiter-scheduler -u recruiter-watchdog --since "1 hour ago"
+
+# All logs since last boot
+journalctl -u recruiter-scheduler -b
+
+# Logs between two timestamps
+journalctl -u recruiter-scheduler --since "2026-05-29 01:00" --until "2026-05-29 02:00"
+```
+
+The journal and the file logs capture the same Python logger output. Use the
+journal for quick interactive checks and live tailing; use file logs (via
+`view_logs.py`) for searching by company name, filtering by log level, or
+looking at a specific past date.
+
 #### Migration note — old pipeline.log
 
 ```text
@@ -644,8 +678,10 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # MONITOR JOBS — Daily 7 AM
+# 9 AM retry guard in case VM was suspended overnight and 7 AM was missed
 # ─────────────────────────────────────────
 0 7 * * * /home/opc/mail/run_monitor.sh
+0 9 * * * /bin/bash -c 'f=/home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log; [ ! -f "$f" ] && /home/opc/mail/run_monitor.sh'
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -687,9 +723,16 @@ CRON_TZ=America/New_York
 0 3 * * * /home/opc/mail/run_enrich.sh
 
 # ─────────────────────────────────────────
-# KEEP-ALIVE — every 4 days (Oracle idle protection)
+# LOG MONITOR — every 15 minutes
+# Scans log files from last byte offset, emails on new errors (Redis-deduped)
 # ─────────────────────────────────────────
-0 12 */4 * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+
+# ─────────────────────────────────────────
+# KEEP-ALIVE — every 4 hours (Oracle idle protection)
+# Changed from every 4 days — closes the overnight suspension gap
+# ─────────────────────────────────────────
+0 */4 * * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
 # ─────────────────────────────────────────
 # DETECT ATS — currently disabled
@@ -715,6 +758,9 @@ CRON_TZ=America/New_York
  1:00 AM (Tue-Sun): sync → backup → find-only → verify-filled (chained)
  1:00 AM (Mon):     sync → backup → verify-only → find-only → verify-filled (chained)
  1:00 AM (1st):     sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
+
+Every 15 min:  log_monitor.py (scans logs, emails on new errors, Redis-deduped)
+Every 4 hours: keep-alive (Oracle idle protection — was every 4 days)
 ```
 
 ### Safety with && chaining
@@ -1062,16 +1108,52 @@ python -m workers.fullscan
 
 ### How thundering herd is prevented automatically
 
-`rebuild_redis()` runs at scheduler startup and classifies every company using
-the **7 AM cycle boundary** (`CYCLE_START_HOUR = 7`):
+Thundering herd = all companies scheduled at the same time, overwhelming the fullscan worker and causing most to miss the 7 AM digest. Two independent mechanisms prevent this.
+
+---
+
+**Layer 1 — `rebuild_redis()` at startup**
+
+Runs automatically every time the scheduler starts. Classifies every company against the **7 AM cycle boundary**:
 
 | Situation | `next_poll_at` in DB | What happens |
 |---|---|---|
-| Fresh deploy / long outage | Days old (before last 7 AM) | **Recovery spread** — redistributes load evenly across a dynamic window |
-| Normal restart (brief downtime) | Within today's cycle (≥ last 7 AM) | **DB timestamps restored** — existing even distribution is preserved |
-| Brand new company | NULL | **Full scan first**, then `now + slot_offset` bootstrap |
+| Fresh deploy / long outage | Days old (before last 7 AM) | **Recovery spread** — redistributes load evenly across a dynamic window based on `STARTUP_AVG_SCAN_TIME_S × company count` |
+| Normal restart (brief downtime) | Within today's cycle (≥ last 7 AM) | **DB timestamps restored** — existing even distribution is preserved as-is |
+| Brand new company | NULL | **Full scan first**, then `slot_offset(company_id)` bootstraps first adaptive poll at a deterministic daily slot |
 
 No manual pre-step required. Just start the workers.
+
+---
+
+**Layer 2 — `_pick_schedule_time()` on every reschedule**
+
+Every time a company is rescheduled after a scan, the new time is chosen by the gap-detection algorithm rather than `now + interval` or random jitter:
+
+```text
+window = interval × 20%  (e.g. 4.8 h on a 24 h fullscan cycle)
+fetch all existing scheduled times within the window from Redis
+find the largest gap between them
+return the midpoint of that gap
+```
+
+The algorithm guarantees maximum separation from the nearest scheduled neighbours regardless of fleet size. Random jitter spreads companies slowly (one random step per cycle); gap-detection converges to an even distribution in 2–3 cycles even from a full cluster.
+
+**Fullscan-specific: digest deadline guard**
+
+For `poll:fullscan`, the algorithm also skips gap midpoints where the predicted scan duration (`avg_fullscan_duration_s` per-company EMA) would push completion past 7 AM ET. This ensures no scan is scheduled so late it cannot finish before the daily digest fires.
+
+```text
+Skip gap midpoint if: midpoint + avg_fullscan_duration_s ≥ next 7 AM ET
+```
+
+`avg_fullscan_duration_s` is updated after every successful scan using an exponential moving average (α=0.3). Default is 30 s until the first scan completes for a company.
+
+---
+
+**Layer 3 — `inflight:fullscan` ZSET**
+
+When `--monitor-jobs` runs at 7 AM, it checks which companies the fullscan worker missed. Without inflight tracking, a company 20 minutes into a 30-minute scan would appear "missed" and trigger a redundant fallback HTTP fetch. The `inflight:fullscan` ZSET tracks actively-scanning companies and excludes them from the missed list.
 
 ### Worker flags
 
@@ -1114,6 +1196,8 @@ All companies firing at once (thundering herd on restart):
   → rebuild_redis() handles this automatically via the 7 AM cycle boundary.
     STALE companies (next_poll_at before last 7 AM) get recovery spread.
     CURRENT companies (within today's cycle) use DB timestamps directly.
+  → Even without a restart, _pick_schedule_time() spreads companies on every
+    reschedule — a cluster converges to even distribution within 2–3 cycles.
   → If still clustered after restart: use reschedule_on_deploy.py as a
     manual override (scores corrupted while scheduler was running).
 
@@ -1127,6 +1211,634 @@ WARMING companies not advancing to STABLE:
   → WARMING decrements on each on_adaptive_complete() success
   → If stuck at 3: verify adaptive worker is running and polling the company
 ```
+
+---
+
+## Reliability Layer — Automatic Monitoring & Recovery
+
+### What it is and why it matters
+
+Before Phase 3, if the scheduler or a worker crashed, someone had to notice the problem, SSH into the server, and manually restart the process. This meant jobs could go unscanned for hours.
+
+Phase 3 adds a self-managing safety net: the system monitors itself, restarts itself when something goes wrong, and emails you only when it truly cannot fix the problem on its own. In normal operation, you should not need to intervene at all.
+
+Think of it as two layers of protection:
+
+| Layer | What it is | How fast | What it handles |
+|---|---|---|---|
+| **systemd** | The OS service manager — like a supervisor who immediately calls a replacement when someone doesn't show up for work | 10–30 seconds | Process crashes — scheduler or watchdog dies unexpectedly |
+| **Watchdog** | A smart monitor that checks the whole system every 5 minutes and tries to fix problems it finds | 5 minutes | Hung workers, empty queues, Redis issues, stuck jobs |
+
+Neither layer requires any manual action on your part for day-to-day issues.
+
+---
+
+### The two systemd services
+
+Two services run continuously in the background and start automatically whenever the server boots:
+
+**`recruiter-scheduler.service`** — runs the main scheduler process. The scheduler also spawns all scan, detail, and fullscan workers as child processes. If the scheduler crashes for any reason, systemd restarts it within 30 seconds — and all workers come back up with it.
+
+**`recruiter-watchdog.service`** — runs the watchdog monitor. If the watchdog itself crashes, systemd restarts it within 10 seconds.
+
+There is also **`recruiter-pipeline-alert@.service`**, which is triggered automatically when a service crashes too many times in a short window (5 crashes within 5 minutes). It sends you an email with the last 30 lines of logs so you can diagnose the problem without needing to SSH in.
+
+---
+
+### What the watchdog monitors — and what it does about it
+
+Every 5 minutes, the watchdog runs seven checks. For each one: what it detects, why it works that way, what alert fires, whether it fixes itself, and exactly what to do if it lands in your inbox.
+
+---
+
+## 1 · systemd service states
+
+**What it checks:**
+
+The watchdog calls `systemctl is-active recruiter-scheduler` (and `recruiter-watchdog`) as a subprocess and reads the single-word output:
+
+- `active` → healthy, nothing to do
+- `activating` → starting up, skip this cycle
+- `failed` → crashed 5 times within 5 minutes; systemd gave up retrying. Service is frozen — **will not restart on its own**
+- `inactive` / anything else → stopped or never started
+
+**Why this check exists separately from heartbeats:**
+
+A worker heartbeat key in Redis has a TTL of 15–45 seconds. If the scheduler just crashed, that key is still alive in Redis for up to 45 more seconds — during that window the heartbeat check says "healthy" while the process is dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key expires. It is the faster, more authoritative signal.
+
+**Why `failed` is different from `inactive`:**
+
+`failed` is a terminal state — systemd has stopped retrying. And `systemctl restart` is silently blocked in `failed` state (does nothing, no error). You must clear the failure counter first with `reset-failed`, then restart.
+
+**Auto-heal:**
+
+```bash
+sudo systemctl reset-failed recruiter-scheduler
+sudo systemctl restart recruiter-scheduler
+```
+
+Both commands run atomically in one `bash -c` call. `reset-failed` is safe to run unconditionally — it's a no-op if the service wasn't in `failed` state — so the watchdog doesn't need to branch on `failed` vs `inactive`.
+
+**The watchdog's own blind spot:**
+
+The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `failed` state, systemd fires the `OnFailure=recruiter-pipeline-alert@.service` template — a one-shot unit that emails the last 30 journal lines so you can diagnose without SSH.
+
+**Your action:**
+
+- `✅ Auto-healed` email arrives → nothing to do
+- `🆘 ESCALATION` email arrives → see Manual recovery section below
+
+---
+
+## 2 · Worker heartbeats
+
+**What it checks:**
+
+Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
+
+```text
+scheduler:       writes every ~1s  TTL=15s   dead after 20s
+scan_worker:     writes every 10s  TTL=30s   dead after 45s
+detail_worker:   writes every 10s  TTL=30s   dead after 45s
+fullscan_worker: writes every 60s  TTL=180s  dead after 1,900s
+```
+
+TTL = 3× write interval, so two consecutive missed writes are tolerated before the key disappears.
+
+**Why a daemon thread — not a loop-top write:**
+
+Earlier versions wrote the heartbeat at the top of the main loop. A single Workday full scan taking 60–90 seconds meant the key (TTL=30s) expired mid-scan — the watchdog falsely declared the worker dead. A daemon thread writes continuously regardless of job duration.
+
+Daemon threads are hard-tied to their process: when the process exits for any reason (crash, SIGKILL, clean shutdown), the OS terminates all daemon threads immediately. The key's TTL then expires and the watchdog correctly detects the dead worker. No ghost heartbeats from a dead process are possible.
+
+**Two alert triggers:**
+
+1. **Key MISSING** — TTL ran out. At least 2 consecutive writes were missed. Worker has almost certainly crashed.
+2. **Key PRESENT but STALE** — key is still in Redis but the `ts` field inside is older than the threshold. Worker may be alive at the OS level but internally deadlocked (daemon thread blocked on a Redis write or lock). Process hasn't exited so TTL hasn't run, but nothing is processing.
+
+Both trigger ERROR and the same auto-heal.
+
+**Auto-heal:**
+
+```bash
+sudo systemctl restart recruiter-scheduler
+```
+
+All workers (scan, detail, fullscan) are child processes of the scheduler — not independent systemd units. Restarting the scheduler recreates the entire managed pool. Spawning an individual worker directly while the scheduler is alive would create an unmanaged orphan that the scheduler would duplicate on its next liveness check.
+
+**Your action:**
+
+- `✅ Auto-healed` → nothing to do
+- Worker keeps dying (repeated alerts) → check logs: `journalctl -u recruiter-scheduler -n 100`
+- `🆘 ESCALATION` → see Manual recovery section
+
+---
+
+## 3 · Queue depths
+
+**What it checks:**
+
+Four queues:
+- `poll:adaptive` (ZSET) — companies scored by next-scan-due timestamp
+- `poll:fullscan` (ZSET) — same, for full scans
+- `queue:detail:adaptive` (LIST) — job IDs waiting for detail-page fetch
+- `queue:detail:fullscan` (LIST) — same, for fullscan-discovered jobs
+
+**Why not a simple overdue count?**
+
+An absolute count ("more than 10 overdue") doesn't scale — 10 out of 139 companies is 7% (a problem); 10 out of 1,000 is 1% (noise). A percentage ratio scales but still can't distinguish a healthy-but-busy queue from a stalled one. A queue can have 50 companies overdue and be perfectly healthy (workers processing flat-out), or 3 overdue and be completely dead (workers crashed). A snapshot can't tell these apart.
+
+**How it actually works — velocity tracking:**
+
+The watchdog saves a state snapshot to Redis at the end of every cycle. On the next cycle it compares three signals:
+
+```text
+Signal 1 — Overdue count delta:      shrinking ↓ = draining, stable/growing → ↑ = problem
+Signal 2 — Queue head (company+score): changed = job was picked up; same = nothing moved
+Signal 3 — Worker processed count:   increased = worker completed jobs; same = worker idle
+```
+
+```text
+3/3 signals stalling → ERROR   (all agree: nothing moved → auto-restart)
+2/3 signals stalling → WARNING (likely stalling, watch next cycle)
+0-1 signals stalling → OK      (making progress, even if running behind)
+```
+
+Requiring multiple signals prevents false alarms from natural variance — a brief Redis blip might stall one signal while the others show movement.
+
+**Fullscan special case — the lock exoneration:**
+
+A Workday full scan legitimately takes 20–30 minutes. During that time the processed count won't change and the queue head won't move — but the worker is healthy. The `fullscan:lock:{company}` key is written when a scan starts and cleared when it finishes. If the watchdog finds any `fullscan:lock:*` key, it suppresses all stall signals for `poll:fullscan` — the worker is provably mid-scan, not dead.
+
+**Alert triggers and auto-heal:**
+
+```text
+poll:adaptive EMPTY  → ERROR   → auto-heal: python pipeline.py --rebuild
+poll:adaptive STALL  → ERROR   → auto-heal: restart recruiter-scheduler
+poll:fullscan EMPTY  → WARNING (normal briefly after rebuild, ignored if transient)
+poll:fullscan STALL  → ERROR   → auto-heal: restart recruiter-scheduler
+detail queue depth >500, not draining → ERROR  (no auto-heal)
+detail queue depth >100, not draining → WARNING (no auto-heal)
+```
+
+Detail queues have no auto-heal because a growing detail queue usually means the workers are overloaded — restarting doesn't help if they're alive and processing. The scheduler's slow-throughput check adds workers automatically when depth stays elevated for two consecutive 30-minute cycles.
+
+**Your action:**
+
+- Poll queue alerts → none unless escalated (auto-heal fires first)
+- Detail queue alerts → check if detail_worker is alive:
+  ```bash
+  redis-cli --scan --pattern "worker:alive:detail_worker:*"
+  ```
+  Missing or stale → `sudo systemctl restart recruiter-scheduler`
+  Alive but queue growing → workers overloaded, check logs: `journalctl -u recruiter-scheduler -n 100`
+
+---
+
+## 4 · Stuck jobs (Stream PEL age)
+
+**What it checks:**
+
+`scan_worker` and `fullscan_worker` read jobs from Redis Streams (`stream:adaptive`, `stream:fullscan`) via `XREADGROUP`. When a worker reads a job, Redis places it in the **PEL** (Pending Entry List) — a per-consumer ledger of "claimed but not yet acknowledged" jobs. The job stays in the PEL until the worker calls `XACK` after completing it. A crashed worker leaves the job orphaned in the PEL.
+
+> `detail_worker` is **not** involved here. It uses Redis LISTs with its own at-least-once mechanism: `LMOVE` atomically moves a job to an inflight list before processing; `LREM` removes it only after the DB write succeeds. If it crashes mid-job, the job stays in the inflight list and is requeued on next startup. No PEL.
+
+**Why not just use time thresholds:**
+
+The old approach was: oldest PEL entry >10 min = WARNING, >30 min = ERROR. This fires constantly on a healthy `fullscan_worker` mid-scan (legitimately 20–30 minutes). A time threshold alone cannot distinguish "job in progress" from "job orphaned."
+
+**How it actually works — consumer liveness:**
+
+Each PEL entry records the consumer name, which embeds the worker's PID (e.g. `worker-myhost-18432`). The watchdog extracts the PID from the consumer name and checks whether the per-PID heartbeat key `worker:alive:{type}:{pid}` is present in Redis:
+
+```text
+Consumer: worker-myhost-18432
+worker:alive:fullscan_worker:18432 → exists   → worker is alive, job is in progress → OK (no alarm, ever)
+worker:alive:fullscan_worker:18432 → missing  → worker 18432 is dead → entry is orphaned
+```
+
+Time thresholds only apply once the consumer is **confirmed dead**:
+
+```text
+Orphaned entry < 10 min  → OK      (XAUTOCLAIM will reclaim it shortly)
+Orphaned entry > 10 min  → WARNING (XAUTOCLAIM should have caught this by now)
+Orphaned entry > 30 min  → ERROR   (XAUTOCLAIM itself may be stuck)
+```
+
+**Auto-heal:** None. The scheduler's `XAUTOCLAIM` loop runs every second and automatically reclaims orphaned PEL entries, re-delivering them to the next available worker. This is fully automatic and requires no intervention.
+
+**Your action:**
+
+- WARNING → wait one cycle; XAUTOCLAIM will handle it
+- ERROR → `sudo systemctl restart recruiter-scheduler` (XAUTOCLAIM is stuck; restarting the scheduler clears it and re-registers all consumers on the first tick)
+
+---
+
+## 5 · Bloom filter presence
+
+**What it checks:**
+
+Scans Redis for all `bloom:fullscan:*` and `bloom:fallback:*` keys. If the total count is zero, all Bloom filter state is gone.
+
+**What Bloom filters do:**
+
+Every completed full scan builds a Redis Bloom filter (`bloom:fullscan:{company}`) containing all job IDs seen on that company's board. On the next scan, each fetched job ID is checked against the filter first — if it's already known, the DB check is skipped entirely. Without these filters, every full scan would compare tens of thousands of job IDs against PostgreSQL on every cycle.
+
+**What zero keys means:**
+
+Redis was wiped — either `FLUSHALL` was called, or Redis restarted with persistence disabled (AOF/RDB was off). All deduplication state is lost.
+
+**Auto-heal:** None. This fires as WARNING, not ERROR.
+
+**What actually happens:**
+
+The next full scan per company runs as a cold start. It fetches all jobs and checks each against PostgreSQL. No duplicate rows are created — the DB has a `UNIQUE` constraint on job ID. The Bloom filters rebuild automatically as each scan completes. The only cost is extra DB traffic for one scan cycle per company.
+
+**Your action:**
+
+Find out why Redis lost data:
+- Redis restarted with no persistence → run `sudo bash deploy/configure-redis.sh` (enables AOF, saves every ~1 second — prevents this from ever happening again)
+- Someone ran `FLUSHALL` → restore from last backup if needed; filters will rebuild on their own
+
+---
+
+## 6 · Company scan coverage
+
+**What it checks:**
+
+Two queries run against PostgreSQL:
+
+```sql
+-- Companies that missed a full scan in the last 26 hours
+SELECT COUNT(*) FROM company_poll_stats
+WHERE last_full_scan_at IS NULL
+   OR last_full_scan_at < NOW() - INTERVAL '26 hours';
+```
+
+If `missed / total > 25%` → ERROR.
+
+The window is 26 hours (not 24) to give a 2-hour buffer for companies finishing just before the 7 AM digest. The threshold is 25% (not 0%) because minor misses during ramp-up or brief ATS outages are expected and not actionable.
+
+A second check looks for stuck detail jobs:
+
+```sql
+SELECT COUNT(*) FROM job_postings
+WHERE status = 'pending_detail'
+  AND created_at < NOW() - INTERVAL '1 hour';
+```
+
+More than 10 stuck rows → WARNING. These are jobs scan_worker queued but detail_worker never picked up.
+
+**Auto-heal:** None for either check. Alert only.
+
+**Your action:**
+
+Coverage alert:
+- Check if fullscan_worker heartbeat is alive (that check usually fires too and auto-heals)
+- If alive but slow → likely a thundering-herd problem; `_pick_schedule_time()` gap algorithm (Phase 2, now implemented) spreads companies automatically over 2–3 cycles — no manual action needed
+- If a specific ATS is down → scheduler puts that platform in outage mode automatically; wait for it to recover
+
+Stuck `pending_detail` alert:
+- Check detail_worker heartbeat: `redis-cli --scan --pattern "worker:alive:detail_worker:*"`
+- If missing → `sudo systemctl restart recruiter-scheduler`
+- If alive but queue growing → detail workers overloaded; check logs
+
+---
+
+## 7 · Redis persistence
+
+**What it checks:**
+
+```python
+info = r.info("persistence")
+last_save = info.get("rdb_last_save_time", 0)  # Unix epoch of last successful RDB save
+age_minutes = (time.time() - last_save) / 60
+```
+
+> **Note:** `rdb_last_bgsave_time_sec` is the *duration* of the last bgsave (e.g. 3 seconds), not an epoch timestamp. Using it as an epoch produces an age of ~28 million minutes and always shows WARNING. The correct field is `rdb_last_save_time`.
+
+If `age_minutes > 30` → WARNING.
+
+**Why this matters:**
+
+Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. By default Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (rebuild_redis() restores from PostgreSQL) but you lose that window's scan results and queue state.
+
+The watchdog fires at 30 minutes to catch a broken snapshot process (disk full, permissions issue) before the gap becomes catastrophic.
+
+**Auto-heal:** None. This requires a one-time configuration change to the Redis server itself.
+
+**Your action — run once, fix permanently:**
+
+```bash
+sudo bash deploy/configure-redis.sh
+```
+
+What it does:
+1. Switches Redis to AOF (Append-Only File) mode — every write is appended to disk within 1 second
+2. Sets `appendfsync everysec` — max data-loss window shrinks from ~5 minutes to ~1 second
+3. Sets `auto-aof-rewrite-percentage 100` and `auto-aof-rewrite-min-size 64mb` — automatic AOF compaction
+4. Patches `redis.conf` so settings survive a Redis restart
+5. Triggers initial `BGREWRITEAOF` to compact the file immediately
+
+After running this, the 30-minute RDB check is permanently green — AOF writes continuously so the last-save timestamp is always recent.
+
+**AOF file size — automatic compaction:**
+
+The AOF grows as operations are appended. Redis handles this automatically via background rewriting: when the file doubles its post-rewrite size AND is at least 64 MB, Redis forks a background process that rewrites the file to just the minimal commands needed to recreate current state. Example: 1,440 heartbeat writes per hour collapse to 4 lines. The file never grows more than ~2× the actual live data size. No manual maintenance needed.
+
+---
+
+### Escalation path
+
+```text
+Problem detected
+  → Attempt auto-fix (if auto-healable — see above)
+  → Email: "⚠ Pipeline Issue — Auto-heal Attempted (1/3)"
+  → Wait 5 minutes
+
+  → Fixed? Email: "✅ Auto-healed"                      — no action needed
+  → Resolved on its own? Email: "✅ Resolved"           — no action needed
+  → Still broken, attempt 2 → try again
+  → Still broken, attempt 3 → try again
+  → Still broken after 3 attempts?
+    → Email: "🆘 ESCALATION — manual intervention required"
+    → Auto-heal paused for 24 hours — you must fix manually
+```
+
+Deduplication prevents repeated emails: once an alert fires for a given issue type, it is suppressed for 1 hour so you do not receive the same email repeatedly between attempts.
+
+The watchdog can call `systemctl restart` without a password prompt because `install-systemd.sh` adds a single narrowly-scoped rule to `/etc/sudoers.d/` — it grants exactly this one command, nothing else.
+
+---
+
+### Alert emails — what each one means and what to do
+
+| Email subject | Meaning | Action needed? |
+|---|---|---|
+| `⚠ Pipeline Issue — Auto-heal Attempted` | Something broke, watchdog is trying to fix it | None — wait and see |
+| `✅ Auto-healed` | Watchdog fixed it successfully | None |
+| `✅ Resolved` | Issue resolved on its own (e.g., Redis briefly unreachable) | None |
+| `🆘 ESCALATION — manual intervention required` | Watchdog tried 3 times and failed | SSH in and fix manually (see below) |
+| `🆘 Pipeline FAILED: recruiter-scheduler — repeated startup crashes` | Service crashed 5 times in 5 minutes — systemd stopped trying | Check the log lines in the email body to diagnose; SSH in if needed |
+| `🔴 CRITICAL: Pipeline Redis is DOWN` | Redis is unreachable — everything has stopped | Check Redis service on server: `sudo systemctl status redis` |
+
+---
+
+### Day-to-day health check
+
+Run this any time to see the current state of every component in one table:
+
+```bash
+python scripts/health_check.py
+```
+
+Exit code 0 means everything is healthy. Exit code 1 means something needs attention. The output is color-coded: green = healthy, amber = warning, red = problem.
+
+To check service status from the command line:
+
+```bash
+# Quick status of both services
+sudo systemctl status recruiter-scheduler recruiter-watchdog
+
+# Is the scheduler running?
+sudo systemctl is-active recruiter-scheduler
+
+# Is the watchdog running?
+sudo systemctl is-active recruiter-watchdog
+```
+
+To watch live logs:
+
+```bash
+# Live scheduler logs (Ctrl+C to stop)
+journalctl -u recruiter-scheduler -f
+
+# Live watchdog logs
+journalctl -u recruiter-watchdog -f
+
+# Last 100 lines of scheduler logs
+journalctl -u recruiter-scheduler -n 100
+
+# Logs from the last hour
+journalctl -u recruiter-scheduler --since "1 hour ago"
+```
+
+---
+
+### Deploying new code
+
+After every `git push`, run this one command on the server:
+
+```bash
+bash deploy/deploy.sh
+```
+
+What it does, in order:
+1. `git pull` — downloads the latest code
+2. `pip install -r requirements.txt` — picks up any new Python dependencies
+3. `sudo systemctl restart recruiter-scheduler recruiter-watchdog` — restarts both services with the new code
+4. Waits 15 seconds for worker heartbeats to appear in Redis
+5. Runs `scripts/health_check.py` to confirm everything came up healthy
+
+If `health_check.py` reports a problem, check the logs:
+
+```bash
+journalctl -u recruiter-scheduler -n 50
+```
+
+---
+
+### June 2026 — Session fixes deploy steps
+
+The following changes were made in this session and require specific deploy actions.
+Run these **once** on the server after `git pull`.
+
+#### What changed
+
+| File | Change | Needs restart? |
+|---|---|---|
+| `workers/scheduler.py` | XAUTOCLAIM `None` msg_id guard (crash fix) | ✅ Yes |
+| `db/pipeline_alerts.py` | `fromisoformat` TypeError fix | ❌ Auto on next run |
+| `scripts/log_monitor.py` | New proactive log scanner (dynamic TTL) | ❌ Via cron |
+| `workers/sentry_init.py` | New Sentry dedup module (dynamic TTL, no re-appear) | ✅ Yes (+ pip + .env) |
+| `pipeline.py` + 5 workers | `init_sentry()` wired in at each entry point | ✅ Yes |
+| Crontab | 9 AM retry guard + keep-alive every 4h + log_monitor/15m | ❌ Via update_crontab.sh |
+
+#### Step-by-step
+
+```bash
+# ── 1. Pull latest code ───────────────────────────────────────────────────────
+cd /home/opc/mail
+git pull
+
+# ── 2. Apply crontab changes (idempotent — safe to run multiple times) ────────
+bash deploy/update_crontab.sh
+
+# Verify the three new entries are present:
+crontab -l | grep -E "(retry|log_monitor|keep-alive|\*/4)"
+
+# ── 3. Install Sentry SDK (one-time) ─────────────────────────────────────────
+/home/opc/mail/venv/bin/pip install sentry-sdk
+
+# ── 4. Add SENTRY_DSN to .env (one-time — get DSN from sentry.io free account)
+#       Skip this step if you haven't set up a Sentry project yet.
+#       init_sentry() is a no-op when SENTRY_DSN is absent — safe to skip.
+echo "SENTRY_DSN=https://xxx@oYYY.ingest.sentry.io/ZZZ" >> /home/opc/mail/.env
+
+# ── 5. Restart services (picks up scheduler.py fix + all sentry_init wiring) ──
+sudo systemctl restart recruiter-scheduler
+sudo systemctl restart recruiter-watchdog
+
+# ── 6. Verify services came back up ──────────────────────────────────────────
+systemctl is-active recruiter-scheduler recruiter-watchdog
+# Both should print "active"
+
+# ── 7. Smoke test log monitor ─────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py
+# Should print "[log_monitor] clean — no issues found" if logs are quiet
+
+# Check that the state file was created (byte offsets per log file):
+cat /home/opc/mail/data/log_monitor_state.json | python3 -m json.tool | head -20
+
+# ── 8. Full health check ──────────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python scripts/health_check.py
+```
+
+#### What takes effect automatically (no action needed)
+
+- `db/pipeline_alerts.py` fix — active on next `run_monitor.sh` execution
+- `scripts/log_monitor.py` — active on next 15-minute cron tick after step 2
+- Dynamic TTL in both `sentry_init.py` and `log_monitor.py` — active immediately
+  after restart (step 5); Redis `ts:{fp}` keys build up over the first few
+  occurrences of each error, then the TTL adapts automatically
+
+---
+
+### CodeRabbit Review (June 2026) — deploy steps
+
+Security fixes, bug fixes, and architectural hardening from CodeRabbit review.
+Run these **once** on the server after `git pull`.
+
+#### What changed
+
+| File | Change | Needs restart? |
+|---|---|---|
+| `workers/sentry_init.py` | Atomic `SET NX` — fixes race where two concurrent workers could both forward the same new error to Sentry | ✅ Yes |
+| `scripts/health_check.py` | Silent `pass` on Redis RDB check replaced with `WARNING` row; scheduler heartbeat parse failure no longer reported as `OK` | ❌ Auto on next run |
+| `scripts/log_monitor.py` | E741 variable rename (`l` → `line`) — linting fix only | ❌ Auto |
+| `jobs/job_monitor.py` | `zrangebyscore` lower bound changed from `-inf` to `now − 7200` — stops stale killed-worker entries permanently excluding companies from missed-jobs check | ❌ Auto |
+| `workers/startup.py` | Redis URL credentials masked before printing to stderr/journal; `SELECT COUNT(*)` startup check replaced with `SELECT 1 … LIMIT 1` (no full-table scan) | ✅ Yes |
+| `workers/scan_worker.py` | `_hb.stop()` moved to after the loop — now called on all exit paths, not just `KeyboardInterrupt` | ✅ Yes |
+| `workers/detail_worker.py` | **Three architectural fixes:** (1) per-PID inflight keys prevent restarting worker from stealing live peer's job; (2) atomic Lua script for shutdown requeue eliminates crash-loss window; (3) `retryable` flag leaves unexpected-error jobs in inflight for recovery | ✅ Yes |
+| `workers/scheduler.py` | `_worker_spawn_times` entry cleaned up in `_shrink_pool()` — prevents unbounded dict growth | ✅ Yes |
+| `workers/fullscan.py` | Updated EMA passed to `_pick_schedule_time()` — deadline guard now reflects the scan that just completed, not the stale pre-scan value | ✅ Yes |
+| `workers/watchdog.py` | File handle in `_attempt_heal` wrapped in `with` block — closes on `Popen` exception too | ✅ Yes |
+| `scripts/startup_failure_alert.py` | Service name validated against allowlist before use in file paths and subprocess args | ❌ Via systemd |
+| `.github/workflows/deploy.yml` | `systemctl cat` check before restart — masks only "unit not found" errors, fails for real restart failures | ❌ CI only |
+| `tests/` | E701/E702 linting fixes across 3 test files | ❌ Tests only |
+
+#### Step-by-step
+
+```bash
+# ── 1. Pull latest code ───────────────────────────────────────────────────────
+cd /home/opc/mail
+git pull
+
+# ── 2. Restart services ───────────────────────────────────────────────────────
+# All source-code fixes take effect on restart.
+sudo systemctl restart recruiter-scheduler
+sudo systemctl restart recruiter-watchdog
+
+# ── 3. Verify services came back up ──────────────────────────────────────────
+systemctl is-active recruiter-scheduler recruiter-watchdog
+# Both should print "active"
+
+# ── 4. Full health check ──────────────────────────────────────────────────────
+/home/opc/mail/venv/bin/python scripts/health_check.py
+# Redis RDB save should now appear in report (was silently missing before)
+# Scheduler heartbeat parse errors now show as WARNING instead of OK
+```
+
+#### Verifying the detail_worker per-PID inflight keys
+
+After restart you can confirm each worker uses its own inflight key:
+
+```bash
+# List all detail inflight keys (should be one per live worker PID)
+redis-cli --scan --pattern "queue:detail:*:inflight:*"
+
+# Each key should have exactly 0 or 1 items (the currently-in-progress job)
+redis-cli LLEN "queue:detail:adaptive:inflight:<pid>"
+```
+
+---
+
+### Manual recovery (when the watchdog escalates)
+
+If you receive a `🆘 ESCALATION` email, SSH into the server and run:
+
+```bash
+# 1. Check what state each service is in
+sudo systemctl status recruiter-scheduler recruiter-watchdog
+
+# 2. Check the last logs for the failed service
+journalctl -u recruiter-scheduler -n 50
+
+# 3. Reset the failed state and restart
+sudo systemctl reset-failed recruiter-scheduler
+sudo systemctl restart recruiter-scheduler
+
+# 4. Verify it came back up
+sudo systemctl is-active recruiter-scheduler
+
+# 5. Run a full health check
+python scripts/health_check.py
+```
+
+If the scheduler is up but workers are missing:
+
+```bash
+# Check worker heartbeats in Redis
+redis-cli --scan --pattern "worker:alive:*"
+
+# If queues are empty, rebuild from PostgreSQL
+python pipeline.py --rebuild
+```
+
+If Redis is the problem:
+
+```bash
+sudo systemctl status redis
+sudo systemctl restart redis
+```
+
+---
+
+### Who manages what — the complete picture
+
+| Component | How it starts | What restarts it if it crashes | Time to recovery |
+|---|---|---|---|
+| scheduler | systemd on boot | systemd (recruiter-scheduler.service) | ~30 seconds |
+| scan_worker pool | scheduler (child process) | scheduler restart via systemd | ~35 seconds |
+| detail_worker pool | scheduler (child process) | scheduler restart via systemd | ~35 seconds |
+| fullscan_worker | scheduler (child process) | scheduler restart via systemd | ~35 seconds |
+| watchdog | systemd on boot | systemd (recruiter-watchdog.service) | ~10 seconds |
+
+---
+
+### Server setup (one-time only)
+
+The scripts in `deploy/` handle all server-side setup. Run these once when setting up a new server:
+
+**`deploy/install-systemd.sh`** (run with `sudo`) — does the full systemd setup:
+1. Removes any old watchdog cron entry to prevent double-running
+2. Stops any existing nohup processes
+3. Sets `.env` file permissions to 600 (read-only by the owner — keeps credentials secure)
+4. Adds the sudoers rule so the watchdog can call `systemctl restart` without a password prompt
+5. Installs and enables the unit files, starts both services
+6. Runs `health_check.py` to confirm everything is running
+
+**`deploy/configure-redis.sh`** (run with `sudo`) — enables Redis AOF (Append-Only File) persistence and configures automatic AOF rewriting. By default Redis saves its in-memory data to disk every 5 minutes (RDB). AOF mode appends every operation to disk within 1 second, reducing the crash data-loss window from ~5 minutes to ~1 second. AOF rewriting (auto-triggered when the file doubles in size and is ≥64 MB) compacts the file back down by collapsing all intermediate writes into just the current state — keeping file size proportional to live data rather than write history.
 
 ---
 
@@ -1162,10 +1874,20 @@ WARMING companies not advancing to STABLE:
        ls -lh /mnt/backups/
 □ 16. Test verify-filled manually (after first monitor run):
        python pipeline.py --verify-filled
-□ 17. Start scheduler workers (in separate terminals or systemd units):
-       python -m workers.scheduler   # adaptive + fullscan dispatch
-       python -m workers.fullscan    # full scan executor
-       # rebuild_redis() runs automatically on startup — no pre-step needed.
+□ 17. Run one-time server setup (systemd services + Redis AOF persistence):
+       sudo bash deploy/first_time_setup.sh
+       # This is the only command you need to run once. It does, in order:
+       #   1. Checks all prerequisites (venv, .env, Redis, PostgreSQL)
+       #   2. Installs recruiter-scheduler + recruiter-watchdog as systemd services
+       #      (starts on boot, auto-restarts on crash)
+       #   3. Adds the sudoers rule so the watchdog can self-heal
+       #   4. Enables Redis AOF persistence (max 1s data loss, was ~5 min)
+       #   5. Configures AOF auto-rewrite (file never grows unbounded)
+       #   6. Waits for all worker heartbeats to appear
+       #   7. Runs health_check.py to confirm everything is healthy
+       #
+       # After this script completes successfully, use deploy/deploy.sh
+       # for every subsequent code update — never run first_time_setup.sh again.
 □ 18. (Emergency only) Redistribute ZSET scores — SKIP on normal deploys.
        # Use ONLY if scores are corrupted while the scheduler is already
        # running and a restart is not possible. rebuild_redis() handles all

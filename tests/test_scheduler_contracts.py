@@ -4,28 +4,38 @@ tests/test_scheduler_contracts.py
 Tests for scheduler.py and scan_worker.py contracts that protect against
 thundering-herd regressions, backoff miscalculations, and stale-state bugs.
 
-Background
-──────────
-These systems are hard to test manually because their effects are statistical
-(jitter distribution) or only visible after multiple failure cycles (backoff
-progression).  A bug in any of these functions can silently defeat the entire
-adaptive polling architecture:
+Phase 2 update
+──────────────
+_reschedule_adaptive() no longer uses random.uniform() jitter.  It now calls
+_pick_schedule_time() — the gap-detection algorithm that finds the largest
+unused gap between existing scheduled times and returns its midpoint.
+TestRescheduleJitter has been replaced with:
 
-  - Missing jitter in _reschedule_adaptive(): companies scheduled at the same
-    interval cluster into waves, saturating the ATS at fixed intervals —
-    the thundering herd problem described in Section 9 of the architecture doc.
+  TestPickScheduleTime
+    · Empty window → target_ts returned (only gap is full window)
+    · Single existing entry → largest of the two resulting gaps is chosen
+    · Multiple clustered entries → picks midpoint of the largest gap
+    · Result always within the tolerance window [lo, hi]
+    · Deadline guard: gap whose midpoint + avg_duration_s ≥ deadline is skipped
+    · Deadline guard: all gaps violate deadline → fallback to target_ts
+    · No deadline set → avg_duration_s has no effect
+    · Tiebreaker: equal-size gaps → closest midpoint to target_ts wins
+    · Self-correction: 3 calls from a full cluster produce 3 distinct times
 
-  - Wrong backoff calculation in _get_backoff_delay(): a company that keeps
-    failing could be retried too aggressively (DDoS risk) or skipped entirely
-    too early (missed coverage).
+  TestNextDigestDeadline
+    · Result is always strictly in the future from now
+    · Result corresponds to exactly 7:00:00 in America/New_York
+    · Result is within 24 hours from now
+    · now before 7 AM ET → returns today's 7 AM ET
+    · now after 7 AM ET → returns tomorrow's 7 AM ET
+    · now exactly at 7 AM ET → returns tomorrow's 7 AM ET
 
-  - p95_ms=None in claim_stale_work(): api_health may have no data for a new
-    platform; `None * 3` raises TypeError, crashing the claim loop and leaving
-    stale inflight messages unreclaimed.
-
-  - WARMING interval override: on_adaptive_complete() must use WARMING_INTERVAL_S
-    during the warming phase instead of the computed adaptive interval, so the
-    engine has 3 full polls of data before switching to dynamic scheduling.
+  TestRescheduleAdaptiveGapBased
+    · ZADD called exactly once on poll:adaptive
+    · Score is within the ±10% tolerance window (not exact jitter bounds)
+    · random.uniform is NOT called (gap-based, not random)
+    · Multiple companies from same cluster get distinct scores
+    · Company name is the ZADD mapping key
 
 Coverage
 ────────
@@ -40,14 +50,6 @@ Coverage
     · First call sets TTL of 86400s on the counter key
     · Counter increments atomically on each call
     · Different op_types use different keys (scan / detail / fullscan)
-
-  TestRescheduleJitter
-    · _reschedule_adaptive() always adds jitter in the range [-10%, +10%]
-    · Jitter is applied to the interval, not the absolute timestamp
-    · Score stored in ZSET is approximately now + interval (within ±10%)
-    · Calling 200 times: distribution spans both negative and positive jitter
-      (statistical test — fails only if jitter is always 0 or always one sign)
-    · Without jitter a fixed interval would produce exact clustering
 
   TestClaimStaleWorkP95Safety
     · p95_ms=None raises TypeError at `p95_ms * 3` — documents known risk
@@ -80,6 +82,21 @@ Coverage
     · Fullscan older than 24h is still correctly flagged as missed under new logic
     · never-fullscanned company (last_full_scan_at=NULL → 0) is always missed
     · Structural test: job_monitor.py queries last_full_scan_at + timedelta(hours=24)
+
+  TestPickScheduleTimeEdgeCases  (additional gap-detection edge cases)
+    · tolerance_pct=0 → window collapses → returns target_ts
+    · entries outside window → treated as empty window → midpoint = target
+    · result always within [lo, hi] tolerance window
+    · deadline with avg_duration=0 → never skipped
+    · all gaps violate deadline → fallback to target_ts
+    · large cluster (20 entries) → still returns a finite result
+    · single entry at center → splits into equal halves, returns valid midpoint
+
+  TestInflightExclusionStructural  (Phase 2.6 — inflight exclusion in job_monitor)
+    · Source uses REDIS_INFLIGHT_FULLSCAN constant
+    · Source decodes bytes from Redis
+    · Source handles Redis unavailability (try/except)
+    · Source uses a ZSET read operation for inflight data
 """
 
 import sys
@@ -230,152 +247,319 @@ class TestBackoffKeyNamespace(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestRescheduleJitter
+# TestPickScheduleTime  (Phase 2 — gap-detection algorithm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRescheduleJitter(unittest.TestCase):
+class TestPickScheduleTime(unittest.TestCase):
     """
-    _reschedule_adaptive() applies ±10% jitter to prevent thundering herd.
-
-    Source (scheduler.py):
-        def _reschedule_adaptive(company, interval_s):
-            jitter = random.uniform(-0.10, 0.10)
-            score  = time.time() + interval_s * (1.0 + jitter)
-            get_redis().zadd(REDIS_POLL_ADAPTIVE, {company: score})
+    _pick_schedule_time() finds the largest gap between existing scheduled
+    times within a tolerance window and returns the midpoint of that gap.
+    Replaces the old 20-slot min-heap (_least_loaded_slot).
     """
 
-    def test_jitter_bounds_via_mock(self):
+    _TARGET = 1_700_000_000.0
+    _INTERVAL = 86400
+    _TOL = 0.20   # 20% → window = 17280 s = 4.8 h
+
+    def _window(self):
+        w = self._INTERVAL * self._TOL
+        return self._TARGET - w / 2, self._TARGET + w / 2
+
+    def _call(self, existing_scores, *, deadline_ts=None, avg_duration_s=0.0,
+              target=None, interval=None, tol=None):
+        from workers.scheduler import _pick_schedule_time
+        r = MagicMock()
+        r.zrangebyscore.return_value = [
+            (f"co{i}".encode(), float(s)) for i, s in enumerate(existing_scores)
+        ]
+        return _pick_schedule_time(
+            target_ts      = target if target is not None else self._TARGET,
+            queue_key      = "poll:fullscan",
+            interval_s     = interval if interval is not None else self._INTERVAL,
+            tolerance_pct  = tol if tol is not None else self._TOL,
+            r              = r,
+            deadline_ts    = deadline_ts,
+            avg_duration_s = avg_duration_s,
+        )
+
+    # ── Basic gap selection ───────────────────────────────────────────────────
+
+    def test_empty_window_returns_target(self):
+        """No existing entries → window is one gap, midpoint = target_ts."""
+        result = self._call([])
+        self.assertAlmostEqual(result, self._TARGET, places=0)
+
+    def test_single_entry_at_lo_picks_right_gap(self):
+        """Entry near lo → left gap is tiny, right gap is large; picks right."""
+        lo, hi = self._window()
+        entry = lo + 100   # tiny left gap (100 s), large right gap (~17180 s)
+        result = self._call([entry])
+        expected = (entry + hi) / 2
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_single_entry_at_hi_picks_left_gap(self):
+        """Entry near hi → large left gap is chosen."""
+        lo, hi = self._window()
+        entry = hi - 100
+        result = self._call([entry])
+        expected = (lo + entry) / 2
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_picks_largest_gap_globally(self):
+        """Three entries clustered near lo → large gap on right side chosen."""
+        lo, hi = self._window()
+        entries = [lo + 100, lo + 200, lo + 300]
+        result = self._call(entries)
+        expected = (lo + 300 + hi) / 2
+        self.assertAlmostEqual(result, expected, places=0)
+
+    def test_result_always_within_window(self):
+        """Result is always within [lo, hi] regardless of existing entries."""
+        lo, hi = self._window()
+        for existing in [[], [self._TARGET], [lo + 1000, hi - 1000],
+                         [self._TARGET] * 10]:
+            result = self._call(existing)
+            self.assertGreaterEqual(result, lo - 1)
+            self.assertLessEqual(result, hi + 1)
+
+    # ── Tiebreaker ────────────────────────────────────────────────────────────
+
+    def test_equal_gaps_tiebreaker_closest_to_target(self):
+        """Equal-size gaps → midpoint closest to target_ts wins."""
+        lo, hi = self._window()
+        # Entry at exact target splits window into two equal halves.
+        # Left midpoint = (lo + target) / 2, right = (target + hi) / 2.
+        # Both equal size → pick one closest to target.
+        # Actually: the two gaps have midpoints equidistant from target,
+        # so we just check the result is one of them (not target itself).
+        result = self._call([self._TARGET])
+        self.assertIn(
+            round(result, 0),
+            {round((lo + self._TARGET) / 2, 0),
+             round((self._TARGET + hi) / 2, 0)},
+        )
+
+    # ── Deadline guard ────────────────────────────────────────────────────────
+
+    def test_deadline_guard_skips_late_gaps(self):
         """
-        Verify that random.uniform is called with exactly (-0.10, 0.10).
-        This is the tightest possible test: it verifies the intent of the code
-        without needing to run 200 iterations.
+        Largest gap midpoint + avg_duration_s ≥ deadline → skipped.
+        Second-largest gap (without deadline issue) is returned instead.
+        """
+        lo, hi = self._window()
+        # Entry at target: left gap mid = (lo+target)/2, right gap mid = (target+hi)/2
+        avg_duration = 1800   # 30 min
+        right_mid = (self._TARGET + hi) / 2
+        # Set deadline so right gap just fails
+        deadline = right_mid + avg_duration - 1
+
+        result = self._call([self._TARGET], deadline_ts=deadline,
+                            avg_duration_s=avg_duration)
+        # Right gap fails → left gap chosen
+        left_mid = (lo + self._TARGET) / 2
+        self.assertAlmostEqual(result, left_mid, places=0)
+
+    def test_deadline_guard_all_gaps_fail_returns_target(self):
+        """All gaps violate deadline → fallback to target_ts."""
+        avg_duration = 86400   # 24 h — always exceeds any gap midpoint
+        deadline = self._TARGET - 1  # deadline already in the past → everything fails
+        result = self._call([], deadline_ts=deadline, avg_duration_s=avg_duration)
+        self.assertAlmostEqual(result, self._TARGET, places=0)
+
+    def test_no_deadline_avg_duration_has_no_effect(self):
+        """With deadline_ts=None, avg_duration_s is ignored."""
+        r1 = self._call([], deadline_ts=None, avg_duration_s=0)
+        r2 = self._call([], deadline_ts=None, avg_duration_s=99999)
+        self.assertAlmostEqual(r1, r2, places=0)
+
+    # ── Self-correction from cluster ──────────────────────────────────────────
+
+    def test_three_calls_from_cluster_produce_distinct_times(self):
+        """
+        Three consecutive new companies all starting from the same clustered
+        pool each get a different scheduled time — the cluster spreads out.
+        """
+        from workers.scheduler import _pick_schedule_time
+        lo, hi = self._window()
+        existing = [self._TARGET] * 10  # all clustered at target
+        chosen = []
+
+        for _ in range(3):
+            r = MagicMock()
+            r.zrangebyscore.return_value = [(b"co", float(s)) for s in existing]
+            result = _pick_schedule_time(
+                target_ts=self._TARGET, queue_key="poll:fullscan",
+                interval_s=self._INTERVAL, tolerance_pct=self._TOL, r=r,
+            )
+            chosen.append(result)
+            existing.append(result)
+
+        self.assertEqual(len(set(round(s, 0) for s in chosen)), 3,
+                         f"Expected 3 distinct times, got: {chosen}")
+        for s in chosen:
+            self.assertGreaterEqual(s, lo - 1)
+            self.assertLessEqual(s, hi + 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestNextDigestDeadline  (Phase 2 — 7 AM ET deadline computation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNextDigestDeadline(unittest.TestCase):
+    """_next_digest_deadline(now) → next 7:00:00 AM America/New_York."""
+
+    def _call(self, now):
+        from workers.scheduler import _next_digest_deadline
+        return _next_digest_deadline(now)
+
+    def _et_hour(self, ts):
+        """Return the ET hour of a Unix timestamp."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        from datetime import datetime
+        return datetime.fromtimestamp(ts, tz=ZoneInfo("America/New_York"))
+
+    def test_result_always_in_future(self):
+        """Deadline is always strictly after now."""
+        for now in [1_748_000_000.0 + h * 3600 for h in range(0, 24, 3)]:
+            result = self._call(now)
+            self.assertGreater(result, now,
+                               f"Deadline not in future from now={now}")
+
+    def test_result_at_exactly_7am_et(self):
+        """Result corresponds to 7:00:00 in America/New_York."""
+        dt = self._et_hour(self._call(1_748_000_000.0))
+        self.assertEqual(dt.hour, 7)
+        self.assertEqual(dt.minute, 0)
+        self.assertEqual(dt.second, 0)
+
+    def test_result_within_24_hours(self):
+        """Deadline is at most 24 hours from now."""
+        now = 1_748_000_000.0
+        self.assertLessEqual(self._call(now) - now, 24 * 3600 + 1)
+
+    def test_before_7am_et_returns_today(self):
+        """now = 3 AM ET → deadline = today 7 AM ET (same calendar day)."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        from datetime import datetime
+        tz = ZoneInfo("America/New_York")
+        now_dt = datetime(2026, 5, 27, 3, 0, 0, tzinfo=tz)
+        result_dt = self._et_hour(self._call(now_dt.timestamp()))
+        self.assertEqual(result_dt.date(), now_dt.date())
+        self.assertEqual(result_dt.hour, 7)
+
+    def test_after_7am_et_returns_tomorrow(self):
+        """now = 10 AM ET → deadline = tomorrow 7 AM ET."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+        tz = ZoneInfo("America/New_York")
+        now_dt = datetime(2026, 5, 27, 10, 0, 0, tzinfo=tz)
+        result_dt = self._et_hour(self._call(now_dt.timestamp()))
+        self.assertEqual(result_dt.date(), (now_dt + timedelta(days=1)).date())
+        self.assertEqual(result_dt.hour, 7)
+
+    def test_exactly_at_7am_et_returns_tomorrow(self):
+        """now = exactly 7 AM ET → deadline = tomorrow 7 AM ET (not today)."""
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo
+        from datetime import datetime, timedelta
+        tz = ZoneInfo("America/New_York")
+        now_dt = datetime(2026, 5, 27, 7, 0, 0, tzinfo=tz)
+        result_dt = self._et_hour(self._call(now_dt.timestamp()))
+        self.assertEqual(result_dt.date(), (now_dt + timedelta(days=1)).date())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestRescheduleAdaptiveGapBased  (Phase 2 — replaces TestRescheduleJitter)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRescheduleAdaptiveGapBased(unittest.TestCase):
+    """
+    _reschedule_adaptive() now uses _pick_schedule_time() (gap-detection)
+    instead of random.uniform() jitter.  These tests verify the new contract.
+    """
+
+    def _call_and_capture(self, company="Acme", interval_s=3600,
+                          existing_scores=None, fixed_now=None):
+        """
+        Call _reschedule_adaptive() with mocked Redis, return (r_mock, score).
         """
         from workers.scheduler import _reschedule_adaptive
+        r = MagicMock()
+        r.zrangebyscore.return_value = [
+            (b"co", float(s)) for s in (existing_scores or [])
+        ]
+        patches = [patch("workers.scheduler.get_redis", return_value=r)]
+        if fixed_now is not None:
+            patches.append(patch("workers.scheduler.time.time",
+                                 return_value=fixed_now))
+        ctx = [p.__enter__() for p in patches]
+        try:
+            _reschedule_adaptive(company, interval_s)
+        finally:
+            for p, _ in zip(reversed(patches), reversed(ctx), strict=True):
+                p.__exit__(None, None, None)
+        score = next(iter(r.zadd.call_args[0][1].values()))
+        return r, score
 
-        with patch("workers.scheduler.random.uniform", return_value=0.0) as mock_uniform, \
-             patch("workers.scheduler.get_redis") as mock_get_redis:
-            mock_redis = MagicMock()
-            mock_get_redis.return_value = mock_redis
+    def test_zadd_called_exactly_once(self):
+        r, _ = self._call_and_capture()
+        self.assertEqual(r.zadd.call_count, 1)
 
+    def test_zadd_targets_poll_adaptive(self):
+        from config import REDIS_POLL_ADAPTIVE
+        r, _ = self._call_and_capture()
+        self.assertEqual(r.zadd.call_args[0][0], REDIS_POLL_ADAPTIVE)
+
+    def test_score_within_tolerance_window(self):
+        """Score is within ±10% of now + interval (20% total window)."""
+        interval = 3600
+        fixed_now = 1_700_000_000.0
+        _, score = self._call_and_capture(interval_s=interval, fixed_now=fixed_now)
+        target = fixed_now + interval
+        window = interval * 0.20
+        self.assertGreaterEqual(score, target - window / 2 - 1)
+        self.assertLessEqual(score, target + window / 2 + 1)
+
+    def test_random_uniform_not_called(self):
+        """Gap-based scheduling does not use random.uniform."""
+        with patch("workers.scheduler.random.uniform") as mock_u, \
+             patch("workers.scheduler.get_redis") as mock_r:
+            mock_r.return_value.zrangebyscore.return_value = []
+            from workers.scheduler import _reschedule_adaptive
             _reschedule_adaptive("Acme", 3600)
+        mock_u.assert_not_called()
 
-            mock_uniform.assert_called_once_with(-0.10, 0.10)
-
-    def test_score_incorporates_jitter(self):
-        """
-        Score stored in ZSET = now + interval * (1 + jitter).
-        With jitter=+0.10, score = now + interval * 1.10.
-        """
-        from workers.scheduler import _reschedule_adaptive
-
+    def test_clustered_companies_get_distinct_scores(self):
+        """Multiple companies starting from the same cluster get different times."""
+        fixed_now = 1_700_000_000.0
         interval = 3600
-        fixed_jitter = 0.10
-        fixed_now = time.time()
-
-        with patch("workers.scheduler.random.uniform", return_value=fixed_jitter), \
-             patch("workers.scheduler.time.time", return_value=fixed_now), \
-             patch("workers.scheduler.get_redis") as mock_get_redis:
-            mock_redis = MagicMock()
-            mock_get_redis.return_value = mock_redis
-
-            _reschedule_adaptive("Acme", interval)
-
-            expected_score = fixed_now + interval * (1.0 + fixed_jitter)
-            mock_redis.zadd.assert_called_once_with(
-                unittest.mock.ANY,   # REDIS_POLL_ADAPTIVE constant
-                {"Acme": expected_score},
-            )
-
-    def test_negative_jitter_decreases_score(self):
-        """Negative jitter pulls the score closer to now (earlier poll)."""
-        from workers.scheduler import _reschedule_adaptive
-
-        interval = 7200
-        fixed_jitter = -0.10
-        fixed_now = time.time()
-
-        with patch("workers.scheduler.random.uniform", return_value=fixed_jitter), \
-             patch("workers.scheduler.time.time", return_value=fixed_now), \
-             patch("workers.scheduler.get_redis") as mock_get_redis:
-            mock_redis = MagicMock()
-            mock_get_redis.return_value = mock_redis
-
-            _reschedule_adaptive("Stripe", interval)
-
-            expected_score = fixed_now + interval * (1.0 + fixed_jitter)
-            # Score should be less than now + interval (no jitter)
-            no_jitter_score = fixed_now + interval
-            self.assertLess(expected_score, no_jitter_score)
-            mock_redis.zadd.assert_called_once_with(
-                unittest.mock.ANY, {"Stripe": expected_score}
-            )
-
-    def test_statistical_both_signs_over_many_calls(self):
-        """
-        Over 200 calls with real random.uniform, jitter must produce both
-        positive and negative offsets (probability of all same sign ≈ 2^-200).
-        This detects if the jitter formula was changed to always return +0 or
-        if the range was collapsed to [0, 0].
-        """
-        from workers.scheduler import _reschedule_adaptive
-
-        interval = 3600
+        target = fixed_now + interval
+        existing = [target] * 10
         scores = []
+        for i in range(3):
+            _, s = self._call_and_capture(
+                company=f"Co{i}", interval_s=interval,
+                existing_scores=existing, fixed_now=fixed_now,
+            )
+            scores.append(s)
+            existing.append(s)
+        self.assertEqual(len(set(round(s, 0) for s in scores)), 3,
+                         f"Expected 3 distinct scores, got {scores}")
 
-        with patch("workers.scheduler.get_redis") as mock_get_redis:
-            mock_redis = MagicMock()
-            mock_get_redis.return_value = mock_redis
-
-            for i in range(200):
-                _reschedule_adaptive(f"Company{i}", interval)
-
-            # Extract scores from zadd calls
-            for c in mock_redis.zadd.call_args_list:
-                mapping = c[0][1]   # second positional arg is the {member: score} dict
-                scores.extend(mapping.values())
-
-        base_time = time.time()
-        # All scores should be approximately now + interval ± 10%
-        lower_bound = base_time + interval * 0.89   # allow 1% measurement slack
-        upper_bound = base_time + interval * 1.11
-
-        self.assertEqual(len(scores), 200, "Expected 200 ZADD calls")
-
-        # Check that both "below no-jitter" and "above no-jitter" are represented
-        no_jitter = base_time + interval
-        below = sum(1 for s in scores if s < no_jitter)
-        above = sum(1 for s in scores if s >= no_jitter)
-        self.assertGreater(below, 10,
-                           f"Only {below}/200 scores were below no-jitter baseline. "
-                           f"Jitter may be one-sided or zero.")
-        self.assertGreater(above, 10,
-                           f"Only {above}/200 scores were above no-jitter baseline. "
-                           f"Jitter may be one-sided or zero.")
-
-    def test_no_jitter_would_cause_exact_clustering(self):
-        """
-        Document the thundering herd problem: if jitter is removed,
-        N companies with the same interval produce identical ZSET scores.
-        This test shows what the code prevents.
-        """
-        # Simulate 5 companies all scheduled with exactly 3600s (no jitter)
-        interval = 3600
-        now = 1_700_000_000.0  # fixed timestamp for reproducibility
-        no_jitter_scores = [now + interval for _ in range(5)]
-
-        # All scores are identical → thundering herd
-        self.assertEqual(len(set(no_jitter_scores)), 1,
-                         "Without jitter all scores are identical — herd forms")
-
-        # With ±10% jitter the scores are spread across a 720s window
-        import random
-        jittered = [now + interval * (1.0 + random.uniform(-0.10, 0.10))
-                    for _ in range(5)]
-        # Very high probability (≈ 1 - 5!/5^5 ≈ 97.6%) that at least 2 are distinct
-        # — we just assert they're not all the same
-        # (degenerate equality is astronomically unlikely with float jitter)
-        self.assertGreater(len(set(jittered)), 1,
-                           "Jittered scores should not all be identical")
+    def test_company_name_in_zadd_mapping(self):
+        r, _ = self._call_and_capture(company="GlobalCorp")
+        self.assertIn("GlobalCorp", r.zadd.call_args[0][1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -762,7 +946,15 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         has_fixed_boundary   = "cycle_start_ts = today_cycle.timestamp()" in src
         has_rolling_window   = "timedelta(hours=24)" in src
         has_fullscan_field   = "last_full_scan_at" in src
-        has_adaptive_field   = "last_poll_epoch" in src  # old adaptive-scan alias
+        # Strip comments and triple-quoted strings before checking:
+        # job_monitor.py mentions "last_poll_at" only in docstrings/comments
+        # that explain why it is NOT used — a raw substring search would
+        # false-positive and fail the assertion even when the code is correct.
+        import re as _re
+        _stripped = _re.sub(r'#[^\n]*', '', src)             # remove # comments
+        _stripped = _re.sub(r'""".*?"""', '', _stripped, flags=_re.DOTALL)  # triple-" strings
+        _stripped = _re.sub(r"'''.*?'''", '', _stripped, flags=_re.DOTALL)  # triple-' strings
+        has_adaptive_field   = "last_poll_at" in _stripped   # adaptive-scan field (wrong alias)
 
         self.assertFalse(has_fixed_boundary,
             "job_monitor.py still uses 'today_cycle.timestamp()' as cycle boundary — "
@@ -776,6 +968,153 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         self.assertFalse(has_adaptive_field,
             "job_monitor.py is still querying last_poll_epoch (adaptive scan alias) — "
             "coverage must be determined by last_full_scan_at from the fullscan worker")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestPickScheduleTimeEdgeCases  (Phase 2 — additional gap-detection coverage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPickScheduleTimeEdgeCases(unittest.TestCase):
+    """
+    Additional edge cases for _pick_schedule_time() not covered by
+    the existing TestPickScheduleTime class.
+    """
+
+    _TARGET  = 1_700_000_000.0
+    _INTERVAL = 86400.0
+
+    def _call(self, existing_scores=None, tolerance_pct=0.20,
+              deadline_ts=None, avg_duration_s=0.0):
+        r = MagicMock()
+        pairs = [(f"co{i}".encode(), s) for i, s in enumerate(existing_scores or [])]
+        r.zrangebyscore.return_value = pairs
+        from workers.scheduler import _pick_schedule_time
+        return _pick_schedule_time(
+            self._TARGET, "poll:adaptive", self._INTERVAL,
+            tolerance_pct, r,
+            deadline_ts=deadline_ts,
+            avg_duration_s=avg_duration_s,
+        )
+
+    def test_tolerance_zero_returns_target(self):
+        """tolerance_pct=0 → window collapses to a single point → returns target_ts."""
+        result = self._call(existing_scores=[], tolerance_pct=0.0)
+        self.assertAlmostEqual(result, self._TARGET, places=1)
+
+    def test_entries_outside_window_ignored(self):
+        """Entries outside [lo, hi] are not returned by ZRANGEBYSCORE so do not split gaps."""
+        # With no in-window entries, full window is a single gap → midpoint = target
+        result = self._call(existing_scores=[], tolerance_pct=0.20)
+        lo = self._TARGET - 0.20 * self._INTERVAL / 2
+        hi = self._TARGET + 0.20 * self._INTERVAL / 2
+        expected_mid = (lo + hi) / 2
+        self.assertAlmostEqual(result, expected_mid, places=1)
+
+    def test_result_within_tolerance_window(self):
+        """Result is always within [target - window/2, target + window/2]."""
+        from workers.scheduler import _pick_schedule_time
+        window = 0.20 * self._INTERVAL
+        lo = self._TARGET - window / 2
+        hi = self._TARGET + window / 2
+        r = MagicMock()
+        r.zrangebyscore.return_value = [(b"co1", self._TARGET - 1000.0),
+                                        (b"co2", self._TARGET + 1000.0)]
+        result = _pick_schedule_time(
+            self._TARGET, "poll:adaptive", self._INTERVAL, 0.20, r,
+        )
+        self.assertGreaterEqual(result, lo - 1)
+        self.assertLessEqual(result, hi + 1)
+
+    def test_deadline_with_zero_avg_duration_not_skipped(self):
+        """avg_duration_s=0 → midpoint + 0 never ≥ deadline for any reasonable gap."""
+        deadline = self._TARGET + 3600.0  # 1 hour from now
+        result = self._call(
+            existing_scores=[],
+            tolerance_pct=0.20,
+            deadline_ts=deadline,
+            avg_duration_s=0.0,
+        )
+        self.assertLess(result + 0.0, deadline,
+                        "Result with avg_duration=0 must be before deadline")
+
+    def test_all_gaps_violate_deadline_fallback_to_target(self):
+        """If every gap midpoint + avg_duration ≥ deadline, falls back to target_ts."""
+        result = self._call(
+            existing_scores=[],
+            tolerance_pct=0.20,
+            deadline_ts=self._TARGET - 1.0,  # deadline in the past — all gaps violate
+            avg_duration_s=1.0,  # non-zero to exercise the combined guard (mid + dur ≥ deadline)
+        )
+        # Fallback path: returns target_ts
+        self.assertAlmostEqual(result, self._TARGET, places=1)
+
+    def test_large_cluster_still_finds_a_result(self):
+        """Even with 20 entries spread across the window, returns a finite result."""
+        window = 0.20 * self._INTERVAL
+        lo = self._TARGET - window / 2
+        step = window / 21
+        # 20 entries spread evenly
+        entries = [lo + step * i for i in range(1, 21)]
+        result = self._call(existing_scores=entries, tolerance_pct=0.20)
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, float)
+
+    def test_single_entry_at_window_center_splits_into_equal_halves(self):
+        """Entry exactly at target_ts → two equal gaps → tiebreaker picks one."""
+        # Both gaps have equal size; tiebreaker picks the one whose midpoint is
+        # closer to target_ts — they are equidistant, so either is valid.
+        result = self._call(existing_scores=[self._TARGET])
+        lo = self._TARGET - 0.20 * self._INTERVAL / 2
+        hi = self._TARGET + 0.20 * self._INTERVAL / 2
+        self.assertGreaterEqual(result, lo - 1)
+        self.assertLessEqual(result, hi + 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestInflightExclusionStructural  (Phase 2.6 — inflight exclusion in job_monitor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInflightExclusionStructural(unittest.TestCase):
+    """
+    Structural tests for _get_worker_missed_companies() in jobs/job_monitor.py.
+
+    These verify source-code invariants (correct constant used, bytes decoded,
+    Redis-unavailable guard) without running full DB or Redis.
+    """
+
+    def setUp(self):
+        import pathlib
+        self.src = (pathlib.Path(__file__).parent.parent
+                    / "jobs" / "job_monitor.py").read_text(encoding="utf-8")
+
+    def test_source_uses_redis_inflight_fullscan_constant(self):
+        """job_monitor.py reads the inflight:fullscan ZSET to exclude in-flight companies."""
+        self.assertIn("REDIS_INFLIGHT_FULLSCAN", self.src,
+                      "job_monitor.py must reference REDIS_INFLIGHT_FULLSCAN to exclude "
+                      "companies whose fullscan is currently in progress")
+
+    def test_source_decodes_bytes_from_redis(self):
+        """job_monitor.py decodes bytes returned by Redis (zrange/zscan returns bytes)."""
+        # At least one of these patterns shows byte decoding
+        has_decode = ".decode(" in self.src or "decode()" in self.src
+        self.assertTrue(has_decode,
+                        "job_monitor.py must decode bytes from Redis inflight ZSET")
+
+    def test_source_handles_redis_unavailable(self):
+        """job_monitor.py handles Redis unavailability gracefully (try/except guard)."""
+        # The function must have a try/except around the Redis call
+        self.assertIn("except", self.src,
+                      "job_monitor.py must handle Redis exceptions gracefully")
+
+    def test_source_uses_zrangebyscore_or_zrange_for_inflight(self):
+        """job_monitor.py uses a ZSET read operation to get inflight companies."""
+        has_zset_read = (
+            "zrange" in self.src or
+            "zrangebyscore" in self.src or
+            "zscan" in self.src
+        )
+        self.assertTrue(has_zset_read,
+                        "job_monitor.py must use a ZSET read operation for inflight:fullscan")
 
 
 if __name__ == "__main__":

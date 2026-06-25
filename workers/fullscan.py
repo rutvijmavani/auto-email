@@ -91,7 +91,6 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
 import copy
 import json
 import os
-import random
 import socket
 import sys
 import time
@@ -109,6 +108,7 @@ from config import (
     REDIS_DETAIL_FULLSCAN,
     REDIS_CYCLE_START,
     REDIS_DB_MAINTENANCE,
+    REDIS_INFLIGHT_FULLSCAN,
     WORKER_BLOCK_SECS,
     SCHEDULER_FULL_SCAN_LOCK_TTL,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
@@ -126,7 +126,11 @@ from config import (
     WARMING_POLLS_COUNT,
 )
 from workers.redis_client import get_redis, ping
-from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
+from workers.heartbeat import Heartbeat
+from workers.scheduler import (
+    set_heartbeat, clear_heartbeat, set_progress,
+    _pick_schedule_time, _next_digest_deadline, _atomic_schedule,
+)
 from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
@@ -486,29 +490,32 @@ def _get_fullscan_state(company: str) -> dict:
     Fetch fullscan-relevant columns from company_poll_stats.
 
     Returns dict with keys:
-        full_scan_interrupted   bool
-        interrupted_at_page     int | None
-        full_scan_interval_s    int
-        last_poll_at            datetime | None   (for Rule 4 check)
-        last_full_scan_at       datetime | None
+        full_scan_interrupted    bool
+        interrupted_at_page      int | None
+        full_scan_interval_s     int
+        last_poll_at             datetime | None   (for Rule 4 check)
+        last_full_scan_at        datetime | None
+        avg_fullscan_duration_s  float             (EMA of past scan durations)
     Returns empty dict if company not in company_poll_stats yet.
     """
     conn = get_conn()
     try:
         row = conn.execute("""
             SELECT full_scan_interrupted, interrupted_at_page,
-                   full_scan_interval_s, last_poll_at, last_full_scan_at
+                   full_scan_interval_s, last_poll_at, last_full_scan_at,
+                   avg_fullscan_duration_s
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
         if not row:
             return {}
         return {
-            "full_scan_interrupted": bool(row["full_scan_interrupted"]),
-            "interrupted_at_page":   row["interrupted_at_page"],
-            "full_scan_interval_s":  row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S,
-            "last_poll_at":          row["last_poll_at"],
-            "last_full_scan_at":     row["last_full_scan_at"],
+            "full_scan_interrupted":   bool(row["full_scan_interrupted"]),
+            "interrupted_at_page":     row["interrupted_at_page"],
+            "full_scan_interval_s":    row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S,
+            "last_poll_at":            row["last_poll_at"],
+            "last_full_scan_at":       row["last_full_scan_at"],
+            "avg_fullscan_duration_s": float(row["avg_fullscan_duration_s"] or 30.0),
         }
     finally:
         conn.close()
@@ -542,32 +549,60 @@ def _complete_fullscan_db(
     platform: str,
     new_jobs: int,
     interval_s: int,
-) -> None:
+    duration_s: float,
+    prev_avg_duration_s: float = 30.0,
+) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
-    and increments total_new_jobs.
+    increments total_new_jobs, and updates the scan duration EMA.
+
+    EMA formula (alpha=0.3):
+        new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
+
+    The EMA is read by _pick_schedule_time() to skip gap midpoints where
+        midpoint + avg_fullscan_duration_s >= next 7 AM deadline
+    ensuring every scheduled scan can finish before the daily digest.
     """
+    _EMA_ALPHA = 0.3
+    new_avg    = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * prev_avg_duration_s
+
     conn = get_conn()
     try:
         conn.execute("""
-            UPDATE company_poll_stats SET
-                last_full_scan_at     = NOW(),
-                next_full_scan_at     = NOW() + (%s * INTERVAL '1 second'),
-                full_scan_interrupted = FALSE,
-                interrupted_at_page   = NULL,
-                interrupted_at        = NULL,
-                total_new_jobs        = total_new_jobs + %s,
-                updated_at            = NOW()
-            WHERE company = %s
-        """, (interval_s, new_jobs, company))
+            INSERT INTO company_poll_stats
+                (company, ats_platform, last_full_scan_at, next_full_scan_at,
+                 full_scan_interrupted, interrupted_at_page, interrupted_at,
+                 total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
+                 updated_at)
+            VALUES
+                (%s, %s, NOW(), NOW() + (%s * INTERVAL '1 second'),
+                 FALSE, NULL, NULL,
+                 %s, %s, %s,
+                 NOW())
+            ON CONFLICT (company) DO UPDATE SET
+                ats_platform             = EXCLUDED.ats_platform,
+                last_full_scan_at        = NOW(),
+                next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
+                full_scan_interrupted    = FALSE,
+                interrupted_at_page      = NULL,
+                interrupted_at           = NULL,
+                total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
+                last_fullscan_duration_s = %s,
+                avg_fullscan_duration_s  = %s,
+                updated_at               = NOW()
+        """, (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
+              interval_s, new_jobs, int(duration_s), new_avg))
         conn.commit()
+        return True
     except Exception as exc:
         logger.error(
             "fullscan: _complete_fullscan_db failed for %r: %s",
             company, exc, exc_info=True,
         )
+        conn.rollback()
+        return False
     finally:
         conn.close()
 
@@ -756,8 +791,16 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             return result
 
     try:
-        # ── 5. Heartbeat + progress ───────────────────────────────────────────
+        # ── 5. Heartbeat + inflight tracking + progress ───────────────────────
         set_heartbeat(company)
+        # Mark this company as actively being scanned so _get_worker_missed_companies()
+        # in --monitor-jobs does not treat it as "missed" mid-scan.
+        # ZREM is called in the finally block regardless of outcome.
+        try:
+            r.zadd(REDIS_INFLIGHT_FULLSCAN, {company: time.time()})
+        except Exception as exc:
+            # Non-fatal — missed inflight write at most delays 7 AM fallback exclusion.
+            logger.debug("fullscan [%s]: inflight ZADD failed (non-fatal): %s", company, exc)
         set_progress(company, "fullscan_start")
 
         is_resume    = fs_state.get("full_scan_interrupted", False)
@@ -1027,99 +1070,99 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             # state and will be read by adaptive scans for early exit.
             bloom.finalize()
 
-            # Reschedule in poll:fullscan ZSET with directionally-aware ±10% jitter.
-            # Base interval is always 24 h (SCHEDULER_FULL_SCAN_INTERVAL_S = 86400 s).
+            # Reschedule using gap-detection algorithm (Phase 2 — thundering herd prevention).
             #
-            # Safe zone — completion outside 5 AM–7 AM window:
-            #   Full ±10% jitter (±2.4 h on a 24 h interval) → free to spread
-            #   in either direction.  A 36-minute cluster becomes a ~5 h window
-            #   after one cycle, fully broken after 2–3 cycles.
+            # _pick_schedule_time() finds the largest gap between already-scheduled
+            # companies in poll:fullscan within a ±10% window (tolerance_pct=0.20
+            # gives a 20%-of-interval total window centred on now+interval_s).
             #
-            # Danger zone — completion strictly between 5 AM and 7 AM:
-            #   With positive jitter the next scan could be pushed to >7 AM the
-            #   following day, causing the company to miss the digest window.
-            #   Negative-only jitter [−10%, 0] always pulls the schedule earlier,
-            #   guaranteeing the next scan completes before the next 7 AM digest.
-            #   Self-correcting: companies drift toward safer (earlier) times each
-            #   cycle without any hard clamp.
+            # The deadline guard ensures the chosen midpoint + avg scan duration
+            # falls before the next 7 AM ET digest — replacing the old danger-zone
+            # jitter + clamping logic with a single principled constraint.
             #
-            # Completions after 7 AM (e.g. 11 AM) are safe zone even though they
-            # are > 5 AM — their next scan lands ~24 h later (also >7 AM next day),
-            # which is still within the next 7 AM–7 AM monitoring window.
-            #
-            # The jittered interval is also written to DB so rebuild_poll_queues()
-            # restores the same spread after a restart.
-            from config import CYCLE_START_HOUR, SEND_TIMEZONE
-            SAFETY_BUFFER_S   = 2 * 3600   # 2 h before digest = 5 AM
-            safe_cutoff_s     = CYCLE_START_HOUR * 3600 - SAFETY_BUFFER_S
-            digest_cutoff_s   = CYCLE_START_HOUR * 3600               # 7 AM
-            # Use SEND_TIMEZONE (America/New_York) so the 5–7 AM window is
-            # evaluated in Eastern time, not server-local UTC.
-            dt_now            = datetime.fromtimestamp(now, tz=ZoneInfo(SEND_TIMEZONE))
-            completion_time_s = dt_now.hour * 3600 + dt_now.minute * 60 + dt_now.second
+            # Self-correcting in 2-3 cycles:
+            #   Day 1: all companies in a tight cluster -> each gets a different gap midpoint
+            #   Day 2: midpoints now spread across the window -> gaps rebalance further
+            #   Day 3+: stable maximum-spread distribution maintained automatically
+            avg_duration_s = fs_state.get("avg_fullscan_duration_s", 30.0)
+            duration_s     = time.monotonic() - start_mono
 
-            if safe_cutoff_s <= completion_time_s < digest_cutoff_s:
-                # Danger zone: 5 AM–7 AM — negative-only jitter to stay before digest
-                jitter_s = int(interval_s * random.uniform(-0.10, 0))
-                logger.debug(
-                    "fullscan: danger-zone completion for %r (%s) — "
-                    "negative-only jitter applied (%+ds)",
-                    company, dt_now.strftime("%H:%M"), jitter_s,
-                )
-            else:
-                # Safe zone: full ±10% jitter
-                jitter_s = int(interval_s * random.uniform(-0.10, 0.10))
+            # Compute the updated EMA using the same alpha as _complete_fullscan_db so
+            # the deadline guard in _pick_schedule_time reflects current performance.
+            # Without this, a scan that suddenly took 4 h would still schedule the
+            # next one using the old "30 s" average — risking a digest collision.
+            _EMA_ALPHA           = 0.3   # must match _complete_fullscan_db
+            updated_avg_duration = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * avg_duration_s
 
-            next_scan_at = now + interval_s + jitter_s
+            # _atomic_schedule: gap-detection + ZADD under a short Redis lock so
+            # concurrent fullscan completions don't both pick the same slot.
+            # Deadline relative to target_ts (see scheduler.py's _atomic_schedule).
+            next_scan_at = _atomic_schedule(
+                r, REDIS_POLL_FULLSCAN, company,
+                now + interval_s, interval_s, 0.20,
+                deadline_ts    = _next_digest_deadline(now + interval_s),
+                avg_duration_s = updated_avg_duration,
+            )
+            # _atomic_schedule already did r.zadd(REDIS_POLL_FULLSCAN, ...)
 
-            # Clamp: even after safe-zone ±10% jitter, the scheduled time
-            # can still land in the 5–7 AM danger window.
-            # Example: completion at 3 AM ET + 24h + 10% jitter = 5:24 AM ET.
-            # Pull it back to just before safe_cutoff_s (4:59:59 AM ET).
-            dt_next      = datetime.fromtimestamp(next_scan_at, tz=ZoneInfo(SEND_TIMEZONE))
-            next_time_s  = dt_next.hour * 3600 + dt_next.minute * 60 + dt_next.second
-            if safe_cutoff_s <= next_time_s < digest_cutoff_s:
-                overshoot_s  = next_time_s - safe_cutoff_s + 1   # 1 s margin
-                next_scan_at -= overshoot_s
-                logger.debug(
-                    "fullscan: clamped next_scan_at for %r "
-                    "(was %s ET, inside 5–7 AM danger window — pulled back %ds)",
-                    company, dt_next.strftime("%H:%M"), overshoot_s,
-                )
-
-            # Update DB: last_full_scan_at, next_full_scan_at, clear interrupted.
-            # Pass delta from now so next_full_scan_at reflects the clamped time.
-            # full_scan_interval_s (base 86400) is NOT updated here — it stays clean.
-            _complete_fullscan_db(company, platform, new_count, int(next_scan_at - now))
-
-            r.zadd(REDIS_POLL_FULLSCAN, {company: next_scan_at})
-
-            result["outcome"]     = "completed"
-            result["success"]     = True
-            result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
-            result["completed_at"] = datetime.now(timezone.utc).isoformat()
-
-            logger.info(
-                "fullscan [%s]: completed — new=%d next_scan_in=%dh (jitter=%+ds)",
-                company, new_count, (interval_s + jitter_s) // 3600, jitter_s,
+            # Update DB: persist scan duration EMA + reschedule time.
+            # full_scan_interval_s (base 86400) stays clean — not overwritten here.
+            db_ok = _complete_fullscan_db(
+                company, platform, new_count,
+                interval_s          = int(next_scan_at - now),
+                duration_s          = duration_s,
+                prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
             )
 
-            # ── Bootstrap new companies into WARMING adaptive cycle ───────────
-            # is_first_fullscan = last_poll_at was NULL before this scan ran.
-            # Use the deterministic slot-offset approach so companies spread
-            # across the day instead of all bootstrapping at midnight+0.
-            if is_first_fullscan:
+            if db_ok:
+                result["outcome"]      = "completed"
+                result["success"]      = True
+                result["duration_ms"]  = int(duration_s * 1000)
+                result["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+                logger.info(
+                    "fullscan [%s]: completed — new=%d duration=%.0fs "
+                    "next_scan_in=%.1fh avg_duration=%.0fs",
+                    company, new_count, duration_s,
+                    (next_scan_at - now) / 3600,
+                    0.3 * duration_s + 0.7 * avg_duration_s,
+                )
+
+                # ── Bootstrap new companies into WARMING adaptive cycle ───────
+                # Only after successful DB write — adaptive polling must start
+                # from a persisted baseline, not an in-memory-only scan result.
+                if is_first_fullscan:
+                    try:
+                        _bootstrap_warming_adaptive(company, r)
+                    except Exception as bw_exc:
+                        # Non-fatal — fall back to immediate ZADD so company isn't lost
+                        logger.error(
+                            "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
+                            "falling back to immediate ZADD",
+                            company, bw_exc,
+                        )
+                        from config import ADAPTIVE_DEFAULT_INTERVAL
+                        r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+            else:
+                result["outcome"] = "error"
+                result["success"] = False
+                # DB write failed — reschedule sooner so stats get persisted on
+                # the next attempt rather than waiting a full interval.
+                _retry_s = min(3600, interval_s // 4)
                 try:
-                    _bootstrap_warming_adaptive(company, r)
-                except Exception as bw_exc:
-                    # Non-fatal — fall back to immediate ZADD so company isn't lost
-                    logger.error(
-                        "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
-                        "falling back to immediate ZADD",
-                        company, bw_exc,
+                    _atomic_schedule(
+                        r, REDIS_POLL_FULLSCAN, company,
+                        now + _retry_s, _retry_s, 0.20,
                     )
-                    from config import ADAPTIVE_DEFAULT_INTERVAL
-                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+                    logger.warning(
+                        "fullscan [%s]: DB write failed — rescheduled retry in %ds",
+                        company, _retry_s,
+                    )
+                except Exception as _sched_err:
+                    logger.error(
+                        "fullscan [%s]: DB write failed and reschedule failed: %s",
+                        company, _sched_err,
+                    )
 
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
@@ -1131,6 +1174,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         r.zadd(REDIS_POLL_FULLSCAN, {company: time.time() + 3600})
 
     finally:
+        try:
+            r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
+        except Exception as exc:
+            logger.debug("fullscan [%s]: inflight ZREM failed (non-fatal): %s", company, exc)
         clear_heartbeat(company)
         if not skip_lock:
             _release_lock(company, r)
@@ -1143,7 +1190,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
 # ─────────────────────────────────────────
 
 def run_worker(once: bool = False, skip_lock: bool = False,
-               skip_init_db: bool = False) -> None:
+               skip_init_db: bool = False,
+               shutdown_event=None) -> None:
     """
     Main fullscan worker loop — stream-based delivery (Section 9 redesign).
 
@@ -1165,18 +1213,27 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     checkpoint ensures the resumed scan doesn't duplicate work.
 
     Args:
-        once:          If True, process at most one company then exit.
-        skip_lock:     If True, bypass exclusivity lock (dev/debug only).
-        skip_init_db:  If True, skip init_db() (parent process already did it).
+        once:           If True, process at most one company then exit.
+        skip_lock:      If True, bypass exclusivity lock (dev/debug only).
+        skip_init_db:   If True, skip init_db() (parent process already did it).
+        shutdown_event: Optional multiprocessing.Event; when set the worker exits
+                        cleanly after the current XREADGROUP poll completes.
+                        Unacked messages remain in the PEL for XAUTOCLAIM recovery.
     """
+    from workers.sentry_init import init_sentry
+    init_sentry()
+
+    # ── Startup validation before init_db() so infra failures produce a clear
+    # STARTUP FAILED message rather than an opaque DB initialisation error.
+    from workers.startup import validate_startup
+    validate_startup("fullscan_worker",
+                     check_redis=True,
+                     check_db=True,          # always verify DB reachability even when
+                                             # skip_init_db=True (scheduler-managed run)
+                     check_config=True)
+
     if not skip_init_db:
         init_db()
-
-    if not ping():
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        logger.error("fullscan: Redis not reachable at %s — aborting", redis_url)
-        print(f"[fullscan] ERROR: Redis unreachable ({redis_url})")
-        sys.exit(1)
 
     r = get_redis()
     _ensure_consumer_group(r)
@@ -1196,10 +1253,28 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     else:
         print("[fullscan] Press Ctrl+C to stop\n")
 
-    processed = 0
+    # ── Background heartbeat ─────────────────────────────────────────────────
+    # Full scans can legitimately take 20-30 minutes for large Workday tenants.
+    # Writing the heartbeat at the top of the loop (old approach) created a
+    # gap equal to the scan duration — a 30-minute scan meant the key was absent
+    # for ~29 minutes, which the watchdog misread as a dead worker.
+    #
+    # A daemon thread writes worker:alive:fullscan_worker every interval_s=60s,
+    # completely independent of the current scan.  TTL = 60×3 = 180s.
+    # Watchdog dead threshold for fullscan_worker = 1,900s — three missed
+    # writes would need to accumulate for ~3 minutes, which only happens if
+    # the process truly exited (daemon thread dies with the process → key TTL
+    # runs out → watchdog correctly detects the dead worker).
+    _hw = {"count": 0}
+    _hb = Heartbeat(r, "fullscan_worker", lambda: _hw["count"],
+                    interval_s=60).start()
 
     while True:
         try:
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan: shutdown_event set — stopping cleanly")
+                break
+
             # ── Pause check ───────────────────────────────────────────────────
             # Full scans are long (minutes); polling db:maintenance every 10s
             # is fine (cheaper than adding pub/sub to an already-complex module).
@@ -1218,8 +1293,12 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 block=STREAM_BLOCK_MS,
             )
 
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan: shutdown_event set after xreadgroup — stopping")
+                break
+
             if not stream_result:
-                if once and processed == 0:
+                if once and _hw["count"] == 0:
                     print("[fullscan] Stream empty — exiting (--once)")
                     break
                 if once:
@@ -1237,7 +1316,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
 
             # ── Run full scan ─────────────────────────────────────────────────
             result    = _run_fullscan(company, r, skip_lock=skip_lock)
-            processed += 1
+            _hw["count"] += 1
 
             # ── XACK: remove from PEL (work complete) ────────────────────────
             # _run_fullscan() handles all rescheduling internally before we get
@@ -1275,8 +1354,12 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 break
             time.sleep(5)
 
+    # Stop heartbeat on ALL exit paths (KeyboardInterrupt, once-flag break,
+    # unhandled exception with once=True, or stream-empty condition).
+    # Matches the pattern already used in scan_worker.
+    _hb.stop()
     logger.info("fullscan worker shutdown | processed=%d worker_id=%s",
-                processed, WORKER_ID)
+                _hw["count"], WORKER_ID)
 
 
 # ─────────────────────────────────────────

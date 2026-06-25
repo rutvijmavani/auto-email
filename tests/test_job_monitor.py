@@ -1741,13 +1741,16 @@ class TestMetricCalculations(unittest.TestCase):
 
     def _stats(self, **kw):
         base = {
-            "companies_monitored": 137,
+            "companies_monitored":   137,
+            "covered_by_workers":    120,  # new field used by _build_alerts
+            "fallback_scanned":        0,
+            "in_flight":               0,
             "companies_with_results": 120,
-            "companies_unknown_ats": 10,
-            "api_failures": 0,
-            "api_failure_list": [],
-            "total_jobs_fetched": 500,
-            "jobs_matched_filters": 50,
+            "companies_unknown_ats":   10,
+            "api_failures":             0,
+            "api_failure_list":        [],
+            "total_jobs_fetched":     500,
+            "jobs_matched_filters":    50,
         }
         base.update(kw)
         return base
@@ -1756,12 +1759,13 @@ class TestMetricCalculations(unittest.TestCase):
         self.assertEqual(len(self.build_alerts(self._stats(), 137)), 0)
 
     def test_coverage_alert_below_70_pct(self):
-        stats = self._stats(companies_with_results=50)
+        # _build_alerts uses covered_by_workers (not companies_with_results)
+        stats = self._stats(covered_by_workers=50)
         alerts = self.build_alerts(stats, 137)
         self.assertTrue(any("Coverage" in a["message"] for a in alerts))
 
     def test_no_coverage_alert_above_70_pct(self):
-        stats = self._stats(companies_with_results=100)
+        stats = self._stats(covered_by_workers=100)
         alerts = self.build_alerts(stats, 137)
         self.assertFalse(any("Coverage" in a["message"] for a in alerts))
 
@@ -1808,6 +1812,7 @@ class TestMetricCalculations(unittest.TestCase):
 
     def test_multiple_alerts_simultaneously(self):
         stats = self._stats(
+            covered_by_workers=50,
             companies_with_results=50,
             companies_unknown_ats=40,
             api_failures=5,
@@ -2859,6 +2864,129 @@ class TestMonitorCLIFlags(unittest.TestCase):
     def test_verify_only_does_not_trigger_monitor(self, _mock_ver, mock_mon):
         self._run(["--verify-only"])
         mock_mon.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestInflightExclusionFromMissed  (Phase 2 — inflight:fullscan exclusion)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestInflightExclusionFromMissed(unittest.TestCase):
+    """
+    _get_worker_missed_companies() excludes companies that are currently being
+    scanned by fullscan_worker (listed in inflight:fullscan ZSET) even if their
+    last_full_scan_at is older than 24 hours.
+
+    Without this exclusion, a company 20 min into a 30-min Workday scan would
+    appear "missed" and trigger a redundant HTTP fallback fetch.
+    """
+
+    _STALE_EPOCH = 1_000_000.0    # definitely older than 24 h
+    # _RECENT_EPOCH is computed in setUp() so it is always genuinely "1 hour ago"
+    # relative to the current wall clock.  A hardcoded 2023 epoch would be > 24 h
+    # ago by now, making _get_worker_missed_companies() classify it as "missed"
+    # and causing test_recent_scan_not_in_missed_regardless_of_inflight to pass
+    # for the wrong reason (inflight exclusion, not recency).
+
+    def setUp(self):
+        from datetime import datetime, timezone, timedelta
+        # Always 1 hour ago — genuinely within the 24-hour rolling window.
+        self._RECENT_EPOCH = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).timestamp()
+
+    def _simple_run(self, companies, scan_map, inflight=None, redis_error=False):
+        """
+        Simpler runner: directly patches the Redis call inside
+        _get_worker_missed_companies using zrangebyscore.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        # Build the cycle_start_ts the function will compute (now - 24h)
+        # We'll freeze time so it's deterministic.
+        fixed_now_epoch = 1_700_000_000.0
+        cycle_start = fixed_now_epoch - 24 * 3600
+
+        mock_rows = [{"company": name, "last_full_scan_epoch": epoch}
+                     for name, epoch in scan_map.items()]
+
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = mock_rows
+        mock_conn.execute.return_value = mock_cursor
+        mock_conn.close = MagicMock()
+
+        inflight_encoded = [
+            c.encode() if isinstance(c, str) else c
+            for c in (inflight or [])
+        ]
+
+        mock_redis = MagicMock()
+        if redis_error:
+            mock_redis.zrangebyscore.side_effect = ConnectionError("Redis down")
+        else:
+            mock_redis.zrangebyscore.return_value = inflight_encoded
+
+        with patch("db.db.get_conn", return_value=mock_conn):
+            with patch("redis.from_url", return_value=mock_redis):
+                from jobs.job_monitor import _get_worker_missed_companies
+                missed, in_flight_names = _get_worker_missed_companies(companies)
+                return missed, in_flight_names
+
+    def test_inflight_company_excluded_even_if_stale(self):
+        """
+        A company with a stale scan (>24 h ago) that is currently in
+        inflight:fullscan must NOT appear in missed and MUST appear in in_flight.
+        """
+        companies = [{"company": "Workday Co"}]
+        scan_map  = {"Workday Co": self._STALE_EPOCH}
+        result, in_flight = self._simple_run(companies, scan_map, inflight=["Workday Co"])
+        names = [c["company"] for c in result]
+        self.assertNotIn("Workday Co", names,
+                         "In-flight company should not appear in missed list")
+        self.assertIn("Workday Co", in_flight,
+                      "In-flight company should appear in in_flight_names")
+
+    def test_non_inflight_stale_company_in_missed(self):
+        """Company with stale scan and NOT in inflight → appears in missed."""
+        companies = [{"company": "Acme"}]
+        scan_map  = {"Acme": self._STALE_EPOCH}
+        result, _ = self._simple_run(companies, scan_map, inflight=[])
+        names = [c["company"] for c in result]
+        self.assertIn("Acme", names)
+
+    def test_recent_scan_not_in_missed_regardless_of_inflight(self):
+        """
+        Company with a recent scan (within 24 h) must NOT appear in missed
+        even when it is NOT in the inflight ZSET.  This verifies the recency
+        branch of _get_worker_missed_companies(), not just inflight exclusion.
+        """
+        companies = [{"company": "Stripe"}]
+        scan_map  = {"Stripe": self._RECENT_EPOCH}
+        # inflight=[] so the only reason Stripe is excluded is recency.
+        result, _ = self._simple_run(companies, scan_map, inflight=[])
+        names = [c["company"] for c in result]
+        self.assertNotIn("Stripe", names)
+
+    def test_redis_unavailable_conservative_include_all(self):
+        """
+        If Redis is unreachable, inflight exclusion is skipped.
+        All stale companies appear in missed (conservative: may do extra work).
+        """
+        companies = [{"company": "BigCorp"}]
+        scan_map  = {"BigCorp": self._STALE_EPOCH}
+        result, _ = self._simple_run(companies, scan_map, redis_error=True)
+        names = [c["company"] for c in result]
+        self.assertIn("BigCorp", names,
+                      "When Redis is unavailable, company should still appear in missed")
+
+    def test_mixed_inflight_and_not(self):
+        """Only the non-inflight stale company appears in missed."""
+        companies = [{"company": "A"}, {"company": "B"}]
+        scan_map  = {"A": self._STALE_EPOCH, "B": self._STALE_EPOCH}
+        result, _ = self._simple_run(companies, scan_map, inflight=["A"])
+        names = [c["company"] for c in result]
+        self.assertNotIn("A", names)
+        self.assertIn("B", names)
 
 
 if __name__ == "__main__":
