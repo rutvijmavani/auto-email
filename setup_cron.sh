@@ -462,11 +462,12 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # MONITOR RETRY — 9 AM fallback
-# Runs only if the 7 AM job was missed (e.g. VM suspension by Oracle Cloud).
-# Checks for today's monitor log; if absent, runs the monitor now so the
-# digest arrives at most 2 hours late rather than not at all.
+# Runs only if the 7 AM job did not complete successfully.
+# Checks for exit=0 in today's monitor log (written by run_monitor.sh after
+# --monitor-jobs finishes); if absent, runs the monitor now so the digest
+# arrives at most 2 hours late rather than not at all.
 # ─────────────────────────────────────────
-0 9 * * * test -f /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log || /home/opc/mail/run_monitor.sh
+0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only

@@ -59,6 +59,7 @@ echo "  Current auto-aof-rewrite-min-size  : $current_rwmin"
 # Check all four settings — a partial previous run may have set only
 # appendonly+appendfsync but skipped the rewrite thresholds.
 AOF_CHANGED=0
+AOF_NEWLY_ENABLED=0   # set only when appendonly transitions no → yes
 
 if [[ "$current_aof"   == "yes"     &&
       "$current_fsync" == "everysec" &&
@@ -69,6 +70,7 @@ if [[ "$current_aof"   == "yes"     &&
     echo "  ✓ AOF already fully configured — nothing to change."
 else
     AOF_CHANGED=1
+    [[ "$current_aof" != "yes" ]] && AOF_NEWLY_ENABLED=1
 
     $REDIS_CLI CONFIG SET appendonly yes
     echo "  Set appendonly                     = yes"
@@ -154,11 +156,12 @@ else
     $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1 || true   # flush in-memory config → file
 fi
 
-# ── Trigger AOF rewrite only when we just enabled AOF ────────────────────────
+# ── Trigger AOF rewrite only when appendonly was newly enabled ────────────────
 # BGREWRITEAOF creates the initial .aof file after appendonly is turned on.
-# Skipped when AOF was already active — the existing .aof file is up to date
-# and an unnecessary rewrite wastes CPU on a large dataset.
-if [[ "$AOF_CHANGED" -eq 1 ]]; then
+# Skipped when only threshold settings changed (appendfsync / rewrite limits)
+# because the existing .aof file is already current in that case, and an
+# unnecessary rewrite wastes CPU on a large dataset.
+if [[ "$AOF_NEWLY_ENABLED" -eq 1 ]]; then
     echo ""
     echo "► Triggering initial AOF rewrite (BGREWRITEAOF)..."
     # CONFIG SET appendonly yes can start an automatic rewrite; check before
@@ -175,7 +178,11 @@ if [[ "$AOF_CHANGED" -eq 1 ]]; then
     sleep 2
 else
     echo ""
-    echo "► Skipping BGREWRITEAOF — AOF was already active, existing file is current."
+    if [[ "$AOF_CHANGED" -eq 1 ]]; then
+        echo "► Skipping BGREWRITEAOF — appendonly was already enabled; only threshold settings changed."
+    else
+        echo "► Skipping BGREWRITEAOF — AOF was already fully configured."
+    fi
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────────────

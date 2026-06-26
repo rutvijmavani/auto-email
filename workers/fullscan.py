@@ -586,7 +586,7 @@ def _complete_fullscan_db(
         )
         _next_ts_val = next_scan_ts if next_scan_ts else interval_s
 
-        conn.execute(f"""
+        conn.execute(f"""  # noqa: S608 — _next_ts_expr is a hard-coded literal, not user input
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
@@ -935,7 +935,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                    and waited < 300):
                 if shutdown_event and shutdown_event.is_set():
                     logger.info("fullscan [%s]: shutdown during backpressure wait", company)
-                    return {"status": "shutdown", "company": company}
+                    result["outcome"] = "shutdown"
+                    return result
                 time.sleep(10)
                 waited += 10
                 if _is_paused(r):
@@ -946,7 +947,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         for chunk_start in range(0, max(len(title_matched), 1), FULLSCAN_CHUNK_SIZE):
             if shutdown_event and shutdown_event.is_set():
                 logger.info("fullscan [%s]: shutdown during chunk processing", company)
-                return {"status": "shutdown", "company": company}
+                result["outcome"] = "shutdown"
+                return result
             chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]
             if not chunk:
                 break

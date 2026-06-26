@@ -228,10 +228,20 @@ def _load_offsets() -> dict[str, int]:
     return {}
 
 
-def _save_offsets(offsets: dict[str, int]) -> None:
+def _load_inodes() -> dict[str, int]:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text()).get("inodes", {})
+        except Exception:
+            pass
+    return {}
+
+
+def _save_offsets(offsets: dict[str, int],
+                  inodes: dict[str, int] | None = None) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _tmp = STATE_FILE.with_suffix(".tmp")
-    _tmp.write_text(json.dumps({"offsets": offsets}, indent=2))
+    _tmp.write_text(json.dumps({"offsets": offsets, "inodes": inodes or {}}, indent=2))
     _tmp.replace(STATE_FILE)   # atomic rename — no partial-write corruption
 
 
@@ -291,10 +301,13 @@ def scan_file(
 
 def collect_raw_findings(
     offsets: dict[str, int],
-) -> tuple[dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
+    inodes: dict[str, int] | None = None,
+) -> tuple[dict[str, int], dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
     """
     Scan all relevant log files.
-    Returns updated offsets and per-filename raw findings.
+    Returns (updated_offsets, updated_inodes, per-filename raw findings).
+    Inode tracking detects log rotation where the replacement file grows larger
+    than the old offset (the existing size<offset check handles file shrinkage).
     """
     cutoff = time.time() - MAX_LOG_AGE_HOURS * 3600
 
@@ -317,18 +330,36 @@ def collect_raw_findings(
     ]
 
     new_offsets = dict(offsets)
+    new_inodes: dict[str, int] = dict(inodes or {})
     raw: dict[str, list] = {}
 
     for path in priority + recent_dated:
         if not path.exists():
             continue
         key = str(path)
-        new_off, hits = scan_file(path, offsets.get(key, 0))
+        saved_offset = offsets.get(key, 0)
+
+        # Reset offset when the file was replaced (log rotation where the new
+        # file has grown past the old offset — the size<offset check in
+        # scan_file already covers truncation/shrinkage).
+        if inodes is not None:
+            try:
+                st = path.stat()
+                current_inode = st.st_ino
+                if current_inode != 0:  # st_ino is 0 on some Windows filesystems
+                    saved_inode = inodes.get(key)
+                    if saved_inode is not None and saved_inode != 0 and current_inode != saved_inode:
+                        saved_offset = 0  # file replaced — restart from beginning
+                new_inodes[key] = current_inode
+            except OSError:
+                pass
+
+        new_off, hits = scan_file(path, saved_offset)
         new_offsets[key] = new_off
         if hits:
             raw[path.name] = hits
 
-    return new_offsets, raw
+    return new_offsets, new_inodes, raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,8 +709,9 @@ def main() -> None:
     print(f"[log_monitor] scan started at {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ── 1. Scan log files ────────────────────────────────────────────────────
-    offsets              = _load_offsets()
-    new_offsets, raw     = collect_raw_findings(offsets)
+    offsets                      = _load_offsets()
+    inodes                       = _load_inodes()
+    new_offsets, new_inodes, raw = collect_raw_findings(offsets, inodes)
     # Do NOT save offsets yet — wait until we have confirmed the alert was sent
     # (or that there were no new errors to alert on).  Saving early would cause
     # the log lines to be permanently skipped if email or Redis fail, since the
@@ -692,7 +724,7 @@ def main() -> None:
     if not raw:
         print("[log_monitor] clean — no issues found")
         # Nothing to alert on — safe to advance offsets now.
-        _save_offsets(new_offsets)
+        _save_offsets(new_offsets, new_inodes)
         # Still run the resolution sweep and digest check even on a clean run.
         # Without the sweep, expired action keys accumulate and errors that
         # recur after a quiet period are not treated as NEW.
@@ -743,7 +775,7 @@ def main() -> None:
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
             # Offsets safe to advance now that the operator has been notified.
-            _save_offsets(new_offsets)
+            _save_offsets(new_offsets, new_inodes)
         else:
             # Email failed — do NOT mark as known and do NOT advance offsets.
             # The next run will re-scan from the same position and retry.
@@ -751,7 +783,7 @@ def main() -> None:
                   "(will retry next run)")
     else:
         # All errors already known/deduped — no new alert needed.
-        _save_offsets(new_offsets)
+        _save_offsets(new_offsets, new_inodes)
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
 

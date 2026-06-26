@@ -1076,13 +1076,25 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
 
     def test_all_gaps_violate_deadline_target_safe_fallback_to_target(self):
         """All gaps fail, target_ts+avg is before next digest → returns target_ts."""
-        # avg_duration=1s is tiny: target_ts+1 << next 7 AM ET, so target is safe.
-        result = self._call(
-            existing_scores=[],
-            tolerance_pct=0.20,
-            deadline_ts=self._TARGET - 1.0,
-            avg_duration_s=1.0,
-        )
+        from unittest.mock import patch
+        _avg = 100.0
+        # existing_scores=[_TARGET] creates two gap midpoints at ±(window/4) from
+        # target.  Mock _next_digest_deadline so those midpoints violate
+        # (midpoint + avg >= midpoint + avg - 1) but target_ts itself is safe
+        # (target + avg < target + avg + 1) — exercises the all-gaps-fail
+        # fallback that returns target_ts rather than post-digest.
+        def _mock_nd(ts):
+            if abs(ts - self._TARGET) < 1.0:
+                return ts + _avg + 1.0   # target safe: ts + avg < deadline
+            return ts + _avg - 1.0       # midpoints violate: ts + avg >= deadline
+
+        with patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call(
+                existing_scores=[self._TARGET],
+                tolerance_pct=0.20,
+                deadline_ts=self._TARGET,  # truthy — enables the deadline guard
+                avg_duration_s=_avg,
+            )
         self.assertAlmostEqual(result, self._TARGET, places=1)
 
     def test_all_gaps_violate_deadline_target_also_violates_returns_post_digest(self):

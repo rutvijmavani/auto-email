@@ -651,7 +651,7 @@ def _build_queue_health_section() -> str:
             for i in issues
         )
 
-        return (
+        result_html = (
             f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;">'
             f'<p style="font-weight:700;font-size:13px;color:#0f172a;margin-bottom:6px;">'
             f'<span style="color:{header_color};">{header_symbol}</span>'
@@ -659,6 +659,8 @@ def _build_queue_health_section() -> str:
             f'{table_html}'
             f'{issue_html}'
         )
+        r.close()
+        return result_html
 
     except Exception as _exc:
         import logging as _logging
@@ -1297,7 +1299,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         _breakdown    = f"{_fb_with_jobs} with jobs"
         if _fb_empty:
             _breakdown += f", {_fb_empty} empty"
-        _cov_detail += f", {_fallback_hits} by fallback ({_breakdown})"
+        _cov_detail += f" + {_fallback_hits} by job monitor ({_breakdown})"
     if _in_flight:
         _cov_detail += f" + {_in_flight} pending (in-flight)"
     coverage = f"{_total_covered}/{_total} ({_cov_pct}%)"

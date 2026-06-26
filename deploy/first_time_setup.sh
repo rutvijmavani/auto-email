@@ -90,7 +90,7 @@ else
 fi
 
 # PostgreSQL (via Python)
-if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python -c 'from db.connection import get_conn; get_conn().close(); print(\"ok\")'" > /dev/null 2>&1; then
+if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python -c "from db.connection import get_conn; get_conn().close(); print(\"ok\")"' _ "$PROJECT_DIR" > /dev/null 2>&1; then
     echo "  ✓ PostgreSQL is reachable"
 else
     echo "  ✗ PostgreSQL is not reachable"
@@ -207,7 +207,7 @@ echo "  STEP 4 — Running full health check"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python scripts/health_check.py"; then
+if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python scripts/health_check.py' _ "$PROJECT_DIR"; then
     HEALTH_OK=true
 else
     HEALTH_OK=false

@@ -925,12 +925,12 @@ def _build_alerts(stats, total_companies):
     alerts = []
 
     if total_companies > 0:
-        # covered_by_workers: confirmed done by background workers (data in DB)
-        # in_flight: actively scanning right now — counted optimistically since
-        #            the scan will likely complete before the digest is emailed.
+        # covered_by_workers: confirmed done by background workers (data in DB).
         # fallback_scanned: of the missed companies, those whose ATS fetch
         #   completed (0 or more jobs).  Use this (not companies_with_results)
         #   for coverage — a 0-job result is still a successful scan.
+        # in_flight companies are NOT included here — they are still scanning
+        # and cannot be credited until confirmed in the DB.
         covered_count = stats.get("covered_by_workers", 0)
         companies_with_data = covered_count + stats.get("fallback_scanned", 0)
         coverage = companies_with_data / total_companies

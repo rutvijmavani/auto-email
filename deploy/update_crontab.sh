@@ -3,7 +3,7 @@
 #
 # Changes applied:
 #   1. MONITOR RETRY  — 9 AM fallback cron that runs --monitor-jobs only if
-#                       the 7 AM run was missed (e.g. Oracle Cloud VM suspension).
+#                       the 7 AM run did not complete successfully (checks exit=0).
 #   2. KEEP-ALIVE     — Changed from "every 4 days at noon" to "every 4 hours"
 #                       so Oracle never sees a 10+ hour idle window overnight.
 #
@@ -58,11 +58,12 @@ NEW_CRON=$(echo "$CLEANED" | awk '
     print ""
     print "# ─────────────────────────────────────────"
     print "# MONITOR RETRY — 9 AM fallback"
-    print "# Runs only if the 7 AM job was missed (e.g. Oracle Cloud VM suspension)."
-    print "# Checks for today'\''s monitor log; if absent, runs the monitor now so the"
+    print "# Runs only if the 7 AM job did not complete successfully."
+    print "# Checks for exit=0 in today'\''s monitor log (written by run_monitor.sh"
+    print "# after --monitor-jobs finishes); if absent, runs the monitor now so the"
     print "# digest arrives at most 2 hours late rather than not at all."
     print "# ─────────────────────────────────────────"
-    print "0 9 * * * test -f /home/opc/mail/logs/monitor_$(date +\\%Y-\\%m-\\%d).log || /home/opc/mail/run_monitor.sh"
+    print "0 9 * * * grep -q '\''exit=0'\'' /home/opc/mail/logs/monitor_$(date +\\%Y-\\%m-\\%d).log 2>/dev/null || /home/opc/mail/run_monitor.sh"
     next
 }
 { print }

@@ -415,8 +415,8 @@ class TestRecoverStuckJobs(unittest.TestCase):
         ]
 
         def _exists(key):
-            ks = key.decode() if isinstance(key, bytes) else key
-            return 1 if ks == hb_key else 0
+            # Dead peer — heartbeat absent, so always returns 0.
+            return 0
 
         r.exists.side_effect = _exists
 
@@ -444,9 +444,9 @@ class TestRecoverStuckJobs(unittest.TestCase):
             (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
             for c in r.exists.call_args_list
         ]
-        self.assertFalse(
+        self.assertTrue(
             any(hb_key in k for k in exists_calls),
-            "Dead peer (no heartbeat returned 0) — should have been checked but was already 0",
+            f"exists() must have been called to check the dead peer's heartbeat key {hb_key!r}",
         )
         # The Lua drain WAS called — peer was recovered
         self.assertTrue(lua_called, "Expected Lua drain to run for dead host:pid peer")

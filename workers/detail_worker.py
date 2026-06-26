@@ -946,15 +946,18 @@ def run_worker(once: bool = False, shutdown_event=None,
                                 "%d retries — discarding permanently",
                                 _r_job_id, _r_company, _MAX_DETAIL_RETRIES,
                             )
-                            r.lrem(inflight_key, 1, raw)
                             try:
                                 delete_pending_detail(_r_company, _r_job_id)
                             except Exception as _dp_err:
                                 logger.error(
                                     "detail_worker: delete_pending_detail "
-                                    "failed for %s: %s", _r_job_id, _dp_err,
+                                    "failed for %s: %s — leaving in inflight",
+                                    _r_job_id, _dp_err,
                                 )
-                            _r_discard = True
+                            else:
+                                # DB row removed — safe to drop from inflight.
+                                r.lrem(inflight_key, 1, raw)
+                                _r_discard = True
                     except Exception as _cnt_err:
                         logger.warning(
                             "detail_worker: retry counter failed for %s: %s "

@@ -975,8 +975,9 @@ def _pick_schedule_time(
 # around the same time), they all read the same gap and write the same score —
 # re-creating the thundering-herd problem the algorithm is designed to prevent.
 #
-# Fix: hold a short Redis lock (500 ms TTL) around the ZRANGEBYSCORE → ZADD pair
-# so at most one process selects a slot at a time.  If the lock is contended, the
+# Fix: hold a Redis lock (2 s TTL) around the ZRANGEBYSCORE → ZADD pair
+# so at most one process selects a slot at a time.  2 s covers ZRANGEBYSCORE +
+# gap selection + ZADD even under network jitter.  If the lock is contended, the
 # caller falls back to scheduling at target_ts directly — still correct, just
 # without gap detection for that one call; the next reschedule call rebalances.
 #
@@ -1008,7 +1009,7 @@ def _atomic_schedule(
     """
     lock_key = f"scheduling:lock:{queue_key}"
     token    = f"{os.getpid()}:{time.monotonic_ns()}"
-    acquired = r.set(lock_key, token, px=500, nx=True)
+    acquired = r.set(lock_key, token, px=2000, nx=True)
     try:
         if acquired:
             score = _pick_schedule_time(
@@ -1046,6 +1047,12 @@ def _atomic_schedule(
                     # target_ts (that would violate the interval contract).
                     _upper = max(target_ts, deadline_ts - avg_duration_s)
                     score  = max(target_ts, min(score, _upper))
+                    # When no safe window remains before the digest, apply the same
+                    # post-digest fallback that _pick_schedule_time uses.
+                    if avg_duration_s > 0 and _upper <= target_ts:
+                        _fb_dl = _next_digest_deadline(target_ts)
+                        if target_ts + avg_duration_s >= _fb_dl:
+                            score = _fb_dl + 900
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,
@@ -1161,18 +1168,17 @@ def on_fullscan_complete(company: str, new_jobs: int,
     interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
     avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
 
-    # _atomic_schedule: gap-detection + ZADD under a short Redis lock.
-    # Prevents two simultaneous fullscan completions from selecting the same slot.
-    # Also stores the score in next_fs so the DB update below can reference it.
-    next_fs = _atomic_schedule(
-        r, REDIS_POLL_FULLSCAN, company,
-        now + interval_s, interval_s, 0.20,
-        # Deadline relative to target_ts: the 7 AM that follows the scheduled slot.
-        deadline_ts    = _next_digest_deadline(now + interval_s),
-        avg_duration_s = avg_duration_s,
-    )
-
     if success:
+        # _atomic_schedule: gap-detection + ZADD under a short Redis lock.
+        # Called only on success so a failed scan does not advance the normal
+        # next-cycle slot and then get immediately overwritten by the retry ZADD.
+        next_fs = _atomic_schedule(
+            r, REDIS_POLL_FULLSCAN, company,
+            now + interval_s, interval_s, 0.20,
+            # Deadline relative to target_ts: the 7 AM that follows the scheduled slot.
+            deadline_ts    = _next_digest_deadline(now + interval_s),
+            avg_duration_s = avg_duration_s,
+        )
         conn = get_conn()
         try:
             conn.execute("""
