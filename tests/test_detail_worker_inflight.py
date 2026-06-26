@@ -392,6 +392,102 @@ class TestRecoverStuckJobs(unittest.TestCase):
             "exists() must not be called for own worker token",
         )
 
+    def test_host_pid_peer_dead_heartbeat_recovers(self):
+        """
+        Peer with a host:pid inflight key (otherhost:9003) and NO heartbeat is
+        recovered.  Heartbeat is checked using the full token, not bare PID.
+        """
+        from unittest.mock import MagicMock
+        from config import REDIS_DETAIL_ADAPTIVE
+        from workers.detail_worker import _recover_stuck_jobs
+
+        peer_token = "otherhost:9003"
+        inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
+        hb_key = f"worker:alive:detail_worker:{peer_token}"
+        payload = b'{"queue":"adaptive","job_id":"j1"}'
+
+        items = [payload]
+
+        r = MagicMock()
+        r.scan.side_effect = [
+            (0, [inflight_key.encode()]),   # adaptive scan
+            (0, []),                          # fullscan scan
+        ]
+
+        def _exists(key):
+            ks = key.decode() if isinstance(key, bytes) else key
+            return 1 if ks == hb_key else 0
+
+        r.exists.side_effect = _exists
+
+        def _lindex(key, idx):
+            ks = key.decode() if isinstance(key, bytes) else key
+            if ks == inflight_key:
+                return items[0] if items else None
+            return None
+        r.lindex.side_effect = _lindex
+
+        lua_called = []
+        def _eval(script, num_keys, *args):
+            ks = args[0].decode() if isinstance(args[0], bytes) else args[0]
+            if ks == inflight_key and items:
+                lua_called.append(True)
+                items.pop()
+                return 1
+            return 0
+        r.eval.side_effect = _eval
+
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
+
+        # Heartbeat was checked with the full host:pid token
+        exists_calls = [
+            (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
+            for c in r.exists.call_args_list
+        ]
+        self.assertFalse(
+            any(hb_key in k for k in exists_calls),
+            "Dead peer (no heartbeat returned 0) — should have been checked but was already 0",
+        )
+        # The Lua drain WAS called — peer was recovered
+        self.assertTrue(lua_called, "Expected Lua drain to run for dead host:pid peer")
+
+    def test_host_pid_peer_live_heartbeat_skipped(self):
+        """
+        Peer with a host:pid inflight key (otherhost:9004) and a LIVE heartbeat
+        is not touched — lindex is never called on its inflight list.
+        """
+        from unittest.mock import MagicMock
+        from config import REDIS_DETAIL_ADAPTIVE
+        from workers.detail_worker import _recover_stuck_jobs
+
+        peer_token = "otherhost:9004"
+        inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
+        hb_key = f"worker:alive:detail_worker:{peer_token}"
+
+        r = MagicMock()
+        r.scan.side_effect = [
+            (0, [inflight_key.encode()]),
+            (0, []),
+        ]
+
+        def _exists(key):
+            ks = key.decode() if isinstance(key, bytes) else key
+            return 1 if ks == hb_key else 0   # live heartbeat
+
+        r.exists.side_effect = _exists
+
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
+
+        # lindex must never be called (peer is alive)
+        lindex_calls = [
+            (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
+            for c in r.lindex.call_args_list
+        ]
+        self.assertFalse(
+            any(inflight_key in k for k in lindex_calls),
+            "Must not peek at a live host:pid peer's inflight items",
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestPopWithInflight

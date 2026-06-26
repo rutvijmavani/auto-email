@@ -726,7 +726,7 @@ CRON_TZ=America/New_York
 # LOG MONITOR — every 15 minutes
 # Scans log files from last byte offset, emails on new errors (Redis-deduped)
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)

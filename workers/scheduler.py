@@ -1521,6 +1521,8 @@ def fullscan_loop() -> None:
     import socket as _socket
     scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
+    _hw_dispatched = 0   # total fullscan dispatches — reported in heartbeat
+
     while True:
         try:
             if _pause_event.is_set():
@@ -1550,8 +1552,9 @@ def fullscan_loop() -> None:
                 # let the 15s TTL expire when many companies are due at once.
                 try:
                     r.set("worker:alive:scheduler", json.dumps({
-                        "pid": os.getpid(),
-                        "ts":  time.time(),
+                        "pid":        os.getpid(),
+                        "ts":         time.time(),
+                        "dispatched": _hw_dispatched,
                     }), ex=15)
                 except Exception as _hb_err:
                     logger.warning("fullscan_loop: heartbeat refresh failed: %s", _hb_err)
@@ -1583,6 +1586,7 @@ def fullscan_loop() -> None:
                     approximate=True,
                 )
                 r.zrem(REDIS_POLL_FULLSCAN, company)
+                _hw_dispatched += 1
 
                 logger.info(
                     "fullscan_loop: dispatched %r to %s (dc=%s)",

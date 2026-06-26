@@ -417,9 +417,11 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 delete_pending_detail(company, job_id)
             except Exception as _del_err:
                 logger.error(
-                    "detail_worker: delete_pending_detail failed for %s: %s",
+                    "detail_worker: delete_pending_detail failed for %s: %s — "
+                    "leaving in inflight for retry when DB recovers",
                     job_id, _del_err,
                 )
+                result["retryable"] = True  # keep item in inflight until cleanup succeeds
             return result
 
         # slug_info comes serialized in the queue payload (str or dict)
@@ -977,7 +979,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                 # that starts before the TTL expires can still reclaim this
                 # inflight item via _recover_stuck_jobs() without waiting 30s.
                 try:
-                    r.delete(f"worker:alive:detail_worker:{os.getpid()}")
+                    r.delete(f"worker:alive:detail_worker:{own_token}")
                 except Exception as _hb_del_err:
                     logger.error(
                         "detail_worker: failed to delete heartbeat key: %s",

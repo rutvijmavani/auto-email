@@ -68,6 +68,7 @@ def _sym(level: str) -> str:
     return {
         "OK":       _c("✓", _GREEN),
         "WARNING":  _c("!", _YELLOW),
+        "DEGRADED": _c("~", _YELLOW),
         "ERROR":    _c("✗", _RED, _BOLD),
         "CRITICAL": _c("✗", _RED, _BOLD),
     }.get(level, "?")

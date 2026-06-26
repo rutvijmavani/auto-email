@@ -120,6 +120,7 @@ class TestValidateStartup(unittest.TestCase):
                 validate_startup("test_worker")
             except SystemExit as exc:
                 self.fail(f"validate_startup raised SystemExit({exc.code}) on success")
+        mock_conn.close.assert_called_once()
 
     def test_all_false_passes_immediately(self):
         """All three checks disabled → always passes regardless of environment."""

@@ -711,7 +711,8 @@ def _build_detail_payload(
 # CORE: run one full scan
 # ─────────────────────────────────────────
 
-def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
+def _run_fullscan(company: str, r, skip_lock: bool = False,
+                  shutdown_event=None) -> dict:
     """
     Perform one complete full scan for a company.
 
@@ -932,6 +933,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             waited = 0
             while (int(r.llen(REDIS_DETAIL_FULLSCAN) or 0) > DETAIL_QUEUE_MAX_FULLSCAN
                    and waited < 300):
+                if shutdown_event and shutdown_event.is_set():
+                    logger.info("fullscan [%s]: shutdown during backpressure wait", company)
+                    return {"status": "shutdown", "company": company}
                 time.sleep(10)
                 waited += 10
                 if _is_paused(r):
@@ -940,6 +944,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # Chunk the flat job list to simulate page-level pause checks.
         # Phase 7 will replace this outer loop with actual paginated HTTP fetches.
         for chunk_start in range(0, max(len(title_matched), 1), FULLSCAN_CHUNK_SIZE):
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan [%s]: shutdown during chunk processing", company)
+                return {"status": "shutdown", "company": company}
             chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]
             if not chunk:
                 break
@@ -1332,7 +1339,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 continue
 
             # ── Run full scan ─────────────────────────────────────────────────
-            result    = _run_fullscan(company, r, skip_lock=skip_lock)
+            result    = _run_fullscan(company, r, skip_lock=skip_lock,
+                                      shutdown_event=shutdown_event)
             _hw["count"] += 1
 
             # ── XACK: remove from PEL (work complete) ────────────────────────

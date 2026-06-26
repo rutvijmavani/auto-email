@@ -12,10 +12,15 @@
 
 set -euo pipefail
 
-# Guard: running as root would update root's crontab, not opc's.
+# Guard: must run as opc — root or any other user would edit the wrong crontab.
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     echo "[ERROR] Do not run this script as root / with sudo."
     echo "        Run as the opc user directly: bash deploy/update_crontab.sh"
+    exit 1
+fi
+if [[ "$(whoami)" != "opc" ]]; then
+    echo "[ERROR] This script must be run as the 'opc' user (current user: $(whoami))."
+    echo "        Switch to opc first: sudo su - opc"
     exit 1
 fi
 

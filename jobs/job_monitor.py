@@ -324,6 +324,10 @@ def run():
         print(f"[INFO] Skipping {skipped} company/companies with "
               f"unknown/unverified ATS — run --detect-ats to fix")
 
+    # Capture scan horizon before the DB classification so any inflight scan
+    # completing during _get_worker_missed_companies() is still credited below.
+    _scan_horizon = time.time()
+
     # ── Split: covered by workers vs missed vs in-flight ─────────────────────
     missed, in_flight_names = _get_worker_missed_companies(companies)
     missed_names = {c["company"] for c in missed}   # O(1) lookups
@@ -372,10 +376,6 @@ def run():
         "api_failure_list":       [],
     }
     stats_lock = threading.Lock()
-
-    # Capture horizon before fallback work so any inflight scan that completes
-    # during the fallback phase is still credited via DB verification below.
-    _scan_horizon = time.time()
 
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     if missed:
@@ -480,10 +480,10 @@ def run():
                     except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
                             "In-flight wait: DB verification failed (%s) — "
-                            "crediting all %d newly-done conservatively",
+                            "leaving %d newly-done unconfirmed (will not credit coverage)",
                             _db_ver_err, len(_newly_done),
                         )
-                        _confirmed_done = _newly_done  # safe fallback
+                        _confirmed_done = set()  # cannot verify without DB
 
                     _unconfirmed = _newly_done - _confirmed_done
                     if _confirmed_done:

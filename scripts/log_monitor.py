@@ -31,13 +31,13 @@ Why Redis instead of a local file?
   Byte offsets (what we've already read) live in a local JSON file so the
   scanner works even when Redis is briefly down.  Dedup / active / resolved
   state lives in Redis so TTL-based expiry is handled automatically without
-  any cron cleanup job.  If Redis is unavailable the scanner degrades
-  gracefully: it still reads logs and updates file offsets, but skips the
-  dedup/alert logic rather than crashing.
+  any cron cleanup job.  If Redis is unavailable and new errors were found,
+  the scanner skips the dedup/alert step AND does NOT advance file offsets,
+  so the same lines are re-evaluated on the next run once Redis recovers.
 
 Cron entry (add via deploy/update_crontab.sh or setup_cron.sh):
   */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py \
-               >> /home/opc/mail/logs/log_monitor.log 2>&1
+               >> /home/opc/mail/logs/log_monitor_$(date +%Y-%m-%d).log 2>&1
 """
 
 from __future__ import annotations

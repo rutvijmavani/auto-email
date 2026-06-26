@@ -1034,12 +1034,18 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
 
     def test_entries_outside_window_ignored(self):
         """Entries outside [lo, hi] are not returned by ZRANGEBYSCORE so do not split gaps."""
-        # With no in-window entries, full window is a single gap → midpoint = target
-        result = self._call(existing_scores=[], tolerance_pct=0.20)
         lo = self._TARGET - 0.20 * self._INTERVAL / 2
         hi = self._TARGET + 0.20 * self._INTERVAL / 2
+        # Out-of-window entries (far below lo and far above hi) must not split
+        # the gap, so the result should be identical to the empty-window case.
+        result_empty   = self._call(existing_scores=[], tolerance_pct=0.20)
+        result_outside = self._call(
+            existing_scores=[lo - 10_000, hi + 10_000],
+            tolerance_pct=0.20,
+        )
         expected_mid = (lo + hi) / 2
-        self.assertAlmostEqual(result, expected_mid, places=1)
+        self.assertAlmostEqual(result_empty,   expected_mid, places=1)
+        self.assertAlmostEqual(result_outside, expected_mid, places=1)
 
     def test_result_within_tolerance_window(self):
         """Result is always within [target - window/2, target + window/2]."""

@@ -107,9 +107,12 @@ fi
 # Run this before restart so the updated definitions are always active.
 echo ""
 echo "► Syncing systemd unit files..."
+SERVICE_USER="$(whoami)"
 for unit_file in "$DEPLOY_DIR/systemd/"*.service; do
     unit_name=$(basename "$unit_file")
-    sudo cp "$unit_file" /etc/systemd/system/"$unit_name"
+    sed "s|User=opc|User=$SERVICE_USER|g; s|Group=opc|Group=$SERVICE_USER|g; \
+         s|/home/opc/mail|$PROJECT_DIR|g" "$unit_file" \
+        | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
     echo "  Installed: $unit_name"
 done
 sudo systemctl daemon-reload
