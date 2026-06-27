@@ -174,9 +174,9 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
         present is considered alive — skip its key entirely.
       • Only drain keys whose owning worker has NO heartbeat (confirmed dead).
 
-    Token format: "{hostname}:{pid}" — guards against PID reuse across hosts
-    when multiple machines share the same Redis.  Legacy keys that used a bare
-    "{pid}" suffix are still handled: the PID is always the last colon component.
+    Token format: "{hostname}:{pid}" for inflight key uniqueness.  Heartbeat keys
+    use pid-only (worker:alive:detail_worker:{pid}); the PID is always the last
+    colon component, so rsplit(":", 1)[-1] extracts it from any token format.
 
     Drain is atomic per item via _ATOMIC_DRAIN_LUA:
       LINDEX (peek) → retry check → Lua(RPOP + optional RPUSH / discard)
@@ -201,7 +201,7 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     )
                     continue
 
-                # Full worker token (supports "hostname:pid" and legacy "pid")
+                # Full worker token ("hostname:pid" or legacy "pid")
                 peer_token = key[len(_prefix):]
 
                 # Never touch our own in-flight key
@@ -209,9 +209,9 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     continue
 
                 # Skip peers with a live heartbeat.
-                # Heartbeat key is host-qualified ({hostname}:{pid}) to prevent
-                # false skips when two hosts share the same PID.
-                hb_key = f"worker:alive:detail_worker:{peer_token}"
+                # Heartbeat key uses pid-only; extract the last colon component.
+                peer_pid = peer_token.rsplit(":", 1)[-1]
+                hb_key = f"worker:alive:detail_worker:{peer_pid}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "
@@ -971,24 +971,12 @@ def run_worker(once: bool = False, shutdown_event=None,
 
                 logger.warning(
                     "detail_worker: transient error — leaving job_id=%s "
-                    "company=%r in inflight; exiting so _recover_stuck_jobs() "
-                    "can reclaim it on the next startup",
+                    "company=%r in inflight; continuing to next job",
                     _r_job_id, _r_company,
                 )
-                # Stop the heartbeat daemon BEFORE deleting the key so the
-                # thread cannot recreate it after deletion (race window).
-                _hb.stop()
-                # Delete our heartbeat key immediately so a respawned worker
-                # that starts before the TTL expires can still reclaim this
-                # inflight item via _recover_stuck_jobs() without waiting 30s.
-                try:
-                    r.delete(f"worker:alive:detail_worker:{own_token}")
-                except Exception as _hb_del_err:
-                    logger.error(
-                        "detail_worker: failed to delete heartbeat key: %s",
-                        _hb_del_err,
-                    )
-                break
+                if once:
+                    break
+                continue
             else:
                 try:
                     r.lrem(inflight_key, 1, raw)

@@ -470,8 +470,8 @@ def run():
                             _vrows = _vconn.execute(
                                 "SELECT company FROM company_poll_stats "
                                 "WHERE company = ANY(%s) "
-                                "AND last_full_scan_at >= "
-                                "    to_timestamp(%s::double precision)",
+                                "AND EXTRACT(EPOCH FROM last_full_scan_at) "
+                                "    >= %s::double precision",
                                 (list(_newly_done), _scan_horizon),
                             ).fetchall()
                             _confirmed_done = {r["company"] for r in _vrows}

@@ -467,6 +467,7 @@ def _build_queue_health_section() -> str:
     Returns an HTML string.  Empty string on any failure so a Redis hiccup
     never blocks the digest from sending.
     """
+    r = None
     try:
         import redis as _redis_lib
         from config import (
@@ -659,7 +660,6 @@ def _build_queue_health_section() -> str:
             f'{table_html}'
             f'{issue_html}'
         )
-        r.close()
         return result_html
 
     except Exception as _exc:
@@ -668,6 +668,12 @@ def _build_queue_health_section() -> str:
             "monitor_report: queue health section failed: %s", _exc, exc_info=True
         )
         return ""
+    finally:
+        if r is not None:
+            try:
+                r.close()
+            except Exception:
+                pass
 
 
 def _build_adaptive_health_section() -> str:

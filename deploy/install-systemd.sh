@@ -179,7 +179,7 @@ sleep 8   # wait for worker heartbeats to appear in Redis
 # Health check failure is a WARNING here, not an abort — workers may still be
 # starting up.  set -euo pipefail would otherwise terminate the whole install
 # script on a transient unhealthy state that resolves in seconds.
-if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python scripts/health_check.py"; then
+if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python scripts/health_check.py' _ "$PROJECT_DIR"; then
     echo "  ✓ Health check passed"
 else
     echo ""

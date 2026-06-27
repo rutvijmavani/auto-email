@@ -33,16 +33,16 @@ EXISTING=$(crontab -l 2>/dev/null || true)
 # Removes: old keep-alive (*/4 days or every 4 days), any existing retry line.
 # Leaves everything else intact.
 CLEANED=$(echo "$EXISTING" \
-  | grep -v "monitor_.*log.*run_monitor"   \
-  | grep -v "MONITOR RETRY"                \
-  | grep -v "missed.*VM suspension"        \
-  | grep -v "9 AM fallback"               \
-  | grep -v "log_monitor"                  \
-  | grep -v "LOG MONITOR"                  \
-  | grep -v "hashlib"                      \
-  | grep -v "KEEP-ALIVE"                   \
-  | grep -v "every 4 days"                 \
-  | grep -v "every 4 hours"               \
+  | grep -v "monitor_.*log.*run_monitor"              \
+  | grep -v "MONITOR RETRY"                           \
+  | grep -v "missed.*VM suspension"                   \
+  | grep -v "9 AM fallback"                           \
+  | grep -v "scripts/log_monitor\.py\|log_monitor_.*\.log" \
+  | grep -v "LOG MONITOR"                             \
+  | grep -v "hashlib.*range(100000)"                  \
+  | grep -v "KEEP-ALIVE"                              \
+  | grep -v "every 4 days"                            \
+  | grep -v "every 4 hours"                           \
   || true)
 
 # ── Build the new crontab ─────────────────────────────────────────────────────

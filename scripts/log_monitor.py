@@ -288,13 +288,16 @@ def scan_file(
     while i < len(lines):
         line = lines[i].rstrip()
         if line and not _is_suppressed(line) and _is_flagged(line):
+            end_j = min(i + 1 + CONTEXT_LINES, len(lines))
             context = [
                 lines[j].rstrip()
-                for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines)))
+                for j in range(i + 1, end_j)
                 if lines[j].strip() and not _is_suppressed(lines[j])
             ]
             findings.append((line, context))
-        i += 1
+            i = end_j   # skip already-captured context so those lines aren't re-flagged
+        else:
+            i += 1
 
     return new_offset, findings
 

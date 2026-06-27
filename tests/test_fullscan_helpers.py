@@ -666,6 +666,19 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
 
         return captured
 
+    def test_sql_text_is_valid(self):
+        """
+        SQL sent to conn.execute() must contain expected DML and must NOT contain
+        any Python lint-suppression comments (which would break the query if the
+        # noqa annotation were accidentally embedded inside the f-string).
+        """
+        result = self._run(duration_s=100.0)
+        sql = result["sql"]
+        self.assertIn("INSERT INTO company_poll_stats", sql)
+        self.assertIn("ON CONFLICT", sql)
+        self.assertNotIn("# noqa", sql)
+        self.assertNotIn("noqa:", sql)
+
     def test_first_scan_ema_from_default_prev(self):
         """
         First scan (prev_avg=30.0): new_avg = 0.3 * duration + 0.7 * 30.

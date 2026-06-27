@@ -100,20 +100,31 @@ def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
     try:
-        from workers.redis_client import ping, get_redis
+        from workers.redis_client import ping
         if not ping():
             raise ConnectionError("PING returned False")
-        # Also verify we can actually write (catches auth errors that ping misses)
-        r = get_redis()
-        r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
-        # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
-        _info = r.info("server")
-        _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
-        if _ver < (6, 2):
-            raise RuntimeError(
-                f"Redis {_info.get('redis_version')} is too old — "
-                "pipeline requires Redis ≥6.2 (LMOVE command)"
-            )
+        # Also verify we can actually write (catches auth errors that ping misses).
+        # Use a dedicated client with short timeouts so a hung Redis never blocks
+        # startup indefinitely — the shared get_redis() has no socket timeout.
+        import redis as _redis_lib
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        r = _redis_lib.from_url(
+            redis_url,
+            socket_timeout=5,
+            socket_connect_timeout=3,
+        )
+        try:
+            r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
+            # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
+            _info = r.info("server")
+            _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
+            if _ver < (6, 2):
+                raise RuntimeError(
+                    f"Redis {_info.get('redis_version')} is too old — "
+                    "pipeline requires Redis ≥6.2 (LMOVE command)"
+                )
+        finally:
+            r.close()
     except Exception as exc:
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         # Mask password so it never appears in systemd/journal logs.

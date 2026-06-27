@@ -586,7 +586,8 @@ def _complete_fullscan_db(
         )
         _next_ts_val = next_scan_ts if next_scan_ts else interval_s
 
-        conn.execute(f"""  # noqa: S608 — _next_ts_expr is a hard-coded literal, not user input
+        conn.execute(  # noqa: S608 — _next_ts_expr is a hard-coded literal, not user input
+            f"""
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
@@ -608,8 +609,9 @@ def _complete_fullscan_db(
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-        """, (company, platform, _next_ts_val, new_jobs, int(duration_s), new_avg,
-              _next_ts_val, new_jobs, int(duration_s), new_avg))
+        """,
+            (company, platform, _next_ts_val, new_jobs, int(duration_s), new_avg,
+             _next_ts_val, new_jobs, int(duration_s), new_avg))
         conn.commit()
         return True
     except Exception as exc:
