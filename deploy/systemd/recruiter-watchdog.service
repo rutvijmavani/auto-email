@@ -31,6 +31,12 @@ ExecStart=/home/opc/mail/venv/bin/python -m workers.watchdog
 Restart=always
 RestartSec=10s
 
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+# read-only (not strict) — WorkingDirectory is under /home
+ProtectHome=read-only
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
 StandardError=journal

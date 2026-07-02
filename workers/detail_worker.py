@@ -1055,6 +1055,22 @@ def run_worker(once: bool = False, shutdown_event=None,
                     )
                     _hb.stop()
                     break
+                else:
+                    # Clear retry counter so a future re-enqueue of the same
+                    # job_id starts with a fresh budget rather than inheriting
+                    # stale attempt count from a previous failure run.
+                    _ack_job_id = payload.get("job_id", "")
+                    if _ack_job_id:
+                        _ack_company = payload.get("company", "")
+                        _ack_rkey = (
+                            f"{_RETRY_KEY_PREFIX}{_ack_company}:{_ack_job_id}"
+                            if _ack_company else
+                            f"{_RETRY_KEY_PREFIX}{_ack_job_id}"
+                        )
+                        try:
+                            r.delete(_ack_rkey)
+                        except Exception:
+                            pass   # non-fatal — TTL will expire it anyway
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]

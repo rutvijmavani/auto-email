@@ -1291,6 +1291,17 @@ def _bootstrap_warming(company: str, r, now: float) -> None:
     )
 
 
+def _write_scheduler_heartbeat(r, dispatched: int) -> None:
+    try:
+        r.set("worker:alive:scheduler", json.dumps({
+            "pid":        os.getpid(),
+            "ts":         time.time(),
+            "dispatched": dispatched,
+        }), ex=15)
+    except Exception as _hb_err:
+        logger.debug("scheduler: heartbeat write failed: %s", _hb_err)
+
+
 # ─────────────────────────────────────────
 # ADAPTIVE DISPATCH LOOP
 # ─────────────────────────────────────────
@@ -1320,16 +1331,6 @@ def adaptive_loop() -> None:
 
     Runs until KeyboardInterrupt or thread stop.
     """
-    def _write_scheduler_heartbeat(r, dispatched: int) -> None:
-        try:
-            r.set("worker:alive:scheduler", json.dumps({
-                "pid":        os.getpid(),
-                "ts":         time.time(),
-                "dispatched": dispatched,
-            }), ex=15)
-        except Exception as _hb_err:
-            logger.debug("scheduler: heartbeat write failed: %s", _hb_err)
-
     r = get_redis()
     _init_consumer_group(r, REDIS_STREAM_ADAPTIVE)
     logger.info("adaptive_loop: started (stream=%s)", REDIS_STREAM_ADAPTIVE)

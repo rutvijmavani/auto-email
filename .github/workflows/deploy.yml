@@ -126,10 +126,32 @@ jobs:
               echo "[ERROR] Health check failed — rolling back to $PREVIOUS_SHA"
               git checkout -B main "$PREVIOUS_SHA"
               pip install -r requirements.txt --quiet
-              for svc in recruiter-scheduler recruiter-watchdog; do
-                sudo systemctl restart "$svc" || true
+
+              echo "[ROLLBACK] Re-syncing systemd unit files from previous revision..."
+              for unit_file in ${{ secrets.VM_PATH }}/deploy/systemd/*.service; do
+                unit_name=$(basename "$unit_file")
+                sed "s|User=opc|User=${{ secrets.VM_USER }}|g; s|Group=opc|Group=${{ secrets.VM_USER }}|g; s|/home/opc/mail|${{ secrets.VM_PATH }}|g" \
+                  "$unit_file" | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
               done
-              echo "[ROLLBACK] Services restarted on previous commit $PREVIOUS_SHA"
+              sudo systemctl daemon-reload
+
+              echo "[ROLLBACK] Restarting services..."
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                sudo systemctl restart "$svc"
+              done
+
+              echo "[ROLLBACK] Verifying rollback services are active..."
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                if ! systemctl is-active --quiet "$svc"; then
+                  echo "[ERROR] $svc failed to start after rollback:"
+                  journalctl -u "$svc" -n 30 --no-pager || true
+                  echo "[FATAL] Rollback failed — manual intervention required"
+                  exit 1
+                fi
+                echo "[OK] $svc is active after rollback"
+              done
+
+              echo "[ROLLBACK] Complete — reverted to $PREVIOUS_SHA"
               exit 1
             fi
 

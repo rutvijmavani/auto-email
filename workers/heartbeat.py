@@ -48,8 +48,8 @@ _HOSTNAME = socket.gethostname()   # resolved once at import time; stable for pr
 
 class Heartbeat:
     """
-    Daemon thread that writes worker:alive:{worker_type} every interval_s
-    seconds while the worker process is alive.
+    Daemon thread that writes worker:alive:{worker_type}:{hostname}:{pid}
+    every interval_s seconds while the worker process is alive.
 
     TTL is set to 3 × interval_s so two consecutive missed writes (Redis
     blip, GIL stall) are tolerated before the key expires.  The watchdog's
