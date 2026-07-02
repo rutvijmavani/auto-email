@@ -10,11 +10,12 @@
 #        → Stops any old nohup/cron processes
 #        → Installs and enables recruiter-scheduler + recruiter-watchdog systemd units
 #        → Adds the sudoers rule so watchdog can self-heal
-#        → Starts both services
+#        → Starts both services, then immediately stops them
 #   3. Runs deploy/configure-redis.sh
 #        → Enables AOF persistence (saves every ~1 second)
 #        → Sets auto-rewrite thresholds (file never grows unbounded)
 #        → Persists settings to redis.conf
+#   3b. Starts recruiter-scheduler + recruiter-watchdog (Redis now durable)
 #   4. Waits for worker heartbeats to appear in Redis
 #   5. Runs scripts/health_check.py — must exit 0 before setup is complete
 #
@@ -126,17 +127,22 @@ echo ""
 echo "  All prerequisites met. Proceeding with setup."
 
 # ─────────────────────────────────────────
-# STEP 1 — SYSTEMD SERVICES
+# STEP 1 — SYSTEMD SERVICES (install only, services started after Redis AOF)
 # ─────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo "  STEP 1 — Installing and starting systemd services"
+echo "  STEP 1 — Installing systemd service units"
 echo "════════════════════════════════════════════════════════════"
 
 bash "$DEPLOY_DIR/install-systemd.sh"
 
+# Stop the services that install-systemd.sh just started — they must not run
+# until Redis AOF durability is configured (Step 2), otherwise any work queued
+# in the first seconds runs on an un-persisted Redis and is at risk of loss.
 echo ""
-echo "  ✓ Step 1 complete — systemd services installed and started"
+echo "  Stopping services temporarily until Redis AOF is configured..."
+sudo systemctl stop recruiter-scheduler recruiter-watchdog 2>/dev/null || true
+echo "  ✓ Step 1 complete — units installed, services stopped pending Redis config"
 
 # ─────────────────────────────────────────
 # STEP 2 — REDIS AOF PERSISTENCE
@@ -150,6 +156,17 @@ bash "$DEPLOY_DIR/configure-redis.sh"
 
 echo ""
 echo "  ✓ Step 2 complete — Redis AOF persistence configured"
+
+# ─────────────────────────────────────────
+# STEP 2b — START SERVICES (Redis now durable)
+# ─────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  STEP 2b — Starting services (Redis AOF now active)"
+echo "════════════════════════════════════════════════════════════"
+
+sudo systemctl start recruiter-scheduler recruiter-watchdog
+echo "  ✓ recruiter-scheduler and recruiter-watchdog started"
 
 # ─────────────────────────────────────────
 # STEP 3 — WAIT FOR WORKER HEARTBEATS
@@ -233,7 +250,7 @@ fi
 echo ""
 echo "  What was configured:"
 echo "    ✓ recruiter-scheduler.service — starts on boot, auto-restarts on crash"
-echo "    ✓ recruiter-watchdog.service  — monitors pipeline, self-heals every 5 min"
+echo "    ✓ recruiter-watchdog.service  — continuously monitors pipeline, restarts dead workers automatically"
 echo "    ✓ Redis AOF persistence  — max 1s data loss on crash (was ~5 min)"
 echo "    ✓ AOF auto-rewrite       — file never grows unbounded"
 echo "    ✓ Sudoers rule           — watchdog can restart scheduler without password"

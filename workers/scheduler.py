@@ -1031,22 +1031,21 @@ def _atomic_schedule(
             if deadline_ts and (deadline_ts - avg_duration_s) > target_ts:
                 # Spread jitter within the remaining safe window so multiple
                 # concurrent lock-busy callers don't all clamp to the same score.
+                # Use purely positive jitter (0 to 10% of safe window) so the
+                # hash distributes evenly without half the values collapsing to
+                # target_ts via max(target_ts, target_ts + negative_jitter).
                 _safe_window = (deadline_ts - avg_duration_s) - target_ts
-                _jitter_s = int(
-                    (_hash_int % max(1, int(_safe_window * 0.10)))
-                    - _safe_window * 0.05
-                )
-                score = max(target_ts, target_ts + _jitter_s)
+                _jitter_s = int(_hash_int % max(1, int(_safe_window * 0.10)))
+                score = target_ts + _jitter_s
             else:
-                _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
+                # No safe window — jitter within 0–10% of interval so all callers
+                # spread positively away from target_ts without clamping.
+                _jitter_s = int(_hash_int % max(1, int(interval_s * 0.10)))
                 score = target_ts + _jitter_s
                 if deadline_ts:
-                    # Clamp score into [target_ts, max(target_ts, deadline_ts - avg)].
-                    # Upper cap: never schedule so late the scan can't finish before
-                    # the digest.  Lower bound: jitter must not push score before
-                    # target_ts (that would violate the interval contract).
+                    # Cap score so the scan can still finish before the digest.
                     _upper = max(target_ts, deadline_ts - avg_duration_s)
-                    score  = max(target_ts, min(score, _upper))
+                    score  = min(score, _upper)
                     # When no safe window remains before the digest, apply the same
                     # post-digest fallback that _pick_schedule_time uses.
                     if avg_duration_s > 0 and _upper <= target_ts:

@@ -118,6 +118,14 @@ jobs:
               echo "[OK] $svc is active"
             done
 
+            echo "  Running health check to verify pipeline state..."
+            sleep 10   # give workers a moment to write their first heartbeat
+            source venv/bin/activate
+            if ! python scripts/health_check.py; then
+              echo "[ERROR] Health check reported errors after deploy — check output above"
+              exit 1
+            fi
+
             echo "Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"

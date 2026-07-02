@@ -100,12 +100,9 @@ def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
     try:
-        from workers.redis_client import ping
-        if not ping():
-            raise ConnectionError("PING returned False")
-        # Also verify we can actually write (catches auth errors that ping misses).
-        # Use a dedicated client with short timeouts so a hung Redis never blocks
-        # startup indefinitely — the shared get_redis() has no socket timeout.
+        # Use a dedicated client with short timeouts for ALL Redis checks so a
+        # hung endpoint never blocks startup indefinitely.  The shared get_redis()
+        # has no socket timeout, so even the initial PING must use this client.
         import redis as _redis_lib
         redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         r = _redis_lib.from_url(
@@ -114,6 +111,8 @@ def _check_redis(prefix: str) -> None:
             socket_connect_timeout=3,
         )
         try:
+            if not r.ping():
+                raise ConnectionError("PING returned False")
             r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
             # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
             _info = r.info("server")

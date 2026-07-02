@@ -37,10 +37,18 @@ CLEANED=$(echo "$EXISTING" \
   | grep -v "MONITOR RETRY"                           \
   | grep -v "missed.*VM suspension"                   \
   | grep -v "9 AM fallback"                           \
+  | grep -v "Runs only if the 7 AM job"               \
+  | grep -v "Checks for exit=0 in today"              \
+  | grep -v "digest arrives at most"                  \
   | grep -v "scripts/log_monitor\.py\|log_monitor_.*\.log" \
   | grep -v "LOG MONITOR"                             \
+  | grep -v "Scans log files for new ERRORs"          \
+  | grep -v "Sends a batched email alert"             \
+  | grep -v "State tracked in data/log_monitor"       \
   | grep -v "hashlib.*range(100000)"                  \
   | grep -v "KEEP-ALIVE"                              \
+  | grep -v "Prevents Oracle Cloud"                   \
+  | grep -v "VM was being suspended"                  \
   | grep -v "every 4 days"                            \
   | grep -v "every 4 hours"                           \
   || true)

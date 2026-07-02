@@ -107,12 +107,12 @@ class TestValidateStartup(unittest.TestCase):
         """All checks pass → validate_startup returns without calling sys.exit."""
         mock_conn = MagicMock()
         mock_r = MagicMock()
-        # _check_redis calls r.info("server") and parses "redis_version".
-        # Return a proper dict so the Redis ≥6.2 version check passes.
+        # _check_redis creates its own bounded client via redis.from_url.
+        # r.ping() must return True; r.info() must return a valid version.
+        mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_r), \
+             patch("redis.from_url", return_value=mock_r), \
              patch("db.db.init_db"), \
              patch("db.db.get_conn", return_value=mock_conn):
             from workers.startup import validate_startup
@@ -250,10 +250,10 @@ class TestValidateStartup(unittest.TestCase):
         env_missing = {k: "" for k in
                        ["REDIS_URL", "DATABASE_URL", "GMAIL_EMAIL", "GMAIL_APP_PASSWORD"]}
         _mock_r = MagicMock()
+        _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, env_missing), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=_mock_r), \
+             patch("redis.from_url", return_value=_mock_r), \
              patch("db.db.init_db"), \
              patch("db.db.get_conn", return_value=MagicMock()):
             from workers.startup import validate_startup
@@ -265,18 +265,20 @@ class TestValidateStartup(unittest.TestCase):
     # ── Redis check ───────────────────────────────────────────────────────────
 
     def test_redis_ping_false_exits_1(self):
-        """ping() returns False → sys.exit(1)."""
+        """r.ping() returns False → sys.exit(1)."""
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=False):
+             patch("redis.from_url", return_value=mock_r):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_db=False, check_config=False)
             self.assertEqual(ctx.exception.code, 1)
 
     def test_redis_ping_exception_exits_1(self):
-        """ping() raises ConnectionError → sys.exit(1)."""
+        """redis.from_url() raises ConnectionError → sys.exit(1)."""
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping",
+             patch("redis.from_url",
                    side_effect=ConnectionError("connection refused")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
@@ -284,10 +286,12 @@ class TestValidateStartup(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
 
     def test_redis_failure_error_to_stderr(self):
-        """Redis failure → STARTUP FAILED written to stderr."""
+        """Redis ping failure → STARTUP FAILED written to stderr."""
         err_buf = io.StringIO()
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=False), \
+             patch("redis.from_url", return_value=mock_r), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
@@ -297,11 +301,11 @@ class TestValidateStartup(unittest.TestCase):
     def test_redis_set_failure_exits_1(self):
         """r.set() raises → startup fails with exit(1)."""
         mock_r = MagicMock()
+        mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "7.0.0"}
         mock_r.set.side_effect = Exception("READONLY You can't write against a read only replica")
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_r):
+             patch("redis.from_url", return_value=mock_r):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_db=False, check_config=False)
@@ -310,10 +314,10 @@ class TestValidateStartup(unittest.TestCase):
     def test_redis_old_version_exits_1(self):
         """Redis version < 6.2 (missing LMOVE) → startup fails with exit(1)."""
         mock_r = MagicMock()
+        mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "5.0.14"}
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_r):
+             patch("redis.from_url", return_value=mock_r):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_db=False, check_config=False)
@@ -322,11 +326,11 @@ class TestValidateStartup(unittest.TestCase):
     def test_redis_old_version_error_to_stderr(self):
         """Redis version < 6.2 → STARTUP FAILED written to stderr."""
         mock_r = MagicMock()
+        mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "6.0.0"}
         err_buf = io.StringIO()
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_r), \
+             patch("redis.from_url", return_value=mock_r), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
@@ -334,18 +338,18 @@ class TestValidateStartup(unittest.TestCase):
         self.assertIn("STARTUP FAILED", err_buf.getvalue())
 
     def test_check_redis_false_skips_redis(self):
-        """check_redis=False → ping is never called, even if it would fail."""
+        """check_redis=False → redis.from_url is never called."""
         mock_conn = MagicMock()
         with patch.dict(os.environ, _full_env()), \
              patch("db.db.get_conn", return_value=mock_conn), \
-             patch("workers.redis_client.ping",
-                   side_effect=AssertionError("ping must not be called when check_redis=False")) as mock_ping:
+             patch("redis.from_url",
+                   side_effect=AssertionError("redis.from_url must not be called when check_redis=False")) as mock_from_url:
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_redis=False, check_config=False)
             except SystemExit as exc:
                 self.fail(f"Should not exit when check_redis=False, got exit({exc.code})")
-            mock_ping.assert_not_called()
+            mock_from_url.assert_not_called()
 
     # ── DB check ─────────────────────────────────────────────────────────────
 
@@ -386,10 +390,10 @@ class TestValidateStartup(unittest.TestCase):
     def test_check_db_false_skips_db(self):
         """check_db=False → PostgreSQL not checked (no exit even if DB would fail)."""
         _mock_r = MagicMock()
+        _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=_mock_r):
+             patch("redis.from_url", return_value=_mock_r):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_db=False, check_config=False)

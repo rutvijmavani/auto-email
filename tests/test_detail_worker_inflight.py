@@ -395,7 +395,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
     def test_host_pid_peer_dead_heartbeat_recovers(self):
         """
         Peer with a host:pid inflight key (otherhost:9003) and NO heartbeat is
-        recovered.  Heartbeat is checked using the pid-only key (last colon component).
+        recovered.  Heartbeat is checked using the full token key (hostname:pid).
         """
         from unittest.mock import MagicMock
         from config import REDIS_DETAIL_ADAPTIVE
@@ -403,7 +403,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
 
         peer_token = "otherhost:9003"
         inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
-        hb_key = "worker:alive:detail_worker:9003"  # pid-only, not full token
+        hb_key = "worker:alive:detail_worker:otherhost:9003"  # full token — hostname:pid
         payload = b'{"queue":"adaptive","job_id":"j1"}'
 
         items = [payload]
@@ -439,14 +439,14 @@ class TestRecoverStuckJobs(unittest.TestCase):
 
         _recover_stuck_jobs(r, self._OWN_TOKEN)
 
-        # Heartbeat was checked with the pid-only key
+        # Heartbeat was checked with the full-token key (hostname:pid)
         exists_calls = [
             (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
             for c in r.exists.call_args_list
         ]
         self.assertTrue(
-            any(hb_key in k for k in exists_calls),
-            f"exists() must have been called to check the dead peer's heartbeat key {hb_key!r}",
+            any(k == hb_key for k in exists_calls),
+            f"exists() must have been called with the full-token heartbeat key {hb_key!r}",
         )
         # The Lua drain WAS called — peer was recovered
         self.assertTrue(lua_called, "Expected Lua drain to run for dead host:pid peer")
@@ -455,6 +455,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
         """
         Peer with a host:pid inflight key (otherhost:9004) and a LIVE heartbeat
         is not touched — lindex is never called on its inflight list.
+        Heartbeat is checked using the full token key (hostname:pid).
         """
         from unittest.mock import MagicMock
         from config import REDIS_DETAIL_ADAPTIVE
@@ -462,7 +463,7 @@ class TestRecoverStuckJobs(unittest.TestCase):
 
         peer_token = "otherhost:9004"
         inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
-        hb_key = "worker:alive:detail_worker:9004"  # pid-only, not full token
+        hb_key = "worker:alive:detail_worker:otherhost:9004"  # full token — hostname:pid
 
         r = MagicMock()
         r.scan.side_effect = [

@@ -1347,12 +1347,15 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                                       shutdown_event=shutdown_event)
             _hw["count"] += 1
 
-            # ── XACK: remove from PEL (work complete) ────────────────────────
-            # _run_fullscan() handles all rescheduling internally before we get
-            # here, so XACK unconditionally marks this delivery as done.
-            r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
-
             outcome = result["outcome"]
+
+            # ── XACK: remove from PEL (work complete) ────────────────────────
+            # Skip XACK on shutdown so the message stays in the PEL for
+            # XAUTOCLAIM recovery — the scan was aborted, not finished.
+            # For all other outcomes, _run_fullscan() handled rescheduling
+            # internally, so marking this delivery done is safe.
+            if outcome != "shutdown":
+                r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
             icon    = {
                 "completed": "[DONE]",
                 "paused":    "[PAUSE]",

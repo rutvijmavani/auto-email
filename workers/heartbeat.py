@@ -36,11 +36,14 @@ Usage
 
 import json
 import os
+import socket
 import threading
 import time
 import logging
 
 logger = logging.getLogger(__name__)
+
+_HOSTNAME = socket.gethostname()   # resolved once at import time; stable for process lifetime
 
 
 class Heartbeat:
@@ -116,11 +119,11 @@ class Heartbeat:
         if self._thread.ident is not None:                 # only join if started
             self._thread.join(timeout=self._interval_s + 2)
         try:
-            self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
+            self._r.delete(f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}")
         except Exception as _del_err:
             logger.debug(
-                "heartbeat: cleanup delete failed for %s:%s — TTL will expire: %s",
-                self._worker_type, os.getpid(), _del_err,
+                "heartbeat: cleanup delete failed for %s:%s:%s — TTL will expire: %s",
+                self._worker_type, _HOSTNAME, os.getpid(), _del_err,
             )
 
     # ── internals ─────────────────────────────────────────────────────────────
@@ -129,7 +132,7 @@ class Heartbeat:
         """Write one heartbeat key to Redis.  Swallows all exceptions."""
         try:
             self._r.set(
-                f"worker:alive:{self._worker_type}:{os.getpid()}",
+                f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}",
                 json.dumps({
                     "pid":       os.getpid(),
                     "ts":        time.time(),

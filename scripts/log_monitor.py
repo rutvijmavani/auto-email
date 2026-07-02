@@ -506,6 +506,7 @@ def sweep_resolved(r, now: float) -> list[dict]:
                 except Exception:
                     pass
                 r.delete(err_key)
+                r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
                 resolved.append(fp)
     except Exception:
         pass

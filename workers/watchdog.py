@@ -862,18 +862,24 @@ def _heartbeat_pid(r, worker_type: str) -> Optional[int]:
         return None
 
 
-def _consumer_pid_alive(r, worker_type: str, c_pid: Optional[int]) -> bool:
+def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
     """
-    Return True if a live heartbeat key exists for this specific worker PID.
+    Return True if a live heartbeat key exists for this stream consumer.
 
-    With per-PID keys (worker:alive:{type}:{pid}), we can directly test whether
-    the exact consumer that owns a PEL entry is still running — no cross-PID
-    ambiguity from a shared single key.
+    consumer_name format: "worker-{hostname}-{pid}" (set by fullscan._CONSUMER_NAME).
+    Heartbeat key format: "worker:alive:{type}:{hostname}:{pid}" (set by heartbeat.py).
+    Both include the hostname so PID reuse across machines cannot produce a false positive.
     """
-    if c_pid is None:
+    if not consumer_name:
         return False
     try:
-        return bool(r.exists(f"worker:alive:{worker_type}:{c_pid}"))
+        if isinstance(consumer_name, bytes):
+            consumer_name = consumer_name.decode()
+        # "worker-{hostname}-{pid}" — split off pid at the last dash, strip "worker-" prefix
+        name, _, pid_str = consumer_name.rpartition("-")
+        hostname = name.removeprefix("worker-")
+        int(pid_str)   # validate — raises ValueError if not a number
+        return bool(r.exists(f"worker:alive:{worker_type}:{hostname}:{pid_str}"))
     except Exception:
         return False
 
@@ -935,7 +941,7 @@ def _check_pel_health(r, issues: list) -> None:
                     if isinstance(e_consumer, bytes):
                         e_consumer = e_consumer.decode()
                     e_pid   = _consumer_pid(e_consumer)
-                    e_alive = _consumer_pid_alive(r, worker_type, e_pid)
+                    e_alive = _consumer_pid_alive(r, worker_type, e_consumer)
                     e_ms    = entry.get("time_since_delivered", 0)
                     if e_alive:
                         alive_entries.append((e_consumer, e_pid, e_ms))

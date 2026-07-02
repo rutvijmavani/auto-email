@@ -164,13 +164,15 @@ def run_health_check() -> int:
     try:
         from db.db import get_conn
         conn = get_conn()
-        row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
-        jobs = row["cnt"] if row else 0
-        pend = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM job_postings WHERE status='pending_detail'"
-        ).fetchone()
-        conn.close()
-        _row("OK", "PostgreSQL", f"{jobs:,} total jobs  {pend['cnt']} pending_detail")
+        try:
+            row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
+            jobs = row["cnt"] if row else 0
+            pend = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM job_postings WHERE status='pending_detail'"
+            ).fetchone()
+            _row("OK", "PostgreSQL", f"{jobs:,} total jobs  {pend['cnt']} pending_detail")
+        finally:
+            conn.close()
     except Exception as exc:
         _row("ERROR", "PostgreSQL", f"UNREACHABLE: {exc}")
         errors += 1

@@ -453,16 +453,16 @@ def run():
                 }
                 _newly_done = _remaining_inflight - _still_active
                 if _newly_done:
-                    _remaining_inflight -= _newly_done
-
-                    # Verify via DB: only credit companies whose last_full_scan_at
-                    # was actually updated since before the fallback phase began.
+                    # Verify via DB before removing from _remaining_inflight.
+                    # Defer removal so a transient DB failure keeps these companies
+                    # in the pending set and retries them on the next poll cycle.
                     # A scan that failed or was aborted may also disappear from
                     # the inflight ZSET, so membership disappearance alone is not
                     # proof of completion.  Use _scan_horizon (captured before the
                     # fallback fetch) so scans that finished during fallback are
                     # also credited correctly.
                     _confirmed_done: set = set()
+                    _db_ok = False
                     try:
                         from db.connection import get_conn as _vget_conn
                         _vconn = _vget_conn()
@@ -475,36 +475,39 @@ def run():
                                 (list(_newly_done), _scan_horizon),
                             ).fetchall()
                             _confirmed_done = {r["company"] for r in _vrows}
+                            _db_ok = True
                         finally:
                             _vconn.close()
                     except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
                             "In-flight wait: DB verification failed (%s) — "
-                            "leaving %d newly-done unconfirmed (will not credit coverage)",
+                            "keeping %d companies pending for retry",
                             _db_ver_err, len(_newly_done),
                         )
-                        _confirmed_done = set()  # cannot verify without DB
 
-                    _unconfirmed = _newly_done - _confirmed_done
-                    if _confirmed_done:
-                        with stats_lock:
-                            stats["covered_by_workers"] += len(_confirmed_done)
-                            stats["in_flight"]           -= len(_confirmed_done)
-                        logger.info(
-                            "In-flight scans confirmed complete: %s (%d still waiting)",
-                            ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
-                        )
-                        print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
-                              f"{', '.join(sorted(_confirmed_done))[:120]}"
-                              f"{'...' if len(_confirmed_done) > 5 else ''}")
-                    if _unconfirmed:
-                        logger.warning(
-                            "In-flight scans left ZSET without DB update "
-                            "(possible failures): %s",
-                            ", ".join(sorted(_unconfirmed)),
-                        )
-                        with stats_lock:
-                            stats["in_flight"] -= len(_unconfirmed)
+                    if _db_ok:
+                        # Only remove from remaining after successful DB check
+                        _remaining_inflight -= _newly_done
+                        _unconfirmed = _newly_done - _confirmed_done
+                        if _confirmed_done:
+                            with stats_lock:
+                                stats["covered_by_workers"] += len(_confirmed_done)
+                                stats["in_flight"]           -= len(_confirmed_done)
+                            logger.info(
+                                "In-flight scans confirmed complete: %s (%d still waiting)",
+                                ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
+                            )
+                            print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
+                                  f"{', '.join(sorted(_confirmed_done))[:120]}"
+                                  f"{'...' if len(_confirmed_done) > 5 else ''}")
+                        if _unconfirmed:
+                            logger.warning(
+                                "In-flight scans left ZSET without DB update "
+                                "(possible failures): %s",
+                                ", ".join(sorted(_unconfirmed)),
+                            )
+                            with stats_lock:
+                                stats["in_flight"] -= len(_unconfirmed)
 
                 if _remaining_inflight:
                     time.sleep(_IN_FLIGHT_POLL_S)

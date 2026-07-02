@@ -1145,9 +1145,9 @@ class TestInflightExclusionStructural(unittest.TestCase):
     """
 
     def setUp(self):
-        import pathlib
-        self.src = (pathlib.Path(__file__).parent.parent
-                    / "jobs" / "job_monitor.py").read_text(encoding="utf-8")
+        import inspect
+        from jobs.job_monitor import _get_worker_missed_companies
+        self.src = inspect.getsource(_get_worker_missed_companies)
 
     def test_source_uses_redis_inflight_fullscan_constant(self):
         """job_monitor.py reads the inflight:fullscan ZSET to exclude in-flight companies."""

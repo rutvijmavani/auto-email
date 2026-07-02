@@ -409,24 +409,26 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
                         f"Expected STALE ERROR, got: {sched_issues}")
 
     def test_scheduler_ok_at_19_seconds(self):
-        """scheduler threshold=20s: key age 19s → OK."""
-        from workers.watchdog import Issue
-        payload = json.dumps({"pid": 1, "ts": self._NOW - 19, "dispatched": 0})
+        """scheduler alive at threshold-1s → OK."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        payload = json.dumps({"pid": 1, "ts": self._NOW - (threshold - 1), "dispatched": 0})
         health  = self._health_payload()
         issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
         sched_issues = [i for i in issues if i.category == "worker:scheduler"]
         self.assertTrue(any(i.level == Issue.OK for i in sched_issues),
-                        f"Expected OK at 19s, got: {sched_issues}")
+                        f"Expected OK at threshold-1s, got: {sched_issues}")
 
     def test_scheduler_stale_at_21_seconds(self):
-        """scheduler threshold=20s: key age 21s → STALE ERROR."""
-        from workers.watchdog import Issue
-        payload = json.dumps({"pid": 1, "ts": self._NOW - 21, "dispatched": 0})
+        """scheduler stale at threshold+1s → STALE ERROR."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        payload = json.dumps({"pid": 1, "ts": self._NOW - (threshold + 1), "dispatched": 0})
         # Even if health key exists, stale scheduler is an error
         issues = self._run(scheduler_raw=payload.encode())
         sched_issues = [i for i in issues if i.category == "worker:scheduler"]
         self.assertTrue(any(i.level == Issue.ERROR for i in sched_issues),
-                        f"Expected ERROR at 21s, got: {sched_issues}")
+                        f"Expected ERROR at threshold+1s, got: {sched_issues}")
 
     def test_unparseable_scheduler_payload_treated_as_ok(self):
         """Unparseable scheduler key JSON (key exists) → treated as alive (OK)."""

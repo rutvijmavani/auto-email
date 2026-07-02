@@ -919,6 +919,8 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
                 result = _run_fullscan("TestCo", r)
             # Outer except catches the ConnectionError → returns result dict
             self.assertIsInstance(result, dict)
+            # Downstream fetch_jobs must still have been called (ZADD failure is non-fatal)
+            mock_ats.fetch_jobs.assert_called_once()
         except ConnectionError:
             self.fail("ConnectionError from ZADD should be caught by _run_fullscan")
 

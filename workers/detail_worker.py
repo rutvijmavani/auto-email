@@ -170,13 +170,13 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
     Safety contract:
       • own_token is always skipped — this worker has no heartbeat yet so it
         would look "dead" from the outside; never touch your own key.
-      • A peer whose heartbeat key (worker:alive:detail_worker:{pid}) is still
-        present is considered alive — skip its key entirely.
+      • A peer whose heartbeat key (worker:alive:detail_worker:{hostname}:{pid})
+        is still present is considered alive — skip its key entirely.
       • Only drain keys whose owning worker has NO heartbeat (confirmed dead).
 
     Token format: "{hostname}:{pid}" for inflight key uniqueness.  Heartbeat keys
-    use pid-only (worker:alive:detail_worker:{pid}); the PID is always the last
-    colon component, so rsplit(":", 1)[-1] extracts it from any token format.
+    use the same token (worker:alive:detail_worker:{hostname}:{pid}), so the
+    full peer_token maps directly to the heartbeat key with no parsing needed.
 
     Drain is atomic per item via _ATOMIC_DRAIN_LUA:
       LINDEX (peek) → retry check → Lua(RPOP + optional RPUSH / discard)
@@ -209,9 +209,8 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     continue
 
                 # Skip peers with a live heartbeat.
-                # Heartbeat key uses pid-only; extract the last colon component.
-                peer_pid = peer_token.rsplit(":", 1)[-1]
-                hb_key = f"worker:alive:detail_worker:{peer_pid}"
+                # Token is hostname:pid; heartbeat key uses the full token.
+                hb_key = f"worker:alive:detail_worker:{peer_token}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "
@@ -970,10 +969,17 @@ def run_worker(once: bool = False, shutdown_event=None,
                     continue
 
                 logger.warning(
-                    "detail_worker: transient error — leaving job_id=%s "
-                    "company=%r in inflight; continuing to next job",
+                    "detail_worker: transient error — requeueing job_id=%s "
+                    "company=%r for retry",
                     _r_job_id, _r_company,
                 )
+                try:
+                    r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
+                except Exception as _rq_err:
+                    logger.error(
+                        "detail_worker: requeue failed for %s: %s — item stays in inflight",
+                        _r_job_id, _rq_err,
+                    )
                 if once:
                     break
                 continue

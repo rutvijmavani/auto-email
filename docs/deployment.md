@@ -681,7 +681,7 @@ CRON_TZ=America/New_York
 # 9 AM retry guard in case VM was suspended overnight and 7 AM was missed
 # ─────────────────────────────────────────
 0 7 * * * /home/opc/mail/run_monitor.sh
-0 9 * * * /bin/bash -c 'f=/home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log; [ ! -f "$f" ] && /home/opc/mail/run_monitor.sh'
+0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -1592,7 +1592,7 @@ Run this any time to see the current state of every component in one table:
 python scripts/health_check.py
 ```
 
-Exit code 0 means everything is healthy. Exit code 1 means something needs attention. The output is color-coded: green = healthy, amber = warning, red = problem.
+Exit code 0 means everything is healthy or has only warnings. Exit code 1 means at least one ERROR or CRITICAL check failed and needs attention. The output is color-coded: green = healthy, amber = warning, red = problem.
 
 To check service status from the command line:
 
