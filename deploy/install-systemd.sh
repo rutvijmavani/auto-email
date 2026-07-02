@@ -110,15 +110,22 @@ SYSTEMCTL_BIN="$(which systemctl)"
 echo "  systemctl resolved to: $SYSTEMCTL_BIN"
 
 SUDOERS_FILE="/etc/sudoers.d/mail-pipeline"
+TEE_BIN="$(which tee)"
 cat > "$SUDOERS_FILE" << EOF
 # Allow opc user to restart/query pipeline services without password.
-# Required by workers/watchdog.py self-healing (uses sudo systemctl).
+# Required by workers/watchdog.py self-healing and deploy workflow.
 # Path = $(which systemctl) → resolved to $SYSTEMCTL_BIN
+# Watchdog commands:
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
+# Deploy-time unit sync (deploy.yml / deploy.sh):
+$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-scheduler.service
+$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-watchdog.service
+$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-pipeline-alert@.service
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
 EOF
 chmod 440 "$SUDOERS_FILE"
 

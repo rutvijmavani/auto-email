@@ -157,9 +157,27 @@ return 1
 """
 
 
-_MAX_DETAIL_RETRIES  = 5
-_RETRY_KEY_PREFIX    = "detail:retry:"
-_RETRY_KEY_TTL       = 86400 * 7   # 7 days — auto-expires if job never comes back
+_MAX_DETAIL_RETRIES    = 5
+_RETRY_KEY_PREFIX      = "detail:retry:"
+_RETRY_KEY_TTL         = 86400 * 7   # 7 days — auto-expires if job never comes back
+_MAX_RETRY_DELAY_S     = 60          # cap exponential backoff at 60 seconds
+_RETRY_DELAY_KEY_SUFFIX = ":retry_delay"  # appended to source queue key
+
+# Drain retry-delayed items from the delay ZSET back into their source queue.
+# Called at the top of the main loop so eligible items are visible before the
+# next pop.  Fully atomic: ZRANGEBYSCORE + RPUSH + ZREM in one Redis eval().
+#
+# KEYS[1] = delay_zset_key   KEYS[2] = source_queue_key   ARGV[1] = now (unix ts)
+_ATOMIC_DRAIN_RETRY_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local count = 0
+for _, item in ipairs(due) do
+    redis.call('RPUSH', KEYS[2], item)
+    redis.call('ZREM', KEYS[1], item)
+    count = count + 1
+end
+return count
+"""
 
 
 def _recover_stuck_jobs(r, own_token: str) -> None:
@@ -821,7 +839,13 @@ def run_worker(once: bool = False, shutdown_event=None,
     }
 
     # ── Recover any jobs left in inflight lists from dead peer workers ────────
-    _recover_stuck_jobs(r, own_token)
+    try:
+        _recover_stuck_jobs(r, own_token)
+    except Exception as _startup_rec_exc:
+        logger.warning(
+            "detail_worker: startup peer recovery failed (%s) — continuing",
+            _startup_rec_exc,
+        )
 
     logger.info(
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
@@ -862,6 +886,29 @@ def run_worker(once: bool = False, shutdown_event=None,
                         "detail_worker: periodic peer recovery failed: %s", _rec_exc
                     )
                 _last_peer_recovery = _now_mono
+
+            # ── Restore backoff-delayed retry items that are now eligible ────────
+            # Items that hit transient errors are held in a per-source delay ZSET
+            # (score = eligible unix timestamp) to prevent tight retry loops.
+            # This drain runs before every pop so eligible items re-enter the
+            # source queue just in time for the next LMOVE.
+            _drain_now = time.time()
+            for _d_src in (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN):
+                _d_key = f"{_d_src}{_RETRY_DELAY_KEY_SUFFIX}"
+                try:
+                    _d_moved = r.eval(
+                        _ATOMIC_DRAIN_RETRY_LUA, 2, _d_key, _d_src, str(_drain_now)
+                    )
+                    if _d_moved:
+                        logger.debug(
+                            "detail_worker: restored %d delayed retry item(s) "
+                            "from %s → %s",
+                            _d_moved, _d_key, _d_src,
+                        )
+                except Exception as _d_err:
+                    logger.debug(
+                        "detail_worker: retry drain failed for %s: %s", _d_key, _d_err
+                    )
 
             # ── At-least-once pop via LMOVE inflight list ─────────────────────
             # Moves item atomically: source_queue → inflight list.
@@ -930,6 +977,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                 _r_job_id  = result.get("job_id", "")
                 _r_company = result.get("company", "")
                 _r_discard = False
+                _backoff_s = 2   # default backoff when attempt count unavailable
                 if _r_job_id:
                     _rkey = (
                         f"{_RETRY_KEY_PREFIX}{_r_company}:{_r_job_id}"
@@ -957,6 +1005,9 @@ def run_worker(once: bool = False, shutdown_event=None,
                                 # DB row removed — safe to drop from inflight.
                                 r.lrem(inflight_key, 1, raw)
                                 _r_discard = True
+                        else:
+                            # Exponential backoff: 1s, 2s, 4s, 8s, 16s … capped.
+                            _backoff_s = min(2 ** (_attempt - 1), _MAX_RETRY_DELAY_S)
                     except Exception as _cnt_err:
                         logger.warning(
                             "detail_worker: retry counter failed for %s: %s "
@@ -968,16 +1019,23 @@ def run_worker(once: bool = False, shutdown_event=None,
                         break
                     continue
 
+                # Delay-requeue: add to the per-source delay ZSET with
+                # score = eligible timestamp so the item is NOT immediately
+                # eligible for the next LMOVE pop. The drainer restores it
+                # once the backoff window expires.
+                _delay_key = f"{source_queue}{_RETRY_DELAY_KEY_SUFFIX}"
                 logger.warning(
-                    "detail_worker: transient error — requeueing job_id=%s "
-                    "company=%r for retry",
-                    _r_job_id, _r_company,
+                    "detail_worker: transient error — delay-requeueing "
+                    "job_id=%s company=%r (backoff=%ds)",
+                    _r_job_id, _r_company, _backoff_s,
                 )
                 try:
-                    r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
+                    r.zadd(_delay_key, {raw: time.time() + _backoff_s})
+                    r.lrem(inflight_key, 1, raw)
                 except Exception as _rq_err:
                     logger.error(
-                        "detail_worker: requeue failed for %s: %s — item stays in inflight",
+                        "detail_worker: delay-requeue failed for %s: %s "
+                        "— item stays in inflight for recovery on next startup",
                         _r_job_id, _rq_err,
                     )
                 if once:

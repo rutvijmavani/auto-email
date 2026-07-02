@@ -9,7 +9,7 @@ Type=oneshot
 User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
-EnvironmentFile=-/home/opc/mail/.env
+EnvironmentFile=/home/opc/mail/.env
 
 # %i = the failed service name (e.g. "recruiter-scheduler")
 ExecStart=/home/opc/mail/venv/bin/python scripts/startup_failure_alert.py %i

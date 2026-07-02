@@ -87,7 +87,16 @@ def _fingerprint(event: dict) -> Optional[str]:
     try:
         exc_values = (event.get("exception") or {}).get("values") or []
         if not exc_values:
-            return None                           # non-exception event
+            # Non-exception event (e.g. logger.error() via LoggingIntegration).
+            # Build a stable fingerprint from level + logger + message prefix so
+            # repeated plain-error logs are deduplicated in Redis just like exceptions.
+            level      = event.get("level") or "error"
+            logger_tag = event.get("logger") or ""
+            message    = (event.get("logentry") or event.get("message") or {})
+            if isinstance(message, dict):
+                message = message.get("formatted") or message.get("message") or ""
+            raw = f"{level}:{logger_tag}:{str(message)[:120]}"
+            return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
         exc      = exc_values[-1]
         exc_type = exc.get("type") or "Unknown"

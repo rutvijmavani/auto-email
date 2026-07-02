@@ -1521,7 +1521,9 @@ If `age_minutes > 30` → WARNING.
 
 **Why this matters:**
 
-Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. By default Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (rebuild_redis() restores from PostgreSQL) but you lose that window's scan results and queue state.
+Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. Out of the box, Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (`rebuild_redis()` restores from PostgreSQL) but you lose that window's scan results and queue state.
+
+> **After running `deploy/configure-redis.sh`** (required once on new servers), Redis switches to AOF mode with `appendfsync everysec`. RDB snapshots are replaced by a write-ahead log flushed every 1 second. The 30-minute RDB check becomes permanently green because the last-save timestamp is refreshed continuously.
 
 The watchdog fires at 30 minutes to catch a broken snapshot process (disk full, permissions issue) before the gap becomes catastrophic.
 
@@ -1567,7 +1569,7 @@ Problem detected
 
 Deduplication prevents repeated emails: once an alert fires for a given issue type, it is suppressed for 1 hour so you do not receive the same email repeatedly between attempts.
 
-The watchdog can call `systemctl restart` without a password prompt because `install-systemd.sh` adds a single narrowly-scoped rule to `/etc/sudoers.d/` — it grants exactly this one command, nothing else.
+The watchdog can call systemctl commands without a password prompt because `install-systemd.sh` adds narrowly-scoped rules to `/etc/sudoers.d/mail-pipeline`. The granted commands are: `systemctl reset-failed`, `systemctl restart` (scheduler + watchdog), and `systemctl is-active` (scheduler + watchdog). The deploy workflow additionally needs `systemctl daemon-reload` and `sudo tee` for unit-file sync — those are also included in the sudoers file.
 
 ---
 
@@ -1637,7 +1639,7 @@ What it does, in order:
 1. `git pull` — downloads the latest code
 2. `pip install -r requirements.txt` — picks up any new Python dependencies
 3. `sudo systemctl restart recruiter-scheduler recruiter-watchdog` — restarts both services with the new code
-4. Waits 15 seconds for worker heartbeats to appear in Redis
+4. Waits 70 seconds for worker heartbeats to appear in Redis (the `fullscan_worker` writes every 60 s, so a shorter wait would give a false "no heartbeat" result)
 5. Runs `scripts/health_check.py` to confirm everything came up healthy
 
 If `health_check.py` reports a problem, check the logs:

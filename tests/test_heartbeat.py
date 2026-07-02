@@ -6,14 +6,14 @@ Tests for workers/heartbeat.py — Heartbeat daemon thread.
 Phase 3.2 — Worker heartbeat in Redis.
 Phase 3.3 — Per-PID key format (multi-worker architecture).
 
-Each worker instance writes its own key: worker:alive:{worker_type}:{pid}
-so multiple workers of the same type do not overwrite each other's heartbeat.
+Each worker instance writes its own key: worker:alive:{worker_type}:{hostname}:{pid}
+so multiple workers of the same type (even on different hosts) do not overwrite each other's heartbeat.
 
 Coverage map
 ────────────
   TestHeartbeatClass
     · start() writes the heartbeat key immediately (synchronous, before thread)
-    · Key format is worker:alive:{worker_type}:{pid}
+    · Key format is worker:alive:{worker_type}:{hostname}:{pid}
     · TTL = 3 x interval_s
     · Payload JSON contains pid, ts, processed fields
     · pid field matches os.getpid()
@@ -58,24 +58,26 @@ class TestHeartbeatClass(unittest.TestCase):
     # ── Key format ────────────────────────────────────────────────────────────
 
     def test_key_format_is_worker_alive_type_pid(self):
-        """Written key is 'worker:alive:{worker_type}:{pid}' — per-PID for multi-worker."""
+        """Written key is 'worker:alive:{worker_type}:{hostname}:{pid}'."""
+        import socket
         r = self._make_r()
         from workers.heartbeat import Heartbeat
         hb = Heartbeat(r, "scan_worker", lambda: 0, interval_s=10)
         hb.start()
         hb.stop()
         key = r.set.call_args[0][0]
-        self.assertEqual(key, f"worker:alive:scan_worker:{os.getpid()}")
+        self.assertEqual(key, f"worker:alive:scan_worker:{socket.gethostname()}:{os.getpid()}")
 
     def test_fullscan_worker_key_format(self):
-        """Key uses the exact worker_type string supplied, plus the process PID."""
+        """Key uses the exact worker_type string and hostname:pid suffix."""
+        import socket
         r = self._make_r()
         from workers.heartbeat import Heartbeat
         hb = Heartbeat(r, "fullscan_worker", lambda: 0, interval_s=60)
         hb.start()
         hb.stop()
         key = r.set.call_args[0][0]
-        self.assertEqual(key, f"worker:alive:fullscan_worker:{os.getpid()}")
+        self.assertEqual(key, f"worker:alive:fullscan_worker:{socket.gethostname()}:{os.getpid()}")
 
     def test_two_workers_same_type_write_different_keys(self):
         """

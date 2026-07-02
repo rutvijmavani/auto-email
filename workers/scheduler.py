@@ -1320,6 +1320,16 @@ def adaptive_loop() -> None:
 
     Runs until KeyboardInterrupt or thread stop.
     """
+    def _write_scheduler_heartbeat(r, dispatched: int) -> None:
+        try:
+            r.set("worker:alive:scheduler", json.dumps({
+                "pid":        os.getpid(),
+                "ts":         time.time(),
+                "dispatched": dispatched,
+            }), ex=15)
+        except Exception as _hb_err:
+            logger.debug("scheduler: heartbeat write failed: %s", _hb_err)
+
     r = get_redis()
     _init_consumer_group(r, REDIS_STREAM_ADAPTIVE)
     logger.info("adaptive_loop: started (stream=%s)", REDIS_STREAM_ADAPTIVE)
@@ -1335,15 +1345,7 @@ def adaptive_loop() -> None:
             # ── Scheduler heartbeat (worker:alive:scheduler) ──────────────────
             # Tick is 1s; TTL = 15s.  Watchdog alerts if scheduler loop stops
             # for more than 15 seconds (paused state still writes this key).
-            try:
-                r.set("worker:alive:scheduler", json.dumps({
-                    "pid":        os.getpid(),
-                    "ts":         time.time(),
-                    "dispatched": _hw_dispatched,
-                }), ex=15)
-            except Exception as exc:
-                # Non-fatal — heartbeat key will expire and watchdog will alert.
-                logger.debug("scheduler: heartbeat write failed: %s", exc)
+            _write_scheduler_heartbeat(r, _hw_dispatched)
 
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
@@ -1372,14 +1374,7 @@ def adaptive_loop() -> None:
             for company in due:
                 # Refresh heartbeat at the start of each iteration so backpressure
                 # or outage `continue` branches don't let the 15s TTL expire.
-                try:
-                    r.set("worker:alive:scheduler", json.dumps({
-                        "pid":        os.getpid(),
-                        "ts":         time.time(),
-                        "dispatched": _hw_dispatched,
-                    }), ex=15)
-                except Exception as _hb_err:
-                    logger.warning("adaptive_loop: heartbeat refresh failed: %s", _hb_err)
+                _write_scheduler_heartbeat(r, _hw_dispatched)
 
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
@@ -1555,14 +1550,7 @@ def fullscan_loop() -> None:
             for company in due:
                 # Refresh heartbeat so backpressure `continue` branches don't
                 # let the 15s TTL expire when many companies are due at once.
-                try:
-                    r.set("worker:alive:scheduler", json.dumps({
-                        "pid":        os.getpid(),
-                        "ts":         time.time(),
-                        "dispatched": _hw_dispatched,
-                    }), ex=15)
-                except Exception as _hb_err:
-                    logger.warning("fullscan_loop: heartbeat refresh failed: %s", _hb_err)
+                _write_scheduler_heartbeat(r, _hw_dispatched)
 
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)

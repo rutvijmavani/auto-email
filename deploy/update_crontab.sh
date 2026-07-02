@@ -71,7 +71,7 @@ NEW_CRON=$(echo "$CLEANED" | awk '
     print "# after --monitor-jobs finishes); if absent, runs the monitor now so the"
     print "# digest arrives at most 2 hours late rather than not at all."
     print "# ─────────────────────────────────────────"
-    print "0 9 * * * grep -q '\''exit=0'\'' /home/opc/mail/logs/monitor_$(date +\\%Y-\\%m-\\%d).log 2>/dev/null || /home/opc/mail/run_monitor.sh"
+    print "0 9 * * * grep -q '\''exit=0'\'' /home/opc/mail/logs/monitor_$(date +\\%Y-\\%m-\\%d).log 2>/dev/null || pgrep -qf run_monitor.sh 2>/dev/null || /home/opc/mail/run_monitor.sh"
     next
 }
 { print }

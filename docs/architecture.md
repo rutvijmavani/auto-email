@@ -424,7 +424,7 @@ The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail 
 Each worker writes its own key including its PID:
 
 ```python
-r.set(f"worker:alive:{worker_type}:{os.getpid()}", json.dumps({
+r.set(f"worker:alive:{worker_type}:{_HOSTNAME}:{os.getpid()}", json.dumps({
     "pid": os.getpid(), "ts": time.time(), "processed": count
 }), ex=30)   # TTL = 30 seconds (3× the 10s write interval)
 ```
@@ -436,9 +436,11 @@ Write intervals, TTLs, and dead thresholds per worker type:
 | `scheduler` | ~1 s (every loop tick) | 15 s | 20 s |
 | `scan_worker` | 10 s | 30 s | 45 s |
 | `detail_worker` | 10 s | 30 s | 45 s |
-| `fullscan_worker` | 60 s | 180 s | 1,900 s |
+| `fullscan_worker` | 60 s | 180 s | 1,900 s (≈31 min) |
 
 TTL = 3× the write interval, so two consecutive missed writes are tolerated (Redis blip, GIL stall) before the key disappears.
+
+> **fullscan_worker note:** TTL (180 s) and Dead after (1,900 s) are intentionally different. The heartbeat daemon thread writes every 60 s so the key stays alive as long as the process runs. The 1,900 s "Dead after" threshold checks the embedded `ts` field — if the timestamp is more than 31 minutes stale while the key is still present, the process is likely hung (e.g. stuck waiting on a network response). This is separate from the TTL expiry that fires ~3 minutes after the process actually dies.
 
 **Why a daemon thread — not a loop-top write:**
 
@@ -472,7 +474,12 @@ The scheduler publishes this JSON key on every pool event (worker death, respawn
 - `consecutive_deaths ≥ 3` → **WARNING** — scheduler struggling to keep workers up
 - `consecutive_deaths ≥ 5` → **ERROR** — pool cannot stabilize; startup crash loop
 
-The per-PID keys (`worker:alive:{type}:{pid}`) are scanned by the watchdog for **display only** — showing which PIDs are live in `health_check.py` output and for PEL consumer-liveness checks. No alerting decisions are made from individual per-PID keys.
+The per-PID keys (`worker:alive:{type}:{hostname}:{pid}`) serve three purposes:
+1. **Display** — `health_check.py` scans them to show which PIDs are currently alive.
+2. **PEL consumer-liveness** — the watchdog's `_consumer_pid_alive()` uses them to determine whether a stream PEL entry belongs to a still-running consumer (decides orphan vs. in-progress).
+3. **Stuck-job recovery** — `detail_worker._recover_stuck_jobs()` checks them to decide whether a peer's inflight list should be drained.
+
+No pool-level alerting decisions (crash loops, worker counts) are made from individual per-PID keys — those come from `scheduler:health`.
 
 **Responsibility split:**
 - **Scheduler** — owns worker lifecycle (spawn / replace / scale). Publishes `scheduler:health` so the watchdog can see inside.

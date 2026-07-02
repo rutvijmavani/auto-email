@@ -118,6 +118,12 @@ class Heartbeat:
         self._stop.set()        # unblocks _stop.wait() on the next sleep boundary
         if self._thread.ident is not None:                 # only join if started
             self._thread.join(timeout=self._interval_s + 2)
+            if self._thread.is_alive():
+                logger.warning(
+                    "heartbeat: thread for %r did not exit within timeout — "
+                    "key will expire via TTL",
+                    self._worker_type,
+                )
         try:
             self._r.delete(f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}")
         except Exception as _del_err:

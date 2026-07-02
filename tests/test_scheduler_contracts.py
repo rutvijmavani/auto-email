@@ -977,15 +977,15 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         has_fixed_boundary   = "cycle_start_ts = today_cycle.timestamp()" in src
         has_rolling_window   = "timedelta(hours=24)" in src
         has_fullscan_field   = "last_full_scan_at" in src
-        # Strip comments and triple-quoted strings before checking:
-        # job_monitor.py mentions "last_poll_at" only in docstrings/comments
-        # that explain why it is NOT used — a raw substring search would
-        # false-positive and fail the assertion even when the code is correct.
-        import re as _re
-        _stripped = _re.sub(r'#[^\n]*', '', src)             # remove # comments
-        _stripped = _re.sub(r'""".*?"""', '', _stripped, flags=_re.DOTALL)  # triple-" strings
-        _stripped = _re.sub(r"'''.*?'''", '', _stripped, flags=_re.DOTALL)  # triple-' strings
-        has_adaptive_field   = "last_poll_at" in _stripped   # adaptive-scan field (wrong alias)
+        # Use ast.walk to check for last_poll_at as an actual Name node in code.
+        # Raw substring or regex approaches would false-positive on comments and
+        # docstrings that explain why last_poll_at is NOT used.
+        import ast as _ast
+        _tree = _ast.parse(src)
+        has_adaptive_field = any(
+            isinstance(node, _ast.Name) and node.id == "last_poll_at"
+            for node in _ast.walk(_tree)
+        )
 
         self.assertFalse(has_fixed_boundary,
             "job_monitor.py still uses 'today_cycle.timestamp()' as cycle boundary — "

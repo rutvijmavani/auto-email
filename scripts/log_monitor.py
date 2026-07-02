@@ -455,7 +455,12 @@ def process_findings(
                 # Do NOT write err_key to Redis here: writing before the email
                 # is sent would suppress the alert for 7 days if the send fails.
                 # err_key is written in main() after a successful send.
-                new_errors[fp] = record
+                if fp in new_errors:
+                    # Same fingerprint appeared twice in this scan — accumulate.
+                    new_errors[fp]["count"] += 1
+                    new_errors[fp]["last_seen"] = now
+                else:
+                    new_errors[fp] = record
             else:
                 # Known error — update last_seen + count, don't alert
                 try:

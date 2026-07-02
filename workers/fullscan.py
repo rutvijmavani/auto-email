@@ -146,6 +146,14 @@ logger = get_logger(__name__)
 WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
 _CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
 
+# Shared EMA alpha for fullscan duration: used in _complete_fullscan_db,
+# _run_fullscan, and the deadline guard in _pick_schedule_time.
+_EMA_ALPHA = 0.3
+
+# Conservative seed for avg_fullscan_duration_s on first scan.
+# Matches db/schema.py DEFAULT 1800.0 — overwritten after first real scan.
+_AVG_DURATION_SEED = 1800.0
+
 # How many jobs to process per "page chunk" before checking for pause.
 # Phase 7 will replace this with actual per-page HTTP fetching.
 FULLSCAN_CHUNK_SIZE = 50
@@ -515,7 +523,7 @@ def _get_fullscan_state(company: str) -> dict:
             "full_scan_interval_s":    row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S,
             "last_poll_at":            row["last_poll_at"],
             "last_full_scan_at":       row["last_full_scan_at"],
-            "avg_fullscan_duration_s": float(row["avg_fullscan_duration_s"] or 30.0),
+            "avg_fullscan_duration_s": float(row["avg_fullscan_duration_s"] or _AVG_DURATION_SEED),
         }
     finally:
         conn.close()
@@ -550,7 +558,7 @@ def _complete_fullscan_db(
     new_jobs: int,
     interval_s: int,
     duration_s: float,
-    prev_avg_duration_s: float = 30.0,
+    prev_avg_duration_s: float = _AVG_DURATION_SEED,
     next_scan_ts: float = 0.0,
 ) -> bool:
     """
@@ -571,37 +579,29 @@ def _complete_fullscan_db(
         midpoint + avg_fullscan_duration_s >= next 7 AM deadline
     ensuring every scheduled scan can finish before the daily digest.
     """
-    _EMA_ALPHA = 0.3
-    new_avg    = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * prev_avg_duration_s
+    new_avg = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * prev_avg_duration_s
 
     conn = get_conn()
     try:
-        # Use the exact Redis-scheduled timestamp when available so the DB and
-        # the ZSET always agree on next_full_scan_at.  Fall back to NOW()+interval
-        # if next_scan_ts was not supplied (e.g. called from a test or legacy path).
-        _next_ts_expr = (
-            "to_timestamp(%s::double precision)"
-            if next_scan_ts else
-            "NOW() + (%s * INTERVAL '1 second')"
-        )
-        _next_ts_val = next_scan_ts if next_scan_ts else interval_s
-
-        conn.execute(  # noqa: S608 — _next_ts_expr is a hard-coded literal, not user input
-            f"""
+        # Two fully-static SQL branches — no f-string — to avoid S608 linting.
+        # next_scan_ts is either an exact Redis-scheduled Unix timestamp (preferred)
+        # or 0 (fall back to NOW()+interval for legacy/test callers).
+        if next_scan_ts:
+            _sql = """
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
                  total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
                  updated_at)
             VALUES
-                (%s, %s, NOW(), {_next_ts_expr},
+                (%s, %s, NOW(), to_timestamp(%s::double precision),
                  FALSE, NULL, NULL,
                  %s, %s, %s,
                  NOW())
             ON CONFLICT (company) DO UPDATE SET
                 ats_platform             = EXCLUDED.ats_platform,
                 last_full_scan_at        = NOW(),
-                next_full_scan_at        = {_next_ts_expr},
+                next_full_scan_at        = to_timestamp(%s::double precision),
                 full_scan_interrupted    = FALSE,
                 interrupted_at_page      = NULL,
                 interrupted_at           = NULL,
@@ -609,9 +609,37 @@ def _complete_fullscan_db(
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-        """,
-            (company, platform, _next_ts_val, new_jobs, int(duration_s), new_avg,
-             _next_ts_val, new_jobs, int(duration_s), new_avg))
+            """
+            _params = (company, platform, next_scan_ts, new_jobs, int(duration_s), new_avg,
+                       next_scan_ts, new_jobs, int(duration_s), new_avg)
+        else:
+            _sql = """
+            INSERT INTO company_poll_stats
+                (company, ats_platform, last_full_scan_at, next_full_scan_at,
+                 full_scan_interrupted, interrupted_at_page, interrupted_at,
+                 total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
+                 updated_at)
+            VALUES
+                (%s, %s, NOW(), NOW() + (%s * INTERVAL '1 second'),
+                 FALSE, NULL, NULL,
+                 %s, %s, %s,
+                 NOW())
+            ON CONFLICT (company) DO UPDATE SET
+                ats_platform             = EXCLUDED.ats_platform,
+                last_full_scan_at        = NOW(),
+                next_full_scan_at        = NOW() + (%s * INTERVAL '1 second'),
+                full_scan_interrupted    = FALSE,
+                interrupted_at_page      = NULL,
+                interrupted_at           = NULL,
+                total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
+                last_fullscan_duration_s = %s,
+                avg_fullscan_duration_s  = %s,
+                updated_at               = NOW()
+            """
+            _params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
+                       interval_s, new_jobs, int(duration_s), new_avg)
+
+        conn.execute(_sql, _params)
         conn.commit()
         return True
     except Exception as exc:
@@ -1111,14 +1139,13 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             #   Day 1: all companies in a tight cluster -> each gets a different gap midpoint
             #   Day 2: midpoints now spread across the window -> gaps rebalance further
             #   Day 3+: stable maximum-spread distribution maintained automatically
-            avg_duration_s = fs_state.get("avg_fullscan_duration_s", 30.0)
+            avg_duration_s = fs_state.get("avg_fullscan_duration_s", _AVG_DURATION_SEED)
             duration_s     = time.monotonic() - start_mono
 
-            # Compute the updated EMA using the same alpha as _complete_fullscan_db so
-            # the deadline guard in _pick_schedule_time reflects current performance.
+            # Compute the updated EMA using the module-level _EMA_ALPHA so the
+            # deadline guard in _pick_schedule_time reflects current performance.
             # Without this, a scan that suddenly took 4 h would still schedule the
-            # next one using the old "30 s" average — risking a digest collision.
-            _EMA_ALPHA           = 0.3   # must match _complete_fullscan_db
+            # next one using the old seed average — risking a digest collision.
             updated_avg_duration = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * avg_duration_s
 
             # _atomic_schedule: gap-detection + ZADD under a short Redis lock so
@@ -1153,7 +1180,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     "next_scan_in=%.1fh avg_duration=%.0fs",
                     company, new_count, duration_s,
                     (next_scan_at - now) / 3600,
-                    0.3 * duration_s + 0.7 * avg_duration_s,
+                    updated_avg_duration,
                 )
 
                 # ── Bootstrap new companies into WARMING adaptive cycle ───────

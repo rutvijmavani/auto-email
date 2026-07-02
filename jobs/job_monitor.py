@@ -221,27 +221,8 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     company_names = [c["company"] for c in companies]
 
-    conn = get_conn()
-    try:
-        rows = conn.execute("""
-            SELECT company,
-                   EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
-            FROM company_poll_stats
-            WHERE company = ANY(%s)
-        """, (company_names,)).fetchall()
-    finally:
-        conn.close()
-
-    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
-    # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
-    # smart early exit and may not have seen every page.  Only a completed fullscan
-    # guarantees the DB is comprehensive for this company's current board.
-    scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
-
-    # Exclude companies whose fullscan_worker is actively running right now.
-    # A Workday scan can take 20-30 minutes; without this check, --monitor-jobs
-    # would fallback-fetch the same company mid-scan, wasting HTTP calls and
-    # potentially sending duplicate jobs to the detail queue.
+    # Take the Redis inflight snapshot FIRST so companies that start a fullscan
+    # between the DB read and the Redis read cannot be misclassified as missed.
     inflight: set = set()
     try:
         from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
@@ -268,6 +249,23 @@ def _get_worker_missed_companies(companies: list) -> tuple:
             "(%s) — proceeding without exclusion (may do extra work)",
             exc,
         )
+
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT company,
+                   EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
+            FROM company_poll_stats
+            WHERE company = ANY(%s)
+        """, (company_names,)).fetchall()
+    finally:
+        conn.close()
+
+    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
+    # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
+    # smart early exit and may not have seen every page.  Only a completed fullscan
+    # guarantees the DB is comprehensive for this company's current board.
+    scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
 
     missed          = []
     in_flight_names = set()
@@ -477,6 +475,7 @@ def run():
                             _confirmed_done = {r["company"] for r in _vrows}
                             _db_ok = True
                         finally:
+                            _vconn.rollback()   # end implicit transaction before returning to pool
                             _vconn.close()
                     except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(

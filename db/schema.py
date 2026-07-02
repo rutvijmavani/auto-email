@@ -854,7 +854,7 @@ def init_db():
         #     skip if midpoint + avg_fullscan_duration_s >= next_7am_deadline
         # EMA formula (a=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
         ("last_fullscan_duration_s", "INTEGER"),
-        ("avg_fullscan_duration_s",  "DOUBLE PRECISION DEFAULT 30.0"),
+        ("avg_fullscan_duration_s",  "DOUBLE PRECISION DEFAULT 1800.0"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
