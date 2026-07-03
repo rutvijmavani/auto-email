@@ -32,7 +32,10 @@ Restart=always
 RestartSec=10s
 
 # ── Sandboxing ───────────────────────────────────────────────────────────────
-NoNewPrivileges=true
+# NoNewPrivileges is intentionally omitted: the watchdog calls
+# "sudo systemctl restart recruiter-scheduler" for self-healing, which requires
+# the setuid bit on /usr/bin/sudo to work. NoNewPrivileges=true disables setuid
+# and would break that path.
 PrivateTmp=true
 # read-only (not strict) — WorkingDirectory is under /home
 ProtectHome=read-only

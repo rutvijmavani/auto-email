@@ -635,7 +635,8 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
 
     _EMA_ALPHA = 0.3
 
-    def _run(self, duration_s, prev_avg=30.0, new_jobs=0, company="Acme"):
+    def _run(self, duration_s, prev_avg=30.0, new_jobs=0, company="Acme",
+             next_scan_ts=0.0):
         """
         Call _complete_fullscan_db() with a mocked DB connection.
         Returns the SQL params passed to conn.execute().
@@ -662,6 +663,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
                 new_jobs=new_jobs, interval_s=86400,
                 duration_s=duration_s,
                 prev_avg_duration_s=prev_avg,
+                next_scan_ts=next_scan_ts,
             )
 
         return captured
@@ -734,6 +736,31 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
         result = self._run(duration_s=0.0, prev_avg=prev_avg)
         actual_avg = result["params"][5]
         self.assertAlmostEqual(actual_avg, expected, places=3)
+
+    def test_next_scan_ts_branch_uses_to_timestamp(self):
+        """When next_scan_ts is provided, SQL uses to_timestamp() not NOW()+interval."""
+        duration  = 900.0
+        prev_avg  = 1800.0
+        ts        = 1_700_000_000.0
+        expected  = self._EMA_ALPHA * duration + (1 - self._EMA_ALPHA) * prev_avg
+
+        result = self._run(duration_s=duration, prev_avg=prev_avg, next_scan_ts=ts)
+        sql    = result["sql"]
+        params = result["params"]
+
+        self.assertIn("to_timestamp", sql,
+                      "next_scan_ts branch must use to_timestamp(), not NOW()+interval")
+        self.assertNotIn("INTERVAL '1 second'", sql,
+                         "next_scan_ts branch must NOT use the NOW()+interval fallback")
+        # params for to_timestamp branch:
+        # (company, platform, next_scan_ts, new_jobs, int(duration_s), new_avg,
+        #  next_scan_ts, new_jobs, int(duration_s), new_avg)
+        self.assertEqual(params[2], ts, "INSERT next_scan_ts mismatch")
+        self.assertEqual(params[6], ts, "UPDATE next_scan_ts mismatch")
+        self.assertAlmostEqual(params[5], expected, places=3,
+                               msg="INSERT EMA mismatch")
+        self.assertAlmostEqual(params[9], expected, places=3,
+                               msg="UPDATE EMA must match INSERT EMA")
 
     def test_persistence_contract(self):
         """_complete_fullscan_db returns True, commits, and INSERT/UPDATE share the same EMA."""

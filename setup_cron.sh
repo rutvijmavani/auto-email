@@ -505,9 +505,11 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # LOG MONITOR — every 15 minutes
-# Scans log files for new ERRORs / tracebacks since last run.
-# Sends a batched email alert (max once per hour) if anything actionable
-# is found.  State tracked in data/log_monitor_state.json.
+# Scans log files for new ERRORs / tracebacks since the last byte offset.
+# Sends an immediate alert email per new error fingerprint (Redis-deduped
+# so each unique issue emails at most once per hour).  A separate 3-day
+# digest collects all seen fingerprints.
+# State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
 */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 

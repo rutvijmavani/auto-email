@@ -1002,8 +1002,12 @@ def run_worker(once: bool = False, shutdown_event=None,
                                     _r_job_id, _dp_err,
                                 )
                             else:
-                                # DB row removed — safe to drop from inflight.
+                                # DB row removed — safe to drop from inflight and clear retry counter.
                                 r.lrem(inflight_key, 1, raw)
+                                try:
+                                    r.delete(_rkey)
+                                except Exception:
+                                    pass   # non-fatal — TTL will expire it
                                 _r_discard = True
                         else:
                             # Exponential backoff: 1s, 2s, 4s, 8s, 16s … capped.

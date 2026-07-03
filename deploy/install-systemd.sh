@@ -117,6 +117,7 @@ cat > "$SUDOERS_FILE" << EOF
 # Path = $(which systemctl) → resolved to $SYSTEMCTL_BIN
 # Watchdog commands:
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
@@ -154,21 +155,31 @@ for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pi
     echo "  Installed: $dst"
 done
 
-# ── Reload systemd + enable + start ──────────────────────────────────────────
+# ── Reload systemd + enable (+ optionally start) ─────────────────────────────
+# Pass --no-start as $1 to install/enable units without starting them.
+# Used by first_time_setup.sh, which controls the start sequence itself (must
+# configure Redis AOF durability before any services run).
+_NO_START="${1:-}"
+
 echo ""
-echo "► Enabling and starting services..."
+echo "► Enabling services (daemon-reload + enable)..."
 systemctl daemon-reload
 
 systemctl enable recruiter-scheduler
 systemctl enable recruiter-watchdog
 
-systemctl start recruiter-scheduler
-echo "  Started recruiter-scheduler"
-sleep 5   # give scheduler time to spawn workers and write heartbeats
+if [[ "$_NO_START" == "--no-start" ]]; then
+    echo "  --no-start specified — skipping service start (caller manages startup)"
+else
+    echo "► Starting services..."
+    systemctl start recruiter-scheduler
+    echo "  Started recruiter-scheduler"
+    sleep 5   # give scheduler time to spawn workers and write heartbeats
 
-systemctl start recruiter-watchdog
-echo "  Started recruiter-watchdog"
-sleep 3
+    systemctl start recruiter-watchdog
+    echo "  Started recruiter-watchdog"
+    sleep 3
+fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
 echo ""

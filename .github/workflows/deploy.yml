@@ -110,6 +110,7 @@ jobs:
             done
 
             echo "[8/8] Verifying services are active..."
+            sleep 3   # brief settle: systemctl restart returns once the process starts, not fully active
             for svc in recruiter-scheduler recruiter-watchdog; do
               if ! systemctl is-active --quiet "$svc"; then
                 echo "[ERROR] $svc failed to start after restart:"
@@ -141,6 +142,7 @@ jobs:
               done
 
               echo "[ROLLBACK] Verifying rollback services are active..."
+              sleep 3
               for svc in recruiter-scheduler recruiter-watchdog; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"

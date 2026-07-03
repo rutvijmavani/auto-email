@@ -965,6 +965,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                    and waited < 300):
                 if shutdown_event and shutdown_event.is_set():
                     logger.info("fullscan [%s]: shutdown during backpressure wait", company)
+                    try:
+                        _write_checkpoint(company, page_num)
+                    except Exception:
+                        pass
                     result["outcome"] = "shutdown"
                     return result
                 time.sleep(10)
@@ -977,6 +981,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         for chunk_start in range(0, max(len(title_matched), 1), FULLSCAN_CHUNK_SIZE):
             if shutdown_event and shutdown_event.is_set():
                 logger.info("fullscan [%s]: shutdown during chunk processing", company)
+                try:
+                    _write_checkpoint(company, page_num)
+                except Exception:
+                    pass
                 result["outcome"] = "shutdown"
                 return result
             chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]

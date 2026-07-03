@@ -223,8 +223,8 @@ def _load_offsets() -> dict[str, int]:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text()).get("offsets", {})
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[log_monitor] _load_offsets: failed to read state ({exc}) — starting from 0")
     return {}
 
 
@@ -232,8 +232,8 @@ def _load_inodes() -> dict[str, int]:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text()).get("inodes", {})
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[log_monitor] _load_inodes: failed to read state ({exc}) — no inode tracking")
     return {}
 
 
@@ -288,16 +288,18 @@ def scan_file(
     while i < len(lines):
         line = lines[i].rstrip()
         if line and not _is_suppressed(line) and _is_flagged(line):
-            end_j = min(i + 1 + CONTEXT_LINES, len(lines))
-            context = [
-                lines[j].rstrip()
-                for j in range(i + 1, end_j)
-                if lines[j].strip() and not _is_suppressed(lines[j])
-            ]
+            context = []
+            for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines))):
+                ctx_raw = lines[j]
+                ctx     = ctx_raw.rstrip()
+                # Stop context at the next independently-flagged line so it can
+                # be reported as its own finding rather than swallowed as context.
+                if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
+                    break
+                if ctx and not _is_suppressed(ctx_raw):
+                    context.append(ctx)
             findings.append((line, context))
-            i = end_j   # skip already-captured context so those lines aren't re-flagged
-        else:
-            i += 1
+        i += 1
 
     return new_offset, findings
 

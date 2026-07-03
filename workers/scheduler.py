@@ -999,7 +999,7 @@ def _atomic_schedule(
     tolerance_pct: float,
     *,
     deadline_ts:    Optional[float] = None,
-    avg_duration_s: float           = 30.0,
+    avg_duration_s: float           = 1800.0,
 ) -> float:
     """
     Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
@@ -1165,7 +1165,7 @@ def on_fullscan_complete(company: str, new_jobs: int,
         return
 
     interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
-    avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
+    avg_duration_s = float(row.get("avg_fullscan_duration_s") or 1800.0)
 
     if success:
         # _atomic_schedule: gap-detection + ZADD under a short Redis lock.

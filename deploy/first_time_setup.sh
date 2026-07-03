@@ -134,15 +134,10 @@ echo "════════════════════════�
 echo "  STEP 1 — Installing systemd service units"
 echo "════════════════════════════════════════════════════════════"
 
-bash "$DEPLOY_DIR/install-systemd.sh"
+bash "$DEPLOY_DIR/install-systemd.sh" --no-start
 
-# Stop the services that install-systemd.sh just started — they must not run
-# until Redis AOF durability is configured (Step 2), otherwise any work queued
-# in the first seconds runs on an un-persisted Redis and is at risk of loss.
-echo ""
-echo "  Stopping services temporarily until Redis AOF is configured..."
-sudo systemctl stop recruiter-scheduler recruiter-watchdog 2>/dev/null || true
-echo "  ✓ Step 1 complete — units installed, services stopped pending Redis config"
+echo "  ✓ Step 1 complete — units installed and enabled, services NOT started yet"
+echo "    (services start in Step 2b after Redis AOF durability is configured)"
 
 # ─────────────────────────────────────────
 # STEP 2 — REDIS AOF PERSISTENCE

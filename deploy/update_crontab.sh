@@ -81,9 +81,11 @@ NEW_CRON="${NEW_CRON}
 
 # ─────────────────────────────────────────
 # LOG MONITOR — every 15 minutes
-# Scans log files for new ERRORs / tracebacks since last run.
-# Sends a batched email alert (max once per hour) if anything actionable
-# is found.  State tracked in data/log_monitor_state.json.
+# Scans log files for new ERRORs / tracebacks since the last byte offset.
+# Sends an immediate alert email per new error fingerprint (Redis-deduped
+# so each unique issue emails at most once per hour).  A separate 3-day
+# digest collects all seen fingerprints.
+# State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
 */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_\$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
@@ -97,12 +99,23 @@ NEW_CRON="${NEW_CRON}
 # ─────────────────────────────────────────
 0 */4 * * * python3 -c \"import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]\" >> /dev/null 2>&1"
 
-# ── Validate 9 AM retry entry before installing ───────────────────────────────
+# ── Validate required sections before installing ──────────────────────────────
+_cron_ok=1
 if ! echo "$NEW_CRON" | grep -q "0 9.*run_monitor\.sh"; then
-    echo ""
     echo "  [WARN] 9 AM retry job is missing from the new crontab template."
     echo "         Expected format: 0 9 * * * .../run_monitor.sh"
-    echo "         Aborting — crontab was NOT changed."
+    _cron_ok=0
+fi
+if ! echo "$NEW_CRON" | grep -q "log_monitor\.py"; then
+    echo "  [WARN] LOG MONITOR section is missing from the new crontab template."
+    _cron_ok=0
+fi
+if ! echo "$NEW_CRON" | grep -q "hashlib.*range(100000)"; then
+    echo "  [WARN] KEEP-ALIVE section is missing from the new crontab template."
+    _cron_ok=0
+fi
+if [[ "$_cron_ok" -eq 0 ]]; then
+    echo "  Aborting — crontab was NOT changed."
     exit 1
 fi
 

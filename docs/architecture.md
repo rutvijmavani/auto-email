@@ -748,7 +748,7 @@ Problem detected
 
 Deduplication prevents repeated emails for the same issue: the same alert type is suppressed for 1 hour so you do not receive a flood of identical messages between healing attempts.
 
-The watchdog can call `systemctl restart` without a password because `install-systemd.sh` adds a single narrowly-scoped sudoers rule granting exactly that one command — nothing else.
+The watchdog can call `sudo systemctl restart` without a password because `install-systemd.sh` writes a narrowly-scoped sudoers rule that grants exactly the following commands — nothing else: `systemctl reset-failed recruiter-scheduler`, `systemctl restart recruiter-scheduler`, `systemctl restart recruiter-watchdog`, `systemctl is-active recruiter-scheduler`, `systemctl is-active recruiter-watchdog`, `systemctl daemon-reload`, and `sudo tee` writes to `/etc/systemd/system/recruiter-*.service` for deploy-time unit sync.
 
 ### Startup validation
 

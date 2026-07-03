@@ -10,7 +10,9 @@ Usage (called by systemd, not directly):
     python scripts/startup_failure_alert.py recruiter-watchdog
 
 This is a one-shot script: send one email and exit.
-Redis dedup key prevents duplicate emails if systemd re-triggers it.
+A flag file under run/ prevents duplicate emails if systemd re-triggers it
+(Redis is intentionally avoided here — it may be unavailable when the service
+is crashing).
 
 Trigger condition:
     StartLimitBurst=5 + StartLimitIntervalSec=300s in the service unit means:
