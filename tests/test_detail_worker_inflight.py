@@ -704,11 +704,15 @@ class TestRetryBehavior(unittest.TestCase):
         self.assertNotIn("|", key)
 
     def test_retry_key_company_with_colon_no_collision(self):
-        """Company names that contain ':' must not collide with bare job_id keys."""
-        key_with    = self._expected_rkey("co:name", "job1")
-        key_without = self._expected_rkey("", "co:name|job1")
-        self.assertNotEqual(key_with, key_without,
-                            "key with company must differ from bare job_id key")
+        """
+        With the old ':' separator, company='co:name' + job_id='job1' and
+        company='co' + job_id='name:job1' both produced 'detail:retry:co:name:job1'.
+        With '|' separator the two keys are distinct.
+        """
+        key_a = self._expected_rkey("co:name", "job1")    # → detail:retry:co:name|job1
+        key_b = self._expected_rkey("co", "name:job1")    # → detail:retry:co|name:job1
+        self.assertNotEqual(key_a, key_b,
+                            "different (company, job_id) pairs must not share a key")
 
     def test_retry_counter_incremented_on_failure(self):
         """incr() is called on the retry key when a processing failure occurs."""

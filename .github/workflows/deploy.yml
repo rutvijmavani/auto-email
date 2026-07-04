@@ -61,6 +61,16 @@ jobs:
             set -e
             cd ${{ secrets.VM_PATH }}
 
+            # Pre-flight: /usr/local/bin/install-pipeline-units must already exist on
+            # the VM — it is created once by "sudo bash deploy/install-systemd.sh".
+            # If it is missing, steps [6/8] will fail under set -e and the trap below
+            # will roll back to PREVIOUS_SHA automatically.
+            if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
+              echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
+              echo "        Run 'sudo bash deploy/install-systemd.sh' once on the VM to provision it."
+              exit 1
+            fi
+
             echo "[1/8] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
@@ -69,6 +79,19 @@ jobs:
             echo "[2/8] Fetching latest code..."
             git fetch --all
             PREVIOUS_SHA=$(git rev-parse HEAD)
+
+            # Early-failure rollback trap: if any step before the health-check
+            # rollback fires fails, revert to PREVIOUS_SHA so the VM is not left
+            # on the new (potentially broken) commit with services still running old code.
+            _early_rollback() {
+              local _exit=$?
+              echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
+              git checkout -B main "$PREVIOUS_SHA" || echo "[FATAL] git rollback failed"
+              pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
+              echo "[ROLLBACK] Reverted to $PREVIOUS_SHA"
+              exit $_exit
+            }
+            trap '_early_rollback' ERR
 
             echo "[3/8] Checking out exact validated commit..."
             git checkout -B main ${{ github.sha }}
@@ -95,6 +118,9 @@ jobs:
             echo "  systemd unit files installed"
             sudo systemctl daemon-reload
             echo "  systemd daemon reloaded"
+
+            # Hand off from early-failure trap to the full health-check rollback below.
+            trap - ERR
 
             echo "[7/8] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do

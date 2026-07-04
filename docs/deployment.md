@@ -1525,7 +1525,7 @@ If `age_minutes > 30` → WARNING.
 
 Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. Out of the box, Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (`rebuild_redis()` restores from PostgreSQL) but you lose that window's scan results and queue state.
 
-> **After running `deploy/configure-redis.sh`** (required once on new servers), Redis switches to AOF mode with `appendfsync everysec`. RDB snapshots are replaced by a write-ahead log flushed every 1 second. The 30-minute RDB check becomes permanently green because the last-save timestamp is refreshed continuously.
+> **After running `deploy/configure-redis.sh`** (required once on new servers), Redis switches to AOF mode with `appendfsync everysec`. RDB snapshots are replaced by a write-ahead log flushed every 1 second. The 30-minute stale-RDB warning is permanently suppressed: `check_redis_persistence()` skips the age check when `aof_enabled` is true, because AOF provides ~1 second durability and the `rdb_last_save_time` metric is no longer meaningful.
 
 The watchdog fires at 30 minutes to catch a broken snapshot process (disk full, permissions issue) before the gap becomes catastrophic.
 
@@ -1544,7 +1544,7 @@ What it does:
 4. Patches `redis.conf` so settings survive a Redis restart
 5. Triggers initial `BGREWRITEAOF` to compact the file immediately
 
-After running this, the 30-minute RDB check is permanently green — AOF writes continuously so the last-save timestamp is always recent.
+After running this, the 30-minute stale-RDB warning is permanently suppressed — `check_redis_persistence()` skips the staleness check when `aof_enabled` is true.
 
 **AOF file size — automatic compaction:**
 

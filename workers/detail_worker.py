@@ -295,7 +295,9 @@ def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     Priority-aware pop with at-least-once guarantee via inflight list.
 
     1. Try non-blocking LMOVE from adaptive first (high priority).
-    2. If adaptive is empty, try non-blocking LMOVE from fullscan.
+    2. If adaptive is empty, block on BLMOVE from fullscan for up to 1 s,
+       then re-check adaptive.  This avoids a busy-poll loop while still
+       picking up adaptive items within ~1 s of enqueue.
     3. If both empty, sleep briefly and retry until timeout.
 
     Returns (source_queue_key, raw_payload) or None on timeout.
@@ -305,22 +307,23 @@ def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     a successful DB write (LREM in the main loop).
     """
     deadline = time.monotonic() + timeout
-    poll_interval = 0.2   # seconds between empty-queue polls
 
     while time.monotonic() < deadline:
-        # ── Adaptive first (high priority) ───────────────────────────────────
+        # ── Adaptive first (high priority, non-blocking) ──────────────────────
         raw = r.lmove(REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE, "RIGHT", "LEFT")
         if raw is not None:
             return (REDIS_DETAIL_ADAPTIVE, raw)
 
-        # ── Fullscan fallback (low priority) ─────────────────────────────────
-        raw = r.lmove(REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN, "RIGHT", "LEFT")
+        # ── Fullscan fallback — block for up to 1 s ───────────────────────────
+        # Use BLMOVE so we yield the thread while waiting rather than busy-polling.
+        # Cap the wait at 1 s so adaptive items are re-checked frequently.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait_s = min(1.0, remaining)
+        raw = r.blmove(REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN, wait_s, "RIGHT", "LEFT")
         if raw is not None:
             return (REDIS_DETAIL_FULLSCAN, raw)
-
-        # ── Both empty — wait briefly before next poll ────────────────────────
-        remaining = deadline - time.monotonic()
-        time.sleep(min(poll_interval, max(0, remaining)))
 
     return None
 

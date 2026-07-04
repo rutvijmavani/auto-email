@@ -83,14 +83,6 @@ class Heartbeat:
                 f"Heartbeat interval_s must be > 0, got {interval_s!r}. "
                 "Zero or negative values cause a busy-spin that hammers Redis."
             )
-        # Ensure the client used for heartbeat writes has a finite socket timeout
-        # so _write() and stop() never block the daemon thread indefinitely if
-        # Redis stalls.  setdefault leaves an existing timeout unchanged.
-        try:
-            r.connection_pool.connection_kwargs.setdefault('socket_timeout', 5)
-            r.connection_pool.connection_kwargs.setdefault('socket_connect_timeout', 3)
-        except Exception:
-            pass
         self._r           = r
         self._worker_type = worker_type
         self._get_count   = get_count

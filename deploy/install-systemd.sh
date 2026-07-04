@@ -141,7 +141,12 @@ echo "  Wrapper installed: $UNIT_INSTALL_BIN"
 # This script detects the same path and writes it into sudoers so they match.
 echo ""
 echo "► Adding sudoers rule for watchdog self-healing..."
-SYSTEMCTL_BIN="$(which systemctl)"
+SYSTEMCTL_BIN="$(which systemctl 2>/dev/null || true)"
+if [[ -z "$SYSTEMCTL_BIN" ]]; then
+    echo "[ERROR] systemctl not found in PATH — cannot create sudoers rule"
+    echo "        Ensure systemd is installed and systemctl is on PATH."
+    exit 1
+fi
 echo "  systemctl resolved to: $SYSTEMCTL_BIN"
 
 SUDOERS_FILE="/etc/sudoers.d/mail-pipeline"

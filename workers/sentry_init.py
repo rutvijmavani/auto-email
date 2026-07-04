@@ -30,9 +30,9 @@ How fingerprinting works:
   (filename + line number).  This is more stable than text-pattern matching
   in log files because variable-length error messages don't affect it.
 
-  Example fingerprint inputs:
-    TypeError   + db/pipeline_alerts.py:385   →  md5("TypeError:pipeline_alerts.py:385")[:16]
-    DataError   + workers/scheduler.py:268    →  md5("DataError:scheduler.py:268")[:16]
+  Example fingerprint inputs (full relative path + line, hashed with SHA-256):
+    TypeError   + db/pipeline_alerts.py:385   →  sha256("TypeError:db/pipeline_alerts.py:385")[:16]
+    DataError   + workers/scheduler.py:268    →  sha256("DataError:workers/scheduler.py:268")[:16]
 
 Setup:
   1. pip install sentry-sdk loguru-sentry-handler   (or: sentry-sdk[loguru])

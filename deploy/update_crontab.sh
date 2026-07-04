@@ -29,29 +29,37 @@ echo "► Updating crontab (monitor retry + keep-alive frequency)..."
 # ── Capture existing crontab ──────────────────────────────────────────────────
 EXISTING=$(crontab -l 2>/dev/null || true)
 
-# ── Remove lines we are replacing ────────────────────────────────────────────
-# Removes: old keep-alive (*/4 days or every 4 days), any existing retry line.
-# Leaves everything else intact.
-CLEANED=$(echo "$EXISTING" \
-  | grep -v "monitor_.*log.*run_monitor"              \
-  | grep -v "MONITOR RETRY"                           \
-  | grep -v "missed.*VM suspension"                   \
-  | grep -v "9 AM fallback"                           \
-  | grep -v "Runs only if the 7 AM job"               \
-  | grep -v "Checks for exit=0 in today"              \
-  | grep -v "digest arrives at most"                  \
-  | grep -v "scripts/log_monitor\.py\|log_monitor_.*\.log" \
-  | grep -v "LOG MONITOR"                             \
-  | grep -v "Scans log files for new ERRORs"          \
-  | grep -v "Sends a batched email alert"             \
-  | grep -v "State tracked in data/log_monitor"       \
-  | grep -v "hashlib.*range(100000)"                  \
-  | grep -v "KEEP-ALIVE"                              \
-  | grep -v "Prevents Oracle Cloud"                   \
-  | grep -v "VM was being suspended"                  \
-  | grep -v "every 4 days"                            \
-  | grep -v "every 4 hours"                           \
-  || true)
+# ── Remove the entire pipeline block (marker-delimited) ──────────────────────
+# setup_cron.sh wraps all pipeline entries between BEGIN/END markers.
+# Strip that whole block so re-inserting the updated entries does not
+# create duplicates regardless of which script installed the crontab.
+# Fall back to grep-based cleanup for legacy crontabs without markers.
+if echo "$EXISTING" | grep -q "# === BEGIN RECRUITER PIPELINE ==="; then
+    CLEANED=$(echo "$EXISTING" | \
+        sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
+else
+    # Legacy crontab (no markers): remove only the specific lines being replaced.
+    CLEANED=$(echo "$EXISTING" \
+      | grep -v "monitor_.*log.*run_monitor"              \
+      | grep -v "MONITOR RETRY"                           \
+      | grep -v "missed.*VM suspension"                   \
+      | grep -v "9 AM fallback"                           \
+      | grep -v "Runs only if the 7 AM job"               \
+      | grep -v "Checks for exit=0 in today"              \
+      | grep -v "digest arrives at most"                  \
+      | grep -v "scripts/log_monitor\.py\|log_monitor_.*\.log" \
+      | grep -v "LOG MONITOR"                             \
+      | grep -v "Scans log files for new ERRORs"          \
+      | grep -v "Sends a batched email alert"             \
+      | grep -v "State tracked in data/log_monitor"       \
+      | grep -v "hashlib.*range(100000)"                  \
+      | grep -v "KEEP-ALIVE"                              \
+      | grep -v "Prevents Oracle Cloud"                   \
+      | grep -v "VM was being suspended"                  \
+      | grep -v "every 4 days"                            \
+      | grep -v "every 4 hours"                           \
+      || true)
+fi
 
 # ── Build the new crontab ─────────────────────────────────────────────────────
 # We inject the retry guard immediately after the 7 AM monitor line and append

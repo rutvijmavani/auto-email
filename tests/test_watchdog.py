@@ -951,17 +951,20 @@ class TestCheckPelHealthPID(unittest.TestCase):
         # _consumer_pid_alive() calls r.exists(f"worker:alive:{type}:{hostname}:{pid}")
         # Require the full worker:alive:{type}:{hostname}:{pid} key shape so the
         # mock fails if the code falls back to a legacy PID-only key format.
-        import socket as _socket
-        _test_hostname = _socket.gethostname()
+        #
+        # The hostname must be derived from consumer_name the same way
+        # _consumer_pid_alive() does it — via rpartition("-") + removeprefix("worker-")
+        # — NOT from socket.gethostname(), which may differ on the test machine.
+        _cn_str = consumer_name.decode() if isinstance(consumer_name, bytes) else consumer_name
+        _cn_name, _, _ = _cn_str.rpartition("-")
+        _parsed_hostname = _cn_name.removeprefix("worker-")
 
         def _exists(key):
             key_s = key.decode() if isinstance(key, bytes) else key
             if heartbeat_pid is None:
                 return 0
             # Must match exact shape: worker:alive:{type}:{hostname}:{pid}
-            # The code builds the key from consumer_name = "worker-{hostname}-{pid}"
-            # via rpartition("-") + removeprefix("worker-").
-            expected_suffix = f":{_test_hostname}:{heartbeat_pid}"
+            expected_suffix = f":{_parsed_hostname}:{heartbeat_pid}"
             if key_s.startswith("worker:alive:") and key_s.endswith(expected_suffix):
                 return 1
             return 0

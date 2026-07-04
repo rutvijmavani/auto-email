@@ -24,7 +24,12 @@ def get_redis() -> "_redis_lib.Redis":
     """
     global _client
     if _client is None:
-        _client = _redis_lib.from_url(REDIS_URL, decode_responses=True)
+        _client = _redis_lib.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=30,
+            socket_connect_timeout=5,
+        )
     return _client
 
 

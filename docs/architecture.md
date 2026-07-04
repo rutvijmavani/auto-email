@@ -314,7 +314,7 @@ new_avg = 0.3 × last_duration_s + 0.7 × prev_avg
 
 Initial value: 1800.0 s (30 min — conservative upper bound so the deadline guard never places an unknown company too close to the 7 AM digest). Updated in `_complete_fullscan_db()` after every successful scan.
 
-**Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 s average, preventing a digest collision on the next cycle.
+**Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 min average, preventing a digest collision on the next cycle.
 
 **DB columns added (idempotent `ADD COLUMN IF NOT EXISTS` in `init_db()`):**
 
@@ -725,7 +725,7 @@ auto-aof-rewrite-percentage 100   # rewrite when AOF doubles vs post-rewrite bas
 auto-aof-rewrite-min-size   64mb  # but not until the file is at least this large
 ```
 
-Both conditions must be true simultaneously. The file oscillates between the post-rewrite baseline size and roughly 2× that size — it never grows unbounded. After running `configure-redis.sh`, the 30-minute RDB check is permanently green because AOF writes continuously.
+Both conditions must be true simultaneously. The file oscillates between the post-rewrite baseline size and roughly 2× that size — it never grows unbounded. After running `configure-redis.sh`, the 30-minute RDB stale check is permanently suppressed: `check_redis_persistence()` skips the stale-RDB warning when `aof_enabled` is true, because AOF provides ~1 second durability and the `rdb_last_save_time` staleness metric is no longer meaningful.
 
 ---
 
