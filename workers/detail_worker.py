@@ -980,7 +980,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                 _backoff_s = 2   # default backoff when attempt count unavailable
                 if _r_job_id:
                     _rkey = (
-                        f"{_RETRY_KEY_PREFIX}{_r_company}:{_r_job_id}"
+                        f"{_RETRY_KEY_PREFIX}{_r_company}|{_r_job_id}"
                         if _r_company else
                         f"{_RETRY_KEY_PREFIX}{_r_job_id}"
                     )
@@ -1007,8 +1007,8 @@ def run_worker(once: bool = False, shutdown_event=None,
                                 r.lrem(inflight_key, 1, raw)
                                 try:
                                     r.delete(_rkey)
-                                except Exception:
-                                    pass   # non-fatal — TTL will expire it
+                                except Exception as _del_err:
+                                    logger.debug("detail_worker: retry counter delete failed for %s: %s", _rkey, _del_err)
                                 _r_discard = True
                         else:
                             # Exponential backoff: 1s, 2s, 4s, 8s, 16s … capped.
@@ -1068,14 +1068,14 @@ def run_worker(once: bool = False, shutdown_event=None,
                     if _ack_job_id:
                         _ack_company = payload.get("company", "")
                         _ack_rkey = (
-                            f"{_RETRY_KEY_PREFIX}{_ack_company}:{_ack_job_id}"
+                            f"{_RETRY_KEY_PREFIX}{_ack_company}|{_ack_job_id}"
                             if _ack_company else
                             f"{_RETRY_KEY_PREFIX}{_ack_job_id}"
                         )
                         try:
                             r.delete(_ack_rkey)
-                        except Exception:
-                            pass   # non-fatal — TTL will expire it anyway
+                        except Exception as _del_err:
+                            logger.debug("detail_worker: ack retry counter delete failed for %s: %s", _ack_rkey, _del_err)
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]

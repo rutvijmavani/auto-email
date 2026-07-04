@@ -428,6 +428,7 @@ class TestQueueHealthSection(unittest.TestCase):
         # Should not contain "backlog" warning text for detail queue
         # (threshold is strictly > 100)
         self.assertNotIn("backlog CRITICAL", result)
+        self.assertNotIn("Detail queue elevated", result)
 
     def test_detail_zero_ok_no_backlog_text(self):
         """detail_total=0 → no backlog warnings."""

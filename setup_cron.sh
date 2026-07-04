@@ -443,6 +443,7 @@ echo "[OK] All wrapper scripts created"
 # To set up systemd for the first time: sudo bash deploy/install-systemd.sh
 
 NEW_CRON=$(cat << 'CRONTAB'
+# === BEGIN RECRUITER PIPELINE ===
 CRON_TZ=America/New_York
 
 # ═══════════════════════════════════════════════════════════════
@@ -529,45 +530,15 @@ CRON_TZ=America/New_York
 # ─────────────────────────────────────────
 0 */4 * * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
+# === END RECRUITER PIPELINE ===
 CRONTAB
 )
 
-# Merge: strip any existing pipeline-owned entries, then append NEW_CRON.
-# Non-pipeline entries (e.g. system or user cron jobs) are preserved.
-PIPELINE_STRIP_PATTERNS=(
-    "run_sync\.sh"
-    "run_monitor\.sh"
-    "run_outreach\.sh"
-    "run_weekly_summary\.sh"
-    "run_nightly\.sh"
-    "run_monday\.sh"
-    "run_monthly\.sh"
-    "run_enrich\.sh"
-    "log_monitor\.py"
-    "hashlib.*sha256.*range\(100000\)"
-    "run_detect\.sh"
-    "RECRUITER PIPELINE"
-    "DAYTIME SYNC"
-    "MONITOR JOBS"
-    "MONITOR RETRY"
-    "OUTREACH"
-    "WEEKLY SUMMARY"
-    "NIGHTLY CHAIN"
-    "MONDAY NIGHTLY"
-    "MONTHLY CHAIN"
-    "DAILY ENRICHMENT"
-    "LOG MONITOR"
-    "DETECT ATS"
-    "KEEP-ALIVE"
-    "CRON_TZ=America"
-    "═══════════════"
-    "─────────────────────"
-)
-
+# Merge: strip any existing pipeline-owned entries (identified by begin/end
+# markers), then append NEW_CRON.  Non-pipeline entries are preserved exactly.
 EXISTING_NON_PIPELINE=$(crontab -l 2>/dev/null || true)
-for _pat in "${PIPELINE_STRIP_PATTERNS[@]}"; do
-    EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | grep -v "$_pat" || true)
-done
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
 # Strip trailing blank lines from retained entries
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | sed '/^[[:space:]]*$/d')
 

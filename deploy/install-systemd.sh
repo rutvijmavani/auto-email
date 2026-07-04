@@ -96,6 +96,41 @@ chown "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR/.env"
 chmod 600 "$PROJECT_DIR/.env"
 echo "  .env permissions: 600 (owner read-only)"
 
+# ── Create root-owned unit-install wrapper ────────────────────────────────────
+# This wrapper reads unit files from the project's deploy/systemd/ directory
+# (not from stdin), applying user/path substitution before writing to
+# /etc/systemd/system/.  Granting sudo access to this wrapper instead of
+# "sudo tee" eliminates the stdin-injection risk: no external caller can pipe
+# arbitrary content through it to become a root-owned service unit.
+echo ""
+echo "► Creating unit-install wrapper..."
+UNIT_INSTALL_BIN="/usr/local/bin/install-pipeline-units"
+cat > "$UNIT_INSTALL_BIN" << WRAPPER_EOF
+#!/bin/bash
+# Root-owned unit installer — reads from the project's deploy/systemd/ directory.
+# Do NOT grant NOPASSWD tee on /etc/systemd/system/ — use this wrapper instead.
+set -euo pipefail
+PROJECT_DIR="${PROJECT_DIR}"
+SERVICE_USER="${SERVICE_USER}"
+SRC_DIR="\$PROJECT_DIR/deploy/systemd"
+DST_DIR="/etc/systemd/system"
+ALLOWED_UNITS=(
+    "recruiter-scheduler.service"
+    "recruiter-watchdog.service"
+    "recruiter-pipeline-alert@.service"
+)
+for unit in "\${ALLOWED_UNITS[@]}"; do
+    src="\$SRC_DIR/\$unit"
+    [[ -f "\$src" ]] || continue
+    sed "s|User=opc|User=\$SERVICE_USER|g; s|Group=opc|Group=\$SERVICE_USER|g; s|/home/opc/mail|\$PROJECT_DIR|g" \
+        "\$src" > "\$DST_DIR/\$unit"
+    echo "  Installed: \$DST_DIR/\$unit"
+done
+WRAPPER_EOF
+chmod 755 "$UNIT_INSTALL_BIN"
+chown root:root "$UNIT_INSTALL_BIN"
+echo "  Wrapper installed: $UNIT_INSTALL_BIN"
+
 # ── Add sudoers rule so watchdog can restart the scheduler ───────────────────
 # The watchdog needs to run: sudo systemctl restart recruiter-scheduler
 # We grant ONLY the minimum commands needed — no blanket sudo.
@@ -110,7 +145,6 @@ SYSTEMCTL_BIN="$(which systemctl)"
 echo "  systemctl resolved to: $SYSTEMCTL_BIN"
 
 SUDOERS_FILE="/etc/sudoers.d/mail-pipeline"
-TEE_BIN="$(which tee)"
 cat > "$SUDOERS_FILE" << EOF
 # Allow opc user to restart/query pipeline services without password.
 # Required by workers/watchdog.py self-healing and deploy workflow.
@@ -122,10 +156,8 @@ $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
-# Deploy-time unit sync (deploy.yml / deploy.sh):
-$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-scheduler.service
-$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-watchdog.service
-$SERVICE_USER ALL=(root) NOPASSWD: $TEE_BIN /etc/systemd/system/recruiter-pipeline-alert@.service
+# Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
+$SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
 EOF
 chmod 440 "$SUDOERS_FILE"

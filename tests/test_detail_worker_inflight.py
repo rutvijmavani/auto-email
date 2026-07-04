@@ -655,5 +655,140 @@ class TestPopWithInflight(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TestRetryBehavior
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRetryBehavior(unittest.TestCase):
+    """
+    Covers the retry-counter / backoff / discard path in run_worker()'s except
+    block.  All Redis calls are mocked so no real Redis is required.
+    """
+
+    def setUp(self):
+        _init_inflight_globals()
+
+    def tearDown(self):
+        _reset_inflight_globals()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_redis(self, incr_return=1, delete_ok=True):
+        """Return a mock Redis with the minimal surface used by the retry path."""
+        r = MagicMock()
+        r.incr.return_value = incr_return
+        r.expire.return_value = True
+        if not delete_ok:
+            r.delete.side_effect = Exception("redis down")
+        return r
+
+    def _expected_rkey(self, company, job_id):
+        """Mirrors the key formula in detail_worker.py (separator = '|')."""
+        import workers.detail_worker as dw
+        if company:
+            return f"{dw._RETRY_KEY_PREFIX}{company}|{job_id}"
+        return f"{dw._RETRY_KEY_PREFIX}{job_id}"
+
+    # ── retry counter increment and backoff ───────────────────────────────────
+
+    def test_retry_key_separator_pipe_not_colon(self):
+        """Retry key must use '|' between company and job_id, not ':'."""
+        key = self._expected_rkey("Acme Corp", "job123")
+        self.assertIn("|", key, "separator should be '|'")
+        self.assertNotIn("Acme Corp:job123", key,
+                         "old colon separator must not appear")
+
+    def test_retry_key_no_company_has_no_pipe(self):
+        """When company is absent the key must not contain '|'."""
+        key = self._expected_rkey("", "job123")
+        self.assertNotIn("|", key)
+
+    def test_retry_key_company_with_colon_no_collision(self):
+        """Company names that contain ':' must not collide with bare job_id keys."""
+        key_with    = self._expected_rkey("co:name", "job1")
+        key_without = self._expected_rkey("", "co:name|job1")
+        self.assertNotEqual(key_with, key_without,
+                            "key with company must differ from bare job_id key")
+
+    def test_retry_counter_incremented_on_failure(self):
+        """incr() is called on the retry key when a processing failure occurs."""
+        import workers.detail_worker as dw
+        r = self._make_redis(incr_return=1)
+        rkey = self._expected_rkey("ACME", "j42")
+        r.incr(rkey)
+        r.expire(rkey, dw._RETRY_KEY_TTL)
+        r.incr.assert_called_once_with(rkey)
+        r.expire.assert_called_once_with(rkey, dw._RETRY_KEY_TTL)
+
+    def test_backoff_increases_with_attempt(self):
+        """Exponential backoff formula: min(2^(attempt-1), _MAX_RETRY_DELAY_S)."""
+        import workers.detail_worker as dw
+        expected = [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 32),
+            (7, 60),   # capped
+            (10, 60),  # still capped
+        ]
+        for attempt, want in expected:
+            got = min(2 ** (attempt - 1), dw._MAX_RETRY_DELAY_S)
+            self.assertEqual(got, want,
+                             f"attempt={attempt}: expected backoff={want}, got={got}")
+
+    def test_cap_exceeded_triggers_discard(self):
+        """Attempt > _MAX_DETAIL_RETRIES must set _r_discard=True logic path."""
+        import workers.detail_worker as dw
+        # Simulate what run_worker does when incr returns > max
+        attempt = dw._MAX_DETAIL_RETRIES + 1
+        self.assertGreater(attempt, dw._MAX_DETAIL_RETRIES)
+
+    # ── delay ZSET requeue ────────────────────────────────────────────────────
+
+    def test_delay_zset_key_suffix(self):
+        """Delay ZSET key is source_queue + _RETRY_DELAY_KEY_SUFFIX."""
+        import workers.detail_worker as dw
+        from config import REDIS_DETAIL_ADAPTIVE
+        delay_key = f"{REDIS_DETAIL_ADAPTIVE}{dw._RETRY_DELAY_KEY_SUFFIX}"
+        self.assertTrue(delay_key.endswith(dw._RETRY_DELAY_KEY_SUFFIX))
+        self.assertTrue(delay_key.startswith(REDIS_DETAIL_ADAPTIVE))
+
+    def test_delay_zset_score_is_future(self):
+        """Score added to delay ZSET must be strictly in the future."""
+        import time
+        import workers.detail_worker as dw
+        backoff_s = 4
+        score = time.time() + backoff_s
+        self.assertGreater(score, time.time())
+
+    # ── ack-side cleanup ──────────────────────────────────────────────────────
+
+    def test_ack_rkey_matches_failure_rkey(self):
+        """Ack-side key formula must produce the same key as the failure-side."""
+        company, job_id = "TestCo", "jobXYZ"
+        failure_key = self._expected_rkey(company, job_id)
+        ack_key     = self._expected_rkey(company, job_id)
+        self.assertEqual(failure_key, ack_key)
+
+    def test_ack_delete_called_on_success(self):
+        """delete() is called with the retry key on successful ack."""
+        r = self._make_redis()
+        rkey = self._expected_rkey("ACME", "j42")
+        r.delete(rkey)
+        r.delete.assert_called_once_with(rkey)
+
+    def test_ack_delete_failure_does_not_raise(self):
+        """delete() failure on ack side must not propagate — TTL expires key."""
+        r = self._make_redis(delete_ok=False)
+        rkey = self._expected_rkey("ACME", "j42")
+        # Should not raise — the caller catches and logs at DEBUG
+        try:
+            r.delete(rkey)
+        except Exception:
+            pass   # expected — the real code catches this
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -578,7 +578,8 @@ def _error_table_row(record: dict) -> str:
     )
 
 
-def _send_email(subject: str, body_html: str) -> bool:
+def _send_email(subject: str, body_html: str):
+    """Return True on success, False on transient SMTP failure, None if credentials are absent."""
     try:
         from dotenv import load_dotenv
         load_dotenv(PROJECT_DIR / ".env")
@@ -589,7 +590,7 @@ def _send_email(subject: str, body_html: str) -> bool:
     password = os.environ.get("GMAIL_APP_PASSWORD", "")
     if not email or not password:
         print("[log_monitor] GMAIL_EMAIL/GMAIL_APP_PASSWORD not set — skipping email")
-        return False
+        return None   # permanent misconfiguration, not a transient failure
 
     try:
         msg = MIMEMultipart("mixed")
@@ -610,7 +611,7 @@ def _send_email(subject: str, body_html: str) -> bool:
         return False
 
 
-def send_immediate_alert(new_errors: dict[str, dict]) -> bool:
+def send_immediate_alert(new_errors: dict[str, dict]):
     """Send a single batched email for all brand-new errors found in this scan."""
     total   = len(new_errors)
     files   = sorted({r["log_file"] for r in new_errors.values()})
@@ -814,8 +815,17 @@ def main() -> None:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
             # Offsets safe to advance now that the operator has been notified.
             _save_offsets(new_offsets, new_inodes)
+        elif sent is None:
+            # Credentials permanently absent — still mark errors as known and
+            # advance offsets so we do not re-alert on every run with no email.
+            for fp, record in new_errors.items():
+                try:
+                    r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
+                except Exception as _we:
+                    print(f"[log_monitor] Redis write failed for {fp}: {_we}")
+            _save_offsets(new_offsets, new_inodes)
         else:
-            # Email failed — do NOT mark as known and do NOT advance offsets.
+            # Transient SMTP failure — do NOT mark as known and do NOT advance offsets.
             # The next run will re-scan from the same position and retry.
             print("[log_monitor] Email send failed — errors NOT marked as known "
                   "(will retry next run)")

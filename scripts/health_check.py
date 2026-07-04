@@ -89,6 +89,9 @@ def _row(level: str, label: str, detail: str) -> None:
 # CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
+_INFLIGHT_STALE_S = 7200   # 2-hour in-flight TTL (matches job_monitor.py)
+
+
 def run_health_check() -> int:
     """
     Run all checks and print a report.
@@ -98,9 +101,9 @@ def run_health_check() -> int:
         REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN,
         REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN,
         REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN,
-        STREAM_CONSUMER_GROUP,
+        STREAM_CONSUMER_GROUP, REDIS_URL,
     )
-    from workers.redis_client import get_redis, ping
+    import redis as _redis_hc_lib
 
     now     = time.time()
     errors  = 0
@@ -115,15 +118,25 @@ def run_health_check() -> int:
     # ── INFRASTRUCTURE ────────────────────────────────────────────────────────
     _section("INFRASTRUCTURE")
 
-    # Redis
-    r_ok = ping()
+    # Redis — use a health-check-specific client with bounded timeouts so the
+    # check never hangs indefinitely if Redis stops responding mid-operation.
+    try:
+        r = _redis_hc_lib.from_url(
+            REDIS_URL,
+            socket_timeout=5,
+            socket_connect_timeout=3,
+            decode_responses=True,
+        )
+        r_ok = r.ping()
+    except Exception:
+        r_ok = False
+        r = None
+
     if not r_ok:
         _row("ERROR", "Redis", "UNREACHABLE — all workers likely stopped")
         errors += 1
         print(f"\n  {_c('Cannot continue — Redis required for all checks', _RED)}\n")
         return 1
-
-    r = get_redis()
 
     try:
         info     = r.info("server")
@@ -308,13 +321,13 @@ def run_health_check() -> int:
     try:
         bloom_count = fallback_count = 0
         cursor = 0
-        for _ in range(10):
+        while True:
             cursor, keys = r.scan(cursor, match="bloom:fullscan:*", count=200)
             bloom_count += len(keys)
             if cursor == 0:
                 break
         cursor = 0
-        for _ in range(10):
+        while True:
             cursor, keys = r.scan(cursor, match="bloom:fallback:*", count=200)
             fallback_count += len(keys)
             if cursor == 0:
@@ -343,7 +356,7 @@ def run_health_check() -> int:
         # so the health check matches the contract used by the monitor layer.
         inflight_names: set = set()
         try:
-            _stale_cutoff = now - 7200   # 2-hour inflight TTL (same as job_monitor)
+            _stale_cutoff = now - _INFLIGHT_STALE_S
             _raw_inflight = r.zrangebyscore(
                 REDIS_INFLIGHT_FULLSCAN, _stale_cutoff, "+inf"
             )
@@ -452,6 +465,11 @@ def run_health_check() -> int:
           f"{_c(f'{errors} errors', _RED if errors else _GREY)}  "
           f"{_c(f'{warnings} warnings', _YELLOW if warnings else _GREY)}")
     print(f"{_c(DSEP, _BOLD)}\n")
+
+    try:
+        r.close()
+    except Exception:
+        pass
 
     return 1 if errors > 0 else 0
 

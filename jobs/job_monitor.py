@@ -436,6 +436,7 @@ def run():
         print(f"[INFO] Waiting up to {_IN_FLIGHT_WAIT_S}s for "
               f"{len(_remaining_inflight)} in-flight scan(s) to finish...")
 
+        _r_wait = None
         try:
             from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
             import redis as _redis_lib_wait
@@ -521,6 +522,12 @@ def run():
                 "%d companies still counted as in-flight",
                 _wait_exc, len(_remaining_inflight),
             )
+        finally:
+            if _r_wait is not None:
+                try:
+                    _r_wait.close()
+                except Exception:
+                    pass
 
         if _remaining_inflight:
             logger.info(

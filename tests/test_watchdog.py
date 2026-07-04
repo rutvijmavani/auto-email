@@ -898,7 +898,7 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         }
         issues, _ = self._run(snap=snap, detail_adp=150)  # now 150 < 200 → draining
         level = self._level(issues, "queue:detail:adaptive")
-        self.assertNotEqual(level, "ERROR")
+        self.assertEqual(level, Issue.OK)
 
     def test_detail_queue_stalled_at_alert_level_is_error(self):
         """depth > DETAIL_QUEUE_ALERT and not draining → ERROR."""

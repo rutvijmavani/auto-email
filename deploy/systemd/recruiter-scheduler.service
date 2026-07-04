@@ -63,9 +63,11 @@ MemoryMax=2G
 # ── Sandboxing ───────────────────────────────────────────────────────────────
 NoNewPrivileges=true
 PrivateTmp=true
-# full makes /usr, /boot, /etc read-only while leaving /home writable so the
-# scheduler can write logs and state files under /home/opc/mail.
+# full makes /usr, /boot, /etc read-only; ProtectHome restricts /home to
+# read-only except for the project directory explicitly re-opened below.
 ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # Logs go to journald.  To view: journalctl -u recruiter-scheduler -f
