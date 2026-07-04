@@ -165,6 +165,15 @@ jobs:
                 echo "[OK] $svc is active after rollback"
               done
 
+              echo "[ROLLBACK] Re-running health check to confirm pipeline is healthy..."
+              sleep 70
+              if ! python scripts/health_check.py; then
+                echo "[FATAL] Health check still failing after rollback to $PREVIOUS_SHA"
+                echo "[FATAL] Pipeline is unhealthy — manual intervention required"
+                exit 1
+              fi
+              echo "[ROLLBACK] Health check passed"
+
               echo "[ROLLBACK] Complete — reverted to $PREVIOUS_SHA"
               exit 1
             fi

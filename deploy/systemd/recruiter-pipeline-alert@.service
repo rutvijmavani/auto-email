@@ -3,6 +3,11 @@ Description=Recruiter Pipeline startup failure alert for %i
 # This is a template unit — %i is the name of the failed service.
 # Triggered by OnFailure=recruiter-pipeline-alert@%n.service in other units.
 # Sends a single email saying which service hit its StartLimitBurst.
+#
+# Network ordering: the alert script sends email — it must wait for full
+# TCP connectivity or the SMTP connection will fail silently during early-boot.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot

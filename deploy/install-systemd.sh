@@ -182,30 +182,38 @@ else
 fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
-echo ""
-echo "► Service status:"
-for svc in recruiter-scheduler recruiter-watchdog; do
-    status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
-    pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
-    echo "  $svc: $status (pid=$pid)"
-done
-
-echo ""
-echo "► Running health check..."
-sleep 8   # wait for worker heartbeats to appear in Redis
-# Run as the service user (not root) so file paths resolve correctly.
-# Health check failure is a WARNING here, not an abort — workers may still be
-# starting up.  set -euo pipefail would otherwise terminate the whole install
-# script on a transient unhealthy state that resolves in seconds.
-if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python scripts/health_check.py' _ "$PROJECT_DIR"; then
-    echo "  ✓ Health check passed"
+# Skip status probe and health check when --no-start was given: services were
+# not started so they will report "inactive", which is not an error condition.
+if [[ "$_NO_START" == "--no-start" ]]; then
+    echo ""
+    echo "  --no-start: skipping service status probe and health check."
+    echo "  The caller is responsible for starting services when ready."
 else
     echo ""
-    echo "  [WARN] Health check reported issues — this is often normal right after startup."
-    echo "         Workers may still be initialising.  Wait 30 s and re-run:"
-    echo "           python scripts/health_check.py"
-    echo "         If issues persist, check:"
-    echo "           journalctl -u recruiter-scheduler -n 50"
+    echo "► Service status:"
+    for svc in recruiter-scheduler recruiter-watchdog; do
+        status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+        pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
+        echo "  $svc: $status (pid=$pid)"
+    done
+
+    echo ""
+    echo "► Running health check..."
+    sleep 8   # wait for worker heartbeats to appear in Redis
+    # Run as the service user (not root) so file paths resolve correctly.
+    # Health check failure is a WARNING here, not an abort — workers may still be
+    # starting up.  set -euo pipefail would otherwise terminate the whole install
+    # script on a transient unhealthy state that resolves in seconds.
+    if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python scripts/health_check.py' _ "$PROJECT_DIR"; then
+        echo "  ✓ Health check passed"
+    else
+        echo ""
+        echo "  [WARN] Health check reported issues — this is often normal right after startup."
+        echo "         Workers may still be initialising.  Wait 30 s and re-run:"
+        echo "           python scripts/health_check.py"
+        echo "         If issues persist, check:"
+        echo "           journalctl -u recruiter-scheduler -n 50"
+    fi
 fi
 
 echo ""

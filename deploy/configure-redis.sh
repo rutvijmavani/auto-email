@@ -129,9 +129,10 @@ if [[ -z "$REDIS_CONF" ]]; then
     fi
 else
     echo "  Found: $REDIS_CONF"
-    # Back up before editing
-    cp "$REDIS_CONF" "${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
-    echo "  Backup: ${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+    # Back up before editing — compute timestamp once so cp and echo use the same path
+    _bak="${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$REDIS_CONF" "$_bak"
+    echo "  Backup: $_bak"
 
     # Patch each directive — update in-place if present, append if missing
     _set_redis_conf() {

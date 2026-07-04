@@ -467,7 +467,7 @@ CRON_TZ=America/New_York
 # --monitor-jobs finishes); if absent, runs the monitor now so the digest
 # arrives at most 2 hours late rather than not at all.
 # ─────────────────────────────────────────
-0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || pgrep -f run_monitor.sh > /dev/null 2>&1 || /home/opc/mail/run_monitor.sh
+0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || pgrep -f 'bash /home/opc/mail/run_monitor\.sh' > /dev/null 2>&1 || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only

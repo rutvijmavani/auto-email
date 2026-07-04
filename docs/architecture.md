@@ -312,7 +312,7 @@ A Workday scan can take 20–30 minutes. If a company is scheduled at 6:45 AM ET
 new_avg = 0.3 × last_duration_s + 0.7 × prev_avg
 ```
 
-Initial value: 30.0 s (conservative — unknown companies get a safe default until their first scan completes). Updated in `_complete_fullscan_db()` after every successful scan.
+Initial value: 1800.0 s (30 min — conservative upper bound so the deadline guard never places an unknown company too close to the 7 AM digest). Updated in `_complete_fullscan_db()` after every successful scan.
 
 **Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 s average, preventing a digest collision on the next cycle.
 
@@ -320,7 +320,7 @@ Initial value: 30.0 s (conservative — unknown companies get a safe default unt
 
 ```sql
 last_fullscan_duration_s  INTEGER                       -- seconds of last scan
-avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 30.0 -- EMA of all past scans
+avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 1800.0 -- EMA of all past scans
 ```
 
 ---

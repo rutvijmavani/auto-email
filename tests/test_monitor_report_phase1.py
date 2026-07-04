@@ -263,6 +263,51 @@ class TestCoverageMetricFix(unittest.TestCase):
         self.assertIn("by job monitor", val,
                       f"Expected 'by job monitor' when fallback_hits>0, got: {val!r}")
 
+    def test_in_flight_appends_pending_text(self):
+        """When in_flight>0 the string includes '+ N pending (in-flight)'."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            companies_with_results=0,
+            in_flight=5,
+        )
+        self.assertIn("pending (in-flight)", val,
+                      f"Expected 'pending (in-flight)' when in_flight=5, got: {val!r}")
+        self.assertIn("5", val)
+
+    def test_no_in_flight_excludes_pending_text(self):
+        """When in_flight=0 the string must not include 'pending (in-flight)'."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            companies_with_results=0,
+        )
+        self.assertNotIn("pending (in-flight)", val,
+                         "Should not append pending text when in_flight=0")
+
+    def test_fallback_empty_shows_sub_count(self):
+        """When some fallback scans returned no jobs, ', N empty' appears in string."""
+        # fallback_scanned=10, companies_with_results=7 → 3 empty
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            fallback_scanned=10,
+            companies_with_results=7,
+        )
+        self.assertIn("3 empty", val,
+                      f"Expected '3 empty' for fallback_empty=3, got: {val!r}")
+
+    def test_no_fallback_empty_excludes_empty_sub_count(self):
+        """When all fallback scans found jobs, ', N empty' must not appear."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            fallback_scanned=5,
+            companies_with_results=5,
+        )
+        self.assertNotIn("empty", val,
+                         "Should not show 'empty' when all fallback scans had results")
+
     # ── Coverage status threshold ─────────────────────────────────────────────
 
     def test_coverage_70_pct_is_ok(self):

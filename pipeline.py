@@ -910,6 +910,9 @@ def main():
     if not init_sentry():
         logger.warning("pipeline: Sentry not initialized — error tracking disabled")
 
+    from workers.startup import validate_startup
+    validate_startup("pipeline")
+
     init_db()
     args = sys.argv[1:]
 

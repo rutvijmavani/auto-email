@@ -46,6 +46,10 @@ RestartSec=10s
 PrivateTmp=true
 # read-only (not strict) — WorkingDirectory is under /home
 ProtectHome=read-only
+# Allow the watchdog to write its log files and state under the project dir.
+# ProtectHome=read-only makes all of /home read-only by default; ReadWritePaths
+# carves out an exception so logging to /home/opc/mail/logs/ still works.
+ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal
