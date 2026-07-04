@@ -257,6 +257,22 @@ def _is_flagged(line: str) -> bool:
     return any(pat.search(line) for pat in FLAG_PATTERNS)
 
 
+# Matches the traceback-component patterns (patterns 2 & 3 in FLAG_PATTERNS):
+# "Traceback (most recent call last):" and exception-type lines like "ValueError: ...".
+# These belong to an ongoing traceback and should stay attached as context to the
+# preceding flagged line, not be split off as independent findings.
+_TRACEBACK_COMPONENT_RE = re.compile(
+    r'^(Traceback \(most recent call last\):'
+    r'|(TypeError|ValueError|AttributeError|KeyError|IndexError'
+    r'|RuntimeError|OSError|IOError|PermissionError'
+    r'|psycopg2\.\w+Error|redis\.exceptions\.\w+Error):)'
+)
+
+
+def _is_traceback_component(line: str) -> bool:
+    return bool(_TRACEBACK_COMPONENT_RE.match(line))
+
+
 def scan_file(
     path: Path, offset: int
 ) -> tuple[int, list[tuple[str, list[str]]]]:
@@ -292,10 +308,12 @@ def scan_file(
             for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines))):
                 ctx_raw = lines[j]
                 ctx     = ctx_raw.rstrip()
-                # Stop context at the next independently-flagged line so it can
-                # be reported as its own finding rather than swallowed as context.
+                # Stop context only at new-problem lines (| ERROR |, [CRON]exit=…).
+                # Traceback components (Traceback/ValueError:/TypeError: etc.) belong
+                # to the current finding and must stay attached as context.
                 if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
-                    break
+                    if not _is_traceback_component(ctx):
+                        break   # genuinely new error — defer as its own finding
                 if ctx and not _is_suppressed(ctx_raw):
                     context.append(ctx)
             findings.append((line, context))
@@ -502,7 +520,10 @@ def sweep_resolved(r, now: float) -> list[dict]:
             act_key = _act_key(fp)
 
             if not r.exists(act_key):
-                # Active key expired → error resolved
+                # Active key expired → error resolved.
+                # Only delete err_key/ts_key after successfully writing the
+                # resolved record; otherwise the digest loses the resolution entry.
+                _resolution_written = False
                 try:
                     raw = r.get(err_key)
                     if raw:
@@ -510,11 +531,13 @@ def sweep_resolved(r, now: float) -> list[dict]:
                         record["resolved_at"] = now
                         r.rpush(_KEY_RESOLVED, json.dumps(record))
                         r.ltrim(_KEY_RESOLVED, -200, -1)  # keep last 200
+                        _resolution_written = True
                 except Exception:
                     pass
-                r.delete(err_key)
-                r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
-                resolved.append(fp)
+                if _resolution_written:
+                    r.delete(err_key)
+                    r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
+                    resolved.append(fp)
     except Exception:
         pass
 
@@ -558,10 +581,10 @@ def _send_email(subject: str, body_html: str) -> bool:
     except Exception:
         pass
 
-    email    = os.environ.get("EMAIL", "")
-    password = os.environ.get("APP_PASSWORD", "")
+    email    = os.environ.get("GMAIL_EMAIL", "")
+    password = os.environ.get("GMAIL_APP_PASSWORD", "")
     if not email or not password:
-        print("[log_monitor] EMAIL/APP_PASSWORD not set — skipping email")
+        print("[log_monitor] GMAIL_EMAIL/GMAIL_APP_PASSWORD not set — skipping email")
         return False
 
     try:

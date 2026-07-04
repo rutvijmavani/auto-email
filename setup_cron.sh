@@ -532,8 +532,51 @@ CRON_TZ=America/New_York
 CRONTAB
 )
 
-echo "$NEW_CRON" | crontab -
-echo "[OK] Crontab installed"
+# Merge: strip any existing pipeline-owned entries, then append NEW_CRON.
+# Non-pipeline entries (e.g. system or user cron jobs) are preserved.
+PIPELINE_STRIP_PATTERNS=(
+    "run_sync\.sh"
+    "run_monitor\.sh"
+    "run_outreach\.sh"
+    "run_weekly_summary\.sh"
+    "run_nightly\.sh"
+    "run_monday\.sh"
+    "run_monthly\.sh"
+    "run_enrich\.sh"
+    "log_monitor\.py"
+    "hashlib.*sha256.*range\(100000\)"
+    "run_detect\.sh"
+    "RECRUITER PIPELINE"
+    "DAYTIME SYNC"
+    "MONITOR JOBS"
+    "MONITOR RETRY"
+    "OUTREACH"
+    "WEEKLY SUMMARY"
+    "NIGHTLY CHAIN"
+    "MONDAY NIGHTLY"
+    "MONTHLY CHAIN"
+    "DAILY ENRICHMENT"
+    "LOG MONITOR"
+    "DETECT ATS"
+    "KEEP-ALIVE"
+    "CRON_TZ=America"
+    "═══════════════"
+    "─────────────────────"
+)
+
+EXISTING_NON_PIPELINE=$(crontab -l 2>/dev/null || true)
+for _pat in "${PIPELINE_STRIP_PATTERNS[@]}"; do
+    EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | grep -v "$_pat" || true)
+done
+# Strip trailing blank lines from retained entries
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | sed '/^[[:space:]]*$/d')
+
+if [[ -n "$EXISTING_NON_PIPELINE" ]]; then
+    printf '%s\n%s\n' "$EXISTING_NON_PIPELINE" "$NEW_CRON" | crontab -
+else
+    echo "$NEW_CRON" | crontab -
+fi
+echo "[OK] Crontab installed (non-pipeline entries preserved)"
 
 # ── Verify ────────────────────────────────────────────────────
 echo ""

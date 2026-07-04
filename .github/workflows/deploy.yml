@@ -129,11 +129,13 @@ jobs:
               pip install -r requirements.txt --quiet
 
               echo "[ROLLBACK] Re-syncing systemd unit files from previous revision..."
+              shopt -s nullglob   # prevent literal glob if deploy/systemd/ is absent
               for unit_file in ${{ secrets.VM_PATH }}/deploy/systemd/*.service; do
                 unit_name=$(basename "$unit_file")
                 sed "s|User=opc|User=${{ secrets.VM_USER }}|g; s|Group=opc|Group=${{ secrets.VM_USER }}|g; s|/home/opc/mail|${{ secrets.VM_PATH }}|g" \
                   "$unit_file" | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
               done
+              shopt -u nullglob
               sudo systemctl daemon-reload
 
               echo "[ROLLBACK] Restarting services..."

@@ -106,20 +106,26 @@ done
 
 if [[ -z "$REDIS_CONF" ]]; then
     echo ""
-    echo "  [WARN] Could not find redis.conf in standard locations:"
+    echo "  [ERROR] Could not find redis.conf in standard locations:"
     for c in "${REDIS_CONF_CANDIDATES[@]}"; do
         echo "         $c"
     done
     echo ""
     echo "  The CONFIG SET above is LIVE but will be lost on Redis restart."
-    echo "  Find your redis.conf and add these lines manually:"
+    echo "  Redis AOF durability is NOT persistent until redis.conf is updated."
+    echo "  Find your redis.conf and add these lines manually, then restart Redis:"
     echo ""
     echo "      appendonly      yes"
     echo "      appendfsync     everysec"
     echo "      auto-aof-rewrite-percentage 100"
     echo "      auto-aof-rewrite-min-size   64mb"
     echo ""
-    echo "  Then restart Redis: sudo systemctl restart redis"
+    echo "  Then: sudo systemctl restart redis"
+    echo ""
+    echo "  To skip this check (not recommended): re-run with SKIP_CONF_CHECK=1"
+    if [[ "${SKIP_CONF_CHECK:-0}" != "1" ]]; then
+        exit 1
+    fi
 else
     echo "  Found: $REDIS_CONF"
     # Back up before editing

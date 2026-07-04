@@ -97,14 +97,30 @@ def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
     logger.debug("%s config check passed (%d keys)", prefix, len(_REQUIRED_ENV_KEYS))
 
 
+def _mask_url(url: str) -> str:
+    """Return *url* with the password replaced by *** for safe logging."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        _p = urlparse(url)
+        if _p.password:
+            user_prefix = f"{_p.username}:" if _p.username else ""
+            return urlunparse(_p._replace(
+                netloc=f"{user_prefix}***@{_p.hostname}"
+                       + (f":{_p.port}" if _p.port else "")
+            ))
+        return url
+    except Exception:
+        return "(could not parse URL)"
+
+
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     try:
         # Use a dedicated client with short timeouts for ALL Redis checks so a
         # hung endpoint never blocks startup indefinitely.  The shared get_redis()
         # has no socket timeout, so even the initial PING must use this client.
         import redis as _redis_lib
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
         r = _redis_lib.from_url(
             redis_url,
             socket_timeout=5,
@@ -122,27 +138,25 @@ def _check_redis(prefix: str) -> None:
                     f"Redis {_info.get('redis_version')} is too old — "
                     "pipeline requires Redis ≥6.2 (LMOVE command)"
                 )
+        except RuntimeError as _ver_err:
+            # Version check failed — Redis is reachable but unsupported.
+            msg = (
+                f"{prefix} STARTUP FAILED — Redis is reachable but too old\n"
+                f"  URL: {_mask_url(redis_url)}\n"
+                f"  Error: {_ver_err}\n"
+                f"  Fix: upgrade Redis to ≥6.2 (sudo apt install redis-server)"
+            )
+            print(msg, file=sys.stderr)
+            logger.error("%s startup: Redis version unsupported: %s", prefix, _ver_err)
+            sys.exit(1)
         finally:
             r.close()
+    except SystemExit:
+        raise
     except Exception as exc:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        # Mask password so it never appears in systemd/journal logs.
-        try:
-            from urllib.parse import urlparse, urlunparse
-            _p = urlparse(redis_url)
-            if _p.password:
-                user_prefix = f"{_p.username}:" if _p.username else ""
-                safe_url = urlunparse(_p._replace(
-                    netloc=f"{user_prefix}***@{_p.hostname}"
-                           + (f":{_p.port}" if _p.port else "")
-                ))
-            else:
-                safe_url = redis_url
-        except Exception:
-            safe_url = "(could not parse REDIS_URL)"
         msg = (
             f"{prefix} STARTUP FAILED — Redis is unreachable\n"
-            f"  URL: {safe_url}\n"
+            f"  URL: {_mask_url(redis_url)}\n"
             f"  Error: {exc}\n"
             f"  Fix: sudo systemctl status redis"
         )
@@ -163,21 +177,9 @@ def _check_postgres(prefix: str) -> None:
         logger.debug("%s PostgreSQL check passed", prefix)
     except Exception as exc:
         db_url_raw = os.getenv("DATABASE_URL", "(not set)")
-        # Mask password in log output
-        try:
-            from urllib.parse import urlparse, urlunparse
-            parsed = urlparse(db_url_raw)
-            db_user_prefix = f"{parsed.username}:" if parsed.username else ""
-            safe_url = urlunparse(parsed._replace(
-                netloc=f"{db_user_prefix}***@{parsed.hostname}"
-                       + (f":{parsed.port}" if parsed.port else "")
-            ))
-        except Exception:
-            safe_url = "(could not parse DATABASE_URL)"
-
         msg = (
             f"{prefix} STARTUP FAILED — PostgreSQL is unreachable\n"
-            f"  URL: {safe_url}\n"
+            f"  URL: {_mask_url(db_url_raw)}\n"
             f"  Error: {exc}\n"
             f"  Fix: check DATABASE_URL in .env; verify PostgreSQL is running."
         )

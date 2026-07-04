@@ -235,14 +235,17 @@ def _get_worker_missed_companies(companies: list) -> tuple:
         _r_inflight = _redis_lib_jm.from_url(
             REDIS_URL, socket_timeout=5, socket_connect_timeout=3
         )
-        stale_threshold = time.time() - 7200
-        raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
-        inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
-        if inflight:
-            logger.debug(
-                "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
-                len(inflight),
-            )
+        try:
+            stale_threshold = time.time() - 7200
+            raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+            inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
+            if inflight:
+                logger.debug(
+                    "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
+                    len(inflight),
+                )
+        finally:
+            _r_inflight.close()
     except Exception as exc:
         logger.warning(
             "_get_worker_missed_companies: Redis unavailable for inflight exclusion "
@@ -462,8 +465,7 @@ def run():
                     _confirmed_done: set = set()
                     _db_ok = False
                     try:
-                        from db.connection import get_conn as _vget_conn
-                        _vconn = _vget_conn()
+                        _vconn = get_conn()
                         try:
                             _vrows = _vconn.execute(
                                 "SELECT company FROM company_poll_stats "

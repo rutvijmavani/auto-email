@@ -982,8 +982,21 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         # docstrings that explain why last_poll_at is NOT used.
         import ast as _ast
         _tree = _ast.parse(src)
+        # Check both Name nodes (direct variable references) and non-docstring
+        # string constants (SQL strings may reference last_poll_at as a column
+        # name without it appearing as a Python identifier).
+        _docstring_nodes: set = set()
+        for _node in _ast.walk(_tree):
+            if isinstance(_node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef, _ast.Module)):
+                if (_ast.get_docstring(_node)):
+                    _body = _node.body
+                    if _body and isinstance(_body[0], _ast.Expr) and isinstance(_body[0].value, _ast.Constant):
+                        _docstring_nodes.add(id(_body[0].value))
         has_adaptive_field = any(
-            isinstance(node, _ast.Name) and node.id == "last_poll_at"
+            (isinstance(node, _ast.Name) and node.id == "last_poll_at")
+            or (isinstance(node, _ast.Constant) and isinstance(node.value, str)
+                and "last_poll_at" in node.value
+                and id(node) not in _docstring_nodes)
             for node in _ast.walk(_tree)
         )
 

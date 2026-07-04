@@ -51,9 +51,9 @@ class Heartbeat:
     Daemon thread that writes worker:alive:{worker_type}:{hostname}:{pid}
     every interval_s seconds while the worker process is alive.
 
-    TTL is set to 3 × interval_s so two consecutive missed writes (Redis
+    TTL is set to 3x interval_s so two consecutive missed writes (Redis
     blip, GIL stall) are tolerated before the key expires.  The watchdog's
-    dead threshold should be set to at least 4 × interval_s so there is
+    dead threshold should be set to at least 4x interval_s so there is
     always a gap between key expiry and alert.
 
     Args:
