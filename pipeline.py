@@ -907,7 +907,8 @@ def run_quota_report(silent_if_healthy=False):
 
 def main():
     from workers.sentry_init import init_sentry
-    init_sentry()
+    if not init_sentry():
+        logger.warning("pipeline: Sentry not initialized — error tracking disabled")
 
     init_db()
     args = sys.argv[1:]

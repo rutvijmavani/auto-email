@@ -10,6 +10,13 @@ Wants=network-online.target
 # Watchdog is intentionally NOT After=recruiter-scheduler.service so it keeps
 # running and alerting even when the scheduler is down.
 
+# Soft-require Redis and Postgres — if they're not systemd-managed (e.g. managed
+# by the cloud provider), remove the relevant Wants/After lines.
+Wants=redis.service
+After=redis.service
+Wants=postgresql.service
+After=postgresql.service
+
 # ── Escalation — repeated rapid failures ─────────────────────────────────────
 # StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
 StartLimitBurst=5

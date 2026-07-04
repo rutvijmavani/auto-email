@@ -60,6 +60,13 @@ TimeoutStopSec=60s
 LimitNOFILE=65536
 MemoryMax=2G
 
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+# full makes /usr, /boot, /etc read-only while leaving /home writable so the
+# scheduler can write logs and state files under /home/opc/mail.
+ProtectSystem=full
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 # Logs go to journald.  To view: journalctl -u recruiter-scheduler -f
 StandardOutput=journal

@@ -317,7 +317,11 @@ def scan_file(
                 if ctx and not _is_suppressed(ctx_raw):
                     context.append(ctx)
             findings.append((line, context))
-        i += 1
+            # Skip past context lines so traceback components (ValueError:, etc.)
+            # already consumed as context are not re-emitted as top-level findings.
+            i += 1 + len(context)
+        else:
+            i += 1
 
     return new_offset, findings
 

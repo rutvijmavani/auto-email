@@ -465,7 +465,8 @@ def run():
                     _confirmed_done: set = set()
                     _db_ok = False
                     try:
-                        _vconn = get_conn()
+                        from db.db import get_conn as _get_conn_wait
+                        _vconn = _get_conn_wait()
                         try:
                             _vrows = _vconn.execute(
                                 "SELECT company FROM company_poll_stats "
@@ -498,9 +499,10 @@ def run():
                                 "In-flight scans confirmed complete: %s (%d still waiting)",
                                 ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
                             )
+                            _names_str = ', '.join(sorted(_confirmed_done))
                             print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
-                                  f"{', '.join(sorted(_confirmed_done))[:120]}"
-                                  f"{'...' if len(_confirmed_done) > 5 else ''}")
+                                  f"{_names_str[:120]}"
+                                  f"{'...' if len(_names_str) > 120 else ''}")
                         if _unconfirmed:
                             logger.warning(
                                 "In-flight scans left ZSET without DB update "

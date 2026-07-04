@@ -1001,6 +1001,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                                     "failed for %s: %s — leaving in inflight",
                                     _r_job_id, _dp_err,
                                 )
+                                _r_discard = True  # skip delay-requeue; item stays in inflight
                             else:
                                 # DB row removed — safe to drop from inflight and clear retry counter.
                                 r.lrem(inflight_key, 1, raw)

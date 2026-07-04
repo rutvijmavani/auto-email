@@ -97,6 +97,7 @@ echo ""
 echo "► Persisting to redis.conf..."
 
 REDIS_CONF=""
+_conf_patched=0
 for candidate in "${REDIS_CONF_CANDIDATES[@]}"; do
     if [[ -f "$candidate" ]]; then
         REDIS_CONF="$candidate"
@@ -159,7 +160,12 @@ else
 
     echo ""
     echo "  Config saved. Reloading Redis config..."
-    $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1 || true   # flush in-memory config → file
+    if ! $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1; then
+        echo "  [WARN] CONFIG REWRITE failed — redis.conf may be read-only or Redis lacks write permission."
+        echo "         The live CONFIG SET is active, but redis.conf was not updated by CONFIG REWRITE."
+        echo "         The file edits above already wrote the directives directly; this warning is non-fatal."
+    fi
+    _conf_patched=1
 fi
 
 # ── Trigger AOF rewrite only when appendonly was newly enabled ────────────────
@@ -211,7 +217,13 @@ if [[ "$aof_enabled" == "yes"     &&
       "$aof_rwpct"   == "100"      &&
       ( "$aof_rwmin" == "64mb" || "$aof_rwmin" == "67108864" ) ]]; then
     echo ""
-    echo "  ✓ AOF persistence is ACTIVE"
+    if [[ "$_conf_patched" -eq 0 ]]; then
+        echo "  ✓ AOF settings are LIVE (active in Redis process)"
+        echo "  [WARN] redis.conf was NOT updated (SKIP_CONF_CHECK=1) — settings will revert on Redis restart"
+    else
+        echo "  ✓ AOF persistence is ACTIVE"
+        echo "  ✓ redis.conf updated — settings survive Redis restart"
+    fi
     echo "  ✓ Data-loss window: ~1 second (AOF fsync everysec)"
     echo "  ✓ AOF compaction:   auto-rewrite when file doubles (≥64 MB)"
 else

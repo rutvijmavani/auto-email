@@ -29,7 +29,7 @@ Both call sites (`_reschedule_adaptive()` and fullscan scheduling) updated.
 
 ## PHASE 2 — Thundering Herd Prevention ✅ DONE
 
-Full design in `docs/adaptive-polling-architecture.md`.
+Full design in `docs/architecture.md`.
 
 ### 2.1 Core algorithm — _pick_schedule_time() ✅ DONE
 **File:** `workers/scheduler.py`  

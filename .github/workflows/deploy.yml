@@ -91,12 +91,14 @@ jobs:
             PY
 
             echo "[6/8] Syncing systemd unit files..."
+            shopt -s nullglob
             for unit_file in ${{ secrets.VM_PATH }}/deploy/systemd/*.service; do
               unit_name=$(basename "$unit_file")
               sed "s|User=opc|User=${{ secrets.VM_USER }}|g; s|Group=opc|Group=${{ secrets.VM_USER }}|g; s|/home/opc/mail|${{ secrets.VM_PATH }}|g" \
                 "$unit_file" | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
               echo "  Installed: $unit_name"
             done
+            shopt -u nullglob
             sudo systemctl daemon-reload
             echo "  systemd daemon reloaded"
 
@@ -125,8 +127,16 @@ jobs:
             source venv/bin/activate
             if ! python scripts/health_check.py; then
               echo "[ERROR] Health check failed — rolling back to $PREVIOUS_SHA"
-              git checkout -B main "$PREVIOUS_SHA"
-              pip install -r requirements.txt --quiet
+              if ! git checkout -B main "$PREVIOUS_SHA"; then
+                echo "[FATAL] git checkout to $PREVIOUS_SHA failed — repository may be in a dirty state"
+                echo "[FATAL] Manual intervention required: git checkout main && git reset --hard $PREVIOUS_SHA"
+                exit 1
+              fi
+              if ! pip install -r requirements.txt --quiet; then
+                echo "[FATAL] pip install failed during rollback — venv may be corrupted"
+                echo "[FATAL] Manual intervention required: deactivate && rm -rf venv && python -m venv venv && pip install -r requirements.txt"
+                exit 1
+              fi
 
               echo "[ROLLBACK] Re-syncing systemd unit files from previous revision..."
               shopt -s nullglob   # prevent literal glob if deploy/systemd/ is absent
