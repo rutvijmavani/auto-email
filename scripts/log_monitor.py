@@ -146,7 +146,12 @@ def _get_redis():
         from dotenv import load_dotenv
         load_dotenv(PROJECT_DIR / ".env")
         url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        return _redis.from_url(url, decode_responses=True)
+        return _redis.from_url(
+            url,
+            decode_responses=True,
+            socket_timeout=30,
+            socket_connect_timeout=5,
+        )
     except Exception:
         return None
 
@@ -167,17 +172,27 @@ def _fingerprint(line: str, context: list[str]) -> str:
     all_lines = [line] + context
 
     exc_type = None
+    exc_msg  = None   # normalized message portion of the exception line
     location = None
 
     # Look for bare exception line: "TypeError: fromisoformat…"
     for _check_line in all_lines:
         m = re.match(
             r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning))'
-            r'(?:\s*:|\s*$)',
+            r'(?:\s*:\s*(.*))?$',
             _check_line.strip(),
         )
         if m:
             exc_type = m.group(1).split(".")[-1]   # strip module prefix
+            _raw_msg = (m.group(2) or "").strip()
+            if _raw_msg:
+                # Normalize variable parts so the same error class+message structure
+                # hashes consistently regardless of run-time values.
+                _raw_msg = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[\d.,]*',
+                                  'TS', _raw_msg)
+                _raw_msg = re.sub(r'\b[0-9a-f]{8,}\b', 'HASH', _raw_msg)
+                _raw_msg = re.sub(r'\b\d{4,}\b', 'N', _raw_msg)
+                exc_msg = _raw_msg[:80]
             break
 
     # Look for traceback frame: '  File "/path/foo.py", line 123, in func'
@@ -195,7 +210,9 @@ def _fingerprint(line: str, context: list[str]) -> str:
     if exc_type and location:
         raw = f"{exc_type}:{location}"
     elif exc_type:
-        raw = exc_type
+        # Include normalized message so ValueError: missing key and
+        # ValueError: invalid timestamp produce distinct fingerprints.
+        raw = f"{exc_type}:{exc_msg}" if exc_msg else exc_type
     elif location:
         # Traceback frame found without a recognisable exception type line —
         # use the file+lineno so the fingerprint is still stable.
@@ -305,6 +322,7 @@ def scan_file(
         line = lines[i].rstrip()
         if line and not _is_suppressed(line) and _is_flagged(line):
             context = []
+            last_consumed = i  # track the last line index consumed by this finding
             for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines))):
                 ctx_raw = lines[j]
                 ctx     = ctx_raw.rstrip()
@@ -314,12 +332,13 @@ def scan_file(
                 if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
                     if not _is_traceback_component(ctx):
                         break   # genuinely new error — defer as its own finding
+                last_consumed = j  # mark consumed even if blank/suppressed (not appended)
                 if ctx and not _is_suppressed(ctx_raw):
                     context.append(ctx)
             findings.append((line, context))
-            # Skip past context lines so traceback components (ValueError:, etc.)
-            # already consumed as context are not re-emitted as top-level findings.
-            i += 1 + len(context)
+            # Skip ALL consumed lines (including blank/suppressed ones between
+            # appended context entries) so they are not re-processed as findings.
+            i = last_consumed + 1
         else:
             i += 1
 
@@ -536,8 +555,8 @@ def sweep_resolved(r, now: float) -> list[dict]:
                         r.rpush(_KEY_RESOLVED, json.dumps(record))
                         r.ltrim(_KEY_RESOLVED, -200, -1)  # keep last 200
                         _resolution_written = True
-                except Exception:
-                    pass
+                except Exception as _res_err:
+                    print(f"[log_monitor] resolution sweep failed for {fp}: {_res_err}")
                 if _resolution_written:
                     r.delete(err_key)
                     r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
@@ -818,12 +837,18 @@ def main() -> None:
         elif sent is None:
             # Credentials permanently absent — still mark errors as known and
             # advance offsets so we do not re-alert on every run with no email.
+            # Only advance offsets if at least one Redis dedup write succeeds;
+            # if all writes fail the errors were not recorded, so keep the old
+            # offsets so the next run can retry once Redis is available again.
+            _any_dedup_written = False
             for fp, record in new_errors.items():
                 try:
                     r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
+                    _any_dedup_written = True
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
-            _save_offsets(new_offsets, new_inodes)
+            if _any_dedup_written:
+                _save_offsets(new_offsets, new_inodes)
         else:
             # Transient SMTP failure — do NOT mark as known and do NOT advance offsets.
             # The next run will re-scan from the same position and retry.

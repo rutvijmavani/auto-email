@@ -133,7 +133,10 @@ def _claim_alert_slot(service: str) -> bool:
                     pass
                 return False
     except Exception:
-        return False
+        # Dedup mechanism failed (e.g. fcntl unavailable, FS error).
+        # Fail open: send the alert rather than silently suppressing it.
+        # Risk of duplicate sends in this path is lower than missing an alert.
+        return True
 
 
 # ─────────────────────────────────────────

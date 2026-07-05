@@ -163,6 +163,20 @@ _RETRY_KEY_TTL         = 86400 * 7   # 7 days — auto-expires if job never come
 _MAX_RETRY_DELAY_S     = 60          # cap exponential backoff at 60 seconds
 _RETRY_DELAY_KEY_SUFFIX = ":retry_delay"  # appended to source queue key
 
+# Move one item from the inflight list into the retry-delay ZSET atomically.
+# LREM-then-ZADD: if the item is gone (concurrent drain/ack), skip the ZADD
+# so the item is not added to the delay ZSET without a corresponding removal.
+#
+# KEYS[1] = delay_zset_key   KEYS[2] = inflight_key
+# ARGV[1] = score (eligible unix timestamp)   ARGV[2] = item payload
+_ATOMIC_DELAY_REQUEUE_LUA = """
+local removed = redis.call('LREM', KEYS[2], 1, ARGV[2])
+if removed > 0 then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+end
+return removed
+"""
+
 # Drain retry-delayed items from the delay ZSET back into their source queue.
 # Called at the top of the main loop so eligible items are visible before the
 # next pop.  Fully atomic: ZRANGEBYSCORE + RPUSH + ZREM in one Redis eval().
@@ -1038,8 +1052,14 @@ def run_worker(once: bool = False, shutdown_event=None,
                     _r_job_id, _r_company, _backoff_s,
                 )
                 try:
-                    r.zadd(_delay_key, {raw: time.time() + _backoff_s})
-                    r.lrem(inflight_key, 1, raw)
+                    # Atomic: LREM from inflight then ZADD to delay ZSET.
+                    # If either step fails the script rolls back — item stays
+                    # in inflight for recovery on next startup.
+                    r.eval(
+                        _ATOMIC_DELAY_REQUEUE_LUA, 2,
+                        _delay_key, inflight_key,
+                        str(time.time() + _backoff_s), raw,
+                    )
                 except Exception as _rq_err:
                     logger.error(
                         "detail_worker: delay-requeue failed for %s: %s "

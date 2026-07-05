@@ -367,24 +367,26 @@ def run_health_check() -> int:
         except Exception as _inf_err:
             logger.debug("health_check: inflight ZSET unavailable: %s", _inf_err)
 
-        conn  = get_conn()
-        total = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
+        conn = get_conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
 
-        # Fetch all stale companies so we can filter out inflight in Python
-        _stale_rows = conn.execute("""
-            SELECT company, last_full_scan_at
-            FROM company_poll_stats
-            WHERE last_full_scan_at IS NULL
-               OR last_full_scan_at < NOW() - INTERVAL '26 hours'
-            ORDER BY last_full_scan_at ASC NULLS FIRST
-        """).fetchall()
+            # Fetch all stale companies so we can filter out inflight in Python
+            _stale_rows = conn.execute("""
+                SELECT company, last_full_scan_at
+                FROM company_poll_stats
+                WHERE last_full_scan_at IS NULL
+                   OR last_full_scan_at < NOW() - INTERVAL '26 hours'
+                ORDER BY last_full_scan_at ASC NULLS FIRST
+            """).fetchall()
 
-        stuck = conn.execute("""
-            SELECT COUNT(*) AS c FROM job_postings
-            WHERE status = 'pending_detail'
-              AND created_at < NOW() - INTERVAL '1 hour'
-        """).fetchone()["c"]
-        conn.close()
+            stuck = conn.execute("""
+                SELECT COUNT(*) AS c FROM job_postings
+                WHERE status = 'pending_detail'
+                  AND created_at < NOW() - INTERVAL '1 hour'
+            """).fetchone()["c"]
+        finally:
+            conn.close()
 
         # Exclude actively-scanning companies from the missed count
         _stale_set    = {r2["company"] for r2 in _stale_rows}

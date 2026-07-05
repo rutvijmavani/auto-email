@@ -106,7 +106,9 @@ def _call_health_section(stats):
         captured["data"] = data
         return MagicMock()   # fake table object
 
-    with patch.object(mrep, "Table", side_effect=_table_ctor):
+    with patch.object(mrep, "Table", side_effect=_table_ctor), \
+         patch.object(mrep, "Paragraph", return_value=MagicMock()), \
+         patch.object(mrep, "HRFlowable", return_value=MagicMock()):
         alerts_mock = []
         styles_mock = MagicMock()
         mrep._build_health_section(stats, alerts_mock, styles_mock)

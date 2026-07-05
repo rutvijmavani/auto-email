@@ -29,35 +29,46 @@ echo "► Updating crontab (monitor retry + keep-alive frequency)..."
 # ── Capture existing crontab ──────────────────────────────────────────────────
 EXISTING=$(crontab -l 2>/dev/null || true)
 
-# ── Remove the entire pipeline block (marker-delimited) ──────────────────────
-# setup_cron.sh wraps all pipeline entries between BEGIN/END markers.
-# Strip that whole block so re-inserting the updated entries does not
-# create duplicates regardless of which script installed the crontab.
-# Fall back to grep-based cleanup for legacy crontabs without markers.
+# ── Remove only the entries being updated, preserving everything else ─────────
+# Both the marker path and the legacy path use the same surgical grep-v list so
+# the `0 7 run_monitor.sh` anchor is always preserved for awk injection.
+# The marker path additionally strips the BEGIN/END marker lines themselves
+# (setup_cron.sh will re-add them on the next full setup run).
+_STRIP_PATTERNS=(
+    "monitor_.*log.*run_monitor"
+    "MONITOR RETRY"
+    "missed.*VM suspension"
+    "9 AM fallback"
+    "Runs only if the 7 AM job"
+    "Checks for exit=0 in today"
+    "digest arrives at most"
+    "scripts/log_monitor\.py"
+    "log_monitor_.*\.log"
+    "LOG MONITOR"
+    "Scans log files for new ERRORs"
+    "Sends a batched email alert"
+    "Sends an immediate alert"
+    "Redis-deduped"
+    "each unique issue emails"
+    "State tracked in data/log_monitor"
+    "hashlib.*range(100000)"
+    "KEEP-ALIVE"
+    "Prevents Oracle Cloud"
+    "VM was being suspended"
+    "every 4 days"
+    "every 4 hours"
+)
+
+CLEANED="$EXISTING"
+for _pat in "${_STRIP_PATTERNS[@]}"; do
+    CLEANED=$(echo "$CLEANED" | grep -v "$_pat" || true)
+done
+
+# Strip marker lines if present (they will be re-added by setup_cron.sh later).
 if echo "$EXISTING" | grep -q "# === BEGIN RECRUITER PIPELINE ==="; then
-    CLEANED=$(echo "$EXISTING" | \
-        sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
-else
-    # Legacy crontab (no markers): remove only the specific lines being replaced.
-    CLEANED=$(echo "$EXISTING" \
-      | grep -v "monitor_.*log.*run_monitor"              \
-      | grep -v "MONITOR RETRY"                           \
-      | grep -v "missed.*VM suspension"                   \
-      | grep -v "9 AM fallback"                           \
-      | grep -v "Runs only if the 7 AM job"               \
-      | grep -v "Checks for exit=0 in today"              \
-      | grep -v "digest arrives at most"                  \
-      | grep -v "scripts/log_monitor\.py\|log_monitor_.*\.log" \
-      | grep -v "LOG MONITOR"                             \
-      | grep -v "Scans log files for new ERRORs"          \
-      | grep -v "Sends a batched email alert"             \
-      | grep -v "State tracked in data/log_monitor"       \
-      | grep -v "hashlib.*range(100000)"                  \
-      | grep -v "KEEP-ALIVE"                              \
-      | grep -v "Prevents Oracle Cloud"                   \
-      | grep -v "VM was being suspended"                  \
-      | grep -v "every 4 days"                            \
-      | grep -v "every 4 hours"                           \
+    CLEANED=$(echo "$CLEANED" \
+      | grep -v "# === BEGIN RECRUITER PIPELINE ===" \
+      | grep -v "# === END RECRUITER PIPELINE ===" \
       || true)
 fi
 

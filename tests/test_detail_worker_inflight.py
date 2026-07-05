@@ -513,6 +513,7 @@ class TestPopWithInflight(unittest.TestCase):
         """Both queues empty → returns None after timeout expires."""
         r = MagicMock()
         r.lmove.return_value = None
+        r.blmove.return_value = None
         from workers.detail_worker import _pop_with_inflight
         result = _pop_with_inflight(r, timeout=0.01)
         self.assertIsNone(result)
@@ -529,6 +530,7 @@ class TestPopWithInflight(unittest.TestCase):
             return None
 
         r.lmove.side_effect = _lmove
+        r.blmove.return_value = None
         from workers.detail_worker import _pop_with_inflight
         _pop_with_inflight(r, timeout=0.01)
         self.assertEqual(first_src[0], REDIS_DETAIL_ADAPTIVE)
@@ -557,13 +559,10 @@ class TestPopWithInflight(unittest.TestCase):
         from config import REDIS_DETAIL_FULLSCAN
 
         r = MagicMock()
+        r.lmove.return_value = None   # adaptive always empty
+        # Fullscan uses blmove (blocking pop, up to 1 s)
+        r.blmove.return_value = b'{"job_id": "456"}'
 
-        def _lmove(src, dst, sd, dd):
-            if src == REDIS_DETAIL_FULLSCAN:
-                return b'{"job_id": "456"}'
-            return None
-
-        r.lmove.side_effect = _lmove
         from workers.detail_worker import _pop_with_inflight
         result = _pop_with_inflight(r, timeout=0.1)
 
@@ -613,26 +612,28 @@ class TestPopWithInflight(unittest.TestCase):
                       "Inflight key must embed the worker PID")
 
     def test_fullscan_item_moved_to_per_pid_fullscan_inflight(self):
-        """Fullscan pop: LMOVE destination is the per-PID _INFLIGHT_FULLSCAN."""
+        """Fullscan pop: BLMOVE destination is the per-PID _INFLIGHT_FULLSCAN."""
         from config import REDIS_DETAIL_FULLSCAN
         from workers.detail_worker import _INFLIGHT_FULLSCAN
 
         r = MagicMock()
+        r.lmove.return_value = None   # adaptive empty → fall through to fullscan
         fs_pop_call = [None]
 
-        def _lmove(src, dst, sd, dd):
-            if src == REDIS_DETAIL_FULLSCAN and fs_pop_call[0] is None:
+        def _blmove(src, dst, wait_s, sd, dd):
+            if fs_pop_call[0] is None:
                 fs_pop_call[0] = (src, dst)
-                return b'{"job_id": "2"}'
-            return None
+            return b'{"job_id": "2"}'
 
-        r.lmove.side_effect = _lmove
+        r.blmove.side_effect = _blmove
         from workers.detail_worker import _pop_with_inflight
         _pop_with_inflight(r, timeout=0.1)
 
         self.assertIsNotNone(fs_pop_call[0])
+        self.assertEqual(fs_pop_call[0][0], REDIS_DETAIL_FULLSCAN,
+                         "Fullscan blmove source must be REDIS_DETAIL_FULLSCAN")
         self.assertEqual(fs_pop_call[0][1], _INFLIGHT_FULLSCAN,
-                         "Fullscan pop destination must be per-PID _INFLIGHT_FULLSCAN")
+                         "Fullscan blmove destination must be per-PID _INFLIGHT_FULLSCAN")
         self.assertIn(str(_FAKE_PID), _INFLIGHT_FULLSCAN,
                       "Inflight key must embed the worker PID")
 

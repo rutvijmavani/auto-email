@@ -953,6 +953,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         # Cast to int explicitly — r.llen() always returns int in production,
         # but an explicit cast guards against unexpected return types (e.g. in
         # tests) and keeps the %d log format safe.
+        _backpressure_wait_s = 0   # tracked so the EMA excludes idle wait time
         queue_depth = int(r.llen(REDIS_DETAIL_FULLSCAN) or 0)
         if queue_depth > DETAIL_QUEUE_MAX_FULLSCAN:
             logger.warning(
@@ -978,6 +979,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 waited += 10
                 if _is_paused(r):
                     break
+            _backpressure_wait_s = waited
 
         # Chunk the flat job list to simulate page-level pause checks.
         # Phase 7 will replace this outer loop with actual paginated HTTP fetches.
@@ -1154,7 +1156,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             #   Day 2: midpoints now spread across the window -> gaps rebalance further
             #   Day 3+: stable maximum-spread distribution maintained automatically
             avg_duration_s = fs_state.get("avg_fullscan_duration_s", _AVG_DURATION_SEED)
-            duration_s     = time.monotonic() - start_mono
+            # Exclude backpressure idle time so queue saturation events don't
+            # inflate the EMA and cause unnecessary scheduling pessimism.
+            duration_s = max(0.0, time.monotonic() - start_mono - _backpressure_wait_s)
 
             # Compute the updated EMA using the module-level _EMA_ALPHA so the
             # deadline guard in _pick_schedule_time reflects current performance.

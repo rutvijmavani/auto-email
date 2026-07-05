@@ -436,6 +436,7 @@ def run():
         print(f"[INFO] Waiting up to {_IN_FLIGHT_WAIT_S}s for "
               f"{len(_remaining_inflight)} in-flight scan(s) to finish...")
 
+        _all_unconfirmed: set = set()   # accumulates across poll iterations
         _r_wait = None
         try:
             from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
@@ -512,6 +513,7 @@ def run():
                             )
                             with stats_lock:
                                 stats["in_flight"] -= len(_unconfirmed)
+                            _all_unconfirmed.update(_unconfirmed)
 
                 if _remaining_inflight:
                     time.sleep(_IN_FLIGHT_POLL_S)
@@ -541,6 +543,60 @@ def run():
             _elapsed = int(time.time() - _wait_start)
             logger.info("All in-flight scans completed within %ds.", _elapsed)
             print(f"[INFO] All in-flight scans completed in {_elapsed}s.")
+
+        # Re-fetch companies that exited the in-flight ZSET without a DB update.
+        # These are likely scan failures; do a fallback fetch so the digest is not
+        # silently incomplete.  Build company_row dicts from the `companies` list
+        # so _process_company receives the same shape as the missed path.
+        if _all_unconfirmed:
+            _company_by_name = {c["company"]: c for c in companies}
+            _retry_rows = [
+                _company_by_name[name]
+                for name in _all_unconfirmed
+                if name in _company_by_name
+            ]
+            if _retry_rows:
+                logger.warning(
+                    "Fallback re-fetching %d unconfirmed scan(s): %s",
+                    len(_retry_rows),
+                    ", ".join(c["company"] for c in _retry_rows),
+                )
+                print(f"[INFO] Fallback re-fetching {len(_retry_rows)} "
+                      f"unconfirmed scan(s): "
+                      f"{', '.join(c['company'] for c in _retry_rows[:5])}"
+                      f"{'...' if len(_retry_rows) > 5 else ''}")
+                with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as _uc_exec:
+                    _uc_futures = {
+                        _uc_exec.submit(
+                            _process_company, company_row, i + 1, len(_retry_rows)
+                        ): company_row["company"]
+                        for i, company_row in enumerate(_retry_rows)
+                    }
+                    for _uc_fut in as_completed(_uc_futures):
+                        _uc_company = _uc_futures[_uc_fut]
+                        try:
+                            _uc_stats = _uc_fut.result()
+                        except Exception as _uc_err:
+                            logger.error(
+                                "Unhandled error in unconfirmed fallback for %r: %s",
+                                _uc_company, _uc_err, exc_info=True,
+                            )
+                            _uc_stats = {
+                                "monitored": 1, "with_results": 0,
+                                "unknown_ats": 0, "failed": 1,
+                                "fetched": 0, "matched": 0, "new": 0,
+                                "failure_name": _uc_company,
+                            }
+                        with stats_lock:
+                            stats["fallback_scanned"]       += _uc_stats.get("fallback_scanned", 0)
+                            stats["companies_with_results"] += _uc_stats.get("with_results",   0)
+                            stats["companies_unknown_ats"]  += _uc_stats.get("unknown_ats",    0)
+                            stats["api_failures"]           += _uc_stats.get("failed",         0)
+                            stats["total_jobs_fetched"]     += _uc_stats.get("fetched",        0)
+                            stats["jobs_matched_filters"]   += _uc_stats.get("matched",        0)
+                            stats["new_jobs_found"]         += _uc_stats.get("new",            0)
+                            if _uc_stats.get("failure_name"):
+                                stats["api_failure_list"].append(_uc_stats["failure_name"])
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()

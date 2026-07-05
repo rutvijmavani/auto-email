@@ -386,7 +386,7 @@ The watchdog calls `systemctl is-active recruiter-scheduler` (and `recruiter-wat
 
 **Why this check exists separately from heartbeats:**
 
-A worker heartbeat key in Redis has a TTL of 15–45 seconds. If the scheduler just crashed, that key is still alive in Redis for up to 45 more seconds — during that window the heartbeat check says "healthy" while the process is actually dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key has had a chance to expire. It is a faster and more authoritative signal.
+A worker heartbeat key in Redis has a TTL of 3× the write interval: 30 seconds for detail/scan workers (10 s interval) and 180 seconds for the fullscan worker (60 s interval). If the scheduler just crashed, a heartbeat key written by a worker it spawned is still alive in Redis for up to 180 more seconds — during that window the heartbeat check says "healthy" while the process is actually dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key has had a chance to expire. It is a faster and more authoritative signal.
 
 **Why `failed` is different from `inactive`:**
 

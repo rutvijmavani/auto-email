@@ -107,14 +107,13 @@ fi
 # Run this before restart so the updated definitions are always active.
 echo ""
 echo "► Syncing systemd unit files..."
-SERVICE_USER="$(whoami)"
-for unit_file in "$DEPLOY_DIR/systemd/"*.service; do
-    unit_name=$(basename "$unit_file")
-    sed "s|User=opc|User=$SERVICE_USER|g; s|Group=opc|Group=$SERVICE_USER|g; \
-         s|/home/opc/mail|$PROJECT_DIR|g" "$unit_file" \
-        | sudo tee /etc/systemd/system/"$unit_name" > /dev/null
-    echo "  Installed: $unit_name"
-done
+if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
+    echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
+    echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
+    exit 1
+fi
+sudo /usr/local/bin/install-pipeline-units
+echo "  systemd unit files installed"
 sudo systemctl daemon-reload
 echo "  systemd daemon reloaded"
 

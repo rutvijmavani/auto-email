@@ -80,14 +80,22 @@ jobs:
             git fetch --all
             PREVIOUS_SHA=$(git rev-parse HEAD)
 
-            # Early-failure rollback trap: if any step before the health-check
-            # rollback fires fails, revert to PREVIOUS_SHA so the VM is not left
-            # on the new (potentially broken) commit with services still running old code.
+            # Early-failure rollback trap: if any step before the long health-check
+            # fails, revert to PREVIOUS_SHA and attempt to restore service state.
+            # Steps 3-6 fail before services are touched → code-only revert is enough.
+            # Steps 7-8 fail after services may have been restarted → also re-sync
+            # unit files and attempt a service restart so the VM is not left dark.
             _early_rollback() {
               local _exit=$?
               echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
               git checkout -B main "$PREVIOUS_SHA" || echo "[FATAL] git rollback failed"
               pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
+              echo "[ROLLBACK] Re-syncing unit files and restarting services..."
+              sudo /usr/local/bin/install-pipeline-units || echo "[WARN] unit sync failed during rollback"
+              sudo systemctl daemon-reload || true
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
+              done
               echo "[ROLLBACK] Reverted to $PREVIOUS_SHA"
               exit $_exit
             }
@@ -119,9 +127,6 @@ jobs:
             sudo systemctl daemon-reload
             echo "  systemd daemon reloaded"
 
-            # Hand off from early-failure trap to the full health-check rollback below.
-            trap - ERR
-
             echo "[7/8] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do
               if ! systemctl cat "$svc" &>/dev/null; then
@@ -141,6 +146,11 @@ jobs:
               fi
               echo "[OK] $svc is active"
             done
+
+            # All pre-health-check steps passed — disable the early-failure trap
+            # before the long health-check sleep to avoid rolling back on
+            # non-fatal signals (e.g. SIGPIPE from pipeline subshells).
+            trap - ERR
 
             echo "  Running health check to verify pipeline state..."
             sleep 70   # fullscan_worker writes heartbeat every 60s — wait at least that long

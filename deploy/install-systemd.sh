@@ -96,23 +96,46 @@ chown "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR/.env"
 chmod 600 "$PROJECT_DIR/.env"
 echo "  .env permissions: 600 (owner read-only)"
 
+# ── Copy unit templates to a root-owned staging directory ─────────────────────
+# The wrapper reads from this directory at deploy time.  Keeping the templates
+# in a root-owned location (not the project tree, which is SERVICE_USER-writable)
+# prevents a privilege-escalation path where the service user writes a malicious
+# unit file and then triggers the root wrapper to install it.
+#
+# Update these staging copies every time install-systemd.sh is re-run so that
+# structural changes to unit files (e.g. new directives) are picked up without
+# requiring a separate manual step.
+echo ""
+echo "► Staging unit templates to root-owned location..."
+UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
+mkdir -p "$UNIT_STAGING_DIR"
+for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service"; do
+    src="$DEPLOY_DIR/systemd/$unit"
+    if [[ -f "$src" ]]; then
+        cp "$src" "$UNIT_STAGING_DIR/$unit"
+        chown root:root "$UNIT_STAGING_DIR/$unit"
+        chmod 644 "$UNIT_STAGING_DIR/$unit"
+        echo "  Staged: $UNIT_STAGING_DIR/$unit"
+    fi
+done
+chown root:root "$UNIT_STAGING_DIR"
+chmod 755 "$UNIT_STAGING_DIR"
+
 # ── Create root-owned unit-install wrapper ────────────────────────────────────
-# This wrapper reads unit files from the project's deploy/systemd/ directory
-# (not from stdin), applying user/path substitution before writing to
-# /etc/systemd/system/.  Granting sudo access to this wrapper instead of
-# "sudo tee" eliminates the stdin-injection risk: no external caller can pipe
-# arbitrary content through it to become a root-owned service unit.
+# Reads from the root-owned staging directory (not the project tree).
+# Granting sudo access to this wrapper instead of "sudo tee" eliminates the
+# stdin-injection risk AND the writable-source-tree privilege-escalation risk.
 echo ""
 echo "► Creating unit-install wrapper..."
 UNIT_INSTALL_BIN="/usr/local/bin/install-pipeline-units"
 cat > "$UNIT_INSTALL_BIN" << WRAPPER_EOF
 #!/bin/bash
-# Root-owned unit installer — reads from the project's deploy/systemd/ directory.
+# Root-owned unit installer — reads from root-owned staging dir.
 # Do NOT grant NOPASSWD tee on /etc/systemd/system/ — use this wrapper instead.
 set -euo pipefail
-PROJECT_DIR="${PROJECT_DIR}"
 SERVICE_USER="${SERVICE_USER}"
-SRC_DIR="\$PROJECT_DIR/deploy/systemd"
+PROJECT_DIR="${PROJECT_DIR}"
+SRC_DIR="/usr/local/share/mail-pipeline/systemd"
 DST_DIR="/etc/systemd/system"
 ALLOWED_UNITS=(
     "recruiter-scheduler.service"
