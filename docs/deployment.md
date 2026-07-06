@@ -726,7 +726,7 @@ CRON_TZ=America/New_York
 # LOG MONITOR — every 15 minutes
 # Scans log files from last byte offset, emails on new errors (Redis-deduped)
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)
@@ -1571,7 +1571,7 @@ Problem detected
 
 Deduplication prevents repeated emails: once an alert fires for a given issue type, it is suppressed for 1 hour so you do not receive the same email repeatedly between attempts.
 
-The watchdog can call systemctl commands without a password prompt because `install-systemd.sh` adds narrowly-scoped rules to `/etc/sudoers.d/mail-pipeline`. The granted commands are: `systemctl reset-failed`, `systemctl restart` (scheduler + watchdog), and `systemctl is-active` (scheduler + watchdog). The deploy workflow additionally needs `systemctl daemon-reload` and `sudo tee` for unit-file sync — those are also included in the sudoers file.
+The watchdog can call systemctl commands without a password prompt because `install-systemd.sh` adds narrowly-scoped rules to `/etc/sudoers.d/mail-pipeline`. The granted commands are: `systemctl reset-failed`, `systemctl restart` (scheduler + watchdog), and `systemctl is-active` (scheduler + watchdog). The deploy workflow additionally needs `systemctl daemon-reload` and the root-owned `/usr/local/bin/install-pipeline-units` wrapper for unit-file sync — both are included in the sudoers file. The wrapper (not `sudo tee`) is used to prevent stdin injection and privilege-escalation via a writable source tree.
 
 ---
 

@@ -187,8 +187,12 @@ class TestRunWorkerInitialisation(unittest.TestCase):
         mock_init.assert_called_once()
 
     def test_redis_unreachable_calls_sys_exit(self):
-        """Redis not reachable → sys.exit(1) called."""
-        with patch("workers.scan_worker.ping", return_value=False), \
+        """Redis not reachable → sys.exit(1) called (via validate_startup)."""
+        # scan_worker now delegates Redis startup checks to validate_startup,
+        # which creates a bounded redis.from_url client and calls r.ping().
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
+        with patch("redis.from_url", return_value=mock_r), \
              patch("workers.scan_worker.init_db"), \
              self.assertRaises(SystemExit) as cm:
             from workers.scan_worker import run_worker

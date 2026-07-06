@@ -30,7 +30,7 @@ Before=recruiter-watchdog.service
 # as "failed" and stops retrying.  OnFailure fires to send an alert email.
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple

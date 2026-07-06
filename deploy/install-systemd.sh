@@ -13,7 +13,6 @@ set -euo pipefail
 
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
-SYSTEMD_DIR="/etc/systemd/system"
 SERVICE_USER="${SUDO_USER:-opc}"
 
 # Reject root as the service user — pipeline processes must not run as root.

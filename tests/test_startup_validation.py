@@ -111,10 +111,10 @@ class TestValidateStartup(unittest.TestCase):
         # r.ping() must return True; r.info() must return a valid version.
         mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "7.0.0"}
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
              patch("redis.from_url", return_value=mock_r), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", return_value=mock_conn):
+             patch("psycopg2.connect", return_value=mock_conn):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker")
@@ -252,10 +252,10 @@ class TestValidateStartup(unittest.TestCase):
         _mock_r = MagicMock()
         _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, env_missing), \
              patch("redis.from_url", return_value=_mock_r), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", return_value=MagicMock()):
+             patch("psycopg2.connect", return_value=MagicMock()):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_config=False)
@@ -340,8 +340,9 @@ class TestValidateStartup(unittest.TestCase):
     def test_check_redis_false_skips_redis(self):
         """check_redis=False → redis.from_url is never called."""
         mock_conn = MagicMock()
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn), \
+             patch("psycopg2.connect", return_value=mock_conn), \
              patch("redis.from_url",
                    side_effect=AssertionError("redis.from_url must not be called when check_redis=False")) as mock_from_url:
             from workers.startup import validate_startup
@@ -354,21 +355,22 @@ class TestValidateStartup(unittest.TestCase):
     # ── DB check ─────────────────────────────────────────────────────────────
 
     def test_db_execute_exception_exits_1(self):
-        """conn.execute() raises → sys.exit(1) (_check_postgres uses SELECT 1)."""
+        """cursor.execute() raises → sys.exit(1) (_check_postgres uses SELECT 1)."""
         mock_conn = MagicMock()
-        mock_conn.execute.side_effect = Exception("connection refused")
+        mock_conn.cursor.return_value.__enter__.return_value.execute.side_effect = Exception("connection refused")
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn):
+             patch("psycopg2.connect", return_value=mock_conn):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_redis=False, check_config=False)
             self.assertEqual(ctx.exception.code, 1)
 
     def test_db_get_conn_exception_exits_1(self):
-        """get_conn() raises → sys.exit(1)."""
+        """psycopg2.connect() raises → sys.exit(1)."""
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", side_effect=Exception("no DB")):
+             patch("psycopg2.connect", side_effect=Exception("no DB")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_redis=False, check_config=False)
@@ -377,10 +379,9 @@ class TestValidateStartup(unittest.TestCase):
     def test_db_failure_error_to_stderr(self):
         """DB failure → STARTUP FAILED written to stderr."""
         err_buf = io.StringIO()
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = Exception("DB down")
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn), \
+             patch("psycopg2.connect", side_effect=Exception("DB down")), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):

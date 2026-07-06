@@ -156,9 +156,19 @@ for svc in recruiter-scheduler recruiter-watchdog; do
 done
 if [[ $_svc_fail -ne 0 ]]; then
     echo ""
-    echo "  [ERROR] One or more services failed to start — check logs:"
-    echo "          journalctl -u recruiter-scheduler -n 50"
-    echo "          journalctl -u recruiter-watchdog  -n 20"
+    echo "  [ERROR] One or more services failed to start — rolling back to $PREVIOUS_SHA"
+    git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
+    "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
+        || echo "  [FATAL] pip rollback failed"
+    sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
+    sudo systemctl daemon-reload || true
+    sudo systemctl restart recruiter-scheduler \
+        || echo "  [WARN] could not restart recruiter-scheduler"
+    sudo systemctl restart recruiter-watchdog \
+        || echo "  [WARN] could not restart recruiter-watchdog"
+    echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
+    echo "             journalctl -u recruiter-scheduler -n 50"
+    echo "             journalctl -u recruiter-watchdog  -n 20"
     exit 1
 fi
 

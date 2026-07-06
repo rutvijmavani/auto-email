@@ -121,9 +121,9 @@ def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     try:
-        # Use a dedicated client with short timeouts for ALL Redis checks so a
-        # hung endpoint never blocks startup indefinitely.  The shared get_redis()
-        # has no socket timeout, so even the initial PING must use this client.
+        # Use a dedicated client with stricter timeouts (5s/3s) so a hung
+        # endpoint never blocks startup indefinitely.  The shared get_redis()
+        # uses longer timeouts suited for runtime use, not fail-fast startup probes.
         import redis as _redis_lib
         r = _redis_lib.from_url(
             redis_url,

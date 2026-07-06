@@ -84,7 +84,7 @@ Also updated `on_fullscan_complete()` in `workers/scheduler.py` (legacy path).
 - `_get_fullscan_state()` fetches `avg_fullscan_duration_s` so it's available at scheduling time
 - DB migration added to `init_db()` in `db/schema.py` (idempotent `ADD COLUMN IF NOT EXISTS`):
   - `last_fullscan_duration_s  INTEGER`
-  - `avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 30.0`
+  - `avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 1800.0`
 
 ### 2.6 job_monitor inflight exclusion ✅ DONE
 **File:** `jobs/job_monitor.py` — `_get_worker_missed_companies()`  

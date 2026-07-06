@@ -561,8 +561,8 @@ def sweep_resolved(r, now: float) -> list[dict]:
                     r.delete(err_key)
                     r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
                     resolved.append(fp)
-    except Exception:
-        pass
+    except Exception as _sweep_err:
+        print(f"[log_monitor] sweep_resolved failed: {_sweep_err}")
 
     return resolved
 
@@ -686,16 +686,16 @@ def send_digest(r, now: float) -> bool:
                 new_since_digest.append(rec)
             else:
                 still_active.append(rec)
-    except Exception:
-        pass
+    except Exception as _active_err:
+        print(f"[log_monitor] send_digest: failed to collect active errors: {_active_err}")
 
     # ── Collect resolved errors ───────────────────────────────────────────────
     resolved: list[dict] = []
     try:
         raw_list = r.lrange(_KEY_RESOLVED, 0, -1)
         resolved = [json.loads(x) for x in raw_list]
-    except Exception:
-        pass
+    except Exception as _resolved_err:
+        print(f"[log_monitor] send_digest: failed to collect resolved errors: {_resolved_err}")
 
     if not new_since_digest and not still_active and not resolved:
         print("[log_monitor] digest: nothing to report — skipping")
@@ -792,14 +792,14 @@ def main() -> None:
                 resolved_fps = sweep_resolved(r, now)
                 if resolved_fps:
                     print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
-            except Exception:
-                pass
+            except Exception as _sw_err:
+                print(f"[log_monitor] clean-run resolution sweep failed: {_sw_err}")
             try:
                 last_digest = float(r.get(_KEY_DIGEST) or 0)
                 if now - last_digest >= DIGEST_INTERVAL_S:
                     send_digest(r, now)
-            except Exception:
-                pass
+            except Exception as _dig_err:
+                print(f"[log_monitor] clean-run digest check failed: {_dig_err}")
         return
 
     # ── 2. Dedup via Redis ───────────────────────────────────────────────────

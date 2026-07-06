@@ -1015,10 +1015,14 @@ def run_worker(once: bool = False, shutdown_event=None,
                             except Exception as _dp_err:
                                 logger.error(
                                     "detail_worker: delete_pending_detail "
-                                    "failed for %s: %s — leaving in inflight",
+                                    "failed for %s: %s — delay-requeueing so "
+                                    "_ATOMIC_DRAIN_RETRY_LUA can retry cleanup",
                                     _r_job_id, _dp_err,
                                 )
-                                _r_discard = True  # skip delay-requeue; item stays in inflight
+                                # Do NOT set _r_discard — let the item fall through
+                                # to the delay-requeue path so inflight_key is
+                                # cleared atomically and the item can be retried.
+                                _backoff_s = _MAX_RETRY_DELAY_S
                             else:
                                 # DB row removed — safe to drop from inflight and clear retry counter.
                                 r.lrem(inflight_key, 1, raw)

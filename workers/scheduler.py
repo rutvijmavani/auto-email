@@ -1219,7 +1219,7 @@ def adaptive_loop() -> None:
             for company in due:
                 # Refresh heartbeat at the start of each iteration so backpressure
                 # or outage `continue` branches don't let the 15s TTL expire.
-                _write_scheduler_heartbeat(r, _hw_dispatched)
+                _write_scheduler_heartbeat(r, "adaptive", _hw_dispatched)
 
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)

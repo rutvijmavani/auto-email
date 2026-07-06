@@ -777,7 +777,8 @@ def run_worker(once: bool = False, shutdown_event=None,
         skip_init_db:   if True, skip init_db() (parent process already did it).
     """
     from workers.sentry_init import init_sentry
-    init_sentry()
+    if not init_sentry():
+        logger.warning("scan_worker: Sentry not initialized — SENTRY_DSN absent or invalid")
 
     # ── Startup validation (Redis + PostgreSQL + required config) ────────────
     # Run before init_db so config/connectivity issues are caught before any

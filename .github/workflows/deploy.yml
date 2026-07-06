@@ -137,7 +137,7 @@ jobs:
             for svc in recruiter-scheduler recruiter-watchdog; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
-                exit 1
+                false  # trigger ERR trap → _early_rollback runs
               fi
               sudo systemctl restart "$svc"
             done
@@ -148,7 +148,7 @@ jobs:
               if ! systemctl is-active --quiet "$svc"; then
                 echo "[ERROR] $svc failed to start after restart:"
                 journalctl -u "$svc" -n 30 --no-pager || true
-                exit 1
+                false  # trigger ERR trap → _early_rollback runs
               fi
               echo "[OK] $svc is active"
             done

@@ -192,9 +192,12 @@ ELAPSED=0
 while true; do
     MISSING=()
     for worker in "${WORKERS[@]}"; do
-        # scheduler uses a single key (no PID suffix); other workers use per-PID keys.
+        # scheduler writes per-loop keys (adaptive + fullscan); consider it alive
+        # when at least one loop key is present.
         if [[ "$worker" == "scheduler" ]]; then
-            if [[ -z "$(redis-cli GET "worker:alive:scheduler" 2>/dev/null)" ]]; then
+            _adp=$(redis-cli GET "worker:alive:scheduler:adaptive" 2>/dev/null)
+            _fsc=$(redis-cli GET "worker:alive:scheduler:fullscan" 2>/dev/null)
+            if [[ -z "$_adp" && -z "$_fsc" ]]; then
                 MISSING+=("$worker")
             fi
         else
