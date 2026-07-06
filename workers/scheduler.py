@@ -1126,15 +1126,21 @@ def _schedule_full_scan(company: str) -> None:
                 company, SCHEDULER_FULL_SCAN_BUFFER_S)
 
 
-def _write_scheduler_heartbeat(r, dispatched: int) -> None:
+def _write_scheduler_heartbeat(r, loop: str, dispatched: int) -> None:
+    """Write per-loop liveness key so a hung loop is detected independently.
+
+    Key: worker:alive:scheduler:{loop}  (e.g. :adaptive or :fullscan)
+    Watchdog checks both keys; if either goes stale the loop is flagged dead
+    even while the other loop keeps the process alive.
+    """
     try:
-        r.set("worker:alive:scheduler", json.dumps({
+        r.set(f"worker:alive:scheduler:{loop}", json.dumps({
             "pid":        os.getpid(),
             "ts":         time.time(),
             "dispatched": dispatched,
         }), ex=15)
     except Exception as _hb_err:
-        logger.debug("scheduler: heartbeat write failed: %s", _hb_err)
+        logger.debug("scheduler: %s_loop heartbeat write failed: %s", loop, _hb_err)
 
 
 # ─────────────────────────────────────────
@@ -1178,10 +1184,13 @@ def adaptive_loop() -> None:
 
     while True:
         try:
-            # ── Scheduler heartbeat (worker:alive:scheduler) ──────────────────
-            # Tick is 1s; TTL = 15s.  Watchdog alerts if scheduler loop stops
-            # for more than 15 seconds (paused state still writes this key).
-            _write_scheduler_heartbeat(r, _hw_dispatched)
+            # ── Scheduler heartbeat (worker:alive:scheduler:adaptive) ─────────
+            # Tick is 1s; TTL = 15s.  Written at top of every iteration so
+            # the key stays live even when no companies are due and during
+            # pause periods.  Watchdog compares this key independently from
+            # worker:alive:scheduler:fullscan so a hung adaptive_loop is
+            # detected even while fullscan_loop is still healthy.
+            _write_scheduler_heartbeat(r, "adaptive", _hw_dispatched)
 
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
@@ -1361,6 +1370,13 @@ def fullscan_loop() -> None:
 
     while True:
         try:
+            # ── Scheduler heartbeat (worker:alive:scheduler:fullscan) ─────────
+            # Written at the TOP of every iteration — before the pause check and
+            # before the due-company loop — so the key stays live even when no
+            # fullscans are due (the common case).  Without this, the key would
+            # expire after 15 idle ticks and trigger a false dead-loop alert.
+            _write_scheduler_heartbeat(r, "fullscan", _hw_dispatched)
+
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
                 _check_auto_resume()
@@ -1384,9 +1400,9 @@ def fullscan_loop() -> None:
                                   withscores=False)
 
             for company in due:
-                # Refresh heartbeat so backpressure `continue` branches don't
-                # let the 15s TTL expire when many companies are due at once.
-                _write_scheduler_heartbeat(r, _hw_dispatched)
+                # Refresh mid-loop so a large due-list doesn't let the TTL
+                # expire between the top-of-loop write and the last dispatch.
+                _write_scheduler_heartbeat(r, "fullscan", _hw_dispatched)
 
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)

@@ -452,8 +452,8 @@ Daemon threads are hard-tied to their process. When the process exits for any re
 
 Because workers are child processes of the scheduler, the watchdog uses a two-layer approach rather than monitoring individual per-PID keys:
 
-**Layer 1 — `worker:alive:scheduler`** (fast, TTL=15s):
-The scheduler writes this key every ~1 second. If missing or stale (age > 20s), the watchdog fires an ERROR immediately and returns early — all workers are presumed dead along with their parent. No point reading pool state when the scheduler is gone.
+**Layer 1 — `worker:alive:scheduler:adaptive` and `worker:alive:scheduler:fullscan`** (fast, TTL=15s each):
+Each scheduler loop writes its own key independently every ~1 second. Checking them separately means a hung loop (e.g. `fullscan_loop` blocked on a long DB query) is detected even while the other loop is healthy — a single shared key would mask the hung loop because the surviving loop keeps refreshing it. If a key is missing or stale (age > 20s), the watchdog fires an ERROR for that loop. If **both** keys are missing, all workers are presumed dead and the watchdog returns early — no point reading pool state when the scheduler process is gone.
 
 **Layer 2 — `scheduler:health`** (rich pool state, TTL=10min):
 The scheduler publishes this JSON key on every pool event (worker death, respawn, scale up/down). It contains per-type alive counts and `consecutive_deaths` counters:

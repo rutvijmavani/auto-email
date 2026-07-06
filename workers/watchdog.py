@@ -568,41 +568,54 @@ def check_worker_heartbeats(r) -> list:
     now     = time.time()
     FIX_CMD = "sudo systemctl restart recruiter-scheduler"
 
-    # ── 1. Scheduler heartbeat — fast single-key check ───────────────────────
+    # ── 1. Scheduler per-loop heartbeats ─────────────────────────────────────
+    # Each scheduler loop (adaptive_loop, fullscan_loop) writes its own key.
+    # Checking them independently means a hung loop is detected even while the
+    # other loop keeps the process alive — the old single shared key masked
+    # one-loop hangs because the surviving loop kept refreshing it.
     dead_after = HEARTBEAT_DEAD_AFTER["scheduler"]
-    raw        = r.get("worker:alive:scheduler")
 
-    if raw is None:
-        issues.append(Issue(
-            Issue.ERROR,
-            "worker:scheduler",
-            "scheduler heartbeat MISSING — scheduler is dead or never started",
-            FIX_CMD,
-            alert_type="worker_scheduler",
-        ))
-        # Scheduler is dead → workers are all dead too → no point reading
-        # scheduler:health (it will also be absent or stale).
-        return issues
+    _loop_raws = {
+        "adaptive": r.get("worker:alive:scheduler:adaptive"),
+        "fullscan": r.get("worker:alive:scheduler:fullscan"),
+    }
 
-    try:
-        d   = json.loads(raw)
-        age = now - d.get("ts", now)
-        if age > dead_after:
+    for loop_name, raw in _loop_raws.items():
+        category   = f"worker:scheduler:{loop_name}"
+        alert_type = f"worker_scheduler_{loop_name}"
+        if raw is None:
             issues.append(Issue(
                 Issue.ERROR,
-                "worker:scheduler",
-                f"scheduler heartbeat STALE — last write {age:.0f}s ago "
-                f"(threshold {dead_after}s). Scheduler may be hung.",
+                category,
+                f"scheduler {loop_name}_loop heartbeat MISSING — loop is dead or never started",
                 FIX_CMD,
-                alert_type="worker_scheduler",
+                alert_type=alert_type,
             ))
         else:
-            issues.append(Issue(Issue.OK, "worker:scheduler",
-                f"alive pid={d.get('pid','?')} dispatched={d.get('dispatched',0)} "
-                f"heartbeat {age:.0f}s ago"))
-    except Exception:
-        issues.append(Issue(Issue.OK, "worker:scheduler",
-            "alive (heartbeat key present)"))
+            try:
+                d   = json.loads(raw)
+                age = now - d.get("ts", now)
+                if age > dead_after:
+                    issues.append(Issue(
+                        Issue.ERROR,
+                        category,
+                        f"scheduler {loop_name}_loop heartbeat STALE — last write {age:.0f}s ago "
+                        f"(threshold {dead_after}s). Loop may be hung.",
+                        FIX_CMD,
+                        alert_type=alert_type,
+                    ))
+                else:
+                    issues.append(Issue(Issue.OK, category,
+                        f"alive pid={d.get('pid','?')} dispatched={d.get('dispatched',0)} "
+                        f"heartbeat {age:.0f}s ago"))
+            except Exception:
+                issues.append(Issue(Issue.OK, category,
+                    "alive (heartbeat key present)"))
+
+    # If BOTH loop keys are missing the scheduler process itself is down —
+    # workers are also dead, so no point reading scheduler:health.
+    if all(v is None for v in _loop_raws.values()):
+        return issues
 
     # ── 2. Pool health from scheduler:health ─────────────────────────────────
     WARN_DEATHS  = 3

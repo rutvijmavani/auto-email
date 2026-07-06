@@ -195,33 +195,37 @@ def run_health_check() -> int:
     # ── WORKER LIVENESS ───────────────────────────────────────────────────────
     _section("WORKER LIVENESS")
 
-    # ── Scheduler — single heartbeat key ─────────────────────────────────────
-    raw = r.get("worker:alive:scheduler")
-    if raw is None:
-        _row("ERROR", "scheduler", "DEAD — heartbeat key missing")
-        errors += 1
-    else:
-        try:
-            d     = json.loads(raw)
-            age_s = now - d.get("ts", now)
-            status = (
-                f"pid={d.get('pid','?')}  "
-                f"dispatched={d.get('dispatched',0)}  "
-                f"heartbeat {age_s:.0f}s ago"
-            )
-            # Scheduler writes this key every SCHEDULER_TICK_SECS (~1 s) with
-            # ex=15.  The TTL is 15 s, so the key expires before age_s can
-            # reach 20 — making "age_s > 20" unreachable dead code.
-            # Use 5 s instead: reachable within the 15 s TTL window, and a
-            # meaningful signal that the scheduler main loop is delayed.
-            if age_s > 5:
-                _row("WARNING", "scheduler", status + "  (STALE)")
+    # ── Scheduler — per-loop heartbeat keys ──────────────────────────────────
+    # Each scheduler loop writes its own key (ex=15s).  Check them independently
+    # so a hung loop is visible even while the other loop keeps the process alive.
+    _sched_loop_raws = {
+        "adaptive": r.get("worker:alive:scheduler:adaptive"),
+        "fullscan": r.get("worker:alive:scheduler:fullscan"),
+    }
+    for _loop_name, _raw in _sched_loop_raws.items():
+        _label = f"scheduler:{_loop_name}"
+        if _raw is None:
+            _row("ERROR", _label, "DEAD — heartbeat key missing")
+            errors += 1
+        else:
+            try:
+                d     = json.loads(_raw)
+                age_s = now - d.get("ts", now)
+                status = (
+                    f"pid={d.get('pid','?')}  "
+                    f"dispatched={d.get('dispatched',0)}  "
+                    f"heartbeat {age_s:.0f}s ago"
+                )
+                # Keys are written with ex=15s.  TTL expires before age_s reaches
+                # 15 — use 5s as the stale threshold: reachable and meaningful.
+                if age_s > 5:
+                    _row("WARNING", _label, status + "  (STALE)")
+                    warnings += 1
+                else:
+                    _row("OK", _label, status)
+            except Exception:
+                _row("WARNING", _label, "alive but heartbeat payload unparseable")
                 warnings += 1
-            else:
-                _row("OK", "scheduler", status)
-        except Exception:
-            _row("WARNING", "scheduler", "alive but heartbeat payload unparseable")
-            warnings += 1
 
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")
