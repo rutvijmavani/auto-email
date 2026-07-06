@@ -315,6 +315,8 @@ REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currentl
                                                    # written at scan start, removed on completion/error
                                                    # read by _get_worker_missed_companies() to exclude
                                                    # in-progress scans from fallback re-fetch
+INFLIGHT_FULLSCAN_STALE_S = 7200                   # 2 h — entries older than this are considered
+                                                   # abandoned (used by health_check and job_monitor)
 
 # Scan queue (scan_worker skeleton → replaced by scheduler in Phase 4)
 SCAN_QUEUE        = "scan:queue"

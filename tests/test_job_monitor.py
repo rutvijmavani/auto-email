@@ -27,6 +27,8 @@ Test Groups:
   TestMetricCalculations       — alert threshold logic
   TestNormalization            — text normalization
   TestMonitorCLIFlags          — pipeline.py flag dispatch
+  TestInflightExclusionFromMissed — in-flight companies excluded from missed
+  TestInFlightWait             — bounded wait: confirm, unconfirmed-retry, Redis-failure
 """
 
 import sys
@@ -2995,6 +2997,137 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
         names = [c["company"] for c in result]
         self.assertNotIn("A", names)
         self.assertIn("B", names)
+
+
+class TestInFlightWait(unittest.TestCase):
+    """
+    Tests for the bounded in-flight wait block inside jobs.job_monitor.run().
+
+    Verifies:
+      - companies confirmed in DB after leaving inflight:fullscan are credited
+        to covered_by_workers (not left as in-flight)
+      - companies that leave the ZSET without a DB record are retried via
+        _process_company (scan failure recovery)
+      - Redis failure during the wait leaves no in-flight companies credited
+        (conservative: no false coverage)
+    """
+
+    _COMPANY_ROW = {"company": "Acme"}
+
+    def _base_patches(self, jm):
+        """Return the list of patches needed for run() to reach the inflight block."""
+        _ok_stats = {
+            "fallback_scanned": 1, "with_results": 0,
+            "unknown_ats": 0, "failed": 0,
+            "fetched": 0, "matched": 0, "new": 0,
+        }
+        return [
+            patch.object(jm, "init_logging"),
+            patch.object(jm, "init_db"),
+            patch.object(jm, "get_monitorable_companies",
+                         return_value=[dict(self._COMPANY_ROW)]),
+            patch.object(jm, "get_all_monitored_companies",
+                         return_value=[dict(self._COMPANY_ROW)]),
+            # ([], {"Acme"}): no missed companies, one in-flight
+            patch.object(jm, "_get_worker_missed_companies",
+                         return_value=([], {"Acme"})),
+            patch.object(jm, "_process_company", return_value=_ok_stats),
+            patch.object(jm, "get_new_postings_for_digest", return_value=[]),
+            patch.object(jm, "_send_no_jobs_email", return_value=False),
+            patch.object(jm, "save_monitor_stats"),
+            patch.object(jm, "_print_metric_alerts"),
+        ]
+
+    def test_confirmed_company_credited_to_covered_by_workers(self):
+        """
+        A company that disappears from inflight:fullscan and is verified in DB
+        must be credited to covered_by_workers and removed from in_flight.
+        """
+        import jobs.job_monitor as jm
+
+        mock_r = MagicMock()
+        mock_r.zrangebyscore.return_value = []   # Acme gone from ZSET immediately
+
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = [{"company": "Acme"}]
+
+        patches = self._base_patches(jm) + [
+            patch("redis.from_url", return_value=mock_r),
+            patch("db.db.get_conn", return_value=mock_conn),
+        ]
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            stats = jm.run()
+
+        self.assertEqual(
+            stats["covered_by_workers"], 1,
+            "Confirmed in-flight company must be credited to covered_by_workers",
+        )
+        self.assertEqual(stats["in_flight"], 0,
+                         "in_flight counter must reach 0 after confirmation")
+
+    def test_unconfirmed_company_retried_via_process_company(self):
+        """
+        A company that leaves the inflight ZSET without a matching DB record
+        (scan aborted / failed) must be retried via _process_company.
+        """
+        import jobs.job_monitor as jm
+
+        mock_r = MagicMock()
+        mock_r.zrangebyscore.return_value = []   # Acme disappears from ZSET
+
+        mock_conn = MagicMock()
+        mock_conn.execute.return_value.fetchall.return_value = []  # not confirmed in DB
+
+        _ok_stats = {
+            "fallback_scanned": 1, "with_results": 0,
+            "unknown_ats": 0, "failed": 0,
+            "fetched": 0, "matched": 0, "new": 0,
+        }
+
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in self._base_patches(jm):
+                stack.enter_context(p)
+            mock_proc = stack.enter_context(
+                patch.object(jm, "_process_company", return_value=_ok_stats)
+            )
+            stack.enter_context(patch("redis.from_url", return_value=mock_r))
+            stack.enter_context(patch("db.db.get_conn", return_value=mock_conn))
+            jm.run()
+
+        mock_proc.assert_called_once()
+        called_row = mock_proc.call_args[0][0]
+        self.assertEqual(called_row["company"], "Acme",
+                         "_process_company must be called with the unconfirmed company")
+
+    def test_redis_failure_does_not_credit_inflight_companies(self):
+        """
+        When Redis is unavailable the wait block must not credit any in-flight
+        companies.  covered_by_workers must remain at its pre-wait value (0).
+        """
+        import jobs.job_monitor as jm
+
+        import contextlib
+        with contextlib.ExitStack() as stack:
+            for p in self._base_patches(jm):
+                stack.enter_context(p)
+            mock_proc = stack.enter_context(
+                patch.object(jm, "_process_company")
+            )
+            stack.enter_context(
+                patch("redis.from_url", side_effect=Exception("Redis down"))
+            )
+            stats = jm.run()
+
+        self.assertEqual(
+            stats["covered_by_workers"], 0,
+            "Redis failure must not credit any in-flight company",
+        )
+        # Unconfirmed fallback requires a successful Redis poll; must not be called
+        mock_proc.assert_not_called()
 
 
 if __name__ == "__main__":

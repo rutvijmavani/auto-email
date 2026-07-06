@@ -44,6 +44,8 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from config import INFLIGHT_FULLSCAN_STALE_S
+
 # ANSI colors for terminal output
 _GREEN  = "\033[92m"
 _YELLOW = "\033[93m"
@@ -89,7 +91,7 @@ def _row(level: str, label: str, detail: str) -> None:
 # CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INFLIGHT_STALE_S = 7200   # 2-hour in-flight TTL (matches job_monitor.py)
+_INFLIGHT_STALE_S = INFLIGHT_FULLSCAN_STALE_S   # imported from config; matches job_monitor.py
 
 
 def run_health_check() -> int:

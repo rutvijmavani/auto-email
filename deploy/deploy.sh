@@ -107,6 +107,11 @@ fi
 # Run this before restart so the updated definitions are always active.
 echo ""
 echo "► Syncing systemd unit files..."
+# NOTE: install-pipeline-units reads from the root-owned staging directory
+# (/usr/local/share/mail-pipeline/systemd/).  If you changed a .service file
+# in this commit, you MUST re-stage it first:
+#   sudo bash deploy/install-systemd.sh
+# (one-time per structural unit change; deploy.sh does not auto-restage)
 if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
     echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
     echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."

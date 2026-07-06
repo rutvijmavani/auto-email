@@ -514,8 +514,8 @@ def process_findings(
                     ttl = r.ttl(err_key)
                     if ttl > 0:
                         r.set(err_key, json.dumps(stored), ex=ttl)
-                except Exception:
-                    pass
+                except Exception as _ttl_err:
+                    print(f"[log_monitor] TTL update failed for {err_key}: {_ttl_err}")
 
             # Update frequency history + refresh active heartbeat with dynamic TTL
             _update_frequency(r, fp, now)

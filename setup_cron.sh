@@ -512,7 +512,7 @@ CRON_TZ=America/New_York
 # digest collects all seen fingerprints.
 # State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # DETECT ATS — currently disabled
@@ -536,9 +536,16 @@ CRONTAB
 
 # Merge: strip any existing pipeline-owned entries (identified by begin/end
 # markers), then append NEW_CRON.  Non-pipeline entries are preserved exactly.
+# Also remove legacy marker-less pipeline entries (run_*.sh lines) that may
+# remain from crontabs installed before the BEGIN/END marker system was added;
+# without this, old entries survive alongside the new marker-delimited block
+# and cause duplicate runs.
 EXISTING_NON_PIPELINE=$(crontab -l 2>/dev/null || true)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
+# Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v '/home/opc/mail/run_[a-z_]*\.sh' || true)
 # Strip trailing blank lines from retained entries
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | sed '/^[[:space:]]*$/d')
 

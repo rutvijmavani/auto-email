@@ -63,6 +63,7 @@ from config import (
     MONITOR_MATCH_RATE_HIGH_ALERT,
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
+    INFLIGHT_FULLSCAN_STALE_S,
 )
 
 logger = get_logger(__name__)
@@ -236,7 +237,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
             REDIS_URL, socket_timeout=5, socket_connect_timeout=3
         )
         try:
-            stale_threshold = time.time() - 7200
+            stale_threshold = time.time() - INFLIGHT_FULLSCAN_STALE_S
             raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
             inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
             if inflight:
@@ -403,18 +404,7 @@ def run():
                         "failure_name": company,
                     }
 
-                with stats_lock:
-                    stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
-                    stats["companies_with_results"] += company_stats.get("with_results",   0)
-                    stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)
-                    stats["api_failures"]           += company_stats.get("failed",         0)
-                    stats["total_jobs_fetched"]     += company_stats.get("fetched",        0)
-                    stats["jobs_matched_filters"]   += company_stats.get("matched",        0)
-                    stats["new_jobs_found"]         += company_stats.get("new",            0)
-                    if company_stats.get("failure_name"):
-                        stats["api_failure_list"].append(
-                            company_stats["failure_name"]
-                        )
+                _merge_company_stats(stats, stats_lock, company_stats)
     else:
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
@@ -446,7 +436,7 @@ def run():
             )
 
             while _remaining_inflight and (time.time() - _wait_start) < _IN_FLIGHT_WAIT_S:
-                _stale_ts    = time.time() - 7200
+                _stale_ts    = time.time() - INFLIGHT_FULLSCAN_STALE_S
                 _active_raw  = _r_wait.zrangebyscore(
                     REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
                 )
@@ -528,8 +518,8 @@ def run():
             if _r_wait is not None:
                 try:
                     _r_wait.close()
-                except Exception:
-                    pass
+                except Exception as _close_err:
+                    logger.debug("job_monitor: _r_wait.close() failed: %s", _close_err)
 
         if _remaining_inflight:
             logger.info(
@@ -587,16 +577,7 @@ def run():
                                 "fetched": 0, "matched": 0, "new": 0,
                                 "failure_name": _uc_company,
                             }
-                        with stats_lock:
-                            stats["fallback_scanned"]       += _uc_stats.get("fallback_scanned", 0)
-                            stats["companies_with_results"] += _uc_stats.get("with_results",   0)
-                            stats["companies_unknown_ats"]  += _uc_stats.get("unknown_ats",    0)
-                            stats["api_failures"]           += _uc_stats.get("failed",         0)
-                            stats["total_jobs_fetched"]     += _uc_stats.get("fetched",        0)
-                            stats["jobs_matched_filters"]   += _uc_stats.get("matched",        0)
-                            stats["new_jobs_found"]         += _uc_stats.get("new",            0)
-                            if _uc_stats.get("failure_name"):
-                                stats["api_failure_list"].append(_uc_stats["failure_name"])
+                        _merge_company_stats(stats, stats_lock, _uc_stats)
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -677,6 +658,20 @@ def run():
 
     logger.info("════ --monitor-jobs finished ════")
     return final_stats
+
+
+def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats: dict) -> None:
+    """Merge per-company result counters into the shared stats dict (thread-safe)."""
+    with stats_lock:
+        stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
+        stats["companies_with_results"] += company_stats.get("with_results",   0)
+        stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)
+        stats["api_failures"]           += company_stats.get("failed",         0)
+        stats["total_jobs_fetched"]     += company_stats.get("fetched",        0)
+        stats["jobs_matched_filters"]   += company_stats.get("matched",        0)
+        stats["new_jobs_found"]         += company_stats.get("new",            0)
+        if company_stats.get("failure_name"):
+            stats["api_failure_list"].append(company_stats["failure_name"])
 
 
 # ─────────────────────────────────────────

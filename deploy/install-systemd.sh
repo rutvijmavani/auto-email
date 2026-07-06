@@ -200,20 +200,12 @@ else
 fi
 
 # ── Install systemd unit files ────────────────────────────────────────────────
+# The wrapper (already created above) reads from the root-owned staging dir and
+# applies the opc→SERVICE_USER/PROJECT_DIR substitutions itself — no need to
+# duplicate that logic here.
 echo ""
 echo "► Installing systemd unit files..."
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service"; do
-    src="$DEPLOY_DIR/systemd/$unit"
-    dst="$SYSTEMD_DIR/$unit"
-    if [[ ! -f "$src" ]]; then
-        echo "  [SKIP] $unit — not found in deploy/systemd/"
-        continue
-    fi
-    # Replace placeholder user 'opc' with actual user if different
-    sed "s|User=opc|User=$SERVICE_USER|g; s|Group=opc|Group=$SERVICE_USER|g; \
-         s|/home/opc/mail|$PROJECT_DIR|g" "$src" > "$dst"
-    echo "  Installed: $dst"
-done
+"$UNIT_INSTALL_BIN"
 
 # ── Reload systemd + enable (+ optionally start) ─────────────────────────────
 # Pass --no-start as $1 to install/enable units without starting them.

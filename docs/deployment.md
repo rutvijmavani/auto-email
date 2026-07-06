@@ -1147,7 +1147,7 @@ For `poll:fullscan`, the algorithm also skips gap midpoints where the predicted 
 Skip gap midpoint if: midpoint + avg_fullscan_duration_s ≥ next 7 AM ET
 ```
 
-`avg_fullscan_duration_s` is updated after every successful scan using an exponential moving average (α=0.3). Default is 30 s until the first scan completes for a company.
+`avg_fullscan_duration_s` is updated after every successful scan using an exponential moving average (α=0.3). Default is 1800 s (30 min) until the first scan completes for a company — a conservative seed that prevents the deadline guard from scheduling scans too close to the 7 AM digest.
 
 ---
 
