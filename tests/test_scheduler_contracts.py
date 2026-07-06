@@ -1046,19 +1046,20 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
         self.assertAlmostEqual(result, self._TARGET, places=1)
 
     def test_entries_outside_window_ignored(self):
-        """Entries outside [lo, hi] are not returned by ZRANGEBYSCORE so do not split gaps."""
-        lo = self._TARGET - 0.20 * self._INTERVAL / 2
-        hi = self._TARGET + 0.20 * self._INTERVAL / 2
-        # Out-of-window entries (far below lo and far above hi) must not split
-        # the gap, so the result should be identical to the empty-window case.
-        result_empty   = self._call(existing_scores=[], tolerance_pct=0.20)
-        result_outside = self._call(
-            existing_scores=[lo - 10_000, hi + 10_000],
-            tolerance_pct=0.20,
+        """ZRANGEBYSCORE is called with exactly [lo, hi] so out-of-window entries never reach the function."""
+        from workers.scheduler import _pick_schedule_time
+        window = 0.20 * self._INTERVAL
+        lo = self._TARGET - window / 2
+        hi = self._TARGET + window / 2
+        r = MagicMock()
+        r.zrangebyscore.return_value = []
+        _pick_schedule_time(
+            self._TARGET, "poll:adaptive", self._INTERVAL, 0.20, r,
         )
-        expected_mid = (lo + hi) / 2
-        self.assertAlmostEqual(result_empty,   expected_mid, places=1)
-        self.assertAlmostEqual(result_outside, expected_mid, places=1)
+        _args, _kwargs = r.zrangebyscore.call_args
+        # Verify the window bounds passed to Redis, not the (untested) mock return value
+        self.assertAlmostEqual(_args[1], lo, places=1)
+        self.assertAlmostEqual(_args[2], hi, places=1)
 
     def test_result_within_tolerance_window(self):
         """Result is always within [target - window/2, target + window/2]."""

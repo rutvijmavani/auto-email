@@ -48,6 +48,34 @@ cd "$PROJECT_DIR"
 
 # Capture the current SHA before any update so we can roll back if needed.
 PREVIOUS_SHA=$(git rev-parse HEAD)
+
+# ── Shared rollback helper ────────────────────────────────────────────────────
+_rollback_to_previous() {
+    echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
+    git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
+    "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
+        || echo "  [FATAL] pip rollback failed"
+    sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
+    sudo systemctl daemon-reload || true
+    sudo systemctl restart recruiter-scheduler \
+        || echo "  [WARN] could not restart recruiter-scheduler"
+    sudo systemctl restart recruiter-watchdog \
+        || echo "  [WARN] could not restart recruiter-watchdog"
+    echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
+    echo "             journalctl -u recruiter-scheduler -n 50"
+    echo "             journalctl -u recruiter-watchdog  -n 20"
+}
+
+# Trap ERR during the pull/install phase so a partial update auto-rolls back.
+# Disabled after restarts begin (explicit rollback calls take over from there).
+_pull_err() {
+    local _exit=$?
+    echo ""
+    echo "  [ERROR] Pull/install step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
+    _rollback_to_previous
+    exit $_exit
+}
+trap '_pull_err' ERR
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -92,6 +120,9 @@ if [[ -f "$PROJECT_DIR/requirements.txt" ]]; then
 else
     echo "  [SKIP] No requirements.txt found."
 fi
+
+# Pull/install complete — hand off to explicit rollback calls for remaining steps.
+trap - ERR
 
 if $NO_RESTART; then
     echo ""
@@ -156,19 +187,8 @@ for svc in recruiter-scheduler recruiter-watchdog; do
 done
 if [[ $_svc_fail -ne 0 ]]; then
     echo ""
-    echo "  [ERROR] One or more services failed to start — rolling back to $PREVIOUS_SHA"
-    git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
-    "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
-        || echo "  [FATAL] pip rollback failed"
-    sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
-    sudo systemctl daemon-reload || true
-    sudo systemctl restart recruiter-scheduler \
-        || echo "  [WARN] could not restart recruiter-scheduler"
-    sudo systemctl restart recruiter-watchdog \
-        || echo "  [WARN] could not restart recruiter-watchdog"
-    echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
-    echo "             journalctl -u recruiter-scheduler -n 50"
-    echo "             journalctl -u recruiter-watchdog  -n 20"
+    echo "  [ERROR] One or more services failed to start"
+    _rollback_to_previous
     exit 1
 fi
 
@@ -183,18 +203,7 @@ else
     "$PROJECT_DIR/venv/bin/python" scripts/health_check.py || {
         echo ""
         echo "  [WARN] Health check reported issues — rolling back to $PREVIOUS_SHA"
-        git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
-        "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
-            || echo "  [FATAL] pip rollback failed"
-        sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
-        sudo systemctl daemon-reload || true
-        sudo systemctl restart recruiter-scheduler \
-            || echo "  [WARN] could not restart recruiter-scheduler"
-        sudo systemctl restart recruiter-watchdog \
-            || echo "  [WARN] could not restart recruiter-watchdog"
-        echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
-        echo "             journalctl -u recruiter-scheduler -n 50"
-        echo "             journalctl -u recruiter-watchdog  -n 20"
+        _rollback_to_previous
         exit 1
     }
 fi

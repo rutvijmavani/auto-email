@@ -546,6 +546,11 @@ EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
 # Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     grep -v '/home/opc/mail/run_[a-z_]*\.sh' || true)
+# Strip log_monitor and keep-alive entries (re-added inside the marker block)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v 'scripts/log_monitor\.py' || true)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v 'hashlib.*range(100000)' || true)
 # Strip trailing blank lines from retained entries
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | sed '/^[[:space:]]*$/d')
 

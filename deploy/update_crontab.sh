@@ -38,27 +38,8 @@ EXISTING=$(crontab -l 2>/dev/null || true)
 # (setup_cron.sh will re-add them on the next full setup run).
 _STRIP_PATTERNS=(
     "monitor_.*log.*run_monitor"
-    "MONITOR RETRY"
-    "missed.*VM suspension"
-    "9 AM fallback"
-    "Runs only if the 7 AM job"
-    "Checks for exit=0 in today"
-    "digest arrives at most"
     "scripts/log_monitor\.py"
-    "log_monitor_.*\.log"
-    "LOG MONITOR"
-    "Scans log files for new ERRORs"
-    "Sends a batched email alert"
-    "Sends an immediate alert"
-    "Redis-deduped"
-    "each unique issue emails"
-    "State tracked in data/log_monitor"
     "hashlib.*range(100000)"
-    "KEEP-ALIVE"
-    "Prevents Oracle Cloud"
-    "VM was being suspended"
-    "every 4 days"
-    "every 4 hours"
 )
 
 CLEANED="$EXISTING"

@@ -1067,9 +1067,11 @@ def run_worker(once: bool = False, shutdown_event=None,
                 except Exception as _rq_err:
                     logger.error(
                         "detail_worker: delay-requeue failed for %s: %s "
-                        "— item stays in inflight for recovery on next startup",
+                        "— item stays in inflight; exiting for peer recovery",
                         _r_job_id, _rq_err,
                     )
+                    _hb.stop()
+                    break
                 if once:
                     break
                 continue

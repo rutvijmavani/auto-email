@@ -38,7 +38,7 @@ if ! $REDIS_CLI ping > /dev/null 2>&1; then
     exit 1
 fi
 
-REDIS_VERSION=$($REDIS_CLI INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
+REDIS_VERSION=$($REDIS_CLI INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]' || true)
 echo ""
 echo "► Redis version: $REDIS_VERSION"
 
@@ -205,7 +205,7 @@ aof_enabled=$($REDIS_CLI CONFIG GET appendonly                    | tail -1)
 aof_fsync=$($REDIS_CLI CONFIG GET appendfsync                     | tail -1)
 aof_rwpct=$($REDIS_CLI CONFIG GET auto-aof-rewrite-percentage     | tail -1)
 aof_rwmin=$($REDIS_CLI CONFIG GET auto-aof-rewrite-min-size       | tail -1)
-aof_file=$($REDIS_CLI INFO persistence | grep aof_filename | cut -d: -f2 | tr -d '[:space:]' || echo "(unknown)")
+aof_file=$($REDIS_CLI CONFIG GET appendfilename 2>/dev/null | tail -1 || echo "(unknown)")
 
 echo "  appendonly                    : $aof_enabled  (want: yes)"
 echo "  appendfsync                   : $aof_fsync   (want: everysec)"
