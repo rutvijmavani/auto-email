@@ -113,6 +113,10 @@ def _mask_url(url: str) -> str:
         return "(could not parse URL)"
 
 
+class _RedisVersionError(Exception):
+    """Raised when Redis is reachable but below the required version."""
+
+
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -134,11 +138,11 @@ def _check_redis(prefix: str) -> None:
             _info = r.info("server")
             _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
             if _ver < (6, 2):
-                raise RuntimeError(
+                raise _RedisVersionError(
                     f"Redis {_info.get('redis_version')} is too old — "
                     "pipeline requires Redis ≥6.2 (LMOVE command)"
                 )
-        except RuntimeError as _ver_err:
+        except _RedisVersionError as _ver_err:
             # Version check failed — Redis is reachable but unsupported.
             msg = (
                 f"{prefix} STARTUP FAILED — Redis is reachable but too old\n"
@@ -151,8 +155,6 @@ def _check_redis(prefix: str) -> None:
             sys.exit(1)
         finally:
             r.close()
-    except SystemExit:
-        raise
     except Exception as exc:
         msg = (
             f"{prefix} STARTUP FAILED — Redis is unreachable\n"
@@ -169,14 +171,19 @@ def _check_redis(prefix: str) -> None:
 
 def _check_postgres(prefix: str) -> None:
     """Verify PostgreSQL is reachable and the schema is accessible."""
+    db_url_raw = os.getenv("DATABASE_URL", "(not set)")
     conn = None
     try:
-        from db.db import get_conn
-        conn = get_conn()
-        conn.execute("SELECT 1").fetchone()
+        import psycopg2
+        # Bypass the shared pool to enforce a bounded connect_timeout so a
+        # slow or unreachable database never blocks startup indefinitely.
+        # The pool (get_conn) uses the raw DATABASE_URL which may have no timeout.
+        conn = psycopg2.connect(dsn=db_url_raw, connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
         logger.debug("%s PostgreSQL check passed", prefix)
     except Exception as exc:
-        db_url_raw = os.getenv("DATABASE_URL", "(not set)")
         msg = (
             f"{prefix} STARTUP FAILED — PostgreSQL is unreachable\n"
             f"  URL: {_mask_url(db_url_raw)}\n"

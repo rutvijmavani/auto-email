@@ -1208,20 +1208,22 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
             return check_worker_heartbeats(r)
 
     def test_scheduler_ok_at_19_seconds(self):
-        """scheduler threshold=20s: key age 19s → OK."""
-        from workers.watchdog import Issue
-        issues = self._run_scheduler_age(19)
+        """scheduler key age (threshold - 1)s → OK."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        issues = self._run_scheduler_age(threshold - 1)
         sched = [i for i in issues if i.category == "worker:scheduler"]
         self.assertTrue(any(i.level == Issue.OK for i in sched),
-                        f"Expected OK at 19s, got: {sched}")
+                        f"Expected OK at {threshold - 1}s, got: {sched}")
 
     def test_scheduler_stale_at_21_seconds(self):
-        """scheduler threshold=20s: key age 21s → STALE ERROR."""
-        from workers.watchdog import Issue
-        issues = self._run_scheduler_age(21)
+        """scheduler key age (threshold + 1)s → STALE ERROR."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        issues = self._run_scheduler_age(threshold + 1)
         sched = [i for i in issues if i.category == "worker:scheduler"]
         self.assertTrue(any(i.level == Issue.ERROR for i in sched),
-                        f"Expected STALE ERROR at 21s, got: {sched}")
+                        f"Expected STALE ERROR at {threshold + 1}s, got: {sched}")
 
     # ── Pool consecutive_deaths threshold boundary ────────────────────────────
 

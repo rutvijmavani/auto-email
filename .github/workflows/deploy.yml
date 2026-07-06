@@ -80,22 +80,28 @@ jobs:
             git fetch --all
             PREVIOUS_SHA=$(git rev-parse HEAD)
 
-            # Early-failure rollback trap: if any step before the long health-check
-            # fails, revert to PREVIOUS_SHA and attempt to restore service state.
-            # Steps 3-6 fail before services are touched → code-only revert is enough.
-            # Steps 7-8 fail after services may have been restarted → also re-sync
-            # unit files and attempt a service restart so the VM is not left dark.
-            _early_rollback() {
-              local _exit=$?
-              echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
-              git checkout -B main "$PREVIOUS_SHA" || echo "[FATAL] git rollback failed"
+            # Shared rollback helper used by both _early_rollback (ERR trap) and
+            # the health-check failure branch.  Reverts code, deps, unit files,
+            # and restarts services — each step guarded so a failure logs clearly
+            # rather than exiting silently under set -e.
+            _rollback_to_sha() {
+              local _sha="${1:-$PREVIOUS_SHA}"
+              git checkout -B main "$_sha" || echo "[FATAL] git rollback to $_sha failed"
               pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
-              echo "[ROLLBACK] Re-syncing unit files and restarting services..."
+              echo "[ROLLBACK] Re-syncing unit files..."
               sudo /usr/local/bin/install-pipeline-units || echo "[WARN] unit sync failed during rollback"
-              sudo systemctl daemon-reload || true
+              sudo systemctl daemon-reload || echo "[WARN] daemon-reload failed during rollback"
               for svc in recruiter-scheduler recruiter-watchdog; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
+            }
+
+            # Early-failure rollback trap: if any step before the long health-check
+            # fails, revert to PREVIOUS_SHA and attempt to restore service state.
+            _early_rollback() {
+              local _exit=$?
+              echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
+              _rollback_to_sha "$PREVIOUS_SHA"
               echo "[ROLLBACK] Reverted to $PREVIOUS_SHA"
               exit $_exit
             }
@@ -157,26 +163,7 @@ jobs:
             source venv/bin/activate
             if ! python scripts/health_check.py; then
               echo "[ERROR] Health check failed — rolling back to $PREVIOUS_SHA"
-              if ! git checkout -B main "$PREVIOUS_SHA"; then
-                echo "[FATAL] git checkout to $PREVIOUS_SHA failed — repository may be in a dirty state"
-                echo "[FATAL] Manual intervention required: git checkout main && git reset --hard $PREVIOUS_SHA"
-                exit 1
-              fi
-              if ! pip install -r requirements.txt --quiet; then
-                echo "[FATAL] pip install failed during rollback — venv may be corrupted"
-                echo "[FATAL] Manual intervention required: deactivate && rm -rf venv && python -m venv venv && pip install -r requirements.txt"
-                exit 1
-              fi
-
-              echo "[ROLLBACK] Re-syncing systemd unit files from previous revision..."
-              sudo /usr/local/bin/install-pipeline-units
-              echo "  systemd unit files installed"
-              sudo systemctl daemon-reload
-
-              echo "[ROLLBACK] Restarting services..."
-              for svc in recruiter-scheduler recruiter-watchdog; do
-                sudo systemctl restart "$svc"
-              done
+              _rollback_to_sha "$PREVIOUS_SHA"
 
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3

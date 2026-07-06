@@ -44,6 +44,7 @@ RestartSec=10s
 # the setuid bit on /usr/bin/sudo to work. NoNewPrivileges=true disables setuid
 # and would break that path.
 PrivateTmp=true
+ProtectSystem=full
 # read-only (not strict) — WorkingDirectory is under /home
 ProtectHome=read-only
 # Allow the watchdog to write its log files and state under the project dir.

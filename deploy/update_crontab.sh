@@ -4,7 +4,9 @@
 # Changes applied:
 #   1. MONITOR RETRY  — 9 AM fallback cron that runs --monitor-jobs only if
 #                       the 7 AM run did not complete successfully (checks exit=0).
-#   2. KEEP-ALIVE     — Changed from "every 4 days at noon" to "every 4 hours"
+#   2. LOG MONITOR    — Every-15-minute cron that scans log files for new ERRORs
+#                       and sends batched email alerts (Redis-deduped per fingerprint).
+#   3. KEEP-ALIVE     — Changed from "every 4 days at noon" to "every 4 hours"
 #                       so Oracle never sees a 10+ hour idle window overnight.
 #
 # Run as opc (no sudo needed — edits the opc crontab):
@@ -106,7 +108,7 @@ NEW_CRON="${NEW_CRON}
 # digest collects all seen fingerprints.
 # State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_\$(date +\%Y-\%m-\%d).log 2>&1 && find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_\$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)

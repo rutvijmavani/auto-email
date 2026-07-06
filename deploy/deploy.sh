@@ -46,7 +46,8 @@ echo ""
 echo "► Pulling latest code from origin..."
 cd "$PROJECT_DIR"
 
-# Show what's incoming before we pull
+# Capture the current SHA before any update so we can roll back if needed.
+PREVIOUS_SHA=$(git rev-parse HEAD)
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
@@ -171,9 +172,19 @@ else
     sleep 15
     "$PROJECT_DIR/venv/bin/python" scripts/health_check.py || {
         echo ""
-        echo "  [WARN] Health check reported issues — check logs:"
-        echo "         journalctl -u recruiter-scheduler -n 50"
-        echo "         journalctl -u recruiter-watchdog  -n 20"
+        echo "  [WARN] Health check reported issues — rolling back to $PREVIOUS_SHA"
+        git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
+        "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
+            || echo "  [FATAL] pip rollback failed"
+        sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
+        sudo systemctl daemon-reload || true
+        sudo systemctl restart recruiter-scheduler \
+            || echo "  [WARN] could not restart recruiter-scheduler"
+        sudo systemctl restart recruiter-watchdog \
+            || echo "  [WARN] could not restart recruiter-watchdog"
+        echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
+        echo "             journalctl -u recruiter-scheduler -n 50"
+        echo "             journalctl -u recruiter-watchdog  -n 20"
         exit 1
     }
 fi

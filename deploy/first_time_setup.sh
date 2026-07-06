@@ -35,6 +35,17 @@ PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
 SERVICE_USER="${SUDO_USER:-opc}"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 
+# Reject root as the service user — same guard as install-systemd.sh.
+# SERVICE_USER=root happens when SUDO_USER is explicitly set to root or when
+# the script is invoked directly as root without sudo (empty SUDO_USER and
+# no fallback matches root).
+if [[ "$SERVICE_USER" == "root" ]]; then
+    echo "[ERROR] SERVICE_USER resolved to 'root'."
+    echo "        Run with sudo as a non-root user: sudo bash deploy/first_time_setup.sh"
+    echo "        Or export SUDO_USER=opc before running."
+    exit 1
+fi
+
 echo "════════════════════════════════════════════════════════════"
 echo "  Mail Pipeline — first-time server setup"
 echo "  Project : $PROJECT_DIR"
@@ -134,7 +145,7 @@ echo "════════════════════════�
 echo "  STEP 1 — Installing systemd service units"
 echo "════════════════════════════════════════════════════════════"
 
-bash "$DEPLOY_DIR/install-systemd.sh" --no-start
+bash "$DEPLOY_DIR/install-systemd.sh"
 
 echo "  ✓ Step 1 complete — units installed and enabled, services NOT started yet"
 echo "    (services start in Step 2b after Redis AOF durability is configured)"

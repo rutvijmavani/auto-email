@@ -208,10 +208,11 @@ echo "► Installing systemd unit files..."
 "$UNIT_INSTALL_BIN"
 
 # ── Reload systemd + enable (+ optionally start) ─────────────────────────────
-# Pass --no-start as $1 to install/enable units without starting them.
-# Used by first_time_setup.sh, which controls the start sequence itself (must
-# configure Redis AOF durability before any services run).
-_NO_START="${1:-}"
+# Services do NOT start by default.  Redis AOF durability must be configured
+# before starting the pipeline (see deploy/configure-redis.sh and
+# first_time_setup.sh).  Pass --start as $1 to start services immediately
+# (re-installs and restarts only — not appropriate for first-time setups).
+_START="${1:-}"
 
 echo ""
 echo "► Enabling services (daemon-reload + enable)..."
@@ -220,9 +221,7 @@ systemctl daemon-reload
 systemctl enable recruiter-scheduler
 systemctl enable recruiter-watchdog
 
-if [[ "$_NO_START" == "--no-start" ]]; then
-    echo "  --no-start specified — skipping service start (caller manages startup)"
-else
+if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."
     systemctl start recruiter-scheduler
     echo "  Started recruiter-scheduler"
@@ -231,14 +230,18 @@ else
     systemctl start recruiter-watchdog
     echo "  Started recruiter-watchdog"
     sleep 3
+else
+    echo "  Services NOT started (default — Redis AOF must be configured first)."
+    echo "  To start immediately after install: sudo bash deploy/install-systemd.sh --start"
+    echo "  For first-time setup: use deploy/first_time_setup.sh instead."
 fi
 
 # ── Verify ───────────────────────────────────────────────────────────────────
-# Skip status probe and health check when --no-start was given: services were
+# Skip status probe and health check unless --start was given: services were
 # not started so they will report "inactive", which is not an error condition.
-if [[ "$_NO_START" == "--no-start" ]]; then
+if [[ "$_START" != "--start" ]]; then
     echo ""
-    echo "  --no-start: skipping service status probe and health check."
+    echo "  Skipping service status probe (services not started)."
     echo "  The caller is responsible for starting services when ready."
 else
     echo ""
