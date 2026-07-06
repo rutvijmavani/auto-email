@@ -436,10 +436,18 @@ def run():
             )
 
             while _remaining_inflight and (time.time() - _wait_start) < _IN_FLIGHT_WAIT_S:
-                _stale_ts    = time.time() - INFLIGHT_FULLSCAN_STALE_S
-                _active_raw  = _r_wait.zrangebyscore(
-                    REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
-                )
+                _stale_ts = time.time() - INFLIGHT_FULLSCAN_STALE_S
+                try:
+                    _active_raw = _r_wait.zrangebyscore(
+                        REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
+                    )
+                except Exception as _redis_poll_err:
+                    logger.warning(
+                        "In-flight wait: Redis poll failed (%s) — retrying next cycle",
+                        _redis_poll_err,
+                    )
+                    time.sleep(_IN_FLIGHT_POLL_S)
+                    continue
                 _still_active = {
                     c.decode() if isinstance(c, bytes) else c
                     for c in (_active_raw or [])

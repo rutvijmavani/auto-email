@@ -910,11 +910,17 @@ def main():
     if not init_sentry():
         logger.warning("pipeline: Sentry not initialized — error tracking disabled")
 
+    args = sys.argv[1:]
+
+    # Only --monitor-jobs / --detect-ats / --monitor-status actively query Redis
+    # worker state; all other subcommands are DB-only operations.
+    _REDIS_CMDS = {"--monitor-jobs", "--detect-ats", "--monitor-status"}
+    _needs_redis = any(a in _REDIS_CMDS for a in args)
+
     from workers.startup import validate_startup
-    validate_startup("pipeline")
+    validate_startup("pipeline", check_redis=_needs_redis)
 
     init_db()
-    args = sys.argv[1:]
 
     logger.info("pipeline.py invoked with args: %s", args)
 

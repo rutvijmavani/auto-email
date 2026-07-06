@@ -386,7 +386,7 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
 
     # ── Layer 1: scheduler key ────────────────────────────────────────────────
 
-    def test_scheduler_key_missing_returns_single_error(self):
+    def test_scheduler_keys_missing_returns_two_errors(self):
         """
         Both scheduler loop heartbeats absent → two ERRORs (one per loop), then early
         return — workers are all presumed dead so scheduler:health is not read.

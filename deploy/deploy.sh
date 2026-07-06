@@ -46,12 +46,22 @@ echo ""
 echo "► Pulling latest code from origin..."
 cd "$PROJECT_DIR"
 
+# Detect detached HEAD before capturing PREVIOUS_SHA — _BRANCH must be defined
+# before the ERR trap fires so _rollback_to_previous can use it safely under set -u.
+_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+if [[ "$_BRANCH" == "HEAD" ]]; then
+    echo "[ERROR] Repository is in detached HEAD state — cannot pull."
+    echo "  Run: git checkout main   (or the appropriate branch)"
+    exit 1
+fi
+
 # Capture the current SHA before any update so we can roll back if needed.
 PREVIOUS_SHA=$(git rev-parse HEAD)
 
 # ── Shared rollback helper ────────────────────────────────────────────────────
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
+    git reset --hard HEAD 2>/dev/null || true
     git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
     "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
         || echo "  [FATAL] pip rollback failed"
@@ -78,15 +88,6 @@ _pull_err() {
 trap '_pull_err' ERR
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
-
-# Detect detached HEAD (e.g. after 'git checkout <sha>') — rev-parse returns
-# the literal string "HEAD" in that state, making 'git pull origin HEAD' fail.
-_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [[ "$_BRANCH" == "HEAD" ]]; then
-    echo "[ERROR] Repository is in detached HEAD state — cannot pull."
-    echo "  Run: git checkout main   (or the appropriate branch)"
-    exit 1
-fi
 
 # Count commits we're about to pull in
 BEHIND=$(git rev-list --count "HEAD..origin/${_BRANCH}" 2>/dev/null || echo "?")

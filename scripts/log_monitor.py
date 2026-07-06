@@ -742,6 +742,11 @@ def send_digest(r, now: float) -> bool:
     if sent:
         r.set(_KEY_DIGEST, str(now))
         r.delete(_KEY_RESOLVED)   # clear resolved log after digest
+    elif sent is None:
+        # Credentials permanently absent — advance the digest timestamp so we
+        # don't retry on every cron cycle (mirrors send_immediate_alert behavior).
+        r.set(_KEY_DIGEST, str(now))
+        # Don't clear _KEY_RESOLVED — resolved errors weren't communicated.
 
     return sent
 
@@ -770,10 +775,6 @@ def main() -> None:
     offsets                      = _load_offsets()
     inodes                       = _load_inodes()
     new_offsets, new_inodes, raw = collect_raw_findings(offsets, inodes)
-    # Do NOT save offsets yet — wait until we have confirmed the alert was sent
-    # (or that there were no new errors to alert on).  Saving early would cause
-    # the log lines to be permanently skipped if email or Redis fail, since the
-    # next run would start from the advanced offset but the dedup key is not set.
 
     total_hits = sum(len(v) for v in raw.values())
     total_new  = sum(new_offsets.get(k, 0) - offsets.get(k, 0) for k in new_offsets)
@@ -821,42 +822,36 @@ def main() -> None:
     if resolved_fps:
         print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
 
+    # Advance offsets now — scan progress is independent of email delivery.
+    # Known errors are already tracked in Redis; new errors without dedup keys
+    # will be re-discovered if they recur in future log lines, and appear in
+    # the periodic digest regardless.
+    _save_offsets(new_offsets, new_inodes)
+
     # ── 4. Immediate alert for brand-new errors ──────────────────────────────
     if new_errors:
         print(f"[log_monitor] {len(new_errors)} NEW error(s): {list(new_errors)}")
         sent = send_immediate_alert(new_errors)
         if sent:
-            # Email delivered — now persist to Redis so next run suppresses these.
+            # Email delivered — persist dedup keys so next run suppresses these.
             for fp, record in new_errors.items():
                 try:
                     r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
-            # Offsets safe to advance now that the operator has been notified.
-            _save_offsets(new_offsets, new_inodes)
         elif sent is None:
-            # Credentials permanently absent — still mark errors as known and
-            # advance offsets so we do not re-alert on every run with no email.
-            # Only advance offsets if at least one Redis dedup write succeeds;
-            # if all writes fail the errors were not recorded, so keep the old
-            # offsets so the next run can retry once Redis is available again.
-            _any_dedup_written = False
+            # Credentials permanently absent — mark as known so the same
+            # fingerprints don't re-appear as new on every subsequent scan.
             for fp, record in new_errors.items():
                 try:
                     r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
-                    _any_dedup_written = True
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
-            if _any_dedup_written:
-                _save_offsets(new_offsets, new_inodes)
         else:
-            # Transient SMTP failure — do NOT mark as known and do NOT advance offsets.
-            # The next run will re-scan from the same position and retry.
-            print("[log_monitor] Email send failed — errors NOT marked as known "
-                  "(will retry next run)")
+            # Transient SMTP failure — offsets already advanced above; dedup
+            # keys NOT written so errors remain discoverable for the digest.
+            print("[log_monitor] Email send failed — will appear in next digest")
     else:
-        # All errors already known/deduped — no new alert needed.
-        _save_offsets(new_offsets, new_inodes)
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
 

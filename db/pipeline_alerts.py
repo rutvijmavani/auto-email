@@ -402,7 +402,7 @@ def check_api_health():
                 )
                 continue
         except (TypeError, ValueError, KeyError) as _date_err:
-            logger.debug(
+            logger.warning(
                 "check_api_health: platform=%s malformed date data, skipping: %s",
                 platform, _date_err,
             )

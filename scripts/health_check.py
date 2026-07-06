@@ -310,7 +310,7 @@ def run_health_check() -> int:
         from workers.watchdog import check_queue_health, Issue
         _wdg_queue_issues = check_queue_health(r, persist_snapshot=False)
         for _issue in _wdg_queue_issues:
-            _lbl = _issue.category.replace("queue:", "").replace("stream:", "stream:")
+            _lbl = _issue.category.replace("queue:", "").replace("stream:", "")
             _row(_issue.level, _lbl, _issue.message)
             if _issue.level in ("ERROR", "CRITICAL"):
                 errors += 1

@@ -86,6 +86,7 @@ jobs:
             # rather than exiting silently under set -e.
             _rollback_to_sha() {
               local _sha="${1:-$PREVIOUS_SHA}"
+              git reset --hard HEAD 2>/dev/null || true
               git checkout -B main "$_sha" || echo "[FATAL] git rollback to $_sha failed"
               pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
               echo "[ROLLBACK] Re-syncing unit files..."
@@ -108,6 +109,7 @@ jobs:
             trap '_early_rollback' ERR
 
             echo "[3/8] Checking out exact validated commit..."
+            git reset --hard HEAD
             git checkout -B main ${{ github.sha }}
 
             echo "[4/8] Installing dependencies..."

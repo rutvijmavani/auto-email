@@ -167,7 +167,7 @@ class TestRunWorkerInitialisation(unittest.TestCase):
     def test_skip_init_db_true_skips_init_db(self):
         """skip_init_db=True → init_db NOT called."""
         r = _make_redis_mock()
-        with patch("workers.scan_worker.ping", return_value=True), \
+        with patch("workers.startup.validate_startup"), \
              patch("workers.scan_worker.get_redis", return_value=r), \
              patch("workers.scan_worker.init_db") as mock_init, \
              patch("workers.scan_worker._ensure_consumer_group"):
@@ -178,7 +178,7 @@ class TestRunWorkerInitialisation(unittest.TestCase):
     def test_skip_init_db_false_calls_init_db(self):
         """skip_init_db=False (default) → init_db called once."""
         r = _make_redis_mock()
-        with patch("workers.scan_worker.ping", return_value=True), \
+        with patch("workers.startup.validate_startup"), \
              patch("workers.scan_worker.get_redis", return_value=r), \
              patch("workers.scan_worker.init_db") as mock_init, \
              patch("workers.scan_worker._ensure_consumer_group"):
