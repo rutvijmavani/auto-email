@@ -308,39 +308,50 @@ def scan_file(
     if size == offset:
         return offset, []    # nothing new
 
+    # Read incrementally so large log deltas after downtime don't spike memory.
+    # A small positional buffer of (raw_line, end_pos) tuples provides the
+    # CONTEXT_LINES lookahead the algorithm needs without materialising the file.
+    findings: list[tuple[str, list[str]]] = []
+    new_offset = offset
     try:
         with open(path, errors="replace") as fh:
             fh.seek(offset)
-            lines      = fh.readlines()
-            new_offset = fh.tell()
+            buf: list[tuple[str, int]] = []   # (raw_line, file_pos_after_line)
+
+            def _fill(n: int) -> None:
+                while len(buf) <= n:
+                    raw = fh.readline()
+                    if not raw:
+                        break
+                    buf.append((raw, fh.tell()))
+
+            _fill(0)
+            while buf:
+                raw0, pos0 = buf[0]
+                line = raw0.rstrip()
+                if line and not _is_suppressed(raw0) and _is_flagged(line):
+                    context = []
+                    last_consumed = 0
+                    _fill(CONTEXT_LINES)
+                    for j in range(1, min(1 + CONTEXT_LINES, len(buf))):
+                        ctx_raw, _ = buf[j]
+                        ctx = ctx_raw.rstrip()
+                        if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
+                            if not _is_traceback_component(ctx):
+                                break
+                        last_consumed = j
+                        if ctx and not _is_suppressed(ctx_raw):
+                            context.append(ctx)
+                    findings.append((line, context))
+                    new_offset = buf[last_consumed][1]
+                    del buf[:last_consumed + 1]
+                    _fill(0)
+                else:
+                    new_offset = pos0
+                    buf.pop(0)
+                    _fill(0)
     except Exception:
         return offset, []
-
-    findings: list[tuple[str, list[str]]] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
-        if line and not _is_suppressed(line) and _is_flagged(line):
-            context = []
-            last_consumed = i  # track the last line index consumed by this finding
-            for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines))):
-                ctx_raw = lines[j]
-                ctx     = ctx_raw.rstrip()
-                # Stop context only at new-problem lines (| ERROR |, [CRON]exit=…).
-                # Traceback components (Traceback/ValueError:/TypeError: etc.) belong
-                # to the current finding and must stay attached as context.
-                if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
-                    if not _is_traceback_component(ctx):
-                        break   # genuinely new error — defer as its own finding
-                last_consumed = j  # mark consumed even if blank/suppressed (not appended)
-                if ctx and not _is_suppressed(ctx_raw):
-                    context.append(ctx)
-            findings.append((line, context))
-            # Skip ALL consumed lines (including blank/suppressed ones between
-            # appended context entries) so they are not re-processed as findings.
-            i = last_consumed + 1
-        else:
-            i += 1
 
     return new_offset, findings
 

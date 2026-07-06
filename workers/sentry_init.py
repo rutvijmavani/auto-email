@@ -35,7 +35,7 @@ How fingerprinting works:
     DataError   + workers/scheduler.py:268    →  sha256("DataError:workers/scheduler.py:268")[:16]
 
 Setup:
-  1. pip install sentry-sdk loguru-sentry-handler   (or: sentry-sdk[loguru])
+  1. pip install sentry-sdk[loguru]
   2. Add SENTRY_DSN=https://xxx@oYYY.ingest.sentry.io/ZZZ  to .env
   3. Call init_sentry() at the top of each entry point (before any work).
 

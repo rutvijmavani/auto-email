@@ -540,7 +540,18 @@ CRONTAB
 # remain from crontabs installed before the BEGIN/END marker system was added;
 # without this, old entries survive alongside the new marker-delimited block
 # and cause duplicate runs.
-EXISTING_NON_PIPELINE=$(crontab -l 2>/dev/null || true)
+_crontab_out=$(crontab -l 2>&1)
+_crontab_exit=$?
+if [[ $_crontab_exit -ne 0 ]]; then
+    if echo "$_crontab_out" | grep -qi "no crontab\|crontab: no"; then
+        EXISTING_NON_PIPELINE=""
+    else
+        echo "[ERROR] crontab -l failed unexpectedly: $_crontab_out"
+        exit 1
+    fi
+else
+    EXISTING_NON_PIPELINE="$_crontab_out"
+fi
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
 # Strip legacy run_*.sh pipeline entries (pre-marker crontabs)

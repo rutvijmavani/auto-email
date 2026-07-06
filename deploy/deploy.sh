@@ -62,7 +62,10 @@ PREVIOUS_SHA=$(git rev-parse HEAD)
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
     git reset --hard HEAD 2>/dev/null || true
-    git checkout -B "$_BRANCH" "$PREVIOUS_SHA" || echo "  [FATAL] git rollback failed"
+    if ! git checkout -B "$_BRANCH" "$PREVIOUS_SHA"; then
+        echo "  [FATAL] git rollback failed — system may be in inconsistent state"
+        return 1
+    fi
     "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
         || echo "  [FATAL] pip rollback failed"
     sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
@@ -150,9 +153,15 @@ if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
     echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
     exit 1
 fi
-sudo /usr/local/bin/install-pipeline-units
+sudo /usr/local/bin/install-pipeline-units || {
+    echo "  [ERROR] Unit sync failed — rolling back"
+    _rollback_to_previous; exit 1
+}
 echo "  systemd unit files installed"
-sudo systemctl daemon-reload
+sudo systemctl daemon-reload || {
+    echo "  [ERROR] daemon-reload failed — rolling back"
+    _rollback_to_previous; exit 1
+}
 echo "  systemd daemon reloaded"
 
 # ── Restart systemd services ──────────────────────────────────────────────────

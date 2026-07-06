@@ -860,6 +860,15 @@ def init_db():
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
 
+    # monitor_stats: new per-run metrics (in_flight, fallback_scanned)
+    for col, defn in [
+        ("in_flight",        "INTEGER DEFAULT 0"),
+        ("fallback_scanned", "INTEGER DEFAULT 0"),
+    ]:
+        c.execute(
+            f"ALTER TABLE monitor_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
+        )
+
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_company_poll_stats_next
         ON company_poll_stats (next_poll_at)

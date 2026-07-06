@@ -21,7 +21,7 @@ After=postgresql.service
 # StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple

@@ -110,12 +110,15 @@ UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
 for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service"; do
     src="$DEPLOY_DIR/systemd/$unit"
-    if [[ -f "$src" ]]; then
-        cp "$src" "$UNIT_STAGING_DIR/$unit"
-        chown root:root "$UNIT_STAGING_DIR/$unit"
-        chmod 644 "$UNIT_STAGING_DIR/$unit"
-        echo "  Staged: $UNIT_STAGING_DIR/$unit"
+    if [[ ! -f "$src" ]]; then
+        echo "[ERROR] Unit file not found: $src"
+        echo "        Ensure deploy/systemd/$unit exists before running this script."
+        exit 1
     fi
+    cp "$src" "$UNIT_STAGING_DIR/$unit"
+    chown root:root "$UNIT_STAGING_DIR/$unit"
+    chmod 644 "$UNIT_STAGING_DIR/$unit"
+    echo "  Staged: $UNIT_STAGING_DIR/$unit"
 done
 chown root:root "$UNIT_STAGING_DIR"
 chmod 755 "$UNIT_STAGING_DIR"
