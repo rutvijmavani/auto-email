@@ -47,7 +47,15 @@ for _pat in "${_STRIP_PATTERNS[@]}"; do
     CLEANED=$(echo "$CLEANED" | grep -v "$_pat" || true)
 done
 
-# Strip marker lines if present (they will be re-added by setup_cron.sh later).
+# Strip per-block markers inserted by this script on previous runs so the
+# blocks can be replaced cleanly without accumulating comment headers.
+for _marker in "MONITOR RETRY" "LOG MONITOR" "KEEP-ALIVE"; do
+    CLEANED=$(echo "$CLEANED" \
+      | sed "/# === BEGIN ${_marker} ===/,/# === END ${_marker} ===/d" \
+      || true)
+done
+
+# Strip RECRUITER PIPELINE markers if present (re-added by setup_cron.sh later).
 if echo "$EXISTING" | grep -q "# === BEGIN RECRUITER PIPELINE ==="; then
     CLEANED=$(echo "$CLEANED" \
       | grep -v "# === BEGIN RECRUITER PIPELINE ===" \
@@ -66,6 +74,7 @@ NEW_CRON=$(echo "$CLEANED" | awk '
 /^0 7[[:space:]].*run_monitor\.sh/ {
     print
     print ""
+    print "# === BEGIN MONITOR RETRY ==="
     print "# ─────────────────────────────────────────"
     print "# MONITOR RETRY — 9 AM fallback"
     print "# Runs only if the 7 AM job did not complete successfully."
@@ -74,6 +83,7 @@ NEW_CRON=$(echo "$CLEANED" | awk '
     print "# digest arrives at most 2 hours late rather than not at all."
     print "# ─────────────────────────────────────────"
     print "0 9 * * * grep -q '\''exit=0'\'' /home/opc/mail/logs/monitor_$(date +\\%Y-\\%m-\\%d).log 2>/dev/null || pgrep -f '\''bash /home/opc/mail/run_monitor\\.sh'\'' > /dev/null 2>&1 || /home/opc/mail/run_monitor.sh"
+    print "# === END MONITOR RETRY ==="
     next
 }
 { print }
@@ -81,6 +91,7 @@ NEW_CRON=$(echo "$CLEANED" | awk '
 
 NEW_CRON="${NEW_CRON}
 
+# === BEGIN LOG MONITOR ===
 # ─────────────────────────────────────────
 # LOG MONITOR — every 15 minutes
 # Scans log files for new ERRORs / tracebacks since the last byte offset.
@@ -90,7 +101,9 @@ NEW_CRON="${NEW_CRON}
 # State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
 */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_\$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
+# === END LOG MONITOR ===
 
+# === BEGIN KEEP-ALIVE ===
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)
 # Prevents Oracle Cloud from suspending the VM overnight.
@@ -99,7 +112,8 @@ NEW_CRON="${NEW_CRON}
 # missed.  Running every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00)
 # ensures no idle window exceeds 4 hours.
 # ─────────────────────────────────────────
-0 */4 * * * python3 -c \"import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]\" >> /dev/null 2>&1"
+0 */4 * * * python3 -c \"import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]\" >> /dev/null 2>&1
+# === END KEEP-ALIVE ==="
 
 # ── Validate required sections before installing ──────────────────────────────
 _cron_ok=1

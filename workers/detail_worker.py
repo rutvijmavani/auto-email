@@ -183,7 +183,7 @@ return removed
 #
 # KEYS[1] = delay_zset_key   KEYS[2] = source_queue_key   ARGV[1] = now (unix ts)
 _ATOMIC_DRAIN_RETRY_LUA = """
-local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 local count = 0
 for _, item in ipairs(due) do
     redis.call('RPUSH', KEYS[2], item)
@@ -192,6 +192,8 @@ for _, item in ipairs(due) do
 end
 return count
 """
+
+_DRAIN_RETRY_BATCH = 50   # max items drained per Lua eval to avoid monopolising Redis
 
 
 def _recover_stuck_jobs(r, own_token: str) -> None:
@@ -914,7 +916,8 @@ def run_worker(once: bool = False, shutdown_event=None,
                 _d_key = f"{_d_src}{_RETRY_DELAY_KEY_SUFFIX}"
                 try:
                     _d_moved = r.eval(
-                        _ATOMIC_DRAIN_RETRY_LUA, 2, _d_key, _d_src, str(_drain_now)
+                        _ATOMIC_DRAIN_RETRY_LUA, 2, _d_key, _d_src,
+                        str(_drain_now), str(_DRAIN_RETRY_BATCH)
                     )
                     if _d_moved:
                         logger.debug(

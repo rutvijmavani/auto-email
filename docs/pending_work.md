@@ -151,9 +151,9 @@ python scripts/health_check.py             # instant full status
 ### 3.2 Worker heartbeat in Redis ✅ DONE
 **Files:** `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`,
 `workers/scheduler.py`  
-**Key:** `worker:alive:{type}:{pid}` with appropriate TTL per worker  
+**Key:** `worker:alive:{type}:{hostname}:{pid}` with appropriate TTL per worker  
 **Payload:** `{"pid": os.getpid(), "processed": count, "ts": time.time()}`  
-**TTLs:** scheduler=15s, scan_worker=30s, detail_worker=30s, fullscan_worker=180s
+**TTLs:** scheduler=30s (per-loop key), scan_worker=30s, detail_worker=30s, fullscan_worker=180s
 
 ### 3.3 workers/watchdog.py ✅ DONE (complete rewrite + systemd wired)
 **Purpose:** Runs continuously under systemd. Checks all components every 5 min,
@@ -207,7 +207,7 @@ python -m workers.watchdog --no-heal        # alerts only, no auto-restart
 
 ### 3.4 Startup validation in each worker ✅ DONE
 **Files:** `workers/startup.py` (new), `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`  
-**Checks:** Redis PING + write test, PostgreSQL SELECT on `job_postings`, required `.env` keys present.  
+**Checks:** Redis PING + write test + version check (≥6.2), PostgreSQL SELECT 1 (connectivity only), required `.env` keys present.  
 Each worker calls `validate_startup(worker_name)` at the top of `run_worker()` before the main loop.
 Exits with `sys.exit(1)` + clear error message on any failure — surfaced immediately in `journalctl`.
 

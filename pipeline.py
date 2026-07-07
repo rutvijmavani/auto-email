@@ -918,7 +918,7 @@ def main():
     _needs_redis = any(a in _REDIS_CMDS for a in args)
 
     # Gmail credentials are required for all subcommands that send email.
-    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs"}
+    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary"}
     _needs_gmail = any(a in _GMAIL_CMDS for a in args)
 
     from workers.startup import validate_startup

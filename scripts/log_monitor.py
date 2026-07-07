@@ -37,7 +37,7 @@ Why Redis instead of a local file?
 
 Cron entry (add via deploy/update_crontab.sh or setup_cron.sh):
   */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py \
-               >> /home/opc/mail/logs/log_monitor_$(date +%Y-%m-%d).log 2>&1
+               >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1
 """
 
 from __future__ import annotations
@@ -859,9 +859,15 @@ def main() -> None:
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
         else:
-            # Transient SMTP failure — offsets already advanced above; dedup
-            # keys NOT written so errors remain discoverable for the digest.
-            print("[log_monitor] Email send failed — will appear in next digest")
+            # Transient SMTP failure — write dedup keys so the digest can
+            # collect these errors (send_digest scans _PFX_ERR* keys, so
+            # errors without dedup keys are invisible to it).
+            for fp, record in new_errors.items():
+                try:
+                    r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
+                except Exception as _we:
+                    print(f"[log_monitor] Redis write failed for {fp}: {_we}")
+            print("[log_monitor] Email send failed — errors recorded for next digest")
     else:
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")

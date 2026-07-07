@@ -117,7 +117,7 @@ def analyse(queue_name: str, r, bucket_minutes: int):
     # a conservative (lower) ideal_per_bk that's harder to falsely exceed.
     slots_in_cycle = math.ceil(86400 / (bucket_minutes * 60))
     ideal_per_bk   = total / max(slots_in_cycle, 1)
-    evenness_ok    = max_pct < 20
+    evenness_ok    = max_pct < 15
 
     print()
     if evenness_ok:

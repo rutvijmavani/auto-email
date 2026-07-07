@@ -107,6 +107,14 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
+# Ensure .env is readable by SERVICE_USER before the PostgreSQL probe — the
+# full permission lock-down (600) happens again in install-systemd.sh (Step 1),
+# but get_conn() needs to load .env credentials now.
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    chown "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR/.env" 2>/dev/null || true
+    chmod 600 "$PROJECT_DIR/.env" 2>/dev/null || true
+fi
+
 # PostgreSQL (via Python)
 if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python -c "from db.connection import get_conn; get_conn().close(); print(\"ok\")"' _ "$PROJECT_DIR" > /dev/null 2>&1; then
     echo "  ✓ PostgreSQL is reachable"

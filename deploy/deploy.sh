@@ -175,7 +175,7 @@ echo "► Syncing systemd unit files..."
 if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
     echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
     echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
-    exit 1
+    _rollback_to_previous; exit 1
 fi
 sudo /usr/local/bin/install-pipeline-units || {
     echo "  [ERROR] Unit sync failed — rolling back"
@@ -195,11 +195,16 @@ echo "  systemd daemon reloaded"
 echo ""
 echo "► Restarting services..."
 
-sudo systemctl restart recruiter-scheduler
+sudo systemctl restart recruiter-scheduler || {
+    echo "  [ERROR] recruiter-scheduler failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
 echo "  Restarted: recruiter-scheduler"
 
-sudo systemctl restart recruiter-watchdog
-echo "  Restarted: recruiter-watchdog"
+sudo systemctl restart recruiter-watchdog || {
+    echo "  [ERROR] recruiter-watchdog failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
 
 echo ""
 echo "  Waiting for services to come up..."

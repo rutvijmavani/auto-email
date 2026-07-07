@@ -1833,15 +1833,17 @@ sudo systemctl restart redis
 
 ### Server setup (one-time only)
 
-The scripts in `deploy/` handle all server-side setup. Run these once when setting up a new server:
+The scripts in `deploy/` handle all server-side setup. **For new servers, always use `deploy/first_time_setup.sh`** — it orchestrates the full sequence in the correct order and handles dependency between steps.
 
-**`deploy/install-systemd.sh`** (run with `sudo`) — does the full systemd setup:
-1. Removes any old watchdog cron entry to prevent double-running
-2. Stops any existing nohup processes
-3. Sets `.env` file permissions to 600 (read-only by the owner — keeps credentials secure)
-4. Adds the sudoers rule so the watchdog can call `systemctl restart` without a password prompt
-5. Installs and enables the unit files, starts both services
-6. Runs `health_check.py` to confirm everything is running
+**`deploy/first_time_setup.sh`** (run with `sudo`) — the single entry point for initial setup:
+1. Checks all prerequisites (venv, `.env`, Redis, PostgreSQL, sub-scripts)
+2. Calls `install-systemd.sh` (Step 1) to set up systemd units and sudoers
+3. Calls `configure-redis.sh` (Step 2) to enable AOF persistence
+4. Starts services and runs `health_check.py` to confirm everything is running
+
+The two scripts below are called by `first_time_setup.sh` automatically. Only run them directly for manual troubleshooting or re-applying individual steps:
+
+**`deploy/install-systemd.sh`** (run with `sudo`) — systemd unit setup, sudoers rule, `.env` permissions. Safe to re-run after unit file changes.
 
 **`deploy/configure-redis.sh`** (run with `sudo`) — enables Redis AOF (Append-Only File) persistence and configures automatic AOF rewriting. By default Redis saves its in-memory data to disk every 5 minutes (RDB). AOF mode appends every operation to disk within 1 second, reducing the crash data-loss window from ~5 minutes to ~1 second. AOF rewriting (auto-triggered when the file doubles in size and is ≥64 MB) compacts the file back down by collapsing all intermediate writes into just the current state — keeping file size proportional to live data rather than write history.
 

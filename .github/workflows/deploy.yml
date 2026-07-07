@@ -86,12 +86,20 @@ jobs:
             # rather than exiting silently under set -e.
             _rollback_to_sha() {
               local _sha="${1:-$PREVIOUS_SHA}"
+              local _checkout_ok=true
               git reset --hard HEAD 2>/dev/null || true
-              git checkout -B main "$_sha" || echo "[FATAL] git rollback to $_sha failed"
-              pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
-              echo "[ROLLBACK] Re-syncing unit files..."
-              sudo /usr/local/bin/install-pipeline-units || echo "[WARN] unit sync failed during rollback"
-              sudo systemctl daemon-reload || echo "[WARN] daemon-reload failed during rollback"
+              if ! git checkout -B main "$_sha"; then
+                echo "[FATAL] git rollback to $_sha failed — code state unknown"
+                _checkout_ok=false
+              fi
+              if $_checkout_ok; then
+                pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
+                echo "[ROLLBACK] Re-syncing unit files..."
+                sudo /usr/local/bin/install-pipeline-units || echo "[WARN] unit sync failed during rollback"
+                sudo systemctl daemon-reload || echo "[WARN] daemon-reload failed during rollback"
+              else
+                echo "[WARN] Skipping pip install and unit sync — code state unknown"
+              fi
               for svc in recruiter-scheduler recruiter-watchdog; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
@@ -110,8 +118,9 @@ jobs:
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
                   echo "[FATAL] Rollback failed — manual intervention required"
+                else
+                  echo "[OK] $svc is active after rollback"
                 fi
-                echo "[OK] $svc is active after rollback"
               done
               exit $_exit
             }

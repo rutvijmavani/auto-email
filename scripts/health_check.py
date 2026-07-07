@@ -196,12 +196,17 @@ def run_health_check() -> int:
     _section("WORKER LIVENESS")
 
     # ── Scheduler — per-loop heartbeat keys ──────────────────────────────────
-    # Each scheduler loop writes its own key (ex=15s).  Check them independently
+    # Each scheduler loop writes its own key (ex=30s).  Check them independently
     # so a hung loop is visible even while the other loop keeps the process alive.
-    _sched_loop_raws = {
-        "adaptive": r.get("worker:alive:scheduler:adaptive"),
-        "fullscan": r.get("worker:alive:scheduler:fullscan"),
-    }
+    try:
+        _sched_loop_raws = {
+            "adaptive": r.get("worker:alive:scheduler:adaptive"),
+            "fullscan": r.get("worker:alive:scheduler:fullscan"),
+        }
+    except Exception as _hb_redis_err:
+        _row("WARNING", "scheduler:heartbeats", f"Redis read failed: {_hb_redis_err}")
+        warnings += 1
+        _sched_loop_raws = {}
     for _loop_name, _raw in _sched_loop_raws.items():
         _label = f"scheduler:{_loop_name}"
         if _raw is None:

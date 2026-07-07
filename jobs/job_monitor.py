@@ -222,37 +222,33 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     company_names = [c["company"] for c in companies]
 
-    # Take the Redis inflight snapshot FIRST so companies that start a fullscan
-    # between the DB read and the Redis read cannot be misclassified as missed.
-    inflight: set = set()
+    # Take two Redis inflight snapshots — before and after the DB query — then
+    # union them so companies that start a scan during the DB read window are
+    # not misclassified as missed.  Only entries within the last 2 h are
+    # considered (older entries come from killed workers without cleanup).
+    inflight:    set   = set()
+    _r_inflight        = None
+    stale_threshold    = time.time() - INFLIGHT_FULLSCAN_STALE_S
     try:
         from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
         import redis as _redis_lib_jm
-        # Only consider entries added within the last 2 hours.  The ZSET score
-        # is the unix timestamp when the worker claimed the company.  Entries
-        # older than 2 h come from workers that were killed without cleanup and
-        # should not permanently exclude companies from the missed-jobs check.
-        # Use a timeout-bound client so a Redis hang never blocks the monitor.
         _r_inflight = _redis_lib_jm.from_url(
             REDIS_URL, socket_timeout=5, socket_connect_timeout=3
         )
-        try:
-            stale_threshold = time.time() - INFLIGHT_FULLSCAN_STALE_S
-            raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
-            inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
-            if inflight:
-                logger.debug(
-                    "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
-                    len(inflight),
-                )
-        finally:
-            _r_inflight.close()
+        raw = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+        inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
+        if inflight:
+            logger.debug(
+                "_get_worker_missed_companies: %d companies in-flight (snapshot 1)",
+                len(inflight),
+            )
     except Exception as exc:
         logger.warning(
             "_get_worker_missed_companies: Redis unavailable for inflight exclusion "
             "(%s) — proceeding without exclusion (may do extra work)",
             exc,
         )
+        _r_inflight = None
 
     conn = get_conn()
     try:
@@ -264,6 +260,16 @@ def _get_worker_missed_companies(companies: list) -> tuple:
         """, (company_names,)).fetchall()
     finally:
         conn.close()
+
+    # Second inflight snapshot after DB query — union narrows the race window.
+    if _r_inflight is not None:
+        try:
+            raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+            inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
+        except Exception:
+            pass
+        finally:
+            _r_inflight.close()
 
     # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
     # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
@@ -478,8 +484,10 @@ def run():
                             _confirmed_done = {r["company"] for r in _vrows}
                             _db_ok = True
                         finally:
-                            _vconn.rollback()   # end implicit transaction before returning to pool
-                            _vconn.close()
+                            try:
+                                _vconn.rollback()   # end implicit transaction before returning to pool
+                            finally:
+                                _vconn.close()
                     except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
                             "In-flight wait: DB verification failed (%s) — "

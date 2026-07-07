@@ -635,7 +635,7 @@ class TestCompleteFullscanDbEMA(unittest.TestCase):
 
     _EMA_ALPHA = 0.3
 
-    def _run(self, duration_s, prev_avg=30.0, new_jobs=0, company="Acme",
+    def _run(self, duration_s, prev_avg=1800.0, new_jobs=0, company="Acme",
              next_scan_ts=0.0):
         """
         Call _complete_fullscan_db() with a mocked DB connection.

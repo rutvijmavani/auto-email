@@ -135,8 +135,15 @@ def _check_redis(prefix: str) -> None:
                 raise ConnectionError("PING returned False")
             r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
             # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
-            _info = r.info("server")
-            _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
+            _info    = r.info("server")
+            _ver_str = _info.get("redis_version", "0.0")
+            try:
+                _ver = tuple(int(x) for x in _ver_str.split(".")[:2])
+            except ValueError:
+                raise _RedisVersionError(
+                    f"Redis version string {_ver_str!r} could not be parsed — "
+                    "ensure Redis ≥6.2 is installed"
+                )
             if _ver < (6, 2):
                 raise _RedisVersionError(
                     f"Redis {_info.get('redis_version')} is too old — "
