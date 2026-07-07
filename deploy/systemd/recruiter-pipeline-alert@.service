@@ -1,7 +1,10 @@
 [Unit]
 Description=Recruiter Pipeline startup failure alert for %i
 # This is a template unit — %i is the name of the failed service.
-# Triggered by OnFailure=recruiter-pipeline-alert@%n.service in other units.
+# Triggered by OnFailure=recruiter-pipeline-alert@%p.service in other units.
+# Use %p (unit prefix, e.g. "recruiter-scheduler"), NOT %n (full unit name with
+# suffix), so the instantiation resolves to "recruiter-pipeline-alert@recruiter-scheduler"
+# rather than "recruiter-pipeline-alert@recruiter-scheduler.service".
 # Sends a single email saying which service hit its StartLimitBurst.
 #
 # Network ordering: the alert script sends email — it must wait for full

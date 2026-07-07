@@ -10,7 +10,7 @@
 #        → Stops any old nohup/cron processes
 #        → Installs and enables recruiter-scheduler + recruiter-watchdog systemd units
 #        → Adds the sudoers rule so watchdog can self-heal
-#        → Starts both services, then immediately stops them
+#        → Installs and enables units (services NOT started here)
 #   3. Runs deploy/configure-redis.sh
 #        → Enables AOF persistence (saves every ~1 second)
 #        → Sets auto-rewrite thresholds (file never grows unbounded)

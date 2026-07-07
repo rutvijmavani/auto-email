@@ -213,8 +213,9 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
     full peer_token maps directly to the heartbeat key with no parsing needed.
 
     Drain is atomic per item via _ATOMIC_DRAIN_LUA:
-      LINDEX (peek) → retry check → Lua(RPOP + optional RPUSH / discard)
-    This prevents live workers from stealing over-retry items during recovery.
+      LINDEX (peek) → Lua(RPOP from inflight + RPUSH to source queue)
+    Recovery from a dead peer is never treated as a retry attempt — the job
+    was never processed.  Retry budgeting happens in run_worker/_process_detail.
     """
     for queue_key, source_key in [
         (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
@@ -253,12 +254,11 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     )
                     continue
 
-                # Peer is dead — drain atomically so no live worker can steal
-                # an over-retry item between the move and the discard decision.
+                # Peer is dead — drain atomically so no concurrent drain worker
+                # can steal an item between peek and pop.
                 # Algorithm per item:
                 #   1. LINDEX (peek rightmost, non-destructive)
-                #   2. Increment retry counter, decide recover vs discard
-                #   3. Lua: RPOP from inflight + RPUSH to source (or discard)
+                #   2. Lua: RPOP from inflight + RPUSH to source
                 #      Returns 0 if item changed (concurrent drain) → re-loop.
                 recovered = 0
                 discarded = 0

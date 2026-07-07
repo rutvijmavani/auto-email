@@ -98,12 +98,27 @@ echo "► Persisting to redis.conf..."
 
 REDIS_CONF=""
 _conf_patched=0
-for candidate in "${REDIS_CONF_CANDIDATES[@]}"; do
-    if [[ -f "$candidate" ]]; then
-        REDIS_CONF="$candidate"
-        break
+
+# Prefer the config file actually loaded by the running redis-server process
+# over the static candidate list — the two can differ on non-standard installs.
+_redis_pid=$(pgrep -x redis-server 2>/dev/null | head -1 || true)
+if [[ -n "$_redis_pid" ]] && [[ -f "/proc/$_redis_pid/cmdline" ]]; then
+    _proc_conf=$(tr '\0' '\n' < "/proc/$_redis_pid/cmdline" | grep '\.conf' | head -1 || true)
+    if [[ -n "$_proc_conf" ]] && [[ -f "$_proc_conf" ]]; then
+        REDIS_CONF="$_proc_conf"
+        echo "  Detected running config: $REDIS_CONF (from /proc/$_redis_pid/cmdline)"
     fi
-done
+fi
+
+# Fall back to the static candidate list when process detection is unavailable.
+if [[ -z "$REDIS_CONF" ]]; then
+    for candidate in "${REDIS_CONF_CANDIDATES[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            REDIS_CONF="$candidate"
+            break
+        fi
+    done
+fi
 
 if [[ -z "$REDIS_CONF" ]]; then
     echo ""
@@ -164,6 +179,13 @@ else
     if ! $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1; then
         echo "  [WARN] CONFIG REWRITE failed — redis.conf may be read-only or Redis lacks write permission."
         echo "         The live CONFIG SET is active, but redis.conf was not updated by CONFIG REWRITE."
+        if [[ -z "$_redis_pid" ]]; then
+            echo "  [ERROR] Could not confirm the running Redis config path (no process detected)."
+            echo "          Cannot guarantee AOF settings will survive a Redis restart."
+            echo "          The file edits above may target the wrong redis.conf."
+            echo "          Fix: ensure Redis is running and redis.conf is writable, then re-run."
+            exit 1
+        fi
         echo "         The file edits above already wrote the directives directly; this warning is non-fatal."
     fi
     _conf_patched=1

@@ -260,9 +260,20 @@ def claim_stale_work(r, stream_key: str, group: str,
         logger.debug("claim_stale_work: xautoclaim error on %r: %s", stream_key, exc)
         return
 
-    # redis-py returns (next_cursor, [(msg_id, fields), ...], ...)
+    # redis-py returns (next_cursor, [(msg_id, fields), ...], [deleted_ids])
+    # The third element (deleted IDs) is present in Redis 7+ when PEL entries
+    # refer to stream messages that have been trimmed or explicitly deleted.
     if not autoclaim_result or len(autoclaim_result) < 2:
         return
+
+    # Log deleted PEL entries so operators know work was lost from the stream.
+    if len(autoclaim_result) >= 3 and autoclaim_result[2]:
+        deleted_ids = autoclaim_result[2]
+        logger.warning(
+            "claim_stale_work: %d PEL entry(ies) on %r have no backing stream "
+            "message (deleted/trimmed) — work is unrecoverable: %s",
+            len(deleted_ids), stream_key, deleted_ids,
+        )
 
     claimed = autoclaim_result[1]
     if not claimed:

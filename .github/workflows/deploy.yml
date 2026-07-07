@@ -54,9 +54,10 @@ jobs:
       - name: Deploy to Oracle VM
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:        ${{ secrets.VM_HOST }}
-          username:    ${{ secrets.VM_USER }}
-          key:         ${{ secrets.VM_SSH_KEY }}
+          host:            ${{ secrets.VM_HOST }}
+          username:        ${{ secrets.VM_USER }}
+          key:             ${{ secrets.VM_SSH_KEY }}
+          command_timeout: 20m
           script: |
             set -e
             cd ${{ secrets.VM_PATH }}

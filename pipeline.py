@@ -919,7 +919,8 @@ def main():
 
     # Gmail credentials are required for all subcommands that send email.
     _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary"}
-    _needs_gmail = any(a in _GMAIL_CMDS for a in args)
+    # No-args = full pipeline (add_job + find_emails + outreach) — also needs Gmail
+    _needs_gmail = not args or any(a in _GMAIL_CMDS for a in args)
 
     from workers.startup import validate_startup
     validate_startup("pipeline", check_redis=_needs_redis, check_gmail=_needs_gmail)

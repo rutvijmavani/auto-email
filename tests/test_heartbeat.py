@@ -23,6 +23,8 @@ Coverage map
     · Default interval_s = 10
     · fullscan_worker with interval_s=60 gets TTL=180
     · stop() sets the internal _stop event
+    · stop() calls r.delete with the exact key (worker:alive:{type}:{hostname}:{pid})
+    · stop() swallows r.delete exceptions
     · get_count lambda is called on every write
 """
 
@@ -272,6 +274,29 @@ class TestHeartbeatClass(unittest.TestCase):
         result = hb.start()
         hb.stop()
         self.assertIs(result, hb)
+
+    def test_stop_deletes_exact_key(self):
+        """stop() calls r.delete with the exact worker:alive:{type}:{hostname}:{pid} key."""
+        import socket
+        r = self._make_r()
+        from workers.heartbeat import Heartbeat, _HOSTNAME
+        hb = Heartbeat(r, "scan_worker", lambda: 0, interval_s=10)
+        hb.start()
+        hb.stop()
+        expected_key = f"worker:alive:scan_worker:{_HOSTNAME}:{os.getpid()}"
+        r.delete.assert_called_once_with(expected_key)
+
+    def test_stop_swallows_delete_exception(self):
+        """stop() must not raise even when r.delete throws."""
+        r = self._make_r()
+        r.delete.side_effect = ConnectionError("Redis down during cleanup")
+        from workers.heartbeat import Heartbeat
+        hb = Heartbeat(r, "scan_worker", lambda: 0, interval_s=10)
+        hb.start()
+        try:
+            hb.stop()   # must not raise
+        except Exception as exc:
+            self.fail(f"stop() must swallow delete exceptions, got: {exc}")
 
 
 if __name__ == "__main__":

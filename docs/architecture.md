@@ -714,9 +714,9 @@ This switches Redis from RDB snapshots to **AOF (Append-Only File)** mode:
 
 **AOF file size — automatic compaction:**
 
-The AOF file grows as every operation is appended. Without compaction it would grow indefinitely — the heartbeat daemon alone writes ~1,440 entries per hour across 4 workers. Redis handles this via automatic background rewriting (`BGREWRITEAOF`):
+The AOF file grows as every operation is appended. Without compaction it would grow indefinitely — the heartbeat daemon alone writes ~360 entries per hour per worker (one every 10 s), scaling with the active worker pool size. Redis handles this via automatic background rewriting (`BGREWRITEAOF`):
 
-Redis forks a background process that looks at the current in-memory state and writes the *minimal* set of commands needed to recreate it, discarding all intermediate history. Example: 1,440 heartbeat writes collapse to 4 lines (one current value per worker).
+Redis forks a background process that looks at the current in-memory state and writes the *minimal* set of commands needed to recreate it, discarding all intermediate history. Example: thousands of heartbeat writes collapse to one line per worker (the current value only).
 
 Two control knobs set by `configure-redis.sh`:
 

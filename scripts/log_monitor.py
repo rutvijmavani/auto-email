@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 scripts/log_monitor.py — Proactive pipeline log scanner with Redis-backed dedup.
 
 ┌─ Every 15 min (cron) ─────────────────────────────────────────────────────┐
