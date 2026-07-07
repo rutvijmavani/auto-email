@@ -248,6 +248,11 @@ def _get_worker_missed_companies(companies: list) -> tuple:
             "(%s) — proceeding without exclusion (may do extra work)",
             exc,
         )
+        if _r_inflight is not None:
+            try:
+                _r_inflight.close()
+            except Exception:
+                pass
         _r_inflight = None
 
     conn = get_conn()

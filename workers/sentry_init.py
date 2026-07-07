@@ -280,10 +280,11 @@ def init_sentry(
 
     # ── Integrations ──────────────────────────────────────────────────────────
     integrations = [
-        # Capture logger.error() / logger.critical() as Sentry events.
-        # level=ERROR means logger.warning() is NOT forwarded — keeps quota down.
+        # Capture logger.warning()+ as breadcrumbs; only ERROR+ creates Sentry events.
+        # Using WARNING for breadcrumb level so the trail leading up to an error
+        # is visible, without flooding Sentry quota with INFO noise.
         LoggingIntegration(
-            level=logging.ERROR,         # capture as breadcrumb from ERROR up
+            level=logging.WARNING,       # capture as breadcrumb from WARNING up
             event_level=logging.ERROR,   # create Sentry event from ERROR up
         ),
     ]
@@ -295,7 +296,7 @@ def init_sentry(
         from sentry_sdk.integrations.loguru import LoguruIntegration
         integrations.append(
             LoguruIntegration(
-                level=logging.ERROR,
+                level=logging.WARNING,
                 event_level=logging.ERROR,
             )
         )

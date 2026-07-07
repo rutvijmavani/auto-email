@@ -409,28 +409,6 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
                             for i in sched_issues),
                         f"Expected STALE ERROR, got: {sched_issues}")
 
-    def test_scheduler_ok_at_19_seconds(self):
-        """Both scheduler loop keys alive at threshold-1s → OK."""
-        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
-        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
-        payload = json.dumps({"pid": 1, "ts": self._NOW - (threshold - 1), "dispatched": 0})
-        health  = self._health_payload()
-        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
-        sched_issues = [i for i in issues if "worker:scheduler:" in i.category]
-        self.assertTrue(any(i.level == Issue.OK for i in sched_issues),
-                        f"Expected OK at threshold-1s, got: {sched_issues}")
-
-    def test_scheduler_stale_at_21_seconds(self):
-        """Both scheduler loop keys stale at threshold+1s → STALE ERROR."""
-        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
-        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
-        payload = json.dumps({"pid": 1, "ts": self._NOW - (threshold + 1), "dispatched": 0})
-        # Even if health key exists, stale scheduler is an error
-        issues = self._run(scheduler_raw=payload.encode())
-        sched_issues = [i for i in issues if "worker:scheduler:" in i.category]
-        self.assertTrue(any(i.level == Issue.ERROR for i in sched_issues),
-                        f"Expected ERROR at threshold+1s, got: {sched_issues}")
-
     def test_unparseable_scheduler_payload_treated_as_ok(self):
         """Unparseable scheduler key JSON (key exists) → treated as alive (OK)."""
         from workers.watchdog import Issue

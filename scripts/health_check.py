@@ -163,6 +163,9 @@ def run_health_check() -> int:
         try:
             persist = r.info("persistence")
             last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
+            # Normalize: some Redis client versions return a datetime object
+            if hasattr(last_s, "timestamp"):
+                last_s = int(last_s.timestamp())
             if isinstance(last_s, int) and last_s > 0:
                 age_min = (now - last_s) / 60
                 if age_min > 30:
@@ -171,6 +174,10 @@ def run_health_check() -> int:
                     warnings += 1
                 else:
                     _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
+            else:
+                _row("WARNING", "Redis RDB save",
+                     "No RDB save recorded — Redis has not persisted data yet")
+                warnings += 1
         except Exception as exc2:
             _row("WARNING", "Redis persistence", f"Persistence check failed: {exc2}")
             warnings += 1
@@ -221,11 +228,10 @@ def run_health_check() -> int:
                     f"dispatched={d.get('dispatched',0)}  "
                     f"heartbeat {age_s:.0f}s ago"
                 )
-                # Keys are written with ex=15s.  TTL expires before age_s reaches
-                # 15 — use 5s as the stale threshold: reachable and meaningful.
-                if age_s > 5:
-                    _row("WARNING", _label, status + "  (STALE)")
-                    warnings += 1
+                # Keys are written with ex=30s.  HEARTBEAT_DEAD_AFTER["scheduler"]=20s.
+                if age_s > 20:
+                    _row("ERROR", _label, status + "  (STALE)")
+                    errors += 1
                 else:
                     _row("OK", _label, status)
             except Exception:
