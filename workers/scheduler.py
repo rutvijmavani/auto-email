@@ -35,7 +35,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from workers.redis_client import get_redis
+from workers.redis_client import get_redis, get_pubsub_redis
 from workers.adaptive import (
     update_poll_interval, load_poll_counts, dump_poll_counts,
     build_thresholds_from_scores, DEFAULT_THRESHOLDS,
@@ -1191,7 +1191,7 @@ def adaptive_loop() -> None:
     while True:
         try:
             # ── Scheduler heartbeat (worker:alive:scheduler:adaptive) ─────────
-            # Tick is 1s; TTL = 15s.  Written at top of every iteration so
+            # Tick is 1s; TTL = 30s.  Written at top of every iteration so
             # the key stays live even when no companies are due and during
             # pause periods.  Watchdog compares this key independently from
             # worker:alive:scheduler:fullscan so a hung adaptive_loop is
@@ -1471,7 +1471,7 @@ def pubsub_listener_loop() -> None:
     _check_auto_resume() can also clear _pause_event / set _resume_event if
     the cronchain heartbeat expires (safety net against permanent pause).
     """
-    r      = get_redis()
+    r      = get_pubsub_redis()   # socket_timeout=None so listen() can idle indefinitely
     pubsub = r.pubsub()
     pubsub.subscribe(REDIS_PAUSE_CHANNEL, REDIS_RESUME_CHANNEL)
     logger.info("pubsub_listener: subscribed to pause/resume channels")

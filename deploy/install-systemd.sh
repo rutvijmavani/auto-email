@@ -5,9 +5,9 @@
 # After this, use deploy/deploy.sh for every code update.
 #
 # Requirements:
-#   - Run as opc (or any user with sudo)
-#   - Python venv at /home/opc/mail/venv
-#   - .env file at /home/opc/mail/.env
+#   - Run as a non-root user with sudo (e.g. opc, or set SUDO_USER=opc)
+#   - Python venv at <project>/venv  (PROJECT_DIR derived from script location)
+#   - .env file at <project>/.env    (same PROJECT_DIR)
 
 set -euo pipefail
 

@@ -45,6 +45,10 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from config import INFLIGHT_FULLSCAN_STALE_S
+try:
+    from workers.watchdog import HEARTBEAT_DEAD_AFTER as _HEARTBEAT_DEAD_AFTER
+except Exception:
+    _HEARTBEAT_DEAD_AFTER = {"scheduler": 20}   # fallback matches watchdog default
 
 # ANSI colors for terminal output
 _GREEN  = "\033[92m"
@@ -228,8 +232,8 @@ def run_health_check() -> int:
                     f"dispatched={d.get('dispatched',0)}  "
                     f"heartbeat {age_s:.0f}s ago"
                 )
-                # Keys are written with ex=30s.  HEARTBEAT_DEAD_AFTER["scheduler"]=20s.
-                if age_s > 20:
+                # Keys are written with ex=30s.  Dead-after from watchdog constant.
+                if age_s > _HEARTBEAT_DEAD_AFTER["scheduler"]:
                     _row("ERROR", _label, status + "  (STALE)")
                     errors += 1
                 else:
@@ -287,14 +291,16 @@ def run_health_check() -> int:
                     f"total_replacements={total}"
                 )
 
+                # Thresholds match watchdog.check_worker_heartbeats local constants
+                # ERR_DEATHS=5, WARN_DEATHS=3 (not exported — kept in sync manually).
                 if alive == 0:
                     _row("ERROR", label_suffix, f"{base}  no live workers")
                     errors += 1
-                elif consec >= 5:
+                elif consec >= 5:   # ERR_DEATHS
                     _row("ERROR", label_suffix,
                          f"{base}  consecutive_rapid_deaths={consec}")
                     errors += 1
-                elif consec >= 3:
+                elif consec >= 3:   # WARN_DEATHS
                     _row("WARNING", label_suffix,
                          f"{base}  consecutive_rapid_deaths={consec}")
                     warnings += 1

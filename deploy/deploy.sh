@@ -112,12 +112,16 @@ _pull_err() {
     _rollback_to_previous
     exit $_exit
 }
-trap '_pull_err' ERR
+
 CURRENT_SHA=$(git rev-parse --short HEAD)
 git fetch origin
 
 # Count commits we're about to pull in
 BEHIND=$(git rev-list --count "HEAD..origin/${_BRANCH}" 2>/dev/null || echo "?")
+
+# Arm ERR trap only AFTER the read-only fetch+count steps so a transient
+# network failure during fetch doesn't trigger a rollback of unchanged code.
+trap '_pull_err' ERR
 echo "  Current commit : $CURRENT_SHA"
 echo "  Commits behind : $BEHIND"
 

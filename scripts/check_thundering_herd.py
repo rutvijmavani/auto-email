@@ -91,7 +91,7 @@ def analyse(queue_name: str, r, bucket_minutes: int):
             if pct > 30:
                 color = RED
                 flag  = f"  ← {BOLD}THUNDERING HERD{RESET}{RED} ({pct:.0f}% in one bucket){RESET}"
-            elif pct > 15:
+            elif pct >= 15:
                 color = YELL
                 flag  = f"  ← {YELL}spike ({pct:.0f}%){RESET}"
             else:

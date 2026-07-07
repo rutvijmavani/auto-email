@@ -918,7 +918,7 @@ def main():
     _needs_redis = any(a in _REDIS_CMDS for a in args)
 
     # Gmail credentials are required for all subcommands that send email.
-    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary"}
+    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary", "--find-only"}
     # No-args = full pipeline (add_job + find_emails + outreach) — also needs Gmail
     _needs_gmail = not args or any(a in _GMAIL_CMDS for a in args)
 

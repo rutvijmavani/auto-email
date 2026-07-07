@@ -33,6 +33,23 @@ def get_redis() -> "_redis_lib.Redis":
     return _client
 
 
+def get_pubsub_redis() -> "_redis_lib.Redis":
+    """
+    Return a Redis client suitable for pub/sub listeners.
+
+    Uses socket_timeout=None so pubsub.listen() can block indefinitely waiting
+    for infrequent pause/resume messages without triggering a TimeoutError.
+    The shared get_redis() client has socket_timeout=30 which would disconnect
+    the listener every 30 s of idle time.
+    """
+    return _redis_lib.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_timeout=None,
+        socket_connect_timeout=5,
+    )
+
+
 def ping() -> bool:
     """Return True if Redis is reachable. Used by startup health check."""
     try:
