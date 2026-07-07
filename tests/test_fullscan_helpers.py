@@ -951,6 +951,54 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
         except ConnectionError:
             self.fail("ConnectionError from ZADD should be caught by _run_fullscan")
 
+    def test_redis_unavailable_for_zrem_non_fatal(self):
+        """
+        If Redis ZREM raises in the finally block of _run_fullscan, the exception
+        is swallowed — the scan result is still returned and fetch_jobs was called.
+        Symmetric to test_redis_unavailable_for_zadd_non_fatal.
+        """
+        from config import REDIS_INFLIGHT_FULLSCAN
+
+        r = MagicMock()
+        r.set.return_value = True
+        r.exists.return_value = False
+        r.zrangebyscore.return_value = []
+
+        def _zrem(key, *members):
+            if key == REDIS_INFLIGHT_FULLSCAN:
+                raise ConnectionError("Redis unavailable")
+        r.zrem.side_effect = _zrem
+
+        minimal_state = {
+            "full_scan_interrupted": False, "interrupted_at_page": None,
+            "full_scan_interval_s": 86400,
+            "last_poll_at": 1_700_000_000.0 - 86400,
+            "last_full_scan_at": None, "avg_fullscan_duration_s": 30.0,
+        }
+        mock_ats = MagicMock()
+        mock_ats.fetch_jobs.return_value = []
+
+        try:
+            with patch("workers.fullscan._get_fullscan_state", return_value=minimal_state), \
+                 patch("workers.fullscan.get_company_row",
+                       return_value={"ats_platform": "greenhouse", "ats_slug": "testco"}), \
+                 patch("workers.fullscan.get_ats_module", return_value=mock_ats), \
+                 patch("workers.fullscan.parse_slug", return_value={}), \
+                 patch("workers.fullscan.get_config", return_value={}), \
+                 patch("workers.fullscan._complete_fullscan_db"), \
+                 patch("workers.fullscan._get_cycle_start", return_value=None), \
+                 patch("workers.fullscan.set_heartbeat"), \
+                 patch("workers.fullscan.set_progress"), \
+                 patch("workers.fullscan.clear_heartbeat"), \
+                 patch("workers.fullscan._release_lock"):
+                from workers.fullscan import _run_fullscan
+                result = _run_fullscan("TestCo", r)
+            self.assertIsInstance(result, dict,
+                                  "ZREM failure should not prevent result dict return")
+            mock_ats.fetch_jobs.assert_called_once()
+        except ConnectionError:
+            self.fail("ConnectionError from ZREM should be caught by _run_fullscan")
+
     def test_inflight_key_name_matches_config(self):
         """REDIS_INFLIGHT_FULLSCAN constant is 'inflight:fullscan'."""
         from config import REDIS_INFLIGHT_FULLSCAN

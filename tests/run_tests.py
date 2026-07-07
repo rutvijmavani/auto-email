@@ -56,14 +56,15 @@ def main():
             return importlib.import_module(f"tests.{name}")
         except Exception as exc:
             _import_failures.append((name, exc))
-            print(f"[WARN] Could not import tests.{name}: {exc}", file=sys.stderr)
+            print(f"[ERROR] Could not import tests.{name}: {exc}", file=sys.stderr)
             return None
 
-    _all_names = [
+    # Single source of truth for all module names grouped by suite.
+    # _loaded is the canonical mapping; suite lists are built from it below.
+    _unit_names = [
         "test_database", "test_outreach", "test_pipeline",
-        "test_integration", "test_job_scraper", "test_validation",
-        "test_verify_only", "test_prospective", "test_reports",
-        "test_job_monitor", "test_location_filter",
+        "test_validation", "test_verify_only", "test_prospective",
+        "test_reports", "test_job_monitor", "test_location_filter",
         # Phase 10/11 comprehensive suites
         "test_adaptive_engine", "test_adaptive_health",
         "test_fullscan_helpers", "test_paginator",
@@ -81,86 +82,28 @@ def main():
         "test_job_monitor_slot", "test_scan_worker_streams",
         "test_scheduler_streams", "test_slot",
     ]
+    _integration_names = ["test_integration"]
+    _scraper_names     = ["test_job_scraper"]
+    _all_names         = _unit_names + _integration_names + _scraper_names
+
     _loaded = {n: _try_import(n) for n in _all_names}
 
-    def _mod(name):
-        return _loaded.get(name)
-
-    test_database              = _mod("test_database")
-    test_outreach              = _mod("test_outreach")
-    test_pipeline              = _mod("test_pipeline")
-    test_integration           = _mod("test_integration")
-    test_job_scraper           = _mod("test_job_scraper")
-    test_validation            = _mod("test_validation")
-    test_verify_only           = _mod("test_verify_only")
-    test_prospective           = _mod("test_prospective")
-    test_reports               = _mod("test_reports")
-    test_job_monitor           = _mod("test_job_monitor")
-    test_location_filter       = _mod("test_location_filter")
-    test_adaptive_engine       = _mod("test_adaptive_engine")
-    test_adaptive_health       = _mod("test_adaptive_health")
-    test_fullscan_helpers      = _mod("test_fullscan_helpers")
-    test_paginator             = _mod("test_paginator")
-    test_watchdog              = _mod("test_watchdog")
-    test_pipeline_health       = _mod("test_pipeline_health")
-    test_phase11_alerts        = _mod("test_phase11_alerts")
-    test_ats_payload_contract  = _mod("test_ats_payload_contract")
-    test_detail_worker_contracts = _mod("test_detail_worker_contracts")
-    test_scheduler_contracts   = _mod("test_scheduler_contracts")
-    test_detail_worker_inflight = _mod("test_detail_worker_inflight")
-    test_heartbeat             = _mod("test_heartbeat")
-    test_monitor_report_phase1 = _mod("test_monitor_report_phase1")
-    test_startup_validation    = _mod("test_startup_validation")
-    test_add                   = _mod("test_add")
-    test_find_only             = _mod("test_find_only")
-    test_outreach_only         = _mod("test_outreach_only")
-    test_api_health            = _mod("test_api_health")
-    test_api_health_p95        = _mod("test_api_health_p95")
-    test_fullscan_bootstrap    = _mod("test_fullscan_bootstrap")
-    test_job_monitor_slot      = _mod("test_job_monitor_slot")
-    test_scan_worker_streams   = _mod("test_scan_worker_streams")
-    test_scheduler_streams     = _mod("test_scheduler_streams")
-    test_slot                  = _mod("test_slot")
-
     if _import_failures:
-        print(f"\n[WARN] {len(_import_failures)} module(s) failed to import and will be skipped:",
+        print(f"\n[ERROR] {len(_import_failures)} module(s) failed to import:",
               file=sys.stderr)
         for _name, _exc in _import_failures:
             print(f"       tests.{_name}: {_exc}", file=sys.stderr)
+        print("[ERROR] Fix import errors before running the suite.", file=sys.stderr)
+        sys.exit(1)
 
-    unit_tests        = [m for m in [
-                         test_database, test_outreach, test_pipeline,
-                         test_validation, test_verify_only, test_prospective,
-                         test_reports, test_job_monitor, test_location_filter,
-                         # Phase 10/11 comprehensive suites
-                         test_adaptive_engine, test_adaptive_health,
-                         test_fullscan_helpers, test_paginator,
-                         test_watchdog, test_pipeline_health,
-                         test_phase11_alerts,
-                         # ATS + scheduler contract suites
-                         test_ats_payload_contract,
-                         test_detail_worker_contracts,
-                         test_scheduler_contracts,
-                         # Phase 3 new-feature suites
-                         test_detail_worker_inflight,
-                         test_heartbeat,
-                         test_monitor_report_phase1,
-                         test_startup_validation,
-                         # Pipeline CLI suites
-                         test_add,
-                         test_find_only,
-                         test_outreach_only,
-                         # DB + worker suites
-                         test_api_health,
-                         test_api_health_p95,
-                         test_fullscan_bootstrap,
-                         test_job_monitor_slot,
-                         test_scan_worker_streams,
-                         test_scheduler_streams,
-                         test_slot] if m is not None]
-    integration_tests = [m for m in [test_integration] if m is not None]
-    scraper_tests     = [m for m in [test_job_scraper] if m is not None]
+    unit_tests        = [_loaded[n] for n in _unit_names        if _loaded.get(n)]
+    integration_tests = [_loaded[n] for n in _integration_names if _loaded.get(n)]
+    scraper_tests     = [_loaded[n] for n in _scraper_names     if _loaded.get(n)]
     all_tests         = unit_tests + integration_tests + scraper_tests
+
+    if not unit_tests:
+        print("[ERROR] No unit test modules loaded — aborting.", file=sys.stderr)
+        sys.exit(1)
 
     if "--unit" in args:
         print("\n" + "=" * 60)

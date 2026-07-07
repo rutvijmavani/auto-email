@@ -255,6 +255,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 pass
         _r_inflight = None
 
+    rows = []
     try:
         conn = get_conn()
         try:
@@ -274,6 +275,13 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
             except Exception:
                 pass
+    except Exception as _db_exc:
+        logger.warning(
+            "_get_worker_missed_companies: DB unavailable (%s) — "
+            "returning empty missed list (may defer work to next cycle)",
+            _db_exc,
+        )
+        return [], set()
     finally:
         if _r_inflight is not None:
             try:

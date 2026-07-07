@@ -138,6 +138,11 @@ HEARTBEAT_DEAD_AFTER = {
     "fullscan_worker": 1900,   # scans can legitimately take 30 min
 }
 
+# Consecutive rapid-death thresholds for worker pool health.
+# Shared with scripts/health_check.py so both tools agree on severity.
+WARN_DEATHS = 3
+ERR_DEATHS  = 5
+
 # Queue health thresholds
 #
 # Poll queues — velocity/delta tracking across consecutive watchdog cycles.
@@ -618,8 +623,6 @@ def check_worker_heartbeats(r) -> list:
         return issues
 
     # ── 2. Pool health from scheduler:health ─────────────────────────────────
-    WARN_DEATHS  = 3
-    ERR_DEATHS   = 5
     _HEALTH_MISS_KEY       = _rkey("pool_health_miss_count", "worker_pool_health")
     _HEALTH_MISS_THRESHOLD = 3   # consecutive misses before escalating to ERROR
     health_raw   = r.get("scheduler:health")

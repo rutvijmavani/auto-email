@@ -433,7 +433,7 @@ Write intervals, TTLs, and dead thresholds per worker type:
 
 | Worker | Write interval | TTL | Dead after |
 |---|---|---|---|
-| `scheduler` | ~1 s (every loop tick) | 15 s | 20 s |
+| `scheduler` | ~1 s (every loop tick) | 30 s | 20 s |
 | `scan_worker` | 10 s | 30 s | 45 s |
 | `detail_worker` | 10 s | 30 s | 45 s |
 | `fullscan_worker` | 60 s | 180 s | 1,900 s (≈31 min) |

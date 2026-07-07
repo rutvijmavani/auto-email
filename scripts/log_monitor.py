@@ -859,10 +859,12 @@ def main() -> None:
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
         else:
-            # Transient SMTP failure — write dedup keys with a short TTL so
-            # the digest can collect them (send_digest scans _PFX_ERR* keys),
-            # but the same error can re-alert once the SMTP outage clears.
-            _TRANSIENT_SMTP_TTL_S = 3600  # 1 hour — much shorter than DEDUP_WINDOW_S
+            # Transient SMTP failure — write dedup keys that outlive the next
+            # digest run so send_digest can collect them.  TTL = DIGEST_INTERVAL_S
+            # (3 days) so the key survives until the digest fires, but is shorter
+            # than DEDUP_WINDOW_S (7 days) so the error can re-alert once the
+            # SMTP outage clears.
+            _TRANSIENT_SMTP_TTL_S = DIGEST_INTERVAL_S
             for fp, record in new_errors.items():
                 try:
                     r.set(_err_key(fp), json.dumps(record), ex=_TRANSIENT_SMTP_TTL_S)
