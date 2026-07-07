@@ -246,14 +246,25 @@ class TestValidateStartup(unittest.TestCase):
             self.assertIn(key, output, f"Expected {key!r} in error message")
 
     def test_check_config_false_skips_env_check(self):
-        """check_config=False → missing env vars not checked (no exit)."""
-        env_missing = {k: "" for k in
-                       ["REDIS_URL", "DATABASE_URL", "GMAIL_EMAIL", "GMAIL_APP_PASSWORD"]}
+        """check_config=False → missing env vars not checked (no exit).
+
+        REDIS_URL must still be set when check_redis=True (the default) because
+        _check_redis requires an explicit URL; only the *config validation* step
+        (which checks whether required env vars are present) is skipped.
+        """
+        # Provide REDIS_URL so the Redis probe can run; leave all other keys empty
+        # to confirm the config validation step (which would reject them) is skipped.
+        env_partial = {
+            "REDIS_URL":          "redis://localhost:6379/0",
+            "DATABASE_URL":       "",
+            "GMAIL_EMAIL":        "",
+            "GMAIL_APP_PASSWORD": "",
+        }
         _mock_r = MagicMock()
         _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
         # _check_postgres now calls psycopg2.connect directly (bypasses pool).
-        with patch.dict(os.environ, env_missing), \
+        with patch.dict(os.environ, env_partial), \
              patch("redis.from_url", return_value=_mock_r), \
              patch("psycopg2.connect", return_value=MagicMock()):
             from workers.startup import validate_startup
@@ -400,6 +411,37 @@ class TestValidateStartup(unittest.TestCase):
                 validate_startup("test_worker", check_db=False, check_config=False)
             except SystemExit as exc:
                 self.fail(f"Should not exit when check_db=False, got exit({exc.code})")
+
+
+class TestMaskUrl(unittest.TestCase):
+    """Direct unit tests for _mask_url credential redaction."""
+
+    def _mask(self, url):
+        from workers.startup import _mask_url
+        return _mask_url(url)
+
+    def test_password_is_replaced_with_stars(self):
+        """URL with password → password replaced by ***."""
+        result = self._mask("redis://:secret@localhost:6379/0")
+        self.assertNotIn("secret", result)
+        self.assertIn("***", result)
+
+    def test_user_and_password_masked(self):
+        """URL with both username and password → *** replaces only the password."""
+        result = self._mask("postgresql://user:hunter2@db.example.com:5432/mydb")
+        self.assertNotIn("hunter2", result)
+        self.assertIn("user", result)
+        self.assertIn("***", result)
+
+    def test_url_without_password_unchanged(self):
+        """URL with no password → returned unchanged."""
+        url = "redis://localhost:6379/0"
+        self.assertEqual(self._mask(url), url)
+
+    def test_url_with_no_scheme_returned_unchanged(self):
+        """URL with no recognizable scheme (no password extracted) → returned unchanged."""
+        url = "not-a-real-url"
+        self.assertEqual(self._mask(url), url)
 
 
 if __name__ == "__main__":

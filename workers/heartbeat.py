@@ -124,6 +124,9 @@ class Heartbeat:
                     "key will expire via TTL",
                     self._worker_type,
                 )
+                # Thread still running — skip explicit delete so the thread can't
+                # recreate the key after we remove it.  TTL handles cleanup.
+                return
         try:
             self._r.delete(f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}")
         except Exception as _del_err:

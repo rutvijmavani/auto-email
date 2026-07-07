@@ -280,11 +280,6 @@ def claim_stale_work(r, stream_key: str, group: str,
         return
 
     for msg_id, fields in claimed:
-        if msg_id is None:
-            # Redis 7.0+ XAUTOCLAIM returns (None, None) for PEL entries
-            # whose stream messages were deleted.  The message is already
-            # gone — nothing to XACK; just skip.
-            continue
         if not fields:
             r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue

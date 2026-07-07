@@ -255,26 +255,31 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 pass
         _r_inflight = None
 
-    conn = get_conn()
     try:
-        rows = conn.execute("""
-            SELECT company,
-                   EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
-            FROM company_poll_stats
-            WHERE company = ANY(%s)
-        """, (company_names,)).fetchall()
-    finally:
-        conn.close()
-
-    # Second inflight snapshot after DB query — union narrows the race window.
-    if _r_inflight is not None:
+        conn = get_conn()
         try:
-            raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
-            inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
-        except Exception:
-            pass
+            rows = conn.execute("""
+                SELECT company,
+                       EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
+                FROM company_poll_stats
+                WHERE company = ANY(%s)
+            """, (company_names,)).fetchall()
         finally:
-            _r_inflight.close()
+            conn.close()
+
+        # Second inflight snapshot after DB query — union narrows the race window.
+        if _r_inflight is not None:
+            try:
+                raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+                inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
+            except Exception:
+                pass
+    finally:
+        if _r_inflight is not None:
+            try:
+                _r_inflight.close()
+            except Exception:
+                pass
 
     # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
     # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses

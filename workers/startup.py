@@ -119,7 +119,13 @@ class _RedisVersionError(Exception):
 
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        sys.stderr.write(
+            f"{prefix} STARTUP FAILED — REDIS_URL is not set; "
+            "cannot probe Redis without an explicit URL\n"
+        )
+        sys.exit(1)
     try:
         # Use a dedicated client with stricter timeouts (5s/3s) so a hung
         # endpoint never blocks startup indefinitely.  The shared get_redis()

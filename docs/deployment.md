@@ -1298,7 +1298,7 @@ The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `fail
 Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
 
 ```text
-scheduler:       writes every ~1s  TTL=15s   dead after 20s
+scheduler:       writes every ~1s  TTL=30s   dead after 20s
 scan_worker:     writes every 10s  TTL=30s   dead after 45s
 detail_worker:   writes every 10s  TTL=30s   dead after 45s
 fullscan_worker: writes every 60s  TTL=180s  dead after 1,900s
@@ -1306,7 +1306,7 @@ fullscan_worker: writes every 60s  TTL=180s  dead after 1,900s
 
 For scan_worker, detail_worker, and fullscan_worker: TTL = 3× write interval, so two consecutive missed writes are tolerated before the key disappears.
 
-The scheduler is an exception: it writes every ~1s but carries a 15s TTL to give the watchdog a 20s dead-after window that absorbs short Redis blips without a false alarm, at the cost of a slightly longer detection delay.
+The scheduler is an exception: it writes every ~1s but carries a 30s TTL to give the watchdog a 20s dead-after window that absorbs short Redis blips without a false alarm, at the cost of a slightly longer detection delay.
 
 **Why a daemon thread — not a loop-top write:**
 
