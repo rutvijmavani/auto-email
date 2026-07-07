@@ -56,9 +56,12 @@ KillSignal=SIGTERM
 TimeoutStopSec=60s
 
 # ── Resource limits ───────────────────────────────────────────────────────────
-# Prevent a runaway scheduler from taking down the whole server.
+# MemoryMax covers the entire cgroup: the scheduler process plus all worker
+# threads it spawns (scan/detail/fullscan workers run as threads, not separate
+# processes, so they all contribute to this limit).  4G accommodates the full
+# worker pool under concurrent HTTP scraping load.
 LimitNOFILE=65536
-MemoryMax=2G
+MemoryMax=4G
 
 # ── Sandboxing ───────────────────────────────────────────────────────────────
 NoNewPrivileges=true

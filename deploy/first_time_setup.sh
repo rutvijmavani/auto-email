@@ -35,6 +35,23 @@ PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
 SERVICE_USER="${SUDO_USER:-opc}"
 PYTHON="$PROJECT_DIR/venv/bin/python"
 
+# Honour the same connection env vars as configure-redis.sh
+REDIS_CLI="${REDIS_CLI:-redis-cli}"
+REDIS_HOST="${REDIS_HOST:-}"
+REDIS_PORT="${REDIS_PORT:-}"
+REDIS_AUTH="${REDIS_AUTH:-}"
+REDIS_SOCKET="${REDIS_SOCKET:-}"
+
+declare -a _REDIS_ARGS=()
+if [[ -n "$REDIS_SOCKET" ]]; then
+    _REDIS_ARGS+=(-s "$REDIS_SOCKET")
+else
+    [[ -n "$REDIS_HOST" ]] && _REDIS_ARGS+=(-h "$REDIS_HOST")
+    [[ -n "$REDIS_PORT" ]] && _REDIS_ARGS+=(-p "$REDIS_PORT")
+fi
+[[ -n "$REDIS_AUTH" ]] && _REDIS_ARGS+=(-a "$REDIS_AUTH" --no-auth-warning)
+_rcli() { $REDIS_CLI "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
+
 # Reject root as the service user — same guard as install-systemd.sh.
 # SERVICE_USER=root happens when SUDO_USER is explicitly set to root or when
 # the script is invoked directly as root without sudo (empty SUDO_USER and
@@ -98,8 +115,8 @@ else
 fi
 
 # Redis reachable
-if redis-cli ping > /dev/null 2>&1; then
-    REDIS_VERSION=$(redis-cli INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
+if _rcli ping > /dev/null 2>&1; then
+    REDIS_VERSION=$(_rcli INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
     echo "  ✓ Redis is running (version $REDIS_VERSION)"
 else
     echo "  ✗ Redis is not reachable (redis-cli ping failed)"

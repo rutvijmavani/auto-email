@@ -261,7 +261,6 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                 #   2. Lua: RPOP from inflight + RPUSH to source
                 #      Returns 0 if item changed (concurrent drain) → re-loop.
                 recovered = 0
-                discarded = 0
                 while True:
                     raw_peek = r.lindex(key, -1)
                     if raw_peek is None:
@@ -277,10 +276,9 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                         _job_id = _company = ""
 
                     # Recovery from a dead peer's inflight is not a retry attempt —
-                    # the job was never actually processed.  Always requeue so the
-                    # retry budget is only charged in the main run_worker loop when
-                    # _process_detail() actually fails with retryable=True.
-                    should_recover = True
+                    # the job was never actually processed.  Always requeue (mode=1)
+                    # so the retry budget is only charged in the main run_worker loop
+                    # when _process_detail() actually fails with retryable=True.
 
                     # Atomically pop from inflight; push to source only if recovering.
                     # If another drain worker already consumed this item, Lua returns 0

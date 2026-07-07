@@ -1212,14 +1212,23 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     try:
                         _bootstrap_warming_adaptive(company, r)
                     except Exception as bw_exc:
-                        # Non-fatal — fall back to immediate ZADD so company isn't lost
+                        # Non-fatal — fall back to immediate ZADD so company isn't lost.
+                        # Wrap the fallback itself so a Redis error here cannot escape
+                        # into the outer except and overwrite the already-success result.
                         logger.error(
                             "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
                             "falling back to immediate ZADD",
                             company, bw_exc,
                         )
-                        from config import ADAPTIVE_DEFAULT_INTERVAL
-                        r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+                        try:
+                            from config import ADAPTIVE_DEFAULT_INTERVAL
+                            r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+                        except Exception as _zadd_err:
+                            logger.error(
+                                "fullscan [%s]: fallback ZADD also failed: %s — "
+                                "company will be rescheduled by next adaptive cycle",
+                                company, _zadd_err,
+                            )
             else:
                 result["outcome"] = "error"
                 result["success"] = False

@@ -81,6 +81,8 @@ def main():
         "test_api_health", "test_api_health_p95", "test_fullscan_bootstrap",
         "test_job_monitor_slot", "test_scan_worker_streams",
         "test_scheduler_streams", "test_slot",
+        # Redis client
+        "test_redis_client",
     ]
     _integration_names = ["test_integration"]
     _scraper_names     = ["test_job_scraper"]

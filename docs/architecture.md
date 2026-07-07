@@ -438,7 +438,7 @@ Write intervals, TTLs, and dead thresholds per worker type:
 | `detail_worker` | 10 s | 30 s | 45 s |
 | `fullscan_worker` | 60 s | 180 s | 1,900 s (≈31 min) |
 
-TTL = 3× the write interval for scan_worker, detail_worker, and fullscan_worker, so two consecutive missed writes are tolerated (Redis blip, GIL stall) before the key disappears. The scheduler is an exception: its TTL is 15 s despite a ~1 s write interval — the larger margin guards against brief GIL stalls in the scheduler's own loop without the overhead of tuning to an exact multiple.
+TTL = 3× the write interval for scan_worker, detail_worker, and fullscan_worker, so two consecutive missed writes are tolerated (Redis blip, GIL stall) before the key disappears. The scheduler is an exception: its TTL is 30 s despite a ~1 s write interval — the larger margin ensures the key outlives the 20 s dead-after threshold even during brief GIL stalls in the scheduler's own loop.
 
 > **fullscan_worker note:** TTL (180 s) and Dead after (1,900 s) are intentionally different. The heartbeat daemon thread writes every 60 s so the key stays alive as long as the process runs. The 1,900 s "Dead after" threshold checks the embedded `ts` field — if the timestamp is more than 31 minutes stale while the key is still present, the process is likely hung (e.g. stuck waiting on a network response). This is separate from the TTL expiry that fires ~3 minutes after the process actually dies.
 
