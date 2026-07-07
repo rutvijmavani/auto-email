@@ -46,6 +46,12 @@ if [[ "$SERVICE_USER" == "root" ]]; then
     exit 1
 fi
 
+if ! id "$SERVICE_USER" &>/dev/null; then
+    echo "[ERROR] Service user '$SERVICE_USER' does not exist on this host."
+    echo "        Create the user or set SUDO_USER to the correct account."
+    exit 1
+fi
+
 echo "════════════════════════════════════════════════════════════"
 echo "  Mail Pipeline — first-time server setup"
 echo "  Project : $PROJECT_DIR"

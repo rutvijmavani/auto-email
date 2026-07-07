@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -181,23 +182,26 @@ def _make_lazy_before_send():
     cache is cleared so the next event triggers a fresh connection attempt.
     """
     _state: dict = {"r": None}
+    _lock = threading.Lock()
 
     def before_send(event: dict, hint: dict) -> Optional[dict]:
-        # Try to get / reconnect Redis
-        if _state["r"] is None:
-            try:
-                from config import REDIS_URL
-                import redis as _redis_mod
-                _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
-                                          socket_timeout=1,
-                                          socket_connect_timeout=1)
-                _r.ping()
-                _state["r"] = _r
-            except Exception as _conn_err:
-                logger.debug(
-                    "sentry_init: Redis unavailable, dedup skipped: %s", _conn_err
-                )
-                return event   # forward without dedup until Redis is back
+        # Try to get / reconnect Redis under lock to avoid concurrent init races.
+        with _lock:
+            if _state["r"] is None:
+                try:
+                    from config import REDIS_URL
+                    import redis as _redis_mod
+                    _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
+                                              socket_timeout=1,
+                                              socket_connect_timeout=1)
+                    _r.ping()
+                    _state["r"] = _r
+                except Exception as _conn_err:
+                    logger.debug(
+                        "sentry_init: Redis unavailable, dedup skipped: %s", _conn_err
+                    )
+                    return event   # forward without dedup until Redis is back
+            _r_snap = _state["r"]
 
         try:
             fp = _fingerprint(event)
@@ -208,11 +212,11 @@ def _make_lazy_before_send():
             act_key = f"{_PFX_ACT}{fp}"
             ts_key  = f"{_PFX_TS}{fp}"
 
-            _update_frequency(_state["r"], ts_key)
-            act_ttl = _compute_act_ttl(_state["r"], ts_key)
+            _update_frequency(_r_snap, ts_key)
+            act_ttl = _compute_act_ttl(_r_snap, ts_key)
 
-            _res       = _state["r"].eval(_DEDUP_LUA, 2, err_key, act_key,
-                                           DEDUP_WINDOW_S, act_ttl)
+            _res       = _r_snap.eval(_DEDUP_LUA, 2, err_key, act_key,
+                                      DEDUP_WINDOW_S, act_ttl)
             is_new     = _res[0]
             act_active = _res[1]
 
@@ -220,7 +224,8 @@ def _make_lazy_before_send():
                 return None
 
         except Exception as _dedup_err:
-            _state["r"] = None   # reset so next event reconnects
+            with _lock:
+                _state["r"] = None   # reset under lock so next event reconnects
             logger.debug("sentry dedup error (ignored): %s", _dedup_err, exc_info=True)
 
         return event

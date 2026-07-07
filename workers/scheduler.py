@@ -1138,7 +1138,7 @@ def _write_scheduler_heartbeat(r, loop: str, dispatched: int) -> None:
             "pid":        os.getpid(),
             "ts":         time.time(),
             "dispatched": dispatched,
-        }), ex=15)
+        }), ex=30)
     except Exception as _hb_err:
         logger.debug("scheduler: %s_loop heartbeat write failed: %s", loop, _hb_err)
 

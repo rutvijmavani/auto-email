@@ -103,7 +103,16 @@ jobs:
               local _exit=$?
               echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
               _rollback_to_sha "$PREVIOUS_SHA"
-              echo "[ROLLBACK] Reverted to $PREVIOUS_SHA"
+              echo "[ROLLBACK] Verifying rollback services are active..."
+              sleep 3
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                if ! systemctl is-active --quiet "$svc"; then
+                  echo "[ERROR] $svc failed to start after rollback:"
+                  journalctl -u "$svc" -n 30 --no-pager || true
+                  echo "[FATAL] Rollback failed — manual intervention required"
+                fi
+                echo "[OK] $svc is active after rollback"
+              done
               exit $_exit
             }
             trap '_early_rollback' ERR

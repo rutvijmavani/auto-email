@@ -746,6 +746,7 @@ CRON_TZ=America/New_York
 ### Full daily timeline (America/New_York)
 ```text
  7:00 AM: --monitor-jobs (tracks URL presence, increments missing counters)
+ 9:00 AM: monitor-retry (fallback: re-runs --monitor-jobs if 7 AM job did not complete)
  9:00 AM: --sync-forms + --sync-prospective
  9:00 AM: --outreach-only (Mon-Fri only)
  9:00 AM: --weekly-summary (Mon only)
@@ -1264,7 +1265,7 @@ The watchdog calls `systemctl is-active recruiter-scheduler` (and `recruiter-wat
 
 **Why this check exists separately from heartbeats:**
 
-A worker heartbeat key in Redis has a TTL that varies by worker (15 s for the scheduler per-loop keys, up to 180 s for fullscan_worker). If the scheduler just crashed, that key is still alive in Redis for up to 15 more seconds — during that window the heartbeat check says "healthy" while the process is dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key expires. It is the faster, more authoritative signal.
+A worker heartbeat key in Redis has a TTL that varies by worker (30 s for the scheduler per-loop keys, up to 180 s for fullscan_worker). If the scheduler just crashed, that key is still alive in Redis for up to 30 more seconds — during that window the heartbeat check says "healthy" while the process is dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key expires. It is the faster, more authoritative signal.
 
 **Why `failed` is different from `inactive`:**
 

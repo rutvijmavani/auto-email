@@ -753,13 +753,15 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
     exceptions are caught and logged.
 
     Args:
-        company:   Company name (must match prospective_companies.company).
-        r:         Redis connection.
-        skip_lock: If True, bypass the exclusivity lock (dev/debug only).
+        company:        Company name (must match prospective_companies.company).
+        r:              Redis connection.
+        skip_lock:      If True, bypass the exclusivity lock (dev/debug only).
+        shutdown_event: Optional threading.Event; when set, the scan exits
+                        early and returns outcome="shutdown".
 
     Returns:
         dict with keys: company, success, new_jobs, fetched, pages,
-        duration_ms, outcome (completed/paused/error/deferred/skipped),
+        duration_ms, outcome (completed/paused/error/deferred/skipped/shutdown),
         worker_id, completed_at.
     """
     start_mono = time.monotonic()
@@ -973,6 +975,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                             "fullscan [%s]: checkpoint write failed during backpressure shutdown: %s",
                             company, _ckpt_err,
                         )
+                    result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
                     result["outcome"] = "shutdown"
                     return result
                 time.sleep(10)
@@ -993,6 +996,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                         "fullscan [%s]: checkpoint write failed during chunk shutdown: %s",
                         company, _ckpt_err,
                     )
+                result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
                 result["outcome"] = "shutdown"
                 return result
             chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]

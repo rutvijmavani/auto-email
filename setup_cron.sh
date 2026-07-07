@@ -540,8 +540,8 @@ CRONTAB
 # remain from crontabs installed before the BEGIN/END marker system was added;
 # without this, old entries survive alongside the new marker-delimited block
 # and cause duplicate runs.
-_crontab_out=$(crontab -l 2>&1)
-_crontab_exit=$?
+_crontab_exit=0
+_crontab_out=$(crontab -l 2>&1) || _crontab_exit=$?
 if [[ $_crontab_exit -ne 0 ]]; then
     if echo "$_crontab_out" | grep -qi "no crontab\|crontab: no"; then
         EXISTING_NON_PIPELINE=""

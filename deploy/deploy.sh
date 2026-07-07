@@ -62,21 +62,45 @@ PREVIOUS_SHA=$(git rev-parse HEAD)
 _rollback_to_previous() {
     echo "  [ROLLBACK] Reverting to $PREVIOUS_SHA..."
     git reset --hard HEAD 2>/dev/null || true
+    local _checkout_ok=true
     if ! git checkout -B "$_BRANCH" "$PREVIOUS_SHA"; then
-        echo "  [FATAL] git rollback failed — system may be in inconsistent state"
-        return 1
+        echo "  [FATAL] git rollback failed — code state unknown"
+        _checkout_ok=false
     fi
-    "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
-        || echo "  [FATAL] pip rollback failed"
-    sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
-    sudo systemctl daemon-reload || true
+
+    # pip install and unit sync require known-good code — skip if checkout failed
+    if $_checkout_ok; then
+        "$PROJECT_DIR/venv/bin/pip" install -q -r "$PROJECT_DIR/requirements.txt" \
+            || echo "  [FATAL] pip rollback failed"
+        sudo /usr/local/bin/install-pipeline-units || echo "  [WARN] unit sync failed"
+        sudo systemctl daemon-reload || true
+    else
+        echo "  [WARN] Skipping pip install and unit sync — code state unknown"
+    fi
+
+    # Always attempt service restarts: a running service on stale code is better
+    # than no service at all
     sudo systemctl restart recruiter-scheduler \
         || echo "  [WARN] could not restart recruiter-scheduler"
     sudo systemctl restart recruiter-watchdog \
         || echo "  [WARN] could not restart recruiter-watchdog"
-    echo "  [ROLLBACK] Reverted to $PREVIOUS_SHA — check logs:"
+
+    # Post-rollback verification
+    sleep 3
+    local _all_active=true
+    for svc in recruiter-scheduler recruiter-watchdog; do
+        if systemctl is-active --quiet "$svc"; then
+            echo "  [OK] $svc is active after rollback"
+        else
+            echo "  [WARN] $svc failed to start after rollback — manual intervention required"
+            journalctl -u "$svc" -n 20 --no-pager || true
+            _all_active=false
+        fi
+    done
+    echo "  [ROLLBACK] Check logs:"
     echo "             journalctl -u recruiter-scheduler -n 50"
     echo "             journalctl -u recruiter-watchdog  -n 20"
+    $_all_active || return 1
 }
 
 # Trap ERR during the pull/install phase so a partial update auto-rolls back.
