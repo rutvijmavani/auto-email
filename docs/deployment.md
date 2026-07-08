@@ -681,7 +681,7 @@ CRON_TZ=America/New_York
 # 9 AM retry guard in case VM was suspended overnight and 7 AM was missed
 # ─────────────────────────────────────────
 0 7 * * * /home/opc/mail/run_monitor.sh
-0 9 * * * /bin/bash -c 'f=/home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log; [ ! -f "$f" ] && /home/opc/mail/run_monitor.sh'
+0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || pgrep -f 'bash /home/opc/mail/run_monitor\.sh' > /dev/null 2>&1 || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -726,7 +726,7 @@ CRON_TZ=America/New_York
 # LOG MONITOR — every 15 minutes
 # Scans log files from last byte offset, emails on new errors (Redis-deduped)
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # KEEP-ALIVE — every 4 hours (Oracle idle protection)
@@ -746,6 +746,7 @@ CRON_TZ=America/New_York
 ### Full daily timeline (America/New_York)
 ```text
  7:00 AM: --monitor-jobs (tracks URL presence, increments missing counters)
+ 9:00 AM: monitor-retry (fallback: re-runs --monitor-jobs if 7 AM job did not complete)
  9:00 AM: --sync-forms + --sync-prospective
  9:00 AM: --outreach-only (Mon-Fri only)
  9:00 AM: --weekly-summary (Mon only)
@@ -1147,7 +1148,7 @@ For `poll:fullscan`, the algorithm also skips gap midpoints where the predicted 
 Skip gap midpoint if: midpoint + avg_fullscan_duration_s ≥ next 7 AM ET
 ```
 
-`avg_fullscan_duration_s` is updated after every successful scan using an exponential moving average (α=0.3). Default is 30 s until the first scan completes for a company.
+`avg_fullscan_duration_s` is updated after every successful scan using an exponential moving average (α=0.3). Default is 1800 s (30 min) until the first scan completes for a company — a conservative seed that prevents the deadline guard from scheduling scans too close to the 7 AM digest.
 
 ---
 
@@ -1264,7 +1265,7 @@ The watchdog calls `systemctl is-active recruiter-scheduler` (and `recruiter-wat
 
 **Why this check exists separately from heartbeats:**
 
-A worker heartbeat key in Redis has a TTL of 15–45 seconds. If the scheduler just crashed, that key is still alive in Redis for up to 45 more seconds — during that window the heartbeat check says "healthy" while the process is dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key expires. It is the faster, more authoritative signal.
+A worker heartbeat key in Redis has a TTL that varies by worker (30 s for the scheduler per-loop keys, up to 180 s for fullscan_worker). If the scheduler just crashed, that key is still alive in Redis for up to 30 more seconds — during that window the heartbeat check says "healthy" while the process is dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key expires. It is the faster, more authoritative signal.
 
 **Why `failed` is different from `inactive`:**
 
@@ -1294,16 +1295,18 @@ The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `fail
 
 **What it checks:**
 
-Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
+Each worker runs a background daemon thread that writes `worker:alive:{type}:{hostname}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
 
 ```text
-scheduler:       writes every ~1s  TTL=15s   dead after 20s
+scheduler:       writes every ~1s  TTL=30s   dead after 20s
 scan_worker:     writes every 10s  TTL=30s   dead after 45s
 detail_worker:   writes every 10s  TTL=30s   dead after 45s
 fullscan_worker: writes every 60s  TTL=180s  dead after 1,900s
 ```
 
-TTL = 3× write interval, so two consecutive missed writes are tolerated before the key disappears.
+For scan_worker, detail_worker, and fullscan_worker: TTL = 3× write interval, so two consecutive missed writes are tolerated before the key disappears.
+
+The scheduler is an exception: it writes every ~1s but carries a 30s TTL to give the watchdog a 20s dead-after window that absorbs short Redis blips without a false alarm, at the cost of a slightly longer detection delay.
 
 **Why a daemon thread — not a loop-top write:**
 
@@ -1521,7 +1524,9 @@ If `age_minutes > 30` → WARNING.
 
 **Why this matters:**
 
-Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. By default Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (rebuild_redis() restores from PostgreSQL) but you lose that window's scan results and queue state.
+Redis is an in-memory database. Everything — poll queues, heartbeat keys, Bloom filters, stream entries — lives in RAM. Out of the box, Redis saves a full RDB snapshot every 5 minutes. If Redis crashes between snapshots, you lose up to 5 minutes of state. Workers would recover on next startup (`rebuild_redis()` restores from PostgreSQL) but you lose that window's scan results and queue state.
+
+> **After running `deploy/configure-redis.sh`** (required once on new servers), Redis switches to AOF mode with `appendfsync everysec`. RDB snapshots are replaced by a write-ahead log flushed every 1 second. The 30-minute stale-RDB warning is permanently suppressed: `check_redis_persistence()` skips the age check when `aof_enabled` is true, because AOF provides ~1 second durability and the `rdb_last_save_time` metric is no longer meaningful.
 
 The watchdog fires at 30 minutes to catch a broken snapshot process (disk full, permissions issue) before the gap becomes catastrophic.
 
@@ -1540,7 +1545,7 @@ What it does:
 4. Patches `redis.conf` so settings survive a Redis restart
 5. Triggers initial `BGREWRITEAOF` to compact the file immediately
 
-After running this, the 30-minute RDB check is permanently green — AOF writes continuously so the last-save timestamp is always recent.
+After running this, the 30-minute stale-RDB warning is permanently suppressed — `check_redis_persistence()` skips the staleness check when `aof_enabled` is true.
 
 **AOF file size — automatic compaction:**
 
@@ -1567,7 +1572,7 @@ Problem detected
 
 Deduplication prevents repeated emails: once an alert fires for a given issue type, it is suppressed for 1 hour so you do not receive the same email repeatedly between attempts.
 
-The watchdog can call `systemctl restart` without a password prompt because `install-systemd.sh` adds a single narrowly-scoped rule to `/etc/sudoers.d/` — it grants exactly this one command, nothing else.
+The watchdog can call systemctl commands without a password prompt because `install-systemd.sh` adds narrowly-scoped rules to `/etc/sudoers.d/mail-pipeline`. The granted commands are: `systemctl reset-failed`, `systemctl restart` (scheduler + watchdog), and `systemctl is-active` (scheduler + watchdog). The deploy workflow additionally needs `systemctl daemon-reload` and the root-owned `/usr/local/bin/install-pipeline-units` wrapper for unit-file sync — both are included in the sudoers file. The wrapper (not `sudo tee`) is used to prevent stdin injection and privilege-escalation via a writable source tree.
 
 ---
 
@@ -1592,7 +1597,7 @@ Run this any time to see the current state of every component in one table:
 python scripts/health_check.py
 ```
 
-Exit code 0 means everything is healthy. Exit code 1 means something needs attention. The output is color-coded: green = healthy, amber = warning, red = problem.
+Exit code 0 means everything is healthy or has only warnings. Exit code 1 means at least one ERROR or CRITICAL check failed and needs attention. The output is color-coded: green = healthy, amber = warning, red = problem.
 
 To check service status from the command line:
 
@@ -1637,7 +1642,7 @@ What it does, in order:
 1. `git pull` — downloads the latest code
 2. `pip install -r requirements.txt` — picks up any new Python dependencies
 3. `sudo systemctl restart recruiter-scheduler recruiter-watchdog` — restarts both services with the new code
-4. Waits 15 seconds for worker heartbeats to appear in Redis
+4. Waits 70 seconds for worker heartbeats to appear in Redis (the `fullscan_worker` writes every 60 s, so a shorter wait would give a false "no heartbeat" result)
 5. Runs `scripts/health_check.py` to confirm everything came up healthy
 
 If `health_check.py` reports a problem, check the logs:
@@ -1828,15 +1833,17 @@ sudo systemctl restart redis
 
 ### Server setup (one-time only)
 
-The scripts in `deploy/` handle all server-side setup. Run these once when setting up a new server:
+The scripts in `deploy/` handle all server-side setup. **For new servers, always use `deploy/first_time_setup.sh`** — it orchestrates the full sequence in the correct order and handles dependency between steps.
 
-**`deploy/install-systemd.sh`** (run with `sudo`) — does the full systemd setup:
-1. Removes any old watchdog cron entry to prevent double-running
-2. Stops any existing nohup processes
-3. Sets `.env` file permissions to 600 (read-only by the owner — keeps credentials secure)
-4. Adds the sudoers rule so the watchdog can call `systemctl restart` without a password prompt
-5. Installs and enables the unit files, starts both services
-6. Runs `health_check.py` to confirm everything is running
+**`deploy/first_time_setup.sh`** (run with `sudo`) — the single entry point for initial setup:
+1. Checks all prerequisites (venv, `.env`, Redis, PostgreSQL, sub-scripts)
+2. Calls `install-systemd.sh` (Step 1) to set up systemd units and sudoers
+3. Calls `configure-redis.sh` (Step 2) to enable AOF persistence
+4. Starts services and runs `health_check.py` to confirm everything is running
+
+The two scripts below are called by `first_time_setup.sh` automatically. Only run them directly for manual troubleshooting or re-applying individual steps:
+
+**`deploy/install-systemd.sh`** (run with `sudo`) — systemd unit setup, sudoers rule, `.env` permissions. Safe to re-run after unit file changes.
 
 **`deploy/configure-redis.sh`** (run with `sudo`) — enables Redis AOF (Append-Only File) persistence and configures automatic AOF rewriting. By default Redis saves its in-memory data to disk every 5 minutes (RDB). AOF mode appends every operation to disk within 1 second, reducing the crash data-loss window from ~5 minutes to ~1 second. AOF rewriting (auto-triggered when the file doubles in size and is ≥64 MB) compacts the file back down by collapsing all intermediate writes into just the current state — keeping file size proportional to live data rather than write history.
 

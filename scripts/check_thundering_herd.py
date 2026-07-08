@@ -91,7 +91,7 @@ def analyse(queue_name: str, r, bucket_minutes: int):
             if pct > 30:
                 color = RED
                 flag  = f"  ← {BOLD}THUNDERING HERD{RESET}{RED} ({pct:.0f}% in one bucket){RESET}"
-            elif pct > 15:
+            elif pct >= 15:
                 color = YELL
                 flag  = f"  ← {YELL}spike ({pct:.0f}%){RESET}"
             else:
@@ -117,12 +117,13 @@ def analyse(queue_name: str, r, bucket_minutes: int):
     # a conservative (lower) ideal_per_bk that's harder to falsely exceed.
     slots_in_cycle = math.ceil(86400 / (bucket_minutes * 60))
     ideal_per_bk   = total / max(slots_in_cycle, 1)
-    evenness_ok    = max_pct < 20
-
     print()
-    if evenness_ok:
+    if max_pct < 15:
         print(f"  {GREEN}✓  Distribution looks healthy — max spike = {max_pct:.1f}% per bucket "
               f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot){RESET}")
+    elif max_pct <= 30:
+        print(f"  {YELL}⚠  Spike detected — {max_pct:.1f}% of companies in one bucket "
+              f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot across 24 h){RESET}")
     else:
         print(f"  {RED}✗  Thundering herd detected — {max_pct:.1f}% of companies in one bucket "
               f"(ideal ≈ {ideal_per_bk:.1f} per {bucket_minutes}-min slot across 24 h){RESET}")

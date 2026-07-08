@@ -15,9 +15,11 @@ After=network-online.target
 Wants=network-online.target
 
 # Soft-require Redis and Postgres — if they're not systemd-managed (e.g. managed
-# by the cloud provider), remove these Wants/After lines.
+# by the cloud provider), remove the relevant Wants/After lines.
 Wants=redis.service
 After=redis.service
+Wants=postgresql.service
+After=postgresql.service
 
 # Restart watchdog AFTER scheduler so watchdog doesn't false-alarm on boot
 Before=recruiter-watchdog.service
@@ -28,7 +30,7 @@ Before=recruiter-watchdog.service
 # as "failed" and stops retrying.  OnFailure fires to send an alert email.
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple
@@ -54,9 +56,21 @@ KillSignal=SIGTERM
 TimeoutStopSec=60s
 
 # ── Resource limits ───────────────────────────────────────────────────────────
-# Prevent a runaway scheduler from taking down the whole server.
+# MemoryMax covers the entire cgroup: the scheduler process plus all worker
+# child processes it spawns via multiprocessing (scan/detail/fullscan workers
+# run as separate processes, so each contributes independently to this limit).
+# 4G accommodates the full worker pool under concurrent HTTP scraping load.
 LimitNOFILE=65536
-MemoryMax=2G
+MemoryMax=4G
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+# full makes /usr, /boot, /etc read-only; ProtectHome restricts /home to
+# read-only except for the project directory explicitly re-opened below.
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 # Logs go to journald.  To view: journalctl -u recruiter-scheduler -f

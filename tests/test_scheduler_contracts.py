@@ -17,7 +17,8 @@ TestRescheduleJitter has been replaced with:
     · Multiple clustered entries → picks midpoint of the largest gap
     · Result always within the tolerance window [lo, hi]
     · Deadline guard: gap whose midpoint + avg_duration_s ≥ deadline is skipped
-    · Deadline guard: all gaps violate deadline → fallback to target_ts
+    · Deadline guard: all gaps violate deadline → fallback to target_ts (if target_ts is safe)
+    · Deadline guard: all gaps AND target_ts violate deadline → next_digest + 900
     · No deadline set → avg_duration_s has no effect
     · Tiebreaker: equal-size gaps → closest midpoint to target_ts wins
     · Self-correction: 3 calls from a full cluster produce 3 distinct times
@@ -88,7 +89,8 @@ Coverage
     · entries outside window → treated as empty window → midpoint = target
     · result always within [lo, hi] tolerance window
     · deadline with avg_duration=0 → never skipped
-    · all gaps violate deadline → fallback to target_ts
+    · all gaps violate deadline, target_ts safe → fallback to target_ts
+    · all gaps AND target_ts violate deadline → next_digest + 900
     · large cluster (20 entries) → still returns a finite result
     · single entry at center → splits into equal halves, returns valid midpoint
 
@@ -343,28 +345,62 @@ class TestPickScheduleTime(unittest.TestCase):
 
     def test_deadline_guard_skips_late_gaps(self):
         """
-        Largest gap midpoint + avg_duration_s ≥ deadline → skipped.
-        Second-largest gap (without deadline issue) is returned instead.
+        Gap whose midpoint + avg_duration_s ≥ _next_digest_deadline(midpoint) is
+        skipped; the safe gap is returned instead.  deadline_ts is only an enable
+        flag — the actual threshold is always _next_digest_deadline(midpoint).
+
+        The first-checked gap (left_mid) is forced to fail so the algorithm must
+        skip it and fall through to the second gap (right_mid), which is safe.
+        Asserting right_mid confirms that late gaps are actually skipped rather
+        than that a safe-first gap was simply returned first.
         """
+        from unittest.mock import patch as _patch
         lo, hi = self._window()
-        # Entry at target: left gap mid = (lo+target)/2, right gap mid = (target+hi)/2
-        avg_duration = 1800   # 30 min
+        avg_duration = 1800
+        left_mid  = (lo + self._TARGET) / 2
         right_mid = (self._TARGET + hi) / 2
-        # Set deadline so right gap just fails
-        deadline = right_mid + avg_duration - 1
 
-        result = self._call([self._TARGET], deadline_ts=deadline,
-                            avg_duration_s=avg_duration)
-        # Right gap fails → left gap chosen
-        left_mid = (lo + self._TARGET) / 2
-        self.assertAlmostEqual(result, left_mid, places=0)
+        def _mock_nd(ts):
+            # Force left_mid (first gap) to fail; right_mid (second gap) is safe.
+            if abs(ts - left_mid) < 1:
+                return ts + avg_duration - 1   # ts + avg >= deadline → skip
+            return ts + avg_duration + 10_000  # ts + avg << deadline → safe
 
-    def test_deadline_guard_all_gaps_fail_returns_target(self):
-        """All gaps violate deadline → fallback to target_ts."""
-        avg_duration = 86400   # 24 h — always exceeds any gap midpoint
-        deadline = self._TARGET - 1  # deadline already in the past → everything fails
-        result = self._call([], deadline_ts=deadline, avg_duration_s=avg_duration)
+        with _patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call([self._TARGET],
+                                deadline_ts=self._TARGET,  # any non-None value enables the check
+                                avg_duration_s=avg_duration)
+        self.assertAlmostEqual(result, right_mid, places=0)
+
+    def test_deadline_guard_all_gaps_fail_target_safe_returns_target(self):
+        """All gap midpoints violate deadline, but target_ts itself is safe → returns target_ts."""
+        from unittest.mock import patch as _patch
+        avg_duration = 1800
+
+        def _mock_nd(ts):
+            # target_ts: plenty of time (safe); gap midpoints (≠ target): barely fail.
+            if abs(ts - self._TARGET) < 1:
+                return ts + avg_duration + 10_000
+            return ts + avg_duration - 1
+
+        # Entry at target splits window into two gaps whose midpoints ≠ target_ts,
+        # so _mock_nd returns different values for midpoints vs target_ts.
+        with _patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call([self._TARGET],
+                                deadline_ts=self._TARGET,
+                                avg_duration_s=avg_duration)
         self.assertAlmostEqual(result, self._TARGET, places=0)
+
+    def test_deadline_guard_all_gaps_fail_target_also_violates_returns_post_digest(self):
+        """All gaps AND target_ts violate deadline → _next_digest_deadline(target_ts) + 900."""
+        from unittest.mock import patch as _patch
+        avg_duration = 1800
+        fixed_deadline = self._TARGET + avg_duration - 1  # ts + avg >= fixed for all ts ≈ target
+
+        with _patch("workers.scheduler._next_digest_deadline", return_value=fixed_deadline):
+            result = self._call([], deadline_ts=self._TARGET, avg_duration_s=avg_duration)
+        expected = fixed_deadline + 900
+        self.assertAlmostEqual(result, expected, places=0)
 
     def test_no_deadline_avg_duration_has_no_effect(self):
         """With deadline_ts=None, avg_duration_s is ignored."""
@@ -946,15 +982,28 @@ class TestWorkerMissedCycleBoundary(unittest.TestCase):
         has_fixed_boundary   = "cycle_start_ts = today_cycle.timestamp()" in src
         has_rolling_window   = "timedelta(hours=24)" in src
         has_fullscan_field   = "last_full_scan_at" in src
-        # Strip comments and triple-quoted strings before checking:
-        # job_monitor.py mentions "last_poll_at" only in docstrings/comments
-        # that explain why it is NOT used — a raw substring search would
-        # false-positive and fail the assertion even when the code is correct.
-        import re as _re
-        _stripped = _re.sub(r'#[^\n]*', '', src)             # remove # comments
-        _stripped = _re.sub(r'""".*?"""', '', _stripped, flags=_re.DOTALL)  # triple-" strings
-        _stripped = _re.sub(r"'''.*?'''", '', _stripped, flags=_re.DOTALL)  # triple-' strings
-        has_adaptive_field   = "last_poll_at" in _stripped   # adaptive-scan field (wrong alias)
+        # Use ast.walk to check for last_poll_at as an actual Name node in code.
+        # Raw substring or regex approaches would false-positive on comments and
+        # docstrings that explain why last_poll_at is NOT used.
+        import ast as _ast
+        _tree = _ast.parse(src)
+        # Check both Name nodes (direct variable references) and non-docstring
+        # string constants (SQL strings may reference last_poll_at as a column
+        # name without it appearing as a Python identifier).
+        _docstring_nodes: set = set()
+        for _node in _ast.walk(_tree):
+            if isinstance(_node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef, _ast.Module)):
+                if (_ast.get_docstring(_node)):
+                    _body = _node.body
+                    if _body and isinstance(_body[0], _ast.Expr) and isinstance(_body[0].value, _ast.Constant):
+                        _docstring_nodes.add(id(_body[0].value))
+        has_adaptive_field = any(
+            (isinstance(node, _ast.Name) and node.id == "last_poll_at")
+            or (isinstance(node, _ast.Constant) and isinstance(node.value, str)
+                and "last_poll_at" in node.value
+                and id(node) not in _docstring_nodes)
+            for node in _ast.walk(_tree)
+        )
 
         self.assertFalse(has_fixed_boundary,
             "job_monitor.py still uses 'today_cycle.timestamp()' as cycle boundary — "
@@ -1002,13 +1051,20 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
         self.assertAlmostEqual(result, self._TARGET, places=1)
 
     def test_entries_outside_window_ignored(self):
-        """Entries outside [lo, hi] are not returned by ZRANGEBYSCORE so do not split gaps."""
-        # With no in-window entries, full window is a single gap → midpoint = target
-        result = self._call(existing_scores=[], tolerance_pct=0.20)
-        lo = self._TARGET - 0.20 * self._INTERVAL / 2
-        hi = self._TARGET + 0.20 * self._INTERVAL / 2
-        expected_mid = (lo + hi) / 2
-        self.assertAlmostEqual(result, expected_mid, places=1)
+        """ZRANGEBYSCORE is called with exactly [lo, hi] so out-of-window entries never reach the function."""
+        from workers.scheduler import _pick_schedule_time
+        window = 0.20 * self._INTERVAL
+        lo = self._TARGET - window / 2
+        hi = self._TARGET + window / 2
+        r = MagicMock()
+        r.zrangebyscore.return_value = []
+        _pick_schedule_time(
+            self._TARGET, "poll:adaptive", self._INTERVAL, 0.20, r,
+        )
+        _args, _kwargs = r.zrangebyscore.call_args
+        # Verify the window bounds passed to Redis, not the (untested) mock return value
+        self.assertAlmostEqual(_args[1], lo, places=1)
+        self.assertAlmostEqual(_args[2], hi, places=1)
 
     def test_result_within_tolerance_window(self):
         """Result is always within [target - window/2, target + window/2]."""
@@ -1037,16 +1093,41 @@ class TestPickScheduleTimeEdgeCases(unittest.TestCase):
         self.assertLess(result + 0.0, deadline,
                         "Result with avg_duration=0 must be before deadline")
 
-    def test_all_gaps_violate_deadline_fallback_to_target(self):
-        """If every gap midpoint + avg_duration ≥ deadline, falls back to target_ts."""
+    def test_all_gaps_violate_deadline_target_safe_fallback_to_target(self):
+        """All gaps fail, target_ts+avg is before next digest → returns target_ts."""
+        from unittest.mock import patch
+        _avg = 100.0
+        # existing_scores=[_TARGET] creates two gap midpoints at ±(window/4) from
+        # target.  Mock _next_digest_deadline so those midpoints violate
+        # (midpoint + avg >= midpoint + avg - 1) but target_ts itself is safe
+        # (target + avg < target + avg + 1) — exercises the all-gaps-fail
+        # fallback that returns target_ts rather than post-digest.
+        def _mock_nd(ts):
+            if abs(ts - self._TARGET) < 1.0:
+                return ts + _avg + 1.0   # target safe: ts + avg < deadline
+            return ts + _avg - 1.0       # midpoints violate: ts + avg >= deadline
+
+        with patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
+            result = self._call(
+                existing_scores=[self._TARGET],
+                tolerance_pct=0.20,
+                deadline_ts=self._TARGET,  # truthy — enables the deadline guard
+                avg_duration_s=_avg,
+            )
+        self.assertAlmostEqual(result, self._TARGET, places=1)
+
+    def test_all_gaps_violate_deadline_target_also_violates_returns_post_digest(self):
+        """All gaps AND target_ts violate deadline → next_digest + 900."""
+        from workers.scheduler import _next_digest_deadline
+        # 24h avg: target_ts+86400 > next 7 AM ET → target also violates.
         result = self._call(
             existing_scores=[],
             tolerance_pct=0.20,
-            deadline_ts=self._TARGET - 1.0,  # deadline in the past — all gaps violate
-            avg_duration_s=1.0,  # non-zero to exercise the combined guard (mid + dur ≥ deadline)
+            deadline_ts=self._TARGET - 1.0,
+            avg_duration_s=86400.0,
         )
-        # Fallback path: returns target_ts
-        self.assertAlmostEqual(result, self._TARGET, places=1)
+        expected = _next_digest_deadline(self._TARGET) + 900
+        self.assertAlmostEqual(result, expected, places=1)
 
     def test_large_cluster_still_finds_a_result(self):
         """Even with 20 entries spread across the window, returns a finite result."""
@@ -1083,9 +1164,9 @@ class TestInflightExclusionStructural(unittest.TestCase):
     """
 
     def setUp(self):
-        import pathlib
-        self.src = (pathlib.Path(__file__).parent.parent
-                    / "jobs" / "job_monitor.py").read_text(encoding="utf-8")
+        import inspect
+        from jobs.job_monitor import _get_worker_missed_companies
+        self.src = inspect.getsource(_get_worker_missed_companies)
 
     def test_source_uses_redis_inflight_fullscan_constant(self):
         """job_monitor.py reads the inflight:fullscan ZSET to exclude in-flight companies."""

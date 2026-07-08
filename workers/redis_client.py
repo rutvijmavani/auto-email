@@ -14,6 +14,13 @@ from config import REDIS_URL
 
 _client: "_redis_lib.Redis | None" = None
 
+# Kwargs shared by all redis-py clients in this process.
+# socket_timeout is NOT included here — callers set it per purpose.
+_BASE_KWARGS: dict = {
+    "decode_responses": True,
+    "socket_connect_timeout": 5,
+}
+
 
 def get_redis() -> "_redis_lib.Redis":
     """
@@ -24,8 +31,28 @@ def get_redis() -> "_redis_lib.Redis":
     """
     global _client
     if _client is None:
-        _client = _redis_lib.from_url(REDIS_URL, decode_responses=True)
+        _client = _redis_lib.from_url(
+            REDIS_URL,
+            **_BASE_KWARGS,
+            socket_timeout=30,
+        )
     return _client
+
+
+def get_pubsub_redis() -> "_redis_lib.Redis":
+    """
+    Return a Redis client suitable for pub/sub listeners.
+
+    Uses socket_timeout=None so pubsub.listen() can block indefinitely waiting
+    for infrequent pause/resume messages without triggering a TimeoutError.
+    The shared get_redis() client has socket_timeout=30 which would disconnect
+    the listener every 30 s of idle time.
+    """
+    return _redis_lib.from_url(
+        REDIS_URL,
+        **_BASE_KWARGS,
+        socket_timeout=None,
+    )
 
 
 def ping() -> bool:

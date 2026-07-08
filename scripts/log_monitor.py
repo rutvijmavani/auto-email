@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 scripts/log_monitor.py — Proactive pipeline log scanner with Redis-backed dedup.
 
 ┌─ Every 15 min (cron) ─────────────────────────────────────────────────────┐
@@ -7,8 +7,9 @@ scripts/log_monitor.py — Proactive pipeline log scanner with Redis-backed dedu
 │  2. Fingerprint each flagged line (exception type + file + lineno)         │
 │  3. NEW error  (not in Redis)   → immediate alert email + store in Redis   │
 │  4. KNOWN error (in Redis)      → silently drop, just refresh "active" key │
-│  5. Resolution sweep            → any error whose "active" key expired      │
-│     (not seen for 4 h)  →  delete main key so next occurrence = NEW again  │
+│  5. Resolution sweep            → any error whose "active" key expired       │
+│     (adaptive TTL: 5 min–24 h based on firing freq) → delete main key so   │
+│     next occurrence = NEW again                                              │
 │     → append to resolved log for next digest                                │
 │  6. Digest due? (every 3 days)  → send NEW / ACTIVE / RESOLVED summary     │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -31,13 +32,13 @@ Why Redis instead of a local file?
   Byte offsets (what we've already read) live in a local JSON file so the
   scanner works even when Redis is briefly down.  Dedup / active / resolved
   state lives in Redis so TTL-based expiry is handled automatically without
-  any cron cleanup job.  If Redis is unavailable the scanner degrades
-  gracefully: it still reads logs and updates file offsets, but skips the
-  dedup/alert logic rather than crashing.
+  any cron cleanup job.  If Redis is unavailable and new errors were found,
+  the scanner skips the dedup/alert step AND does NOT advance file offsets,
+  so the same lines are re-evaluated on the next run once Redis recovers.
 
 Cron entry (add via deploy/update_crontab.sh or setup_cron.sh):
   */15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py \
-               >> /home/opc/mail/logs/log_monitor.log 2>&1
+               >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1
 """
 
 from __future__ import annotations
@@ -146,7 +147,12 @@ def _get_redis():
         from dotenv import load_dotenv
         load_dotenv(PROJECT_DIR / ".env")
         url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-        return _redis.from_url(url, decode_responses=True)
+        return _redis.from_url(
+            url,
+            decode_responses=True,
+            socket_timeout=30,
+            socket_connect_timeout=5,
+        )
     except Exception:
         return None
 
@@ -167,17 +173,27 @@ def _fingerprint(line: str, context: list[str]) -> str:
     all_lines = [line] + context
 
     exc_type = None
+    exc_msg  = None   # normalized message portion of the exception line
     location = None
 
     # Look for bare exception line: "TypeError: fromisoformat…"
     for _check_line in all_lines:
         m = re.match(
             r'^([A-Za-z][A-Za-z0-9_.]*(?:Error|Exception|Warning))'
-            r'(?:\s*:|\s*$)',
+            r'(?:\s*:\s*(.*))?$',
             _check_line.strip(),
         )
         if m:
             exc_type = m.group(1).split(".")[-1]   # strip module prefix
+            _raw_msg = (m.group(2) or "").strip()
+            if _raw_msg:
+                # Normalize variable parts so the same error class+message structure
+                # hashes consistently regardless of run-time values.
+                _raw_msg = re.sub(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[\d.,]*',
+                                  'TS', _raw_msg)
+                _raw_msg = re.sub(r'\b[0-9a-f]{8,}\b', 'HASH', _raw_msg)
+                _raw_msg = re.sub(r'\b\d{4,}\b', 'N', _raw_msg)
+                exc_msg = _raw_msg[:80]
             break
 
     # Look for traceback frame: '  File "/path/foo.py", line 123, in func'
@@ -195,7 +211,9 @@ def _fingerprint(line: str, context: list[str]) -> str:
     if exc_type and location:
         raw = f"{exc_type}:{location}"
     elif exc_type:
-        raw = exc_type
+        # Include normalized message so ValueError: missing key and
+        # ValueError: invalid timestamp produce distinct fingerprints.
+        raw = f"{exc_type}:{exc_msg}" if exc_msg else exc_type
     elif location:
         # Traceback frame found without a recognisable exception type line —
         # use the file+lineno so the fingerprint is still stable.
@@ -223,14 +241,26 @@ def _load_offsets() -> dict[str, int]:
     if STATE_FILE.exists():
         try:
             return json.loads(STATE_FILE.read_text()).get("offsets", {})
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[log_monitor] _load_offsets: failed to read state ({exc}) — starting from 0")
     return {}
 
 
-def _save_offsets(offsets: dict[str, int]) -> None:
+def _load_inodes() -> dict[str, int]:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text()).get("inodes", {})
+        except Exception as exc:
+            print(f"[log_monitor] _load_inodes: failed to read state ({exc}) — no inode tracking")
+    return {}
+
+
+def _save_offsets(offsets: dict[str, int],
+                  inodes: dict[str, int] | None = None) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"offsets": offsets}, indent=2))
+    _tmp = STATE_FILE.with_suffix(".tmp")
+    _tmp.write_text(json.dumps({"offsets": offsets, "inodes": inodes or {}}, indent=2))
+    _tmp.replace(STATE_FILE)   # atomic rename — no partial-write corruption
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -243,6 +273,22 @@ def _is_suppressed(line: str) -> bool:
 
 def _is_flagged(line: str) -> bool:
     return any(pat.search(line) for pat in FLAG_PATTERNS)
+
+
+# Matches the traceback-component patterns (patterns 2 & 3 in FLAG_PATTERNS):
+# "Traceback (most recent call last):" and exception-type lines like "ValueError: ...".
+# These belong to an ongoing traceback and should stay attached as context to the
+# preceding flagged line, not be split off as independent findings.
+_TRACEBACK_COMPONENT_RE = re.compile(
+    r'^(Traceback \(most recent call last\):'
+    r'|(TypeError|ValueError|AttributeError|KeyError|IndexError'
+    r'|RuntimeError|OSError|IOError|PermissionError'
+    r'|psycopg2\.\w+Error|redis\.exceptions\.\w+Error):)'
+)
+
+
+def _is_traceback_component(line: str) -> bool:
+    return bool(_TRACEBACK_COMPONENT_RE.match(line))
 
 
 def scan_file(
@@ -263,36 +309,77 @@ def scan_file(
     if size == offset:
         return offset, []    # nothing new
 
+    # Read incrementally so large log deltas after downtime don't spike memory.
+    # A small positional buffer of (raw_line, end_pos) tuples provides the
+    # CONTEXT_LINES lookahead the algorithm needs without materialising the file.
+    findings: list[tuple[str, list[str]]] = []
+    new_offset = offset
     try:
         with open(path, errors="replace") as fh:
             fh.seek(offset)
-            lines      = fh.readlines()
-            new_offset = fh.tell()
+            # Each entry: (raw_line, start_pos, end_pos)
+            # start_pos is captured before readline() so we can re-position to
+            # the line's start when it has no trailing newline (partial write).
+            buf: list[tuple[str, int, int]] = []
+
+            def _fill(n: int) -> None:
+                while len(buf) <= n:
+                    start = fh.tell()
+                    raw = fh.readline()
+                    if not raw:
+                        break
+                    buf.append((raw, start, fh.tell()))
+
+            _fill(0)
+            while buf:
+                raw0, start0, end0 = buf[0]
+                line = raw0.rstrip()
+                if line and not _is_suppressed(raw0) and _is_flagged(line):
+                    if not raw0.endswith('\n'):
+                        # Flagged line is a partial write — stay at start so
+                        # the completed line is re-read on the next scan cycle.
+                        new_offset = start0
+                        buf.pop(0)
+                        _fill(0)
+                        continue
+                    context = []
+                    last_consumed = 0
+                    _fill(CONTEXT_LINES)
+                    for j in range(1, min(1 + CONTEXT_LINES, len(buf))):
+                        ctx_raw, _, _ = buf[j]
+                        ctx = ctx_raw.rstrip()
+                        if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
+                            if not _is_traceback_component(ctx):
+                                break
+                        last_consumed = j
+                        if ctx and not _is_suppressed(ctx_raw):
+                            context.append(ctx)
+                    findings.append((line, context))
+                    new_offset = buf[last_consumed][2]  # end_pos
+                    del buf[:last_consumed + 1]
+                    _fill(0)
+                else:
+                    # For a complete line advance past it; for an unterminated
+                    # final line stay at its start so it is re-read once the
+                    # write completes (avoids silently skipping partial lines).
+                    new_offset = end0 if raw0.endswith('\n') else start0
+                    buf.pop(0)
+                    _fill(0)
     except Exception:
         return offset, []
-
-    findings: list[tuple[str, list[str]]] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i].rstrip()
-        if line and not _is_suppressed(line) and _is_flagged(line):
-            context = [
-                lines[j].rstrip()
-                for j in range(i + 1, min(i + 1 + CONTEXT_LINES, len(lines)))
-                if lines[j].strip() and not _is_suppressed(lines[j])
-            ]
-            findings.append((line, context))
-        i += 1
 
     return new_offset, findings
 
 
 def collect_raw_findings(
     offsets: dict[str, int],
-) -> tuple[dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
+    inodes: dict[str, int] | None = None,
+) -> tuple[dict[str, int], dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
     """
     Scan all relevant log files.
-    Returns updated offsets and per-filename raw findings.
+    Returns (updated_offsets, updated_inodes, per-filename raw findings).
+    Inode tracking detects log rotation where the replacement file grows larger
+    than the old offset (the existing size<offset check handles file shrinkage).
     """
     cutoff = time.time() - MAX_LOG_AGE_HOURS * 3600
 
@@ -315,18 +402,36 @@ def collect_raw_findings(
     ]
 
     new_offsets = dict(offsets)
+    new_inodes: dict[str, int] = dict(inodes or {})
     raw: dict[str, list] = {}
 
     for path in priority + recent_dated:
         if not path.exists():
             continue
         key = str(path)
-        new_off, hits = scan_file(path, offsets.get(key, 0))
+        saved_offset = offsets.get(key, 0)
+
+        # Reset offset when the file was replaced (log rotation where the new
+        # file has grown past the old offset — the size<offset check in
+        # scan_file already covers truncation/shrinkage).
+        if inodes is not None:
+            try:
+                st = path.stat()
+                current_inode = st.st_ino
+                if current_inode != 0:  # st_ino is 0 on some Windows filesystems
+                    saved_inode = inodes.get(key)
+                    if saved_inode is not None and saved_inode != 0 and current_inode != saved_inode:
+                        saved_offset = 0  # file replaced — restart from beginning
+                new_inodes[key] = current_inode
+            except OSError:
+                pass
+
+        new_off, hits = scan_file(path, saved_offset)
         new_offsets[key] = new_off
         if hits:
             raw[path.name] = hits
 
-    return new_offsets, raw
+    return new_offsets, new_inodes, raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -419,7 +524,12 @@ def process_findings(
                 # Do NOT write err_key to Redis here: writing before the email
                 # is sent would suppress the alert for 7 days if the send fails.
                 # err_key is written in main() after a successful send.
-                new_errors[fp] = record
+                if fp in new_errors:
+                    # Same fingerprint appeared twice in this scan — accumulate.
+                    new_errors[fp]["count"] += 1
+                    new_errors[fp]["last_seen"] = now
+                else:
+                    new_errors[fp] = record
             else:
                 # Known error — update last_seen + count, don't alert
                 try:
@@ -430,8 +540,8 @@ def process_findings(
                     ttl = r.ttl(err_key)
                     if ttl > 0:
                         r.set(err_key, json.dumps(stored), ex=ttl)
-                except Exception:
-                    pass
+                except Exception as _ttl_err:
+                    print(f"[log_monitor] TTL update failed for {err_key}: {_ttl_err}")
 
             # Update frequency history + refresh active heartbeat with dynamic TTL
             _update_frequency(r, fp, now)
@@ -459,7 +569,10 @@ def sweep_resolved(r, now: float) -> list[dict]:
             act_key = _act_key(fp)
 
             if not r.exists(act_key):
-                # Active key expired → error resolved
+                # Active key expired → error resolved.
+                # Only delete err_key/ts_key after successfully writing the
+                # resolved record; otherwise the digest loses the resolution entry.
+                _resolution_written = False
                 try:
                     raw = r.get(err_key)
                     if raw:
@@ -467,12 +580,15 @@ def sweep_resolved(r, now: float) -> list[dict]:
                         record["resolved_at"] = now
                         r.rpush(_KEY_RESOLVED, json.dumps(record))
                         r.ltrim(_KEY_RESOLVED, -200, -1)  # keep last 200
-                except Exception:
-                    pass
-                r.delete(err_key)
-                resolved.append(fp)
-    except Exception:
-        pass
+                        _resolution_written = True
+                except Exception as _res_err:
+                    print(f"[log_monitor] resolution sweep failed for {fp}: {_res_err}")
+                if _resolution_written:
+                    r.delete(err_key)
+                    r.delete(_ts_key(fp))   # clear cadence history so next incident starts fresh
+                    resolved.append(fp)
+    except Exception as _sweep_err:
+        print(f"[log_monitor] sweep_resolved failed: {_sweep_err}")
 
     return resolved
 
@@ -507,18 +623,19 @@ def _error_table_row(record: dict) -> str:
     )
 
 
-def _send_email(subject: str, body_html: str) -> bool:
+def _send_email(subject: str, body_html: str):
+    """Return True on success, False on transient SMTP failure, None if credentials are absent."""
     try:
         from dotenv import load_dotenv
         load_dotenv(PROJECT_DIR / ".env")
     except Exception:
         pass
 
-    email    = os.environ.get("EMAIL", "")
-    password = os.environ.get("APP_PASSWORD", "")
+    email    = os.environ.get("GMAIL_EMAIL", "")
+    password = os.environ.get("GMAIL_APP_PASSWORD", "")
     if not email or not password:
-        print("[log_monitor] EMAIL/APP_PASSWORD not set — skipping email")
-        return False
+        print("[log_monitor] GMAIL_EMAIL/GMAIL_APP_PASSWORD not set — skipping email")
+        return None   # permanent misconfiguration, not a transient failure
 
     try:
         msg = MIMEMultipart("mixed")
@@ -539,7 +656,7 @@ def _send_email(subject: str, body_html: str) -> bool:
         return False
 
 
-def send_immediate_alert(new_errors: dict[str, dict]) -> bool:
+def send_immediate_alert(new_errors: dict[str, dict]):
     """Send a single batched email for all brand-new errors found in this scan."""
     total   = len(new_errors)
     files   = sorted({r["log_file"] for r in new_errors.values()})
@@ -589,22 +706,21 @@ def send_digest(r, now: float) -> bool:
             if not raw:
                 continue
             rec = json.loads(raw)
-            rec["is_active"] = bool(r.exists(_act_key(fp)))
 
             if rec.get("first_seen", 0) >= last_digest:
                 new_since_digest.append(rec)
             else:
                 still_active.append(rec)
-    except Exception:
-        pass
+    except Exception as _active_err:
+        print(f"[log_monitor] send_digest: failed to collect active errors: {_active_err}")
 
     # ── Collect resolved errors ───────────────────────────────────────────────
     resolved: list[dict] = []
     try:
         raw_list = r.lrange(_KEY_RESOLVED, 0, -1)
         resolved = [json.loads(x) for x in raw_list]
-    except Exception:
-        pass
+    except Exception as _resolved_err:
+        print(f"[log_monitor] send_digest: failed to collect resolved errors: {_resolved_err}")
 
     if not new_since_digest and not still_active and not resolved:
         print("[log_monitor] digest: nothing to report — skipping")
@@ -651,6 +767,11 @@ def send_digest(r, now: float) -> bool:
     if sent:
         r.set(_KEY_DIGEST, str(now))
         r.delete(_KEY_RESOLVED)   # clear resolved log after digest
+    elif sent is None:
+        # Credentials permanently absent — advance the digest timestamp so we
+        # don't retry on every cron cycle (mirrors send_immediate_alert behavior).
+        r.set(_KEY_DIGEST, str(now))
+        # Don't clear _KEY_RESOLVED — resolved errors weren't communicated.
 
     return sent
 
@@ -676,12 +797,9 @@ def main() -> None:
     print(f"[log_monitor] scan started at {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
 
     # ── 1. Scan log files ────────────────────────────────────────────────────
-    offsets              = _load_offsets()
-    new_offsets, raw     = collect_raw_findings(offsets)
-    # Do NOT save offsets yet — wait until we have confirmed the alert was sent
-    # (or that there were no new errors to alert on).  Saving early would cause
-    # the log lines to be permanently skipped if email or Redis fail, since the
-    # next run would start from the advanced offset but the dedup key is not set.
+    offsets                      = _load_offsets()
+    inodes                       = _load_inodes()
+    new_offsets, new_inodes, raw = collect_raw_findings(offsets, inodes)
 
     total_hits = sum(len(v) for v in raw.values())
     total_new  = sum(new_offsets.get(k, 0) - offsets.get(k, 0) for k in new_offsets)
@@ -690,7 +808,7 @@ def main() -> None:
     if not raw:
         print("[log_monitor] clean — no issues found")
         # Nothing to alert on — safe to advance offsets now.
-        _save_offsets(new_offsets)
+        _save_offsets(new_offsets, new_inodes)
         # Still run the resolution sweep and digest check even on a clean run.
         # Without the sweep, expired action keys accumulate and errors that
         # recur after a quiet period are not treated as NEW.
@@ -700,14 +818,14 @@ def main() -> None:
                 resolved_fps = sweep_resolved(r, now)
                 if resolved_fps:
                     print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
-            except Exception:
-                pass
+            except Exception as _sw_err:
+                print(f"[log_monitor] clean-run resolution sweep failed: {_sw_err}")
             try:
                 last_digest = float(r.get(_KEY_DIGEST) or 0)
                 if now - last_digest >= DIGEST_INTERVAL_S:
                     send_digest(r, now)
-            except Exception:
-                pass
+            except Exception as _dig_err:
+                print(f"[log_monitor] clean-run digest check failed: {_dig_err}")
         return
 
     # ── 2. Dedup via Redis ───────────────────────────────────────────────────
@@ -730,28 +848,49 @@ def main() -> None:
         print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
 
     # ── 4. Immediate alert for brand-new errors ──────────────────────────────
+    # Dedup keys are written BEFORE advancing offsets so a crash cannot advance
+    # scan progress without recording the fingerprints.  If we wrote offsets
+    # first and then crashed before writing dedup keys, the errors would be
+    # silently skipped on the next run (offsets advanced past them, no dedup key
+    # to suppress, but the log lines are never re-scanned).
     if new_errors:
         print(f"[log_monitor] {len(new_errors)} NEW error(s): {list(new_errors)}")
         sent = send_immediate_alert(new_errors)
         if sent:
-            # Email delivered — now persist to Redis so next run suppresses these.
+            # Email delivered — persist dedup keys so next run suppresses these.
             for fp, record in new_errors.items():
                 try:
                     r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
-            # Offsets safe to advance now that the operator has been notified.
-            _save_offsets(new_offsets)
+        elif sent is None:
+            # Credentials permanently absent — mark as known so the same
+            # fingerprints don't re-appear as new on every subsequent scan.
+            for fp, record in new_errors.items():
+                try:
+                    r.set(_err_key(fp), json.dumps(record), ex=DEDUP_WINDOW_S)
+                except Exception as _we:
+                    print(f"[log_monitor] Redis write failed for {fp}: {_we}")
         else:
-            # Email failed — do NOT mark as known and do NOT advance offsets.
-            # The next run will re-scan from the same position and retry.
-            print("[log_monitor] Email send failed — errors NOT marked as known "
-                  "(will retry next run)")
+            # Transient SMTP failure — write dedup keys that outlive the next
+            # digest run so send_digest can collect them.  TTL = DIGEST_INTERVAL_S
+            # (3 days) so the key survives until the digest fires, but is shorter
+            # than DEDUP_WINDOW_S (7 days) so the error can re-alert once the
+            # SMTP outage clears.
+            _TRANSIENT_SMTP_TTL_S = DIGEST_INTERVAL_S
+            for fp, record in new_errors.items():
+                try:
+                    r.set(_err_key(fp), json.dumps(record), ex=_TRANSIENT_SMTP_TTL_S)
+                except Exception as _we:
+                    print(f"[log_monitor] Redis write failed for {fp}: {_we}")
+            print("[log_monitor] Email send failed — errors recorded for next digest")
+        # Advance offsets only after dedup keys are written.
+        _save_offsets(new_offsets, new_inodes)
     else:
-        # All errors already known/deduped — no new alert needed.
-        _save_offsets(new_offsets)
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
+        # No new errors — safe to advance offsets immediately.
+        _save_offsets(new_offsets, new_inodes)
 
     # ── 5. Periodic digest ───────────────────────────────────────────────────
     try:

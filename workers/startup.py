@@ -94,45 +94,84 @@ def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
         logger.error("%s startup: missing config keys: %s", prefix, missing)
         sys.exit(1)
 
-    logger.debug("%s config check passed (%d keys)", prefix, len(_REQUIRED_ENV_KEYS))
+    logger.debug("%s config check passed (%d keys)", prefix, len(keys_to_check))
+
+
+def _mask_url(url: str) -> str:
+    """Return *url* with the password replaced by *** for safe logging."""
+    try:
+        from urllib.parse import urlparse, urlunparse
+        _p = urlparse(url)
+        if _p.password:
+            user_prefix = f"{_p.username}:" if _p.username else ""
+            return urlunparse(_p._replace(
+                netloc=f"{user_prefix}***@{_p.hostname}"
+                       + (f":{_p.port}" if _p.port else "")
+            ))
+        return url
+    except Exception:
+        return "(could not parse URL)"
+
+
+class _RedisVersionError(Exception):
+    """Raised when Redis is reachable but below the required version."""
 
 
 def _check_redis(prefix: str) -> None:
     """Verify Redis is reachable with a PING."""
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        sys.stderr.write(
+            f"{prefix} STARTUP FAILED — REDIS_URL is not set; "
+            "cannot probe Redis without an explicit URL\n"
+        )
+        sys.exit(1)
     try:
-        from workers.redis_client import ping, get_redis
-        if not ping():
-            raise ConnectionError("PING returned False")
-        # Also verify we can actually write (catches auth errors that ping misses)
-        r = get_redis()
-        r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
-        # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
-        _info = r.info("server")
-        _ver  = tuple(int(x) for x in _info.get("redis_version", "0.0").split(".")[:2])
-        if _ver < (6, 2):
-            raise RuntimeError(
-                f"Redis {_info.get('redis_version')} is too old — "
-                "pipeline requires Redis ≥6.2 (LMOVE command)"
-            )
-    except Exception as exc:
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        # Mask password so it never appears in systemd/journal logs.
+        # Use a dedicated client with stricter timeouts (5s/3s) so a hung
+        # endpoint never blocks startup indefinitely.  The shared get_redis()
+        # uses longer timeouts suited for runtime use, not fail-fast startup probes.
+        import redis as _redis_lib
+        r = _redis_lib.from_url(
+            redis_url,
+            socket_timeout=5,
+            socket_connect_timeout=3,
+        )
         try:
-            from urllib.parse import urlparse, urlunparse
-            _p = urlparse(redis_url)
-            if _p.password:
-                user_prefix = f"{_p.username}:" if _p.username else ""
-                safe_url = urlunparse(_p._replace(
-                    netloc=f"{user_prefix}***@{_p.hostname}"
-                           + (f":{_p.port}" if _p.port else "")
-                ))
-            else:
-                safe_url = redis_url
-        except Exception:
-            safe_url = "(could not parse REDIS_URL)"
+            if not r.ping():
+                raise ConnectionError("PING returned False")
+            r.set(f"startup:check:{prefix.strip('[]')}", "1", ex=10)
+            # LMOVE (used by detail_worker for at-least-once delivery) requires Redis ≥6.2.
+            _info    = r.info("server")
+            _ver_str = _info.get("redis_version", "0.0")
+            try:
+                _ver = tuple(int(x) for x in _ver_str.split(".")[:2])
+            except ValueError as err:
+                raise _RedisVersionError(
+                    f"Redis version string {_ver_str!r} could not be parsed — "
+                    "ensure Redis ≥6.2 is installed"
+                ) from err
+            if _ver < (6, 2):
+                raise _RedisVersionError(
+                    f"Redis {_info.get('redis_version')} is too old — "
+                    "pipeline requires Redis ≥6.2 (LMOVE command)"
+                )
+        except _RedisVersionError as _ver_err:
+            # Version check failed — Redis is reachable but unsupported.
+            msg = (
+                f"{prefix} STARTUP FAILED — Redis is reachable but too old\n"
+                f"  URL: {_mask_url(redis_url)}\n"
+                f"  Error: {_ver_err}\n"
+                f"  Fix: upgrade Redis to ≥6.2 (sudo apt install redis-server)"
+            )
+            print(msg, file=sys.stderr)
+            logger.error("%s startup: Redis version unsupported: %s", prefix, _ver_err)
+            sys.exit(1)
+        finally:
+            r.close()
+    except Exception as exc:
         msg = (
             f"{prefix} STARTUP FAILED — Redis is unreachable\n"
-            f"  URL: {safe_url}\n"
+            f"  URL: {_mask_url(redis_url)}\n"
             f"  Error: {exc}\n"
             f"  Fix: sudo systemctl status redis"
         )
@@ -145,29 +184,22 @@ def _check_redis(prefix: str) -> None:
 
 def _check_postgres(prefix: str) -> None:
     """Verify PostgreSQL is reachable and the schema is accessible."""
+    db_url_raw = os.getenv("DATABASE_URL", "(not set)")
     conn = None
     try:
-        from db.db import get_conn
-        conn = get_conn()
-        conn.execute("SELECT 1").fetchone()
+        import psycopg2
+        # Bypass the shared pool to enforce a bounded connect_timeout so a
+        # slow or unreachable database never blocks startup indefinitely.
+        # The pool (get_conn) uses the raw DATABASE_URL which may have no timeout.
+        conn = psycopg2.connect(dsn=db_url_raw, connect_timeout=5)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
         logger.debug("%s PostgreSQL check passed", prefix)
     except Exception as exc:
-        db_url_raw = os.getenv("DATABASE_URL", "(not set)")
-        # Mask password in log output
-        try:
-            from urllib.parse import urlparse, urlunparse
-            parsed = urlparse(db_url_raw)
-            db_user_prefix = f"{parsed.username}:" if parsed.username else ""
-            safe_url = urlunparse(parsed._replace(
-                netloc=f"{db_user_prefix}***@{parsed.hostname}"
-                       + (f":{parsed.port}" if parsed.port else "")
-            ))
-        except Exception:
-            safe_url = "(could not parse DATABASE_URL)"
-
         msg = (
             f"{prefix} STARTUP FAILED — PostgreSQL is unreachable\n"
-            f"  URL: {safe_url}\n"
+            f"  URL: {_mask_url(db_url_raw)}\n"
             f"  Error: {exc}\n"
             f"  Fix: check DATABASE_URL in .env; verify PostgreSQL is running."
         )
@@ -178,5 +210,5 @@ def _check_postgres(prefix: str) -> None:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as _close_err:
+                logger.debug("startup: PostgreSQL connection close failed: %s", _close_err)

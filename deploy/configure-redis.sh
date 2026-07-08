@@ -15,6 +15,26 @@
 set -euo pipefail
 
 REDIS_CLI="${REDIS_CLI:-redis-cli}"
+
+# Optional connection env vars — mirror the settings used by the Python stack.
+# REDIS_SOCKET takes precedence over host/port when both are set.
+REDIS_HOST="${REDIS_HOST:-}"
+REDIS_PORT="${REDIS_PORT:-}"
+REDIS_AUTH="${REDIS_AUTH:-}"
+REDIS_SOCKET="${REDIS_SOCKET:-}"
+
+declare -a _REDIS_ARGS=()
+if [[ -n "$REDIS_SOCKET" ]]; then
+    _REDIS_ARGS+=(-s "$REDIS_SOCKET")
+else
+    [[ -n "$REDIS_HOST" ]] && _REDIS_ARGS+=(-h "$REDIS_HOST")
+    [[ -n "$REDIS_PORT" ]] && _REDIS_ARGS+=(-p "$REDIS_PORT")
+fi
+# REDIS_AUTH is kept out of _REDIS_ARGS — passing -a on the command line exposes
+# the password in /proc/<pid>/cmdline and ps output.  redis-cli honours the
+# REDISCLI_AUTH environment variable instead, which is scoped to each invocation.
+_rcli() { REDISCLI_AUTH="${REDIS_AUTH}" "$REDIS_CLI" "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
+
 REDIS_CONF_CANDIDATES=(
     /etc/redis/redis.conf
     /etc/redis.conf
@@ -32,13 +52,13 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ── Check Redis is reachable ──────────────────────────────────────────────────
-if ! $REDIS_CLI ping > /dev/null 2>&1; then
+if ! _rcli ping > /dev/null 2>&1; then
     echo "[ERROR] Cannot reach Redis (redis-cli ping failed)."
     echo "        Is Redis running?  sudo systemctl status redis"
     exit 1
 fi
 
-REDIS_VERSION=$($REDIS_CLI INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
+REDIS_VERSION=$(_rcli INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]' || true)
 echo ""
 echo "► Redis version: $REDIS_VERSION"
 
@@ -46,10 +66,10 @@ echo "► Redis version: $REDIS_VERSION"
 echo ""
 echo "► Applying AOF config via CONFIG SET (live — no restart needed)..."
 
-current_aof=$($REDIS_CLI CONFIG GET appendonly            | tail -1)
-current_fsync=$($REDIS_CLI CONFIG GET appendfsync          | tail -1)
-current_rwpct=$($REDIS_CLI CONFIG GET auto-aof-rewrite-percentage | tail -1)
-current_rwmin=$($REDIS_CLI CONFIG GET auto-aof-rewrite-min-size   | tail -1)
+current_aof=$(_rcli CONFIG GET appendonly            | tail -1)
+current_fsync=$(_rcli CONFIG GET appendfsync          | tail -1)
+current_rwpct=$(_rcli CONFIG GET auto-aof-rewrite-percentage | tail -1)
+current_rwmin=$(_rcli CONFIG GET auto-aof-rewrite-min-size   | tail -1)
 
 echo "  Current appendonly                 : $current_aof"
 echo "  Current appendfsync                : $current_fsync"
@@ -59,6 +79,7 @@ echo "  Current auto-aof-rewrite-min-size  : $current_rwmin"
 # Check all four settings — a partial previous run may have set only
 # appendonly+appendfsync but skipped the rewrite thresholds.
 AOF_CHANGED=0
+AOF_NEWLY_ENABLED=0   # set only when appendonly transitions no → yes
 
 if [[ "$current_aof"   == "yes"     &&
       "$current_fsync" == "everysec" &&
@@ -69,11 +90,12 @@ if [[ "$current_aof"   == "yes"     &&
     echo "  ✓ AOF already fully configured — nothing to change."
 else
     AOF_CHANGED=1
+    [[ "$current_aof" != "yes" ]] && AOF_NEWLY_ENABLED=1
 
-    $REDIS_CLI CONFIG SET appendonly yes
+    _rcli CONFIG SET appendonly yes
     echo "  Set appendonly                     = yes"
 
-    $REDIS_CLI CONFIG SET appendfsync everysec
+    _rcli CONFIG SET appendfsync everysec
     echo "  Set appendfsync                    = everysec"
 
     # AOF rewrite (compaction): Redis rewrites the AOF to just the minimal
@@ -83,10 +105,10 @@ else
     # Trigger: when file doubles vs its size after the last rewrite (100%)
     # and is at least 64 MB.  These are the Redis defaults but we set them
     # explicitly so the config is self-documenting and version-independent.
-    $REDIS_CLI CONFIG SET auto-aof-rewrite-percentage 100
+    _rcli CONFIG SET auto-aof-rewrite-percentage 100
     echo "  Set auto-aof-rewrite-percentage    = 100"
 
-    $REDIS_CLI CONFIG SET auto-aof-rewrite-min-size 64mb
+    _rcli CONFIG SET auto-aof-rewrite-min-size 64mb
     echo "  Set auto-aof-rewrite-min-size      = 64mb"
 fi
 
@@ -95,34 +117,57 @@ echo ""
 echo "► Persisting to redis.conf..."
 
 REDIS_CONF=""
-for candidate in "${REDIS_CONF_CANDIDATES[@]}"; do
-    if [[ -f "$candidate" ]]; then
-        REDIS_CONF="$candidate"
-        break
+_conf_patched=0
+
+# Prefer the config file actually loaded by the running redis-server process
+# over the static candidate list — the two can differ on non-standard installs.
+_redis_pid=$(pgrep -x redis-server 2>/dev/null | head -1 || true)
+if [[ -n "$_redis_pid" ]] && [[ -f "/proc/$_redis_pid/cmdline" ]]; then
+    _proc_conf=$(tr '\0' '\n' < "/proc/$_redis_pid/cmdline" | grep '\.conf' | head -1 || true)
+    if [[ -n "$_proc_conf" ]] && [[ -f "$_proc_conf" ]]; then
+        REDIS_CONF="$_proc_conf"
+        echo "  Detected running config: $REDIS_CONF (from /proc/$_redis_pid/cmdline)"
     fi
-done
+fi
+
+# Fall back to the static candidate list when process detection is unavailable.
+if [[ -z "$REDIS_CONF" ]]; then
+    for candidate in "${REDIS_CONF_CANDIDATES[@]}"; do
+        if [[ -f "$candidate" ]]; then
+            REDIS_CONF="$candidate"
+            break
+        fi
+    done
+fi
 
 if [[ -z "$REDIS_CONF" ]]; then
     echo ""
-    echo "  [WARN] Could not find redis.conf in standard locations:"
+    echo "  [ERROR] Could not find redis.conf in standard locations:"
     for c in "${REDIS_CONF_CANDIDATES[@]}"; do
         echo "         $c"
     done
     echo ""
     echo "  The CONFIG SET above is LIVE but will be lost on Redis restart."
-    echo "  Find your redis.conf and add these lines manually:"
+    echo "  Redis AOF durability is NOT persistent until redis.conf is updated."
+    echo "  Find your redis.conf and add these lines manually, then restart Redis:"
     echo ""
     echo "      appendonly      yes"
     echo "      appendfsync     everysec"
     echo "      auto-aof-rewrite-percentage 100"
     echo "      auto-aof-rewrite-min-size   64mb"
     echo ""
-    echo "  Then restart Redis: sudo systemctl restart redis"
+    echo "  Then: sudo systemctl restart redis"
+    echo ""
+    echo "  To skip this check (not recommended): re-run with SKIP_CONF_CHECK=1"
+    if [[ "${SKIP_CONF_CHECK:-0}" != "1" ]]; then
+        exit 1
+    fi
 else
     echo "  Found: $REDIS_CONF"
-    # Back up before editing
-    cp "$REDIS_CONF" "${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
-    echo "  Backup: ${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+    # Back up before editing — compute timestamp once so cp and echo use the same path
+    _bak="${REDIS_CONF}.bak.$(date +%Y%m%d_%H%M%S)"
+    cp "$REDIS_CONF" "$_bak"
+    echo "  Backup: $_bak"
 
     # Patch each directive — update in-place if present, append if missing
     _set_redis_conf() {
@@ -151,41 +196,58 @@ else
 
     echo ""
     echo "  Config saved. Reloading Redis config..."
-    $REDIS_CLI CONFIG REWRITE > /dev/null 2>&1 || true   # flush in-memory config → file
+    if ! _rcli CONFIG REWRITE > /dev/null 2>&1; then
+        echo "  [WARN] CONFIG REWRITE failed — redis.conf may be read-only or Redis lacks write permission."
+        echo "         The live CONFIG SET is active, but redis.conf was not updated by CONFIG REWRITE."
+        if [[ -z "$_redis_pid" ]]; then
+            echo "  [ERROR] Could not confirm the running Redis config path (no process detected)."
+            echo "          Cannot guarantee AOF settings will survive a Redis restart."
+            echo "          The file edits above may target the wrong redis.conf."
+            echo "          Fix: ensure Redis is running and redis.conf is writable, then re-run."
+            exit 1
+        fi
+        echo "         The file edits above already wrote the directives directly; this warning is non-fatal."
+    fi
+    _conf_patched=1
 fi
 
-# ── Trigger AOF rewrite only when we just enabled AOF ────────────────────────
+# ── Trigger AOF rewrite only when appendonly was newly enabled ────────────────
 # BGREWRITEAOF creates the initial .aof file after appendonly is turned on.
-# Skipped when AOF was already active — the existing .aof file is up to date
-# and an unnecessary rewrite wastes CPU on a large dataset.
-if [[ "$AOF_CHANGED" -eq 1 ]]; then
+# Skipped when only threshold settings changed (appendfsync / rewrite limits)
+# because the existing .aof file is already current in that case, and an
+# unnecessary rewrite wastes CPU on a large dataset.
+if [[ "$AOF_NEWLY_ENABLED" -eq 1 ]]; then
     echo ""
     echo "► Triggering initial AOF rewrite (BGREWRITEAOF)..."
     # CONFIG SET appendonly yes can start an automatic rewrite; check before
     # issuing a second BGREWRITEAOF to avoid the BUSY error.
-    _aof_rw_active=$($REDIS_CLI INFO persistence 2>/dev/null \
+    _aof_rw_active=$(_rcli INFO persistence 2>/dev/null \
         | grep -E "^aof_rewrite_in_progress:|^aof_rewrite_scheduled:" \
         | awk -F: '{s+=$2} END {print s+0}')
     if [[ "${_aof_rw_active:-0}" -gt 0 ]]; then
         echo "  AOF rewrite already in progress — skipping BGREWRITEAOF."
     else
-        $REDIS_CLI BGREWRITEAOF
+        _rcli BGREWRITEAOF
         echo "  AOF rewrite started in background."
     fi
     sleep 2
 else
     echo ""
-    echo "► Skipping BGREWRITEAOF — AOF was already active, existing file is current."
+    if [[ "$AOF_CHANGED" -eq 1 ]]; then
+        echo "► Skipping BGREWRITEAOF — appendonly was already enabled; only threshold settings changed."
+    else
+        echo "► Skipping BGREWRITEAOF — AOF was already fully configured."
+    fi
 fi
 
 # ── Verify ────────────────────────────────────────────────────────────────────
 echo ""
 echo "► Verification:"
-aof_enabled=$($REDIS_CLI CONFIG GET appendonly                    | tail -1)
-aof_fsync=$($REDIS_CLI CONFIG GET appendfsync                     | tail -1)
-aof_rwpct=$($REDIS_CLI CONFIG GET auto-aof-rewrite-percentage     | tail -1)
-aof_rwmin=$($REDIS_CLI CONFIG GET auto-aof-rewrite-min-size       | tail -1)
-aof_file=$($REDIS_CLI INFO persistence | grep aof_filename | cut -d: -f2 | tr -d '[:space:]' || echo "(unknown)")
+aof_enabled=$(_rcli CONFIG GET appendonly                    | tail -1)
+aof_fsync=$(_rcli CONFIG GET appendfsync                     | tail -1)
+aof_rwpct=$(_rcli CONFIG GET auto-aof-rewrite-percentage     | tail -1)
+aof_rwmin=$(_rcli CONFIG GET auto-aof-rewrite-min-size       | tail -1)
+aof_file=$(_rcli CONFIG GET appendfilename 2>/dev/null | tail -1 || echo "(unknown)")
 
 echo "  appendonly                    : $aof_enabled  (want: yes)"
 echo "  appendfsync                   : $aof_fsync   (want: everysec)"
@@ -198,7 +260,13 @@ if [[ "$aof_enabled" == "yes"     &&
       "$aof_rwpct"   == "100"      &&
       ( "$aof_rwmin" == "64mb" || "$aof_rwmin" == "67108864" ) ]]; then
     echo ""
-    echo "  ✓ AOF persistence is ACTIVE"
+    if [[ "$_conf_patched" -eq 0 ]]; then
+        echo "  ✓ AOF settings are LIVE (active in Redis process)"
+        echo "  [WARN] redis.conf was NOT updated (SKIP_CONF_CHECK=1) — settings will revert on Redis restart"
+    else
+        echo "  ✓ AOF persistence is ACTIVE"
+        echo "  ✓ redis.conf updated — settings survive Redis restart"
+    fi
     echo "  ✓ Data-loss window: ~1 second (AOF fsync everysec)"
     echo "  ✓ AOF compaction:   auto-rewrite when file doubles (≥64 MB)"
 else

@@ -366,7 +366,7 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
     def _make_r(self, scheduler_raw=None, health_raw=None):
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler":
+            if key in ("worker:alive:scheduler:adaptive", "worker:alive:scheduler:fullscan"):
                 return scheduler_raw
             if key == "scheduler:health":
                 return health_raw
@@ -386,16 +386,17 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
 
     # ── Layer 1: scheduler key ────────────────────────────────────────────────
 
-    def test_scheduler_key_missing_returns_single_error(self):
+    def test_scheduler_keys_missing_returns_two_errors(self):
         """
-        Scheduler heartbeat absent → single ERROR, function returns immediately.
-        Workers are all presumed dead — no point reading scheduler:health.
+        Both scheduler loop heartbeats absent → two ERRORs (one per loop), then early
+        return — workers are all presumed dead so scheduler:health is not read.
         """
         from workers.watchdog import Issue
         issues = self._run(scheduler_raw=None)
-        self.assertEqual(len(issues), 1)
-        self.assertEqual(issues[0].level, Issue.ERROR)
-        self.assertIn("MISSING", issues[0].message)
+        self.assertEqual(len(issues), 2,
+            f"Expected 2 MISSING errors (one per loop), got {len(issues)}: {issues}")
+        self.assertTrue(all(i.level == Issue.ERROR for i in issues))
+        self.assertTrue(all("MISSING" in i.message for i in issues))
 
     def test_scheduler_key_stale_returns_error(self):
         """Scheduler key present but ts older than threshold → ERROR STALE."""
@@ -408,32 +409,12 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
                             for i in sched_issues),
                         f"Expected STALE ERROR, got: {sched_issues}")
 
-    def test_scheduler_ok_at_19_seconds(self):
-        """scheduler threshold=20s: key age 19s → OK."""
-        from workers.watchdog import Issue
-        payload = json.dumps({"pid": 1, "ts": self._NOW - 19, "dispatched": 0})
-        health  = self._health_payload()
-        issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
-        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
-        self.assertTrue(any(i.level == Issue.OK for i in sched_issues),
-                        f"Expected OK at 19s, got: {sched_issues}")
-
-    def test_scheduler_stale_at_21_seconds(self):
-        """scheduler threshold=20s: key age 21s → STALE ERROR."""
-        from workers.watchdog import Issue
-        payload = json.dumps({"pid": 1, "ts": self._NOW - 21, "dispatched": 0})
-        # Even if health key exists, stale scheduler is an error
-        issues = self._run(scheduler_raw=payload.encode())
-        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
-        self.assertTrue(any(i.level == Issue.ERROR for i in sched_issues),
-                        f"Expected ERROR at 21s, got: {sched_issues}")
-
     def test_unparseable_scheduler_payload_treated_as_ok(self):
         """Unparseable scheduler key JSON (key exists) → treated as alive (OK)."""
         from workers.watchdog import Issue
         health = self._health_payload()
         issues = self._run(scheduler_raw=b"bad-json", health_raw=health.encode())
-        sched_issues = [i for i in issues if i.category == "worker:scheduler"]
+        sched_issues = [i for i in issues if "worker:scheduler:" in i.category]
         self.assertTrue(any(i.level == Issue.OK for i in sched_issues))
 
     # ── Layer 2: scheduler:health pool state ─────────────────────────────────
@@ -514,16 +495,17 @@ class TestCheckWorkerHeartbeats(unittest.TestCase):
     def test_all_4_worker_categories_covered(self):
         """
         With scheduler alive and scheduler:health present, issues cover all
-        4 worker categories: scheduler + scan_worker + detail_worker + fullscan_worker.
+        5 worker categories: scheduler:adaptive + scheduler:fullscan + scan_worker +
+        detail_worker + fullscan_worker.
         """
         payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
         health  = self._health_payload()
         issues  = self._run(scheduler_raw=payload.encode(), health_raw=health.encode())
-        self.assertGreaterEqual(len(issues), 4,
-            f"Expected ≥4 issues (scheduler + 3 pool types), got {len(issues)}: {issues}")
+        self.assertGreaterEqual(len(issues), 5,
+            f"Expected ≥5 issues (2 scheduler loops + 3 pool types), got {len(issues)}: {issues}")
         categories = {i.category for i in issues}
-        for expected in ("worker:scheduler", "worker:scan_worker",
-                         "worker:detail_worker", "worker:fullscan_worker"):
+        for expected in ("worker:scheduler:adaptive", "worker:scheduler:fullscan",
+                         "worker:scan_worker", "worker:detail_worker", "worker:fullscan_worker"):
             self.assertTrue(any(expected in c for c in categories),
                             f"Missing issue category containing '{expected}'")
 
@@ -834,7 +816,7 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         self.assertEqual(self._level(issues, "poll:adaptive"), Issue.WARNING)
 
     def test_queue_making_progress_is_ok(self):
-        """Overdue shrinking → queue is moving → OK."""
+        """Overdue shrinking (s1=False) + proc increasing (s3=False) → stall=1/3 < 2 → OK."""
         from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 5,
@@ -845,11 +827,10 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         }
         issues, _ = self._run(
             snap=snap,
-            adp_overdue=3,   # SHRINKING → s1 progresses → at most WARNING, likely OK
-            scan_proc=55,    # INCREASED
+            adp_overdue=3,   # SHRINKING → s1=False
+            scan_proc=55,    # INCREASED → s3=False; s2=True (head same) → stall=1 < 2 → OK
         )
-        level = self._level(issues, "poll:adaptive")
-        self.assertNotEqual(level, "ERROR")
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.OK)
 
     # ── Fullscan lock exoneration ─────────────────────────────────────────────
 
@@ -887,17 +868,17 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
 
     def test_detail_queue_draining_ok(self):
-        """depth decreased since last cycle → draining → OK."""
+        """depth decreased since last cycle AND below DETAIL_QUEUE_WARN → draining → OK."""
         from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
             "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
-            "detail_adp_depth": 200, "detail_fs_depth": 0,  # was 200
+            "detail_adp_depth": 80, "detail_fs_depth": 0,  # was 80
             "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
         }
-        issues, _ = self._run(snap=snap, detail_adp=150)  # now 150 < 200 → draining
+        issues, _ = self._run(snap=snap, detail_adp=60)  # now 60 < 80 < DETAIL_QUEUE_WARN(100) → OK
         level = self._level(issues, "queue:detail:adaptive")
-        self.assertNotEqual(level, "ERROR")
+        self.assertEqual(level, Issue.OK)
 
     def test_detail_queue_stalled_at_alert_level_is_error(self):
         """depth > DETAIL_QUEUE_ALERT and not draining → ERROR."""
@@ -947,18 +928,25 @@ class TestCheckPelHealthPID(unittest.TestCase):
             }] if pending > 0 else []
         r.xpending_range.side_effect = _xpending_range
 
-        # _consumer_pid_alive() calls r.exists(f"worker:alive:{type}:{c_pid}")
-        # — NOT r.get.  Return 1 if the PID in the key matches heartbeat_pid.
+        # _consumer_pid_alive() calls r.exists(f"worker:alive:{type}:{hostname}:{pid}")
+        # Require the full worker:alive:{type}:{hostname}:{pid} key shape so the
+        # mock fails if the code falls back to a legacy PID-only key format.
+        #
+        # The hostname must be derived from consumer_name the same way
+        # _consumer_pid_alive() does it — via rpartition("-") + removeprefix("worker-")
+        # — NOT from socket.gethostname(), which may differ on the test machine.
+        _cn_str = consumer_name.decode() if isinstance(consumer_name, bytes) else consumer_name
+        _cn_name, _, _ = _cn_str.rpartition("-")
+        _parsed_hostname = _cn_name.removeprefix("worker-")
+
         def _exists(key):
             key_s = key.decode() if isinstance(key, bytes) else key
             if heartbeat_pid is None:
                 return 0
-            if "worker:alive:" in key_s:
-                try:
-                    pid_in_key = int(key_s.rsplit(":", 1)[-1])
-                    return 1 if pid_in_key == heartbeat_pid else 0
-                except (ValueError, IndexError):
-                    return 0
+            # Must match exact shape: worker:alive:{type}:{hostname}:{pid}
+            expected_suffix = f":{_parsed_hostname}:{heartbeat_pid}"
+            if key_s.startswith("worker:alive:") and key_s.endswith(expected_suffix):
+                return 1
             return 0
         r.exists.side_effect = _exists
         return r
@@ -1176,11 +1164,11 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
     # ── Scheduler heartbeat age threshold ─────────────────────────────────────
 
     def _run_scheduler_age(self, age_s):
-        """Run heartbeat check with scheduler key at a specific age."""
+        """Run heartbeat check with both per-loop scheduler keys at a specific age."""
         payload = json.dumps({"pid": 1, "ts": self._NOW - age_s, "dispatched": 0})
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler":
+            if key in ("worker:alive:scheduler:adaptive", "worker:alive:scheduler:fullscan"):
                 return payload.encode()
             if key == "scheduler:health":
                 # Provide valid health so function doesn't return WARNING early
@@ -1200,25 +1188,27 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
             return check_worker_heartbeats(r)
 
     def test_scheduler_ok_at_19_seconds(self):
-        """scheduler threshold=20s: key age 19s → OK."""
-        from workers.watchdog import Issue
-        issues = self._run_scheduler_age(19)
-        sched = [i for i in issues if i.category == "worker:scheduler"]
+        """scheduler key age (threshold - 1)s → OK for both loops."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        issues = self._run_scheduler_age(threshold - 1)
+        sched = [i for i in issues if i.category in ("worker:scheduler:adaptive", "worker:scheduler:fullscan")]
         self.assertTrue(any(i.level == Issue.OK for i in sched),
-                        f"Expected OK at 19s, got: {sched}")
+                        f"Expected OK at {threshold - 1}s, got: {sched}")
 
     def test_scheduler_stale_at_21_seconds(self):
-        """scheduler threshold=20s: key age 21s → STALE ERROR."""
-        from workers.watchdog import Issue
-        issues = self._run_scheduler_age(21)
-        sched = [i for i in issues if i.category == "worker:scheduler"]
+        """scheduler key age (threshold + 1)s → STALE ERROR for both loops."""
+        from workers.watchdog import Issue, HEARTBEAT_DEAD_AFTER
+        threshold = HEARTBEAT_DEAD_AFTER["scheduler"]
+        issues = self._run_scheduler_age(threshold + 1)
+        sched = [i for i in issues if i.category in ("worker:scheduler:adaptive", "worker:scheduler:fullscan")]
         self.assertTrue(any(i.level == Issue.ERROR for i in sched),
-                        f"Expected STALE ERROR at 21s, got: {sched}")
+                        f"Expected STALE ERROR at {threshold + 1}s, got: {sched}")
 
     # ── Pool consecutive_deaths threshold boundary ────────────────────────────
 
     def _run_deaths(self, ptype="scan", deaths=0):
-        """Run heartbeat check with scheduler alive and given deaths count."""
+        """Run heartbeat check with both scheduler loop keys alive and given deaths count."""
         scheduler_payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
         pool = {
             "scan":     {"alive": 3, "consecutive_deaths": 0, "total_replacements": 0},
@@ -1229,7 +1219,7 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
         health = json.dumps({"ts": self._NOW - 1, "pool": pool})
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler":
+            if key in ("worker:alive:scheduler:adaptive", "worker:alive:scheduler:fullscan"):
                 return scheduler_payload.encode()
             if key == "scheduler:health":
                 return health.encode()
@@ -1272,8 +1262,9 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
 
     def test_all_4_worker_categories_with_scheduler_alive(self):
         """
-        When scheduler is alive and scheduler:health is present, check_worker_heartbeats
-        returns issues covering all 4 categories (scheduler + 3 pool types).
+        When both scheduler loop keys are alive and scheduler:health is present,
+        check_worker_heartbeats returns issues for all 5 categories
+        (scheduler:adaptive + scheduler:fullscan + 3 pool types).
         """
         scheduler_payload = json.dumps({"pid": 1, "ts": self._NOW - 5, "dispatched": 0})
         health = json.dumps({
@@ -1286,7 +1277,7 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
         })
         r = MagicMock()
         def _get(key):
-            if key == "worker:alive:scheduler":
+            if key in ("worker:alive:scheduler:adaptive", "worker:alive:scheduler:fullscan"):
                 return scheduler_payload.encode()
             if key == "scheduler:health":
                 return health.encode()
@@ -1297,8 +1288,8 @@ class TestAdditionalHeartbeatThresholds(unittest.TestCase):
             from workers.watchdog import check_worker_heartbeats
             issues = check_worker_heartbeats(r)
         categories = {i.category for i in issues}
-        for expected in ("worker:scheduler", "worker:scan_worker",
-                         "worker:detail_worker", "worker:fullscan_worker"):
+        for expected in ("worker:scheduler:adaptive", "worker:scheduler:fullscan",
+                         "worker:scan_worker", "worker:detail_worker", "worker:fullscan_worker"):
             self.assertTrue(any(expected in c for c in categories),
                             f"Missing category containing '{expected}' — got: {categories}")
 

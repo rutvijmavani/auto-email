@@ -63,6 +63,7 @@ from config import (
     MONITOR_MATCH_RATE_HIGH_ALERT,
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
+    INFLIGHT_FULLSCAN_STALE_S,
 )
 
 logger = get_logger(__name__)
@@ -221,45 +222,24 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     company_names = [c["company"] for c in companies]
 
-    conn = get_conn()
-    try:
-        rows = conn.execute("""
-            SELECT company,
-                   EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
-            FROM company_poll_stats
-            WHERE company = ANY(%s)
-        """, (company_names,)).fetchall()
-    finally:
-        conn.close()
-
-    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
-    # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
-    # smart early exit and may not have seen every page.  Only a completed fullscan
-    # guarantees the DB is comprehensive for this company's current board.
-    scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
-
-    # Exclude companies whose fullscan_worker is actively running right now.
-    # A Workday scan can take 20-30 minutes; without this check, --monitor-jobs
-    # would fallback-fetch the same company mid-scan, wasting HTTP calls and
-    # potentially sending duplicate jobs to the detail queue.
-    inflight: set = set()
+    # Take two Redis inflight snapshots — before and after the DB query — then
+    # union them so companies that start a scan during the DB read window are
+    # not misclassified as missed.  Only entries within the last 2 h are
+    # considered (older entries come from killed workers without cleanup).
+    inflight:    set   = set()
+    _r_inflight        = None
+    stale_threshold    = time.time() - INFLIGHT_FULLSCAN_STALE_S
     try:
         from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
         import redis as _redis_lib_jm
-        # Only consider entries added within the last 2 hours.  The ZSET score
-        # is the unix timestamp when the worker claimed the company.  Entries
-        # older than 2 h come from workers that were killed without cleanup and
-        # should not permanently exclude companies from the missed-jobs check.
-        # Use a timeout-bound client so a Redis hang never blocks the monitor.
         _r_inflight = _redis_lib_jm.from_url(
             REDIS_URL, socket_timeout=5, socket_connect_timeout=3
         )
-        stale_threshold = time.time() - 7200
-        raw      = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+        raw = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
         inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
         if inflight:
             logger.debug(
-                "_get_worker_missed_companies: %d companies in-flight, excluding from missed",
+                "_get_worker_missed_companies: %d companies in-flight (snapshot 1)",
                 len(inflight),
             )
     except Exception as exc:
@@ -268,6 +248,56 @@ def _get_worker_missed_companies(companies: list) -> tuple:
             "(%s) — proceeding without exclusion (may do extra work)",
             exc,
         )
+        if _r_inflight is not None:
+            try:
+                _r_inflight.close()
+            except Exception:
+                pass
+        _r_inflight = None
+
+    rows = []
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT company,
+                       EXTRACT(EPOCH FROM last_full_scan_at) AS last_full_scan_epoch
+                FROM company_poll_stats
+                WHERE company = ANY(%s)
+            """, (company_names,)).fetchall()
+        finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            conn.close()
+
+        # Second inflight snapshot after DB query — union narrows the race window.
+        if _r_inflight is not None:
+            try:
+                raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+                inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
+            except Exception:
+                pass
+    except Exception as _db_exc:
+        logger.warning(
+            "_get_worker_missed_companies: DB unavailable (%s) — "
+            "treating all %d companies as missed (conservative fallback)",
+            _db_exc, len(companies),
+        )
+        return list(companies), set()
+    finally:
+        if _r_inflight is not None:
+            try:
+                _r_inflight.close()
+            except Exception:
+                pass
+
+    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
+    # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
+    # smart early exit and may not have seen every page.  Only a completed fullscan
+    # guarantees the DB is comprehensive for this company's current board.
+    scan_map = {r["company"]: (r["last_full_scan_epoch"] or 0) for r in rows}
 
     missed          = []
     in_flight_names = set()
@@ -323,6 +353,10 @@ def run():
         logger.warning("%d companies skipped (unknown/unverified ATS)", skipped)
         print(f"[INFO] Skipping {skipped} company/companies with "
               f"unknown/unverified ATS — run --detect-ats to fix")
+
+    # Capture scan horizon before the DB classification so any inflight scan
+    # completing during _get_worker_missed_companies() is still credited below.
+    _scan_horizon = time.time()
 
     # ── Split: covered by workers vs missed vs in-flight ─────────────────────
     missed, in_flight_names = _get_worker_missed_companies(companies)
@@ -398,18 +432,7 @@ def run():
                         "failure_name": company,
                     }
 
-                with stats_lock:
-                    stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
-                    stats["companies_with_results"] += company_stats.get("with_results",   0)
-                    stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)
-                    stats["api_failures"]           += company_stats.get("failed",         0)
-                    stats["total_jobs_fetched"]     += company_stats.get("fetched",        0)
-                    stats["jobs_matched_filters"]   += company_stats.get("matched",        0)
-                    stats["new_jobs_found"]         += company_stats.get("new",            0)
-                    if company_stats.get("failure_name"):
-                        stats["api_failure_list"].append(
-                            company_stats["failure_name"]
-                        )
+                _merge_company_stats(stats, stats_lock, company_stats)
     else:
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
@@ -420,6 +443,7 @@ def run():
     # seconds so their results are included rather than silently skipped.
     if in_flight_names:
         _remaining_inflight = set(in_flight_names)
+        _wait_start = time.time()   # elapsed-time gate for the polling loop below
         logger.info(
             "Waiting up to %ds for %d in-flight scan(s): %s%s",
             _IN_FLIGHT_WAIT_S,
@@ -430,7 +454,8 @@ def run():
         print(f"[INFO] Waiting up to {_IN_FLIGHT_WAIT_S}s for "
               f"{len(_remaining_inflight)} in-flight scan(s) to finish...")
 
-        _wait_start = time.time()
+        _all_unconfirmed: set = set()   # accumulates across poll iterations
+        _r_wait = None
         try:
             from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
             import redis as _redis_lib_wait
@@ -439,64 +464,84 @@ def run():
             )
 
             while _remaining_inflight and (time.time() - _wait_start) < _IN_FLIGHT_WAIT_S:
-                _stale_ts    = time.time() - 7200
-                _active_raw  = _r_wait.zrangebyscore(
-                    REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
-                )
+                _stale_ts = time.time() - INFLIGHT_FULLSCAN_STALE_S
+                try:
+                    _active_raw = _r_wait.zrangebyscore(
+                        REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
+                    )
+                except Exception as _redis_poll_err:
+                    logger.warning(
+                        "In-flight wait: Redis poll failed (%s) — retrying next cycle",
+                        _redis_poll_err,
+                    )
+                    time.sleep(_IN_FLIGHT_POLL_S)
+                    continue
                 _still_active = {
                     c.decode() if isinstance(c, bytes) else c
                     for c in (_active_raw or [])
                 }
                 _newly_done = _remaining_inflight - _still_active
                 if _newly_done:
-                    _remaining_inflight -= _newly_done
-
-                    # Verify via DB: only credit companies whose last_full_scan_at
-                    # was actually updated since the wait began.  A scan that failed
-                    # or was aborted may also disappear from the inflight ZSET, so
-                    # membership disappearance alone is not proof of completion.
+                    # Verify via DB before removing from _remaining_inflight.
+                    # Defer removal so a transient DB failure keeps these companies
+                    # in the pending set and retries them on the next poll cycle.
+                    # A scan that failed or was aborted may also disappear from
+                    # the inflight ZSET, so membership disappearance alone is not
+                    # proof of completion.  Use _scan_horizon (captured before the
+                    # fallback fetch) so scans that finished during fallback are
+                    # also credited correctly.
                     _confirmed_done: set = set()
+                    _db_ok = False
                     try:
-                        _vconn = get_conn()
+                        from db.db import get_conn as _get_conn_wait
+                        _vconn = _get_conn_wait()
                         try:
                             _vrows = _vconn.execute(
                                 "SELECT company FROM company_poll_stats "
                                 "WHERE company = ANY(%s) "
-                                "AND last_full_scan_at >= "
-                                "    to_timestamp(%s::double precision)",
-                                (list(_newly_done), _wait_start),
+                                "AND EXTRACT(EPOCH FROM last_full_scan_at) "
+                                "    >= %s::double precision",
+                                (list(_newly_done), _scan_horizon),
                             ).fetchall()
                             _confirmed_done = {r["company"] for r in _vrows}
+                            _db_ok = True
                         finally:
-                            _vconn.close()
-                    except Exception as _db_ver_err:
+                            try:
+                                _vconn.rollback()   # end implicit transaction before returning to pool
+                            finally:
+                                _vconn.close()
+                    except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
                             "In-flight wait: DB verification failed (%s) — "
-                            "crediting all %d newly-done conservatively",
+                            "keeping %d companies pending for retry",
                             _db_ver_err, len(_newly_done),
                         )
-                        _confirmed_done = _newly_done  # safe fallback
 
-                    _unconfirmed = _newly_done - _confirmed_done
-                    if _confirmed_done:
-                        with stats_lock:
-                            stats["covered_by_workers"] += len(_confirmed_done)
-                            stats["in_flight"]           -= len(_confirmed_done)
-                        logger.info(
-                            "In-flight scans confirmed complete: %s (%d still waiting)",
-                            ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
-                        )
-                        print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
-                              f"{', '.join(sorted(_confirmed_done))[:120]}"
-                              f"{'...' if len(_confirmed_done) > 5 else ''}")
-                    if _unconfirmed:
-                        logger.warning(
-                            "In-flight scans left ZSET without DB update "
-                            "(possible failures): %s",
-                            ", ".join(sorted(_unconfirmed)),
-                        )
-                        with stats_lock:
-                            stats["in_flight"] -= len(_unconfirmed)
+                    if _db_ok:
+                        # Only remove from remaining after successful DB check
+                        _remaining_inflight -= _newly_done
+                        _unconfirmed = _newly_done - _confirmed_done
+                        if _confirmed_done:
+                            with stats_lock:
+                                stats["covered_by_workers"] += len(_confirmed_done)
+                                stats["in_flight"]           -= len(_confirmed_done)
+                            logger.info(
+                                "In-flight scans confirmed complete: %s (%d still waiting)",
+                                ", ".join(sorted(_confirmed_done)), len(_remaining_inflight),
+                            )
+                            _names_str = ', '.join(sorted(_confirmed_done))
+                            print(f"[INFO] {len(_confirmed_done)} scan(s) confirmed done: "
+                                  f"{_names_str[:120]}"
+                                  f"{'...' if len(_names_str) > 120 else ''}")
+                        if _unconfirmed:
+                            logger.warning(
+                                "In-flight scans left ZSET without DB update "
+                                "(possible failures): %s",
+                                ", ".join(sorted(_unconfirmed)),
+                            )
+                            with stats_lock:
+                                stats["in_flight"] -= len(_unconfirmed)
+                            _all_unconfirmed.update(_unconfirmed)
 
                 if _remaining_inflight:
                     time.sleep(_IN_FLIGHT_POLL_S)
@@ -507,6 +552,12 @@ def run():
                 "%d companies still counted as in-flight",
                 _wait_exc, len(_remaining_inflight),
             )
+        finally:
+            if _r_wait is not None:
+                try:
+                    _r_wait.close()
+                except Exception as _close_err:
+                    logger.debug("job_monitor: _r_wait.close() failed: %s", _close_err)
 
         if _remaining_inflight:
             logger.info(
@@ -520,6 +571,51 @@ def run():
             _elapsed = int(time.time() - _wait_start)
             logger.info("All in-flight scans completed within %ds.", _elapsed)
             print(f"[INFO] All in-flight scans completed in {_elapsed}s.")
+
+        # Re-fetch companies that exited the in-flight ZSET without a DB update.
+        # These are likely scan failures; do a fallback fetch so the digest is not
+        # silently incomplete.  Build company_row dicts from the `companies` list
+        # so _process_company receives the same shape as the missed path.
+        if _all_unconfirmed:
+            _company_by_name = {c["company"]: c for c in companies}
+            _retry_rows = [
+                _company_by_name[name]
+                for name in _all_unconfirmed
+                if name in _company_by_name
+            ]
+            if _retry_rows:
+                logger.warning(
+                    "Fallback re-fetching %d unconfirmed scan(s): %s",
+                    len(_retry_rows),
+                    ", ".join(c["company"] for c in _retry_rows),
+                )
+                print(f"[INFO] Fallback re-fetching {len(_retry_rows)} "
+                      f"unconfirmed scan(s): "
+                      f"{', '.join(c['company'] for c in _retry_rows[:5])}"
+                      f"{'...' if len(_retry_rows) > 5 else ''}")
+                with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as _uc_exec:
+                    _uc_futures = {
+                        _uc_exec.submit(
+                            _process_company, company_row, i + 1, len(_retry_rows)
+                        ): company_row["company"]
+                        for i, company_row in enumerate(_retry_rows)
+                    }
+                    for _uc_fut in as_completed(_uc_futures):
+                        _uc_company = _uc_futures[_uc_fut]
+                        try:
+                            _uc_stats = _uc_fut.result()
+                        except Exception as _uc_err:
+                            logger.error(
+                                "Unhandled error in unconfirmed fallback for %r: %s",
+                                _uc_company, _uc_err, exc_info=True,
+                            )
+                            _uc_stats = {
+                                "monitored": 1, "with_results": 0,
+                                "unknown_ats": 0, "failed": 1,
+                                "fetched": 0, "matched": 0, "new": 0,
+                                "failure_name": _uc_company,
+                            }
+                        _merge_company_stats(stats, stats_lock, _uc_stats)
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -600,6 +696,20 @@ def run():
 
     logger.info("════ --monitor-jobs finished ════")
     return final_stats
+
+
+def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats: dict) -> None:
+    """Merge per-company result counters into the shared stats dict (thread-safe)."""
+    with stats_lock:
+        stats["fallback_scanned"]       += company_stats.get("fallback_scanned", 0)
+        stats["companies_with_results"] += company_stats.get("with_results",   0)
+        stats["companies_unknown_ats"]  += company_stats.get("unknown_ats",    0)
+        stats["api_failures"]           += company_stats.get("failed",         0)
+        stats["total_jobs_fetched"]     += company_stats.get("fetched",        0)
+        stats["jobs_matched_filters"]   += company_stats.get("matched",        0)
+        stats["new_jobs_found"]         += company_stats.get("new",            0)
+        if company_stats.get("failure_name"):
+            stats["api_failure_list"].append(company_stats["failure_name"])
 
 
 # ─────────────────────────────────────────
@@ -917,12 +1027,12 @@ def _build_alerts(stats, total_companies):
     alerts = []
 
     if total_companies > 0:
-        # covered_by_workers: confirmed done by background workers (data in DB)
-        # in_flight: actively scanning right now — counted optimistically since
-        #            the scan will likely complete before the digest is emailed.
+        # covered_by_workers: confirmed done by background workers (data in DB).
         # fallback_scanned: of the missed companies, those whose ATS fetch
         #   completed (0 or more jobs).  Use this (not companies_with_results)
         #   for coverage — a 0-job result is still a successful scan.
+        # in_flight companies are NOT included here — they are still scanning
+        # and cannot be credited until confirmed in the DB.
         covered_count = stats.get("covered_by_workers", 0)
         companies_with_data = covered_count + stats.get("fallback_scanned", 0)
         coverage = companies_with_data / total_companies

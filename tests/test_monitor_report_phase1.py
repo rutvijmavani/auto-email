@@ -54,21 +54,21 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# ── Install ReportLab stubs if library is absent ──────────────────────────────
-# sys.modules.setdefault only inserts when the key is NOT already present,
-# so a real ReportLab install takes priority automatically.
-_RL_STUB_MODS = [
-    "reportlab",
-    "reportlab.lib",
-    "reportlab.lib.pagesizes",
-    "reportlab.lib.styles",
-    "reportlab.lib.units",
-    "reportlab.lib.colors",
-    "reportlab.lib.enums",
-    "reportlab.platypus",
-]
-for _mod in _RL_STUB_MODS:
-    sys.modules.setdefault(_mod, MagicMock())
+# ── Install ReportLab stubs only when the library is not installed ────────────
+import importlib.util as _ilu
+if _ilu.find_spec("reportlab") is None:
+    _RL_STUB_MODS = [
+        "reportlab",
+        "reportlab.lib",
+        "reportlab.lib.pagesizes",
+        "reportlab.lib.styles",
+        "reportlab.lib.units",
+        "reportlab.lib.colors",
+        "reportlab.lib.enums",
+        "reportlab.platypus",
+    ]
+    for _mod in _RL_STUB_MODS:
+        sys.modules.setdefault(_mod, MagicMock())
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -106,7 +106,9 @@ def _call_health_section(stats):
         captured["data"] = data
         return MagicMock()   # fake table object
 
-    with patch.object(mrep, "Table", side_effect=_table_ctor):
+    with patch.object(mrep, "Table", side_effect=_table_ctor), \
+         patch.object(mrep, "Paragraph", return_value=MagicMock()), \
+         patch.object(mrep, "HRFlowable", return_value=MagicMock()):
         alerts_mock = []
         styles_mock = MagicMock()
         mrep._build_health_section(stats, alerts_mock, styles_mock)
@@ -263,6 +265,51 @@ class TestCoverageMetricFix(unittest.TestCase):
         self.assertIn("by job monitor", val,
                       f"Expected 'by job monitor' when fallback_hits>0, got: {val!r}")
 
+    def test_in_flight_appends_pending_text(self):
+        """When in_flight>0 the string includes '+ N pending (in-flight)'."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            companies_with_results=0,
+            in_flight=5,
+        )
+        self.assertIn("pending (in-flight)", val,
+                      f"Expected 'pending (in-flight)' when in_flight=5, got: {val!r}")
+        self.assertIn("5", val)
+
+    def test_no_in_flight_excludes_pending_text(self):
+        """When in_flight=0 the string must not include 'pending (in-flight)'."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            companies_with_results=0,
+        )
+        self.assertNotIn("pending (in-flight)", val,
+                         "Should not append pending text when in_flight=0")
+
+    def test_fallback_empty_shows_sub_count(self):
+        """When some fallback scans returned no jobs, ', N empty' appears in string."""
+        # fallback_scanned=10, companies_with_results=7 → 3 empty
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            fallback_scanned=10,
+            companies_with_results=7,
+        )
+        self.assertIn("3 empty", val,
+                      f"Expected '3 empty' for fallback_empty=3, got: {val!r}")
+
+    def test_no_fallback_empty_excludes_empty_sub_count(self):
+        """When all fallback scans found jobs, ', N empty' must not appear."""
+        val = self._coverage_val(
+            companies_monitored=139,
+            covered_by_workers=100,
+            fallback_scanned=5,
+            companies_with_results=5,
+        )
+        self.assertNotIn("empty", val,
+                         "Should not show 'empty' when all fallback scans had results")
+
     # ── Coverage status threshold ─────────────────────────────────────────────
 
     def test_coverage_70_pct_is_ok(self):
@@ -383,6 +430,7 @@ class TestQueueHealthSection(unittest.TestCase):
         # Should not contain "backlog" warning text for detail queue
         # (threshold is strictly > 100)
         self.assertNotIn("backlog CRITICAL", result)
+        self.assertNotIn("Detail queue elevated", result)
 
     def test_detail_zero_ok_no_backlog_text(self):
         """detail_total=0 → no backlog warnings."""

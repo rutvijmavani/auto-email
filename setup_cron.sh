@@ -435,37 +435,15 @@ echo "[OK] All wrapper scripts created"
 # To verify: date && timedatectl
 # ═══════════════════════════════════════════════════════════════
 
-EXISTING_CRON=$(crontab -l 2>/dev/null || echo "")
-
-CLEAN_CRON=$(echo "$EXISTING_CRON" \
-  | grep -v "run_sync.sh" \
-  | grep -v "run_nightly.sh" \
-  | grep -v "run_monday.sh" \
-  | grep -v "run_monthly.sh" \
-  | grep -v "run_outreach.sh" \
-  | grep -v "run_monitor.sh" \
-  | grep -v "run_detect.sh" \
-  | grep -v "run_weekly_summary.sh" \
-  | grep -v "run_enrich.sh" \
-  | grep -v "run_verify_filled.sh" \
-  | grep -v "run_ats_discovery.sh" \
-  | grep -v "run_db_maintenance.sh" \
-  | grep -v "keep-alive" \
-  | grep -v "hashlib" \
-  | grep -v "backups.*mtime" \
-  | grep -v "RECRUITER PIPELINE" \
-  | grep -v "All times UTC" \
-  | grep -v "workers.watchdog" \
-  || true)
 # NOTE: workers/watchdog.py is intentionally NOT in the crontab.
 # It runs continuously as a systemd service (recruiter-watchdog.service), NOT as a
-# cron job.  If a watchdog cron entry exists from before systemd was set up,
-# the line above removes it.  The correct way to manage the watchdog is:
+# cron job.  The correct way to manage the watchdog is:
 #   sudo systemctl status recruiter-watchdog
 #   journalctl -u recruiter-watchdog -f
 # To set up systemd for the first time: sudo bash deploy/install-systemd.sh
 
 NEW_CRON=$(cat << 'CRONTAB'
+# === BEGIN RECRUITER PIPELINE ===
 CRON_TZ=America/New_York
 
 # ═══════════════════════════════════════════════════════════════
@@ -485,11 +463,12 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # MONITOR RETRY — 9 AM fallback
-# Runs only if the 7 AM job was missed (e.g. VM suspension by Oracle Cloud).
-# Checks for today's monitor log; if absent, runs the monitor now so the
-# digest arrives at most 2 hours late rather than not at all.
+# Runs only if the 7 AM job did not complete successfully.
+# Checks for exit=0 in today's monitor log (written by run_monitor.sh after
+# --monitor-jobs finishes); if absent, runs the monitor now so the digest
+# arrives at most 2 hours late rather than not at all.
 # ─────────────────────────────────────────
-0 9 * * * test -f /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log || /home/opc/mail/run_monitor.sh
+0 9 * * * grep -q 'exit=0' /home/opc/mail/logs/monitor_$(date +\%Y-\%m-\%d).log 2>/dev/null || pgrep -f 'bash /home/opc/mail/run_monitor\.sh' > /dev/null 2>&1 || /home/opc/mail/run_monitor.sh
 
 # ─────────────────────────────────────────
 # OUTREACH — Mon-Fri 9 AM only
@@ -527,11 +506,13 @@ CRON_TZ=America/New_York
 
 # ─────────────────────────────────────────
 # LOG MONITOR — every 15 minutes
-# Scans log files for new ERRORs / tracebacks since last run.
-# Sends a batched email alert (max once per hour) if anything actionable
-# is found.  State tracked in data/log_monitor_state.json.
+# Scans log files for new ERRORs / tracebacks since the last byte offset.
+# Sends an immediate alert email per new error fingerprint (Redis-deduped
+# so each unique issue emails at most once per hour).  A separate 3-day
+# digest collects all seen fingerprints.
+# State (offsets, inodes) tracked in data/log_monitor_state.json.
 # ─────────────────────────────────────────
-*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor.log 2>&1
+*/15 * * * * /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py >> /home/opc/mail/logs/log_monitor_$(date +\%Y-\%m-\%d).log 2>&1; find /home/opc/mail/logs -name 'log_monitor_*.log' -mtime +14 -delete
 
 # ─────────────────────────────────────────
 # DETECT ATS — currently disabled
@@ -549,11 +530,56 @@ CRON_TZ=America/New_York
 # ─────────────────────────────────────────
 0 */4 * * * python3 -c "import hashlib; [hashlib.sha256(str(i).encode()).hexdigest() for i in range(100000)]" >> /dev/null 2>&1
 
+# === END RECRUITER PIPELINE ===
 CRONTAB
 )
 
-echo "$NEW_CRON" | crontab -
-echo "[OK] Crontab installed"
+# Merge: strip any existing pipeline-owned entries (identified by begin/end
+# markers), then append NEW_CRON.  Non-pipeline entries are preserved exactly.
+# Also remove legacy marker-less pipeline entries (run_*.sh lines) that may
+# remain from crontabs installed before the BEGIN/END marker system was added;
+# without this, old entries survive alongside the new marker-delimited block
+# and cause duplicate runs.
+_crontab_exit=0
+_crontab_out=$(crontab -l 2>&1) || _crontab_exit=$?
+if [[ $_crontab_exit -ne 0 ]]; then
+    if echo "$_crontab_out" | grep -qi "no crontab\|crontab: no"; then
+        EXISTING_NON_PIPELINE=""
+    else
+        echo "[ERROR] crontab -l failed unexpectedly: $_crontab_out"
+        exit 1
+    fi
+else
+    EXISTING_NON_PIPELINE="$_crontab_out"
+fi
+# Guard: only strip the RECRUITER PIPELINE block when BOTH markers are present.
+# An unmatched BEGIN causes sed to delete from BEGIN to end-of-file, destroying
+# all unrelated cron entries that follow.
+if echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ===" && \
+   echo "$EXISTING_NON_PIPELINE" | grep -qF "# === END RECRUITER PIPELINE ==="; then
+    EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+        sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
+elif echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ==="; then
+    echo "[ERROR] Unmatched '# === BEGIN RECRUITER PIPELINE ===' found in crontab — aborting to prevent data loss."
+    exit 1
+fi
+# Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v '/home/opc/mail/run_[a-z_]*\.sh' || true)
+# Strip log_monitor and keep-alive entries (re-added inside the marker block)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v 'scripts/log_monitor\.py' || true)
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+    grep -v 'hashlib.*range(100000)' || true)
+# Strip trailing blank lines from retained entries
+EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | sed '/^[[:space:]]*$/d')
+
+if [[ -n "$EXISTING_NON_PIPELINE" ]]; then
+    printf '%s\n%s\n' "$EXISTING_NON_PIPELINE" "$NEW_CRON" | crontab -
+else
+    echo "$NEW_CRON" | crontab -
+fi
+echo "[OK] Crontab installed (non-pipeline entries preserved)"
 
 # ── Verify ────────────────────────────────────────────────────
 echo ""

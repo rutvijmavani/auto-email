@@ -36,21 +36,24 @@ Usage
 
 import json
 import os
+import socket
 import threading
 import time
 import logging
 
 logger = logging.getLogger(__name__)
 
+_HOSTNAME = socket.gethostname()   # resolved once at import time; stable for process lifetime
+
 
 class Heartbeat:
     """
-    Daemon thread that writes worker:alive:{worker_type} every interval_s
-    seconds while the worker process is alive.
+    Daemon thread that writes worker:alive:{worker_type}:{hostname}:{pid}
+    every interval_s seconds while the worker process is alive.
 
-    TTL is set to 3 × interval_s so two consecutive missed writes (Redis
+    TTL is set to 3x interval_s so two consecutive missed writes (Redis
     blip, GIL stall) are tolerated before the key expires.  The watchdog's
-    dead threshold should be set to at least 4 × interval_s so there is
+    dead threshold should be set to at least 4x interval_s so there is
     always a gap between key expiry and alert.
 
     Args:
@@ -115,10 +118,22 @@ class Heartbeat:
         self._stop.set()        # unblocks _stop.wait() on the next sleep boundary
         if self._thread.ident is not None:                 # only join if started
             self._thread.join(timeout=self._interval_s + 2)
+            if self._thread.is_alive():
+                logger.warning(
+                    "heartbeat: thread for %r did not exit within timeout — "
+                    "key will expire via TTL",
+                    self._worker_type,
+                )
+                # Thread still running — skip explicit delete so the thread can't
+                # recreate the key after we remove it.  TTL handles cleanup.
+                return
         try:
-            self._r.delete(f"worker:alive:{self._worker_type}:{os.getpid()}")
-        except Exception:
-            pass    # best-effort; TTL will expire the key if Redis is unavailable
+            self._r.delete(f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}")
+        except Exception as _del_err:
+            logger.debug(
+                "heartbeat: cleanup delete failed for %s:%s:%s — TTL will expire: %s",
+                self._worker_type, _HOSTNAME, os.getpid(), _del_err,
+            )
 
     # ── internals ─────────────────────────────────────────────────────────────
 
@@ -126,7 +141,7 @@ class Heartbeat:
         """Write one heartbeat key to Redis.  Swallows all exceptions."""
         try:
             self._r.set(
-                f"worker:alive:{self._worker_type}:{os.getpid()}",
+                f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}",
                 json.dumps({
                     "pid":       os.getpid(),
                     "ts":        time.time(),

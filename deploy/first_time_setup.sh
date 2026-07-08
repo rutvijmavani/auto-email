@@ -10,11 +10,12 @@
 #        → Stops any old nohup/cron processes
 #        → Installs and enables recruiter-scheduler + recruiter-watchdog systemd units
 #        → Adds the sudoers rule so watchdog can self-heal
-#        → Starts both services
+#        → Installs and enables units (services NOT started here)
 #   3. Runs deploy/configure-redis.sh
 #        → Enables AOF persistence (saves every ~1 second)
 #        → Sets auto-rewrite thresholds (file never grows unbounded)
 #        → Persists settings to redis.conf
+#   3b. Starts recruiter-scheduler + recruiter-watchdog (Redis now durable)
 #   4. Waits for worker heartbeats to appear in Redis
 #   5. Runs scripts/health_check.py — must exit 0 before setup is complete
 #
@@ -33,6 +34,40 @@ DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$DEPLOY_DIR")"
 SERVICE_USER="${SUDO_USER:-opc}"
 PYTHON="$PROJECT_DIR/venv/bin/python"
+
+# Honour the same connection env vars as configure-redis.sh
+REDIS_CLI="${REDIS_CLI:-redis-cli}"
+REDIS_HOST="${REDIS_HOST:-}"
+REDIS_PORT="${REDIS_PORT:-}"
+REDIS_AUTH="${REDIS_AUTH:-}"
+REDIS_SOCKET="${REDIS_SOCKET:-}"
+
+declare -a _REDIS_ARGS=()
+if [[ -n "$REDIS_SOCKET" ]]; then
+    _REDIS_ARGS+=(-s "$REDIS_SOCKET")
+else
+    [[ -n "$REDIS_HOST" ]] && _REDIS_ARGS+=(-h "$REDIS_HOST")
+    [[ -n "$REDIS_PORT" ]] && _REDIS_ARGS+=(-p "$REDIS_PORT")
+fi
+# REDIS_AUTH stays out of _REDIS_ARGS to avoid cmdline exposure — pass via env var.
+_rcli() { REDISCLI_AUTH="${REDIS_AUTH}" "$REDIS_CLI" "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
+
+# Reject root as the service user — same guard as install-systemd.sh.
+# SERVICE_USER=root happens when SUDO_USER is explicitly set to root or when
+# the script is invoked directly as root without sudo (empty SUDO_USER and
+# no fallback matches root).
+if [[ "$SERVICE_USER" == "root" ]]; then
+    echo "[ERROR] SERVICE_USER resolved to 'root'."
+    echo "        Run with sudo as a non-root user: sudo bash deploy/first_time_setup.sh"
+    echo "        Or export SUDO_USER=opc before running."
+    exit 1
+fi
+
+if ! id "$SERVICE_USER" &>/dev/null; then
+    echo "[ERROR] Service user '$SERVICE_USER' does not exist on this host."
+    echo "        Create the user or set SUDO_USER to the correct account."
+    exit 1
+fi
 
 echo "════════════════════════════════════════════════════════════"
 echo "  Mail Pipeline — first-time server setup"
@@ -80,8 +115,8 @@ else
 fi
 
 # Redis reachable
-if redis-cli ping > /dev/null 2>&1; then
-    REDIS_VERSION=$(redis-cli INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
+if _rcli ping > /dev/null 2>&1; then
+    REDIS_VERSION=$(_rcli INFO server 2>/dev/null | grep redis_version | cut -d: -f2 | tr -d '[:space:]')
     echo "  ✓ Redis is running (version $REDIS_VERSION)"
 else
     echo "  ✗ Redis is not reachable (redis-cli ping failed)"
@@ -89,8 +124,16 @@ else
     ERRORS=$((ERRORS + 1))
 fi
 
+# Ensure .env is readable by SERVICE_USER before the PostgreSQL probe — the
+# full permission lock-down (600) happens again in install-systemd.sh (Step 1),
+# but get_conn() needs to load .env credentials now.
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    chown "$SERVICE_USER:$SERVICE_USER" "$PROJECT_DIR/.env" 2>/dev/null || true
+    chmod 600 "$PROJECT_DIR/.env" 2>/dev/null || true
+fi
+
 # PostgreSQL (via Python)
-if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python -c 'from db.db import get_conn; get_conn().close(); print(\"ok\")'" > /dev/null 2>&1; then
+if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python -c "from db.connection import get_conn; get_conn().close(); print(\"ok\")"' _ "$PROJECT_DIR" > /dev/null 2>&1; then
     echo "  ✓ PostgreSQL is reachable"
 else
     echo "  ✗ PostgreSQL is not reachable"
@@ -126,17 +169,17 @@ echo ""
 echo "  All prerequisites met. Proceeding with setup."
 
 # ─────────────────────────────────────────
-# STEP 1 — SYSTEMD SERVICES
+# STEP 1 — SYSTEMD SERVICES (install only, services started after Redis AOF)
 # ─────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════════════"
-echo "  STEP 1 — Installing and starting systemd services"
+echo "  STEP 1 — Installing systemd service units"
 echo "════════════════════════════════════════════════════════════"
 
 bash "$DEPLOY_DIR/install-systemd.sh"
 
-echo ""
-echo "  ✓ Step 1 complete — systemd services installed and started"
+echo "  ✓ Step 1 complete — units installed and enabled, services NOT started yet"
+echo "    (services start in Step 2b after Redis AOF durability is configured)"
 
 # ─────────────────────────────────────────
 # STEP 2 — REDIS AOF PERSISTENCE
@@ -150,6 +193,17 @@ bash "$DEPLOY_DIR/configure-redis.sh"
 
 echo ""
 echo "  ✓ Step 2 complete — Redis AOF persistence configured"
+
+# ─────────────────────────────────────────
+# STEP 2b — START SERVICES (Redis now durable)
+# ─────────────────────────────────────────
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  STEP 2b — Starting services (Redis AOF now active)"
+echo "════════════════════════════════════════════════════════════"
+
+sudo systemctl start recruiter-scheduler recruiter-watchdog
+echo "  ✓ recruiter-scheduler and recruiter-watchdog started"
 
 # ─────────────────────────────────────────
 # STEP 3 — WAIT FOR WORKER HEARTBEATS
@@ -169,14 +223,17 @@ ELAPSED=0
 while true; do
     MISSING=()
     for worker in "${WORKERS[@]}"; do
-        # scheduler uses a single key (no PID suffix); other workers use per-PID keys.
+        # scheduler writes per-loop keys (adaptive + fullscan); consider it alive
+        # when at least one loop key is present.
         if [[ "$worker" == "scheduler" ]]; then
-            if [[ -z "$(redis-cli GET "worker:alive:scheduler" 2>/dev/null)" ]]; then
+            _adp=$(_rcli GET "worker:alive:scheduler:adaptive" 2>/dev/null)
+            _fsc=$(_rcli GET "worker:alive:scheduler:fullscan" 2>/dev/null)
+            if [[ -z "$_adp" && -z "$_fsc" ]]; then
                 MISSING+=("$worker")
             fi
         else
             # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
-            if [[ -z "$(redis-cli --scan --pattern "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
+            if [[ -z "$(_rcli --scan --pattern "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
                 MISSING+=("$worker")
             fi
         fi
@@ -207,7 +264,7 @@ echo "  STEP 4 — Running full health check"
 echo "════════════════════════════════════════════════════════════"
 echo ""
 
-if sudo -u "$SERVICE_USER" bash -c "cd $PROJECT_DIR && source venv/bin/activate && python scripts/health_check.py"; then
+if sudo -u "$SERVICE_USER" bash -c 'cd "$1" && source venv/bin/activate && python scripts/health_check.py' _ "$PROJECT_DIR"; then
     HEALTH_OK=true
 else
     HEALTH_OK=false
@@ -233,7 +290,7 @@ fi
 echo ""
 echo "  What was configured:"
 echo "    ✓ recruiter-scheduler.service — starts on boot, auto-restarts on crash"
-echo "    ✓ recruiter-watchdog.service  — monitors pipeline, self-heals every 5 min"
+echo "    ✓ recruiter-watchdog.service  — continuously monitors pipeline, restarts dead workers automatically"
 echo "    ✓ Redis AOF persistence  — max 1s data loss on crash (was ~5 min)"
 echo "    ✓ AOF auto-rewrite       — file never grows unbounded"
 echo "    ✓ Sudoers rule           — watchdog can restart scheduler without password"

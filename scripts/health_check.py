@@ -44,6 +44,18 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+from config import INFLIGHT_FULLSCAN_STALE_S
+try:
+    from workers.watchdog import (
+        HEARTBEAT_DEAD_AFTER as _HEARTBEAT_DEAD_AFTER,
+        WARN_DEATHS as _WARN_DEATHS,
+        ERR_DEATHS  as _ERR_DEATHS,
+    )
+except Exception:
+    _HEARTBEAT_DEAD_AFTER = {"scheduler": 20}   # fallback matches watchdog default
+    _WARN_DEATHS = 3
+    _ERR_DEATHS  = 5
+
 # ANSI colors for terminal output
 _GREEN  = "\033[92m"
 _YELLOW = "\033[93m"
@@ -68,6 +80,7 @@ def _sym(level: str) -> str:
     return {
         "OK":       _c("✓", _GREEN),
         "WARNING":  _c("!", _YELLOW),
+        "DEGRADED": _c("~", _YELLOW),
         "ERROR":    _c("✗", _RED, _BOLD),
         "CRITICAL": _c("✗", _RED, _BOLD),
     }.get(level, "?")
@@ -88,6 +101,9 @@ def _row(level: str, label: str, detail: str) -> None:
 # CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
+_INFLIGHT_STALE_S = INFLIGHT_FULLSCAN_STALE_S   # imported from config; matches job_monitor.py
+
+
 def run_health_check() -> int:
     """
     Run all checks and print a report.
@@ -97,9 +113,9 @@ def run_health_check() -> int:
         REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN,
         REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN,
         REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN,
-        STREAM_CONSUMER_GROUP,
+        STREAM_CONSUMER_GROUP, REDIS_URL,
     )
-    from workers.redis_client import get_redis, ping
+    import redis as _redis_hc_lib
 
     now     = time.time()
     errors  = 0
@@ -114,15 +130,25 @@ def run_health_check() -> int:
     # ── INFRASTRUCTURE ────────────────────────────────────────────────────────
     _section("INFRASTRUCTURE")
 
-    # Redis
-    r_ok = ping()
+    # Redis — use a health-check-specific client with bounded timeouts so the
+    # check never hangs indefinitely if Redis stops responding mid-operation.
+    try:
+        r = _redis_hc_lib.from_url(
+            REDIS_URL,
+            socket_timeout=5,
+            socket_connect_timeout=3,
+            decode_responses=True,
+        )
+        r_ok = r.ping()
+    except Exception:
+        r_ok = False
+        r = None
+
     if not r_ok:
         _row("ERROR", "Redis", "UNREACHABLE — all workers likely stopped")
         errors += 1
         print(f"\n  {_c('Cannot continue — Redis required for all checks', _RED)}\n")
         return 1
-
-    r = get_redis()
 
     try:
         info     = r.info("server")
@@ -146,15 +172,26 @@ def run_health_check() -> int:
         # Fallback: direct RDB-save check if watchdog module is unavailable
         try:
             persist = r.info("persistence")
+            aof_on  = persist.get("aof_enabled") in (1, "1", True)
             last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
+            # Normalize: some Redis client versions return a datetime object
+            if hasattr(last_s, "timestamp"):
+                last_s = int(last_s.timestamp())
             if isinstance(last_s, int) and last_s > 0:
                 age_min = (now - last_s) / 60
-                if age_min > 30:
+                if age_min > 30 and not aof_on:
+                    # Only warn about stale RDB when AOF is off — with AOF the
+                    # data-loss window is ~1 s regardless of last snapshot age.
                     _row("WARNING", "Redis RDB save",
                          f"Last save {age_min:.0f} min ago — data loss window is large")
                     warnings += 1
                 else:
-                    _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
+                    suffix = " [AOF active — data safe]" if aof_on else ""
+                    _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago{suffix}")
+            else:
+                _row("WARNING", "Redis RDB save",
+                     "No RDB save recorded — Redis has not persisted data yet")
+                warnings += 1
         except Exception as exc2:
             _row("WARNING", "Redis persistence", f"Persistence check failed: {exc2}")
             warnings += 1
@@ -163,13 +200,15 @@ def run_health_check() -> int:
     try:
         from db.db import get_conn
         conn = get_conn()
-        row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
-        jobs = row["cnt"] if row else 0
-        pend = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM job_postings WHERE status='pending_detail'"
-        ).fetchone()
-        conn.close()
-        _row("OK", "PostgreSQL", f"{jobs:,} total jobs  {pend['cnt']} pending_detail")
+        try:
+            row  = conn.execute("SELECT COUNT(*) AS cnt FROM job_postings").fetchone()
+            jobs = row["cnt"] if row else 0
+            pend = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM job_postings WHERE status='pending_detail'"
+            ).fetchone()
+            _row("OK", "PostgreSQL", f"{jobs:,} total jobs  {pend['cnt']} pending_detail")
+        finally:
+            conn.close()
     except Exception as exc:
         _row("ERROR", "PostgreSQL", f"UNREACHABLE: {exc}")
         errors += 1
@@ -177,33 +216,41 @@ def run_health_check() -> int:
     # ── WORKER LIVENESS ───────────────────────────────────────────────────────
     _section("WORKER LIVENESS")
 
-    # ── Scheduler — single heartbeat key ─────────────────────────────────────
-    raw = r.get("worker:alive:scheduler")
-    if raw is None:
-        _row("ERROR", "scheduler", "DEAD — heartbeat key missing")
-        errors += 1
-    else:
-        try:
-            d     = json.loads(raw)
-            age_s = now - d.get("ts", now)
-            status = (
-                f"pid={d.get('pid','?')}  "
-                f"dispatched={d.get('dispatched',0)}  "
-                f"heartbeat {age_s:.0f}s ago"
-            )
-            # Scheduler writes this key every SCHEDULER_TICK_SECS (~1 s) with
-            # ex=15.  The TTL is 15 s, so the key expires before age_s can
-            # reach 20 — making "age_s > 20" unreachable dead code.
-            # Use 5 s instead: reachable within the 15 s TTL window, and a
-            # meaningful signal that the scheduler main loop is delayed.
-            if age_s > 5:
-                _row("WARNING", "scheduler", status + "  (STALE)")
+    # ── Scheduler — per-loop heartbeat keys ──────────────────────────────────
+    # Each scheduler loop writes its own key (ex=30s).  Check them independently
+    # so a hung loop is visible even while the other loop keeps the process alive.
+    try:
+        _sched_loop_raws = {
+            "adaptive": r.get("worker:alive:scheduler:adaptive"),
+            "fullscan": r.get("worker:alive:scheduler:fullscan"),
+        }
+    except Exception as _hb_redis_err:
+        _row("WARNING", "scheduler:heartbeats", f"Redis read failed: {_hb_redis_err}")
+        warnings += 1
+        _sched_loop_raws = {}
+    for _loop_name, _raw in _sched_loop_raws.items():
+        _label = f"scheduler:{_loop_name}"
+        if _raw is None:
+            _row("ERROR", _label, "DEAD — heartbeat key missing")
+            errors += 1
+        else:
+            try:
+                d     = json.loads(_raw)
+                age_s = now - d.get("ts", now)
+                status = (
+                    f"pid={d.get('pid','?')}  "
+                    f"dispatched={d.get('dispatched',0)}  "
+                    f"heartbeat {age_s:.0f}s ago"
+                )
+                # Keys are written with ex=30s.  Dead-after from watchdog constant.
+                if age_s > _HEARTBEAT_DEAD_AFTER["scheduler"]:
+                    _row("ERROR", _label, status + "  (STALE)")
+                    errors += 1
+                else:
+                    _row("OK", _label, status)
+            except Exception:
+                _row("WARNING", _label, "alive but heartbeat payload unparseable")
                 warnings += 1
-            else:
-                _row("OK", "scheduler", status)
-        except Exception:
-            _row("WARNING", "scheduler", "alive but heartbeat payload unparseable")
-            warnings += 1
 
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")
@@ -257,11 +304,11 @@ def run_health_check() -> int:
                 if alive == 0:
                     _row("ERROR", label_suffix, f"{base}  no live workers")
                     errors += 1
-                elif consec >= 5:
+                elif consec >= _ERR_DEATHS:
                     _row("ERROR", label_suffix,
                          f"{base}  consecutive_rapid_deaths={consec}")
                     errors += 1
-                elif consec >= 3:
+                elif consec >= _WARN_DEATHS:
                     _row("WARNING", label_suffix,
                          f"{base}  consecutive_rapid_deaths={consec}")
                     warnings += 1
@@ -288,7 +335,7 @@ def run_health_check() -> int:
         from workers.watchdog import check_queue_health, Issue
         _wdg_queue_issues = check_queue_health(r, persist_snapshot=False)
         for _issue in _wdg_queue_issues:
-            _lbl = _issue.category.replace("queue:", "").replace("stream:", "stream:")
+            _lbl = _issue.category.replace("queue:", "").replace("stream:", "")
             _row(_issue.level, _lbl, _issue.message)
             if _issue.level in ("ERROR", "CRITICAL"):
                 errors += 1
@@ -302,28 +349,32 @@ def run_health_check() -> int:
     # ── BLOOM FILTERS ─────────────────────────────────────────────────────────
     _section("BLOOM FILTERS")
 
-    bloom_count = fallback_count = 0
-    cursor = 0
-    for _ in range(10):
-        cursor, keys = r.scan(cursor, match="bloom:fullscan:*", count=200)
-        bloom_count += len(keys)
-        if cursor == 0:
-            break
-    cursor = 0
-    for _ in range(10):
-        cursor, keys = r.scan(cursor, match="bloom:fallback:*", count=200)
-        fallback_count += len(keys)
-        if cursor == 0:
-            break
+    try:
+        bloom_count = fallback_count = 0
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="bloom:fullscan:*", count=200)
+            bloom_count += len(keys)
+            if cursor == 0:
+                break
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="bloom:fallback:*", count=200)
+            fallback_count += len(keys)
+            if cursor == 0:
+                break
 
-    total_bloom = bloom_count + fallback_count
-    if total_bloom == 0:
-        _row("WARNING", "bloom filters",
-             "No bloom:fullscan:* keys found — Redis may have restarted without saving")
+        total_bloom = bloom_count + fallback_count
+        if total_bloom == 0:
+            _row("WARNING", "bloom filters",
+                 "No bloom:fullscan:* keys found — Redis may have restarted without saving")
+            warnings += 1
+        else:
+            _row("OK", "bloom filters",
+                 f"~{total_bloom} keys  (RedisBloom={bloom_count}  fallback={fallback_count})")
+    except Exception as _bloom_err:
+        _row("DEGRADED", "bloom filters", f"Redis scan error: {_bloom_err}")
         warnings += 1
-    else:
-        _row("OK", "bloom filters",
-             f"~{total_bloom} keys  (RedisBloom={bloom_count}  fallback={fallback_count})")
 
     # ── COVERAGE ──────────────────────────────────────────────────────────────
     _section("COVERAGE (last 26h)")
@@ -336,7 +387,7 @@ def run_health_check() -> int:
         # so the health check matches the contract used by the monitor layer.
         inflight_names: set = set()
         try:
-            _stale_cutoff = now - 7200   # 2-hour inflight TTL (same as job_monitor)
+            _stale_cutoff = now - _INFLIGHT_STALE_S
             _raw_inflight = r.zrangebyscore(
                 REDIS_INFLIGHT_FULLSCAN, _stale_cutoff, "+inf"
             )
@@ -347,24 +398,26 @@ def run_health_check() -> int:
         except Exception as _inf_err:
             logger.debug("health_check: inflight ZSET unavailable: %s", _inf_err)
 
-        conn  = get_conn()
-        total = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
+        conn = get_conn()
+        try:
+            total = conn.execute("SELECT COUNT(*) AS c FROM company_poll_stats").fetchone()["c"]
 
-        # Fetch all stale companies so we can filter out inflight in Python
-        _stale_rows = conn.execute("""
-            SELECT company, last_full_scan_at
-            FROM company_poll_stats
-            WHERE last_full_scan_at IS NULL
-               OR last_full_scan_at < NOW() - INTERVAL '26 hours'
-            ORDER BY last_full_scan_at ASC NULLS FIRST
-        """).fetchall()
+            # Fetch all stale companies so we can filter out inflight in Python
+            _stale_rows = conn.execute("""
+                SELECT company, last_full_scan_at
+                FROM company_poll_stats
+                WHERE last_full_scan_at IS NULL
+                   OR last_full_scan_at < NOW() - INTERVAL '26 hours'
+                ORDER BY last_full_scan_at ASC NULLS FIRST
+            """).fetchall()
 
-        stuck = conn.execute("""
-            SELECT COUNT(*) AS c FROM job_postings
-            WHERE status = 'pending_detail'
-              AND created_at < NOW() - INTERVAL '1 hour'
-        """).fetchone()["c"]
-        conn.close()
+            stuck = conn.execute("""
+                SELECT COUNT(*) AS c FROM job_postings
+                WHERE status = 'pending_detail'
+                  AND created_at < NOW() - INTERVAL '1 hour'
+            """).fetchone()["c"]
+        finally:
+            conn.close()
 
         # Exclude actively-scanning companies from the missed count
         _stale_set    = {r2["company"] for r2 in _stale_rows}
@@ -409,25 +462,19 @@ def run_health_check() -> int:
         warnings += 1
 
     # ── HUNG WORKERS ─────────────────────────────────────────────────────────
-    hung = []
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-        for key in keys:
-            ks = key.decode() if isinstance(key, bytes) else key
-            company = ks.split(":", 1)[1]
-            if not r.exists(f"progress:{company}"):
-                hung.append(company)
-        if cursor == 0:
-            break
-
     _section("HUNG WORKERS  (heartbeat alive, no progress update)")
-    if hung:
-        _row("WARNING", "hung workers",
-             f"{len(hung)}: {', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")
+    try:
+        from workers.watchdog import check_hung_workers
+        _hung_issues = check_hung_workers(r)
+        if _hung_issues:
+            for _hi in _hung_issues:
+                _row(_hi.level, "hung workers", _hi.message)
+                warnings += 1
+        else:
+            _row("OK", "hung workers", "none detected")
+    except Exception as _hung_err:
+        _row("DEGRADED", "hung workers", f"Redis scan error: {_hung_err}")
         warnings += 1
-    else:
-        _row("OK", "hung workers", "none detected")
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print(f"\n  {'─' * 60}")
@@ -440,6 +487,11 @@ def run_health_check() -> int:
           f"{_c(f'{errors} errors', _RED if errors else _GREY)}  "
           f"{_c(f'{warnings} warnings', _YELLOW if warnings else _GREY)}")
     print(f"{_c(DSEP, _BOLD)}\n")
+
+    try:
+        r.close()
+    except Exception:
+        pass
 
     return 1 if errors > 0 else 0
 

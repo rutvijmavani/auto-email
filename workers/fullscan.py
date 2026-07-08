@@ -146,6 +146,14 @@ logger = get_logger(__name__)
 WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
 _CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
 
+# Shared EMA alpha for fullscan duration: used in _complete_fullscan_db,
+# _run_fullscan, and the deadline guard in _pick_schedule_time.
+_EMA_ALPHA = 0.3
+
+# Conservative seed for avg_fullscan_duration_s on first scan.
+# Matches db/schema.py DEFAULT 1800.0 — overwritten after first real scan.
+_AVG_DURATION_SEED = 1800.0
+
 # How many jobs to process per "page chunk" before checking for pause.
 # Phase 7 will replace this with actual per-page HTTP fetching.
 FULLSCAN_CHUNK_SIZE = 50
@@ -515,7 +523,7 @@ def _get_fullscan_state(company: str) -> dict:
             "full_scan_interval_s":    row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S,
             "last_poll_at":            row["last_poll_at"],
             "last_full_scan_at":       row["last_full_scan_at"],
-            "avg_fullscan_duration_s": float(row["avg_fullscan_duration_s"] or 30.0),
+            "avg_fullscan_duration_s": float(row["avg_fullscan_duration_s"] or _AVG_DURATION_SEED),
         }
     finally:
         conn.close()
@@ -550,13 +558,19 @@ def _complete_fullscan_db(
     new_jobs: int,
     interval_s: int,
     duration_s: float,
-    prev_avg_duration_s: float = 30.0,
+    prev_avg_duration_s: float = _AVG_DURATION_SEED,
+    next_scan_ts: float = 0.0,
 ) -> bool:
     """
     Update company_poll_stats on successful full scan completion.
 
     Sets last_full_scan_at, next_full_scan_at, clears interrupted flag,
     increments total_new_jobs, and updates the scan duration EMA.
+
+    next_scan_ts: exact Unix timestamp written to Redis by _atomic_schedule.
+        When provided (non-zero), it is persisted directly so the DB and Redis
+        ZSET agree on the scheduled time.  If omitted, falls back to
+        NOW() + interval_s seconds (legacy behaviour).
 
     EMA formula (alpha=0.3):
         new_avg = 0.3 * duration_s + 0.7 * prev_avg_duration_s
@@ -565,12 +579,41 @@ def _complete_fullscan_db(
         midpoint + avg_fullscan_duration_s >= next 7 AM deadline
     ensuring every scheduled scan can finish before the daily digest.
     """
-    _EMA_ALPHA = 0.3
-    new_avg    = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * prev_avg_duration_s
+    new_avg = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * prev_avg_duration_s
 
     conn = get_conn()
     try:
-        conn.execute("""
+        # Two fully-static SQL branches — no f-string — to avoid S608 linting.
+        # next_scan_ts is either an exact Redis-scheduled Unix timestamp (preferred)
+        # or 0 (fall back to NOW()+interval for legacy/test callers).
+        if next_scan_ts:
+            _sql = """
+            INSERT INTO company_poll_stats
+                (company, ats_platform, last_full_scan_at, next_full_scan_at,
+                 full_scan_interrupted, interrupted_at_page, interrupted_at,
+                 total_new_jobs, last_fullscan_duration_s, avg_fullscan_duration_s,
+                 updated_at)
+            VALUES
+                (%s, %s, NOW(), to_timestamp(%s::double precision),
+                 FALSE, NULL, NULL,
+                 %s, %s, %s,
+                 NOW())
+            ON CONFLICT (company) DO UPDATE SET
+                ats_platform             = EXCLUDED.ats_platform,
+                last_full_scan_at        = NOW(),
+                next_full_scan_at        = to_timestamp(%s::double precision),
+                full_scan_interrupted    = FALSE,
+                interrupted_at_page      = NULL,
+                interrupted_at           = NULL,
+                total_new_jobs           = COALESCE(company_poll_stats.total_new_jobs, 0) + %s,
+                last_fullscan_duration_s = %s,
+                avg_fullscan_duration_s  = %s,
+                updated_at               = NOW()
+            """
+            _params = (company, platform, next_scan_ts, new_jobs, int(duration_s), new_avg,
+                       next_scan_ts, new_jobs, int(duration_s), new_avg)
+        else:
+            _sql = """
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_full_scan_at, next_full_scan_at,
                  full_scan_interrupted, interrupted_at_page, interrupted_at,
@@ -592,8 +635,11 @@ def _complete_fullscan_db(
                 last_fullscan_duration_s = %s,
                 avg_fullscan_duration_s  = %s,
                 updated_at               = NOW()
-        """, (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
-              interval_s, new_jobs, int(duration_s), new_avg))
+            """
+            _params = (company, platform, interval_s, new_jobs, int(duration_s), new_avg,
+                       interval_s, new_jobs, int(duration_s), new_avg)
+
+        conn.execute(_sql, _params)
         conn.commit()
         return True
     except Exception as exc:
@@ -695,7 +741,8 @@ def _build_detail_payload(
 # CORE: run one full scan
 # ─────────────────────────────────────────
 
-def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
+def _run_fullscan(company: str, r, skip_lock: bool = False,
+                  shutdown_event=None) -> dict:
     """
     Perform one complete full scan for a company.
 
@@ -706,13 +753,15 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
     exceptions are caught and logged.
 
     Args:
-        company:   Company name (must match prospective_companies.company).
-        r:         Redis connection.
-        skip_lock: If True, bypass the exclusivity lock (dev/debug only).
+        company:        Company name (must match prospective_companies.company).
+        r:              Redis connection.
+        skip_lock:      If True, bypass the exclusivity lock (dev/debug only).
+        shutdown_event: Optional threading.Event; when set, the scan exits
+                        early and returns outcome="shutdown".
 
     Returns:
         dict with keys: company, success, new_jobs, fetched, pages,
-        duration_ms, outcome (completed/paused/error/deferred/skipped),
+        duration_ms, outcome (completed/paused/error/deferred/skipped/shutdown),
         worker_id, completed_at.
     """
     start_mono = time.monotonic()
@@ -906,6 +955,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
         # Cast to int explicitly — r.llen() always returns int in production,
         # but an explicit cast guards against unexpected return types (e.g. in
         # tests) and keeps the %d log format safe.
+        _backpressure_wait_s = 0   # tracked so the EMA excludes idle wait time
         queue_depth = int(r.llen(REDIS_DETAIL_FULLSCAN) or 0)
         if queue_depth > DETAIL_QUEUE_MAX_FULLSCAN:
             logger.warning(
@@ -916,14 +966,39 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             waited = 0
             while (int(r.llen(REDIS_DETAIL_FULLSCAN) or 0) > DETAIL_QUEUE_MAX_FULLSCAN
                    and waited < 300):
+                if shutdown_event and shutdown_event.is_set():
+                    logger.info("fullscan [%s]: shutdown during backpressure wait", company)
+                    try:
+                        _write_checkpoint(company, page_num)
+                    except Exception as _ckpt_err:
+                        logger.warning(
+                            "fullscan [%s]: checkpoint write failed during backpressure shutdown: %s",
+                            company, _ckpt_err,
+                        )
+                    result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+                    result["outcome"] = "shutdown"
+                    return result
                 time.sleep(10)
                 waited += 10
                 if _is_paused(r):
                     break
+            _backpressure_wait_s = waited
 
         # Chunk the flat job list to simulate page-level pause checks.
         # Phase 7 will replace this outer loop with actual paginated HTTP fetches.
         for chunk_start in range(0, max(len(title_matched), 1), FULLSCAN_CHUNK_SIZE):
+            if shutdown_event and shutdown_event.is_set():
+                logger.info("fullscan [%s]: shutdown during chunk processing", company)
+                try:
+                    _write_checkpoint(company, page_num)
+                except Exception as _ckpt_err:
+                    logger.warning(
+                        "fullscan [%s]: checkpoint write failed during chunk shutdown: %s",
+                        company, _ckpt_err,
+                    )
+                result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+                result["outcome"] = "shutdown"
+                return result
             chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]
             if not chunk:
                 break
@@ -1084,14 +1159,15 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
             #   Day 1: all companies in a tight cluster -> each gets a different gap midpoint
             #   Day 2: midpoints now spread across the window -> gaps rebalance further
             #   Day 3+: stable maximum-spread distribution maintained automatically
-            avg_duration_s = fs_state.get("avg_fullscan_duration_s", 30.0)
-            duration_s     = time.monotonic() - start_mono
+            avg_duration_s = fs_state.get("avg_fullscan_duration_s", _AVG_DURATION_SEED)
+            # Exclude backpressure idle time so queue saturation events don't
+            # inflate the EMA and cause unnecessary scheduling pessimism.
+            duration_s = max(0.0, time.monotonic() - start_mono - _backpressure_wait_s)
 
-            # Compute the updated EMA using the same alpha as _complete_fullscan_db so
-            # the deadline guard in _pick_schedule_time reflects current performance.
+            # Compute the updated EMA using the module-level _EMA_ALPHA so the
+            # deadline guard in _pick_schedule_time reflects current performance.
             # Without this, a scan that suddenly took 4 h would still schedule the
-            # next one using the old "30 s" average — risking a digest collision.
-            _EMA_ALPHA           = 0.3   # must match _complete_fullscan_db
+            # next one using the old seed average — risking a digest collision.
             updated_avg_duration = _EMA_ALPHA * duration_s + (1 - _EMA_ALPHA) * avg_duration_s
 
             # _atomic_schedule: gap-detection + ZADD under a short Redis lock so
@@ -1112,6 +1188,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                 interval_s          = int(next_scan_at - now),
                 duration_s          = duration_s,
                 prev_avg_duration_s = avg_duration_s,   # DB function recomputes EMA
+                next_scan_ts        = next_scan_at,     # exact Redis score → no drift
             )
 
             if db_ok:
@@ -1125,7 +1202,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                     "next_scan_in=%.1fh avg_duration=%.0fs",
                     company, new_count, duration_s,
                     (next_scan_at - now) / 3600,
-                    0.3 * duration_s + 0.7 * avg_duration_s,
+                    updated_avg_duration,
                 )
 
                 # ── Bootstrap new companies into WARMING adaptive cycle ───────
@@ -1135,14 +1212,23 @@ def _run_fullscan(company: str, r, skip_lock: bool = False) -> dict:
                     try:
                         _bootstrap_warming_adaptive(company, r)
                     except Exception as bw_exc:
-                        # Non-fatal — fall back to immediate ZADD so company isn't lost
+                        # Non-fatal — fall back to immediate ZADD so company isn't lost.
+                        # Wrap the fallback itself so a Redis error here cannot escape
+                        # into the outer except and overwrite the already-success result.
                         logger.error(
                             "fullscan [%s]: _bootstrap_warming_adaptive failed: %s — "
                             "falling back to immediate ZADD",
                             company, bw_exc,
                         )
-                        from config import ADAPTIVE_DEFAULT_INTERVAL
-                        r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+                        try:
+                            from config import ADAPTIVE_DEFAULT_INTERVAL
+                            r.zadd(REDIS_POLL_ADAPTIVE, {company: now + ADAPTIVE_DEFAULT_INTERVAL})
+                        except Exception as _zadd_err:
+                            logger.error(
+                                "fullscan [%s]: fallback ZADD also failed: %s — "
+                                "company will be rescheduled by next adaptive cycle",
+                                company, _zadd_err,
+                            )
             else:
                 result["outcome"] = "error"
                 result["success"] = False
@@ -1315,15 +1401,19 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 continue
 
             # ── Run full scan ─────────────────────────────────────────────────
-            result    = _run_fullscan(company, r, skip_lock=skip_lock)
+            result    = _run_fullscan(company, r, skip_lock=skip_lock,
+                                      shutdown_event=shutdown_event)
             _hw["count"] += 1
 
-            # ── XACK: remove from PEL (work complete) ────────────────────────
-            # _run_fullscan() handles all rescheduling internally before we get
-            # here, so XACK unconditionally marks this delivery as done.
-            r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
-
             outcome = result["outcome"]
+
+            # ── XACK: remove from PEL (work complete) ────────────────────────
+            # Skip XACK on shutdown so the message stays in the PEL for
+            # XAUTOCLAIM recovery — the scan was aborted, not finished.
+            # For all other outcomes, _run_fullscan() handled rescheduling
+            # internally, so marking this delivery done is safe.
+            if outcome != "shutdown":
+                r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
             icon    = {
                 "completed": "[DONE]",
                 "paused":    "[PAUSE]",

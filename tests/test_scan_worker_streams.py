@@ -167,7 +167,7 @@ class TestRunWorkerInitialisation(unittest.TestCase):
     def test_skip_init_db_true_skips_init_db(self):
         """skip_init_db=True → init_db NOT called."""
         r = _make_redis_mock()
-        with patch("workers.scan_worker.ping", return_value=True), \
+        with patch("workers.startup.validate_startup"), \
              patch("workers.scan_worker.get_redis", return_value=r), \
              patch("workers.scan_worker.init_db") as mock_init, \
              patch("workers.scan_worker._ensure_consumer_group"):
@@ -178,7 +178,7 @@ class TestRunWorkerInitialisation(unittest.TestCase):
     def test_skip_init_db_false_calls_init_db(self):
         """skip_init_db=False (default) → init_db called once."""
         r = _make_redis_mock()
-        with patch("workers.scan_worker.ping", return_value=True), \
+        with patch("workers.startup.validate_startup"), \
              patch("workers.scan_worker.get_redis", return_value=r), \
              patch("workers.scan_worker.init_db") as mock_init, \
              patch("workers.scan_worker._ensure_consumer_group"):
@@ -187,9 +187,16 @@ class TestRunWorkerInitialisation(unittest.TestCase):
         mock_init.assert_called_once()
 
     def test_redis_unreachable_calls_sys_exit(self):
-        """Redis not reachable → sys.exit(1) called."""
-        with patch("workers.scan_worker.ping", return_value=False), \
+        """Redis not reachable → sys.exit(1) called (via validate_startup)."""
+        # scan_worker delegates Redis startup checks to validate_startup,
+        # which runs _check_config before _check_redis.  Provide the required
+        # env vars so the failure comes from Redis, not missing config.
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
+        env = {"REDIS_URL": "redis://localhost:6379/0", "DATABASE_URL": "postgresql://x"}
+        with patch("redis.from_url", return_value=mock_r), \
              patch("workers.scan_worker.init_db"), \
+             patch.dict("os.environ", env), \
              self.assertRaises(SystemExit) as cm:
             from workers.scan_worker import run_worker
             run_worker(once=True, skip_init_db=True)

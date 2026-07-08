@@ -10,11 +10,18 @@ Wants=network-online.target
 # Watchdog is intentionally NOT After=recruiter-scheduler.service so it keeps
 # running and alerting even when the scheduler is down.
 
+# Soft-require Redis and Postgres — if they're not systemd-managed (e.g. managed
+# by the cloud provider), remove the relevant Wants/After lines.
+Wants=redis.service
+After=redis.service
+Wants=postgresql.service
+After=postgresql.service
+
 # ── Escalation — repeated rapid failures ─────────────────────────────────────
 # StartLimitBurst/StartLimitIntervalSec belong in [Unit] (systemd v229+).
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple
@@ -30,6 +37,20 @@ ExecStart=/home/opc/mail/venv/bin/python -m workers.watchdog
 # always be running to catch scheduler failures.
 Restart=always
 RestartSec=10s
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+# NoNewPrivileges is intentionally omitted: the watchdog calls
+# "sudo systemctl restart recruiter-scheduler" for self-healing, which requires
+# the setuid bit on /usr/bin/sudo to work. NoNewPrivileges=true disables setuid
+# and would break that path.
+PrivateTmp=true
+ProtectSystem=full
+# read-only (not strict) — WorkingDirectory is under /home
+ProtectHome=read-only
+# Allow the watchdog to write its log files and state under the project dir.
+# ProtectHome=read-only makes all of /home read-only by default; ReadWritePaths
+# carves out an exception so logging to /home/opc/mail/logs/ still works.
+ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 StandardOutput=journal

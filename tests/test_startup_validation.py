@@ -107,19 +107,20 @@ class TestValidateStartup(unittest.TestCase):
         """All checks pass → validate_startup returns without calling sys.exit."""
         mock_conn = MagicMock()
         mock_r = MagicMock()
-        # _check_redis calls r.info("server") and parses "redis_version".
-        # Return a proper dict so the Redis ≥6.2 version check passes.
+        # _check_redis creates its own bounded client via redis.from_url.
+        # r.ping() must return True; r.info() must return a valid version.
+        mock_r.ping.return_value = True
         mock_r.info.return_value = {"redis_version": "7.0.0"}
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=mock_r), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", return_value=mock_conn):
+             patch("redis.from_url", return_value=mock_r), \
+             patch("psycopg2.connect", return_value=mock_conn):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker")
             except SystemExit as exc:
                 self.fail(f"validate_startup raised SystemExit({exc.code}) on success")
+        mock_conn.close.assert_called_once()
 
     def test_all_false_passes_immediately(self):
         """All three checks disabled → always passes regardless of environment."""
@@ -245,16 +246,27 @@ class TestValidateStartup(unittest.TestCase):
             self.assertIn(key, output, f"Expected {key!r} in error message")
 
     def test_check_config_false_skips_env_check(self):
-        """check_config=False → missing env vars not checked (no exit)."""
-        env_missing = {k: "" for k in
-                       ["REDIS_URL", "DATABASE_URL", "GMAIL_EMAIL", "GMAIL_APP_PASSWORD"]}
+        """check_config=False → missing env vars not checked (no exit).
+
+        REDIS_URL must still be set when check_redis=True (the default) because
+        _check_redis requires an explicit URL; only the *config validation* step
+        (which checks whether required env vars are present) is skipped.
+        """
+        # Provide REDIS_URL so the Redis probe can run; leave all other keys empty
+        # to confirm the config validation step (which would reject them) is skipped.
+        env_partial = {
+            "REDIS_URL":          "redis://localhost:6379/0",
+            "DATABASE_URL":       "",
+            "GMAIL_EMAIL":        "",
+            "GMAIL_APP_PASSWORD": "",
+        }
         _mock_r = MagicMock()
+        _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
-        with patch.dict(os.environ, env_missing), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=_mock_r), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", return_value=MagicMock()):
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
+        with patch.dict(os.environ, env_partial), \
+             patch("redis.from_url", return_value=_mock_r), \
+             patch("psycopg2.connect", return_value=MagicMock()):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_config=False)
@@ -264,18 +276,20 @@ class TestValidateStartup(unittest.TestCase):
     # ── Redis check ───────────────────────────────────────────────────────────
 
     def test_redis_ping_false_exits_1(self):
-        """ping() returns False → sys.exit(1)."""
+        """r.ping() returns False → sys.exit(1)."""
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=False):
+             patch("redis.from_url", return_value=mock_r):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_db=False, check_config=False)
             self.assertEqual(ctx.exception.code, 1)
 
     def test_redis_ping_exception_exits_1(self):
-        """ping() raises ConnectionError → sys.exit(1)."""
+        """redis.from_url() raises ConnectionError → sys.exit(1)."""
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping",
+             patch("redis.from_url",
                    side_effect=ConnectionError("connection refused")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
@@ -283,10 +297,51 @@ class TestValidateStartup(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1)
 
     def test_redis_failure_error_to_stderr(self):
-        """Redis failure → STARTUP FAILED written to stderr."""
+        """Redis ping failure → STARTUP FAILED written to stderr."""
+        err_buf = io.StringIO()
+        mock_r = MagicMock()
+        mock_r.ping.return_value = False
+        with patch.dict(os.environ, _full_env()), \
+             patch("redis.from_url", return_value=mock_r), \
+             patch("sys.stderr", err_buf):
+            from workers.startup import validate_startup
+            with self.assertRaises(SystemExit):
+                validate_startup("test_worker", check_db=False, check_config=False)
+        self.assertIn("STARTUP FAILED", err_buf.getvalue())
+
+    def test_redis_set_failure_exits_1(self):
+        """r.set() raises → startup fails with exit(1)."""
+        mock_r = MagicMock()
+        mock_r.ping.return_value = True
+        mock_r.info.return_value = {"redis_version": "7.0.0"}
+        mock_r.set.side_effect = Exception("READONLY You can't write against a read only replica")
+        with patch.dict(os.environ, _full_env()), \
+             patch("redis.from_url", return_value=mock_r):
+            from workers.startup import validate_startup
+            with self.assertRaises(SystemExit) as ctx:
+                validate_startup("test_worker", check_db=False, check_config=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_redis_old_version_exits_1(self):
+        """Redis version < 6.2 (missing LMOVE) → startup fails with exit(1)."""
+        mock_r = MagicMock()
+        mock_r.ping.return_value = True
+        mock_r.info.return_value = {"redis_version": "5.0.14"}
+        with patch.dict(os.environ, _full_env()), \
+             patch("redis.from_url", return_value=mock_r):
+            from workers.startup import validate_startup
+            with self.assertRaises(SystemExit) as ctx:
+                validate_startup("test_worker", check_db=False, check_config=False)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_redis_old_version_error_to_stderr(self):
+        """Redis version < 6.2 → STARTUP FAILED written to stderr."""
+        mock_r = MagicMock()
+        mock_r.ping.return_value = True
+        mock_r.info.return_value = {"redis_version": "6.0.0"}
         err_buf = io.StringIO()
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=False), \
+             patch("redis.from_url", return_value=mock_r), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
@@ -294,37 +349,39 @@ class TestValidateStartup(unittest.TestCase):
         self.assertIn("STARTUP FAILED", err_buf.getvalue())
 
     def test_check_redis_false_skips_redis(self):
-        """check_redis=False → ping is never called, even if it would fail."""
+        """check_redis=False → redis.from_url is never called."""
         mock_conn = MagicMock()
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn), \
-             patch("workers.redis_client.ping",
-                   side_effect=AssertionError("ping must not be called when check_redis=False")) as mock_ping:
+             patch("psycopg2.connect", return_value=mock_conn), \
+             patch("redis.from_url",
+                   side_effect=AssertionError("redis.from_url must not be called when check_redis=False")) as mock_from_url:
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_redis=False, check_config=False)
             except SystemExit as exc:
                 self.fail(f"Should not exit when check_redis=False, got exit({exc.code})")
-            mock_ping.assert_not_called()
+            mock_from_url.assert_not_called()
 
     # ── DB check ─────────────────────────────────────────────────────────────
 
     def test_db_execute_exception_exits_1(self):
-        """conn.execute() raises → sys.exit(1) (_check_postgres uses SELECT 1)."""
+        """cursor.execute() raises → sys.exit(1) (_check_postgres uses SELECT 1)."""
         mock_conn = MagicMock()
-        mock_conn.execute.side_effect = Exception("connection refused")
+        mock_conn.cursor.return_value.__enter__.return_value.execute.side_effect = Exception("connection refused")
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn):
+             patch("psycopg2.connect", return_value=mock_conn):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_redis=False, check_config=False)
             self.assertEqual(ctx.exception.code, 1)
 
     def test_db_get_conn_exception_exits_1(self):
-        """get_conn() raises → sys.exit(1)."""
+        """psycopg2.connect() raises → sys.exit(1)."""
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.init_db"), \
-             patch("db.db.get_conn", side_effect=Exception("no DB")):
+             patch("psycopg2.connect", side_effect=Exception("no DB")):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit) as ctx:
                 validate_startup("test_worker", check_redis=False, check_config=False)
@@ -333,10 +390,9 @@ class TestValidateStartup(unittest.TestCase):
     def test_db_failure_error_to_stderr(self):
         """DB failure → STARTUP FAILED written to stderr."""
         err_buf = io.StringIO()
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = Exception("DB down")
+        # _check_postgres now calls psycopg2.connect directly (bypasses pool).
         with patch.dict(os.environ, _full_env()), \
-             patch("db.db.get_conn", return_value=mock_conn), \
+             patch("psycopg2.connect", side_effect=Exception("DB down")), \
              patch("sys.stderr", err_buf):
             from workers.startup import validate_startup
             with self.assertRaises(SystemExit):
@@ -346,15 +402,46 @@ class TestValidateStartup(unittest.TestCase):
     def test_check_db_false_skips_db(self):
         """check_db=False → PostgreSQL not checked (no exit even if DB would fail)."""
         _mock_r = MagicMock()
+        _mock_r.ping.return_value = True
         _mock_r.info.return_value = {"redis_version": "7.0.0"}
         with patch.dict(os.environ, _full_env()), \
-             patch("workers.redis_client.ping", return_value=True), \
-             patch("workers.redis_client.get_redis", return_value=_mock_r):
+             patch("redis.from_url", return_value=_mock_r):
             from workers.startup import validate_startup
             try:
                 validate_startup("test_worker", check_db=False, check_config=False)
             except SystemExit as exc:
                 self.fail(f"Should not exit when check_db=False, got exit({exc.code})")
+
+
+class TestMaskUrl(unittest.TestCase):
+    """Direct unit tests for _mask_url credential redaction."""
+
+    def _mask(self, url):
+        from workers.startup import _mask_url
+        return _mask_url(url)
+
+    def test_password_is_replaced_with_stars(self):
+        """URL with password → password replaced by ***."""
+        result = self._mask("redis://:secret@localhost:6379/0")
+        self.assertNotIn("secret", result)
+        self.assertIn("***", result)
+
+    def test_user_and_password_masked(self):
+        """URL with both username and password → *** replaces only the password."""
+        result = self._mask("postgresql://user:hunter2@db.example.com:5432/mydb")
+        self.assertNotIn("hunter2", result)
+        self.assertIn("user", result)
+        self.assertIn("***", result)
+
+    def test_url_without_password_unchanged(self):
+        """URL with no password → returned unchanged."""
+        url = "redis://localhost:6379/0"
+        self.assertEqual(self._mask(url), url)
+
+    def test_url_with_no_scheme_returned_unchanged(self):
+        """URL with no recognizable scheme (no password extracted) → returned unchanged."""
+        url = "not-a-real-url"
+        self.assertEqual(self._mask(url), url)
 
 
 if __name__ == "__main__":

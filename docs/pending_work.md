@@ -29,7 +29,7 @@ Both call sites (`_reschedule_adaptive()` and fullscan scheduling) updated.
 
 ## PHASE 2 — Thundering Herd Prevention ✅ DONE
 
-Full design in `docs/adaptive-polling-architecture.md`.
+Full design in `docs/architecture.md`.
 
 ### 2.1 Core algorithm — _pick_schedule_time() ✅ DONE
 **File:** `workers/scheduler.py`  
@@ -84,7 +84,7 @@ Also updated `on_fullscan_complete()` in `workers/scheduler.py` (legacy path).
 - `_get_fullscan_state()` fetches `avg_fullscan_duration_s` so it's available at scheduling time
 - DB migration added to `init_db()` in `db/schema.py` (idempotent `ADD COLUMN IF NOT EXISTS`):
   - `last_fullscan_duration_s  INTEGER`
-  - `avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 30.0`
+  - `avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 1800.0`
 
 ### 2.6 job_monitor inflight exclusion ✅ DONE
 **File:** `jobs/job_monitor.py` — `_get_worker_missed_companies()`  
@@ -112,7 +112,7 @@ Stale reference to `_least_loaded_slot()` replaced with `_pick_schedule_time()`.
 - `recruiter-scheduler.service` → `Restart=always RestartSec=30s` → scheduler restarts within 30s on any crash
 - `recruiter-watchdog.service` → `Restart=always RestartSec=10s` → watchdog restarts within 10s
 - `StartLimitBurst=5` in 300s → if service dies 5× in 5 min, systemd stops retrying and fires `OnFailure=`
-- `OnFailure=recruiter-pipeline-alert@%n.service` → `startup_failure_alert.py` sends email with journal logs
+- `OnFailure=recruiter-pipeline-alert@%p.service` → `startup_failure_alert.py` sends email with journal logs
 
 **Who manages what (current state with systemd):**
 
@@ -151,9 +151,9 @@ python scripts/health_check.py             # instant full status
 ### 3.2 Worker heartbeat in Redis ✅ DONE
 **Files:** `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`,
 `workers/scheduler.py`  
-**Key:** `worker:alive:{type}:{pid}` with appropriate TTL per worker  
+**Key:** `worker:alive:{type}:{hostname}:{pid}` with appropriate TTL per worker  
 **Payload:** `{"pid": os.getpid(), "processed": count, "ts": time.time()}`  
-**TTLs:** scheduler=15s, scan_worker=30s, detail_worker=30s, fullscan_worker=180s
+**TTLs:** scheduler=30s (per-loop key), scan_worker=30s, detail_worker=30s, fullscan_worker=180s
 
 ### 3.3 workers/watchdog.py ✅ DONE (complete rewrite + systemd wired)
 **Purpose:** Runs continuously under systemd. Checks all components every 5 min,
@@ -207,7 +207,7 @@ python -m workers.watchdog --no-heal        # alerts only, no auto-restart
 
 ### 3.4 Startup validation in each worker ✅ DONE
 **Files:** `workers/startup.py` (new), `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`  
-**Checks:** Redis PING + write test, PostgreSQL SELECT on `job_postings`, required `.env` keys present.  
+**Checks:** Redis PING + write test + version check (≥6.2), PostgreSQL SELECT 1 (connectivity only), required `.env` keys present.  
 Each worker calls `validate_startup(worker_name)` at the top of `run_worker()` before the main loop.
 Exits with `sys.exit(1)` + clear error message on any failure — surfaced immediately in `journalctl`.
 

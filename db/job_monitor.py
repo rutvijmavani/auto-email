@@ -383,8 +383,9 @@ def save_monitor_stats(stats):
                companies_unknown_ats, api_failures,
                total_jobs_fetched, new_jobs_found,
                jobs_matched_filters, run_duration_seconds,
-               pdf_generated, email_sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               pdf_generated, email_sent,
+               in_flight, fallback_scanned)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
                 companies_monitored    = EXCLUDED.companies_monitored,
                 companies_with_results = EXCLUDED.companies_with_results,
@@ -395,7 +396,9 @@ def save_monitor_stats(stats):
                 jobs_matched_filters   = EXCLUDED.jobs_matched_filters,
                 run_duration_seconds   = EXCLUDED.run_duration_seconds,
                 pdf_generated          = EXCLUDED.pdf_generated,
-                email_sent             = EXCLUDED.email_sent
+                email_sent             = EXCLUDED.email_sent,
+                in_flight              = EXCLUDED.in_flight,
+                fallback_scanned       = EXCLUDED.fallback_scanned
         """, (
             today,
             stats.get("companies_monitored",    0),
@@ -408,6 +411,8 @@ def save_monitor_stats(stats):
             stats.get("run_duration_seconds",    0),
             stats.get("pdf_generated",           0),
             stats.get("email_sent",              0),
+            stats.get("in_flight",               0),
+            stats.get("fallback_scanned",        0),
         ))
         conn.commit()
     finally:

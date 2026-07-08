@@ -1,18 +1,35 @@
 [Unit]
 Description=Recruiter Pipeline startup failure alert for %i
 # This is a template unit — %i is the name of the failed service.
-# Triggered by OnFailure=recruiter-pipeline-alert@%n.service in other units.
+# Triggered by OnFailure=recruiter-pipeline-alert@%p.service in other units.
+# Use %p (unit prefix, e.g. "recruiter-scheduler"), NOT %n (full unit name with
+# suffix), so the instantiation resolves to "recruiter-pipeline-alert@recruiter-scheduler"
+# rather than "recruiter-pipeline-alert@recruiter-scheduler.service".
 # Sends a single email saying which service hit its StartLimitBurst.
+#
+# Network ordering: the alert script sends email — it must wait for full
+# TCP connectivity or the SMTP connection will fail silently during early-boot.
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
-EnvironmentFile=-/home/opc/mail/.env
+EnvironmentFile=/home/opc/mail/.env
 
 # %i = the failed service name (e.g. "recruiter-scheduler")
 ExecStart=/home/opc/mail/venv/bin/python scripts/startup_failure_alert.py %i
 
 # Don't restart — this is a one-shot alert, not a long-running service.
 Restart=no
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+# startup_failure_alert.py only reads journal logs and sends email — no writes
+# outside the project directory are needed.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail

@@ -54,30 +54,87 @@ jobs:
       - name: Deploy to Oracle VM
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:        ${{ secrets.VM_HOST }}
-          username:    ${{ secrets.VM_USER }}
-          key:         ${{ secrets.VM_SSH_KEY }}
+          host:            ${{ secrets.VM_HOST }}
+          username:        ${{ secrets.VM_USER }}
+          key:             ${{ secrets.VM_SSH_KEY }}
+          command_timeout: 20m
           script: |
             set -e
             cd ${{ secrets.VM_PATH }}
 
-            echo "[1/6] Upgrading pip..."
+            # Pre-flight: /usr/local/bin/install-pipeline-units must already exist on
+            # the VM — it is created once by "sudo bash deploy/install-systemd.sh".
+            # If it is missing, steps [6/8] will fail under set -e and the trap below
+            # will roll back to PREVIOUS_SHA automatically.
+            if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
+              echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
+              echo "        Run 'sudo bash deploy/install-systemd.sh' once on the VM to provision it."
+              exit 1
+            fi
+
+            echo "[1/8] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
             python --version
 
-            echo "[2/6] Fetching latest code..."
+            echo "[2/8] Fetching latest code..."
             git fetch --all
-            git config advice.detachedHead false
+            PREVIOUS_SHA=$(git rev-parse HEAD)
 
-            echo "[3/6] Checking out exact validated commit..."
+            # Shared rollback helper used by both _early_rollback (ERR trap) and
+            # the health-check failure branch.  Reverts code, deps, unit files,
+            # and restarts services — each step guarded so a failure logs clearly
+            # rather than exiting silently under set -e.
+            _rollback_to_sha() {
+              local _sha="${1:-$PREVIOUS_SHA}"
+              local _checkout_ok=true
+              git reset --hard HEAD 2>/dev/null || true
+              if ! git checkout -B main "$_sha"; then
+                echo "[FATAL] git rollback to $_sha failed — code state unknown"
+                _checkout_ok=false
+              fi
+              if $_checkout_ok; then
+                pip install -r requirements.txt --quiet || echo "[FATAL] pip rollback failed"
+                echo "[ROLLBACK] Re-syncing unit files..."
+                sudo /usr/local/bin/install-pipeline-units || echo "[WARN] unit sync failed during rollback"
+                sudo systemctl daemon-reload || echo "[WARN] daemon-reload failed during rollback"
+              else
+                echo "[WARN] Skipping pip install and unit sync — code state unknown"
+              fi
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
+              done
+            }
+
+            # Early-failure rollback trap: if any step before the long health-check
+            # fails, revert to PREVIOUS_SHA and attempt to restore service state.
+            _early_rollback() {
+              local _exit=$?
+              echo "[ERROR] Early deploy step failed (exit $_exit) — rolling back to $PREVIOUS_SHA"
+              _rollback_to_sha "$PREVIOUS_SHA"
+              echo "[ROLLBACK] Verifying rollback services are active..."
+              sleep 3
+              for svc in recruiter-scheduler recruiter-watchdog; do
+                if ! systemctl is-active --quiet "$svc"; then
+                  echo "[ERROR] $svc failed to start after rollback:"
+                  journalctl -u "$svc" -n 30 --no-pager || true
+                  echo "[FATAL] Rollback failed — manual intervention required"
+                else
+                  echo "[OK] $svc is active after rollback"
+                fi
+              done
+              exit $_exit
+            }
+            trap '_early_rollback' ERR
+
+            echo "[3/8] Checking out exact validated commit..."
             git reset --hard HEAD
-            git checkout ${{ github.sha }}
+            git checkout -B main ${{ github.sha }}
 
-            echo "[4/6] Installing dependencies..."
+            echo "[4/8] Installing dependencies..."
             pip install -r requirements.txt --quiet
 
-            echo "[5/6] Verifying PostgreSQL connection..."
+            echo "[5/8] Verifying PostgreSQL connection..."
 
             python - <<'PY'
             import sys
@@ -91,32 +148,94 @@ jobs:
             conn.close()
             PY
 
-            echo "[6/7] Restarting services..."
-            for svc in recruiter-scheduler recruiter-watchdog; do
-              _cat_exit=0
-              _cat_err=$(systemctl cat "$svc" 2>&1 >/dev/null) || _cat_exit=$?
-              if [[ $_cat_exit -eq 0 ]]; then
-                sudo systemctl restart "$svc"
-              elif echo "$_cat_err" | grep -qiE "No files found|not found|No such file"; then
-                echo "[WARN] $svc unit not installed yet — run deploy/install-systemd.sh"
-              else
-                echo "[ERROR] systemctl cat $svc failed (exit=$_cat_exit): $_cat_err"
-                exit 1
+            echo "[6/8] Syncing systemd unit files..."
+            # Guard: verify the root-owned staging directory is current relative to
+            # the repo's deploy/systemd/ files.  The install-pipeline-units wrapper
+            # reads from the staging dir (updated only by install-systemd.sh), so if
+            # a unit file changed in this commit without a manual re-run of
+            # install-systemd.sh the staging would be stale and the new directives
+            # would be silently dropped.  Fail closed here so the operator knows.
+            _stale_units=0
+            for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service"; do
+              _src="deploy/systemd/$_unit"
+              _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
+              if [[ ! -f "$_staged" ]]; then
+                echo "[ERROR] Staging file missing: $_staged"
+                echo "        Run: sudo bash deploy/install-systemd.sh"
+                _stale_units=1
+              elif ! diff -q "$_src" "$_staged" > /dev/null 2>&1; then
+                echo "[ERROR] Staged unit out of date: $_unit"
+                echo "        deploy/systemd/$_unit differs from $_staged"
+                echo "        Run: sudo bash deploy/install-systemd.sh"
+                _stale_units=1
               fi
             done
+            if [[ "$_stale_units" -eq 1 ]]; then
+              echo "[ERROR] Systemd unit staging is stale — deployment aborted."
+              false
+            fi
+            sudo /usr/local/bin/install-pipeline-units
+            echo "  systemd unit files installed"
+            sudo systemctl daemon-reload
+            echo "  systemd daemon reloaded"
 
-            echo "[7/7] Verifying services are active..."
+            echo "[7/8] Restarting services..."
             for svc in recruiter-scheduler recruiter-watchdog; do
-              if systemctl cat "$svc" &>/dev/null; then
+              if ! systemctl cat "$svc" &>/dev/null; then
+                echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
+                false  # trigger ERR trap → _early_rollback runs
+              fi
+              sudo systemctl restart "$svc"
+            done
+
+            echo "[8/8] Verifying services are active..."
+            sleep 3   # brief settle: systemctl restart returns once the process starts, not fully active
+            for svc in recruiter-scheduler recruiter-watchdog; do
+              if ! systemctl is-active --quiet "$svc"; then
+                echo "[ERROR] $svc failed to start after restart:"
+                journalctl -u "$svc" -n 30 --no-pager || true
+                false  # trigger ERR trap → _early_rollback runs
+              fi
+              echo "[OK] $svc is active"
+            done
+
+            # All pre-health-check steps passed — disable the early-failure trap
+            # before the long health-check sleep to avoid rolling back on
+            # non-fatal signals (e.g. SIGPIPE from pipeline subshells).
+            trap - ERR
+
+            echo "  Running health check to verify pipeline state..."
+            sleep 70   # fullscan_worker writes heartbeat every 60s — wait at least that long
+            source venv/bin/activate
+            if ! python scripts/health_check.py; then
+              echo "[ERROR] Health check failed — rolling back to $PREVIOUS_SHA"
+              _rollback_to_sha "$PREVIOUS_SHA"
+
+              echo "[ROLLBACK] Verifying rollback services are active..."
+              sleep 3
+              for svc in recruiter-scheduler recruiter-watchdog; do
                 if ! systemctl is-active --quiet "$svc"; then
-                  echo "[ERROR] $svc failed to start after restart:"
+                  echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
+                  echo "[FATAL] Rollback failed — manual intervention required"
                   exit 1
                 fi
-                echo "[OK] $svc is active"
-              fi
-            done
+                echo "[OK] $svc is active after rollback"
+              done
 
-            echo "[8/8] Deploy complete ✓"
+              echo "[ROLLBACK] Re-running health check to confirm pipeline is healthy..."
+              sleep 70
+              if ! python scripts/health_check.py; then
+                echo "[FATAL] Health check still failing after rollback to $PREVIOUS_SHA"
+                echo "[FATAL] Pipeline is unhealthy — manual intervention required"
+                exit 1
+              fi
+              echo "[ROLLBACK] Health check passed"
+
+              echo "[ROLLBACK] Complete — reverted to $PREVIOUS_SHA"
+              exit 1
+            fi
+
+            echo "Deploy complete ✓"
             echo "Deployed commit: ${{ github.sha }}"
             echo "Deployed at: $(date)"

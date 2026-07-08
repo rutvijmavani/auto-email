@@ -10,7 +10,9 @@ Usage (called by systemd, not directly):
     python scripts/startup_failure_alert.py recruiter-watchdog
 
 This is a one-shot script: send one email and exit.
-Redis dedup key prevents duplicate emails if systemd re-triggers it.
+A flag file under run/ prevents duplicate emails if systemd re-triggers it
+(Redis is intentionally avoided here — it may be unavailable when the service
+is crashing).
 
 Trigger condition:
     StartLimitBurst=5 + StartLimitIntervalSec=300s in the service unit means:
@@ -94,24 +96,50 @@ def _claim_alert_slot(service: str) -> bool:
     try:
         age = time.time() - os.path.getmtime(flag)
     except OSError:
-        return False  # can't stat → assume recent → suppress
+        # Can't stat the flag file (unusual FS error) — fail open so a real
+        # alert is not silently dropped.  Aligns with the fcntl failure path
+        # below which also fails open.
+        return True
 
     if age < _DEDUP_WINDOW_S:
         return False  # still within dedup window → suppress
 
-    # Flag expired → atomically replace it so only one caller wins
-    tmp = flag + f".{os.getpid()}.tmp"
+    # Flag expired → serialize via flock so only one concurrent caller wins.
+    # os.rename is individually atomic on POSIX, but two concurrent processes can
+    # both see the same stale mtime, create separate tmp files, and both rename
+    # successfully — both returning True and both sending the alert.
+    # A lock file shared by all callers serialises the check+rename into one
+    # critical section so only the first caller wins.
+    lock_path = flag + ".lock"
     try:
-        with open(tmp, "w") as fh:
-            fh.write(datetime.now().isoformat())
-        os.rename(tmp, flag)   # atomic on POSIX (Linux/macOS)
-        return True
+        import fcntl
+        with open(lock_path, "w") as _lf:
+            fcntl.flock(_lf, fcntl.LOCK_EX)
+            # Re-check age inside the lock — a concurrent caller may have
+            # already renewed the flag while we were waiting.
+            try:
+                _age_now = time.time() - os.path.getmtime(flag)
+            except OSError:
+                return False
+            if _age_now < _DEDUP_WINDOW_S:
+                return False   # another caller already renewed it
+            tmp = flag + f".{os.getpid()}.tmp"
+            try:
+                with open(tmp, "w") as fh:
+                    fh.write(datetime.now().isoformat())
+                os.rename(tmp, flag)
+                return True
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return False
     except Exception:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-        return False
+        # Dedup mechanism failed (e.g. fcntl unavailable, FS error).
+        # Fail open: send the alert rather than silently suppressing it.
+        # Risk of duplicate sends in this path is lower than missing an alert.
+        return True
 
 
 # ─────────────────────────────────────────
@@ -150,18 +178,18 @@ _DIAGNOSE_HINTS = {
     "recruiter-scheduler": [
         "Check Redis is running: <code>systemctl status redis</code>",
         "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
-        "Check .env file exists and is readable: <code>ls -la /home/opc/mail/.env</code>",
+        f"Check .env file exists and is readable: <code>ls -la {_PROJECT_DIR}/.env</code>",
         "Check for Python errors: <code>journalctl -u recruiter-scheduler -n 50</code>",
-        "Try starting manually: <code>cd /home/opc/mail && source venv/bin/activate "
+        f"Try starting manually: <code>cd {_PROJECT_DIR} &amp;&amp; source venv/bin/activate "
         "&amp;&amp; python pipeline.py --scheduler</code>",
         "Re-enable after fixing: <code>sudo systemctl reset-failed recruiter-scheduler "
         "&amp;&amp; sudo systemctl start recruiter-scheduler</code>",
     ],
     "recruiter-watchdog": [
         "Check Redis is running: <code>systemctl status redis</code>",
-        "Check .env file exists and is readable: <code>ls -la /home/opc/mail/.env</code>",
+        f"Check .env file exists and is readable: <code>ls -la {_PROJECT_DIR}/.env</code>",
         "Check for Python errors: <code>journalctl -u recruiter-watchdog -n 50</code>",
-        "Try starting manually: <code>cd /home/opc/mail && source venv/bin/activate "
+        f"Try starting manually: <code>cd {_PROJECT_DIR} &amp;&amp; source venv/bin/activate "
         "&amp;&amp; python -m workers.watchdog</code>",
         "Re-enable after fixing: <code>sudo systemctl reset-failed recruiter-watchdog "
         "&amp;&amp; sudo systemctl start recruiter-watchdog</code>",

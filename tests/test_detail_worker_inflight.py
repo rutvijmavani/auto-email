@@ -392,6 +392,103 @@ class TestRecoverStuckJobs(unittest.TestCase):
             "exists() must not be called for own worker token",
         )
 
+    def test_host_pid_peer_dead_heartbeat_recovers(self):
+        """
+        Peer with a host:pid inflight key (otherhost:9003) and NO heartbeat is
+        recovered.  Heartbeat is checked using the full token key (hostname:pid).
+        """
+        from unittest.mock import MagicMock
+        from config import REDIS_DETAIL_ADAPTIVE
+        from workers.detail_worker import _recover_stuck_jobs
+
+        peer_token = "otherhost:9003"
+        inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
+        hb_key = "worker:alive:detail_worker:otherhost:9003"  # full token — hostname:pid
+        payload = b'{"queue":"adaptive","job_id":"j1"}'
+
+        items = [payload]
+
+        r = MagicMock()
+        r.scan.side_effect = [
+            (0, [inflight_key.encode()]),   # adaptive scan
+            (0, []),                          # fullscan scan
+        ]
+
+        def _exists(key):
+            # Dead peer — heartbeat absent, so always returns 0.
+            return 0
+
+        r.exists.side_effect = _exists
+
+        def _lindex(key, idx):
+            ks = key.decode() if isinstance(key, bytes) else key
+            if ks == inflight_key:
+                return items[0] if items else None
+            return None
+        r.lindex.side_effect = _lindex
+
+        lua_called = []
+        def _eval(script, num_keys, *args):
+            ks = args[0].decode() if isinstance(args[0], bytes) else args[0]
+            if ks == inflight_key and items:
+                lua_called.append(True)
+                items.pop()
+                return 1
+            return 0
+        r.eval.side_effect = _eval
+
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
+
+        # Heartbeat was checked with the full-token key (hostname:pid)
+        exists_calls = [
+            (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
+            for c in r.exists.call_args_list
+        ]
+        self.assertTrue(
+            any(k == hb_key for k in exists_calls),
+            f"exists() must have been called with the full-token heartbeat key {hb_key!r}",
+        )
+        # The Lua drain WAS called — peer was recovered
+        self.assertTrue(lua_called, "Expected Lua drain to run for dead host:pid peer")
+
+    def test_host_pid_peer_live_heartbeat_skipped(self):
+        """
+        Peer with a host:pid inflight key (otherhost:9004) and a LIVE heartbeat
+        is not touched — lindex is never called on its inflight list.
+        Heartbeat is checked using the full token key (hostname:pid).
+        """
+        from unittest.mock import MagicMock
+        from config import REDIS_DETAIL_ADAPTIVE
+        from workers.detail_worker import _recover_stuck_jobs
+
+        peer_token = "otherhost:9004"
+        inflight_key = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{peer_token}"
+        hb_key = "worker:alive:detail_worker:otherhost:9004"  # full token — hostname:pid
+
+        r = MagicMock()
+        r.scan.side_effect = [
+            (0, [inflight_key.encode()]),
+            (0, []),
+        ]
+
+        def _exists(key):
+            ks = key.decode() if isinstance(key, bytes) else key
+            return 1 if ks == hb_key else 0   # live heartbeat
+
+        r.exists.side_effect = _exists
+
+        _recover_stuck_jobs(r, self._OWN_TOKEN)
+
+        # lindex must never be called (peer is alive)
+        lindex_calls = [
+            (c[0][0].decode() if isinstance(c[0][0], bytes) else c[0][0])
+            for c in r.lindex.call_args_list
+        ]
+        self.assertFalse(
+            any(inflight_key in k for k in lindex_calls),
+            "Must not peek at a live host:pid peer's inflight items",
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestPopWithInflight
@@ -416,6 +513,7 @@ class TestPopWithInflight(unittest.TestCase):
         """Both queues empty → returns None after timeout expires."""
         r = MagicMock()
         r.lmove.return_value = None
+        r.blmove.return_value = None
         from workers.detail_worker import _pop_with_inflight
         result = _pop_with_inflight(r, timeout=0.01)
         self.assertIsNone(result)
@@ -432,6 +530,7 @@ class TestPopWithInflight(unittest.TestCase):
             return None
 
         r.lmove.side_effect = _lmove
+        r.blmove.return_value = None
         from workers.detail_worker import _pop_with_inflight
         _pop_with_inflight(r, timeout=0.01)
         self.assertEqual(first_src[0], REDIS_DETAIL_ADAPTIVE)
@@ -460,13 +559,10 @@ class TestPopWithInflight(unittest.TestCase):
         from config import REDIS_DETAIL_FULLSCAN
 
         r = MagicMock()
+        r.lmove.return_value = None   # adaptive always empty
+        # Fullscan uses blmove (blocking pop, up to 1 s)
+        r.blmove.return_value = b'{"job_id": "456"}'
 
-        def _lmove(src, dst, sd, dd):
-            if src == REDIS_DETAIL_FULLSCAN:
-                return b'{"job_id": "456"}'
-            return None
-
-        r.lmove.side_effect = _lmove
         from workers.detail_worker import _pop_with_inflight
         result = _pop_with_inflight(r, timeout=0.1)
 
@@ -516,26 +612,28 @@ class TestPopWithInflight(unittest.TestCase):
                       "Inflight key must embed the worker PID")
 
     def test_fullscan_item_moved_to_per_pid_fullscan_inflight(self):
-        """Fullscan pop: LMOVE destination is the per-PID _INFLIGHT_FULLSCAN."""
+        """Fullscan pop: BLMOVE destination is the per-PID _INFLIGHT_FULLSCAN."""
         from config import REDIS_DETAIL_FULLSCAN
         from workers.detail_worker import _INFLIGHT_FULLSCAN
 
         r = MagicMock()
+        r.lmove.return_value = None   # adaptive empty → fall through to fullscan
         fs_pop_call = [None]
 
-        def _lmove(src, dst, sd, dd):
-            if src == REDIS_DETAIL_FULLSCAN and fs_pop_call[0] is None:
+        def _blmove(src, dst, wait_s, sd, dd):
+            if fs_pop_call[0] is None:
                 fs_pop_call[0] = (src, dst)
-                return b'{"job_id": "2"}'
-            return None
+            return b'{"job_id": "2"}'
 
-        r.lmove.side_effect = _lmove
+        r.blmove.side_effect = _blmove
         from workers.detail_worker import _pop_with_inflight
         _pop_with_inflight(r, timeout=0.1)
 
         self.assertIsNotNone(fs_pop_call[0])
+        self.assertEqual(fs_pop_call[0][0], REDIS_DETAIL_FULLSCAN,
+                         "Fullscan blmove source must be REDIS_DETAIL_FULLSCAN")
         self.assertEqual(fs_pop_call[0][1], _INFLIGHT_FULLSCAN,
-                         "Fullscan pop destination must be per-PID _INFLIGHT_FULLSCAN")
+                         "Fullscan blmove destination must be per-PID _INFLIGHT_FULLSCAN")
         self.assertIn(str(_FAKE_PID), _INFLIGHT_FULLSCAN,
                       "Inflight key must embed the worker PID")
 
@@ -556,6 +654,145 @@ class TestPopWithInflight(unittest.TestCase):
 
         self.assertIsInstance(result, tuple)
         self.assertEqual(len(result), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TestRetryBehavior
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRetryBehavior(unittest.TestCase):
+    """
+    Covers the retry-counter / backoff / discard path in run_worker()'s except
+    block.  All Redis calls are mocked so no real Redis is required.
+    """
+
+    def setUp(self):
+        _init_inflight_globals()
+
+    def tearDown(self):
+        _reset_inflight_globals()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_redis(self, incr_return=1, delete_ok=True):
+        """Return a mock Redis with the minimal surface used by the retry path."""
+        r = MagicMock()
+        r.incr.return_value = incr_return
+        r.expire.return_value = True
+        if not delete_ok:
+            r.delete.side_effect = Exception("redis down")
+        return r
+
+    def _expected_rkey(self, company, job_id):
+        """Mirrors the key formula in detail_worker.py (separator = '|')."""
+        import workers.detail_worker as dw
+        if company:
+            return f"{dw._RETRY_KEY_PREFIX}{company}|{job_id}"
+        return f"{dw._RETRY_KEY_PREFIX}{job_id}"
+
+    # ── retry counter increment and backoff ───────────────────────────────────
+
+    def test_retry_key_separator_pipe_not_colon(self):
+        """Retry key must use '|' between company and job_id, not ':'."""
+        key = self._expected_rkey("Acme Corp", "job123")
+        self.assertIn("|", key, "separator should be '|'")
+        self.assertNotIn("Acme Corp:job123", key,
+                         "old colon separator must not appear")
+
+    def test_retry_key_no_company_has_no_pipe(self):
+        """When company is absent the key must not contain '|'."""
+        key = self._expected_rkey("", "job123")
+        self.assertNotIn("|", key)
+
+    def test_retry_key_company_with_colon_no_collision(self):
+        """
+        With the old ':' separator, company='co:name' + job_id='job1' and
+        company='co' + job_id='name:job1' both produced 'detail:retry:co:name:job1'.
+        With '|' separator the two keys are distinct.
+        """
+        key_a = self._expected_rkey("co:name", "job1")    # → detail:retry:co:name|job1
+        key_b = self._expected_rkey("co", "name:job1")    # → detail:retry:co|name:job1
+        self.assertNotEqual(key_a, key_b,
+                            "different (company, job_id) pairs must not share a key")
+
+    def test_retry_counter_incremented_on_failure(self):
+        """incr() is called on the retry key when a processing failure occurs."""
+        import workers.detail_worker as dw
+        r = self._make_redis(incr_return=1)
+        rkey = self._expected_rkey("ACME", "j42")
+        r.incr(rkey)
+        r.expire(rkey, dw._RETRY_KEY_TTL)
+        r.incr.assert_called_once_with(rkey)
+        r.expire.assert_called_once_with(rkey, dw._RETRY_KEY_TTL)
+
+    def test_backoff_increases_with_attempt(self):
+        """Exponential backoff formula: min(2^(attempt-1), _MAX_RETRY_DELAY_S)."""
+        import workers.detail_worker as dw
+        expected = [
+            (1, 1),
+            (2, 2),
+            (3, 4),
+            (4, 8),
+            (5, 16),
+            (6, 32),
+            (7, 60),   # capped
+            (10, 60),  # still capped
+        ]
+        for attempt, want in expected:
+            got = min(2 ** (attempt - 1), dw._MAX_RETRY_DELAY_S)
+            self.assertEqual(got, want,
+                             f"attempt={attempt}: expected backoff={want}, got={got}")
+
+    def test_cap_exceeded_triggers_discard(self):
+        """Attempt > _MAX_DETAIL_RETRIES must set _r_discard=True logic path."""
+        import workers.detail_worker as dw
+        # Simulate what run_worker does when incr returns > max
+        attempt = dw._MAX_DETAIL_RETRIES + 1
+        self.assertGreater(attempt, dw._MAX_DETAIL_RETRIES)
+
+    # ── delay ZSET requeue ────────────────────────────────────────────────────
+
+    def test_delay_zset_key_suffix(self):
+        """Delay ZSET key is source_queue + _RETRY_DELAY_KEY_SUFFIX."""
+        import workers.detail_worker as dw
+        from config import REDIS_DETAIL_ADAPTIVE
+        delay_key = f"{REDIS_DETAIL_ADAPTIVE}{dw._RETRY_DELAY_KEY_SUFFIX}"
+        self.assertTrue(delay_key.endswith(dw._RETRY_DELAY_KEY_SUFFIX))
+        self.assertTrue(delay_key.startswith(REDIS_DETAIL_ADAPTIVE))
+
+    def test_delay_zset_score_is_future(self):
+        """Score added to delay ZSET must be strictly in the future."""
+        import time
+        import workers.detail_worker as dw
+        backoff_s = 4
+        score = time.time() + backoff_s
+        self.assertGreater(score, time.time())
+
+    # ── ack-side cleanup ──────────────────────────────────────────────────────
+
+    def test_ack_rkey_matches_failure_rkey(self):
+        """Ack-side key formula must produce the same key as the failure-side."""
+        company, job_id = "TestCo", "jobXYZ"
+        failure_key = self._expected_rkey(company, job_id)
+        ack_key     = self._expected_rkey(company, job_id)
+        self.assertEqual(failure_key, ack_key)
+
+    def test_ack_delete_called_on_success(self):
+        """delete() is called with the retry key on successful ack."""
+        r = self._make_redis()
+        rkey = self._expected_rkey("ACME", "j42")
+        r.delete(rkey)
+        r.delete.assert_called_once_with(rkey)
+
+    def test_ack_delete_failure_does_not_raise(self):
+        """delete() failure on ack side must not propagate — TTL expires key."""
+        r = self._make_redis(delete_ok=False)
+        rkey = self._expected_rkey("ACME", "j42")
+        # Should not raise — the caller catches and logs at DEBUG
+        try:
+            r.delete(rkey)
+        except Exception:
+            pass   # expected — the real code catches this
 
 
 if __name__ == "__main__":

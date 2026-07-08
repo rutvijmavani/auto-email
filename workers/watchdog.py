@@ -138,6 +138,11 @@ HEARTBEAT_DEAD_AFTER = {
     "fullscan_worker": 1900,   # scans can legitimately take 30 min
 }
 
+# Consecutive rapid-death thresholds for worker pool health.
+# Shared with scripts/health_check.py so both tools agree on severity.
+WARN_DEATHS = 3
+ERR_DEATHS  = 5
+
 # Queue health thresholds
 #
 # Poll queues — velocity/delta tracking across consecutive watchdog cycles.
@@ -568,45 +573,56 @@ def check_worker_heartbeats(r) -> list:
     now     = time.time()
     FIX_CMD = "sudo systemctl restart recruiter-scheduler"
 
-    # ── 1. Scheduler heartbeat — fast single-key check ───────────────────────
+    # ── 1. Scheduler per-loop heartbeats ─────────────────────────────────────
+    # Each scheduler loop (adaptive_loop, fullscan_loop) writes its own key.
+    # Checking them independently means a hung loop is detected even while the
+    # other loop keeps the process alive — the old single shared key masked
+    # one-loop hangs because the surviving loop kept refreshing it.
     dead_after = HEARTBEAT_DEAD_AFTER["scheduler"]
-    raw        = r.get("worker:alive:scheduler")
 
-    if raw is None:
-        issues.append(Issue(
-            Issue.ERROR,
-            "worker:scheduler",
-            "scheduler heartbeat MISSING — scheduler is dead or never started",
-            FIX_CMD,
-            alert_type="worker_scheduler",
-        ))
-        # Scheduler is dead → workers are all dead too → no point reading
-        # scheduler:health (it will also be absent or stale).
-        return issues
+    _loop_raws = {
+        "adaptive": r.get("worker:alive:scheduler:adaptive"),
+        "fullscan": r.get("worker:alive:scheduler:fullscan"),
+    }
 
-    try:
-        d   = json.loads(raw)
-        age = now - d.get("ts", now)
-        if age > dead_after:
+    for loop_name, raw in _loop_raws.items():
+        category   = f"worker:scheduler:{loop_name}"
+        alert_type = f"worker_scheduler_{loop_name}"
+        if raw is None:
             issues.append(Issue(
                 Issue.ERROR,
-                "worker:scheduler",
-                f"scheduler heartbeat STALE — last write {age:.0f}s ago "
-                f"(threshold {dead_after}s). Scheduler may be hung.",
+                category,
+                f"scheduler {loop_name}_loop heartbeat MISSING — loop is dead or never started",
                 FIX_CMD,
-                alert_type="worker_scheduler",
+                alert_type=alert_type,
             ))
         else:
-            issues.append(Issue(Issue.OK, "worker:scheduler",
-                f"alive pid={d.get('pid','?')} dispatched={d.get('dispatched',0)} "
-                f"heartbeat {age:.0f}s ago"))
-    except Exception:
-        issues.append(Issue(Issue.OK, "worker:scheduler",
-            "alive (heartbeat key present)"))
+            try:
+                d   = json.loads(raw)
+                age = now - d.get("ts", now)
+                if age > dead_after:
+                    issues.append(Issue(
+                        Issue.ERROR,
+                        category,
+                        f"scheduler {loop_name}_loop heartbeat STALE — last write {age:.0f}s ago "
+                        f"(threshold {dead_after}s). Loop may be hung.",
+                        FIX_CMD,
+                        alert_type=alert_type,
+                    ))
+                else:
+                    issues.append(Issue(Issue.OK, category,
+                        f"alive pid={d.get('pid','?')} dispatched={d.get('dispatched',0)} "
+                        f"heartbeat {age:.0f}s ago"))
+            except Exception:
+                issues.append(Issue(Issue.OK, category,
+                    "alive (heartbeat key present)"))
+
+    # If BOTH loop keys are missing the scheduler process itself is down —
+    # workers are also dead, so no point reading scheduler:health.
+    if all(v is None for v in _loop_raws.values()):
+        return issues
 
     # ── 2. Pool health from scheduler:health ─────────────────────────────────
-    WARN_DEATHS  = 3
-    ERR_DEATHS   = 5
     _HEALTH_MISS_KEY       = _rkey("pool_health_miss_count", "worker_pool_health")
     _HEALTH_MISS_THRESHOLD = 3   # consecutive misses before escalating to ERROR
     health_raw   = r.get("scheduler:health")
@@ -862,18 +878,24 @@ def _heartbeat_pid(r, worker_type: str) -> Optional[int]:
         return None
 
 
-def _consumer_pid_alive(r, worker_type: str, c_pid: Optional[int]) -> bool:
+def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
     """
-    Return True if a live heartbeat key exists for this specific worker PID.
+    Return True if a live heartbeat key exists for this stream consumer.
 
-    With per-PID keys (worker:alive:{type}:{pid}), we can directly test whether
-    the exact consumer that owns a PEL entry is still running — no cross-PID
-    ambiguity from a shared single key.
+    consumer_name format: "worker-{hostname}-{pid}" (set by fullscan._CONSUMER_NAME).
+    Heartbeat key format: "worker:alive:{type}:{hostname}:{pid}" (set by heartbeat.py).
+    Both include the hostname so PID reuse across machines cannot produce a false positive.
     """
-    if c_pid is None:
+    if not consumer_name:
         return False
     try:
-        return bool(r.exists(f"worker:alive:{worker_type}:{c_pid}"))
+        if isinstance(consumer_name, bytes):
+            consumer_name = consumer_name.decode()
+        # "worker-{hostname}-{pid}" — split off pid at the last dash, strip "worker-" prefix
+        name, _, pid_str = consumer_name.rpartition("-")
+        hostname = name.removeprefix("worker-")
+        int(pid_str)   # validate — raises ValueError if not a number
+        return bool(r.exists(f"worker:alive:{worker_type}:{hostname}:{pid_str}"))
     except Exception:
         return False
 
@@ -935,7 +957,7 @@ def _check_pel_health(r, issues: list) -> None:
                     if isinstance(e_consumer, bytes):
                         e_consumer = e_consumer.decode()
                     e_pid   = _consumer_pid(e_consumer)
-                    e_alive = _consumer_pid_alive(r, worker_type, e_pid)
+                    e_alive = _consumer_pid_alive(r, worker_type, e_consumer)
                     e_ms    = entry.get("time_since_delivered", 0)
                     if e_alive:
                         alive_entries.append((e_consumer, e_pid, e_ms))

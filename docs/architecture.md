@@ -218,7 +218,7 @@ Alert email (only if intervention needed)
 | `config.py` | All configuration in one place |
 | `workers/watchdog.py` | Pipeline health monitor and auto-healer. Runs continuously. Checks worker heartbeats, queue depths, systemd service states, stuck jobs, bloom filter presence, and Redis persistence every 5 minutes. Sends alert emails and restarts services automatically before escalating to a human. |
 | `workers/startup.py` | Startup validator run by every worker before its main loop begins. Checks that Redis is reachable, PostgreSQL is reachable, and all required `.env` keys are present. Exits immediately with a clear error message if anything is missing — prevents silent failures. |
-| `scripts/health_check.py` | Instant CLI status tool. Prints a color-coded table of all components (services, workers, queues, Redis). Exit code 0 = healthy, 1 = something is wrong. Run any time for a quick system snapshot. |
+| `scripts/health_check.py` | Instant CLI status tool. Prints a color-coded table of all components (services, workers, queues, Redis). Exit code 0 = healthy or warnings-only; exit code 1 = at least one ERROR or CRITICAL issue found. Run any time for a quick system snapshot. |
 | `scripts/startup_failure_alert.py` | Email alert triggered automatically by systemd when a service crashes too many times in a short window (5 crashes in 5 minutes). Embeds the last 30 journal log lines in the email so you can diagnose without SSH. |
 | `deploy/deploy.sh` | Code deployment script. Run after every `git push`: pulls latest code, installs new dependencies, restarts both services, waits for heartbeats, and runs `health_check.py` to confirm everything is healthy. |
 | `deploy/install-systemd.sh` | One-time server setup script (run with `sudo`). Installs and enables the systemd unit files, removes old cron/nohup processes, secures `.env` permissions, and adds the sudoers rule for watchdog self-healing. |
@@ -312,15 +312,15 @@ A Workday scan can take 20–30 minutes. If a company is scheduled at 6:45 AM ET
 new_avg = 0.3 × last_duration_s + 0.7 × prev_avg
 ```
 
-Initial value: 30.0 s (conservative — unknown companies get a safe default until their first scan completes). Updated in `_complete_fullscan_db()` after every successful scan.
+Initial value: 1800.0 s (30 min — conservative upper bound so the deadline guard never places an unknown company too close to the 7 AM digest). Updated in `_complete_fullscan_db()` after every successful scan.
 
-**Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 s average, preventing a digest collision on the next cycle.
+**Important:** `_pick_schedule_time()` receives the **updated** EMA (computed inline after the scan's `duration_s` is measured, using the same α=0.3 formula) rather than the stale pre-scan value loaded from `fs_state`. This ensures the deadline guard reflects the scan that just completed — if a scan unexpectedly took 4 h, the next scheduling decision uses a 4 h-weighted EMA rather than the old 30 min average, preventing a digest collision on the next cycle.
 
 **DB columns added (idempotent `ADD COLUMN IF NOT EXISTS` in `init_db()`):**
 
 ```sql
 last_fullscan_duration_s  INTEGER                       -- seconds of last scan
-avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 30.0 -- EMA of all past scans
+avg_fullscan_duration_s   DOUBLE PRECISION DEFAULT 1800.0 -- EMA of all past scans
 ```
 
 ---
@@ -367,7 +367,7 @@ A third unit, **`recruiter-pipeline-alert@.service`**, is a one-shot template tr
 
 ### The watchdog — continuous health monitoring and self-healing
 
-Think of the watchdog as a dedicated operations person who checks the entire system every 5 minutes, tries to fix problems immediately, and only calls you when they cannot fix it themselves.
+Think of the watchdog as a dedicated operations person who checks the entire system every 5 minutes, tries to fix problems immediately, and only alerts you when they cannot fix it themselves.
 
 **What it checks every 5 minutes — complete walkthrough:**
 
@@ -386,7 +386,7 @@ The watchdog calls `systemctl is-active recruiter-scheduler` (and `recruiter-wat
 
 **Why this check exists separately from heartbeats:**
 
-A worker heartbeat key in Redis has a TTL of 15–45 seconds. If the scheduler just crashed, that key is still alive in Redis for up to 45 more seconds — during that window the heartbeat check says "healthy" while the process is actually dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key has had a chance to expire. It is a faster and more authoritative signal.
+A worker heartbeat key in Redis has a TTL of 3× the write interval: 30 seconds for detail/scan workers (10 s interval) and 180 seconds for the fullscan worker (60 s interval). If the scheduler just crashed, a heartbeat key written by a worker it spawned is still alive in Redis for up to 180 more seconds — during that window the heartbeat check says "healthy" while the process is actually dead. `systemctl is-active` reads the true OS-level state immediately, before the heartbeat key has had a chance to expire. It is a faster and more authoritative signal.
 
 **Why `failed` is different from `inactive`:**
 
@@ -406,7 +406,7 @@ The watchdog runs both commands atomically in one `bash -c` call. `reset-failed`
 The watchdog cannot restart itself via this mechanism. If `recruiter-watchdog.service` enters `failed` state, there is no running watchdog to detect it. This is handled by a separate `OnFailure=` hook in the unit file:
 
 ```ini
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 ```
 
 When the watchdog crashes too many times, systemd fires `recruiter-pipeline-alert@.service` — a one-shot unit that runs `startup_failure_alert.py` and emails the last 30 journal lines so you can diagnose without SSH.
@@ -419,12 +419,12 @@ When the watchdog crashes too many times, systemd fires `recruiter-pipeline-aler
 
 **Multi-worker per-PID key architecture:**
 
-The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail workers, 3 fullscan workers — counts calculated dynamically from 30-day API health history). Because multiple workers of the same type run simultaneously, a single shared key per type would collapse all of them into one — the last writer would overwrite everyone else's heartbeat, making it impossible to track individual workers.
+The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail workers, 3 fullscan workers). Scan and detail worker counts are calculated dynamically from 30-day API health history; the fullscan worker pool is pinned at `WORKER_FLOOR` (a fixed minimum) because fullscan throughput is not latency-sensitive. Because multiple workers of the same type run simultaneously, a single shared key per type would collapse all of them into one — the last writer would overwrite everyone else's heartbeat, making it impossible to track individual workers.
 
 Each worker writes its own key including its PID:
 
 ```python
-r.set(f"worker:alive:{worker_type}:{os.getpid()}", json.dumps({
+r.set(f"worker:alive:{worker_type}:{_HOSTNAME}:{os.getpid()}", json.dumps({
     "pid": os.getpid(), "ts": time.time(), "processed": count
 }), ex=30)   # TTL = 30 seconds (3× the 10s write interval)
 ```
@@ -433,12 +433,14 @@ Write intervals, TTLs, and dead thresholds per worker type:
 
 | Worker | Write interval | TTL | Dead after |
 |---|---|---|---|
-| `scheduler` | ~1 s (every loop tick) | 15 s | 20 s |
+| `scheduler` | ~1 s (every loop tick) | 30 s | 20 s |
 | `scan_worker` | 10 s | 30 s | 45 s |
 | `detail_worker` | 10 s | 30 s | 45 s |
-| `fullscan_worker` | 60 s | 180 s | 1,900 s |
+| `fullscan_worker` | 60 s | 180 s | 1,900 s (≈31 min) |
 
-TTL = 3× the write interval, so two consecutive missed writes are tolerated (Redis blip, GIL stall) before the key disappears.
+TTL = 3× the write interval for scan_worker, detail_worker, and fullscan_worker, so two consecutive missed writes are tolerated (Redis blip, GIL stall) before the key disappears. The scheduler is an exception: its TTL is 30 s despite a ~1 s write interval — the larger margin ensures the key outlives the 20 s dead-after threshold even during brief GIL stalls in the scheduler's own loop.
+
+> **fullscan_worker note:** TTL (180 s) and Dead after (1,900 s) are intentionally different. The heartbeat daemon thread writes every 60 s so the key stays alive as long as the process runs. The 1,900 s "Dead after" threshold checks the embedded `ts` field — if the timestamp is more than 31 minutes stale while the key is still present, the process is likely hung (e.g. stuck waiting on a network response). This is separate from the TTL expiry that fires ~3 minutes after the process actually dies.
 
 **Why a daemon thread — not a loop-top write:**
 
@@ -450,8 +452,8 @@ Daemon threads are hard-tied to their process. When the process exits for any re
 
 Because workers are child processes of the scheduler, the watchdog uses a two-layer approach rather than monitoring individual per-PID keys:
 
-**Layer 1 — `worker:alive:scheduler`** (fast, TTL=15s):
-The scheduler writes this key every ~1 second. If missing or stale (age > 20s), the watchdog fires an ERROR immediately and returns early — all workers are presumed dead along with their parent. No point reading pool state when the scheduler is gone.
+**Layer 1 — `worker:alive:scheduler:adaptive` and `worker:alive:scheduler:fullscan`** (fast, TTL=30s each):
+Each scheduler loop writes its own key independently every ~1 second. Checking them separately means a hung loop (e.g. `fullscan_loop` blocked on a long DB query) is detected even while the other loop is healthy — a single shared key would mask the hung loop because the surviving loop keeps refreshing it. If a key is missing or stale (age > 20s), the watchdog fires an ERROR for that loop. If **both** keys are missing, all workers are presumed dead and the watchdog returns early — no point reading pool state when the scheduler process is gone.
 
 **Layer 2 — `scheduler:health`** (rich pool state, TTL=10min):
 The scheduler publishes this JSON key on every pool event (worker death, respawn, scale up/down). It contains per-type alive counts and `consecutive_deaths` counters:
@@ -472,7 +474,12 @@ The scheduler publishes this JSON key on every pool event (worker death, respawn
 - `consecutive_deaths ≥ 3` → **WARNING** — scheduler struggling to keep workers up
 - `consecutive_deaths ≥ 5` → **ERROR** — pool cannot stabilize; startup crash loop
 
-The per-PID keys (`worker:alive:{type}:{pid}`) are scanned by the watchdog for **display only** — showing which PIDs are live in `health_check.py` output and for PEL consumer-liveness checks. No alerting decisions are made from individual per-PID keys.
+The per-PID keys (`worker:alive:{type}:{hostname}:{pid}`) serve three purposes:
+1. **Display** — `health_check.py` scans them to show which PIDs are currently alive.
+2. **PEL consumer-liveness** — the watchdog's `_consumer_pid_alive()` uses them to determine whether a stream PEL entry belongs to a still-running consumer (decides orphan vs. in-progress).
+3. **Stuck-job recovery** — `detail_worker._recover_stuck_jobs()` checks them to decide whether a peer's inflight list should be drained.
+
+No pool-level alerting decisions (crash loops, worker counts) are made from individual per-PID keys — those come from `scheduler:health`.
 
 **Responsibility split:**
 - **Scheduler** — owns worker lifecycle (spawn / replace / scale). Publishes `scheduler:health` so the watchdog can see inside.
@@ -569,12 +576,12 @@ r.xpending(stream_key, STREAM_CONSUMER_GROUP)           # total pending count
 r.xpending_range(stream_key, group, "-", "+", count=1)  # oldest entry details
 ```
 
-`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:18432` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
+`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's hostname and PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:{hostname}:{pid}` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
 
 ```text
 Consumer name:     worker-myhost-18432
-EXISTS worker:alive:scan_worker:18432  → 1 → worker is alive, job is in progress → OK
-EXISTS worker:alive:scan_worker:18432  → 0 → worker 18432 is dead → entry is orphaned
+EXISTS worker:alive:scan_worker:myhost:18432  → 1 → worker is alive, job is in progress → OK
+EXISTS worker:alive:scan_worker:myhost:18432  → 0 → worker 18432 is dead → entry is orphaned
 ```
 
 With the old shared single-type key, if worker PID 19001 was running and had overwritten the `worker:alive:scan_worker` key, the watchdog would have incorrectly concluded PID 18432 was alive because a *different* worker of the same type was alive. Per-PID keys eliminate this cross-worker false negative entirely.
@@ -603,7 +610,7 @@ The scheduler's `claim_stale_work()` function calls `XAUTOCLAIM` on every tick. 
 
 Every completed full scan builds a Redis Bloom filter (`bloom:fullscan:{company}`) containing all job IDs seen on that company's board. On the next full scan, each fetched job ID is checked against the filter before hitting PostgreSQL — if it is already in the filter, the DB check is skipped entirely. Without these filters, every full scan would need to compare tens of thousands of job IDs against the database on every cycle.
 
-Two keys per company:
+Three keys per company:
 - `bloom:fullscan:{company}` — the authoritative filter from the last *completed* scan (read-only during the current scan)
 - `bloom:fullscan:new:{company}` — being built during the current scan; promoted to the authoritative key on completion
 - `bloom:fallback:{company}` — Redis SET fallback when RedisBloom module is unavailable (exact match, more memory)
@@ -707,9 +714,9 @@ This switches Redis from RDB snapshots to **AOF (Append-Only File)** mode:
 
 **AOF file size — automatic compaction:**
 
-The AOF file grows as every operation is appended. Without compaction it would grow indefinitely — the heartbeat daemon alone writes ~1,440 entries per hour across 4 workers. Redis handles this via automatic background rewriting (`BGREWRITEAOF`):
+The AOF file grows as every operation is appended. Without compaction it would grow indefinitely — the heartbeat daemon alone writes ~360 entries per hour per worker (one every 10 s), scaling with the active worker pool size. Redis handles this via automatic background rewriting (`BGREWRITEAOF`):
 
-Redis forks a background process that looks at the current in-memory state and writes the *minimal* set of commands needed to recreate it, discarding all intermediate history. Example: 1,440 heartbeat writes collapse to 4 lines (one current value per worker).
+Redis forks a background process that looks at the current in-memory state and writes the *minimal* set of commands needed to recreate it, discarding all intermediate history. Example: thousands of heartbeat writes collapse to one line per worker (the current value only).
 
 Two control knobs set by `configure-redis.sh`:
 
@@ -718,7 +725,7 @@ auto-aof-rewrite-percentage 100   # rewrite when AOF doubles vs post-rewrite bas
 auto-aof-rewrite-min-size   64mb  # but not until the file is at least this large
 ```
 
-Both conditions must be true simultaneously. The file oscillates between the post-rewrite baseline size and roughly 2× that size — it never grows unbounded. After running `configure-redis.sh`, the 30-minute RDB check is permanently green because AOF writes continuously.
+Both conditions must be true simultaneously. The file oscillates between the post-rewrite baseline size and roughly 2× that size — it never grows unbounded. After running `configure-redis.sh`, the 30-minute RDB stale check is permanently suppressed: `check_redis_persistence()` skips the stale-RDB warning when `aof_enabled` is true, because AOF provides ~1 second durability and the `rdb_last_save_time` staleness metric is no longer meaningful.
 
 ---
 
@@ -741,7 +748,7 @@ Problem detected
 
 Deduplication prevents repeated emails for the same issue: the same alert type is suppressed for 1 hour so you do not receive a flood of identical messages between healing attempts.
 
-The watchdog can call `systemctl restart` without a password because `install-systemd.sh` adds a single narrowly-scoped sudoers rule granting exactly that one command — nothing else.
+The watchdog can call `sudo systemctl restart` without a password because `install-systemd.sh` writes a narrowly-scoped sudoers rule that grants exactly the following commands — nothing else: `systemctl reset-failed recruiter-scheduler`, `systemctl restart recruiter-scheduler`, `systemctl restart recruiter-watchdog`, `systemctl is-active recruiter-scheduler`, `systemctl is-active recruiter-watchdog`, `systemctl daemon-reload`, and `install-pipeline-units` to install unit files into `/etc/systemd/system/` for deploy-time unit sync. `install-pipeline-units` is a root-owned wrapper that reads templates from a root-owned staging directory (`/usr/local/share/mail-pipeline/systemd/`), eliminating the `sudo tee` stdin-injection risk of the older approach.
 
 ### Startup validation
 

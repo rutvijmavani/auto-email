@@ -907,10 +907,27 @@ def run_quota_report(silent_if_healthy=False):
 
 def main():
     from workers.sentry_init import init_sentry
-    init_sentry()
+    if not init_sentry():
+        logger.warning("pipeline: Sentry not initialized — error tracking disabled")
+
+    args = sys.argv[1:]
+
+    # Only --monitor-jobs / --monitor-status actively query Redis worker state;
+    # --detect-ats is DB + web scraping only, no Redis reads.
+    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status"}
+    _needs_redis = any(a in _REDIS_CMDS for a in args)
+
+    # Gmail credentials are required for all subcommands that send email.
+    # --verify-only sends a verify report; --detect-ats sends a detection report
+    # (when there are unknowns/close-calls).
+    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary", "--find-only", "--verify-only", "--detect-ats"}
+    # No-args = full pipeline (add_job + find_emails + outreach) — also needs Gmail
+    _needs_gmail = not args or any(a in _GMAIL_CMDS for a in args)
+
+    from workers.startup import validate_startup
+    validate_startup("pipeline", check_redis=_needs_redis, check_gmail=_needs_gmail)
 
     init_db()
-    args = sys.argv[1:]
 
     logger.info("pipeline.py invoked with args: %s", args)
 

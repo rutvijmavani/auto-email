@@ -35,7 +35,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from workers.redis_client import get_redis
+from workers.redis_client import get_redis, get_pubsub_redis
 from workers.adaptive import (
     update_poll_interval, load_poll_counts, dump_poll_counts,
     build_thresholds_from_scores, DEFAULT_THRESHOLDS,
@@ -260,20 +260,26 @@ def claim_stale_work(r, stream_key: str, group: str,
         logger.debug("claim_stale_work: xautoclaim error on %r: %s", stream_key, exc)
         return
 
-    # redis-py returns (next_cursor, [(msg_id, fields), ...], ...)
+    # redis-py returns (next_cursor, [(msg_id, fields), ...], [deleted_ids])
+    # The third element (deleted IDs) is present in Redis 7+ when PEL entries
+    # refer to stream messages that have been trimmed or explicitly deleted.
     if not autoclaim_result or len(autoclaim_result) < 2:
         return
+
+    # Log deleted PEL entries so operators know work was lost from the stream.
+    if len(autoclaim_result) >= 3 and autoclaim_result[2]:
+        deleted_ids = autoclaim_result[2]
+        logger.warning(
+            "claim_stale_work: %d PEL entry(ies) on %r have no backing stream "
+            "message (deleted/trimmed) — work is unrecoverable: %s",
+            len(deleted_ids), stream_key, deleted_ids,
+        )
 
     claimed = autoclaim_result[1]
     if not claimed:
         return
 
     for msg_id, fields in claimed:
-        if msg_id is None:
-            # Redis 7.0+ XAUTOCLAIM returns (None, None) for PEL entries
-            # whose stream messages were deleted.  The message is already
-            # gone — nothing to XACK; just skip.
-            continue
         if not fields:
             r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue
@@ -920,7 +926,7 @@ def _pick_schedule_time(
     scores   = sorted(float(s) for _, s in raw)
 
     # Build gaps including window-edge sentinels
-    points = [lo] + scores + [hi]
+    points = [lo, *scores, hi]
     gaps   = [
         (points[i + 1] - points[i], points[i], points[i + 1])
         for i in range(len(points) - 1)
@@ -975,8 +981,9 @@ def _pick_schedule_time(
 # around the same time), they all read the same gap and write the same score —
 # re-creating the thundering-herd problem the algorithm is designed to prevent.
 #
-# Fix: hold a short Redis lock (500 ms TTL) around the ZRANGEBYSCORE → ZADD pair
-# so at most one process selects a slot at a time.  If the lock is contended, the
+# Fix: hold a Redis lock (2 s TTL) around the ZRANGEBYSCORE → ZADD pair
+# so at most one process selects a slot at a time.  2 s covers ZRANGEBYSCORE +
+# gap selection + ZADD even under network jitter.  If the lock is contended, the
 # caller falls back to scheduling at target_ts directly — still correct, just
 # without gap detection for that one call; the next reschedule call rebalances.
 #
@@ -998,7 +1005,7 @@ def _atomic_schedule(
     tolerance_pct: float,
     *,
     deadline_ts:    Optional[float] = None,
-    avg_duration_s: float           = 30.0,
+    avg_duration_s: float           = 1800.0,
 ) -> float:
     """
     Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
@@ -1008,7 +1015,7 @@ def _atomic_schedule(
     """
     lock_key = f"scheduling:lock:{queue_key}"
     token    = f"{os.getpid()}:{time.monotonic_ns()}"
-    acquired = r.set(lock_key, token, px=500, nx=True)
+    acquired = r.set(lock_key, token, px=2000, nx=True)
     try:
         if acquired:
             score = _pick_schedule_time(
@@ -1024,26 +1031,33 @@ def _atomic_schedule(
             # Another process is scheduling — apply a deterministic per-company
             # offset so concurrent callers don't all land on the same timestamp
             # (thundering herd).  Use a hash of the company string to produce a
-            # reproducible, unique spread within ±(interval_s * 5%) of target_ts.
+            # reproducible, unique positive spread within the safe window or 0–10% of interval.
             import hashlib as _hashlib
             _hash_int = int(_hashlib.md5(company.encode(), usedforsecurity=False).hexdigest(), 16)
             if deadline_ts and (deadline_ts - avg_duration_s) > target_ts:
                 # Spread jitter within the remaining safe window so multiple
                 # concurrent lock-busy callers don't all clamp to the same score.
+                # Use purely positive jitter (0 to 10% of safe window) so the
+                # hash distributes evenly without half the values collapsing to
+                # target_ts via max(target_ts, target_ts + negative_jitter).
                 _safe_window = (deadline_ts - avg_duration_s) - target_ts
-                _jitter_s = int(
-                    (_hash_int % max(1, int(_safe_window * 0.10)))
-                    - _safe_window * 0.05
-                )
+                _jitter_s = int(_hash_int % max(1, int(_safe_window * 0.10)))
                 score = target_ts + _jitter_s
             else:
-                _jitter_s = (_hash_int % max(1, int(interval_s * 0.10))) - int(interval_s * 0.05)
+                # No safe window — jitter within 0–10% of interval so all callers
+                # spread positively away from target_ts without clamping.
+                _jitter_s = int(_hash_int % max(1, int(interval_s * 0.10)))
                 score = target_ts + _jitter_s
                 if deadline_ts:
-                    # Guard: never clamp score before target_ts — that would
-                    # violate the interval contract when the deadline is already
-                    # past (deadline_ts - avg_duration_s < target_ts).
-                    score = min(score, max(target_ts, deadline_ts - avg_duration_s))
+                    # Cap score so the scan can still finish before the digest.
+                    _upper = max(target_ts, deadline_ts - avg_duration_s)
+                    score  = min(score, _upper)
+                    # When no safe window remains before the digest, apply the same
+                    # post-digest fallback that _pick_schedule_time uses.
+                    if avg_duration_s > 0 and _upper <= target_ts:
+                        _fb_dl = _next_digest_deadline(target_ts)
+                        if target_ts + avg_duration_s >= _fb_dl:
+                            score = _fb_dl + 900
             logger.debug(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,
@@ -1118,170 +1132,21 @@ def _schedule_full_scan(company: str) -> None:
                 company, SCHEDULER_FULL_SCAN_BUFFER_S)
 
 
-# ─────────────────────────────────────────
-# FULL SCAN COMPLETION HANDLER
-# ─────────────────────────────────────────
+def _write_scheduler_heartbeat(r, loop: str, dispatched: int) -> None:
+    """Write per-loop liveness key so a hung loop is detected independently.
 
-def on_fullscan_complete(company: str, new_jobs: int,
-                         success: bool = True) -> None:
+    Key: worker:alive:scheduler:{loop}  (e.g. :adaptive or :fullscan)
+    Watchdog checks both keys; if either goes stale the loop is flagged dead
+    even while the other loop keeps the process alive.
     """
-    Called after a full scan worker completes.
-
-    Steps:
-        1. Update last_full_scan_at and schedule next_full_scan_at in DB
-        2. Re-queue company in poll:fullscan for its next cycle
-        3. If this was the FIRST full scan (last_poll_at IS NULL), bootstrap
-           the company into poll:adaptive so incremental scans begin now.
-
-    Args:
-        company:  company name
-        new_jobs: new jobs found in this scan
-        success:  False if scan failed (ATS error)
-    """
-    r   = get_redis()
-    now = time.time()
-
-    conn = get_conn()
     try:
-        row = conn.execute("""
-            SELECT last_poll_at, full_scan_interval_s, full_scan_deferred,
-                   avg_fullscan_duration_s
-            FROM company_poll_stats
-            WHERE company = %s
-        """, (company,)).fetchone()
-    finally:
-        conn.close()
-
-    if not row:
-        logger.warning("on_fullscan_complete: no poll_stats row for %r", company)
-        return
-
-    interval_s     = (row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S)
-    avg_duration_s = float(row.get("avg_fullscan_duration_s") or 30.0)
-
-    # _atomic_schedule: gap-detection + ZADD under a short Redis lock.
-    # Prevents two simultaneous fullscan completions from selecting the same slot.
-    # Also stores the score in next_fs so the DB update below can reference it.
-    next_fs = _atomic_schedule(
-        r, REDIS_POLL_FULLSCAN, company,
-        now + interval_s, interval_s, 0.20,
-        # Deadline relative to target_ts: the 7 AM that follows the scheduled slot.
-        deadline_ts    = _next_digest_deadline(now + interval_s),
-        avg_duration_s = avg_duration_s,
-    )
-
-    if success:
-        conn = get_conn()
-        try:
-            conn.execute("""
-                UPDATE company_poll_stats
-                SET last_full_scan_at  = CURRENT_TIMESTAMP,
-                    next_full_scan_at  = %s,
-                    full_scan_deferred = FALSE,
-                    updated_at         = CURRENT_TIMESTAMP
-                WHERE company = %s
-            """, (datetime.fromtimestamp(next_fs), company))
-            conn.commit()
-        finally:
-            conn.close()
-        # Note: r.zadd already done inside _atomic_schedule above
-        logger.info(
-            "on_fullscan_complete: company=%r new_jobs=%d "
-            "next_fullscan=+%.1fh (slot offset from ideal: %+.0fs) success=True",
-            company, new_jobs,
-            (next_fs - now) / 3600,
-            next_fs - (now + interval_s),
-        )
-
-        # ── Bootstrap new companies into WARMING after their first full scan ────
-        # last_poll_at IS NULL means no adaptive scan has ever run for this
-        # company — it entered through the fullscan-first path.
-        # New design: start WARMING (3 polls at fixed 2h interval) rather than
-        # jumping straight into the adaptive engine with no history.
-        if row["last_poll_at"] is None:
-            _bootstrap_warming(company, r, now)
-    else:
-        # On failure: reschedule full scan with a 1-hour retry
-        retry_delay = 3600
-        r.zadd(REDIS_POLL_FULLSCAN, {company: now + retry_delay})
-        logger.warning(
-            "on_fullscan_complete: company=%r FAILED — "
-            "retrying full scan in %ds",
-            company, retry_delay,
-        )
-
-
-# ─────────────────────────────────────────
-# WARMING BOOTSTRAP
-# ─────────────────────────────────────────
-
-def _bootstrap_warming(company: str, r, now: float) -> None:
-    """
-    Bootstrap a brand-new company into the WARMING lifecycle after its first
-    full scan completes (last_poll_at IS NULL).
-
-    Steps:
-        1. Read initial_slot_offset_s from DB (set at registration time).
-           Fall back to slot_offset(company_id) if column is NULL (legacy rows).
-        2. first_poll_at = now + initial_slot_offset_s.
-           Spreads new companies across the next 24 h window from now —
-           no midnight anchoring, no daily wave.
-        3. Write warming_polls_remaining=WARMING_POLLS_COUNT + next_poll_at to DB.
-        4. ZADD company to poll:adaptive at first_poll_at.
-    """
-    from workers.slot import slot_offset
-
-    # Fetch initial_slot_offset_s and company id from DB
-    conn = get_conn()
-    try:
-        row = conn.execute("""
-            SELECT id, initial_slot_offset_s
-            FROM company_poll_stats
-            WHERE company = %s
-        """, (company,)).fetchone()
-    finally:
-        conn.close()
-
-    if row and row["initial_slot_offset_s"] is not None:
-        offset_s = int(row["initial_slot_offset_s"])
-    elif row:
-        # Legacy row without initial_slot_offset_s — compute from company ID
-        offset_s = slot_offset(row["id"])
-        logger.debug(
-            "_bootstrap_warming: %r has no initial_slot_offset_s — "
-            "using slot_offset(id=%d) = %ds",
-            company, row["id"], offset_s,
-        )
-    else:
-        # No stats row yet — use a hash of the company name as fallback
-        offset_s = slot_offset(company)
-
-    # Spread across the next 24 h from now — always in the future.
-    first_poll_at = now + offset_s
-    first_poll_dt = datetime.fromtimestamp(first_poll_at)
-
-    conn = get_conn()
-    try:
-        conn.execute("""
-            UPDATE company_poll_stats
-            SET warming_polls_remaining = %s,
-                next_poll_at            = %s,
-                updated_at              = CURRENT_TIMESTAMP
-            WHERE company = %s
-        """, (WARMING_POLLS_COUNT, first_poll_dt, company))
-        conn.commit()
-    finally:
-        conn.close()
-
-    r.zadd(REDIS_POLL_ADAPTIVE, {company: first_poll_at})
-
-    logger.info(
-        "on_fullscan_complete: WARMING bootstrap for %r — "
-        "warming_polls=%d first_poll_in=%.1fh (offset=%ds)",
-        company, WARMING_POLLS_COUNT,
-        offset_s / 3600,
-        offset_s,
-    )
+        r.set(f"worker:alive:scheduler:{loop}", json.dumps({
+            "pid":        os.getpid(),
+            "ts":         time.time(),
+            "dispatched": dispatched,
+        }), ex=30)
+    except Exception as _hb_err:
+        logger.debug("scheduler: %s_loop heartbeat write failed: %s", loop, _hb_err)
 
 
 # ─────────────────────────────────────────
@@ -1325,18 +1190,13 @@ def adaptive_loop() -> None:
 
     while True:
         try:
-            # ── Scheduler heartbeat (worker:alive:scheduler) ──────────────────
-            # Tick is 1s; TTL = 15s.  Watchdog alerts if scheduler loop stops
-            # for more than 15 seconds (paused state still writes this key).
-            try:
-                r.set("worker:alive:scheduler", json.dumps({
-                    "pid":        os.getpid(),
-                    "ts":         time.time(),
-                    "dispatched": _hw_dispatched,
-                }), ex=15)
-            except Exception as exc:
-                # Non-fatal — heartbeat key will expire and watchdog will alert.
-                logger.debug("scheduler: heartbeat write failed: %s", exc)
+            # ── Scheduler heartbeat (worker:alive:scheduler:adaptive) ─────────
+            # Tick is 1s; TTL = 30s.  Written at top of every iteration so
+            # the key stays live even when no companies are due and during
+            # pause periods.  Watchdog compares this key independently from
+            # worker:alive:scheduler:fullscan so a hung adaptive_loop is
+            # detected even while fullscan_loop is still healthy.
+            _write_scheduler_heartbeat(r, "adaptive", _hw_dispatched)
 
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
@@ -1365,14 +1225,7 @@ def adaptive_loop() -> None:
             for company in due:
                 # Refresh heartbeat at the start of each iteration so backpressure
                 # or outage `continue` branches don't let the 15s TTL expire.
-                try:
-                    r.set("worker:alive:scheduler", json.dumps({
-                        "pid":        os.getpid(),
-                        "ts":         time.time(),
-                        "dispatched": _hw_dispatched,
-                    }), ex=15)
-                except Exception as _hb_err:
-                    logger.warning("adaptive_loop: heartbeat refresh failed: %s", _hb_err)
+                _write_scheduler_heartbeat(r, "adaptive", _hw_dispatched)
 
                 # ── Backpressure: detail queue overloaded ─────────────────────
                 depth = r.llen(REDIS_DETAIL_ADAPTIVE)
@@ -1519,8 +1372,17 @@ def fullscan_loop() -> None:
     import socket as _socket
     scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
+    _hw_dispatched = 0   # total fullscan dispatches — reported in heartbeat
+
     while True:
         try:
+            # ── Scheduler heartbeat (worker:alive:scheduler:fullscan) ─────────
+            # Written at the TOP of every iteration — before the pause check and
+            # before the due-company loop — so the key stays live even when no
+            # fullscans are due (the common case).  Without this, the key would
+            # expire after 15 idle ticks and trigger a false dead-loop alert.
+            _write_scheduler_heartbeat(r, "fullscan", _hw_dispatched)
+
             if _pause_event.is_set():
                 time.sleep(SCHEDULER_TICK_SECS)
                 _check_auto_resume()
@@ -1544,15 +1406,9 @@ def fullscan_loop() -> None:
                                   withscores=False)
 
             for company in due:
-                # Refresh heartbeat so backpressure `continue` branches don't
-                # let the 15s TTL expire when many companies are due at once.
-                try:
-                    r.set("worker:alive:scheduler", json.dumps({
-                        "pid": os.getpid(),
-                        "ts":  time.time(),
-                    }), ex=15)
-                except Exception as _hb_err:
-                    logger.warning("fullscan_loop: heartbeat refresh failed: %s", _hb_err)
+                # Refresh mid-loop so a large due-list doesn't let the TTL
+                # expire between the top-of-loop write and the last dispatch.
+                _write_scheduler_heartbeat(r, "fullscan", _hw_dispatched)
 
                 # Backpressure: fullscan detail queue overloaded
                 depth = r.llen(REDIS_DETAIL_FULLSCAN)
@@ -1581,6 +1437,7 @@ def fullscan_loop() -> None:
                     approximate=True,
                 )
                 r.zrem(REDIS_POLL_FULLSCAN, company)
+                _hw_dispatched += 1
 
                 logger.info(
                     "fullscan_loop: dispatched %r to %s (dc=%s)",
@@ -1595,53 +1452,6 @@ def fullscan_loop() -> None:
         except Exception as exc:
             logger.error("fullscan_loop: error: %s", exc, exc_info=True)
             time.sleep(5)
-
-
-# ─────────────────────────────────────────
-# RESULT CONSUMER (reads scan:results)
-# ─────────────────────────────────────────
-
-def result_consumer_loop() -> None:
-    """
-    Reads completion events from scan:results and routes to the correct
-    completion handler based on scan_type.
-
-    Runs continuously alongside the adaptive dispatch loop.
-    """
-    r = get_redis()
-    logger.info("result_consumer_loop: started")
-
-    while True:
-        try:
-            item = r.brpop("scan:results", timeout=5)
-            if item is None:
-                continue
-
-            _, raw = item
-            result = json.loads(raw)
-
-            company   = result.get("company", "")
-            new_jobs  = result.get("new_jobs", 0)
-            success   = result.get("success", False)
-            scan_type = result.get("scan_type", "adaptive")
-
-            if scan_type == "adaptive" and company:
-                on_adaptive_complete(company, new_jobs, success)
-            elif scan_type == "fullscan" and company:
-                on_fullscan_complete(company, new_jobs, success)
-            elif company:
-                logger.warning(
-                    "result_consumer_loop: unknown scan_type=%r company=%r — "
-                    "dropping result",
-                    scan_type, company,
-                )
-
-        except KeyboardInterrupt:
-            logger.info("result_consumer_loop: stopping")
-            break
-        except Exception as exc:
-            logger.error("result_consumer_loop: error: %s", exc, exc_info=True)
-            time.sleep(1)
 
 
 # ─────────────────────────────────────────
@@ -1660,24 +1470,35 @@ def pubsub_listener_loop() -> None:
     within ~1s of a resume signal rather than spinning on a fixed sleep.
     _check_auto_resume() can also clear _pause_event / set _resume_event if
     the cronchain heartbeat expires (safety net against permanent pause).
-    """
-    r      = get_redis()
-    pubsub = r.pubsub()
-    pubsub.subscribe(REDIS_PAUSE_CHANNEL, REDIS_RESUME_CHANNEL)
-    logger.info("pubsub_listener: subscribed to pause/resume channels")
 
-    for message in pubsub.listen():
-        if message["type"] != "message":
-            continue
-        channel = message["channel"]
-        if channel == REDIS_PAUSE_CHANNEL:
-            logger.info("pubsub_listener: PAUSE received — halting dispatchers")
-            _pause_event.set()
-            _resume_event.clear()
-        elif channel == REDIS_RESUME_CHANNEL:
-            logger.info("pubsub_listener: RESUME received — resuming dispatchers")
-            _resume_event.set()
-            _pause_event.clear()
+    Uses get_message(timeout=5) instead of listen() so a silently wedged TCP
+    session is detected within 5 s and the subscription is re-established.
+    """
+    import time as _time
+    while True:
+        try:
+            r      = get_pubsub_redis()
+            pubsub = r.pubsub()
+            pubsub.subscribe(REDIS_PAUSE_CHANNEL, REDIS_RESUME_CHANNEL)
+            logger.info("pubsub_listener: subscribed to pause/resume channels")
+            while True:
+                message = pubsub.get_message(timeout=5.0)
+                if message is None or message["type"] != "message":
+                    continue
+                channel = message["channel"]
+                if channel == REDIS_PAUSE_CHANNEL:
+                    logger.info("pubsub_listener: PAUSE received — halting dispatchers")
+                    _pause_event.set()
+                    _resume_event.clear()
+                elif channel == REDIS_RESUME_CHANNEL:
+                    logger.info("pubsub_listener: RESUME received — resuming dispatchers")
+                    _resume_event.set()
+                    _pause_event.clear()
+        except Exception as _ps_err:
+            logger.warning(
+                "pubsub_listener: connection lost (%s) — reconnecting in 5s", _ps_err
+            )
+            _time.sleep(5)
 
 
 def _check_auto_resume() -> None:

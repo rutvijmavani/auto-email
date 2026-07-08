@@ -157,9 +157,43 @@ return 1
 """
 
 
-_MAX_DETAIL_RETRIES  = 5
-_RETRY_KEY_PREFIX    = "detail:retry:"
-_RETRY_KEY_TTL       = 86400 * 7   # 7 days — auto-expires if job never comes back
+_MAX_DETAIL_RETRIES    = 5
+_RETRY_KEY_PREFIX      = "detail:retry:"
+_RETRY_KEY_TTL         = 86400 * 7   # 7 days — auto-expires if job never comes back
+_MAX_RETRY_DELAY_S     = 60          # cap exponential backoff at 60 seconds
+_RETRY_DELAY_KEY_SUFFIX = ":retry_delay"  # appended to source queue key
+
+# Move one item from the inflight list into the retry-delay ZSET atomically.
+# LREM-then-ZADD: if the item is gone (concurrent drain/ack), skip the ZADD
+# so the item is not added to the delay ZSET without a corresponding removal.
+#
+# KEYS[1] = delay_zset_key   KEYS[2] = inflight_key
+# ARGV[1] = score (eligible unix timestamp)   ARGV[2] = item payload
+_ATOMIC_DELAY_REQUEUE_LUA = """
+local removed = redis.call('LREM', KEYS[2], 1, ARGV[2])
+if removed > 0 then
+    redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
+end
+return removed
+"""
+
+# Drain retry-delayed items from the delay ZSET back into their source queue.
+# Called at the top of the main loop so eligible items are visible before the
+# next pop.  Fully atomic: ZRANGEBYSCORE + RPUSH + ZREM in one Redis eval().
+#
+# KEYS[1] = delay_zset_key   KEYS[2] = source_queue_key   ARGV[1] = now (unix ts)
+_ATOMIC_DRAIN_RETRY_LUA = """
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+local count = 0
+for _, item in ipairs(due) do
+    redis.call('RPUSH', KEYS[2], item)
+    redis.call('ZREM', KEYS[1], item)
+    count = count + 1
+end
+return count
+"""
+
+_DRAIN_RETRY_BATCH = 50   # max items drained per Lua eval to avoid monopolising Redis
 
 
 def _recover_stuck_jobs(r, own_token: str) -> None:
@@ -170,17 +204,18 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
     Safety contract:
       • own_token is always skipped — this worker has no heartbeat yet so it
         would look "dead" from the outside; never touch your own key.
-      • A peer whose heartbeat key (worker:alive:detail_worker:{pid}) is still
-        present is considered alive — skip its key entirely.
+      • A peer whose heartbeat key (worker:alive:detail_worker:{hostname}:{pid})
+        is still present is considered alive — skip its key entirely.
       • Only drain keys whose owning worker has NO heartbeat (confirmed dead).
 
-    Token format: "{hostname}:{pid}" — guards against PID reuse across hosts
-    when multiple machines share the same Redis.  Legacy keys that used a bare
-    "{pid}" suffix are still handled: the PID is always the last colon component.
+    Token format: "{hostname}:{pid}" for inflight key uniqueness.  Heartbeat keys
+    use the same token (worker:alive:detail_worker:{hostname}:{pid}), so the
+    full peer_token maps directly to the heartbeat key with no parsing needed.
 
     Drain is atomic per item via _ATOMIC_DRAIN_LUA:
-      LINDEX (peek) → retry check → Lua(RPOP + optional RPUSH / discard)
-    This prevents live workers from stealing over-retry items during recovery.
+      LINDEX (peek) → Lua(RPOP from inflight + RPUSH to source queue)
+    Recovery from a dead peer is never treated as a retry attempt — the job
+    was never processed.  Retry budgeting happens in run_worker/_process_detail.
     """
     for queue_key, source_key in [
         (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_ADAPTIVE),
@@ -201,26 +236,23 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     )
                     continue
 
-                # Full worker token (supports "hostname:pid" and legacy "pid")
+                # Full worker token ("hostname:pid" or legacy "pid")
                 peer_token = key[len(_prefix):]
 
                 # Never touch our own in-flight key
                 if peer_token == own_token:
                     continue
 
-                # Extract PID for heartbeat lookup (last colon component)
-                try:
-                    peer_pid = int(peer_token.rsplit(":", 1)[-1])
-                except ValueError:
-                    logger.warning(
-                        "detail_worker: cannot extract PID from inflight key %r "
-                        "— skipping",
-                        key,
-                    )
-                    continue
-
-                # Skip peers with a live heartbeat
-                hb_key = f"worker:alive:detail_worker:{peer_pid}"
+                # Skip peers with a live heartbeat.
+                # The Heartbeat class writes worker:alive:{type}:{hostname}:{pid} (no
+                # epoch).  peer_token from new-format inflight keys is hostname:pid:epoch,
+                # so strip the epoch before building the lookup key.  Without stripping,
+                # every live new-format peer appears dead and its inflight jobs are
+                # incorrectly drained.  PID-reuse protection comes from own_token
+                # comparison above (which uses the full epoch-bearing token).
+                _hb_parts = peer_token.split(":")
+                _hb_token = ":".join(_hb_parts[:2]) if len(_hb_parts) >= 3 else peer_token
+                hb_key = f"worker:alive:detail_worker:{_hb_token}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "
@@ -229,15 +261,13 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     )
                     continue
 
-                # Peer is dead — drain atomically so no live worker can steal
-                # an over-retry item between the move and the discard decision.
+                # Peer is dead — drain atomically so no concurrent drain worker
+                # can steal an item between peek and pop.
                 # Algorithm per item:
                 #   1. LINDEX (peek rightmost, non-destructive)
-                #   2. Increment retry counter, decide recover vs discard
-                #   3. Lua: RPOP from inflight + RPUSH to source (or discard)
+                #   2. Lua: RPOP from inflight + RPUSH to source
                 #      Returns 0 if item changed (concurrent drain) → re-loop.
                 recovered = 0
-                discarded = 0
                 while True:
                     raw_peek = r.lindex(key, -1)
                     if raw_peek is None:
@@ -252,61 +282,29 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     except Exception:
                         _job_id = _company = ""
 
-                    should_recover = True
-                    if _job_id:
-                        _rkey = (
-                            f"{_RETRY_KEY_PREFIX}{_company}:{_job_id}"
-                            if _company else
-                            f"{_RETRY_KEY_PREFIX}{_job_id}"
-                        )
-                        try:
-                            _attempt = int(r.incr(_rkey))
-                            r.expire(_rkey, _RETRY_KEY_TTL)
-                        except Exception:
-                            _attempt = 1   # safe default: allow retry
-
-                        if _attempt > _MAX_DETAIL_RETRIES:
-                            logger.error(
-                                "detail_worker: job_id=%s company=%r exceeded "
-                                "%d retries — discarding permanently",
-                                _job_id, _company, _MAX_DETAIL_RETRIES,
-                            )
-                            should_recover = False
+                    # Recovery from a dead peer's inflight is not a retry attempt —
+                    # the job was never actually processed.  Always requeue (mode=1)
+                    # so the retry budget is only charged in the main run_worker loop
+                    # when _process_detail() actually fails with retryable=True.
 
                     # Atomically pop from inflight; push to source only if recovering.
                     # If another drain worker already consumed this item, Lua returns 0
                     # and we re-loop to pick up the next item.
                     _moved = r.eval(
                         _ATOMIC_DRAIN_LUA, 2, key, source_key,
-                        raw_peek, "1" if should_recover else "0",
+                        raw_peek, "1",   # always recover (mode=1 → RPUSH to source)
                     )
                     if not _moved:
                         # Concurrent drain took the item — re-loop to get next
                         continue
 
-                    if not should_recover:
-                        try:
-                            delete_pending_detail(_company, _job_id)
-                        except Exception as _db_err:
-                            logger.error(
-                                "detail_worker: delete_pending_detail "
-                                "failed for %s: %s", _job_id, _db_err,
-                            )
-                        discarded += 1
-                    else:
-                        recovered += 1
+                    recovered += 1
 
                 if recovered:
                     logger.warning(
                         "detail_worker: recovered %d stuck job(s) from "
                         "dead peer token=%s: %s -> %s",
                         recovered, peer_token, key, source_key,
-                    )
-                if discarded:
-                    logger.error(
-                        "detail_worker: permanently discarded %d job(s) from "
-                        "dead peer token=%s (exceeded %d retries)",
-                        discarded, peer_token, _MAX_DETAIL_RETRIES,
                     )
 
             if cursor == 0:
@@ -318,7 +316,9 @@ def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     Priority-aware pop with at-least-once guarantee via inflight list.
 
     1. Try non-blocking LMOVE from adaptive first (high priority).
-    2. If adaptive is empty, try non-blocking LMOVE from fullscan.
+    2. If adaptive is empty, block on BLMOVE from fullscan for up to 1 s,
+       then re-check adaptive.  This avoids a busy-poll loop while still
+       picking up adaptive items within ~1 s of enqueue.
     3. If both empty, sleep briefly and retry until timeout.
 
     Returns (source_queue_key, raw_payload) or None on timeout.
@@ -328,22 +328,23 @@ def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     a successful DB write (LREM in the main loop).
     """
     deadline = time.monotonic() + timeout
-    poll_interval = 0.2   # seconds between empty-queue polls
 
     while time.monotonic() < deadline:
-        # ── Adaptive first (high priority) ───────────────────────────────────
+        # ── Adaptive first (high priority, non-blocking) ──────────────────────
         raw = r.lmove(REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE, "RIGHT", "LEFT")
         if raw is not None:
             return (REDIS_DETAIL_ADAPTIVE, raw)
 
-        # ── Fullscan fallback (low priority) ─────────────────────────────────
-        raw = r.lmove(REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN, "RIGHT", "LEFT")
+        # ── Fullscan fallback — block for up to 1 s ───────────────────────────
+        # Use BLMOVE so we yield the thread while waiting rather than busy-polling.
+        # Cap the wait at 1 s so adaptive items are re-checked frequently.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait_s = min(1.0, remaining)
+        raw = r.blmove(REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN, wait_s, "RIGHT", "LEFT")
         if raw is not None:
             return (REDIS_DETAIL_FULLSCAN, raw)
-
-        # ── Both empty — wait briefly before next poll ────────────────────────
-        remaining = deadline - time.monotonic()
-        time.sleep(min(poll_interval, max(0, remaining)))
 
     return None
 
@@ -457,9 +458,11 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 delete_pending_detail(company, job_id)
             except Exception as _del_err:
                 logger.error(
-                    "detail_worker: delete_pending_detail failed for %s: %s",
+                    "detail_worker: delete_pending_detail failed for %s: %s — "
+                    "leaving in inflight for retry when DB recovers",
                     job_id, _del_err,
                 )
+                result["retryable"] = True  # keep item in inflight until cleanup succeeds
             return result
 
         # slug_info comes serialized in the queue payload (str or dict)
@@ -809,18 +812,19 @@ def run_worker(once: bool = False, shutdown_event=None,
     """
     Main detail fetch worker loop.
 
-    BRPOPs payloads from [queue:detail:adaptive, queue:detail:fullscan].
-    Redis BRPOP with a list of keys pops from the first non-empty key —
-    adaptive queue is listed first so it always has priority.
+    Pops payloads from queue:detail:adaptive and queue:detail:fullscan using
+    _pop_with_inflight(), which atomically moves each item into a per-worker
+    inflight list (inflight:detail_worker:{hostname}:{pid}) before processing.
+
+    On shutdown, _ATOMIC_REQUEUE_LUA moves any in-progress item back to the
+    front of its source queue so it is not lost.  On startup,
+    _recover_stuck_jobs() scans peer inflight keys and requeues items from
+    workers whose heartbeat has expired.
 
     Args:
         once:           if True, process at most one job then exit.
         shutdown_event: multiprocessing.Event set by the scheduler when this
-                        worker should stop. Checked after BRPOP returns.
-                        If set, the payload is pushed back to the front of the
-                        source queue (LPUSH) so it is not lost — detail jobs
-                        do not use exponential backoff since the issue is
-                        worker count, not a platform error for this job.
+                        worker should stop. Checked after each pop attempt.
         skip_init_db:   if True, skip the init_db() call (used when the
                         scheduler parent process already ran it before fork).
     """
@@ -848,9 +852,11 @@ def run_worker(once: bool = False, shutdown_event=None,
     # when the scheduler imports this module before spawning workers.
     global _INFLIGHT_ADAPTIVE, _INFLIGHT_FULLSCAN, _INFLIGHT_KEY
     own_pid   = os.getpid()
-    # Include hostname so PID reuse on a different host cannot accidentally match
-    # a live peer's inflight key when multiple machines share the same Redis.
-    own_token          = f"{socket.gethostname()}:{own_pid}"
+    # Include hostname and a boot epoch so PID reuse (same host, same PID, new
+    # process) does not collide with a dead peer's inflight key.  The epoch is
+    # monotonic-ns captured here (inside the forked process) rather than at
+    # module-import time, so each worker process gets a unique value.
+    own_token          = f"{socket.gethostname()}:{own_pid}:{time.monotonic_ns()}"
     _INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{own_token}"
     _INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight:{own_token}"
     _INFLIGHT_KEY      = {
@@ -859,7 +865,13 @@ def run_worker(once: bool = False, shutdown_event=None,
     }
 
     # ── Recover any jobs left in inflight lists from dead peer workers ────────
-    _recover_stuck_jobs(r, own_token)
+    try:
+        _recover_stuck_jobs(r, own_token)
+    except Exception as _startup_rec_exc:
+        logger.warning(
+            "detail_worker: startup peer recovery failed (%s) — continuing",
+            _startup_rec_exc,
+        )
 
     logger.info(
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
@@ -886,20 +898,44 @@ def run_worker(once: bool = False, shutdown_event=None,
     # _PEER_RECOVERY_INTERVAL_S so stranded inflight jobs are reclaimed quickly
     # without adding meaningful overhead (SCAN returns empty in the common case).
     _PEER_RECOVERY_INTERVAL_S = 300   # 5 minutes
-    _last_peer_recovery = time.time()
+    _last_peer_recovery = time.monotonic()
 
     while True:
         try:
             # ── Periodic dead-peer recovery ───────────────────────────────────
-            _now_mono = time.time()
+            _now_mono = time.monotonic()
             if _now_mono - _last_peer_recovery >= _PEER_RECOVERY_INTERVAL_S:
                 try:
-                    _recover_stuck_jobs(r, own_pid)
+                    _recover_stuck_jobs(r, own_token)
                 except Exception as _rec_exc:
                     logger.warning(
                         "detail_worker: periodic peer recovery failed: %s", _rec_exc
                     )
                 _last_peer_recovery = _now_mono
+
+            # ── Restore backoff-delayed retry items that are now eligible ────────
+            # Items that hit transient errors are held in a per-source delay ZSET
+            # (score = eligible unix timestamp) to prevent tight retry loops.
+            # This drain runs before every pop so eligible items re-enter the
+            # source queue just in time for the next LMOVE.
+            _drain_now = time.time()
+            for _d_src in (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN):
+                _d_key = f"{_d_src}{_RETRY_DELAY_KEY_SUFFIX}"
+                try:
+                    _d_moved = r.eval(
+                        _ATOMIC_DRAIN_RETRY_LUA, 2, _d_key, _d_src,
+                        str(_drain_now), str(_DRAIN_RETRY_BATCH)
+                    )
+                    if _d_moved:
+                        logger.debug(
+                            "detail_worker: restored %d delayed retry item(s) "
+                            "from %s → %s",
+                            _d_moved, _d_key, _d_src,
+                        )
+                except Exception as _d_err:
+                    logger.debug(
+                        "detail_worker: retry drain failed for %s: %s", _d_key, _d_err
+                    )
 
             # ── At-least-once pop via LMOVE inflight list ─────────────────────
             # Moves item atomically: source_queue → inflight list.
@@ -930,12 +966,20 @@ def run_worker(once: bool = False, shutdown_event=None,
             # has its own per-PID inflight key, so there is only ever one item
             # in this key at a time.  LREM is semantically clearer and safe.
             if shutdown_event is not None and shutdown_event.is_set():
-                r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
-                logger.info(
-                    "detail_worker: shutdown (pre-process), atomically returned "
-                    "job to %s — exiting",
-                    source_queue,
-                )
+                try:
+                    r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
+                    logger.info(
+                        "detail_worker: shutdown (pre-process), atomically returned "
+                        "job to %s — exiting",
+                        source_queue,
+                    )
+                except Exception as _requeue_exc:
+                    logger.error(
+                        "detail_worker: shutdown requeue failed — item may be stranded "
+                        "in inflight and requires peer recovery on next startup: %s",
+                        _requeue_exc,
+                    )
+                    _hb.stop()
                 break
 
             try:
@@ -946,7 +990,15 @@ def run_worker(once: bool = False, shutdown_event=None,
                     "detail_worker: bad JSON in %s: %s | raw=%r",
                     source_queue, exc, raw[:200],
                 )
-                r.lrem(inflight_key, 1, raw)   # discard — retrying won't help
+                try:
+                    r.lrem(inflight_key, 1, raw)
+                except Exception as _lrem_err:
+                    logger.error(
+                        "detail_worker: lrem failed for malformed item — "
+                        "leaving in inflight; exiting for recovery: %s", _lrem_err,
+                    )
+                    _hb.stop()
+                    break
                 if once:
                     break
                 continue
@@ -963,26 +1015,92 @@ def run_worker(once: bool = False, shutdown_event=None,
             # filtered, and known-permanent errors where _finish() already
             # deleted the pending_detail DB row.  These are acknowledged.
             if result.get("retryable"):
-                logger.warning(
-                    "detail_worker: transient error — leaving job_id=%s "
-                    "company=%r in inflight; exiting so _recover_stuck_jobs() "
-                    "can reclaim it on the next startup",
-                    result.get("job_id"), result.get("company"),
-                )
-                # Stop the heartbeat daemon BEFORE deleting the key so the
-                # thread cannot recreate it after deletion (race window).
-                _hb.stop()
-                # Delete our heartbeat key immediately so a respawned worker
-                # that starts before the TTL expires can still reclaim this
-                # inflight item via _recover_stuck_jobs() without waiting 30s.
-                try:
-                    r.delete(f"worker:alive:detail_worker:{os.getpid()}")
-                except Exception as _hb_del_err:
-                    logger.error(
-                        "detail_worker: failed to delete heartbeat key: %s",
-                        _hb_del_err,
+                # Charge the retry budget here — not in recovery — so only real
+                # processing failures count against the limit.
+                _r_job_id  = result.get("job_id", "")
+                _r_company = result.get("company", "")
+                _r_discard = False
+                _backoff_s = 2   # default backoff when attempt count unavailable
+                if _r_job_id:
+                    _rkey = (
+                        f"{_RETRY_KEY_PREFIX}{_r_company}|{_r_job_id}"
+                        if _r_company else
+                        f"{_RETRY_KEY_PREFIX}{_r_job_id}"
                     )
-                break
+                    try:
+                        _attempt = int(r.incr(_rkey))
+                        r.expire(_rkey, _RETRY_KEY_TTL)
+                        if _attempt > _MAX_DETAIL_RETRIES:
+                            logger.error(
+                                "detail_worker: job_id=%s company=%r exceeded "
+                                "%d retries — discarding permanently",
+                                _r_job_id, _r_company, _MAX_DETAIL_RETRIES,
+                            )
+                            try:
+                                delete_pending_detail(_r_company, _r_job_id)
+                            except Exception as _dp_err:
+                                logger.error(
+                                    "detail_worker: delete_pending_detail "
+                                    "failed for %s: %s — delay-requeueing so "
+                                    "_ATOMIC_DRAIN_RETRY_LUA can retry cleanup",
+                                    _r_job_id, _dp_err,
+                                )
+                                # Do NOT set _r_discard — let the item fall through
+                                # to the delay-requeue path so inflight_key is
+                                # cleared atomically and the item can be retried.
+                                _backoff_s = _MAX_RETRY_DELAY_S
+                            else:
+                                # DB row removed — safe to drop from inflight and clear retry counter.
+                                r.lrem(inflight_key, 1, raw)
+                                try:
+                                    r.delete(_rkey)
+                                except Exception as _del_err:
+                                    logger.debug("detail_worker: retry counter delete failed for %s: %s", _rkey, _del_err)
+                                _r_discard = True
+                        else:
+                            # Exponential backoff: 1s, 2s, 4s, 8s, 16s … capped.
+                            _backoff_s = min(2 ** (_attempt - 1), _MAX_RETRY_DELAY_S)
+                    except Exception as _cnt_err:
+                        logger.warning(
+                            "detail_worker: retry counter failed for %s: %s "
+                            "— allowing retry",
+                            _r_job_id, _cnt_err,
+                        )
+                if _r_discard:
+                    if once:
+                        break
+                    continue
+
+                # Delay-requeue: add to the per-source delay ZSET with
+                # score = eligible timestamp so the item is NOT immediately
+                # eligible for the next LMOVE pop. The drainer restores it
+                # once the backoff window expires.
+                _delay_key = f"{source_queue}{_RETRY_DELAY_KEY_SUFFIX}"
+                logger.warning(
+                    "detail_worker: transient error — delay-requeueing "
+                    "job_id=%s company=%r (backoff=%ds)",
+                    _r_job_id, _r_company, _backoff_s,
+                )
+                try:
+                    # Atomic: LREM from inflight then ZADD to delay ZSET.
+                    # If either step fails the script rolls back — item stays
+                    # in inflight for recovery on next startup.
+                    r.eval(
+                        _ATOMIC_DELAY_REQUEUE_LUA, 2,
+                        _delay_key, inflight_key,
+                        str(time.time() + _backoff_s), raw,
+                    )
+                except Exception as _rq_err:
+                    logger.error(
+                        "detail_worker: delay-requeue failed for %s: %s "
+                        "— item stays in inflight; exiting for peer recovery",
+                        _r_job_id, _rq_err,
+                    )
+                    _hb.stop()
+                    break
+                if once:
+                    break
+                continue
             else:
                 try:
                     r.lrem(inflight_key, 1, raw)
@@ -997,6 +1115,22 @@ def run_worker(once: bool = False, shutdown_event=None,
                     )
                     _hb.stop()
                     break
+                else:
+                    # Clear retry counter so a future re-enqueue of the same
+                    # job_id starts with a fresh budget rather than inheriting
+                    # stale attempt count from a previous failure run.
+                    _ack_job_id = payload.get("job_id", "")
+                    if _ack_job_id:
+                        _ack_company = payload.get("company", "")
+                        _ack_rkey = (
+                            f"{_RETRY_KEY_PREFIX}{_ack_company}|{_ack_job_id}"
+                            if _ack_company else
+                            f"{_RETRY_KEY_PREFIX}{_ack_job_id}"
+                        )
+                        try:
+                            r.delete(_ack_rkey)
+                        except Exception as _del_err:
+                            logger.debug("detail_worker: ack retry counter delete failed for %s: %s", _ack_rkey, _del_err)
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]

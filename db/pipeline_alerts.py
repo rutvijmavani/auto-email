@@ -401,7 +401,11 @@ def check_api_health():
                     platform
                 )
                 continue
-        except (TypeError, ValueError, KeyError):
+        except (TypeError, ValueError, KeyError) as _date_err:
+            logger.warning(
+                "check_api_health: platform=%s malformed date data, skipping: %s",
+                platform, _date_err,
+            )
             continue
 
         # Check if all N consecutive days are above threshold

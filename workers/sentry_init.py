@@ -30,12 +30,12 @@ How fingerprinting works:
   (filename + line number).  This is more stable than text-pattern matching
   in log files because variable-length error messages don't affect it.
 
-  Example fingerprint inputs:
-    TypeError   + db/pipeline_alerts.py:385   →  md5("TypeError:pipeline_alerts.py:385")[:16]
-    DataError   + workers/scheduler.py:268    →  md5("DataError:scheduler.py:268")[:16]
+  Example fingerprint inputs (full relative path + line, hashed with SHA-256):
+    TypeError   + db/pipeline_alerts.py:385   →  sha256("TypeError:db/pipeline_alerts.py:385")[:16]
+    DataError   + workers/scheduler.py:268    →  sha256("DataError:workers/scheduler.py:268")[:16]
 
 Setup:
-  1. pip install sentry-sdk loguru-sentry-handler   (or: sentry-sdk[loguru])
+  1. pip install sentry-sdk
   2. Add SENTRY_DSN=https://xxx@oYYY.ingest.sentry.io/ZZZ  to .env
   3. Call init_sentry() at the top of each entry point (before any work).
 
@@ -48,6 +48,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -87,7 +88,16 @@ def _fingerprint(event: dict) -> Optional[str]:
     try:
         exc_values = (event.get("exception") or {}).get("values") or []
         if not exc_values:
-            return None                           # non-exception event
+            # Non-exception event (e.g. logger.error() via LoggingIntegration).
+            # Build a stable fingerprint from level + logger + message prefix so
+            # repeated plain-error logs are deduplicated in Redis just like exceptions.
+            level      = event.get("level") or "error"
+            logger_tag = event.get("logger") or ""
+            message    = (event.get("logentry") or event.get("message") or {})
+            if isinstance(message, dict):
+                message = message.get("formatted") or message.get("message") or ""
+            raw = f"{level}:{logger_tag}:{str(message)[:120]}"
+            return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
         exc      = exc_values[-1]
         exc_type = exc.get("type") or "Unknown"
@@ -116,7 +126,11 @@ def _fingerprint(event: dict) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_frequency(r, ts_key: str) -> None:
-    """Push current timestamp into the history ring-buffer (newest-first)."""
+    """Push current timestamp into the history ring-buffer (newest-first).
+
+    The three Redis calls are not atomic; a crash between them leaves the list
+    without the TTL reset, which self-corrects on the next successful call.
+    """
     r.lpush(ts_key, time.time())
     r.ltrim(ts_key, 0, HISTORY_SIZE - 1)
     r.expire(ts_key, DEDUP_WINDOW_S)   # auto-clean with the err key
@@ -172,22 +186,26 @@ def _make_lazy_before_send():
     cache is cleared so the next event triggers a fresh connection attempt.
     """
     _state: dict = {"r": None}
+    _lock = threading.Lock()
 
     def before_send(event: dict, hint: dict) -> Optional[dict]:
-        # Try to get / reconnect Redis
-        if _state["r"] is None:
-            try:
-                from config import REDIS_URL
-                import redis as _redis_mod
-                _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
-                                          socket_timeout=1)
-                _r.ping()
-                _state["r"] = _r
-            except Exception as _conn_err:
-                logger.debug(
-                    "sentry_init: Redis unavailable, dedup skipped: %s", _conn_err
-                )
-                return event   # forward without dedup until Redis is back
+        # Try to get / reconnect Redis under lock to avoid concurrent init races.
+        with _lock:
+            if _state["r"] is None:
+                try:
+                    from config import REDIS_URL
+                    import redis as _redis_mod
+                    _r = _redis_mod.from_url(REDIS_URL, decode_responses=True,
+                                              socket_timeout=1,
+                                              socket_connect_timeout=1)
+                    _r.ping()
+                    _state["r"] = _r
+                except Exception as _conn_err:
+                    logger.debug(
+                        "sentry_init: Redis unavailable, dedup skipped: %s", _conn_err
+                    )
+                    return event   # forward without dedup until Redis is back
+            _r_snap = _state["r"]
 
         try:
             fp = _fingerprint(event)
@@ -198,11 +216,11 @@ def _make_lazy_before_send():
             act_key = f"{_PFX_ACT}{fp}"
             ts_key  = f"{_PFX_TS}{fp}"
 
-            _update_frequency(_state["r"], ts_key)
-            act_ttl = _compute_act_ttl(_state["r"], ts_key)
+            _update_frequency(_r_snap, ts_key)
+            act_ttl = _compute_act_ttl(_r_snap, ts_key)
 
-            _res       = _state["r"].eval(_DEDUP_LUA, 2, err_key, act_key,
-                                           DEDUP_WINDOW_S, act_ttl)
+            _res       = _r_snap.eval(_DEDUP_LUA, 2, err_key, act_key,
+                                      DEDUP_WINDOW_S, act_ttl)
             is_new     = _res[0]
             act_active = _res[1]
 
@@ -210,7 +228,8 @@ def _make_lazy_before_send():
                 return None
 
         except Exception as _dedup_err:
-            _state["r"] = None   # reset so next event reconnects
+            with _lock:
+                _state["r"] = None   # reset under lock so next event reconnects
             logger.debug("sentry dedup error (ignored): %s", _dedup_err, exc_info=True)
 
         return event
@@ -265,10 +284,11 @@ def init_sentry(
 
     # ── Integrations ──────────────────────────────────────────────────────────
     integrations = [
-        # Capture logger.error() / logger.critical() as Sentry events.
-        # level=ERROR means logger.warning() is NOT forwarded — keeps quota down.
+        # Capture logger.warning()+ as breadcrumbs; only ERROR+ creates Sentry events.
+        # Using WARNING for breadcrumb level so the trail leading up to an error
+        # is visible, without flooding Sentry quota with INFO noise.
         LoggingIntegration(
-            level=logging.ERROR,         # capture as breadcrumb from ERROR up
+            level=logging.WARNING,       # capture as breadcrumb from WARNING up
             event_level=logging.ERROR,   # create Sentry event from ERROR up
         ),
     ]
@@ -280,23 +300,30 @@ def init_sentry(
         from sentry_sdk.integrations.loguru import LoguruIntegration
         integrations.append(
             LoguruIntegration(
-                level=logging.ERROR,
+                level=logging.WARNING,
                 event_level=logging.ERROR,
             )
         )
     except ImportError:
         pass   # standard logging integration above already covers this
 
-    sentry_sdk.init(
-        dsn           = dsn,
-        integrations  = integrations,
-        before_send   = before_send_fn,
-        environment   = os.environ.get("ENVIRONMENT", "production"),
-        release       = release or os.environ.get("GIT_COMMIT", ""),
-        # Don't send PII (email addresses, IP addresses) by default
-        send_default_pii = False,
-        # Sample rate for performance tracing (set to 0 to disable tracing)
-        traces_sample_rate = 0.0,
-    )
+    try:
+        sentry_sdk.init(
+            dsn           = dsn,
+            integrations  = integrations,
+            before_send   = before_send_fn,
+            environment   = os.environ.get("ENVIRONMENT", "production"),
+            release       = release or os.environ.get("GIT_COMMIT", ""),
+            # Don't send PII (email addresses, IP addresses) by default
+            send_default_pii = False,
+            # Sample rate for performance tracing (set to 0 to disable tracing)
+            traces_sample_rate = 0.0,
+        )
+    except Exception as _init_err:
+        logger.warning(
+            "sentry_init: sentry_sdk.init() failed (invalid DSN or integration "
+            "error) — Sentry disabled for this process: %s", _init_err,
+        )
+        return False
 
     return True
