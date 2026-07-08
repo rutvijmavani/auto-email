@@ -669,9 +669,10 @@ class TestVerifyOnlyCLIFlag(unittest.TestCase):
 
     def _run_main_with_args(self, args):
         import pipeline
-        with patch.object(sys, "argv", ["pipeline.py"] + args):
-            with patch("pipeline.init_db"):
-                pipeline.main()
+        with patch.object(sys, "argv", ["pipeline.py"] + args), \
+             patch("pipeline.init_db"), \
+             patch("workers.startup.validate_startup"):
+            pipeline.main()
 
     @patch("pipeline.run_verify_only")
     def test_verify_only_flag_calls_run_verify_only(self, mock_verify):
