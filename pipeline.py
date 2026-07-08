@@ -914,7 +914,7 @@ def main():
 
     # Only --monitor-jobs / --monitor-status actively query Redis worker state;
     # --detect-ats is DB + web scraping only, no Redis reads.
-    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status"}
+    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status", "--scheduler"}
     _needs_redis = any(a in _REDIS_CMDS for a in args)
 
     # Gmail credentials are required for all subcommands that send email.
@@ -1063,6 +1063,11 @@ def main():
             print('[ERROR] Usage: --set-custom-ats "Company" --curl "curl ..."')
             return
         run_set_custom_ats(company, curl_string, detail_curl=detail_curl)
+        return
+
+    if "--scheduler" in args:
+        from workers.scheduler import run_scheduler
+        run_scheduler(skip_rebuild="--skip-rebuild" in args)
         return
 
     # Full pipeline
