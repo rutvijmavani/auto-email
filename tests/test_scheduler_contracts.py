@@ -348,24 +348,29 @@ class TestPickScheduleTime(unittest.TestCase):
         Gap whose midpoint + avg_duration_s ≥ _next_digest_deadline(midpoint) is
         skipped; the safe gap is returned instead.  deadline_ts is only an enable
         flag — the actual threshold is always _next_digest_deadline(midpoint).
+
+        The first-checked gap (left_mid) is forced to fail so the algorithm must
+        skip it and fall through to the second gap (right_mid), which is safe.
+        Asserting right_mid confirms that late gaps are actually skipped rather
+        than that a safe-first gap was simply returned first.
         """
         from unittest.mock import patch as _patch
         lo, hi = self._window()
         avg_duration = 1800
-        right_mid = (self._TARGET + hi) / 2
         left_mid  = (lo + self._TARGET) / 2
+        right_mid = (self._TARGET + hi) / 2
 
         def _mock_nd(ts):
-            # Force right_mid to fail (ts + avg >= ts + avg - 1); left_mid is safe.
-            if abs(ts - right_mid) < 1:
-                return ts + avg_duration - 1
-            return ts + avg_duration + 10_000
+            # Force left_mid (first gap) to fail; right_mid (second gap) is safe.
+            if abs(ts - left_mid) < 1:
+                return ts + avg_duration - 1   # ts + avg >= deadline → skip
+            return ts + avg_duration + 10_000  # ts + avg << deadline → safe
 
         with _patch("workers.scheduler._next_digest_deadline", side_effect=_mock_nd):
             result = self._call([self._TARGET],
                                 deadline_ts=self._TARGET,  # any non-None value enables the check
                                 avg_duration_s=avg_duration)
-        self.assertAlmostEqual(result, left_mid, places=0)
+        self.assertAlmostEqual(result, right_mid, places=0)
 
     def test_deadline_guard_all_gaps_fail_target_safe_returns_target(self):
         """All gap midpoints violate deadline, but target_ts itself is safe → returns target_ts."""

@@ -406,7 +406,7 @@ The watchdog runs both commands atomically in one `bash -c` call. `reset-failed`
 The watchdog cannot restart itself via this mechanism. If `recruiter-watchdog.service` enters `failed` state, there is no running watchdog to detect it. This is handled by a separate `OnFailure=` hook in the unit file:
 
 ```ini
-OnFailure=recruiter-pipeline-alert@%n.service
+OnFailure=recruiter-pipeline-alert@%p.service
 ```
 
 When the watchdog crashes too many times, systemd fires `recruiter-pipeline-alert@.service` — a one-shot unit that runs `startup_failure_alert.py` and emails the last 30 journal lines so you can diagnose without SSH.
@@ -452,7 +452,7 @@ Daemon threads are hard-tied to their process. When the process exits for any re
 
 Because workers are child processes of the scheduler, the watchdog uses a two-layer approach rather than monitoring individual per-PID keys:
 
-**Layer 1 — `worker:alive:scheduler:adaptive` and `worker:alive:scheduler:fullscan`** (fast, TTL=15s each):
+**Layer 1 — `worker:alive:scheduler:adaptive` and `worker:alive:scheduler:fullscan`** (fast, TTL=30s each):
 Each scheduler loop writes its own key independently every ~1 second. Checking them separately means a hung loop (e.g. `fullscan_loop` blocked on a long DB query) is detected even while the other loop is healthy — a single shared key would mask the hung loop because the surviving loop keeps refreshing it. If a key is missing or stale (age > 20s), the watchdog fires an ERROR for that loop. If **both** keys are missing, all workers are presumed dead and the watchdog returns early — no point reading pool state when the scheduler process is gone.
 
 **Layer 2 — `scheduler:health`** (rich pool state, TTL=10min):
@@ -576,12 +576,12 @@ r.xpending(stream_key, STREAM_CONSUMER_GROUP)           # total pending count
 r.xpending_range(stream_key, group, "-", "+", count=1)  # oldest entry details
 ```
 
-`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:18432` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
+`xpending_range` returns the consumer name for each entry — e.g. `worker-myhost-18432`. This name embeds the worker's hostname and PID at launch time. The watchdog checks the **specific** per-PID heartbeat key `worker:alive:{type}:{hostname}:{pid}` directly via `EXISTS`, rather than a shared single-type key. This gives an unambiguous answer even when multiple workers of the same type are running:
 
 ```text
 Consumer name:     worker-myhost-18432
-EXISTS worker:alive:scan_worker:18432  → 1 → worker is alive, job is in progress → OK
-EXISTS worker:alive:scan_worker:18432  → 0 → worker 18432 is dead → entry is orphaned
+EXISTS worker:alive:scan_worker:myhost:18432  → 1 → worker is alive, job is in progress → OK
+EXISTS worker:alive:scan_worker:myhost:18432  → 0 → worker 18432 is dead → entry is orphaned
 ```
 
 With the old shared single-type key, if worker PID 19001 was running and had overwritten the `worker:alive:scan_worker` key, the watchdog would have incorrectly concluded PID 18432 was alive because a *different* worker of the same type was alive. Per-PID keys eliminate this cross-worker false negative entirely.

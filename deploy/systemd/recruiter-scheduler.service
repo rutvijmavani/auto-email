@@ -57,9 +57,9 @@ TimeoutStopSec=60s
 
 # ── Resource limits ───────────────────────────────────────────────────────────
 # MemoryMax covers the entire cgroup: the scheduler process plus all worker
-# threads it spawns (scan/detail/fullscan workers run as threads, not separate
-# processes, so they all contribute to this limit).  4G accommodates the full
-# worker pool under concurrent HTTP scraping load.
+# child processes it spawns via multiprocessing (scan/detail/fullscan workers
+# run as separate processes, so each contributes independently to this limit).
+# 4G accommodates the full worker pool under concurrent HTTP scraping load.
 LimitNOFILE=65536
 MemoryMax=4G
 

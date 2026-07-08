@@ -1,6 +1,11 @@
 #!/bin/bash
 # deploy/update_crontab.sh — Apply crontab-only fixes without running full setup_cron.sh.
 #
+# PREREQUISITE: setup_cron.sh must have already installed the base pipeline crontab,
+# which includes the 7 AM "0 7 * * * ... run_monitor.sh" anchor entry that
+# MONITOR RETRY is injected after.  This script is NOT a standalone crontab
+# initializer — it will abort if the 7 AM anchor is missing.
+#
 # Changes applied:
 #   1. MONITOR RETRY  — 9 AM fallback cron that runs --monitor-jobs only if
 #                       the 7 AM run did not complete successfully (checks exit=0).

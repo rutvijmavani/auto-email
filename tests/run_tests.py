@@ -52,11 +52,13 @@ def main():
     _import_failures = []
 
     def _try_import(name):
+        import traceback as _tb
         try:
             return importlib.import_module(f"tests.{name}")
         except Exception as exc:
             _import_failures.append((name, exc))
             print(f"[ERROR] Could not import tests.{name}: {exc}", file=sys.stderr)
+            _tb.print_exc(file=sys.stderr)
             return None
 
     # Single source of truth for all module names grouped by suite.

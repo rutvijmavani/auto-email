@@ -244,12 +244,15 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     continue
 
                 # Skip peers with a live heartbeat.
-                # Since the boot-epoch fix, inflight tokens are hostname:pid:epoch.
-                # Heartbeat keys still use hostname:pid — strip the epoch so old
-                # and new format tokens both map to the correct heartbeat key.
-                _hb_parts = peer_token.split(':')
-                _hb_token = ':'.join(_hb_parts[:2]) if len(_hb_parts) >= 3 else peer_token
-                hb_key = f"worker:alive:detail_worker:{_hb_token}"
+                # Use the full peer_token (including boot epoch for new-format tokens)
+                # so a PID-reused current process cannot masquerade as the dead peer.
+                # The Heartbeat class writes worker:alive:{type}:{hostname}:{pid} (no
+                # epoch), so new-format tokens (hostname:pid:epoch) produce a key that
+                # will never exist — correctly marking the dead peer for recovery.
+                # Old-format tokens (hostname:pid) still check the shared key, but
+                # those are only present from pre-epoch workers and disappear after
+                # one restart cycle.
+                hb_key = f"worker:alive:detail_worker:{peer_token}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "

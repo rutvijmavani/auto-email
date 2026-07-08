@@ -175,7 +175,11 @@ fi
 echo "  systemctl resolved to: $SYSTEMCTL_BIN"
 
 SUDOERS_FILE="/etc/sudoers.d/mail-pipeline"
-cat > "$SUDOERS_FILE" << EOF
+# Write to a temp file first, validate with visudo, then atomically install.
+# Writing directly to SUDOERS_FILE and validating afterward leaves a window
+# where a bad rule is live and can break sudo system-wide.
+_SUDOERS_TMP=$(mktemp /tmp/mail-pipeline-sudoers.XXXXXX)
+cat > "$_SUDOERS_TMP" << EOF
 # Allow opc user to restart/query pipeline services without password.
 # Required by workers/watchdog.py self-healing and deploy workflow.
 # Path = $(which systemctl) → resolved to $SYSTEMCTL_BIN
@@ -190,14 +194,15 @@ $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
 EOF
-chmod 440 "$SUDOERS_FILE"
+chmod 440 "$_SUDOERS_TMP"
 
-# Validate the sudoers file before committing it
-if visudo -c -f "$SUDOERS_FILE" 2>/dev/null; then
-    echo "  Sudoers rule validated and written to $SUDOERS_FILE"
+if visudo -c -f "$_SUDOERS_TMP" 2>/dev/null; then
+    mv "$_SUDOERS_TMP" "$SUDOERS_FILE"
+    chmod 440 "$SUDOERS_FILE"
+    echo "  Sudoers rule validated and installed at $SUDOERS_FILE"
 else
-    echo "  [ERROR] sudoers syntax check failed — removing bad file"
-    rm -f "$SUDOERS_FILE"
+    echo "  [ERROR] sudoers syntax check failed — temp file discarded (sudo unchanged)"
+    rm -f "$_SUDOERS_TMP"
     exit 1
 fi
 
