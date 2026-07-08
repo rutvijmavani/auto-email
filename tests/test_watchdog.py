@@ -1026,6 +1026,85 @@ class TestCheckPelHealthPID(unittest.TestCase):
         self.assertTrue(any(i.level == Issue.ERROR for i in stream_issues),
                         f"Expected ERROR for dead consumer past PEL_ALERT_AGE_MS; got {[i.level for i in stream_issues]}")
 
+    def _run_scheduler(self, pending=1, idle_ms=0, consumer_pid=59656,
+                        heartbeat_pid=None):
+        """Run _check_pel_health with a scheduler-format consumer name."""
+        import json as _json
+        from config import REDIS_STREAM_ADAPTIVE
+        r = MagicMock()
+
+        consumer_name = f"scheduler-job-pipeline-{consumer_pid}".encode()
+
+        def _xpending(stream, group):
+            return {"pending": pending, "min": None, "max": None, "consumers": []}
+        r.xpending.side_effect = _xpending
+
+        def _xpending_range(stream, group, **kwargs):
+            return [{
+                "consumer":             consumer_name,
+                "time_since_delivered": idle_ms,
+                "message_id":           b"1-1",
+            }] if pending > 0 else []
+        r.xpending_range.side_effect = _xpending_range
+
+        # Scheduler heartbeat is stored in the value of worker:alive:scheduler:adaptive
+        # (and/or worker:alive:scheduler:fullscan). No key exists when heartbeat_pid=None.
+        def _get(key):
+            key_s = key.decode() if isinstance(key, bytes) else key
+            if heartbeat_pid is None:
+                return None
+            if key_s in ("worker:alive:scheduler:adaptive",
+                          "worker:alive:scheduler:fullscan"):
+                return _json.dumps({"pid": heartbeat_pid, "ts": self._NOW}).encode()
+            return None
+        r.get.side_effect = _get
+        r.exists.return_value = 0  # should not be called for scheduler consumers
+
+        issues = []
+        with patch("workers.watchdog.time.time", return_value=self._NOW):
+            from workers.watchdog import _check_pel_health
+            _check_pel_health(r, issues)
+        return issues
+
+    def test_scheduler_consumer_alive_same_pid_is_ok(self):
+        """Scheduler consumer PID matches adaptive heartbeat → alive → OK even if old."""
+        from workers.watchdog import Issue, PEL_ALERT_AGE_MS
+        issues = self._run_scheduler(
+            pending=1,
+            idle_ms=PEL_ALERT_AGE_MS * 2,
+            consumer_pid=59656,
+            heartbeat_pid=59656,
+        )
+        stream_issues = [i for i in issues if "PEL" in i.category]
+        self.assertTrue(any(i.level == Issue.OK for i in stream_issues),
+                        f"Expected OK when scheduler alive with same PID; got {stream_issues}")
+
+    def test_scheduler_consumer_dead_different_pid_is_error(self):
+        """Scheduler heartbeat has different PID → old consumer is dead → ERROR when old."""
+        from workers.watchdog import Issue, PEL_ALERT_AGE_MS
+        issues = self._run_scheduler(
+            pending=1,
+            idle_ms=PEL_ALERT_AGE_MS + 1_000,
+            consumer_pid=59656,
+            heartbeat_pid=60000,  # different PID → old consumer is dead
+        )
+        stream_issues = [i for i in issues if "PEL" in i.category]
+        self.assertTrue(any(i.level == Issue.ERROR for i in stream_issues),
+                        f"Expected ERROR for dead scheduler consumer past threshold; got {stream_issues}")
+
+    def test_scheduler_consumer_no_heartbeat_is_error(self):
+        """No scheduler heartbeat at all → consumer appears dead → ERROR when old."""
+        from workers.watchdog import Issue, PEL_ALERT_AGE_MS
+        issues = self._run_scheduler(
+            pending=1,
+            idle_ms=PEL_ALERT_AGE_MS + 1_000,
+            consumer_pid=59656,
+            heartbeat_pid=None,
+        )
+        stream_issues = [i for i in issues if "PEL" in i.category]
+        self.assertTrue(any(i.level == Issue.ERROR for i in stream_issues),
+                        f"Expected ERROR when no scheduler heartbeat; got {stream_issues}")
+
     def test_xpending_error_produces_warning_not_crash(self):
         from workers.watchdog import Issue
         issues = self._run(xpending_error=True)

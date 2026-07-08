@@ -882,16 +882,40 @@ def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
     """
     Return True if a live heartbeat key exists for this stream consumer.
 
-    consumer_name format: "worker-{hostname}-{pid}" (set by fullscan._CONSUMER_NAME).
-    Heartbeat key format: "worker:alive:{type}:{hostname}:{pid}" (set by heartbeat.py).
+    Standard worker consumer format: "worker-{hostname}-{pid}"
+    Heartbeat key format:            "worker:alive:{type}:{hostname}:{pid}"
     Both include the hostname so PID reuse across machines cannot produce a false positive.
+
+    Scheduler consumer format: "scheduler-{hostname}-{pid}"
+    Scheduler heartbeat keys:  "worker:alive:scheduler:adaptive" and
+                               "worker:alive:scheduler:fullscan" (no hostname:pid in key).
+    The scheduler PID is stored in the heartbeat value — matched against the consumer PID
+    to distinguish a restarted scheduler (new PID) from the original consumer (old PID).
     """
     if not consumer_name:
         return False
     try:
         if isinstance(consumer_name, bytes):
             consumer_name = consumer_name.decode()
-        # "worker-{hostname}-{pid}" — split off pid at the last dash, strip "worker-" prefix
+
+        # Scheduler consumer names use "scheduler-{hostname}-{pid}" but heartbeat keys
+        # are "worker:alive:scheduler:adaptive/fullscan" (no hostname:pid in the key).
+        if consumer_name.startswith("scheduler-"):
+            pid_str = consumer_name.rsplit("-", 1)[-1]
+            int(pid_str)  # validate
+            for hb_key in ("worker:alive:scheduler:adaptive",
+                           "worker:alive:scheduler:fullscan"):
+                raw = r.get(hb_key)
+                if raw:
+                    try:
+                        hb_pid = str(json.loads(raw).get("pid", ""))
+                        if hb_pid == pid_str:
+                            return True
+                    except Exception:
+                        pass
+            return False
+
+        # Standard format: "worker-{hostname}-{pid}"
         name, _, pid_str = consumer_name.rpartition("-")
         hostname = name.removeprefix("worker-")
         int(pid_str)   # validate — raises ValueError if not a number
