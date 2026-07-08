@@ -209,6 +209,13 @@ class TestRunWorkerInitialisation(unittest.TestCase):
 
 class TestRunWorkerStreamLoop(unittest.TestCase):
 
+    def setUp(self):
+        self._vs_patcher = patch("workers.startup.validate_startup")
+        self._vs_patcher.start()
+
+    def tearDown(self):
+        self._vs_patcher.stop()
+
     def _common_patches(self, r):
         """Return a list of context managers for common patches."""
         return [
@@ -356,6 +363,13 @@ class TestRunWorkerStreamLoop(unittest.TestCase):
 
 class TestRunWorkerCompletionHandler(unittest.TestCase):
 
+    def setUp(self):
+        self._vs_patcher = patch("workers.startup.validate_startup")
+        self._vs_patcher.start()
+
+    def tearDown(self):
+        self._vs_patcher.stop()
+
     def _run_with_result(self, scan_result, company="Stripe"):
         msgs = _make_stream_message(company=company)
         r    = _make_redis_mock(stream_messages=msgs)
@@ -451,6 +465,13 @@ class TestRunWorkerCompletionHandler(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunWorkerMessageParsing(unittest.TestCase):
+
+    def setUp(self):
+        self._vs_patcher = patch("workers.startup.validate_startup")
+        self._vs_patcher.start()
+
+    def tearDown(self):
+        self._vs_patcher.stop()
 
     def _run_and_capture_payload(self, fields):
         """Run worker with custom message fields; capture payload passed to scan."""

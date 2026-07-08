@@ -569,9 +569,10 @@ class TestProspectsCLIFlags(unittest.TestCase):
 
     def _run_main_with_args(self, args):
         import pipeline
-        with patch.object(sys, "argv", ["pipeline.py"] + args):
-            with patch("pipeline.init_db"):
-                pipeline.main()
+        with patch.object(sys, "argv", ["pipeline.py"] + args), \
+             patch("pipeline.init_db"), \
+             patch("workers.startup.validate_startup"):
+            pipeline.main()
 
     @patch("pipeline.run_import_prospects")
     def test_import_prospects_flag(self, mock_import):

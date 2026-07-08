@@ -2838,9 +2838,10 @@ class TestMonitorCLIFlags(unittest.TestCase):
 
     def _run(self, args):
         import pipeline
-        with patch.object(sys, "argv", ["pipeline.py", *args]):
-            with patch("pipeline.init_db"):
-                pipeline.main()
+        with patch.object(sys, "argv", ["pipeline.py", *args]), \
+             patch("pipeline.init_db"), \
+             patch("workers.startup.validate_startup"):
+            pipeline.main()
 
     @patch("jobs.job_monitor.run")
     def test_monitor_jobs_flag(self, mock_run):
