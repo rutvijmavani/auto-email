@@ -990,7 +990,15 @@ def run_worker(once: bool = False, shutdown_event=None,
                     "detail_worker: bad JSON in %s: %s | raw=%r",
                     source_queue, exc, raw[:200],
                 )
-                r.lrem(inflight_key, 1, raw)   # discard — retrying won't help
+                try:
+                    r.lrem(inflight_key, 1, raw)
+                except Exception as _lrem_err:
+                    logger.error(
+                        "detail_worker: lrem failed for malformed item — "
+                        "leaving in inflight; exiting for recovery: %s", _lrem_err,
+                    )
+                    _hb.stop()
+                    break
                 if once:
                     break
                 continue

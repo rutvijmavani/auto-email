@@ -96,7 +96,10 @@ def _claim_alert_slot(service: str) -> bool:
     try:
         age = time.time() - os.path.getmtime(flag)
     except OSError:
-        return False  # can't stat → assume recent → suppress
+        # Can't stat the flag file (unusual FS error) — fail open so a real
+        # alert is not silently dropped.  Aligns with the fcntl failure path
+        # below which also fails open.
+        return True
 
     if age < _DEDUP_WINDOW_S:
         return False  # still within dedup window → suppress

@@ -24,3 +24,12 @@ ExecStart=/home/opc/mail/venv/bin/python scripts/startup_failure_alert.py %i
 
 # Don't restart — this is a one-shot alert, not a long-running service.
 Restart=no
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+# startup_failure_alert.py only reads journal logs and sends email — no writes
+# outside the project directory are needed.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail

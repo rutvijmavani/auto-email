@@ -1470,24 +1470,35 @@ def pubsub_listener_loop() -> None:
     within ~1s of a resume signal rather than spinning on a fixed sleep.
     _check_auto_resume() can also clear _pause_event / set _resume_event if
     the cronchain heartbeat expires (safety net against permanent pause).
-    """
-    r      = get_pubsub_redis()   # socket_timeout=None so listen() can idle indefinitely
-    pubsub = r.pubsub()
-    pubsub.subscribe(REDIS_PAUSE_CHANNEL, REDIS_RESUME_CHANNEL)
-    logger.info("pubsub_listener: subscribed to pause/resume channels")
 
-    for message in pubsub.listen():
-        if message["type"] != "message":
-            continue
-        channel = message["channel"]
-        if channel == REDIS_PAUSE_CHANNEL:
-            logger.info("pubsub_listener: PAUSE received — halting dispatchers")
-            _pause_event.set()
-            _resume_event.clear()
-        elif channel == REDIS_RESUME_CHANNEL:
-            logger.info("pubsub_listener: RESUME received — resuming dispatchers")
-            _resume_event.set()
-            _pause_event.clear()
+    Uses get_message(timeout=5) instead of listen() so a silently wedged TCP
+    session is detected within 5 s and the subscription is re-established.
+    """
+    import time as _time
+    while True:
+        try:
+            r      = get_pubsub_redis()
+            pubsub = r.pubsub()
+            pubsub.subscribe(REDIS_PAUSE_CHANNEL, REDIS_RESUME_CHANNEL)
+            logger.info("pubsub_listener: subscribed to pause/resume channels")
+            while True:
+                message = pubsub.get_message(timeout=5.0)
+                if message is None or message["type"] != "message":
+                    continue
+                channel = message["channel"]
+                if channel == REDIS_PAUSE_CHANNEL:
+                    logger.info("pubsub_listener: PAUSE received — halting dispatchers")
+                    _pause_event.set()
+                    _resume_event.clear()
+                elif channel == REDIS_RESUME_CHANNEL:
+                    logger.info("pubsub_listener: RESUME received — resuming dispatchers")
+                    _resume_event.set()
+                    _pause_event.clear()
+        except Exception as _ps_err:
+            logger.warning(
+                "pubsub_listener: connection lost (%s) — reconnecting in 5s", _ps_err
+            )
+            _time.sleep(5)
 
 
 def _check_auto_resume() -> None:

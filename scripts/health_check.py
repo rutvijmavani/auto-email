@@ -172,18 +172,22 @@ def run_health_check() -> int:
         # Fallback: direct RDB-save check if watchdog module is unavailable
         try:
             persist = r.info("persistence")
+            aof_on  = persist.get("aof_enabled") in (1, "1", True)
             last_s  = persist.get("rdb_last_save_time", 0) or r.lastsave()
             # Normalize: some Redis client versions return a datetime object
             if hasattr(last_s, "timestamp"):
                 last_s = int(last_s.timestamp())
             if isinstance(last_s, int) and last_s > 0:
                 age_min = (now - last_s) / 60
-                if age_min > 30:
+                if age_min > 30 and not aof_on:
+                    # Only warn about stale RDB when AOF is off — with AOF the
+                    # data-loss window is ~1 s regardless of last snapshot age.
                     _row("WARNING", "Redis RDB save",
                          f"Last save {age_min:.0f} min ago — data loss window is large")
                     warnings += 1
                 else:
-                    _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago")
+                    suffix = " [AOF active — data safe]" if aof_on else ""
+                    _row("OK", "Redis RDB save", f"Last save {age_min:.0f} min ago{suffix}")
             else:
                 _row("WARNING", "Redis RDB save",
                      "No RDB save recorded — Redis has not persisted data yet")
@@ -458,28 +462,17 @@ def run_health_check() -> int:
         warnings += 1
 
     # ── HUNG WORKERS ─────────────────────────────────────────────────────────
+    _section("HUNG WORKERS  (heartbeat alive, no progress update)")
     try:
-        hung = []
-        cursor = 0
-        while True:
-            cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-            for key in keys:
-                ks = key.decode() if isinstance(key, bytes) else key
-                company = ks.split(":", 1)[1]
-                if not r.exists(f"progress:{company}"):
-                    hung.append(company)
-            if cursor == 0:
-                break
-
-        _section("HUNG WORKERS  (heartbeat alive, no progress update)")
-        if hung:
-            _row("WARNING", "hung workers",
-                 f"{len(hung)}: {', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")
-            warnings += 1
+        from workers.watchdog import check_hung_workers
+        _hung_issues = check_hung_workers(r)
+        if _hung_issues:
+            for _hi in _hung_issues:
+                _row(_hi.level, "hung workers", _hi.message)
+                warnings += 1
         else:
             _row("OK", "hung workers", "none detected")
     except Exception as _hung_err:
-        _section("HUNG WORKERS  (heartbeat alive, no progress update)")
         _row("DEGRADED", "hung workers", f"Redis scan error: {_hung_err}")
         warnings += 1
 

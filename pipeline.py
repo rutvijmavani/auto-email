@@ -912,13 +912,15 @@ def main():
 
     args = sys.argv[1:]
 
-    # Only --monitor-jobs / --detect-ats / --monitor-status actively query Redis
-    # worker state; all other subcommands are DB-only operations.
-    _REDIS_CMDS = {"--monitor-jobs", "--detect-ats", "--monitor-status"}
+    # Only --monitor-jobs / --monitor-status actively query Redis worker state;
+    # --detect-ats is DB + web scraping only, no Redis reads.
+    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status"}
     _needs_redis = any(a in _REDIS_CMDS for a in args)
 
     # Gmail credentials are required for all subcommands that send email.
-    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary", "--find-only"}
+    # --verify-only sends a verify report; --detect-ats sends a detection report
+    # (when there are unknowns/close-calls).
+    _GMAIL_CMDS = {"--outreach-only", "--performance-report", "--quota-report", "--monitor-jobs", "--weekly-summary", "--find-only", "--verify-only", "--detect-ats"}
     # No-args = full pipeline (add_job + find_emails + outreach) — also needs Gmail
     _needs_gmail = not args or any(a in _GMAIL_CMDS for a in args)
 

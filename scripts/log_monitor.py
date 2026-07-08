@@ -7,8 +7,9 @@ scripts/log_monitor.py — Proactive pipeline log scanner with Redis-backed dedu
 │  2. Fingerprint each flagged line (exception type + file + lineno)         │
 │  3. NEW error  (not in Redis)   → immediate alert email + store in Redis   │
 │  4. KNOWN error (in Redis)      → silently drop, just refresh "active" key │
-│  5. Resolution sweep            → any error whose "active" key expired      │
-│     (not seen for 4 h)  →  delete main key so next occurrence = NEW again  │
+│  5. Resolution sweep            → any error whose "active" key expired       │
+│     (adaptive TTL: 5 min–24 h based on firing freq) → delete main key so   │
+│     next occurrence = NEW again                                              │
 │     → append to resolved log for next digest                                │
 │  6. Digest due? (every 3 days)  → send NEW / ACTIVE / RESOLVED summary     │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -334,6 +335,13 @@ def scan_file(
                 raw0, start0, end0 = buf[0]
                 line = raw0.rstrip()
                 if line and not _is_suppressed(raw0) and _is_flagged(line):
+                    if not raw0.endswith('\n'):
+                        # Flagged line is a partial write — stay at start so
+                        # the completed line is re-read on the next scan cycle.
+                        new_offset = start0
+                        buf.pop(0)
+                        _fill(0)
+                        continue
                     context = []
                     last_consumed = 0
                     _fill(CONTEXT_LINES)
@@ -698,7 +706,6 @@ def send_digest(r, now: float) -> bool:
             if not raw:
                 continue
             rec = json.loads(raw)
-            rec["is_active"] = bool(r.exists(_act_key(fp)))
 
             if rec.get("first_seen", 0) >= last_digest:
                 new_since_digest.append(rec)
