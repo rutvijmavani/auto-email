@@ -181,6 +181,26 @@ if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
     echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
     _rollback_to_previous; exit 1
 fi
+# Guard: verify staging is current before installing — same check as deploy.yml.
+# If a unit file changed in this commit and install-systemd.sh was not re-run,
+# install-pipeline-units would silently install the stale staged copy.
+_stale_units=0
+for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service"; do
+    _src="$DEPLOY_DIR/systemd/$_unit"
+    _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
+    if [[ ! -f "$_staged" ]]; then
+        echo "[ERROR] Staging file missing: $_staged — run: sudo bash deploy/install-systemd.sh"
+        _stale_units=1
+    elif ! diff -q "$_src" "$_staged" > /dev/null 2>&1; then
+        echo "[ERROR] Staged unit out of date: $_unit (deploy/systemd/ vs staging)"
+        echo "        Run: sudo bash deploy/install-systemd.sh"
+        _stale_units=1
+    fi
+done
+if [[ "$_stale_units" -eq 1 ]]; then
+    echo "[ERROR] Systemd unit staging is stale — rolling back"
+    _rollback_to_previous; exit 1
+fi
 sudo /usr/local/bin/install-pipeline-units || {
     echo "  [ERROR] Unit sync failed — rolling back"
     _rollback_to_previous; exit 1

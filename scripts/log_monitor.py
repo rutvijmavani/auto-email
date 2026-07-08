@@ -316,25 +316,29 @@ def scan_file(
     try:
         with open(path, errors="replace") as fh:
             fh.seek(offset)
-            buf: list[tuple[str, int]] = []   # (raw_line, file_pos_after_line)
+            # Each entry: (raw_line, start_pos, end_pos)
+            # start_pos is captured before readline() so we can re-position to
+            # the line's start when it has no trailing newline (partial write).
+            buf: list[tuple[str, int, int]] = []
 
             def _fill(n: int) -> None:
                 while len(buf) <= n:
+                    start = fh.tell()
                     raw = fh.readline()
                     if not raw:
                         break
-                    buf.append((raw, fh.tell()))
+                    buf.append((raw, start, fh.tell()))
 
             _fill(0)
             while buf:
-                raw0, pos0 = buf[0]
+                raw0, start0, end0 = buf[0]
                 line = raw0.rstrip()
                 if line and not _is_suppressed(raw0) and _is_flagged(line):
                     context = []
                     last_consumed = 0
                     _fill(CONTEXT_LINES)
                     for j in range(1, min(1 + CONTEXT_LINES, len(buf))):
-                        ctx_raw, _ = buf[j]
+                        ctx_raw, _, _ = buf[j]
                         ctx = ctx_raw.rstrip()
                         if ctx and not _is_suppressed(ctx_raw) and _is_flagged(ctx_raw):
                             if not _is_traceback_component(ctx):
@@ -343,11 +347,14 @@ def scan_file(
                         if ctx and not _is_suppressed(ctx_raw):
                             context.append(ctx)
                     findings.append((line, context))
-                    new_offset = buf[last_consumed][1]
+                    new_offset = buf[last_consumed][2]  # end_pos
                     del buf[:last_consumed + 1]
                     _fill(0)
                 else:
-                    new_offset = pos0
+                    # For a complete line advance past it; for an unterminated
+                    # final line stay at its start so it is re-read once the
+                    # write completes (avoids silently skipping partial lines).
+                    new_offset = end0 if raw0.endswith('\n') else start0
                     buf.pop(0)
                     _fill(0)
     except Exception:

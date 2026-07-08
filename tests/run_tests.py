@@ -88,7 +88,18 @@ def main():
     _scraper_names     = ["test_job_scraper"]
     _all_names         = _unit_names + _integration_names + _scraper_names
 
-    _loaded = {n: _try_import(n) for n in _all_names}
+    # Only import modules needed for the selected suite so a broken unrelated
+    # test module does not block a targeted --unit, --integration, or --scraper run.
+    if "--unit" in args or "--e2e" in args:
+        _names_to_import = _unit_names
+    elif "--integration" in args:
+        _names_to_import = _integration_names
+    elif "--scraper" in args:
+        _names_to_import = _scraper_names
+    else:
+        _names_to_import = _all_names  # default: load everything
+
+    _loaded = {n: _try_import(n) for n in _names_to_import}
 
     if _import_failures:
         print(f"\n[ERROR] {len(_import_failures)} module(s) failed to import:",
@@ -103,9 +114,11 @@ def main():
     scraper_tests     = [_loaded[n] for n in _scraper_names     if _loaded.get(n)]
     all_tests         = unit_tests + integration_tests + scraper_tests
 
-    if not unit_tests:
-        print("[ERROR] No unit test modules loaded — aborting.", file=sys.stderr)
-        sys.exit(1)
+    # Only enforce the non-empty unit-suite guard when we're actually running units.
+    if not args or "--unit" in args or "--e2e" in args:
+        if not unit_tests:
+            print("[ERROR] No unit test modules loaded — aborting.", file=sys.stderr)
+            sys.exit(1)
 
     if "--unit" in args:
         print("\n" + "=" * 60)

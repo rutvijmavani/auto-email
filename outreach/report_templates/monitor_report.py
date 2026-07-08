@@ -236,7 +236,7 @@ def _compute_coverage(stats: dict) -> tuple:
     in_flight      = stats.get("in_flight", 0)
     total_covered  = worker_covered + fallback_hits
     total          = stats.get("companies_monitored", 0)
-    cov_pct        = int(total_covered / total * 100) if total else 0
+    cov_pct        = min(100, int(total_covered / total * 100)) if total else 0
 
     detail = f"{worker_covered} by workers"
     if fallback_hits:

@@ -244,8 +244,12 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                     continue
 
                 # Skip peers with a live heartbeat.
-                # Token is hostname:pid; heartbeat key uses the full token.
-                hb_key = f"worker:alive:detail_worker:{peer_token}"
+                # Since the boot-epoch fix, inflight tokens are hostname:pid:epoch.
+                # Heartbeat keys still use hostname:pid — strip the epoch so old
+                # and new format tokens both map to the correct heartbeat key.
+                _hb_parts = peer_token.split(':')
+                _hb_token = ':'.join(_hb_parts[:2]) if len(_hb_parts) >= 3 else peer_token
+                hb_key = f"worker:alive:detail_worker:{_hb_token}"
                 if r.exists(hb_key):
                     logger.debug(
                         "detail_worker: peer token=%s heartbeat present — "
@@ -845,9 +849,11 @@ def run_worker(once: bool = False, shutdown_event=None,
     # when the scheduler imports this module before spawning workers.
     global _INFLIGHT_ADAPTIVE, _INFLIGHT_FULLSCAN, _INFLIGHT_KEY
     own_pid   = os.getpid()
-    # Include hostname so PID reuse on a different host cannot accidentally match
-    # a live peer's inflight key when multiple machines share the same Redis.
-    own_token          = f"{socket.gethostname()}:{own_pid}"
+    # Include hostname and a boot epoch so PID reuse (same host, same PID, new
+    # process) does not collide with a dead peer's inflight key.  The epoch is
+    # monotonic-ns captured here (inside the forked process) rather than at
+    # module-import time, so each worker process gets a unique value.
+    own_token          = f"{socket.gethostname()}:{own_pid}:{time.monotonic_ns()}"
     _INFLIGHT_ADAPTIVE = f"{REDIS_DETAIL_ADAPTIVE}:inflight:{own_token}"
     _INFLIGHT_FULLSCAN = f"{REDIS_DETAIL_FULLSCAN}:inflight:{own_token}"
     _INFLIGHT_KEY      = {
