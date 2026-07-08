@@ -261,8 +261,8 @@ if $SKIP_HEALTH; then
     echo "  Health check skipped (--skip-health)."
 else
     echo ""
-    echo "► Running health check (waiting 60s for worker heartbeats)..."
-    sleep 60
+    echo "► Running health check (waiting 70s for worker heartbeats)..."
+    sleep 70
     "$PROJECT_DIR/venv/bin/python" scripts/health_check.py || {
         echo ""
         echo "  [WARN] Health check reported issues — rolling back to $PREVIOUS_SHA"

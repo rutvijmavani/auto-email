@@ -17,7 +17,7 @@ class TestGetPubsubRedis(unittest.TestCase):
     def test_called_with_redis_url(self):
         url = "redis://testhost:6380/1"
         from_url, _ = self._call(url)
-        args, kwargs = from_url.call_args
+        args, _ = from_url.call_args
         self.assertEqual(args[0], url)
 
     def test_socket_timeout_is_none(self):

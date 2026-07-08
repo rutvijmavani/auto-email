@@ -35,7 +35,7 @@ How fingerprinting works:
     DataError   + workers/scheduler.py:268    →  sha256("DataError:workers/scheduler.py:268")[:16]
 
 Setup:
-  1. pip install sentry-sdk[loguru]
+  1. pip install sentry-sdk
   2. Add SENTRY_DSN=https://xxx@oYYY.ingest.sentry.io/ZZZ  to .env
   3. Call init_sentry() at the top of each entry point (before any work).
 
@@ -126,7 +126,11 @@ def _fingerprint(event: dict) -> Optional[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_frequency(r, ts_key: str) -> None:
-    """Push current timestamp into the history ring-buffer (newest-first)."""
+    """Push current timestamp into the history ring-buffer (newest-first).
+
+    The three Redis calls are not atomic; a crash between them leaves the list
+    without the TTL reset, which self-corrects on the next successful call.
+    """
     r.lpush(ts_key, time.time())
     r.ltrim(ts_key, 0, HISTORY_SIZE - 1)
     r.expire(ts_key, DEDUP_WINDOW_S)   # auto-clean with the err key

@@ -367,7 +367,7 @@ A third unit, **`recruiter-pipeline-alert@.service`**, is a one-shot template tr
 
 ### The watchdog — continuous health monitoring and self-healing
 
-Think of the watchdog as a dedicated operations person who checks the entire system every 5 minutes, tries to fix problems immediately, and only calls you when they cannot fix it themselves.
+Think of the watchdog as a dedicated operations person who checks the entire system every 5 minutes, tries to fix problems immediately, and only alerts you when they cannot fix it themselves.
 
 **What it checks every 5 minutes — complete walkthrough:**
 

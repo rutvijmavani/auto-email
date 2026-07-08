@@ -94,7 +94,7 @@ def _check_config(prefix: str, *, include_gmail: bool = False) -> None:
         logger.error("%s startup: missing config keys: %s", prefix, missing)
         sys.exit(1)
 
-    logger.debug("%s config check passed (%d keys)", prefix, len(_REQUIRED_ENV_KEYS))
+    logger.debug("%s config check passed (%d keys)", prefix, len(keys_to_check))
 
 
 def _mask_url(url: str) -> str:
@@ -145,11 +145,11 @@ def _check_redis(prefix: str) -> None:
             _ver_str = _info.get("redis_version", "0.0")
             try:
                 _ver = tuple(int(x) for x in _ver_str.split(".")[:2])
-            except ValueError:
+            except ValueError as err:
                 raise _RedisVersionError(
                     f"Redis version string {_ver_str!r} could not be parsed — "
                     "ensure Redis ≥6.2 is installed"
-                )
+                ) from err
             if _ver < (6, 2):
                 raise _RedisVersionError(
                     f"Redis {_info.get('redis_version')} is too old — "

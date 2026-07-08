@@ -112,7 +112,7 @@ Stale reference to `_least_loaded_slot()` replaced with `_pick_schedule_time()`.
 - `recruiter-scheduler.service` → `Restart=always RestartSec=30s` → scheduler restarts within 30s on any crash
 - `recruiter-watchdog.service` → `Restart=always RestartSec=10s` → watchdog restarts within 10s
 - `StartLimitBurst=5` in 300s → if service dies 5× in 5 min, systemd stops retrying and fires `OnFailure=`
-- `OnFailure=recruiter-pipeline-alert@%n.service` → `startup_failure_alert.py` sends email with journal logs
+- `OnFailure=recruiter-pipeline-alert@%p.service` → `startup_failure_alert.py` sends email with journal logs
 
 **Who manages what (current state with systemd):**
 

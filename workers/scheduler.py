@@ -926,7 +926,7 @@ def _pick_schedule_time(
     scores   = sorted(float(s) for _, s in raw)
 
     # Build gaps including window-edge sentinels
-    points = [lo] + scores + [hi]
+    points = [lo, *scores, hi]
     gaps   = [
         (points[i + 1] - points[i], points[i], points[i + 1])
         for i in range(len(points) - 1)
