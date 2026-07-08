@@ -833,13 +833,12 @@ def main() -> None:
     if resolved_fps:
         print(f"[log_monitor] {len(resolved_fps)} error(s) resolved: {resolved_fps}")
 
-    # Advance offsets now — scan progress is independent of email delivery.
-    # Known errors are already tracked in Redis; new errors without dedup keys
-    # will be re-discovered if they recur in future log lines, and appear in
-    # the periodic digest regardless.
-    _save_offsets(new_offsets, new_inodes)
-
     # ── 4. Immediate alert for brand-new errors ──────────────────────────────
+    # Dedup keys are written BEFORE advancing offsets so a crash cannot advance
+    # scan progress without recording the fingerprints.  If we wrote offsets
+    # first and then crashed before writing dedup keys, the errors would be
+    # silently skipped on the next run (offsets advanced past them, no dedup key
+    # to suppress, but the log lines are never re-scanned).
     if new_errors:
         print(f"[log_monitor] {len(new_errors)} NEW error(s): {list(new_errors)}")
         sent = send_immediate_alert(new_errors)
@@ -871,9 +870,13 @@ def main() -> None:
                 except Exception as _we:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
             print("[log_monitor] Email send failed — errors recorded for next digest")
+        # Advance offsets only after dedup keys are written.
+        _save_offsets(new_offsets, new_inodes)
     else:
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
+        # No new errors — safe to advance offsets immediately.
+        _save_offsets(new_offsets, new_inodes)
 
     # ── 5. Periodic digest ───────────────────────────────────────────────────
     try:

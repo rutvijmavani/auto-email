@@ -49,8 +49,8 @@ else
     [[ -n "$REDIS_HOST" ]] && _REDIS_ARGS+=(-h "$REDIS_HOST")
     [[ -n "$REDIS_PORT" ]] && _REDIS_ARGS+=(-p "$REDIS_PORT")
 fi
-[[ -n "$REDIS_AUTH" ]] && _REDIS_ARGS+=(-a "$REDIS_AUTH" --no-auth-warning)
-_rcli() { $REDIS_CLI "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
+# REDIS_AUTH stays out of _REDIS_ARGS to avoid cmdline exposure — pass via env var.
+_rcli() { REDISCLI_AUTH="${REDIS_AUTH}" "$REDIS_CLI" "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
 
 # Reject root as the service user — same guard as install-systemd.sh.
 # SERVICE_USER=root happens when SUDO_USER is explicitly set to root or when
@@ -226,14 +226,14 @@ while true; do
         # scheduler writes per-loop keys (adaptive + fullscan); consider it alive
         # when at least one loop key is present.
         if [[ "$worker" == "scheduler" ]]; then
-            _adp=$(redis-cli GET "worker:alive:scheduler:adaptive" 2>/dev/null)
-            _fsc=$(redis-cli GET "worker:alive:scheduler:fullscan" 2>/dev/null)
+            _adp=$(_rcli GET "worker:alive:scheduler:adaptive" 2>/dev/null)
+            _fsc=$(_rcli GET "worker:alive:scheduler:fullscan" 2>/dev/null)
             if [[ -z "$_adp" && -z "$_fsc" ]]; then
                 MISSING+=("$worker")
             fi
         else
             # Heartbeat keys are per-PID: worker:alive:{type}:{pid}
-            if [[ -z "$(redis-cli --scan --pattern "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
+            if [[ -z "$(_rcli --scan --pattern "worker:alive:${worker}:*" 2>/dev/null | head -1)" ]]; then
                 MISSING+=("$worker")
             fi
         fi

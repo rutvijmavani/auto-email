@@ -552,8 +552,17 @@ if [[ $_crontab_exit -ne 0 ]]; then
 else
     EXISTING_NON_PIPELINE="$_crontab_out"
 fi
-EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
-    sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
+# Guard: only strip the RECRUITER PIPELINE block when BOTH markers are present.
+# An unmatched BEGIN causes sed to delete from BEGIN to end-of-file, destroying
+# all unrelated cron entries that follow.
+if echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ===" && \
+   echo "$EXISTING_NON_PIPELINE" | grep -qF "# === END RECRUITER PIPELINE ==="; then
+    EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
+        sed '/# === BEGIN RECRUITER PIPELINE ===/,/# === END RECRUITER PIPELINE ===/d')
+elif echo "$EXISTING_NON_PIPELINE" | grep -qF "# === BEGIN RECRUITER PIPELINE ==="; then
+    echo "[ERROR] Unmatched '# === BEGIN RECRUITER PIPELINE ===' found in crontab — aborting to prevent data loss."
+    exit 1
+fi
 # Strip legacy run_*.sh pipeline entries (pre-marker crontabs)
 EXISTING_NON_PIPELINE=$(echo "$EXISTING_NON_PIPELINE" | \
     grep -v '/home/opc/mail/run_[a-z_]*\.sh' || true)

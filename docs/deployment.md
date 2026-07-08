@@ -1295,7 +1295,7 @@ The watchdog cannot restart itself. If `recruiter-watchdog.service` enters `fail
 
 **What it checks:**
 
-Each worker runs a background daemon thread that writes `worker:alive:{type}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
+Each worker runs a background daemon thread that writes `worker:alive:{type}:{hostname}:{pid}` to Redis on a fixed interval, independent of what the main thread is doing:
 
 ```text
 scheduler:       writes every ~1s  TTL=30s   dead after 20s

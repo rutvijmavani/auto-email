@@ -266,6 +266,10 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 WHERE company = ANY(%s)
             """, (company_names,)).fetchall()
         finally:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
             conn.close()
 
         # Second inflight snapshot after DB query — union narrows the race window.
@@ -278,10 +282,10 @@ def _get_worker_missed_companies(companies: list) -> tuple:
     except Exception as _db_exc:
         logger.warning(
             "_get_worker_missed_companies: DB unavailable (%s) — "
-            "returning empty missed list (may defer work to next cycle)",
-            _db_exc,
+            "treating all %d companies as missed (conservative fallback)",
+            _db_exc, len(companies),
         )
-        return [], set()
+        return list(companies), set()
     finally:
         if _r_inflight is not None:
             try:

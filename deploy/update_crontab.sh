@@ -49,10 +49,17 @@ done
 
 # Strip per-block markers inserted by this script on previous runs so the
 # blocks can be replaced cleanly without accumulating comment headers.
+# Guard: only run the range-delete when BOTH markers are present — an unmatched
+# BEGIN causes sed to delete from BEGIN to end-of-file, wiping unrelated entries.
 for _marker in "MONITOR RETRY" "LOG MONITOR" "KEEP-ALIVE"; do
-    CLEANED=$(echo "$CLEANED" \
-      | sed "/# === BEGIN ${_marker} ===/,/# === END ${_marker} ===/d" \
-      || true)
+    if echo "$CLEANED" | grep -qF "# === BEGIN ${_marker} ===" && \
+       echo "$CLEANED" | grep -qF "# === END ${_marker} ==="; then
+        CLEANED=$(echo "$CLEANED" \
+          | sed "/# === BEGIN ${_marker} ===/,/# === END ${_marker} ===/d" \
+          || true)
+    elif echo "$CLEANED" | grep -qF "# === BEGIN ${_marker} ==="; then
+        echo "[WARN] Unmatched '# === BEGIN ${_marker} ===' in crontab — skipping block removal to preserve other entries" >&2
+    fi
 done
 
 # Strip RECRUITER PIPELINE markers if present (re-added by setup_cron.sh later).

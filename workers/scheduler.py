@@ -1031,7 +1031,7 @@ def _atomic_schedule(
             # Another process is scheduling — apply a deterministic per-company
             # offset so concurrent callers don't all land on the same timestamp
             # (thundering herd).  Use a hash of the company string to produce a
-            # reproducible, unique spread within ±(interval_s * 5%) of target_ts.
+            # reproducible, unique positive spread within the safe window or 0–10% of interval.
             import hashlib as _hashlib
             _hash_int = int(_hashlib.md5(company.encode(), usedforsecurity=False).hexdigest(), 16)
             if deadline_ts and (deadline_ts - avg_duration_s) > target_ts:

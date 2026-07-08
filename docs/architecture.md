@@ -419,7 +419,7 @@ When the watchdog crashes too many times, systemd fires `recruiter-pipeline-aler
 
 **Multi-worker per-PID key architecture:**
 
-The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail workers, 3 fullscan workers — counts calculated dynamically from 30-day API health history). Because multiple workers of the same type run simultaneously, a single shared key per type would collapse all of them into one — the last writer would overwrite everyone else's heartbeat, making it impossible to track individual workers.
+The scheduler runs **multiple workers per type** (e.g. 3 scan workers, 4 detail workers, 3 fullscan workers). Scan and detail worker counts are calculated dynamically from 30-day API health history; the fullscan worker pool is pinned at `WORKER_FLOOR` (a fixed minimum) because fullscan throughput is not latency-sensitive. Because multiple workers of the same type run simultaneously, a single shared key per type would collapse all of them into one — the last writer would overwrite everyone else's heartbeat, making it impossible to track individual workers.
 
 Each worker writes its own key including its PID:
 

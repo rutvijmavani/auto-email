@@ -30,10 +30,10 @@ else
     [[ -n "$REDIS_HOST" ]] && _REDIS_ARGS+=(-h "$REDIS_HOST")
     [[ -n "$REDIS_PORT" ]] && _REDIS_ARGS+=(-p "$REDIS_PORT")
 fi
-[[ -n "$REDIS_AUTH" ]] && _REDIS_ARGS+=(-a "$REDIS_AUTH" --no-auth-warning)
-
-# All redis-cli calls go through this wrapper so connection args are injected.
-_rcli() { $REDIS_CLI "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
+# REDIS_AUTH is kept out of _REDIS_ARGS — passing -a on the command line exposes
+# the password in /proc/<pid>/cmdline and ps output.  redis-cli honours the
+# REDISCLI_AUTH environment variable instead, which is scoped to each invocation.
+_rcli() { REDISCLI_AUTH="${REDIS_AUTH}" "$REDIS_CLI" "${_REDIS_ARGS[@]+"${_REDIS_ARGS[@]}"}" "$@"; }
 
 REDIS_CONF_CANDIDATES=(
     /etc/redis/redis.conf

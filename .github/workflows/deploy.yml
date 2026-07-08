@@ -149,6 +149,31 @@ jobs:
             PY
 
             echo "[6/8] Syncing systemd unit files..."
+            # Guard: verify the root-owned staging directory is current relative to
+            # the repo's deploy/systemd/ files.  The install-pipeline-units wrapper
+            # reads from the staging dir (updated only by install-systemd.sh), so if
+            # a unit file changed in this commit without a manual re-run of
+            # install-systemd.sh the staging would be stale and the new directives
+            # would be silently dropped.  Fail closed here so the operator knows.
+            _stale_units=0
+            for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service"; do
+              _src="deploy/systemd/$_unit"
+              _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
+              if [[ ! -f "$_staged" ]]; then
+                echo "[ERROR] Staging file missing: $_staged"
+                echo "        Run: sudo bash deploy/install-systemd.sh"
+                _stale_units=1
+              elif ! diff -q "$_src" "$_staged" > /dev/null 2>&1; then
+                echo "[ERROR] Staged unit out of date: $_unit"
+                echo "        deploy/systemd/$_unit differs from $_staged"
+                echo "        Run: sudo bash deploy/install-systemd.sh"
+                _stale_units=1
+              fi
+            done
+            if [[ "$_stale_units" -eq 1 ]]; then
+              echo "[ERROR] Systemd unit staging is stale — deployment aborted."
+              false
+            fi
             sudo /usr/local/bin/install-pipeline-units
             echo "  systemd unit files installed"
             sudo systemctl daemon-reload

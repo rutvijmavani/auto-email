@@ -957,12 +957,20 @@ def run_worker(once: bool = False, shutdown_event=None,
             # has its own per-PID inflight key, so there is only ever one item
             # in this key at a time.  LREM is semantically clearer and safe.
             if shutdown_event is not None and shutdown_event.is_set():
-                r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
-                logger.info(
-                    "detail_worker: shutdown (pre-process), atomically returned "
-                    "job to %s — exiting",
-                    source_queue,
-                )
+                try:
+                    r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
+                    logger.info(
+                        "detail_worker: shutdown (pre-process), atomically returned "
+                        "job to %s — exiting",
+                        source_queue,
+                    )
+                except Exception as _requeue_exc:
+                    logger.error(
+                        "detail_worker: shutdown requeue failed — item may be stranded "
+                        "in inflight and requires peer recovery on next startup: %s",
+                        _requeue_exc,
+                    )
+                    _hb.stop()
                 break
 
             try:
