@@ -213,7 +213,11 @@ def check_pipeline_health():
     from datetime import date as date_type, timedelta as td
     recent = stats[:days]
     try:
-        dates = [date_type.fromisoformat(s["date"]) for s in recent]
+        dates = [
+            s["date"] if isinstance(s["date"], date_type)
+            else date_type.fromisoformat(s["date"])
+            for s in recent
+        ]
         for i in range(len(dates) - 1):
             if (dates[i] - dates[i + 1]).days != 1:
                 logger.debug(
@@ -221,7 +225,7 @@ def check_pipeline_health():
                     dates[i], dates[i + 1]
                 )
                 return []
-    except (ValueError, KeyError):
+    except (TypeError, ValueError, KeyError):
         return []
 
     # ── Metric 1 streak check ──

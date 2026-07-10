@@ -732,7 +732,11 @@ def _build_detail_payload(
     }
 
     for key in PLATFORM_DETAIL_KEYS.get(platform, []):
-        if job.get(key) is not None:
+        # Use truthiness (not `is not None`) so that empty strings are treated as
+        # absent.  fetch_job_detail() guard clauses use `not all([...])` which
+        # treats empty strings as missing — forwarding "" would silently trigger
+        # the guard and return the job unenriched.
+        if job.get(key):
             payload[key] = job[key]
 
     # Country code available at listing level (Workday, SmartRecruiters, etc.)

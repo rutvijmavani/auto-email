@@ -317,6 +317,11 @@ REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currentl
                                                    # in-progress scans from fallback re-fetch
 INFLIGHT_FULLSCAN_STALE_S = 7200                   # 2 h — entries older than this are considered
                                                    # abandoned (used by health_check and job_monitor)
+REDIS_INFLIGHT_FULLSCAN_DC_PREFIX  = "inflight:fullscans"           # ZSET per-DC fullscan concurrency
+                                                                    # key: {prefix}:{dc_key}, member: company
+WORKER_CURRENT_JOB_FULLSCAN_PREFIX = "worker:current_job:fullscan" # STRING per-worker pid
+                                                                    # key: {prefix}:{pid}, value: "company|dc_key"
+WORKER_CURRENT_JOB_FULLSCAN_TTL    = 3600                          # 1 h backstop (scheduler cleanup is primary)
 
 # Scan queue (scan_worker skeleton → replaced by scheduler in Phase 4)
 SCAN_QUEUE        = "scan:queue"
@@ -388,8 +393,6 @@ CYCLE_START_HOUR               = 7          # monitoring day runs 7 AM → 7 AM
                                              # used by rebuild_poll_queues() to
                                              # distinguish stale (previous cycle) from
                                              # current-cycle companies on restart.
-SCHEDULER_DAWN_PATROL_WINDOW   = 4 * 3600   # redistribute polls due after +4h
-SCHEDULER_DAWN_PATROL_SPREAD   = 2 * 3600   # spread them across 2h window
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan
 SCHEDULER_FULL_SCAN_INTERVAL_S = 86400      # default full scan every 24h
 SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
@@ -473,8 +476,9 @@ CONCURRENCY_SPIKE_FACTOR_THRESHOLD = 5.0   # spike_factor > this → concurrency
 WORKER_SHUTDOWN_TIMEOUT_S         = 30     # seconds before forced SIGKILL on shutdown
 WORKER_FAST_CHECK_INTERVAL_S      = 300    # 5 min — error-triggered worker reduction
 WORKER_SLOW_CHECK_INTERVAL_S      = 1800   # 30 min — throughput-driven scaling
-WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of combined DB pool for scan workers
-WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of combined DB pool for detail workers
+WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of remaining DB pool for scan workers
+WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of remaining DB pool for detail workers
+WORKER_POOL_FULLSCAN_FRACTION     = 0.25   # 25% of remaining DB pool for fullscan workers
 WORKER_FLOOR                      = 2      # minimum workers per pool (redundancy)
 WORKER_DEPRIORITISE_SECS          = 300    # seconds to push erroring platform's
                                            # companies forward in poll:adaptive

@@ -338,11 +338,21 @@ def should_fetch_detail(job: dict, platform: str, config: dict,
         "jobvite":         "_slug",
         "taleo":           "_contest_no",
         "smartrecruiters": "_company_slug",
-        "workday":         "_external_path",
     }
     key = required_keys.get(platform)
     if key is not None:
         return bool(job.get(key))
+
+    # Workday: fetch_job_detail() guard requires ALL of _external_path, _slug,
+    # _wd, and _path.  Gating only on _external_path (the detail URL) is not
+    # enough — if _slug or _wd are missing (malformed stored ats_slug), the
+    # guard fires silently and returns the job unchanged with no enrichment.
+    if platform == "workday":
+        return bool(
+            job.get("_external_path")
+            and job.get("_slug")
+            and job.get("_wd")
+        )
 
     if platform == "sitemap":
         return bool(job.get("job_url")) and job.get("_feed_type") != "xml"

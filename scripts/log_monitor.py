@@ -96,8 +96,6 @@ FLAG_PATTERNS: list[re.Pattern] = [
 
 # ── Patterns that SUPPRESS a line even if it matches FLAG_PATTERNS ────────────
 SUPPRESS_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("Accenture missing_keys (expected Workday behaviour)",
-     re.compile(r'MISSING required keys.*company=.accenture')),
     ("URL-extracted non-US location (expected filter behaviour)",
      re.compile(r'non-US location')),
     ("api_health default fallback (handled internally)",

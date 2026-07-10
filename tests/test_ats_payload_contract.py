@@ -114,26 +114,28 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
         self.assertEqual(payload["_slug"], "acme")
         self.assertEqual(payload["_wd"], "wd1")
         self.assertEqual(payload["_path"], "careers")
-        # _site=None → not forwarded (guard: job.get(key) is not None)
+        # _site=None → not forwarded (falsy value excluded)
         self.assertNotIn("_site", payload)
 
-    def test_workday_empty_string_is_forwarded(self):
-        """Empty string is not None — it IS forwarded (guard: is not None)."""
+    def test_workday_empty_string_not_forwarded(self):
+        """Empty strings must NOT be forwarded — they are falsy and would silently
+        trigger fetch_job_detail()'s guard (not all([slug, wd, path, external_path]))
+        returning the job unenriched, identical to having a None value."""
         job = _minimal_job(_external_path="", _slug="acme", _wd="wd1", _path="")
         payload = _build_detail_payload("Acme", "workday", job, {})
-        # Empty strings are forwarded (will cause guard to fire, but that's
-        # the responsibility of the caller to pass valid data)
-        self.assertIn("_external_path", payload)
-        self.assertEqual(payload["_external_path"], "")
-        self.assertIn("_path", payload)
-        self.assertEqual(payload["_path"], "")
+        # _external_path="" and _path="" are falsy → must NOT be forwarded
+        self.assertNotIn("_external_path", payload)
+        self.assertNotIn("_path", payload)
+        # non-empty keys ARE still forwarded
+        self.assertIn("_slug", payload)
+        self.assertIn("_wd", payload)
 
     def test_workday_none_value_not_forwarded(self):
         """Key with None value must NOT appear in the payload."""
         job = _minimal_job(_slug=None, _wd="wd1", _path="careers",
                            _external_path="/job/test")
         payload = _build_detail_payload("Acme", "workday", job, {})
-        # _slug=None → skipped
+        # _slug=None → skipped (falsy)
         self.assertNotIn("_slug", payload)
 
     def test_taleo_keys_forwarded(self):

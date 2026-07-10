@@ -64,7 +64,11 @@ from config import (
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
     INFLIGHT_FULLSCAN_STALE_S,
+    REDIS_POLL_FULLSCAN,
+    SCHEDULER_FULL_SCAN_BUFFER_S,
+    SCHEDULER_FULL_SCAN_INTERVAL_S,
 )
+from workers.scheduler import _atomic_schedule, _next_digest_deadline
 
 logger = get_logger(__name__)
 
@@ -161,11 +165,16 @@ def _should_fetch_detail(job, platform, config, slug_info=None):
         "jobvite":         "_slug",
         "taleo":           "_contest_no",
         "smartrecruiters": "_company_slug",
-        "workday":         "_external_path",
     }
     key = required_keys.get(platform)
     if key is not None:
         return bool(job.get(key))
+    if platform == "workday":
+        return bool(
+            job.get("_external_path")
+            and job.get("_slug")
+            and job.get("_wd")
+        )
     # sitemap: skip XML feeds (they already have all data in the feed)
     if platform == "sitemap":
         return bool(job.get("job_url")) and job.get("_feed_type") != "xml"
@@ -315,6 +324,79 @@ def _get_worker_missed_companies(companies: list) -> tuple:
     return missed, in_flight_names
 
 
+def _queue_fullscans_for_missed(missed: list) -> None:
+    """
+    After the monitor's listing fallback, queue a fullscan for each missed
+    company whose next_full_scan_at is NULL or already past.
+
+    The listing fallback covers new job discovery for today's digest, but only
+    a fullscan updates last_full_scan_at and handles expiration tracking.
+    Without this, a persistently missed company gets listing fallbacks forever
+    and never receives another fullscan.
+    """
+    if not missed:
+        return
+
+    from db.db import get_conn
+    import redis as _redis_lib
+    from config import REDIS_URL
+
+    company_names = [c["company"] for c in missed]
+    now = time.time()
+
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT company, next_full_scan_at, avg_fullscan_duration_s
+                FROM company_poll_stats
+                WHERE company = ANY(%s)
+            """, (company_names,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("_queue_fullscans_for_missed: DB query failed (%s) — skipping fullscan queuing", exc)
+        return
+
+    scan_map = {r["company"]: r for r in rows}
+
+    try:
+        r = _redis_lib.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=3)
+    except Exception as exc:
+        logger.warning("_queue_fullscans_for_missed: Redis connect failed (%s) — skipping fullscan queuing", exc)
+        return
+
+    queued = 0
+    for company_row in missed:
+        company = company_row["company"]
+        stats_row = scan_map.get(company)
+        if stats_row is None:
+            continue
+
+        next_scan = stats_row["next_full_scan_at"]
+        if next_scan is not None:
+            next_ts = next_scan.timestamp() if hasattr(next_scan, "timestamp") else float(next_scan)
+            if next_ts > now:
+                continue  # fullscan already scheduled in the future
+
+        avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
+        _atomic_schedule(
+            r, REDIS_POLL_FULLSCAN, company,
+            now + SCHEDULER_FULL_SCAN_BUFFER_S,
+            SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+            deadline_ts    = _next_digest_deadline(now),
+            avg_duration_s = avg_duration,
+        )
+        queued += 1
+        logger.info(
+            "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
+            company, next_scan,
+        )
+
+    if queued:
+        logger.info("monitor: queued fullscans for %d/%d missed companies", queued, len(missed))
+
+
 def run():
     """
     Main entry point for --monitor-jobs.
@@ -433,6 +515,12 @@ def run():
                     }
 
                 _merge_company_stats(stats, stats_lock, company_stats)
+
+        # Queue a fullscan for each missed company whose next_full_scan_at
+        # is NULL or already past — the listing fallback only covers new job
+        # discovery; the fullscan handles expiration tracking and updates
+        # last_full_scan_at so the company isn't "missed" indefinitely.
+        _queue_fullscans_for_missed(missed)
     else:
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
@@ -893,14 +981,17 @@ def _process_company(company_row, position, total):
         #   Tier 3: is_us_location() on descriptor-embedded location string
         #           → fallback when alpha2Code absent (older/custom tenants).
         if platform == "workday" and job.get("_external_path"):
+            _snap_cc  = job.get("_country_code", "")
+            _snap_loc = job.get("location", "")
             with sem:
                 try:
                     job = ats_module.fetch_job_detail(job)
                 except Exception as e:
                     logger.error(
-                        "Workday fetch_job_detail failed %s/%s: %s",
+                        "Workday fetch_job_detail failed %s/%s: %s — skipping",
                         company, job.get("job_id"), e, exc_info=True,
                     )
+                    continue
             alpha2 = (job.get("_country_code") or "").upper()
             if alpha2:
                 # Tier 1: structured alpha-2 code — no text parsing needed
@@ -917,6 +1008,23 @@ def _process_company(company_row, position, total):
                     company, job.get("title"), job.get("location"),
                 )
                 continue
+            else:
+                # is_us_location returned True but alpha2 is absent.
+                # If detail fetch produced no new data (guard fired or API blank),
+                # the listing-level location alone is not trustworthy — skip rather
+                # than risk leaking a non-US job (e.g. empty locationsText or an
+                # ambiguous city name like "Glasgow Campus" matching Glasgow, KY).
+                _enriched = (
+                    job.get("_country_code", "") != _snap_cc
+                    or job.get("location", "") != _snap_loc
+                )
+                if not _enriched:
+                    logger.warning(
+                        "Workday detail returned no enrichment and no alpha2 for "
+                        "%s/%s (location=%r) — skipping to avoid leaking non-US job",
+                        company, job.get("job_id"), job.get("location"),
+                    )
+                    continue
 
         # ── Alpha-2 listing-level gate ────────────────────────────────────────
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO

@@ -476,6 +476,29 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
 
         detail_attempted = should_fetch_detail(job, platform, config, slug_info)
 
+        # For listing_filter="title_only" platforms (e.g. Workday), the listing
+        # location is vague/absent — detail enrichment is the only reliable
+        # source of location and alpha2.  If detail was supposed to happen
+        # (has_detail=True) but required keys are missing so should_fetch_detail
+        # returned False, we cannot make a correct filter decision.  Retry rather
+        # than risk leaking a non-US job through is_us_location("") = True.
+        if (
+            not detail_attempted
+            and config.get("has_detail")
+            and config.get("listing_filter") == "title_only"
+        ):
+            logger.warning(
+                "detail_worker: detail required for listing_filter=title_only but "
+                "skipped (missing required keys in payload) — retrying. "
+                "platform=%s company=%r job_id=%s payload_underscore_keys=%s",
+                platform, company, job_id,
+                [k for k in job if k.startswith("_") and job.get(k)],
+            )
+            result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+            result["outcome"]   = "error"
+            result["retryable"] = True
+            return result
+
         if detail_attempted:
             # ── Pre-flight key audit ──────────────────────────────────────────
             # Each fetch_job_detail() has a guard clause that returns the
@@ -578,12 +601,18 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 logger.warning(
                     "detail_worker: fetch_job_detail returned NO new data "
                     "(location/cc/description unchanged). "
-                    "Guard may have fired or API returned empty. "
+                    "Guard may have fired or API returned empty — retrying. "
                     "platform=%s company=%r job_id=%s "
                     "location=%r cc=%r",
                     platform, company, job_id,
                     job.get("location"), job.get("_country_code"),
                 )
+                result["duration_ms"] = int(
+                    (time.monotonic() - start_mono) * 1000
+                )
+                result["outcome"]   = "error"
+                result["retryable"] = True
+                return result
 
         # ── 3. Filter pipeline ────────────────────────────────────────────────
 

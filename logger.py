@@ -10,6 +10,11 @@
 #
 # Log files written to (all in logs/):
 #
+#   Scheduler       → scheduler.log               (active, rotates at midnight)
+#     TimedRotatingFileHandler — rotates to scheduler.log.YYYY-MM-DD at
+#     midnight so each day's entries are in a clearly-named file.
+#     backupCount=0: _cleanup_old_logs() owns 14-day retention for backups.
+#
 #   Daily commands  → {command}_YYYY-MM-DD.log   (14-day retention)
 #     monitor, outreach, sync, nightly, monday, weekly,
 #     detect, verify_filled, find, …
@@ -248,14 +253,34 @@ def init_logging(command: str = "pipeline") -> None:
         root.addHandler(console)
 
     # ── 2. Command-specific log file ────────────────────────────────
-    # Monthly commands accumulate into one YYYY-MM file per month.
-    # Daily commands get a fresh YYYY-MM-DD file each day.
-    # Plain FileHandler (append) — TimedRotatingFileHandler rotation
-    # never fires for short-lived cron processes; _cleanup_old_logs()
-    # handles deletion at startup instead.
-    date_fmt     = "%Y-%m" if command in _MONTHLY_COMMANDS else "%Y-%m-%d"
-    today        = datetime.now().strftime(date_fmt)
-    command_file = LOG_DIR / f"{command}_{today}.log"
+    # The scheduler is the only long-running process that reliably crosses
+    # midnight, so it uses TimedRotatingFileHandler on a fixed base name
+    # (scheduler.log).  At midnight the handler renames the file to
+    # scheduler.log.YYYY-MM-DD and opens a fresh scheduler.log, keeping
+    # each day's entries in a separate file with an unambiguous name.
+    # backupCount=0 disables the handler's own deletion — _cleanup_old_logs()
+    # owns the 14-day retention for *.log.YYYY-MM-DD files.
+    #
+    # All other commands are short-lived cron processes that terminate in
+    # minutes and are never alive at midnight, so TimedRotatingFileHandler
+    # would never fire for them.  They use plain FileHandler on a dated
+    # filename; _cleanup_old_logs() handles deletion at startup instead.
+    if command == "scheduler":
+        command_file = LOG_DIR / "scheduler.log"
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            command_file,
+            when="midnight",
+            backupCount=0,       # _cleanup_old_logs() handles deletion
+            encoding="utf-8",
+        )
+    else:
+        date_fmt     = "%Y-%m" if command in _MONTHLY_COMMANDS else "%Y-%m-%d"
+        today        = datetime.now().strftime(date_fmt)
+        command_file = LOG_DIR / f"{command}_{today}.log"
+        file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
+
+    file_handler.setLevel(LOG_LEVEL)
+    file_handler.setFormatter(formatter)
 
     # ── 3. Catch-all pipeline_YYYY-MM-DD.log ────────────────────────
     # Always-on daily file — useful for grepping across all commands.
@@ -268,9 +293,6 @@ def init_logging(command: str = "pipeline") -> None:
     # Adding two FileHandlers to the same path would duplicate every log line.
     # In that case skip the command-specific handler and rely on the catchall.
     if command_file != pipeline_file:
-        file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
-        file_handler.setLevel(LOG_LEVEL)
-        file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
     catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")

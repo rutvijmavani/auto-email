@@ -1066,7 +1066,9 @@ def main():
         return
 
     if "--scheduler" in args:
+        from logger import init_logging
         from workers.scheduler import run_scheduler
+        init_logging("scheduler")
         run_scheduler(skip_rebuild="--skip-rebuild" in args)
         return
 

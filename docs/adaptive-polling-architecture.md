@@ -353,7 +353,15 @@ Full scan dispatcher (runs every 5 seconds):
                  ZADD poll:fullscan  {company: now + 900}
                  continue  ← come back after adaptive runs
        dc_key = get_dc_key(company)
-       XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * {company, triggered_at}
+       Ceiling check (Lua — atomic): if worker:ceil:learned:{dc_key} exists:
+         ZREMRANGEBYSCORE inflight:scans:{dc_key} 0 (now-10min)     ← prune stale adaptive entries
+         ZREMRANGEBYSCORE inflight:fullscans:{dc_key} 0 (now-2h)    ← prune stale fullscan entries
+         total = ZCARD inflight:scans:{dc_key} + ZCARD inflight:fullscans:{dc_key}
+         if total >= ceiling:
+           ZADD poll:fullscan {company: now+30}
+           continue  ← re-queue and skip
+         ZADD inflight:fullscans:{dc_key} {now} {company}  ← claim slot atomically
+       XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * {company, dc_key, triggered_at}
        ZREM poll:fullscan {company}
 
 Full scan workers (one pool per dc_key):
@@ -692,24 +700,48 @@ No company polls less frequently than every 12 hours. Worst case: a dormant comp
 Dawn patrol redistributed late adaptive polls into the 7 AM–9 AM window at cycle start. This is no longer needed. Hash-based slot assignment (see Section 24) distributes adaptive polls evenly across the 24-hour day from the very first cycle — there are no clustered late polls to redistribute. Dawn patrol is removed.
 
 **Rule 3 — Adaptive triggers full scan directly (structural enforcement)**
-When adaptive completes, it checks whether full scan is due and queues it automatically. Full scan can only enter `poll:fullscan` via this path — never independently.
+When adaptive completes, it checks whether a full scan needs to be scheduled or
+rescheduled, and queues one if needed. Full scan can only enter `poll:fullscan` via
+this path (Path 2) or via `fullscan.py` post-completion rescheduling (Path 1).
 
 ```python
 def on_adaptive_complete(company):
     update_stats(company)
     reschedule_adaptive(company)
 
-    if should_trigger_full_scan(company):
-        redis.zadd("poll:fullscan", {company.name: time.time() + 300})
+    if success:
+        _maybe_reschedule_full_scan(company, row)
 
-def should_trigger_full_scan(company):
-    if company.last_full_scan_at is None:
-        return True   # never been full-scanned
-    elapsed = time.time() - company.last_full_scan_at.timestamp()
-    return elapsed >= company.full_scan_interval_s   # 24h
+def _maybe_reschedule_full_scan(company, row):
+    # Suppressed during active ATS scan backoff
+    if r.exists(f"retry:backoff:scan:{company}"):
+        return
+
+    avg_duration = float(row["avg_fullscan_duration_s"] or 1800.0)
+    next_scan    = row["next_full_scan_at"]
+
+    if next_scan is not None:
+        next_ts  = next_scan.timestamp()
+        deadline = _next_digest_deadline(now)
+        if next_ts > now and (next_ts + avg_duration) < deadline:
+            return   # already scheduled and will finish before 7 AM digest
+
+    # Use _atomic_schedule (gap-filling) rather than raw zadd
+    _atomic_schedule(
+        r, REDIS_POLL_FULLSCAN, company,
+        now + SCHEDULER_FULL_SCAN_BUFFER_S,
+        SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+        deadline_ts    = _next_digest_deadline(now),
+        avg_duration_s = avg_duration,
+    )
 ```
 
-Because full scan is triggered 5 minutes after adaptive, the adaptive-first rule is enforced by design — full scan physically cannot run before adaptive.
+Three cases trigger (re)scheduling: `next_full_scan_at` is NULL (never scheduled),
+`next_full_scan_at` is in the past (overdue / ZSET entry lost), or the scheduled time
+plus average scan duration would miss the 7 AM digest deadline.
+
+Because fullscan requires a prior adaptive completion (Path 2 only fires inside
+`on_adaptive_complete`), the adaptive-first rule is enforced by design.
 
 **Rule 5 — Pre-7 AM full scan trigger (crossing-day boundary)**
 When `on_adaptive_complete()` reschedules the next adaptive poll to *tomorrow* (crossing the 7 AM boundary), the full scan for the current cycle may not have run yet. If sufficient time remains tonight, trigger the full scan now rather than leaving it undone until tomorrow's cycle.
@@ -908,6 +940,11 @@ def claim_stale_work(stream_key: str, group: str, consumer: str,
     stale = redis.xautoclaim(stream_key, group, consumer, min_idle_time=idle_ms)
 
     for msg_id, fields in stale[1]:
+        # Redis 7+ returns (None, None) for PEL entries whose backing stream
+        # message was trimmed/deleted by MAXLEN. Skip rather than XACK with None
+        # (which would raise a Redis error). These are logged separately as deleted_ids.
+        if msg_id is None:
+            continue
         company = fields["company"]
 
         # Check how many times this message has been delivered already
@@ -978,17 +1015,20 @@ def on_adaptive_complete(company):
     update_stats(company)          # update score, interval, recent_poll_counts
     reschedule_adaptive(company)   # ZADD poll:adaptive with new next_poll_at
 
-    if should_trigger_full_scan(company):
-        redis.zadd("poll:fullscan", {company.name: time.time() + 300})
-
-def should_trigger_full_scan(company):
-    if company.last_full_scan_at is None:
-        return True   # never been full-scanned → trigger immediately
-    elapsed = time.time() - company.last_full_scan_at.timestamp()
-    return elapsed >= company.full_scan_interval_s   # 86400s (24h)
+    if success:
+        _maybe_reschedule_full_scan(company, row)
 ```
 
-This makes the adaptive-first rule structural: full scan **cannot** enter `poll:fullscan` without an adaptive poll having just completed. The 5-minute offset (`time.time() + 300`) gives detail workers a head start on any new jobs adaptive just found before the full scan begins.
+`_maybe_reschedule_full_scan` is a no-op when the company already has a future fullscan
+scheduled that will finish before the 7 AM digest (checked via `next_full_scan_at` from
+`company_poll_stats` + `avg_fullscan_duration_s` EMA). It only writes to `poll:fullscan`
+when scheduling is genuinely missing or stale, and uses `_atomic_schedule` (gap-filling)
+rather than a raw `zadd` to prevent clustering with other companies.
+
+This makes the adaptive-first rule structural: full scan **cannot** enter `poll:fullscan`
+without an adaptive poll having just completed. The `SCHEDULER_FULL_SCAN_BUFFER_S` offset
+(default 5 min) gives detail workers a head start on any new jobs adaptive just found
+before the full scan begins.
 
 **Full scan frequency** is controlled entirely by `full_scan_interval_s` (default 24h) in `company_poll_stats`. Even if adaptive runs twice in a day (which it will for active companies at 3–6h intervals), only the first call after the 24h window has elapsed triggers a new full scan:
 
@@ -1004,6 +1044,45 @@ Next day:
 ```
 
 Full scan runs exactly once per 24h per company, regardless of how often adaptive polls.
+
+### Missed-company fullscan queuing — job_monitor safety net
+
+When the 7 AM job_monitor runs, `_get_worker_missed_companies()` identifies companies
+that were not covered by scan workers (worker death, thundering herd, throughput ceiling).
+The monitor performs a listing fallback scan for each missed company (all pages via
+`fetch_jobs()`), which catches new jobs for the digest. However, this listing fallback
+does **not** update `last_full_scan_at` and does **not** queue a fullscan — the Bloom
+filter stays stale and the company may not get a proper fullscan until late in the day.
+
+`_queue_fullscans_for_missed(missed)` runs after the listing fallback:
+
+```python
+def _queue_fullscans_for_missed(missed):
+    # For each missed company where next_full_scan_at is NULL or in the past
+    for company in missed:
+        next_scan = stats_row["next_full_scan_at"]
+        if next_scan is not None and next_scan.timestamp() > now:
+            continue   # already has a future fullscan — leave it alone
+        _atomic_schedule(
+            r, REDIS_POLL_FULLSCAN, company,
+            now + SCHEDULER_FULL_SCAN_BUFFER_S,
+            SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+            deadline_ts    = _next_digest_deadline(now),
+            avg_duration_s = avg_duration,
+        )
+```
+
+**Why this matters:** The listing fallback in job_monitor serves as the digest-day
+recovery for missed companies (all pages, same coverage as a fullscan), but the fullscan
+worker is the only path that updates `last_full_scan_at` and rebuilds the Bloom filter.
+Without `_queue_fullscans_for_missed`, a company that was missed today would: (a) not have
+an updated Bloom filter for tomorrow's adaptive early-exit checks, and (b) have a stale or
+NULL `next_full_scan_at` which might trigger Path 2 rescheduling during the *next* adaptive
+completion — possibly at the wrong time. Queuing the fullscan explicitly ensures the company
+gets proper coverage within the same day.
+
+Redis or DB failures in `_queue_fullscans_for_missed` are non-fatal: the listing fallback
+result is already saved regardless, and the warning is logged.
 
 ### Full scan behavior by ATS platform type
 
@@ -1157,6 +1236,22 @@ for proc in all_worker_processes:
 
 Dead workers are replaced on the next tick — not at the next 5-minute or 30-minute check.
 
+For dead fullscan workers, the liveness check also releases the inflight slot the worker was
+holding so future dispatches are not incorrectly throttled:
+
+```python
+# After spawning replacement, for each dead fullscan worker:
+raw = r.get(f"worker:current_job:fullscan:{old_pid}")
+if raw:
+    company, dc_key = raw.split("|", 1)
+    r.zrem(f"inflight:fullscans:{dc_key}", company)   # release slot
+r.delete(f"worker:current_job:fullscan:{old_pid}")    # clean up
+```
+
+This runs event-driven within ~5s of the crash. If the worker died before it wrote the
+`worker:current_job:fullscan:{pid}` key, the slot remains until the 2-h stale prune on
+the next fullscan dispatch for that DC key.
+
 **Layer 2 — Fast error check (every 5 minutes)**
 
 Reacts to error spikes that the semaphore alone cannot resolve (semaphore already at floor):
@@ -1264,50 +1359,62 @@ Worker removal affects all platforms equally since workers are not platform-spec
 
 The correct isolation: track **in-flight scans per platform/DC** and throttle at dispatch time, not at worker-count level.
 
-**In-flight tracking — Stream PEL (replaces inflight ZSET)**
+**In-flight tracking — two ZSET keys (one per scan type)**
 
-`inflight:scans:{dc_key}` ZSET is eliminated. The Stream's **Pending Entries List (PEL)** serves as the inflight tracker directly — it contains exactly the messages that have been delivered to a consumer but not yet ACK'd, which is precisely the definition of "in flight":
+Adaptive and fullscan workers share the same learned ceiling per DC key but use **separate ZSET keys** to track their inflight slots. This is necessary because the two scan types have very different durations — a 10-minute stale window that prunes abandoned adaptive slots would prune active fullscan slots mid-scan (full scans take 20–30 min).
 
-```python
-def pel_size(redis, dc_key: str) -> int:
-    """Current in-flight scan count for a DC key."""
-    info = redis.xpending(f"stream:adaptive:{dc_key}", "scan-workers")
-    return info["pending"]   # 0 if nothing in flight
+```
+inflight:scans:{dc_key}      — adaptive scan inflight  (stale window: INFLIGHT_STALE_WINDOW_S = 10 min)
+inflight:fullscans:{dc_key}  — fullscan inflight        (stale window: INFLIGHT_FULLSCAN_STALE_S  = 2 h)
 ```
 
-Ceiling check in the dispatcher becomes:
+Both counts are summed before comparing to the ceiling. Neither scan type can proceed if their combined total hits the limit.
+
+**Adaptive dispatch throttle check**
 
 ```python
-inflight = pel_size(redis, dc_key)     # from Stream PEL — always accurate
-ceiling  = int(redis.get(f"worker:ceil:learned:{dc_key}") or DB_POOL_MAXCONN - 3)
-
-if inflight >= ceiling:
-    continue   # hold company in poll:adaptive ZSET, retry next tick
+ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
+if ceiling_raw:
+    inflight_key = f"inflight:scans:{dc_key}"
+    r.zremrangebyscore(inflight_key, 0, now - INFLIGHT_STALE_WINDOW_S)  # prune stale adaptive
+    pending_count = (
+        r.zcard(inflight_key)
+        + r.zcard(f"inflight:fullscans:{dc_key}")   # fullscan slots count toward ceiling too
+    )
+    if pending_count >= int(ceiling_raw):
+        r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})
+        continue
 ```
 
-**Why PEL beats a hand-maintained ZSET:**
+**Fullscan dispatch throttle check (atomic Lua)**
 
-| Property | `inflight:scans` ZSET (old) | Stream PEL (new) |
+The fullscan dispatcher uses a Lua script so the check + ZADD is atomic — no two dispatches can both read "slot available" and both proceed in the same loop iteration.
+
+```lua
+-- KEYS[1] = inflight:scans:{dc_key}      KEYS[2] = inflight:fullscans:{dc_key}
+-- ARGV[1] = ceiling   ARGV[2] = adaptive stale cutoff   ARGV[3] = fullscan stale cutoff
+-- ARGV[4] = company   ARGV[5] = now
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[2])   -- prune stale adaptive entries
+redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, ARGV[3])   -- prune stale fullscan entries
+local total = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
+if total >= tonumber(ARGV[1]) then
+    return 0   -- throttled
+end
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])   -- claim slot
+return 1   -- ok
+```
+
+If `_claimed == 0`: company re-queued to `poll:fullscan` at `+30s` and skipped. The slot claimed here is the authoritative reservation — `_run_fullscan()` does not ZADD again; it only writes `worker:current_job:fullscan:{pid}` for crash-recovery bookkeeping and releases the slot in its finally block.
+
+**Why not use the Stream PEL for inflight tracking:**
+
+| Property | Stream PEL | ZSET with stale window |
 |---|---|---|
-| Stale entry cleanup | `ZREMRANGEBYSCORE` with timeout constant | Automatic — PEL entry removed by `XACK` or `XAUTOCLAIM` |
-| Worker crash safety | Timeout constant must be tuned; too short = false zero | `XAUTOCLAIM` re-delivers after idle timeout — PEL stays accurate |
-| Write overhead | `ZADD` on dispatch + `ZREM` on complete | Zero — PEL is a side-effect of `XADD`/`XACK`, no extra writes |
-| Drift risk | Yes — `ZREM` missed on crash leaves count permanently high | No — PEL is authoritative Redis internals, not application bookkeeping |
+| Fullscan + adaptive combined count | Two separate streams → can't combine easily | Two ZSETs → simple ZCARD sum |
+| Atomic check + claim | Requires Lua anyway; PEL written by XADD not by the check | Lua can ZREMRANGEBYSCORE + ZCARD + ZADD atomically |
+| Stale window per type | PEL uses XAUTOCLAIM timeout (same for all messages) | Independent per-type stale windows |
 
-**Dispatch throttle check**
-
-The adaptive dispatcher checks the ceiling via PEL size before each `XADD`:
-
-```python
-dc_key   = get_dc_key(company)                         # e.g. workday_wd12, greenhouse
-inflight = pel_size(redis, dc_key)                     # XPENDING count — no stale cleanup needed
-ceiling  = int(redis.get(f"worker:ceil:learned:{dc_key}") or DB_POOL_MAXCONN - 3)
-
-if inflight >= ceiling:
-    continue   # leave company in poll:adaptive ZSET, retry next dispatcher tick
-```
-
-A Workday DC12 ceiling has **zero effect** on Greenhouse or Lever dispatching. Each DC key has its own stream and its own PEL — fully independent.
+A Workday DC12 ceiling has **zero effect** on Greenhouse or Lever dispatching. Each DC key has its own set of inflight ZSETs — fully independent.
 
 **Learned ceiling — empirical discovery**
 
@@ -1772,6 +1879,29 @@ XREADGROUP GROUP fullscan-workers {consumer} COUNT 1 BLOCK 500      — 500ms bl
 XACK stream:fullscan:{dc_key} fullscan-workers {msg_id}
 XAUTOCLAIM stream:fullscan:{dc_key} fullscan-workers {consumer}
   MIN-IDLE-TIME {p95_full_scan_ms * 3}                              — self-calibrating; separate from listing scan p95
+
+Key: "inflight:fullscans:{dc_key}"   e.g. inflight:fullscans:workday_wd1
+Type: Sorted Set (ZSET)
+Score: Unix timestamp when slot was claimed (dispatch time)
+Member: company name
+
+Written by fullscan_loop's Lua script at dispatch time (atomically with ceiling check).
+ZREM'd by _run_fullscan() finally block on all exit paths.
+ZREMRANGEBYSCORE prunes entries older than INFLIGHT_FULLSCAN_STALE_S (2 h) — backstop for
+hard crashes where the finally block and _replace_dead_workers() both failed.
+Stale window is 2h (not 10min like adaptive) because full scans run 20–30 min.
+
+Key: "worker:current_job:fullscan:{pid}"   e.g. worker:current_job:fullscan:12345
+Type: String
+Value: "{company}|{dc_key}"   e.g. "Accenture|workday_wd1"
+TTL: 3600s (1 h — safety backstop only)
+
+Written by _run_fullscan() at scan start (after acquiring the lock).
+DEL'd by _run_fullscan() finally block on all exit paths.
+Read by _replace_dead_workers() when a fullscan worker is found dead — extracts company+dc_key,
+ZREMs the inflight:fullscans:{dc_key} slot, then DELs this key.
+If the worker died before _run_fullscan() reached the SET (e.g. died during XREADGROUP),
+this key is never written and the slot waits for the 2-h stale prune.
 ```
 
 #### 3. Detail Fetch Queues (Two-Tier Lists)
@@ -2389,7 +2519,7 @@ The counter is **reset to 0** on any successful operation of that type (`r.delet
 
 **Full scan suppressed during active scan backoff**
 
-`_should_trigger_full_scan()` checks `r.exists(f"retry:backoff:scan:{company}")`. If the scan backoff key exists, the full scan trigger is suppressed. A full scan makes significantly more requests than a listing scan — triggering one while the ATS is already struggling accelerates the problem.
+`_maybe_reschedule_full_scan()` checks `r.exists(f"retry:backoff:scan:{company}")` at entry. If the scan backoff key exists, fullscan scheduling is suppressed entirely. A full scan makes significantly more requests than a listing scan — triggering one while the ATS is already struggling accelerates the problem.
 
 **Backoff and outage mode — take the maximum, not the sum**
 

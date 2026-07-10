@@ -109,6 +109,9 @@ from config import (
     REDIS_CYCLE_START,
     REDIS_DB_MAINTENANCE,
     REDIS_INFLIGHT_FULLSCAN,
+    REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
+    WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
+    WORKER_CURRENT_JOB_FULLSCAN_TTL,
     WORKER_BLOCK_SECS,
     SCHEDULER_FULL_SCAN_LOCK_TTL,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
@@ -742,6 +745,7 @@ def _build_detail_payload(
 # ─────────────────────────────────────────
 
 def _run_fullscan(company: str, r, skip_lock: bool = False,
+                  dc_key: str = "",
                   shutdown_event=None) -> dict:
     """
     Perform one complete full scan for a company.
@@ -850,6 +854,21 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         except Exception as exc:
             # Non-fatal — missed inflight write at most delays 7 AM fallback exclusion.
             logger.debug("fullscan [%s]: inflight ZADD failed (non-fatal): %s", company, exc)
+        # Per-DC slot was claimed atomically in fullscan_loop's Lua script (ZADD to
+        # inflight:fullscans:{dc_key}).  Register current_job key so that
+        # _replace_dead_workers() can find company|dc_key on crash and release the slot.
+        if dc_key:
+            try:
+                r.set(
+                    f"{WORKER_CURRENT_JOB_FULLSCAN_PREFIX}:{os.getpid()}",
+                    f"{company}|{dc_key}",
+                    ex=WORKER_CURRENT_JOB_FULLSCAN_TTL,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: current_job SET failed (non-fatal): %s",
+                    company, exc,
+                )
         set_progress(company, "fullscan_start")
 
         is_resume    = fs_state.get("full_scan_interrupted", False)
@@ -1264,6 +1283,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
         except Exception as exc:
             logger.debug("fullscan [%s]: inflight ZREM failed (non-fatal): %s", company, exc)
+        if dc_key:
+            _pid = os.getpid()
+            try:
+                r.zrem(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company)
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: dc inflight ZREM failed (non-fatal): %s",
+                    company, exc,
+                )
+            try:
+                r.delete(f"{WORKER_CURRENT_JOB_FULLSCAN_PREFIX}:{_pid}")
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: current_job DEL failed (non-fatal): %s",
+                    company, exc,
+                )
         clear_heartbeat(company)
         if not skip_lock:
             _release_lock(company, r)
@@ -1400,8 +1435,11 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
                 continue
 
+            dc_key = fields.get("dc_key", "")
+
             # ── Run full scan ─────────────────────────────────────────────────
             result    = _run_fullscan(company, r, skip_lock=skip_lock,
+                                      dc_key=dc_key,
                                       shutdown_event=shutdown_event)
             _hw["count"] += 1
 
