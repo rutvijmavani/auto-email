@@ -2678,7 +2678,7 @@ def _slow_throughput_check_loop() -> None:
             # workers (each worker is busy AND more work is waiting).
             # Scale down when the stream is idle and pool is above the floor.
             # Uses the same 2-consecutive-check hysteresis as scan/detail.
-            fullscan_stream_depth = r.xlen(REDIS_STREAM_FULLSCAN)
+            fullscan_stream_depth = _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
             n_fullscan   = _get_fullscan_pool_size()
             fullscan_ceil = max(
                 WORKER_FLOOR,

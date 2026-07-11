@@ -213,6 +213,33 @@ def run_health_check() -> int:
         _row("ERROR", "PostgreSQL", f"UNREACHABLE: {exc}")
         errors += 1
 
+    # ── SENTRY ────────────────────────────────────────────────────────────────
+    try:
+        import sentry_sdk as _sentry_sdk_hc
+        _sentry_installed = True
+    except ImportError:
+        _sentry_installed = False
+
+    if not _sentry_installed:
+        _row("WARNING", "Sentry", "sentry-sdk not installed — run: pip install sentry-sdk")
+        warnings += 1
+    else:
+        try:
+            from pathlib import Path as _Path
+            from dotenv import dotenv_values as _dotenv_values
+            _env_path = _Path(_ROOT) / ".env"
+            _env_vals = _dotenv_values(_env_path) if _env_path.exists() else {}
+            _dsn = _env_vals.get("SENTRY_DSN", "").strip().strip('"').strip("'")
+        except Exception:
+            _dsn = os.environ.get("SENTRY_DSN", "").strip()
+
+        if not _dsn:
+            _row("WARNING", "Sentry", "SENTRY_DSN not set in .env — exception capture disabled")
+            warnings += 1
+        else:
+            _dsn_display = _dsn[:30] + "…" if len(_dsn) > 30 else _dsn
+            _row("OK", "Sentry", f"configured  dsn={_dsn_display}")
+
     # ── WORKER LIVENESS ───────────────────────────────────────────────────────
     _section("WORKER LIVENESS")
 

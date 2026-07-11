@@ -519,7 +519,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 if not job.get(k)
             ]
             if _missing:
-                logger.warning(
+                logger.error(
                     "detail_worker: MISSING required keys — fetch_job_detail "
                     "guard will fire with NO HTTP request made. "
                     "platform=%s company=%r job_id=%s missing_keys=%s "

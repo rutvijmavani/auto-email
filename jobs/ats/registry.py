@@ -352,6 +352,7 @@ def should_fetch_detail(job: dict, platform: str, config: dict,
             job.get("_external_path")
             and job.get("_slug")
             and job.get("_wd")
+            and job.get("_path")
         )
 
     if platform == "sitemap":

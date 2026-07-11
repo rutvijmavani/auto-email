@@ -399,11 +399,20 @@ def collect_raw_findings(
         if p not in priority and _mtime_safe(p) >= cutoff
     ]
 
+    # TimedRotatingFileHandler rotates scheduler.log → scheduler.log.YYYY-MM-DD
+    # at midnight.  These files end in a date suffix, not ".log", so glob("*.log")
+    # misses them entirely.  Include any such rotation backups within the cutoff
+    # window so errors from yesterday evening are not silently skipped.
+    rotation_backups = [
+        p for p in LOGS_DIR.glob("*.log.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]")
+        if _mtime_safe(p) >= cutoff
+    ]
+
     new_offsets = dict(offsets)
     new_inodes: dict[str, int] = dict(inodes or {})
     raw: dict[str, list] = {}
 
-    for path in priority + recent_dated:
+    for path in priority + recent_dated + rotation_backups:
         if not path.exists():
             continue
         key = str(path)
@@ -453,7 +462,15 @@ def _ts_key(fp: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_frequency(r, fp: str, now: float) -> None:
-    """Push current timestamp into the history ring-buffer (newest-first)."""
+    """Push current timestamp into the history ring-buffer (newest-first).
+
+    Uses scan time (now), not the log line's own timestamp.  On first deploy
+    or after downtime, a backlog of errors is processed in one pass so all
+    timestamps collapse to ~now → avg_IAT≈0 → TTL=MIN_ACT_TTL_S (5 min).
+    Those errors resolve before the next scan if they stopped firing.
+    This is an accepted tradeoff: Sentry catches such errors in real-time;
+    log_monitor's role is ongoing pattern detection, not historical replay.
+    """
     key = _ts_key(fp)
     r.lpush(key, now)
     r.ltrim(key, 0, HISTORY_SIZE - 1)

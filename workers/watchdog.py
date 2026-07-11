@@ -1635,7 +1635,7 @@ def _kill_ghost_workers(r) -> None:
                     continue
                 status_text = (pid_dir / "status").read_text()
                 ppid_line   = next(
-                    l for l in status_text.splitlines() if l.startswith("PPid:")
+                    line for line in status_text.splitlines() if line.startswith("PPid:")
                 )
                 ppid = int(ppid_line.split()[1])
                 if ppid != scheduler_pid:
@@ -2194,7 +2194,8 @@ def run_watchdog(once: bool = False,
 
     while True:
         try:
-            _kill_ghost_workers(r)
+            if _systemd_available():
+                _kill_ghost_workers(r)
             issues = _run_all_checks(r)
 
             errors   = sum(1 for i in issues if i.level in ("ERROR", "CRITICAL"))

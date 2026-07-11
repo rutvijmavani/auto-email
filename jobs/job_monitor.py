@@ -174,6 +174,7 @@ def _should_fetch_detail(job, platform, config, slug_info=None):
             job.get("_external_path")
             and job.get("_slug")
             and job.get("_wd")
+            and job.get("_path")
         )
     # sitemap: skip XML feeds (they already have all data in the feed)
     if platform == "sitemap":
@@ -353,6 +354,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                 WHERE company = ANY(%s)
             """, (company_names,)).fetchall()
         finally:
+            conn.rollback()
             conn.close()
     except Exception as exc:
         logger.warning("_queue_fullscans_for_missed: DB query failed (%s) — skipping fullscan queuing", exc)
@@ -980,7 +982,7 @@ def _process_company(company_row, position, total):
         #           → stored as _country_code by fetch_job_detail(); definitive.
         #   Tier 3: is_us_location() on descriptor-embedded location string
         #           → fallback when alpha2Code absent (older/custom tenants).
-        if platform == "workday" and job.get("_external_path"):
+        if platform == "workday" and _should_fetch_detail(job, platform, config, slug_info):
             _snap_cc  = job.get("_country_code", "")
             _snap_loc = job.get("location", "")
             with sem:

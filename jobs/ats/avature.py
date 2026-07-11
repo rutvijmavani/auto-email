@@ -1,18 +1,23 @@
 # jobs/ats/avature.py — Avature job board scraper
 #
 # Avature does not expose a public JSON API.
-# Jobs are discovered via sitemap.xml and fetched via HTML scraping.
+# Jobs are discovered via sitemap.xml (primary) or SearchJobs pagination (fallback).
 #
 # URL patterns:
 #   Hosted:       {slug}.avature.net/careers/JobDetail/{title-slug}/{job_id}
 #   Custom domain: jobs.ea.com/en_US/careers/JobDetail/{title-slug}/{job_id}
 #                  jobs.siemens.com/en_US/externaljobs/JobDetail/{title-slug}/{job_id}
 #
-# Sitemap:      {base_url}/careers/sitemap.xml
-#               {base_url}/{path}/sitemap.xml  (custom domain variant)
+# Sitemap (primary):  {base_url}/{path}/sitemap.xml
+#   Works for: EA (jobs.ea.com), hosted tenants (slug.avature.net)
+#
+# SearchJobs fallback: {base_url}/{path}/SearchJobs/?jobOffset=N&jobRecordsPerPage=12
+#   Used when sitemap is missing or contains only platform pages (no /JobDetail/ URLs).
+#   Siemens pattern: sitemap.xml exists but lists Login/Register/SearchJobs pages only.
 #
 # Option C freshness strategy:
 #   1. Fetch sitemap.xml → extract all JobDetail URLs + job IDs
+#      (if no job URLs → fall back to SearchJobs pagination)
 #   2. Compare with DB → find new job IDs only
 #   3. Fetch detail page ONLY for new jobs
 #   4. Extract title, location, posted_at, description from HTML
@@ -28,6 +33,7 @@
 
 import re
 import json
+import time
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
@@ -39,6 +45,11 @@ from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_matc
 
 JOB_DETAIL_RE = re.compile(r"/JobDetail/[^/]+/(\d+)/?$", re.IGNORECASE)
 DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
+
+# SearchJobs pagination fallback — used when sitemap has no job URLs
+# (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
+_SEARCH_PAGE_SIZE = 12
+_SEARCH_MAX_PAGES = 50   # 50 × 12 = 600 jobs max
 
 # Known Avature custom domains — maps domain → careers path
 CUSTOM_DOMAINS = {
@@ -78,13 +89,17 @@ def detect(company):
         resp     = fetch_html(sitemap, platform="avature", track=False)
 
         if resp is None:
-            continue
+            continue  # subdomain doesn't exist — skip
 
-        soup    = BeautifulSoup(resp.text, "xml")
+        soup     = BeautifulSoup(resp.text, "xml")
         job_urls = _extract_job_urls(soup)
 
         if not job_urls:
-            continue
+            # Sitemap exists but has no /JobDetail/ URLs (platform-pages-only pattern)
+            # Fall back to SearchJobs pagination to confirm this is a real Avature tenant
+            job_urls = _probe_search_jobs(base, path)
+            if not job_urls:
+                continue
 
         # Validate company match using first job title from URL slug
         first_url  = job_urls[0]
@@ -108,14 +123,18 @@ def detect(company):
         sitemap = f"{base}/{path}/sitemap.xml"
         resp    = fetch_html(sitemap, platform="avature", track=False)
 
-        if resp is None:
-            continue
-
-        soup     = BeautifulSoup(resp.text, "xml")
-        job_urls = _extract_job_urls(soup)
+        if resp is not None:
+            soup     = BeautifulSoup(resp.text, "xml")
+            job_urls = _extract_job_urls(soup)
+        else:
+            job_urls = []
 
         if not job_urls:
-            continue
+            # Sitemap missing or contains only platform pages (Siemens pattern)
+            # The domain is hardcoded so we know it's Avature — try SearchJobs directly
+            job_urls = _probe_search_jobs(base, path)
+            if not job_urls:
+                continue
 
         slug_info = {"base": base, "path": path}
         sample    = _urls_to_stubs(job_urls[:3], slug_info, company)
@@ -165,14 +184,16 @@ def fetch_jobs(slug_info, company):
     resp        = fetch_html(sitemap_url, platform="avature",
                              timeout=(10, None))
 
-    if resp is None:
-        return []
-
-    soup     = BeautifulSoup(resp.text, "xml")
-    job_urls = _extract_job_urls(soup)
+    if resp is not None:
+        soup     = BeautifulSoup(resp.text, "xml")
+        job_urls = _extract_job_urls(soup)
+    else:
+        job_urls = []
 
     if not job_urls:
-        return []
+        # Sitemap missing OR has no /JobDetail/ URLs (Siemens: platform-pages-only)
+        # Fall back to SearchJobs pagination endpoint
+        return _fetch_via_search(slug_info, company)
 
     return _urls_to_stubs(job_urls, slug_info, company)
 
@@ -235,6 +256,85 @@ def fetch_job_detail(job):
 
     except Exception:
         return job
+
+
+# ─────────────────────────────────────────
+# HELPERS — SEARCHJOBS PAGINATION FALLBACK
+# ─────────────────────────────────────────
+
+def _probe_search_jobs(base, path):
+    """
+    Fetch page 0 of SearchJobs to confirm this is a live Avature tenant.
+    Used during detection when sitemap has no job URLs.
+    Returns a list of job URL strings (may be empty if endpoint fails/no jobs).
+    """
+    url  = f"{base}/{path}/SearchJobs/?jobOffset=0&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
+    resp = fetch_html(url, platform="avature", track=False)
+    if resp is None:
+        return []
+    soup = BeautifulSoup(resp.text, "html.parser")
+    return _anchors_to_urls(soup, base)
+
+
+def _fetch_via_search(slug_info, company):
+    """
+    Paginate SearchJobs endpoint to collect all job URLs.
+    Fallback when sitemap is missing or contains only platform pages (Siemens pattern).
+
+    URL: {base}/{path}/SearchJobs/?jobOffset=N&jobRecordsPerPage=12
+    Selects anchors with /JobDetail/ in href — works across all Avature themes.
+    """
+    base = slug_info.get("base", "")
+    path = slug_info.get("path", "careers")
+    if not base:
+        return []
+
+    all_urls = []
+    seen_ids = set()
+
+    for page in range(_SEARCH_MAX_PAGES):
+        offset = page * _SEARCH_PAGE_SIZE
+        url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
+        resp   = fetch_html(url, platform="avature")
+        if resp is None:
+            break
+
+        soup         = BeautifulSoup(resp.text, "html.parser")
+        page_urls    = _anchors_to_urls(soup, base)
+        new_this_page = 0
+
+        for job_url in page_urls:
+            job_id = _extract_job_id(job_url)
+            if not job_id or job_id in seen_ids:
+                continue
+            seen_ids.add(job_id)
+            all_urls.append(job_url)
+            new_this_page += 1
+
+        if new_this_page == 0:
+            break  # no new jobs on this page = end of results
+
+        if page < _SEARCH_MAX_PAGES - 1:
+            time.sleep(0.5)
+
+    return _urls_to_stubs(all_urls, slug_info, company)
+
+
+def _anchors_to_urls(soup, base):
+    """
+    Extract all /JobDetail/ hrefs from a SearchJobs results page.
+    Resolves relative URLs against base. Filters out decoy apply-link texts.
+    """
+    _DECOY = {"apply", "apply now", "apply online", "learn more", "view job", ""}
+    urls = []
+    for anchor in soup.select('a[href*="/JobDetail/"]'):
+        if anchor.get_text(strip=True).lower() in _DECOY:
+            continue
+        href = anchor.get("href", "")
+        if not href:
+            continue
+        urls.append(href if href.startswith("http") else f"{base}{href}")
+    return urls
 
 
 # ─────────────────────────────────────────
