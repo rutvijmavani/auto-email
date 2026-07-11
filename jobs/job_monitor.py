@@ -354,8 +354,10 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                 WHERE company = ANY(%s)
             """, (company_names,)).fetchall()
         finally:
-            conn.rollback()
-            conn.close()
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
     except Exception as exc:
         logger.warning("_queue_fullscans_for_missed: DB query failed (%s) — skipping fullscan queuing", exc)
         return
@@ -368,35 +370,38 @@ def _queue_fullscans_for_missed(missed: list) -> None:
         logger.warning("_queue_fullscans_for_missed: Redis connect failed (%s) — skipping fullscan queuing", exc)
         return
 
-    queued = 0
-    for company_row in missed:
-        company = company_row["company"]
-        stats_row = scan_map.get(company)
-        if stats_row is None:
-            continue
+    try:
+        queued = 0
+        for company_row in missed:
+            company = company_row["company"]
+            stats_row = scan_map.get(company)
+            if stats_row is None:
+                continue
 
-        next_scan = stats_row["next_full_scan_at"]
-        if next_scan is not None:
-            next_ts = next_scan.timestamp() if hasattr(next_scan, "timestamp") else float(next_scan)
-            if next_ts > now:
-                continue  # fullscan already scheduled in the future
+            next_scan = stats_row["next_full_scan_at"]
+            if next_scan is not None:
+                next_ts = next_scan.timestamp() if hasattr(next_scan, "timestamp") else float(next_scan)
+                if next_ts > now:
+                    continue  # fullscan already scheduled in the future
 
-        avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
-        _atomic_schedule(
-            r, REDIS_POLL_FULLSCAN, company,
-            now + SCHEDULER_FULL_SCAN_BUFFER_S,
-            SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
-            deadline_ts    = _next_digest_deadline(now),
-            avg_duration_s = avg_duration,
-        )
-        queued += 1
-        logger.info(
-            "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
-            company, next_scan,
-        )
+            avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
+            _atomic_schedule(
+                r, REDIS_POLL_FULLSCAN, company,
+                now + SCHEDULER_FULL_SCAN_BUFFER_S,
+                SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+                deadline_ts    = _next_digest_deadline(now),
+                avg_duration_s = avg_duration,
+            )
+            queued += 1
+            logger.info(
+                "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
+                company, next_scan,
+            )
 
-    if queued:
-        logger.info("monitor: queued fullscans for %d/%d missed companies", queued, len(missed))
+        if queued:
+            logger.info("monitor: queued fullscans for %d/%d missed companies", queued, len(missed))
+    finally:
+        r.close()
 
 
 def run():

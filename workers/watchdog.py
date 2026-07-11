@@ -1586,8 +1586,8 @@ def _get_scheduler_pid(r) -> int | None:
         hb = r.get("worker:alive:scheduler:adaptive")
         if hb:
             return json.loads(hb).get("pid")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("_get_scheduler_pid: failed to read scheduler heartbeat: %s", exc)
     return None
 
 

@@ -49,7 +49,7 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 # SearchJobs pagination fallback — used when sitemap has no job URLs
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
 _SEARCH_PAGE_SIZE = 12
-_SEARCH_MAX_PAGES = 50   # 50 × 12 = 600 jobs max
+_SEARCH_MAX_PAGES = 50   # 50 x 12 = 600 jobs max
 
 # Known Avature custom domains — maps domain → careers path
 CUSTOM_DOMAINS = {

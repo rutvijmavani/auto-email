@@ -2435,12 +2435,13 @@ def _slow_throughput_check_loop() -> None:
             detail_depth  = r.llen(REDIS_DETAIL_ADAPTIVE)
             scan_backlog  = r.zcard(REDIS_POLL_ADAPTIVE)
             n_scan, n_detail = _get_pool_snapshot()
+            n_fullscan       = _get_fullscan_pool_size()
 
             db_budget    = DB_POOL_MAXCONN - 3
             scan_ceil    = max(WORKER_FLOOR,
-                               int((db_budget - n_detail) * WORKER_POOL_SCAN_FRACTION))
+                               int((db_budget - n_detail - n_fullscan) * WORKER_POOL_SCAN_FRACTION))
             detail_ceil  = max(WORKER_FLOOR,
-                               int((db_budget - n_scan) * WORKER_POOL_DETAIL_FRACTION))
+                               int((db_budget - n_scan - n_fullscan) * WORKER_POOL_DETAIL_FRACTION))
             dynamic_floor = _remaining_work_minimum(r)
 
             # ── Phase 11: Redis memory alert ──────────────────────────────────
@@ -2679,7 +2680,6 @@ def _slow_throughput_check_loop() -> None:
             # Scale down when the stream is idle and pool is above the floor.
             # Uses the same 2-consecutive-check hysteresis as scan/detail.
             fullscan_stream_depth = _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
-            n_fullscan   = _get_fullscan_pool_size()
             fullscan_ceil = max(
                 WORKER_FLOOR,
                 int((db_budget - n_scan - n_detail) * WORKER_POOL_FULLSCAN_FRACTION),

@@ -49,6 +49,8 @@ A **collaborative, source-of-truth job intelligence platform** where job hunters
 
 These stay off the table until invite-only is validated and the next problem is clear.
 
+**Phase 1 data ownership note:** All per-user data (watchlists, job statuses, recruiter contacts) is operator-managed — created and modified via admin scripts only. Users have no direct access to the system in Phase 1. There is no authentication, no user-facing UI, and no self-service data deletion. Privacy and authorization requirements are deferred to Phase 3 (Web UI) when users interact with the system directly.
+
 ---
 
 ## Phased Plan
@@ -146,9 +148,10 @@ Gmail will get flagged as spam with multiple recipients. Switch to AWS SES, Send
 
 ```bash
 python add_user.py --email friend@example.com --companies "Google,Apple,Stripe"
+python add_company.py --company "Stripe" --url "https://stripe.com/jobs"
 ```
 
-No web UI needed. You add users manually. Friends add companies via a shared script or by telling you.
+No web UI needed. You (the operator) add users and companies manually via these scripts. Friends tell you which companies to add; you run the script. There is no self-service mechanism in Phase 1.
 
 **Effort:** half day
 
@@ -175,7 +178,7 @@ Write a one-time migration script that:
 
 **Phase 1 exit criteria (move to Phase 2 only when):**
 - At least 3 active users receiving digests
-- Users are adding companies themselves
+- Users are requesting companies to add (operator adds them via admin script)
 - The digest is surfacing jobs people wouldn't have found otherwise
 - At least one person has found and applied to a job through it
 
@@ -190,18 +193,34 @@ Only build this when Phase 1 is working and you feel load or coverage limits.
 Workers already scale horizontally via Redis Streams consumer groups — zero code change. Only the scheduler needs coordination:
 
 ```python
-# Only one scheduler instance runs at a time
-acquired = r.set("scheduler:leader", socket.gethostname(), nx=True, ex=30)
+import uuid, redis
+
+LEADER_KEY = "scheduler:leader"
+LEADER_TTL = 30  # seconds
+
+token = str(uuid.uuid4())  # unique ownership token per instance
+acquired = r.set(LEADER_KEY, token, nx=True, ex=LEADER_TTL)
 if not acquired:
     stand_by_until_leader_dies()
 
+# Renew only if we still own the lock (Lua: compare token, then expire)
+_RENEW_SCRIPT = redis.client.Script(r, """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("expire", KEYS[1], ARGV[2])
+    else
+        return 0
+    end
+""")
+
 while True:
-    r.expire("scheduler:leader", 30)  # heartbeat
+    renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
+    if not renewed:
+        break  # another instance took over — stop and exit
     run_scheduling_tick()
     sleep(10)
 ```
 
-If leader dies → lock expires → standby takes over automatically.
+If leader dies → lock expires → standby takes over. A paused former leader cannot renew leadership because the Lua script verifies the token before extending TTL.
 
 **Effort:** ~30 lines of code, 2–3 days including testing
 
@@ -346,8 +365,8 @@ No significant new work needed.
 
 ### The Scraping Risk
 
-Personal use and invite-only: legally fine, practically undetectable.
-Commercial scale (1,000+ users): Workday and eightfold actively fight scrapers. Distributed fleet model helps (each user's IP, not yours). Long-term mitigation: official API partnerships or lean on public-API ATS platforms.
+Personal use and invite-only: practically low-profile, but legal and terms-of-service status depends on each ATS platform's ToS and applicable law — do not assume it is legally fine without review before scaling beyond personal use.
+Commercial scale (1,000+ users): Workday and eightfold actively fight scrapers. Distributed fleet model helps (each user's IP, not yours). Long-term mitigation: official API partnerships or lean on public-API ATS platforms. ToS review and explicit scraping constraints are required before this stage.
 
 ---
 

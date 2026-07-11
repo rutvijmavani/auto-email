@@ -782,11 +782,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    def _release_dc(reason: str) -> None:
+        if dc_key:
+            try:
+                r.zrem(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company)
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: dc inflight ZREM failed on early exit (%s): %s",
+                    company, reason, exc,
+                )
+
     # ── 1. Company metadata ───────────────────────────────────────────────────
     company_row = get_company_row(company)
     if not company_row:
         logger.warning("fullscan [%s]: company not found in DB — skipping", company)
         result["outcome"] = "skipped"
+        _release_dc("company-not-found")
         return result
 
     platform = company_row.get("ats_platform", "unknown")
@@ -797,6 +808,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             "fullscan [%s]: unknown ATS or missing slug — skipping", company
         )
         result["outcome"] = "skipped"
+        _release_dc("unknown-ats-or-missing-slug")
         return result
 
     # ── 2. ATS module + config ────────────────────────────────────────────────
@@ -806,6 +818,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         logger.error(
             "fullscan [%s]: no ATS module for platform=%s", company, platform
         )
+        _release_dc("missing-ats-module")
         return result
 
     slug_info = parse_slug(platform, slug, config)
@@ -827,6 +840,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             if last_poll_ts < cycle_start:
                 _defer_adaptive_first(company, r)
                 result["outcome"] = "deferred"
+                _release_dc("adaptive-first-defer")
                 return result
     else:
         # cycle:start not set → --monitor-jobs hasn't run yet today.
@@ -841,6 +855,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company,
             )
             result["outcome"] = "skipped"
+            _release_dc("lock-held")
             return result
 
     try:

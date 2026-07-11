@@ -476,9 +476,9 @@ CONCURRENCY_SPIKE_FACTOR_THRESHOLD = 5.0   # spike_factor > this → concurrency
 WORKER_SHUTDOWN_TIMEOUT_S         = 30     # seconds before forced SIGKILL on shutdown
 WORKER_FAST_CHECK_INTERVAL_S      = 300    # 5 min — error-triggered worker reduction
 WORKER_SLOW_CHECK_INTERVAL_S      = 1800   # 30 min — throughput-driven scaling
-WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of remaining DB pool for scan workers
-WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of remaining DB pool for detail workers
-WORKER_POOL_FULLSCAN_FRACTION     = 0.25   # 25% of remaining DB pool for fullscan workers
+WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of remaining DB pool (after detail+fullscan) for scan workers
+WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of remaining DB pool (after scan+fullscan) for detail workers
+WORKER_POOL_FULLSCAN_FRACTION     = 0.25   # 25% of remaining DB pool (after scan+detail) for fullscan workers
 WORKER_FLOOR                      = 2      # minimum workers per pool (redundancy)
 WORKER_DEPRIORITISE_SECS          = 300    # seconds to push erroring platform's
                                            # companies forward in poll:adaptive

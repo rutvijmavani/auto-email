@@ -226,12 +226,11 @@ def run_health_check() -> int:
     else:
         try:
             from pathlib import Path as _Path
-            from dotenv import dotenv_values as _dotenv_values
-            _env_path = _Path(_ROOT) / ".env"
-            _env_vals = _dotenv_values(_env_path) if _env_path.exists() else {}
-            _dsn = _env_vals.get("SENTRY_DSN", "").strip().strip('"').strip("'")
+            from dotenv import load_dotenv as _load_dotenv
+            _load_dotenv(_Path(_ROOT) / ".env")
         except Exception:
-            _dsn = os.environ.get("SENTRY_DSN", "").strip()
+            pass
+        _dsn = os.environ.get("SENTRY_DSN", "").strip()
 
         if not _dsn:
             _row("WARNING", "Sentry", "SENTRY_DSN not set in .env — exception capture disabled")

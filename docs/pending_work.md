@@ -371,12 +371,13 @@ not forwarded, so the guard fires at an earlier stage where it is detectable.
 **Impact:** Workday jobs with an empty `_external_path` (listing pagination edge case)
 no longer silently fall through to the URL-city fallback.
 
-### 6.2 job_monitor: Workday `_should_fetch_detail` requires all 3 keys ✅ DONE
-**File:** `jobs/job_monitor.py` — `_should_fetch_detail()`  
-**Problem:** Workday detail fetch was attempted when only `_external_path` was present,
-even if `_slug` or `_wd` were missing. `fetch_job_detail()` needs all three to construct
-the correct Workday URL — missing any one causes the guard to fire and the job returns
-unenriched.  
+### 6.2 job_monitor + registry: Workday `_should_fetch_detail` requires all 4 keys ✅ DONE
+**Files:** `jobs/job_monitor.py` — `_should_fetch_detail()`, `jobs/ats/registry.py` — `should_fetch_detail()`  
+**Problem:** Workday detail fetch was attempted when only `_external_path`, `_slug`, and
+`_wd` were present, even if `_path` was missing. `fetch_job_detail()` needs all four to
+construct the correct Workday URL — missing `_path` causes the guard to fire and the job
+returns unenriched. The same gap existed in both the local `_should_fetch_detail()` in
+`job_monitor.py` and the registry-level `should_fetch_detail()` in `registry.py`.  
 **Fix:**
 ```python
 if platform == "workday":
@@ -384,9 +385,11 @@ if platform == "workday":
         job.get("_external_path")
         and job.get("_slug")
         and job.get("_wd")
+        and job.get("_path")
     )
 ```
-All three must be truthy before the detail fetch is attempted.
+All four must be truthy before the detail fetch is attempted. Applied identically in both
+`job_monitor.py` and `registry.py`.
 
 ### 6.3 detail_worker Bug 1: missing detail keys + title_only → retryable ✅ DONE
 **File:** `workers/detail_worker.py`  
