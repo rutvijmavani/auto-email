@@ -228,16 +228,15 @@ def run_health_check() -> int:
             from pathlib import Path as _Path
             from dotenv import load_dotenv as _load_dotenv
             _load_dotenv(_Path(_ROOT) / ".env")
-        except Exception:
-            pass
+        except Exception as _dotenv_err:
+            print(f"  [WARNING] health_check: .env load failed: {_dotenv_err}", flush=True)
         _dsn = os.environ.get("SENTRY_DSN", "").strip()
 
         if not _dsn:
             _row("WARNING", "Sentry", "SENTRY_DSN not set in .env — exception capture disabled")
             warnings += 1
         else:
-            _dsn_display = _dsn[:30] + "…" if len(_dsn) > 30 else _dsn
-            _row("OK", "Sentry", f"configured  dsn={_dsn_display}")
+            _row("OK", "Sentry", "configured")
 
     # ── WORKER LIVENESS ───────────────────────────────────────────────────────
     _section("WORKER LIVENESS")

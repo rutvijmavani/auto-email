@@ -35,6 +35,7 @@ import re
 import json
 import time
 from datetime import datetime
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
 
@@ -333,7 +334,7 @@ def _anchors_to_urls(soup, base):
         href = anchor.get("href", "")
         if not href:
             continue
-        urls.append(href if href.startswith("http") else f"{base}{href}")
+        urls.append(href if href.startswith("http") else urljoin(base, href))
     return urls
 
 

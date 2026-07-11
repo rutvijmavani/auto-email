@@ -208,6 +208,7 @@ def init_logging(command: str = "pipeline") -> None:
                  "monitor"            → logs/monitor_YYYY-MM-DD.log
                  "detect"             → logs/detect_YYYY-MM-DD.log
                  "sync"               → logs/sync_YYYY-MM-DD.log
+                 "scheduler"          → logs/scheduler.log (rotates nightly)
                  "monthly"            → logs/monthly_YYYY-MM.log
                  "enrich"             → logs/enrich_YYYY-MM.log
                  "build_ats_slug_list"→ logs/build_ats_slug_list_YYYY-MM.log

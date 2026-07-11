@@ -1574,9 +1574,9 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
 # Any process matching these patterns whose PPID is not the scheduler's PID is
 # a ghost competing with the managed pool for the same Redis queues.
 _GHOST_WORKER_PATTERNS = (
-    "workers.detail_worker",
-    "workers.scan_worker",
-    "workers.fullscan",
+    "python -m workers.detail_worker",
+    "python -m workers.scan_worker",
+    "python -m workers.fullscan",
 )
 
 

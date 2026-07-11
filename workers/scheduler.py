@@ -1020,6 +1020,7 @@ def _atomic_schedule(
                 deadline_ts    = deadline_ts,
                 avg_duration_s = avg_duration_s,
             )
+            score = max(score, time.time())  # never insert a past-due ZADD score
         else:
             # Another process is scheduling — apply a deterministic per-company
             # offset so concurrent callers don't all land on the same timestamp

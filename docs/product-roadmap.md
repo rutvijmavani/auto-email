@@ -7,9 +7,9 @@
 
 ## Vision
 
-A **collaborative, source-of-truth job intelligence platform** where job hunters collectively monitor company career pages directly — guaranteeing freshness that LinkedIn/Indeed cannot match — and share a growing database of companies, job postings, and recruiter contacts, while keeping application tracking personal.
+A **collaborative, source-of-truth job intelligence platform** where job hunters collectively monitor company career pages directly — delivering near-real-time freshness that LinkedIn/Indeed cannot match — and share a growing database of companies, job postings, and recruiter contacts, while keeping application tracking personal.
 
-**Core differentiator:** We monitor the ATS directly (Workday, Greenhouse, Lever, eightfold, etc.), not an aggregator. A job appears here the moment it's posted — hours or days before it surfaces on LinkedIn/Indeed.
+**Core differentiator:** We monitor the ATS directly (Workday, Greenhouse, Lever, eightfold, etc.), not an aggregator. Jobs typically surface here within 1–6 hours of posting — hours or days before LinkedIn/Indeed syndicates them. (Actual latency depends on ATS polling interval and platform delays; "instant" is not guaranteed.)
 
 **Business model:** Not decided. Validate invite-only first. Do not think about subscriptions or billing until there are active users who find the product indispensable.
 
@@ -49,7 +49,16 @@ A **collaborative, source-of-truth job intelligence platform** where job hunters
 
 These stay off the table until invite-only is validated and the next problem is clear.
 
-**Phase 1 data ownership note:** All per-user data (watchlists, job statuses, recruiter contacts) is operator-managed — created and modified via admin scripts only. Users have no direct access to the system in Phase 1. There is no authentication, no user-facing UI, and no self-service data deletion. Privacy and authorization requirements are deferred to Phase 3 (Web UI) when users interact with the system directly.
+**Phase 1 data ownership note:** All per-user data (watchlists, job statuses, recruiter contacts) is operator-managed — created and modified via admin scripts only. Users have no direct access to the system in Phase 1. There is no authentication, no user-facing UI, and no self-service data deletion.
+
+Minimum privacy controls before inviting users:
+- Operator access must be authorized (i.e., only you run the admin scripts; no shared credentials)
+- Users must consent to their email and job-tracking data being stored
+- Retention policy: define how long data is kept; delete user data on request (manual, via admin script)
+- User data export: operator can dump a user's rows on request (watchlist, statuses, outreach)
+- Incident response: if data is exposed, notify affected users promptly
+
+Full privacy and authorization infrastructure (role-based access, self-service deletion, audit logs) is deferred to Phase 3 (Web UI) when users interact with the system directly.
 
 ---
 
@@ -121,7 +130,7 @@ Add `verified BOOLEAN DEFAULT FALSE` and `added_by INT REFERENCES users(id)` to 
 **Key design principle:** Jobs are non-rivalrous. If 3 users watch Google, scan Google once → all 3 see the results. Scheduler computes `UNION of all users' watchlists` = companies to scan.
 
 **Data split:**
-```
+```text
 SHARED (all users benefit)          PER-USER (personal layer)
 ├── companies                        ├── user_watchlist
 ├── jobs                             ├── user_job_status
@@ -255,14 +264,16 @@ User 1's Oracle Free Tier     User 2's AWS Free Tier
 Deployment for each user (two files, one command):
 ```yaml
 # docker-compose.yml
+# Use an immutable digest instead of :latest to prevent unexpected upgrades.
+# Example: ghcr.io/yourhandle/pipeline-worker@sha256:<digest>
 services:
   scan_worker:
-    image: ghcr.io/yourhandle/pipeline-worker:latest
+    image: ghcr.io/yourhandle/pipeline-worker@sha256:<digest>
     env_file: .env    # REDIS_URL + DATABASE_URL only
     restart: always
 
   detail_worker:
-    image: ghcr.io/yourhandle/pipeline-worker:latest
+    image: ghcr.io/yourhandle/pipeline-worker@sha256:<digest>
     env_file: .env
     restart: always
 ```
@@ -271,8 +282,17 @@ services:
 
 **Security before enabling this:**
 - TLS on Redis + PostgreSQL
+- Redis ACLs: each worker gets a dedicated credential with access restricted to the streams and keys it actually uses (no KEYS *, no CONFIG, no admin commands); rotate credentials per deployment
 - Worker DB credential = append job results only (no read of user data, no admin)
 - Firewall: allowlist known worker IPs only
+- Workers are authenticated to Redis by credential only — they are not trusted to self-identify their user or tenant; all task scoping is enforced server-side via stream namespacing
+- Define per-worker egress quotas (max requests/minute per IP) to contain abuse if a worker is compromised
+
+**Threat model for distributed workers:**
+- **Compromised worker:** A worker that is taken over by an attacker can read jobs from its assigned streams and write fabricated job results to the DB. Mitigate: append-only DB credential (cannot read user data), stream namespacing (limits blast radius to specific queues), Redis ACL (cannot inspect other tenants' keys).
+- **Malicious user-deployed worker:** A user could deploy a worker and point it at a target company's ATS repeatedly to DoS it. Mitigate: per-worker egress quotas enforced via Redis rate-limit keys; scheduler controls polling intervals and cannot be overridden by workers.
+- **Credential leak:** If a user's `.env` is exposed, an attacker gets Redis + DB credentials. Mitigate: per-user Redis credentials with minimal ACL scope; DB credential is append-only and scoped to the job-results tables.
+- **User consent:** Users who deploy workers must explicitly consent to their IP being used for scraping. Document this clearly in the deployment instructions.
 
 **Note:** Only offer this to technical users who can set up a server. Non-technical users wait for the web UI.
 
@@ -305,6 +325,14 @@ Needed when non-technical friends can't use a CLI or config file. This unlocks t
 top_jobs = llm.rank_by_relevance(user_resume, new_jobs, top_n=10)
 ```
 
+**LLM data-handling requirements before building this:**
+- Choose an LLM provider that does not train on API inputs by default, or get explicit opt-out confirmation
+- Redact PII from resumes before sending (phone numbers, home address, passport/visa details) — job titles and skills are sufficient for ranking
+- User must explicitly consent to their resume being sent to a third-party LLM service
+- Confirm provider's data retention policy (how long prompts are stored, if at all)
+- Treat LLM failure as non-fatal: if the ranking call fails, fall back to sending all new jobs unranked rather than skipping the digest
+- Each user's resume is sent only in their own API call — never batch multiple users' data in one prompt
+
 **Effort:** 4–6 weeks
 
 ---
@@ -316,9 +344,30 @@ top_jobs = llm.rank_by_relevance(user_resume, new_jobs, top_n=10)
 Paste careers URL → auto-detect platform:
 
 ```python
+import ipaddress
+from urllib.parse import urlparse
+
 def detect_ats(careers_url: str) -> str:
-    r = requests.get(careers_url, follow_redirects=True, timeout=10)
-    url, html = r.url, r.text
+    # SSRF guard: only allow http/https, reject private/loopback/metadata IPs
+    _parsed = urlparse(careers_url)
+    if _parsed.scheme not in ("http", "https"):
+        raise ValueError(f"detect_ats: unsupported scheme {_parsed.scheme!r}")
+    try:
+        _ip = ipaddress.ip_address(_parsed.hostname)
+        if _ip.is_private or _ip.is_loopback or _ip.is_link_local:
+            raise ValueError(f"detect_ats: private/loopback IP blocked: {_parsed.hostname}")
+    except ValueError as _e:
+        if "does not appear to be an IPv4 or IPv6" not in str(_e):
+            raise  # re-raise SSRF errors; hostname (not raw IP) is fine
+
+    r = requests.get(
+        careers_url, follow_redirects=True, timeout=10,
+        stream=True,  # don't buffer the entire response
+    )
+    # Cap response size to avoid memory exhaustion on large pages
+    html = r.raw.read(1_000_000, decode_content=True).decode("utf-8", errors="replace")
+    r.close()
+    url = r.url
 
     fingerprints = [
         ('workday',    'myworkdayjobs.com'),
@@ -338,9 +387,9 @@ def detect_ats(careers_url: str) -> str:
 
 Covers ~70–80% of companies. Only `unknown` needs manual attention.
 
-### Public APIs (No Scraping, No ToS Risk)
+### Prefer Official / Public Endpoints
 
-Migrate these platforms to their official APIs as a priority:
+Using official APIs is lower-risk than scraping — but ToS still applies to all endpoints; review each platform's developer terms before production use. Migrate these platforms to their official APIs as a priority:
 
 | Platform | Public API | Base URL |
 |----------|-----------|----------|
