@@ -290,6 +290,7 @@ services:
 
 **Threat model for distributed workers:**
 - **Compromised worker:** A worker that is taken over by an attacker can read jobs from its assigned streams and write fabricated job results to the DB. Mitigate: append-only DB credential (cannot read user data), stream namespacing (limits blast radius to specific queues), Redis ACL (cannot inspect other tenants' keys).
+- **Result integrity:** A compromised worker could submit fabricated job records (wrong titles, locations, or URLs). Mitigate: the central server issues a signed task token per work item; submitted results must include the token and are bound to the assigned company + source URL + platform; the server validates company, source URL, and platform before writing to the DB. Only results that pass server-side validation can appear in user digests.
 - **Malicious user-deployed worker:** A user could deploy a worker and point it at a target company's ATS repeatedly to DoS it. Mitigate: per-worker egress quotas enforced via Redis rate-limit keys; scheduler controls polling intervals and cannot be overridden by workers.
 - **Credential leak:** If a user's `.env` is exposed, an attacker gets Redis + DB credentials. Mitigate: per-user Redis credentials with minimal ACL scope; DB credential is append-only and scoped to the job-results tables.
 - **User consent:** Users who deploy workers must explicitly consent to their IP being used for scraping. Document this clearly in the deployment instructions.
@@ -344,30 +345,50 @@ top_jobs = llm.rank_by_relevance(user_resume, new_jobs, top_n=10)
 Paste careers URL → auto-detect platform:
 
 ```python
-import ipaddress
-from urllib.parse import urlparse
+import ipaddress, socket, requests
+from urllib.parse import urlparse, urljoin
+
+_MAX_DETECT_REDIRECTS = 5
+_METADATA_NETS = [ipaddress.ip_network("169.254.169.254/32")]  # AWS/GCP/Azure metadata
+
+def _ssrf_check(url: str) -> None:
+    """Raise ValueError if url targets a private/loopback/link-local/metadata address."""
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise ValueError(f"detect_ats: unsupported scheme {p.scheme!r}")
+    hostname = p.hostname or ""
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Hostname (not raw IP) — resolve to detect DNS-rebinding to a private address
+        try:
+            ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+        except (socket.gaierror, ValueError):
+            return  # unresolvable; requests.get will fail naturally
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        raise ValueError(f"detect_ats: blocked address {ip} for {hostname!r}")
+    if any(ip in net for net in _METADATA_NETS):
+        raise ValueError(f"detect_ats: metadata IP blocked: {ip}")
 
 def detect_ats(careers_url: str) -> str:
-    # SSRF guard: only allow http/https, reject private/loopback/metadata IPs
-    _parsed = urlparse(careers_url)
-    if _parsed.scheme not in ("http", "https"):
-        raise ValueError(f"detect_ats: unsupported scheme {_parsed.scheme!r}")
-    try:
-        _ip = ipaddress.ip_address(_parsed.hostname)
-        if _ip.is_private or _ip.is_loopback or _ip.is_link_local:
-            raise ValueError(f"detect_ats: private/loopback IP blocked: {_parsed.hostname}")
-    except ValueError as _e:
-        if "does not appear to be an IPv4 or IPv6" not in str(_e):
-            raise  # re-raise SSRF errors; hostname (not raw IP) is fine
+    _ssrf_check(careers_url)
 
-    r = requests.get(
-        careers_url, follow_redirects=True, timeout=10,
-        stream=True,  # don't buffer the entire response
-    )
+    session = requests.Session()
+    resp = session.get(careers_url, allow_redirects=False, timeout=10)
+
+    # Follow redirects manually, validating each hop before following
+    hops = 0
+    while resp.is_redirect and hops < _MAX_DETECT_REDIRECTS:
+        next_url = resp.headers.get("Location", "")
+        if not next_url.startswith(("http://", "https://")):
+            next_url = urljoin(resp.url, next_url)
+        _ssrf_check(next_url)          # validate scheme + resolved IP at every hop
+        resp = session.get(next_url, allow_redirects=False, timeout=10)
+        hops += 1
+
     # Cap response size to avoid memory exhaustion on large pages
-    html = r.raw.read(1_000_000, decode_content=True).decode("utf-8", errors="replace")
-    r.close()
-    url = r.url
+    html = resp.content[:1_000_000].decode("utf-8", errors="replace")
+    url  = resp.url
 
     fingerprints = [
         ('workday',    'myworkdayjobs.com'),
@@ -435,7 +456,7 @@ Commercial scale (1,000+ users): Workday and eightfold actively fight scrapers. 
 
 ## Network Effect
 
-```
+```text
 More users
   → more companies added collaboratively
   → better ATS + recruiter coverage

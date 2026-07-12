@@ -1574,9 +1574,9 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
 # Any process matching these patterns whose PPID is not the scheduler's PID is
 # a ghost competing with the managed pool for the same Redis queues.
 _GHOST_WORKER_PATTERNS = (
-    "python -m workers.detail_worker",
-    "python -m workers.scan_worker",
-    "python -m workers.fullscan",
+    "-m workers.detail_worker",
+    "-m workers.scan_worker",
+    "-m workers.fullscan",
 )
 
 
@@ -1674,10 +1674,31 @@ def _kill_ghost_workers(r) -> None:
     for pid in killed:
         try:
             os.kill(pid, 0)  # Raises ProcessLookupError if already gone
+        except ProcessLookupError:
+            continue  # Exited cleanly after SIGTERM
+        # Re-read cmdline: PID may have been reused by a different process
+        # in the 10-second grace window between SIGTERM and SIGKILL.
+        try:
+            _recheck = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+        except FileNotFoundError:
+            continue  # process exited between kill(0) and cmdline read
+        if not any(pat in _recheck for pat in _GHOST_WORKER_PATTERNS):
+            logger.debug(
+                "watchdog: PID %d cmdline changed after SIGTERM — skipping SIGKILL "
+                "(PID may have been reused): %r",
+                pid, _recheck[:120],
+            )
+            continue
+        try:
             os.kill(pid, _signal.SIGKILL)
             logger.warning("watchdog: ghost PID %d ignored SIGTERM — SIGKILLed", pid)
         except ProcessLookupError:
-            pass  # Exited cleanly after SIGTERM
+            pass  # Exited between re-check and SIGKILL
 
     pid_list = ", ".join(str(p) for p in killed)
     _send_email(

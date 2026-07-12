@@ -358,7 +358,7 @@ fullscan slots mid-scan, silently undercounting concurrent load.
 ## PHASE 6 — Correctness Fixes ✅ DONE (locally, awaiting deploy)
 
 Traced from the India Accenture leak investigation (Jun–Jul 2026). All fixes are
-coded and uncommitted. Ship together — they address the same root-cause chain.
+implemented in this PR and awaiting deployment. Ship together — they address the same root-cause chain.
 
 ### 6.1 scan_worker: empty-string detail keys treated as absent ✅ DONE
 **File:** `workers/scan_worker.py` — `_build_detail_payload()`  
@@ -368,8 +368,11 @@ detail payload. `fetch_job_detail()` guard clauses use `not all([...])` which tr
 unenriched. Downstream code can't distinguish this from a successful detail fetch.  
 **Fix:** Changed to `if job.get(key):` — empty strings are now treated as absent and
 not forwarded, so the guard fires at an earlier stage where it is detectable.  
-**Impact:** Workday jobs with an empty `_external_path` (listing pagination edge case)
-no longer silently fall through to the URL-city fallback.
+**Impact:** In the `detail_worker` retry path where `has_detail=True` and
+`listing_filter=="title_only"`, a job with an empty `_external_path` now returns
+an error/retryable outcome instead of silently entering the filter pipeline with
+incomplete data. Other filter modes (`full`, etc.) are unaffected by this change;
+equivalent protection for those paths requires separate handling.
 
 ### 6.2 job_monitor + registry: Workday `_should_fetch_detail` requires all 4 keys ✅ DONE
 **Files:** `jobs/job_monitor.py` — `_should_fetch_detail()`, `jobs/ats/registry.py` — `should_fetch_detail()`  

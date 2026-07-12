@@ -274,7 +274,7 @@ def _probe_search_jobs(base, path):
     if resp is None:
         return []
     soup = BeautifulSoup(resp.text, "html.parser")
-    return _anchors_to_urls(soup, base)
+    return _anchors_to_urls(soup, url)
 
 
 def _fetch_via_search(slug_info, company):
@@ -301,7 +301,7 @@ def _fetch_via_search(slug_info, company):
             break
 
         soup         = BeautifulSoup(resp.text, "html.parser")
-        page_urls    = _anchors_to_urls(soup, base)
+        page_urls    = _anchors_to_urls(soup, url)
         new_this_page = 0
 
         for job_url in page_urls:
@@ -321,10 +321,11 @@ def _fetch_via_search(slug_info, company):
     return _urls_to_stubs(all_urls, slug_info, company)
 
 
-def _anchors_to_urls(soup, base):
+def _anchors_to_urls(soup, page_url):
     """
     Extract all /JobDetail/ hrefs from a SearchJobs results page.
-    Resolves relative URLs against base. Filters out decoy apply-link texts.
+    Resolves relative hrefs against the page URL (per-spec base for relative links).
+    Absolute hrefs pass through unchanged. Filters out decoy apply-link texts.
     """
     _DECOY = {"apply", "apply now", "apply online", "learn more", "view job", ""}
     urls = []
@@ -334,7 +335,7 @@ def _anchors_to_urls(soup, base):
         href = anchor.get("href", "")
         if not href:
             continue
-        urls.append(href if href.startswith("http") else urljoin(base, href))
+        urls.append(href if href.startswith("http") else urljoin(page_url, href))
     return urls
 
 

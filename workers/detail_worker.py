@@ -601,18 +601,23 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 logger.warning(
                     "detail_worker: fetch_job_detail returned NO new data "
                     "(location/cc/description unchanged). "
-                    "Guard may have fired or API returned empty — retrying. "
+                    "Guard may have fired or API returned empty. "
                     "platform=%s company=%r job_id=%s "
                     "location=%r cc=%r",
                     platform, company, job_id,
                     job.get("location"), job.get("_country_code"),
                 )
-                result["duration_ms"] = int(
-                    (time.monotonic() - start_mono) * 1000
-                )
-                result["outcome"]   = "error"
-                result["retryable"] = True
-                return result
+                if config.get("listing_filter") == "title_only":
+                    # Location is unavailable from the listing — without enriched
+                    # detail data we cannot make a safe filter decision; retry.
+                    result["duration_ms"] = int(
+                        (time.monotonic() - start_mono) * 1000
+                    )
+                    result["outcome"]   = "error"
+                    result["retryable"] = True
+                    return result
+                # listing_filter="full": listing payload already has location and
+                # description; fall through into the filter pipeline.
 
         # ── 3. Filter pipeline ────────────────────────────────────────────────
 
