@@ -1581,11 +1581,72 @@ _GHOST_WORKER_PATTERNS = (
 
 
 def _get_scheduler_pid(r) -> int | None:
-    """Return the live scheduler PID from the Redis heartbeat, or None."""
+    """
+    Return the confirmed live scheduler PID, or None if identity cannot be verified.
+
+    Validation steps:
+      1. Read PID from the Redis heartbeat key.
+      2. Confirm the process is alive (os.kill(pid, 0)).
+      3. Confirm its cmdline matches the scheduler entrypoint (-m workers.scheduler).
+      4. Fallback: if cmdline check fails, confirm via systemd MainPID for the
+         recruiter-scheduler unit (handles compiled or aliased entrypoints).
+
+    Returns None — skipping the ghost-worker kill pass entirely — if any
+    step cannot confirm the scheduler's identity.
+    """
     try:
         hb = r.get("worker:alive:scheduler:adaptive")
-        if hb:
-            return json.loads(hb).get("pid")
+        if not hb:
+            return None
+        pid = json.loads(hb).get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+
+        # Step 2: confirm process is alive
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            logger.debug(
+                "_get_scheduler_pid: heartbeat PID %d is no longer alive — skipping",
+                pid,
+            )
+            return None
+        except PermissionError:
+            pass  # process exists; we cannot signal it but it is alive
+
+        # Step 3: confirm cmdline identifies the scheduler entrypoint
+        try:
+            cmdline = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+            if "-m workers.scheduler" in cmdline:
+                return pid
+        except FileNotFoundError:
+            return None  # exited between kill(0) and cmdline read
+
+        # Step 4: cmdline check inconclusive — confirm via systemd MainPID
+        if _systemd_available():
+            try:
+                out = subprocess.run(
+                    ["systemctl", "show", "-p", "MainPID", "--value",
+                     _UNIT_SCHEDULER],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout.strip()
+                if out and int(out) == pid:
+                    return pid
+            except (subprocess.SubprocessError, ValueError, OSError):
+                pass
+
+        logger.debug(
+            "_get_scheduler_pid: PID %d could not be confirmed as the scheduler "
+            "— skipping ghost-worker kill pass",
+            pid,
+        )
+        return None
+
     except Exception as exc:
         logger.debug("_get_scheduler_pid: failed to read scheduler heartbeat: %s", exc)
     return None
@@ -2233,7 +2294,7 @@ def run_watchdog(once: bool = False,
 
     while True:
         try:
-            if _systemd_available():
+            if self_heal and _systemd_available():
                 _kill_ghost_workers(r)
             issues = _run_all_checks(r)
 

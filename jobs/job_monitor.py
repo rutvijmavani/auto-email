@@ -50,6 +50,7 @@ from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats, get_ats_module,
 )
 from jobs.ats.registry import get_config
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
@@ -887,6 +888,7 @@ def _process_company(company_row, position, total):
 
     with sem:
         # ── Fetch jobs ────────────────────────────────────
+        _scan_complete = True
         try:
             slug_info = _parse_slug(platform, slug, config)
             # custom: validate that the slug parsed to a usable dict
@@ -897,6 +899,17 @@ def _process_company(company_row, position, total):
                 return result
             logger.debug("%s fetch: %r slug=%s", platform, company, slug_info)
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            # Avature SearchJobs pagination cut short (deadline or fetch failure).
+            # Use partial stubs but skip absence tracking — the result set is
+            # incomplete and marking unseen jobs as missing would be incorrect.
+            raw_jobs       = exc.stubs
+            _scan_complete = False
+            logger.warning(
+                "avature [%s]: incomplete SearchJobs scan (%d stub(s)) — "
+                "absence tracking skipped",
+                company, len(raw_jobs),
+            )
         except Exception as e:
             logger.error("API fetch failed for %r (platform=%s): %s",
                          company, platform, e, exc_info=True)
@@ -925,14 +938,14 @@ def _process_company(company_row, position, total):
     fetched_urls = {job["job_url"] for job in raw_jobs}
     tracked      = get_tracked_urls_for_company(company)
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
-    missing_ids  = [tracked[url] for url in tracked
-                    if url not in fetched_urls]
     if present_ids:
         reset_missing_days(present_ids)
-    if missing_ids:
-        increment_missing_days(missing_ids)
-        logger.debug("Missing from scan: %d jobs for %r",
-                     len(missing_ids), company)
+    if _scan_complete:
+        missing_ids = [tracked[url] for url in tracked if url not in fetched_urls]
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
 
     if not raw_jobs:
         logger.info("No jobs returned for %r", company)

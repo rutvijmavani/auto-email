@@ -53,8 +53,20 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 # SearchJobs pagination fallback — used when sitemap has no job URLs
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
 _SEARCH_PAGE_SIZE    = 12
-_SEARCH_MAX_PAGES    = 50    # 50 x 12 = 600 jobs max
-_SEARCH_DEADLINE_S   = 120   # max wall time for the full SearchJobs pagination
+
+
+class IncompleteSearchError(Exception):
+    """
+    Raised by _fetch_via_search when a page fetch failure interrupts pagination
+    before the natural end-of-results. Callers should treat the partial stub
+    list as unreliable for absence tracking and skip incrementing missing-days
+    counters.
+    """
+    def __init__(self, stubs: list):
+        self.stubs = stubs
+        super().__init__(
+            f"SearchJobs pagination incomplete — {len(stubs)} stub(s) collected"
+        )
 
 # Known Avature custom domains — maps domain → careers path
 CUSTOM_DOMAINS = {
@@ -94,17 +106,21 @@ def detect(company):
         resp     = fetch_html(sitemap, platform="avature", track=False)
 
         if resp is None:
-            continue  # subdomain doesn't exist — skip
-
-        soup     = BeautifulSoup(resp.text, "xml")
-        job_urls = _extract_job_urls(soup)
-
-        if not job_urls:
-            # Sitemap exists but has no /JobDetail/ URLs (platform-pages-only pattern)
-            # Fall back to SearchJobs pagination to confirm this is a real Avature tenant
+            # Sitemap unreachable — the subdomain may still be a live Avature
+            # tenant with SearchJobs available; try before skipping.
             job_urls = _probe_search_jobs(base, path)
             if not job_urls:
                 continue
+        else:
+            soup     = BeautifulSoup(resp.text, "xml")
+            job_urls = _extract_job_urls(soup)
+
+            if not job_urls:
+                # Sitemap exists but has no /JobDetail/ URLs (platform-pages-only
+                # pattern, e.g. Siemens) — fall back to SearchJobs pagination.
+                job_urls = _probe_search_jobs(base, path)
+                if not job_urls:
+                    continue
 
         # Validate company match using first job title from URL slug
         first_url  = job_urls[0]
@@ -288,6 +304,12 @@ def _fetch_via_search(slug_info, company):
 
     URL: {base}/{path}/SearchJobs/?jobOffset=N&jobRecordsPerPage=12
     Selects anchors with /JobDetail/ in href — works across all Avature themes.
+
+    Raises IncompleteSearchError (carrying partial stubs) if a page fetch fails
+    mid-pagination, so the caller can skip absence tracking on the incomplete
+    result set. Pagination runs until the ATS returns an empty page (natural
+    end) — no hard page or time cap, matching the (10, None) timeout approach
+    used by successfactors.py for large tenants.
     """
     base = slug_info.get("base", "")
     path = slug_info.get("path", "careers")
@@ -296,24 +318,19 @@ def _fetch_via_search(slug_info, company):
 
     all_urls = []
     seen_ids = set()
-    deadline = time.monotonic() + _SEARCH_DEADLINE_S
+    page     = 0
 
-    for page in range(_SEARCH_MAX_PAGES):
-        if time.monotonic() >= deadline:
-            logger.warning(
-                "avature [%s]: _fetch_via_search deadline reached after %d page(s) — stopping",
-                company, page,
-            )
-            break
-
+    while True:
         offset = page * _SEARCH_PAGE_SIZE
         url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
         resp   = fetch_html(url, platform="avature")
         if resp is None:
-            break
+            # Fetch failure mid-pagination — partial result; skip absence tracking.
+            stubs = _urls_to_stubs(all_urls, slug_info, company)
+            raise IncompleteSearchError(stubs)
 
-        soup         = BeautifulSoup(resp.text, "html.parser")
-        page_urls    = _anchors_to_urls(soup, url)
+        soup          = BeautifulSoup(resp.text, "html.parser")
+        page_urls     = _anchors_to_urls(soup, url)
         new_this_page = 0
 
         for job_url in page_urls:
@@ -325,13 +342,10 @@ def _fetch_via_search(slug_info, company):
             new_this_page += 1
 
         if new_this_page == 0:
-            break  # no new jobs on this page = end of results
+            break  # natural end of results — pagination complete
 
-        if page < _SEARCH_MAX_PAGES - 1:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.5, remaining))
+        page += 1
+        time.sleep(0.5)
 
     return _urls_to_stubs(all_urls, slug_info, company)
 

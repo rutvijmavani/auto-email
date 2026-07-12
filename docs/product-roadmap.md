@@ -349,45 +349,75 @@ import ipaddress, socket, requests
 from urllib.parse import urlparse, urljoin
 
 _MAX_DETECT_REDIRECTS = 5
-_METADATA_NETS = [ipaddress.ip_network("169.254.169.254/32")]  # AWS/GCP/Azure metadata
+_MAX_BODY_BYTES       = 1_000_000
+_METADATA_NETS = [
+    ipaddress.ip_network("169.254.169.254/32"),  # AWS/GCP/Azure IMDS
+    ipaddress.ip_network("fd00:ec2::254/128"),    # AWS IMDSv6
+]
 
 def _ssrf_check(url: str) -> None:
-    """Raise ValueError if url targets a private/loopback/link-local/metadata address."""
+    """
+    Raise ValueError if url targets a private/loopback/link-local/metadata address.
+    Resolves ALL addresses returned by getaddrinfo (not just the first) so a host
+    with a mix of public and private records is rejected. Does not prevent
+    DNS-rebinding between this check and the actual TCP connection — pin the
+    resolved address for the request if that threat is in scope.
+    """
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         raise ValueError(f"detect_ats: unsupported scheme {p.scheme!r}")
     hostname = p.hostname or ""
     try:
-        ip = ipaddress.ip_address(hostname)
+        # Try raw IP first (no DNS lookup needed)
+        addrs = [ipaddress.ip_address(hostname)]
     except ValueError:
-        # Hostname (not raw IP) — resolve to detect DNS-rebinding to a private address
+        # Hostname — resolve every A/AAAA record and check all of them
         try:
-            ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+            results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+            addrs   = [ipaddress.ip_address(r[4][0]) for r in results]
         except (socket.gaierror, ValueError):
-            return  # unresolvable; requests.get will fail naturally
-    if ip.is_private or ip.is_loopback or ip.is_link_local:
-        raise ValueError(f"detect_ats: blocked address {ip} for {hostname!r}")
-    if any(ip in net for net in _METADATA_NETS):
-        raise ValueError(f"detect_ats: metadata IP blocked: {ip}")
+            return  # unresolvable; the request will fail naturally
+    for ip in addrs:
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            raise ValueError(f"detect_ats: blocked address {ip} for {hostname!r}")
+        if any(ip in net for net in _METADATA_NETS):
+            raise ValueError(f"detect_ats: metadata IP blocked: {ip}")
+
+def _read_body(resp, limit: int = _MAX_BODY_BYTES) -> str:
+    """Read up to `limit` bytes from a response, closing it when done."""
+    cl = resp.headers.get("Content-Length", "")
+    if cl.isdigit() and int(cl) > limit:
+        raise ValueError(f"detect_ats: Content-Length {cl} exceeds {limit}-byte limit")
+    chunks = []
+    total  = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=65_536):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"detect_ats: response body exceeds {limit}-byte limit")
+            chunks.append(chunk)
+    finally:
+        resp.close()
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 def detect_ats(careers_url: str) -> str:
     _ssrf_check(careers_url)
 
     session = requests.Session()
-    resp = session.get(careers_url, allow_redirects=False, timeout=10)
+    resp = session.get(careers_url, allow_redirects=False, timeout=10, stream=True)
 
     # Follow redirects manually, validating each hop before following
     hops = 0
     while resp.is_redirect and hops < _MAX_DETECT_REDIRECTS:
+        resp.close()
         next_url = resp.headers.get("Location", "")
         if not next_url.startswith(("http://", "https://")):
             next_url = urljoin(resp.url, next_url)
-        _ssrf_check(next_url)          # validate scheme + resolved IP at every hop
-        resp = session.get(next_url, allow_redirects=False, timeout=10)
+        _ssrf_check(next_url)          # validate scheme + all resolved IPs at every hop
+        resp = session.get(next_url, allow_redirects=False, timeout=10, stream=True)
         hops += 1
 
-    # Cap response size to avoid memory exhaustion on large pages
-    html = resp.content[:1_000_000].decode("utf-8", errors="replace")
+    html = _read_body(resp)            # enforces 1 MB cap; closes resp
     url  = resp.url
 
     fingerprints = [

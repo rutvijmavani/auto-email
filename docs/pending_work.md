@@ -366,13 +366,15 @@ implemented in this PR and awaiting deployment. Ship together — they address t
 detail payload. `fetch_job_detail()` guard clauses use `not all([...])` which treats
 `""` as falsy — so the guard fires, the HTTP request is skipped, and the job returns
 unenriched. Downstream code can't distinguish this from a successful detail fetch.  
-**Fix:** Changed to `if job.get(key):` — empty strings are now treated as absent and
-not forwarded, so the guard fires at an earlier stage where it is detectable.  
-**Impact:** In the `detail_worker` retry path where `has_detail=True` and
-`listing_filter=="title_only"`, a job with an empty `_external_path` now returns
-an error/retryable outcome instead of silently entering the filter pipeline with
-incomplete data. Other filter modes (`full`, etc.) are unaffected by this change;
-equivalent protection for those paths requires separate handling.
+**Fix:** Changed to `if job.get(key):` — empty strings are now treated as absent
+and not forwarded into the detail payload.  
+**Impact:** When `has_detail=True` and `listing_filter=="title_only"`, the absent
+key causes `should_fetch_detail()` in `detail_worker` to return `False`. The
+pre-fetch eligibility check (`not detail_attempted and has_detail and
+listing_filter=="title_only"`) then fires before any HTTP request or internal
+`fetch_job_detail()` guard is reached, returning `error/retryable` instead of
+silently entering the filter pipeline with incomplete data. Other filter modes
+(`full`, etc.) are unaffected; equivalent protection requires separate handling.
 
 ### 6.2 job_monitor + registry: Workday `_should_fetch_detail` requires all 4 keys ✅ DONE
 **Files:** `jobs/job_monitor.py` — `_should_fetch_detail()`, `jobs/ats/registry.py` — `should_fetch_detail()`  
