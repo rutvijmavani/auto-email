@@ -855,9 +855,10 @@ def run():
 
                     if not existing_check:
                         conn.execute(
-                            "INSERT OR IGNORE INTO prospective_companies "
+                            "INSERT INTO prospective_companies "
                             "(company, domain, priority, status, created_at) "
-                            "VALUES (?, ?, 2, 'pending', ?)",
+                            "VALUES (?, ?, 2, 'pending', ?) "
+                            "ON CONFLICT DO NOTHING",
                             (company, domain, datetime.utcnow())
                         )
 
@@ -883,6 +884,7 @@ def run():
                         sheet_row, company
                     )
                 except Exception as e:
+                    conn.rollback()
                     logger.warning(
                         "Row %d: could not store raw curls for %r: %s",
                         sheet_row, company, e

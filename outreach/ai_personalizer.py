@@ -75,12 +75,15 @@ Return only the email body.
 Do not include any placeholder like [Dear Hiring manager].
 """
 
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=prompt
-    )
-
-    return response.text.strip()
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        print("Gemini error (followup):", e)
+        return ""
 
 
 def generate_subject(company, job_title, stage="initial"):
