@@ -1470,6 +1470,14 @@ def fullscan_loop() -> None:
                     maxlen=STREAM_MAXLEN_FULLSCAN,
                     approximate=True,
                 )
+                if not ceiling_raw:
+                    # No ceiling learned yet — slot was not claimed by Lua above;
+                    # ZADD here so the inflight ZSET is populated from day one and
+                    # the ceiling learner has data to work with.
+                    r.zadd(
+                        f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
+                        {company: time.time()},
+                    )
                 r.zrem(REDIS_POLL_FULLSCAN, company)
                 _hw_dispatched += 1
 

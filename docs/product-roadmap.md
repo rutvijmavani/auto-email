@@ -249,7 +249,7 @@ Becomes essential when logs need to be aggregated across multiple servers. Not w
 
 Each user optionally deploys worker-only instances on their own free cloud tier. Central server handles coordination + data only. Workers use each user's IP for scraping — distributes rate limiting risk.
 
-```
+```text
 Central Server (your Oracle instance)
 ├── PostgreSQL  — all shared data
 ├── Redis       — task queue + coordination
@@ -343,6 +343,11 @@ top_jobs = llm.rank_by_relevance(user_resume, new_jobs, top_n=10)
 ### Detecting ATS When Adding a Company
 
 Paste careers URL → auto-detect platform:
+
+> **⚠ Non-production prototype** — DNS-rebinding is not fully mitigated (the resolved
+> address is checked before connection but not pinned to the TCP socket). Pin the resolved
+> address (via a custom `HTTPAdapter` or `socket.getaddrinfo` + `create_connection`) before
+> deploying this in a production environment.
 
 ```python
 import ipaddress, socket, requests

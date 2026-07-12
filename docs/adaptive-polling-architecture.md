@@ -362,6 +362,10 @@ Full scan dispatcher (runs every 5 seconds):
            continue  ← re-queue and skip
          ZADD inflight:fullscans:{dc_key} {now} {company}  ← claim slot atomically
        XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * {company, dc_key, triggered_at}
+         ⚠ Slot claim (ZADD above) and XADD are not atomic. If XADD fails the
+           reserved slot stays in inflight:fullscans until the 2h stale window prunes it.
+           To fix fully: move XADD into the Lua script (requires Redis 7+) or
+           ZREM the slot in an XADD error handler.
        ZREM poll:fullscan {company}
 
 Full scan workers (one pool per dc_key):
@@ -701,8 +705,14 @@ Dawn patrol redistributed late adaptive polls into the 7 AM–9 AM window at cyc
 
 **Rule 3 — Adaptive triggers full scan directly (structural enforcement)**
 When adaptive completes, it checks whether a full scan needs to be scheduled or
-rescheduled, and queues one if needed. Full scan can only enter `poll:fullscan` via
-this path (Path 2) or via `fullscan.py` post-completion rescheduling (Path 1).
+rescheduled, and queues one if needed. Full scan can enter `poll:fullscan` via three paths:
+
+- **Path 1** — `fullscan.py` post-completion rescheduling (normal cadence)
+- **Path 2** — `_maybe_reschedule_full_scan()` triggered by adaptive completion (this rule)
+- **Path 3** — `_queue_fullscans_for_missed()` in `job_monitor.py` (safety net for companies
+  whose fullscan was missed entirely — NULL or stale `next_full_scan_at`). This path bypasses
+  the adaptive-first rule (Rule 4) since the company has already been seen by the listing
+  fallback; it schedules a fullscan directly.
 
 ```python
 def on_adaptive_complete(company):
@@ -1363,7 +1373,7 @@ The correct isolation: track **in-flight scans per platform/DC** and throttle at
 
 Adaptive and fullscan workers share the same learned ceiling per DC key but use **separate ZSET keys** to track their inflight slots. This is necessary because the two scan types have very different durations — a 10-minute stale window that prunes abandoned adaptive slots would prune active fullscan slots mid-scan (full scans take 20–30 min).
 
-```
+```text
 inflight:scans:{dc_key}      — adaptive scan inflight  (stale window: INFLIGHT_STALE_WINDOW_S = 10 min)
 inflight:fullscans:{dc_key}  — fullscan inflight        (stale window: INFLIGHT_FULLSCAN_STALE_S  = 2 h)
 ```
@@ -1406,9 +1416,11 @@ return 1   -- ok
 
 If `_claimed == 0`: company re-queued to `poll:fullscan` at `+30s` and skipped. The slot claimed here is the authoritative reservation — `_run_fullscan()` does not ZADD again; it only writes `worker:current_job:fullscan:{pid}` for crash-recovery bookkeeping and releases the slot in its finally block.
 
-**Why not use the Stream PEL for inflight tracking:**
+**Why not use the Stream PEL for inflight tracking (historical evaluation):**
 
-| Property | Stream PEL | ZSET with stale window |
+The Stream PEL was evaluated and rejected in favour of the ZSET approach. ZSET with stale-window pruning (`ZREMRANGEBYSCORE`) is the authoritative inflight count; `_get_stream_pending_count()` queries `XPENDING` for monitoring only, not for ceiling checks.
+
+| Property | Stream PEL | ZSET with stale window (current approach) |
 |---|---|---|
 | Fullscan + adaptive combined count | Two separate streams → can't combine easily | Two ZSETs → simple ZCARD sum |
 | Atomic check + claim | Requires Lua anyway; PEL written by XADD not by the check | Lua can ZREMRANGEBYSCORE + ZCARD + ZADD atomically |

@@ -53,6 +53,7 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 # SearchJobs pagination fallback — used when sitemap has no job URLs
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
 _SEARCH_PAGE_SIZE    = 12
+_SEARCH_MAX_PAGES    = 2000  # safety cap; 2000 × 12 = 24 000 jobs max per run
 
 
 class IncompleteSearchError(Exception):
@@ -306,10 +307,10 @@ def _fetch_via_search(slug_info, company):
     Selects anchors with /JobDetail/ in href — works across all Avature themes.
 
     Raises IncompleteSearchError (carrying partial stubs) if a page fetch fails
-    mid-pagination, so the caller can skip absence tracking on the incomplete
-    result set. Pagination runs until the ATS returns an empty page (natural
-    end) — no hard page or time cap, matching the (10, None) timeout approach
-    used by successfactors.py for large tenants.
+    mid-pagination or the safety cap (_SEARCH_MAX_PAGES) is hit, so the caller
+    can skip absence tracking on the incomplete result set. Pagination runs until
+    the ATS returns an empty page (natural end) — no hard time cap, matching the
+    (10, None) timeout approach used by successfactors.py for large tenants.
     """
     base = slug_info.get("base", "")
     path = slug_info.get("path", "careers")
@@ -318,9 +319,8 @@ def _fetch_via_search(slug_info, company):
 
     all_urls = []
     seen_ids = set()
-    page     = 0
 
-    while True:
+    for page in range(_SEARCH_MAX_PAGES):
         offset = page * _SEARCH_PAGE_SIZE
         url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
         resp   = fetch_html(url, platform="avature")
@@ -344,8 +344,15 @@ def _fetch_via_search(slug_info, company):
         if new_this_page == 0:
             break  # natural end of results — pagination complete
 
-        page += 1
         time.sleep(0.5)
+    else:
+        # Safety cap reached — treat as incomplete so absence tracking is skipped.
+        logger.warning(
+            "avature [%s]: SearchJobs hit _SEARCH_MAX_PAGES=%d — treating as incomplete",
+            company, _SEARCH_MAX_PAGES,
+        )
+        stubs = _urls_to_stubs(all_urls, slug_info, company)
+        raise IncompleteSearchError(stubs)
 
     return _urls_to_stubs(all_urls, slug_info, company)
 

@@ -482,10 +482,18 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         # (has_detail=True) but required keys are missing so should_fetch_detail
         # returned False, we cannot make a correct filter decision.  Retry rather
         # than risk leaking a non-US job through is_us_location("") = True.
+        #
+        # Only retry on missing required inputs — intentional skips (XML sitemap
+        # jobs, custom jobs that already have a description) should fall through.
+        _pre_missing = [
+            k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
+            if not job.get(k)
+        ]
         if (
             not detail_attempted
             and config.get("has_detail")
             and config.get("listing_filter") == "title_only"
+            and _pre_missing
         ):
             logger.warning(
                 "detail_worker: detail required for listing_filter=title_only but "
@@ -607,17 +615,20 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     platform, company, job_id,
                     job.get("location"), job.get("_country_code"),
                 )
-                if config.get("listing_filter") == "title_only":
-                    # Location is unavailable from the listing — without enriched
-                    # detail data we cannot make a safe filter decision; retry.
+                if config.get("listing_filter") == "title_only" and _missing:
+                    # Required keys were absent — the fetch_job_detail guard
+                    # fired silently; without enriched location we cannot make a
+                    # safe filter decision.  Retry so a later attempt with a
+                    # complete payload can enrich the job correctly.
                     result["duration_ms"] = int(
                         (time.monotonic() - start_mono) * 1000
                     )
                     result["outcome"]   = "error"
                     result["retryable"] = True
                     return result
-                # listing_filter="full": listing payload already has location and
-                # description; fall through into the filter pipeline.
+                # listing_filter="full" OR no missing required keys (fetch
+                # succeeded but data was genuinely unchanged): fall through into
+                # the filter pipeline so the job is processed correctly.
 
         # ── 3. Filter pipeline ────────────────────────────────────────────────
 

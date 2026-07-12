@@ -69,8 +69,6 @@ from config import (
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
 )
-from workers.scheduler import _atomic_schedule, _next_digest_deadline
-
 logger = get_logger(__name__)
 
 
@@ -342,6 +340,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
     from db.db import get_conn
     import redis as _redis_lib
     from config import REDIS_URL
+    from workers.scheduler import _atomic_schedule, _next_digest_deadline
 
     company_names = [c["company"] for c in missed]
     now = time.time()
@@ -374,19 +373,23 @@ def _queue_fullscans_for_missed(missed: list) -> None:
     try:
         queued = 0
         for company_row in missed:
-            company = company_row["company"]
-            stats_row = scan_map.get(company)
-            if stats_row is None:
-                continue
-
-            next_scan = stats_row["next_full_scan_at"]
-            if next_scan is not None:
-                next_ts = next_scan.timestamp() if hasattr(next_scan, "timestamp") else float(next_scan)
-                if next_ts > now:
-                    continue  # fullscan already scheduled in the future
-
-            avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
             try:
+                company   = company_row["company"]
+                stats_row = scan_map.get(company)
+                if stats_row is None:
+                    continue
+
+                next_scan = stats_row["next_full_scan_at"]
+                if next_scan is not None:
+                    next_ts = (
+                        next_scan.timestamp()
+                        if hasattr(next_scan, "timestamp")
+                        else float(next_scan)
+                    )
+                    if next_ts > now:
+                        continue  # fullscan already scheduled in the future
+
+                avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
                 _atomic_schedule(
                     r, REDIS_POLL_FULLSCAN, company,
                     now + SCHEDULER_FULL_SCAN_BUFFER_S,
@@ -394,17 +397,17 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                     deadline_ts    = _next_digest_deadline(now),
                     avg_duration_s = avg_duration,
                 )
+                queued += 1
+                logger.info(
+                    "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
+                    company, next_scan,
+                )
             except Exception as exc:
                 logger.warning(
-                    "monitor: failed to queue fullscan for missed company %r: %s",
-                    company, exc,
+                    "monitor: failed to queue fullscan for company %r: %s",
+                    company_row.get("company", "?"), exc,
                 )
                 continue
-            queued += 1
-            logger.info(
-                "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
-                company, next_scan,
-            )
 
         if queued:
             logger.info("monitor: queued fullscans for %d/%d missed companies", queued, len(missed))

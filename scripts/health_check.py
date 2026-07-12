@@ -224,17 +224,22 @@ def run_health_check() -> int:
         _row("WARNING", "Sentry", "sentry-sdk not installed — run: pip install sentry-sdk")
         warnings += 1
     else:
+        _dotenv_failed = False
         try:
             from pathlib import Path as _Path
             from dotenv import load_dotenv as _load_dotenv
             _load_dotenv(_Path(_ROOT) / ".env")
         except Exception as _dotenv_err:
             print(f"  [WARNING] health_check: .env load failed: {_dotenv_err}", flush=True)
+            _dotenv_failed = True
+            warnings += 1
         _dsn = os.environ.get("SENTRY_DSN", "").strip()
 
         if not _dsn:
             _row("WARNING", "Sentry", "SENTRY_DSN not set in .env — exception capture disabled")
             warnings += 1
+        elif _dotenv_failed:
+            _row("WARNING", "Sentry", "configured (SENTRY_DSN found in environment but .env load failed)")
         else:
             _row("OK", "Sentry", "configured")
 

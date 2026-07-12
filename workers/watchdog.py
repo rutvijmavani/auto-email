@@ -1631,7 +1631,7 @@ def _get_scheduler_pid(r) -> int | None:
         if _systemd_available():
             try:
                 out = subprocess.run(
-                    ["systemctl", "show", "-p", "MainPID", "--value",
+                    [_SYSTEMCTL, "show", "-p", "MainPID", "--value",
                      _UNIT_SCHEDULER],
                     capture_output=True, text=True, timeout=3,
                 ).stdout.strip()
@@ -1701,7 +1701,7 @@ def _kill_ghost_workers(r) -> None:
                 ppid = int(ppid_line.split()[1])
                 if ppid != scheduler_pid:
                     ghosts.append(pid)
-            except (FileNotFoundError, StopIteration, ValueError, UnicodeDecodeError):
+            except (FileNotFoundError, PermissionError, StopIteration, ValueError, UnicodeDecodeError):
                 continue
     except Exception as exc:
         logger.warning("watchdog: ghost worker scan failed: %s", exc)
