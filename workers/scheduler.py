@@ -2949,9 +2949,11 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
           f"{scan_count} scan + {detail_count} detail + {fullscan_count} fullscan workers "
           f"— Ctrl+C to stop")
 
+    from logger import cleanup_logs_if_due
     try:
         while True:
             time.sleep(60)
+            cleanup_logs_if_due()
     except KeyboardInterrupt:
         logger.info("scheduler: shutdown requested — draining worker pools")
         print("\n[scheduler] Shutting down workers...")

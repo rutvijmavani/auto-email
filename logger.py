@@ -38,6 +38,7 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -316,6 +317,31 @@ def init_logging(command: str = "pipeline") -> None:
         _log.info(
             "Log cleanup ran at startup — deleted=%d errors=%d",
             _deleted, _errors,
+        )
+
+
+_last_log_cleanup: float = 0.0
+_LOG_CLEANUP_INTERVAL_S: float = 86400.0  # 24 h
+
+
+def cleanup_logs_if_due() -> None:
+    """
+    Prune rotated log files older than 14 days if 24 hours have elapsed since
+    the last run. Intended for long-running processes (scheduler) that are never
+    restarted and would otherwise never re-trigger the startup cleanup in
+    init_logging(). Safe to call frequently — is a no-op until the interval elapses.
+    """
+    global _last_log_cleanup
+    now = time.time()
+    if now - _last_log_cleanup < _LOG_CLEANUP_INTERVAL_S:
+        return
+    _last_log_cleanup = now
+    deleted, errors = _cleanup_old_logs()
+    _log = logging.getLogger(__name__)
+    if deleted or errors:
+        _log.info(
+            "logger: periodic log cleanup — deleted=%d errors=%d",
+            deleted, errors,
         )
 
 

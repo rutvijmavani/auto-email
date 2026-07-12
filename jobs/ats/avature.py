@@ -31,6 +31,7 @@
 #   Custom domain:{"base": "https://jobs.ea.com", "path": "en_US/careers"}
 #                 {"base": "https://jobs.siemens.com", "path": "en_US/externaljobs"}
 
+import logging
 import re
 import json
 import time
@@ -38,6 +39,8 @@ from datetime import datetime
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────
@@ -49,8 +52,9 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 
 # SearchJobs pagination fallback — used when sitemap has no job URLs
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
-_SEARCH_PAGE_SIZE = 12
-_SEARCH_MAX_PAGES = 50   # 50 x 12 = 600 jobs max
+_SEARCH_PAGE_SIZE    = 12
+_SEARCH_MAX_PAGES    = 50    # 50 x 12 = 600 jobs max
+_SEARCH_DEADLINE_S   = 120   # max wall time for the full SearchJobs pagination
 
 # Known Avature custom domains — maps domain → careers path
 CUSTOM_DOMAINS = {
@@ -292,8 +296,16 @@ def _fetch_via_search(slug_info, company):
 
     all_urls = []
     seen_ids = set()
+    deadline = time.monotonic() + _SEARCH_DEADLINE_S
 
     for page in range(_SEARCH_MAX_PAGES):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "avature [%s]: _fetch_via_search deadline reached after %d page(s) — stopping",
+                company, page,
+            )
+            break
+
         offset = page * _SEARCH_PAGE_SIZE
         url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
         resp   = fetch_html(url, platform="avature")
@@ -316,7 +328,10 @@ def _fetch_via_search(slug_info, company):
             break  # no new jobs on this page = end of results
 
         if page < _SEARCH_MAX_PAGES - 1:
-            time.sleep(0.5)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.5, remaining))
 
     return _urls_to_stubs(all_urls, slug_info, company)
 

@@ -1694,6 +1694,24 @@ def _kill_ghost_workers(r) -> None:
                 pid, _recheck[:120],
             )
             continue
+        # Re-read PPID: if the process was adopted by the scheduler between
+        # SIGTERM and now it is no longer a ghost and must not be killed.
+        try:
+            _status_recheck = Path(f"/proc/{pid}/status").read_text()
+            _ppid_recheck   = int(
+                next(
+                    line for line in _status_recheck.splitlines()
+                    if line.startswith("PPid:")
+                ).split()[1]
+            )
+            if _ppid_recheck == scheduler_pid:
+                logger.debug(
+                    "watchdog: PID %d is now a child of scheduler (PPID=%d) — skipping SIGKILL",
+                    pid, scheduler_pid,
+                )
+                continue
+        except (FileNotFoundError, StopIteration, ValueError):
+            continue  # process exited; nothing to kill
         try:
             os.kill(pid, _signal.SIGKILL)
             logger.warning("watchdog: ghost PID %d ignored SIGTERM — SIGKILLed", pid)
