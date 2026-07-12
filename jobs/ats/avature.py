@@ -53,8 +53,6 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 # SearchJobs pagination fallback — used when sitemap has no job URLs
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
 _SEARCH_PAGE_SIZE    = 12
-_SEARCH_MAX_PAGES    = 2000  # safety cap; 2000 × 12 = 24 000 jobs max per run
-_SEARCH_DEADLINE_S   = 1800  # 30-min wall-clock cap; prevents holding semaphore for tens of minutes
 
 
 class IncompleteSearchError(Exception):
@@ -188,10 +186,10 @@ def fetch_jobs(slug_info, company):
         location, posted_at, description filled by fetch_job_detail().
 
     Raises:
-        IncompleteSearchError: if the SearchJobs fallback fails mid-pagination or
-                               hits _SEARCH_MAX_PAGES; carries partial stubs so
-                               callers can skip absence tracking but run presence
-                               tracking on whatever was collected.
+        IncompleteSearchError: if the SearchJobs fallback fails mid-pagination
+                               (fetch error); carries partial stubs so callers
+                               can skip absence tracking but run presence tracking
+                               on whatever was collected.
     """
     if not slug_info:
         return []
@@ -313,30 +311,22 @@ def _fetch_via_search(slug_info, company):
     URL: {base}/{path}/SearchJobs/?jobOffset=N&jobRecordsPerPage=12
     Selects anchors with /JobDetail/ in href — works across all Avature themes.
 
-    Raises IncompleteSearchError (carrying partial stubs) if a page fetch fails
-    mid-pagination or the safety cap (_SEARCH_MAX_PAGES) is hit, so the caller
-    can skip absence tracking on the incomplete result set. Pagination runs until
-    the ATS returns an empty page (natural end) — no hard time cap, matching the
-    (10, None) timeout approach used by successfactors.py for large tenants.
+    Raises IncompleteSearchError (carrying partial stubs) only on a mid-pagination
+    fetch failure; callers can then skip absence tracking on the incomplete result.
+    Pagination terminates naturally when the ATS returns an empty page — no
+    artificial page cap or time limit, so large tenants (e.g. Accenture ~3000 jobs)
+    are fetched in full.
     """
     base = slug_info.get("base", "")
     path = slug_info.get("path", "careers")
     if not base:
         return []
 
-    all_urls  = []
-    seen_ids  = set()
-    _deadline = time.time() + _SEARCH_DEADLINE_S
+    all_urls = []
+    seen_ids = set()
+    page     = 0
 
-    for page in range(_SEARCH_MAX_PAGES):
-        if time.time() >= _deadline:
-            logger.warning(
-                "avature [%s]: SearchJobs hit _SEARCH_DEADLINE_S=%ds after %d page(s) — treating as incomplete",
-                company, _SEARCH_DEADLINE_S, page,
-            )
-            stubs = _urls_to_stubs(all_urls, slug_info, company)
-            raise IncompleteSearchError(stubs)
-
+    while True:
         offset = page * _SEARCH_PAGE_SIZE
         url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
         resp   = fetch_html(url, platform="avature")
@@ -360,15 +350,8 @@ def _fetch_via_search(slug_info, company):
         if new_this_page == 0:
             break  # natural end of results — pagination complete
 
+        page += 1
         time.sleep(0.5)
-    else:
-        # Safety cap reached — treat as incomplete so absence tracking is skipped.
-        logger.warning(
-            "avature [%s]: SearchJobs hit _SEARCH_MAX_PAGES=%d — treating as incomplete",
-            company, _SEARCH_MAX_PAGES,
-        )
-        stubs = _urls_to_stubs(all_urls, slug_info, company)
-        raise IncompleteSearchError(stubs)
 
     return _urls_to_stubs(all_urls, slug_info, company)
 
