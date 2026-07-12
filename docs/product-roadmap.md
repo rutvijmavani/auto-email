@@ -390,12 +390,12 @@ def _ssrf_check(url: str) -> None:
 
 def _read_body(resp, limit: int = _MAX_BODY_BYTES) -> str:
     """Read up to `limit` bytes from a response, closing it when done."""
-    cl = resp.headers.get("Content-Length", "")
-    if cl.isdigit() and int(cl) > limit:
-        raise ValueError(f"detect_ats: Content-Length {cl} exceeds {limit}-byte limit")
     chunks = []
     total  = 0
     try:
+        cl = resp.headers.get("Content-Length", "")
+        if cl.isdigit() and int(cl) > limit:
+            raise ValueError(f"detect_ats: Content-Length {cl} exceeds {limit}-byte limit")
         for chunk in resp.iter_content(chunk_size=65_536):
             total += len(chunk)
             if total > limit:

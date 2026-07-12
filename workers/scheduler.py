@@ -95,6 +95,7 @@ from config import (
     WORKER_SCALING_LOCK_TTL,
     REDIS_INFLIGHT_PREFIX,
     INFLIGHT_STALE_WINDOW_S,
+    REDIS_INFLIGHT_FULLSCAN,
     REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
     WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
     INFLIGHT_FULLSCAN_STALE_S,
@@ -1112,6 +1113,13 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
         )
         return
 
+    if r.zscore(REDIS_INFLIGHT_FULLSCAN, company) is not None:
+        logger.debug(
+            "_maybe_reschedule_full_scan: %r is actively in-flight — suppressing",
+            company,
+        )
+        return
+
     now          = time.time()
     avg_duration = float(row["avg_fullscan_duration_s"] or 1800.0)
     next_scan    = row["next_full_scan_at"]
@@ -1457,19 +1465,38 @@ def fullscan_loop() -> None:
                         )
                         continue
 
-                r.xadd(
-                    REDIS_STREAM_FULLSCAN,
-                    {
-                        "company":     company,
-                        "scan_type":   "fullscan",
-                        "dc_key":      dc_key,
-                        "context":     "normal",
-                        "enqueued_at": datetime.utcnow().isoformat(),
-                        "request_id":  f"full-{int(now)}",
-                    },
-                    maxlen=STREAM_MAXLEN_FULLSCAN,
-                    approximate=True,
-                )
+                try:
+                    r.xadd(
+                        REDIS_STREAM_FULLSCAN,
+                        {
+                            "company":     company,
+                            "scan_type":   "fullscan",
+                            "dc_key":      dc_key,
+                            "context":     "normal",
+                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "request_id":  f"full-{int(now)}",
+                        },
+                        maxlen=STREAM_MAXLEN_FULLSCAN,
+                        approximate=True,
+                    )
+                except Exception as _xadd_exc:
+                    # XADD failed — if the Lua script claimed a DC inflight slot
+                    # (ceiling_raw path), release it now so it doesn't leak until
+                    # the stale cleanup window expires.
+                    if ceiling_raw:
+                        try:
+                            r.zrem(
+                                f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
+                                company,
+                            )
+                        except Exception:
+                            pass
+                    logger.error(
+                        "fullscan_loop: XADD failed for %r (dc=%s): %s — rescheduling",
+                        company, dc_key, _xadd_exc,
+                    )
+                    r.zadd(REDIS_POLL_FULLSCAN, {company: now + 60})
+                    continue
                 if not ceiling_raw:
                     # No ceiling learned yet — slot was not claimed by Lua above;
                     # ZADD here so the inflight ZSET is populated from day one and
@@ -1638,10 +1665,12 @@ def calculate_worker_counts(r) -> tuple:
     """
     window_s = 23 * 3600   # 23-hour working window
 
-    # DB pool ceiling split 60/40 (no workers running yet at startup)
-    db_budget   = DB_POOL_MAXCONN - 3   # 3 reserved for scheduler + maintenance
-    scan_ceil   = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_SCAN_FRACTION))
-    detail_ceil = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_DETAIL_FRACTION))
+    # DB pool ceiling: subtract fullscan reservation first, then split remainder 60/40
+    db_budget       = DB_POOL_MAXCONN - 3   # 3 reserved for scheduler + maintenance
+    fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
+    remaining       = max(0, db_budget - fullscan_budget)
+    scan_ceil       = max(WORKER_FLOOR, int(remaining * WORKER_POOL_SCAN_FRACTION))
+    detail_ceil     = max(WORKER_FLOOR, int(remaining * WORKER_POOL_DETAIL_FRACTION))
 
     # Number of companies registered for adaptive polling today
     scan_polls_today = max(1, r.zcard(REDIS_POLL_ADAPTIVE))
@@ -2688,7 +2717,9 @@ def _slow_throughput_check_loop() -> None:
             # workers (each worker is busy AND more work is waiting).
             # Scale down when the stream is idle and pool is above the floor.
             # Uses the same 2-consecutive-check hysteresis as scan/detail.
-            fullscan_stream_depth = _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
+            _fullscan_xlen        = r.xlen(REDIS_STREAM_FULLSCAN)
+            _fullscan_pel         = _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
+            fullscan_stream_depth = max(0, _fullscan_xlen - _fullscan_pel)
             fullscan_ceil = max(
                 WORKER_FLOOR,
                 int((db_budget - n_scan - n_detail) * WORKER_POOL_FULLSCAN_FRACTION),
@@ -2721,7 +2752,7 @@ def _slow_throughput_check_loop() -> None:
                             ),
                         )
                         _hysteresis["fullscan_add"] = 0
-            elif fullscan_stream_depth == 0 and n_fullscan > WORKER_FLOOR:
+            elif _fullscan_xlen == 0 and n_fullscan > WORKER_FLOOR:
                 _hysteresis["fullscan_remove"] += 1
                 _hysteresis["fullscan_add"]     = 0
 
@@ -2833,9 +2864,10 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
         1. Rebuilds Redis from PostgreSQL on startup (unless skip_rebuild)
         2. Calibrates band thresholds and seeds concurrency limits
         3. Calculates data-driven startup worker counts from 30-day history
-        5. Spawns two co-scheduled multiprocessing.Process pools:
-               scan_pool   — listing scan workers
-               detail_pool — detail fetch workers
+        5. Spawns three co-scheduled multiprocessing.Process pools:
+               scan_pool     — listing scan workers
+               detail_pool   — detail fetch workers
+               fullscan_pool — fullscan workers (stream:fullscan consumers)
         6. Starts six daemon threads:
                adaptive_loop               — dispatches to stream:adaptive (two-layer)
                fullscan_loop               — dispatches to stream:fullscan (two-layer)

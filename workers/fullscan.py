@@ -855,7 +855,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company,
             )
             result["outcome"] = "skipped"
-            _release_dc("lock-held")
+            # Do NOT call _release_dc here — this worker never claimed a DC slot;
+            # the worker that holds the lock owns the slot and will release it.
             return result
 
     try:

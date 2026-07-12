@@ -185,6 +185,12 @@ def fetch_jobs(slug_info, company):
     Returns:
         List of normalized job dicts.
         location, posted_at, description filled by fetch_job_detail().
+
+    Raises:
+        IncompleteSearchError: if the SearchJobs fallback fails mid-pagination or
+                               hits _SEARCH_MAX_PAGES; carries partial stubs so
+                               callers can skip absence tracking but run presence
+                               tracking on whatever was collected.
     """
     if not slug_info:
         return []
