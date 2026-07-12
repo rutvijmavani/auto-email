@@ -200,7 +200,14 @@ Only build this when Phase 1 is working and you feel load or coverage limits.
 
 #### 2a — Multi-Server + Scheduler Leader Election
 
-Workers already scale horizontally via Redis Streams consumer groups — zero code change. Only the scheduler needs coordination:
+Workers already scale horizontally via Redis Streams consumer groups — no scheduler-leader change needed for workers. Only the scheduler needs coordination:
+
+**Security prerequisites before multi-server rollout:**
+- Signed task tokens on stream messages (prevent a rogue worker from injecting fake jobs)
+- Server-side result validation before DB writes (reject results from unauthenticated sources)
+- Redis ACLs: restrict each server to only the key namespaces it needs
+- Append-only database roles: workers get INSERT/UPDATE only; DROP/TRUNCATE restricted to operator sessions
+- Per-server rate limits on XADD (prevent one misbehaving node from flooding the stream)
 
 ```python
 import time, uuid, redis, threading
@@ -225,19 +232,28 @@ def _run_as_leader(token):
 
     def _heartbeat_loop():
         """Renew lease on an independent timer, not tied to scheduling tick duration."""
-        while _leader.is_set():
-            renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
-            if not renewed:
-                _leader.clear()  # lost leadership — signal main loop to stop
-                break
-            time.sleep(RENEW_INTERVAL)
+        try:
+            while _leader.is_set():
+                try:
+                    renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
+                except Exception:
+                    renewed = 0
+                if not renewed:
+                    break
+                time.sleep(RENEW_INTERVAL)
+        finally:
+            _leader.clear()  # always signal main loop to stop, even on exception
 
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
     while _leader.is_set():
-        run_scheduling_tick()   # may take several seconds; heartbeat runs independently
+        try:
+            run_scheduling_tick()   # may take several seconds; heartbeat runs independently
+        except Exception:
+            _leader.clear()  # scheduling failure stops heartbeat renewal and exits loop
+            raise
         time.sleep(10)
-    # _leader cleared by heartbeat thread — stop scheduling immediately
+    # _leader cleared by heartbeat thread or scheduling failure — stop immediately
 
 # Retry acquiring the lock until this instance becomes leader.
 while True:
@@ -442,6 +458,12 @@ def detect_ats(careers_url: str) -> str:
         _ssrf_check(next_url)          # validate scheme + all resolved IPs at every hop
         resp = session.get(next_url, allow_redirects=False, timeout=10, stream=True)
         hops += 1
+
+    if resp.is_redirect:
+        resp.close()
+        raise ValueError(
+            f"detect_ats: too many redirects (> {_MAX_DETECT_REDIRECTS}) for {careers_url!r}"
+        )
 
     html = _read_body(resp)            # enforces 1 MB cap; closes resp
     url  = resp.url

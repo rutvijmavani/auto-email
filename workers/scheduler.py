@@ -227,6 +227,29 @@ def _get_stream_pending_count(r, stream_key: str,
         return 0
 
 
+def _get_stream_undelivered_count(r, stream_key: str,
+                                   group: str = STREAM_CONSUMER_GROUP) -> int:
+    """Return the count of messages in the stream not yet delivered to any consumer.
+
+    Uses XINFO GROUPS `lag` (Redis 7.0+) which counts only undelivered entries,
+    excluding acknowledged history that XLEN would include.  Falls back to
+    XLEN - PEL for Redis < 7.0.
+    """
+    try:
+        for g in r.xinfo_groups(stream_key):
+            name = g.get("name", b"")
+            if isinstance(name, bytes):
+                name = name.decode()
+            if name == group:
+                lag = g.get("lag")
+                return int(lag) if lag is not None else 0
+        return 0
+    except Exception:
+        xlen = r.xlen(stream_key)
+        pel  = _get_stream_pending_count(r, stream_key, group)
+        return max(0, xlen - pel)
+
+
 def claim_stale_work(r, stream_key: str, group: str,
                      consumer: str, p95_ms: int,
                      op_type: str = "scan") -> None:
@@ -1151,6 +1174,16 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
         deadline = _next_digest_deadline(now)
         if next_ts > now and (next_ts + avg_duration) < deadline:
             return  # already scheduled and will finish before digest
+
+    # Guard against overwriting a valid ZSET entry when next_full_scan_at is NULL
+    # or stale (e.g., queued by _queue_fullscans_for_missed or a prior call here).
+    existing_zset = r.zscore(REDIS_POLL_FULLSCAN, company)
+    if existing_zset is not None and float(existing_zset) > now:
+        logger.debug(
+            "_maybe_reschedule_full_scan: %r already in poll:fullscan at %.0f — skipping",
+            company, float(existing_zset),
+        )
+        return
 
     _atomic_schedule(
         r, REDIS_POLL_FULLSCAN, company,
@@ -2500,11 +2533,11 @@ def _slow_throughput_check_loop() -> None:
             n_scan, n_detail = _get_pool_snapshot()
             n_fullscan       = _get_fullscan_pool_size()
 
-            db_budget    = DB_POOL_MAXCONN - 3
-            scan_ceil    = max(WORKER_FLOOR,
-                               int((db_budget - n_detail - n_fullscan) * WORKER_POOL_SCAN_FRACTION))
-            detail_ceil  = max(WORKER_FLOOR,
-                               int((db_budget - n_scan - n_fullscan) * WORKER_POOL_DETAIL_FRACTION))
+            db_budget        = DB_POOL_MAXCONN - 3
+            _fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
+            _remaining       = max(0, db_budget - _fullscan_budget)
+            scan_ceil        = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_SCAN_FRACTION))
+            detail_ceil      = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_DETAIL_FRACTION))
             dynamic_floor = _remaining_work_minimum(r)
 
             # ── Phase 11: Redis memory alert ──────────────────────────────────
@@ -2742,13 +2775,10 @@ def _slow_throughput_check_loop() -> None:
             # workers (each worker is busy AND more work is waiting).
             # Scale down when the stream is idle and pool is above the floor.
             # Uses the same 2-consecutive-check hysteresis as scan/detail.
-            _fullscan_xlen        = r.xlen(REDIS_STREAM_FULLSCAN)
-            _fullscan_pel         = _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
-            fullscan_stream_depth = max(0, _fullscan_xlen - _fullscan_pel)
-            fullscan_ceil = max(
-                WORKER_FLOOR,
-                int((db_budget - n_scan - n_detail) * WORKER_POOL_FULLSCAN_FRACTION),
+            fullscan_stream_depth = _get_stream_undelivered_count(
+                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
             )
+            fullscan_ceil = _fullscan_budget
 
             if fullscan_stream_depth > n_fullscan:
                 _hysteresis["fullscan_add"]    += 1

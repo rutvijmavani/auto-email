@@ -137,6 +137,7 @@ from workers.scheduler import (
 from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
 from db.job_monitor import (
@@ -926,7 +927,17 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         # all pages in one call and process in FULLSCAN_CHUNK_SIZE chunks.
         set_progress(company, "fullscan_fetching")
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
-        raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        try:
+            raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            if not exc.stubs:
+                raise
+            logger.warning(
+                "fullscan [%s]: avature partial fetch for %r — %d stubs "
+                "(HTTP failure mid-pagination)",
+                company, company, len(exc.stubs),
+            )
+            raw_jobs = exc.stubs
         set_progress(company, "fullscan_processing")
 
         # ── Persist slug_info mutations made in-place by ATS modules ──────────

@@ -116,6 +116,7 @@ from workers.http_client import set_request_context
 from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db
 from db.job_monitor import (
@@ -319,6 +320,15 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            if not exc.stubs:
+                raise
+            logger.warning(
+                "scan_worker [%s]: avature partial fetch for %r — %d stubs "
+                "(HTTP failure mid-pagination)",
+                request_id, company, len(exc.stubs),
+            )
+            raw_jobs = exc.stubs
         finally:
             set_request_context("normal")   # always reset, even on exception
 

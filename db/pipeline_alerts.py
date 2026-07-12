@@ -225,7 +225,10 @@ def check_pipeline_health():
                     dates[i], dates[i + 1]
                 )
                 return []
-    except (TypeError, ValueError, KeyError):
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.debug(
+            "check_pipeline_health: skipping non-contiguous alert data: %s", exc,
+        )
         return []
 
     # ── Metric 1 streak check ──
