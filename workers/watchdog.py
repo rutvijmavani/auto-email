@@ -913,16 +913,22 @@ def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
         if consumer_name.startswith("scheduler-"):
             pid_str = consumer_name.rsplit("-", 1)[-1]
             int(pid_str)  # validate
-            for hb_key in ("worker:alive:scheduler:adaptive",
-                           "worker:alive:scheduler:fullscan"):
-                raw = r.get(hb_key)
-                if raw:
-                    try:
-                        hb_pid = str(json.loads(raw).get("pid", ""))
-                        if hb_pid == pid_str:
-                            return True
-                    except Exception:
-                        pass
+            # Check only the specific loop's heartbeat key — the fullscan and
+            # adaptive loops update independent keys.  Checking both would give a
+            # false-alive result if one loop died while the other still runs.
+            _hb_key = (
+                "worker:alive:scheduler:fullscan"
+                if worker_type == "fullscan_worker"
+                else "worker:alive:scheduler:adaptive"
+            )
+            raw = r.get(_hb_key)
+            if raw:
+                try:
+                    hb_pid = str(json.loads(raw).get("pid", ""))
+                    if hb_pid == pid_str:
+                        return True
+                except Exception:
+                    pass
             return False
 
         # Standard format: "worker-{hostname}-{pid}"

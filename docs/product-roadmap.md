@@ -19,7 +19,7 @@ A **collaborative, source-of-truth job intelligence platform** where job hunters
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Adaptive scheduler | ✅ Production | Redis ZSET gap-filling, dynamic 1h–6h intervals per company |
+| Adaptive scheduler | ✅ Production | Redis ZSET gap-filling, dynamic intervals per company (3h floor, 6h active max, 12h dormant/default) |
 | scan_worker | ✅ Production | Redis Streams consumer groups |
 | detail_worker | ✅ Production | Job detail enrichment, country filtering |
 | fullscan_worker | ✅ Production | Periodic full sweep |
@@ -53,6 +53,7 @@ These stay off the table until invite-only is validated and the next problem is 
 
 Minimum privacy controls before inviting users:
 - Operator access must be authorized (i.e., only you run the admin scripts; no shared credentials)
+- Maintain an audit trail of admin script executions (log who ran what and when; store outside the database)
 - Users must consent to their email and job-tracking data being stored
 - Retention policy: define how long data is kept; delete user data on request (manual, via admin script)
 - User data export: operator can dump a user's rows on request (watchlist, statuses, outreach)
@@ -109,7 +110,7 @@ CREATE TABLE recruiters (
 CREATE TABLE user_job_status (
     user_id INT REFERENCES users(id) ON DELETE CASCADE,
     job_id INT REFERENCES jobs(id),
-    status TEXT CHECK (status IN ('seen','saved','applied','rejected','offer')),
+    status TEXT CHECK (status IN ('seen','saved','applied','interviewing','rejected','offer')),
     notes TEXT,
     applied_at TIMESTAMPTZ,
     PRIMARY KEY (user_id, job_id)
@@ -202,16 +203,11 @@ Only build this when Phase 1 is working and you feel load or coverage limits.
 Workers already scale horizontally via Redis Streams consumer groups — zero code change. Only the scheduler needs coordination:
 
 ```python
-import uuid, redis, threading
+import time, uuid, redis, threading
 
-LEADER_KEY    = "scheduler:leader"
-LEADER_TTL    = 30   # seconds — lock expiry
-RENEW_INTERVAL = 10  # seconds — heartbeat interval (< LEADER_TTL/2)
-
-token = str(uuid.uuid4())  # unique ownership token per instance
-acquired = r.set(LEADER_KEY, token, nx=True, ex=LEADER_TTL)
-if not acquired:
-    stand_by_until_leader_dies()
+LEADER_KEY     = "scheduler:leader"
+LEADER_TTL     = 30   # seconds — lock expiry
+RENEW_INTERVAL = 10   # seconds — heartbeat interval (< LEADER_TTL/2)
 
 # Renew only if we still own the lock (Lua: compare token, then expire).
 # Returns 1 on success, 0 if ownership was lost.
@@ -223,24 +219,34 @@ _RENEW_SCRIPT = r.register_script("""
     end
 """)
 
-_leader = threading.Event()
-_leader.set()  # start as leader
+def _run_as_leader(token):
+    _leader = threading.Event()
+    _leader.set()  # start as leader
 
-def _heartbeat_loop():
-    """Renew lease on an independent timer, not tied to scheduling tick duration."""
+    def _heartbeat_loop():
+        """Renew lease on an independent timer, not tied to scheduling tick duration."""
+        while _leader.is_set():
+            renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
+            if not renewed:
+                _leader.clear()  # lost leadership — signal main loop to stop
+                break
+            time.sleep(RENEW_INTERVAL)
+
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
     while _leader.is_set():
-        renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
-        if not renewed:
-            _leader.clear()  # lost leadership — signal main loop to stop
-            break
-        time.sleep(RENEW_INTERVAL)
+        run_scheduling_tick()   # may take several seconds; heartbeat runs independently
+        time.sleep(10)
+    # _leader cleared by heartbeat thread — stop scheduling immediately
 
-threading.Thread(target=_heartbeat_loop, daemon=True).start()
-
-while _leader.is_set():
-    run_scheduling_tick()   # may take several seconds; heartbeat runs independently
-    sleep(10)
-# _leader cleared by heartbeat thread — stop scheduling immediately
+# Retry acquiring the lock until this instance becomes leader.
+while True:
+    token = str(uuid.uuid4())  # fresh token each attempt
+    if r.set(LEADER_KEY, token, nx=True, ex=LEADER_TTL):
+        _run_as_leader(token)
+    else:
+        stand_by_until_leader_dies()  # block until TTL expires or leader key deleted
+    # Loop: try to acquire again after leadership ends or standby wakes
 ```
 
 If leader dies → lock expires → standby takes over. A paused former leader cannot renew leadership because the Lua script verifies the token before extending TTL.
@@ -395,7 +401,7 @@ def _ssrf_check(url: str) -> None:
             results = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
             addrs   = [ipaddress.ip_address(r[4][0]) for r in results]
         except (socket.gaierror, ValueError):
-            return  # unresolvable; the request will fail naturally
+            raise ValueError(f"detect_ats: blocked unresolvable hostname {hostname!r}")
     for ip in addrs:
         # Reject anything that isn't a globally-routable unicast address.
         # This covers private, loopback, link-local, multicast, reserved, and

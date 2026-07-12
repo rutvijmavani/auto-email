@@ -281,8 +281,9 @@ consumers were incorrectly reported as DEAD in the PEL health check.
 **Root cause:** The heartbeat key lookup was being done with the wrong key name; the function
 also needed to parse PID from the consumer name and match it against the heartbeat JSON payload.  
 **Fix:** Added a `scheduler-` prefix branch that extracts the PID suffix from the consumer
-name and checks whether either `worker:alive:scheduler:adaptive` or
-`worker:alive:scheduler:fullscan` contains a matching `"pid"` field.  
+name and checks the specific loop's heartbeat key (`worker:alive:scheduler:fullscan` for
+`fullscan_worker`, `worker:alive:scheduler:adaptive` otherwise) for a matching `"pid"`.
+Checking both keys would give a false-alive result if one loop died while the other ran.  
 **Tests added:** 3 new test methods in `TestCheckPelHealthPID`
 (`test_scheduler_consumer_alive_same_pid_is_ok`,
 `test_scheduler_consumer_dead_different_pid_is_error`,
