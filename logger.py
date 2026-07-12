@@ -231,7 +231,11 @@ def init_logging(command: str = "pipeline") -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # Run cleanup before configuring handlers so the stats can be logged below.
+    # Stamp _last_log_cleanup so cleanup_logs_if_due() treats this as the last
+    # run and waits a full 24h before triggering again.
+    global _last_log_cleanup
     _deleted, _errors = _cleanup_old_logs()
+    _last_log_cleanup = time.time()
 
     root = logging.getLogger()
     root.setLevel(LOG_LEVEL)

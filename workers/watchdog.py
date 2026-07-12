@@ -1724,12 +1724,42 @@ def _kill_ghost_workers(r) -> None:
 
     killed: list[int] = []
     for pid in ghosts:
+        # Revalidate immediately before SIGTERM — the process may have exited or
+        # been adopted by the scheduler between the ghost scan and now.
+        try:
+            _pre_cmdline = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+            if not any(pat in _pre_cmdline for pat in _GHOST_WORKER_PATTERNS):
+                logger.debug(
+                    "watchdog: PID %d cmdline changed before SIGTERM — skipping (PID may have been reused): %r",
+                    pid, _pre_cmdline[:120],
+                )
+                continue
+            _pre_status = Path(f"/proc/{pid}/status").read_text()
+            _pre_ppid   = int(
+                next(
+                    line for line in _pre_status.splitlines()
+                    if line.startswith("PPid:")
+                ).split()[1]
+            )
+            if _pre_ppid == scheduler_pid:
+                logger.debug(
+                    "watchdog: PID %d was adopted by scheduler before SIGTERM — skipping",
+                    pid,
+                )
+                continue
+        except (FileNotFoundError, StopIteration, ValueError):
+            continue  # Process exited between scan and revalidation
         try:
             os.kill(pid, _signal.SIGTERM)
             killed.append(pid)
             logger.info("watchdog: SIGTERM → ghost PID %d", pid)
         except ProcessLookupError:
-            pass  # Already dead between scan and kill
+            pass  # Already dead between revalidation and kill
         except PermissionError:
             logger.warning("watchdog: no permission to kill ghost PID %d", pid)
 

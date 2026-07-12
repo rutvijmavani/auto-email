@@ -389,25 +389,24 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                     if next_ts > now:
                         continue  # fullscan already scheduled in the future
 
-                # Also check the live Redis ZSET — the DB row may not yet reflect
-                # a fullscan scheduled by another monitor pass or the scheduler.
-                # ZSCORE returns the epoch timestamp the scan is scheduled for.
-                existing_score = r.zscore(REDIS_POLL_FULLSCAN, company)
-                if existing_score is not None and existing_score > now:
-                    logger.debug(
-                        "monitor: skipping missed-fullscan queue for %r — already in poll:fullscan at %.0f",
-                        company, existing_score,
-                    )
-                    continue
-
                 avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
-                _atomic_schedule(
+                # skip_if_future=True atomically checks the ZSET under the
+                # scheduling lock — eliminates the race between a pre-lock zscore
+                # check and the eventual ZADD. Returns None when skipped.
+                _sched_ts = _atomic_schedule(
                     r, REDIS_POLL_FULLSCAN, company,
                     now + SCHEDULER_FULL_SCAN_BUFFER_S,
                     SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
                     deadline_ts    = _next_digest_deadline(now),
                     avg_duration_s = avg_duration,
+                    skip_if_future = True,
                 )
+                if _sched_ts is None:
+                    logger.debug(
+                        "monitor: %r already in poll:fullscan — skipping",
+                        company,
+                    )
+                    continue
                 queued += 1
                 logger.info(
                     "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
@@ -915,8 +914,20 @@ def _process_company(company_row, position, total):
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except IncompleteSearchError as exc:
             # Avature SearchJobs pagination cut short (deadline or fetch failure).
-            # Use partial stubs but skip absence tracking — the result set is
-            # incomplete and marking unseen jobs as missing would be incorrect.
+            # Empty stubs means the very first page fetch failed — treat as a hard
+            # fetch failure rather than a zero-job scan so last_checked_at is not
+            # updated and the company remains eligible for the next scan cycle.
+            if not exc.stubs:
+                logger.error(
+                    "avature [%s]: IncompleteSearchError with 0 stubs — treating as fetch failure",
+                    company,
+                )
+                result["failed"]       = 1
+                result["failure_name"] = company
+                return result
+            # Partial stubs: use what was collected but skip absence tracking —
+            # the result set is incomplete and marking unseen jobs as missing
+            # would be incorrect.
             raw_jobs       = exc.stubs
             _scan_complete = False
             logger.warning(
@@ -1070,10 +1081,18 @@ def _process_company(company_row, position, total):
         elif platform == "workday":
             # _should_fetch_detail returned False (missing _external_path or wd keys).
             # Apply listing-level location fallback so non-US jobs are not leaked.
-            if not is_us_location(job.get("location", "")):
+            # Empty location: cannot determine US without detail — skip to avoid leaking.
+            _loc = (job.get("location") or "").strip()
+            if not _loc:
+                logger.debug(
+                    "Workday no-detail job skipped (empty location — cannot verify US): %r | %s",
+                    company, job.get("title"),
+                )
+                continue
+            if not is_us_location(_loc):
                 logger.debug(
                     "Workday non-US dropped (no-detail listing fallback): %r | %s | %s",
-                    company, job.get("title"), job.get("location"),
+                    company, job.get("title"), _loc,
                 )
                 continue
 

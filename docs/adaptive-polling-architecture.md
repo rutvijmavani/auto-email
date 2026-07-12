@@ -362,10 +362,8 @@ Full scan dispatcher (runs every 5 seconds):
            continue  ← re-queue and skip
          ZADD inflight:fullscans:{dc_key} {now} {company}  ← claim slot atomically
        XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * {company, dc_key, triggered_at}
-         ⚠ Slot claim (ZADD above) and XADD are not atomic. If XADD fails the
-           reserved slot stays in inflight:fullscans until the 2h stale window prunes it.
-           To fix fully: move XADD into the Lua script (requires Redis 7+) or
-           ZREM the slot in an XADD error handler.
+         On XADD failure: ZREM inflight:fullscans:{dc_key} {company}  ← release claimed slot
+           and ZADD poll:fullscan {company: now+60}  ← reschedule; prevents slot leak
        ZREM poll:fullscan {company}
 
 Full scan workers (one pool per dc_key):
@@ -751,7 +749,11 @@ Three cases trigger (re)scheduling: `next_full_scan_at` is NULL (never scheduled
 plus average scan duration would miss the 7 AM digest deadline.
 
 Because fullscan requires a prior adaptive completion (Path 2 only fires inside
-`on_adaptive_complete`), the adaptive-first rule is enforced by design.
+`on_adaptive_complete`), the adaptive-first rule is enforced by design for the normal
+scan cycle. **Exception — Path 3 safety net:** `_queue_fullscans_for_missed()` in
+`job_monitor.py` (Path 3) can schedule a fullscan after a listing-scan fallback even
+when no adaptive completion has occurred, to catch companies whose fullscan window
+would otherwise be missed entirely.
 
 **Rule 5 — Pre-7 AM full scan trigger (crossing-day boundary)**
 When `on_adaptive_complete()` reschedules the next adaptive poll to *tomorrow* (crossing the 7 AM boundary), the full scan for the current cycle may not have run yet. If sufficient time remains tonight, trigger the full scan now rather than leaving it undone until tomorrow's cycle.

@@ -998,20 +998,33 @@ def _atomic_schedule(
     interval_s:    float,
     tolerance_pct: float,
     *,
-    deadline_ts:    Optional[float] = None,
-    avg_duration_s: float           = 1800.0,
-) -> float:
+    deadline_ts:     Optional[float] = None,
+    avg_duration_s:  float           = 1800.0,
+    skip_if_future:  bool            = False,
+) -> Optional[float]:
     """
     Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
     short-lived Redis lock so concurrent processes cannot select the same gap.
 
-    Returns the scheduled Unix timestamp.
+    If skip_if_future=True, the ZADD is skipped (under the lock) when the company
+    already has a valid future score in queue_key, preventing a race between a
+    pre-lock zscore check and the eventual ZADD.
+
+    Returns the scheduled Unix timestamp, or None when skip_if_future suppressed the ZADD.
     """
     lock_key = f"scheduling:lock:{queue_key}"
     token    = f"{os.getpid()}:{time.monotonic_ns()}"
     acquired = r.set(lock_key, token, px=2000, nx=True)
     try:
         if acquired:
+            if skip_if_future:
+                _existing = r.zscore(queue_key, company)
+                if _existing is not None and float(_existing) > time.time():
+                    logger.debug(
+                        "_atomic_schedule: %r already in %r at %.0f — skip_if_future suppressed ZADD",
+                        company, queue_key, float(_existing),
+                    )
+                    return None
             score = _pick_schedule_time(
                 target_ts      = target_ts,
                 queue_key      = queue_key,
