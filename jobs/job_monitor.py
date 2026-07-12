@@ -49,7 +49,7 @@ from db.db import (
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats, get_ats_module,
 )
-from jobs.ats.registry import get_config
+from jobs.ats.registry import get_config, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
@@ -149,42 +149,6 @@ def _parse_slug(platform, slug, config):
         return defaults.get(platform, {})
 
 
-def _should_fetch_detail(job, platform, config, slug_info=None):
-    """
-    Return True if fetch_job_detail() should be called for this job.
-
-    Checks the registry has_detail flag and platform-specific preconditions
-    (the job dict must contain the key the detail fetcher needs).
-    """
-    if not config.get("has_detail"):
-        return False
-    # Platforms that require a specific key in the job dict
-    required_keys = {
-        "icims":           "_base_url",
-        "jobvite":         "_slug",
-        "taleo":           "_contest_no",
-        "smartrecruiters": "_company_slug",
-    }
-    key = required_keys.get(platform)
-    if key is not None:
-        return bool(job.get(key))
-    if platform == "workday":
-        return bool(
-            job.get("_external_path")
-            and job.get("_slug")
-            and job.get("_wd")
-            and job.get("_path")
-        )
-    # sitemap: skip XML feeds (they already have all data in the feed)
-    if platform == "sitemap":
-        return bool(job.get("job_url")) and job.get("_feed_type") != "xml"
-    # custom: only if detail config exists AND listing didn't already fill description
-    if platform == "custom":
-        return bool(
-            slug_info and slug_info.get("detail") and not job.get("description")
-        )
-    # Default: fetch detail if a job URL is available
-    return bool(job.get("job_url"))
 
 
 # ─────────────────────────────────────────
@@ -1032,7 +996,7 @@ def _process_company(company_row, position, total):
         #           → stored as _country_code by fetch_job_detail(); definitive.
         #   Tier 3: is_us_location() on descriptor-embedded location string
         #           → fallback when alpha2Code absent (older/custom tenants).
-        if platform == "workday" and _should_fetch_detail(job, platform, config, slug_info):
+        if platform == "workday" and should_fetch_detail(job, platform, config, slug_info):
             _snap_cc  = job.get("_country_code", "")
             _snap_loc = job.get("location", "")
             with sem:
@@ -1079,7 +1043,7 @@ def _process_company(company_row, position, total):
                     continue
 
         elif platform == "workday":
-            # _should_fetch_detail returned False (missing _external_path or wd keys).
+            # should_fetch_detail returned False (missing _external_path or wd keys).
             # Apply listing-level location fallback so non-US jobs are not leaked.
             if not is_us_location(job.get("location", "")):
                 logger.debug(
@@ -1112,12 +1076,12 @@ def _process_company(company_row, position, total):
             continue
 
         # ── Detail fetch for new jobs ─────────────────────────────────────────
-        # Registry has_detail + _should_fetch_detail() drive when to fetch.
+        # Registry has_detail + should_fetch_detail() drive when to fetch.
         # Each call re-acquires the semaphore to throttle detail HTTP requests.
         # Workday excluded — detail was fetched in the early-fetch path above.
         # Custom uses a different signature (passes slug_info_cached).
         if platform == "custom":
-            if _should_fetch_detail(job, platform, config, slug_info_cached):
+            if should_fetch_detail(job, platform, config, slug_info_cached):
                 with sem:
                     try:
                         job = ats_module.fetch_job_detail(job, slug_info_cached)
@@ -1131,7 +1095,7 @@ def _process_company(company_row, position, total):
                             "Custom fetch_job_detail failed %s/%s: %s",
                             company, job.get("job_id"), e, exc_info=True,
                         )
-        elif platform != "workday" and _should_fetch_detail(job, platform, config):
+        elif platform != "workday" and should_fetch_detail(job, platform, config):
             with sem:
                 try:
                     job = ats_module.fetch_job_detail(job)

@@ -54,6 +54,7 @@ DATE_FORMATS   = ["%d-%b-%Y", "%Y-%m-%d", "%B %d, %Y", "%b %d, %Y"]
 # (e.g. Siemens: sitemap.xml contains only platform pages, no /JobDetail/ URLs)
 _SEARCH_PAGE_SIZE    = 12
 _SEARCH_MAX_PAGES    = 2000  # safety cap; 2000 × 12 = 24 000 jobs max per run
+_SEARCH_DEADLINE_S   = 1800  # 30-min wall-clock cap; prevents holding semaphore for tens of minutes
 
 
 class IncompleteSearchError(Exception):
@@ -323,10 +324,19 @@ def _fetch_via_search(slug_info, company):
     if not base:
         return []
 
-    all_urls = []
-    seen_ids = set()
+    all_urls  = []
+    seen_ids  = set()
+    _deadline = time.time() + _SEARCH_DEADLINE_S
 
     for page in range(_SEARCH_MAX_PAGES):
+        if time.time() >= _deadline:
+            logger.warning(
+                "avature [%s]: SearchJobs hit _SEARCH_DEADLINE_S=%ds after %d page(s) — treating as incomplete",
+                company, _SEARCH_DEADLINE_S, page,
+            )
+            stubs = _urls_to_stubs(all_urls, slug_info, company)
+            raise IncompleteSearchError(stubs)
+
         offset = page * _SEARCH_PAGE_SIZE
         url    = f"{base}/{path}/SearchJobs/?jobOffset={offset}&jobRecordsPerPage={_SEARCH_PAGE_SIZE}"
         resp   = fetch_html(url, platform="avature")

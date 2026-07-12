@@ -91,7 +91,7 @@ CREATE TABLE users (
 );
 
 CREATE TABLE user_watchlist (
-    user_id INT REFERENCES users(id),
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     company_id INT REFERENCES companies(id),
     PRIMARY KEY (user_id, company_id)
 );
@@ -103,11 +103,11 @@ CREATE TABLE recruiters (
     email TEXT,
     title TEXT,
     linkedin_url TEXT,
-    added_by INT REFERENCES users(id)
+    added_by INT REFERENCES users(id) ON DELETE SET NULL  -- attribution; nullable
 );
 
 CREATE TABLE user_job_status (
-    user_id INT REFERENCES users(id),
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     job_id INT REFERENCES jobs(id),
     status TEXT CHECK (status IN ('seen','saved','applied','rejected','offer')),
     notes TEXT,
@@ -117,7 +117,7 @@ CREATE TABLE user_job_status (
 
 CREATE TABLE user_outreach (
     id SERIAL PRIMARY KEY,
-    user_id INT REFERENCES users(id),
+    user_id INT REFERENCES users(id) ON DELETE CASCADE,
     recruiter_id INT REFERENCES recruiters(id),
     contacted_at TIMESTAMPTZ,
     response_at TIMESTAMPTZ,
@@ -125,7 +125,7 @@ CREATE TABLE user_outreach (
 );
 ```
 
-Add `verified BOOLEAN DEFAULT FALSE` and `added_by INT REFERENCES users(id)` to the existing `companies` table. Crowd-sourced submissions start unverified.
+Add `verified BOOLEAN DEFAULT FALSE` and `added_by INT REFERENCES users(id) ON DELETE SET NULL` (nullable attribution) to the existing `companies` table. Crowd-sourced submissions start unverified.
 
 **Key design principle:** Jobs are non-rivalrous. If 3 users watch Google, scan Google once → all 3 see the results. Scheduler computes `UNION of all users' watchlists` = companies to scan.
 
@@ -202,17 +202,19 @@ Only build this when Phase 1 is working and you feel load or coverage limits.
 Workers already scale horizontally via Redis Streams consumer groups — zero code change. Only the scheduler needs coordination:
 
 ```python
-import uuid, redis
+import uuid, redis, threading
 
-LEADER_KEY = "scheduler:leader"
-LEADER_TTL = 30  # seconds
+LEADER_KEY    = "scheduler:leader"
+LEADER_TTL    = 30   # seconds — lock expiry
+RENEW_INTERVAL = 10  # seconds — heartbeat interval (< LEADER_TTL/2)
 
 token = str(uuid.uuid4())  # unique ownership token per instance
 acquired = r.set(LEADER_KEY, token, nx=True, ex=LEADER_TTL)
 if not acquired:
     stand_by_until_leader_dies()
 
-# Renew only if we still own the lock (Lua: compare token, then expire)
+# Renew only if we still own the lock (Lua: compare token, then expire).
+# Returns 1 on success, 0 if ownership was lost.
 _RENEW_SCRIPT = r.register_script("""
     if redis.call("get", KEYS[1]) == ARGV[1] then
         return redis.call("expire", KEYS[1], ARGV[2])
@@ -221,12 +223,24 @@ _RENEW_SCRIPT = r.register_script("""
     end
 """)
 
-while True:
-    renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
-    if not renewed:
-        break  # another instance took over — stop and exit
-    run_scheduling_tick()
+_leader = threading.Event()
+_leader.set()  # start as leader
+
+def _heartbeat_loop():
+    """Renew lease on an independent timer, not tied to scheduling tick duration."""
+    while _leader.is_set():
+        renewed = _RENEW_SCRIPT(keys=[LEADER_KEY], args=[token, LEADER_TTL])
+        if not renewed:
+            _leader.clear()  # lost leadership — signal main loop to stop
+            break
+        time.sleep(RENEW_INTERVAL)
+
+threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
+while _leader.is_set():
+    run_scheduling_tick()   # may take several seconds; heartbeat runs independently
     sleep(10)
+# _leader cleared by heartbeat thread — stop scheduling immediately
 ```
 
 If leader dies → lock expires → standby takes over. A paused former leader cannot renew leadership because the Lua script verifies the token before extending TTL.
@@ -362,7 +376,7 @@ _METADATA_NETS = [
 
 def _ssrf_check(url: str) -> None:
     """
-    Raise ValueError if url targets a private/loopback/link-local/metadata address.
+    Raise ValueError if url targets any non-globally-routable address.
     Resolves ALL addresses returned by getaddrinfo (not just the first) so a host
     with a mix of public and private records is rejected. Does not prevent
     DNS-rebinding between this check and the actual TCP connection — pin the
@@ -383,10 +397,11 @@ def _ssrf_check(url: str) -> None:
         except (socket.gaierror, ValueError):
             return  # unresolvable; the request will fail naturally
     for ip in addrs:
-        if ip.is_private or ip.is_loopback or ip.is_link_local:
-            raise ValueError(f"detect_ats: blocked address {ip} for {hostname!r}")
-        if any(ip in net for net in _METADATA_NETS):
-            raise ValueError(f"detect_ats: metadata IP blocked: {ip}")
+        # Reject anything that isn't a globally-routable unicast address.
+        # This covers private, loopback, link-local, multicast, reserved, and
+        # metadata addresses (e.g. 169.254.169.254, fd00:ec2::254) in one check.
+        if not ip.is_global:
+            raise ValueError(f"detect_ats: blocked non-global address {ip} for {hostname!r}")
 
 def _read_body(resp, limit: int = _MAX_BODY_BYTES) -> str:
     """Read up to `limit` bytes from a response, closing it when done."""

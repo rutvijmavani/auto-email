@@ -1036,6 +1036,15 @@ def _atomic_schedule(
             )
             score = max(score, time.time())  # never insert a past-due ZADD score
         else:
+            # Lock contended — check skip_if_future before falling through to jitter.
+            if skip_if_future:
+                _existing_c = r.zscore(queue_key, company)
+                if _existing_c is not None and float(_existing_c) > time.time():
+                    logger.debug(
+                        "_atomic_schedule: %r already in %r at %.0f — skip_if_future suppressed ZADD (lock-contended path)",
+                        company, queue_key, float(_existing_c),
+                    )
+                    return None
             # Another process is scheduling — apply a deterministic per-company
             # offset so concurrent callers don't all land on the same timestamp
             # (thundering herd).  Use a hash of the company string to produce a
@@ -1502,8 +1511,11 @@ def fullscan_loop() -> None:
                                 f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
                                 company,
                             )
-                        except Exception:
-                            pass
+                        except Exception as _zrem_exc:
+                            logger.debug(
+                                "fullscan_loop: ZREM inflight slot failed for %r (dc=%s): %s — slot will expire via stale window",
+                                company, dc_key, _zrem_exc,
+                            )
                     logger.error(
                         "fullscan_loop: XADD failed for %r (dc=%s): %s — rescheduling",
                         company, dc_key, _xadd_exc,
@@ -2765,7 +2777,7 @@ def _slow_throughput_check_loop() -> None:
                             ),
                         )
                         _hysteresis["fullscan_add"] = 0
-            elif _fullscan_xlen == 0 and n_fullscan > WORKER_FLOOR:
+            elif fullscan_stream_depth == 0 and n_fullscan > WORKER_FLOOR:
                 _hysteresis["fullscan_remove"] += 1
                 _hysteresis["fullscan_add"]     = 0
 

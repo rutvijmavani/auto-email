@@ -301,10 +301,15 @@ def init_logging(command: str = "pipeline") -> None:
     if command_file != pipeline_file:
         root.addHandler(file_handler)
 
-    catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
-    catchall.setLevel(LOG_LEVEL)
-    catchall.setFormatter(formatter)
-    root.addHandler(catchall)
+    # Scheduler runs for days and uses a TimedRotatingFileHandler that already
+    # captures everything.  Attaching a plain FileHandler for pipeline_<date>.log
+    # would cause it to grow indefinitely (never rotated).  Skip the catch-all
+    # for scheduler so output goes only through the rotating scheduler.log.
+    if command != "scheduler":
+        catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
+        catchall.setLevel(LOG_LEVEL)
+        catchall.setFormatter(formatter)
+        root.addHandler(catchall)
 
     # ── 4. Silence noisy third-party loggers ───────────────────────
     # These would flood DEBUG output with HTTP wire traces.
