@@ -226,13 +226,20 @@ def run_health_check() -> int:
     else:
         _dotenv_failed = False
         try:
-            from pathlib import Path as _Path
             from dotenv import load_dotenv as _load_dotenv
-            _load_dotenv(_Path(_ROOT) / ".env")
-        except Exception as _dotenv_err:
-            print(f"  [WARNING] health_check: .env load failed: {_dotenv_err}", flush=True)
+        except ImportError:
+            print("  [WARNING] health_check: python-dotenv not installed — .env not loaded", flush=True)
             _dotenv_failed = True
             warnings += 1
+            _load_dotenv = None
+        if _load_dotenv is not None:
+            try:
+                from pathlib import Path as _Path
+                _load_dotenv(_Path(_ROOT) / ".env")
+            except Exception as _dotenv_err:
+                print(f"  [WARNING] health_check: .env load failed: {_dotenv_err}", flush=True)
+                _dotenv_failed = True
+                warnings += 1
         _dsn = os.environ.get("SENTRY_DSN", "").strip()
 
         if not _dsn:

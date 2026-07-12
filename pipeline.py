@@ -912,6 +912,13 @@ def main():
 
     args = sys.argv[1:]
 
+    # Initialize scheduler logging before validate_startup so that startup
+    # warnings (Sentry init, startup checks) go to scheduler.log, not the
+    # default pipeline log.
+    if "--scheduler" in args:
+        from logger import init_logging
+        init_logging("scheduler")
+
     # Only --monitor-jobs / --monitor-status actively query Redis worker state;
     # --detect-ats is DB + web scraping only, no Redis reads.
     _REDIS_CMDS = {"--monitor-jobs", "--monitor-status", "--scheduler"}
@@ -1066,9 +1073,7 @@ def main():
         return
 
     if "--scheduler" in args:
-        from logger import init_logging
         from workers.scheduler import run_scheduler
-        init_logging("scheduler")
         run_scheduler(skip_rebuild="--skip-rebuild" in args)
         return
 

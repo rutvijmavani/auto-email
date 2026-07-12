@@ -213,7 +213,7 @@ if not acquired:
     stand_by_until_leader_dies()
 
 # Renew only if we still own the lock (Lua: compare token, then expire)
-_RENEW_SCRIPT = redis.client.Script(r, """
+_RENEW_SCRIPT = r.register_script("""
     if redis.call("get", KEYS[1]) == ARGV[1] then
         return redis.call("expire", KEYS[1], ARGV[2])
     else

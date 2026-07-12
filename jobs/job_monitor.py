@@ -389,6 +389,17 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                     if next_ts > now:
                         continue  # fullscan already scheduled in the future
 
+                # Also check the live Redis ZSET — the DB row may not yet reflect
+                # a fullscan scheduled by another monitor pass or the scheduler.
+                # ZSCORE returns the epoch timestamp the scan is scheduled for.
+                existing_score = r.zscore(REDIS_POLL_FULLSCAN, company)
+                if existing_score is not None and existing_score > now:
+                    logger.debug(
+                        "monitor: skipping missed-fullscan queue for %r — already in poll:fullscan at %.0f",
+                        company, existing_score,
+                    )
+                    continue
+
                 avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
                 _atomic_schedule(
                     r, REDIS_POLL_FULLSCAN, company,

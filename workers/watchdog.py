@@ -1669,6 +1669,13 @@ def _kill_ghost_workers(r) -> None:
     Action: SIGTERM → 10s grace period → SIGKILL any survivors.
     Sends one alert email per kill batch (Redis-deduped, 1h cooldown).
     Skipped entirely when the scheduler PID is unknown (avoids false kills).
+
+    ⚠  On systemd-managed hosts this will also terminate matching worker
+    processes started manually for debugging (e.g. `python -m workers.scan_worker`)
+    if they are not children of the scheduler PID.  Before running debug workers
+    alongside a live scheduler, either start them as children of the scheduler
+    (via `--spawn-worker` if available) or temporarily set `self_heal=False` in
+    the watchdog config to suppress ghost-worker detection.
     """
     import signal as _signal
 
