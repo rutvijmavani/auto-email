@@ -1081,18 +1081,10 @@ def _process_company(company_row, position, total):
         elif platform == "workday":
             # _should_fetch_detail returned False (missing _external_path or wd keys).
             # Apply listing-level location fallback so non-US jobs are not leaked.
-            # Empty location: cannot determine US without detail — skip to avoid leaking.
-            _loc = (job.get("location") or "").strip()
-            if not _loc:
-                logger.debug(
-                    "Workday no-detail job skipped (empty location — cannot verify US): %r | %s",
-                    company, job.get("title"),
-                )
-                continue
-            if not is_us_location(_loc):
+            if not is_us_location(job.get("location", "")):
                 logger.debug(
                     "Workday non-US dropped (no-detail listing fallback): %r | %s | %s",
-                    company, job.get("title"), _loc,
+                    company, job.get("title"), job.get("location"),
                 )
                 continue
 
