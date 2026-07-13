@@ -1752,10 +1752,17 @@ def _scrape_html_listing(soup):
         seen_hrefs.add(href)
 
         # Build minimal job dict
+        jid = _extract_id_from_path(href)
+        if not jid:
+            qs = parse_qs(urlparse(href).query)
+            for _k in ("jobId", "req_id", "jobID", "job_id", "jobid", "id"):
+                if _k in qs:
+                    jid = qs[_k][0]
+                    break
         job = {
             "title":   title,
-            "job_url": href if href.startswith("http") else "",
-            "job_id":  _extract_id_from_path(href),
+            "job_url": href,
+            "job_id":  jid,
             "location": "",
         }
 
