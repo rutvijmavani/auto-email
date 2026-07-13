@@ -49,7 +49,8 @@ from db.db import (
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats, get_ats_module,
 )
-from jobs.ats.registry import get_config
+from jobs.ats.registry import get_config, should_fetch_detail
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
@@ -64,8 +65,10 @@ from config import (
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
     INFLIGHT_FULLSCAN_STALE_S,
+    REDIS_POLL_FULLSCAN,
+    SCHEDULER_FULL_SCAN_BUFFER_S,
+    SCHEDULER_FULL_SCAN_INTERVAL_S,
 )
-
 logger = get_logger(__name__)
 
 
@@ -146,36 +149,6 @@ def _parse_slug(platform, slug, config):
         return defaults.get(platform, {})
 
 
-def _should_fetch_detail(job, platform, config, slug_info=None):
-    """
-    Return True if fetch_job_detail() should be called for this job.
-
-    Checks the registry has_detail flag and platform-specific preconditions
-    (the job dict must contain the key the detail fetcher needs).
-    """
-    if not config.get("has_detail"):
-        return False
-    # Platforms that require a specific key in the job dict
-    required_keys = {
-        "icims":           "_base_url",
-        "jobvite":         "_slug",
-        "taleo":           "_contest_no",
-        "smartrecruiters": "_company_slug",
-        "workday":         "_external_path",
-    }
-    key = required_keys.get(platform)
-    if key is not None:
-        return bool(job.get(key))
-    # sitemap: skip XML feeds (they already have all data in the feed)
-    if platform == "sitemap":
-        return bool(job.get("job_url")) and job.get("_feed_type") != "xml"
-    # custom: only if detail config exists AND listing didn't already fill description
-    if platform == "custom":
-        return bool(
-            slug_info and slug_info.get("detail") and not job.get("description")
-        )
-    # Default: fetch detail if a job URL is available
-    return bool(job.get("job_url"))
 
 
 # ─────────────────────────────────────────
@@ -315,6 +288,107 @@ def _get_worker_missed_companies(companies: list) -> tuple:
     return missed, in_flight_names
 
 
+def _queue_fullscans_for_missed(missed: list) -> None:
+    """
+    After the monitor's listing fallback, queue a fullscan for each missed
+    company whose next_full_scan_at is NULL or already past.
+
+    The listing fallback covers new job discovery for today's digest, but only
+    a fullscan updates last_full_scan_at and handles expiration tracking.
+    Without this, a persistently missed company gets listing fallbacks forever
+    and never receives another fullscan.
+    """
+    if not missed:
+        return
+
+    from db.db import get_conn
+    import redis as _redis_lib
+    from config import REDIS_URL
+    from workers.scheduler import _atomic_schedule, _next_digest_deadline
+
+    company_names = [c["company"] for c in missed]
+    now = time.time()
+
+    try:
+        conn = get_conn()
+        try:
+            rows = conn.execute("""
+                SELECT company, next_full_scan_at, avg_fullscan_duration_s
+                FROM company_poll_stats
+                WHERE company = ANY(%s)
+            """, (company_names,)).fetchall()
+        finally:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.warning("_queue_fullscans_for_missed: DB query failed (%s) — skipping fullscan queuing", exc)
+        return
+
+    scan_map = {r["company"]: r for r in rows}
+
+    try:
+        r = _redis_lib.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=3)
+    except Exception as exc:
+        logger.warning("_queue_fullscans_for_missed: Redis connect failed (%s) — skipping fullscan queuing", exc)
+        return
+
+    try:
+        queued = 0
+        for company_row in missed:
+            try:
+                company   = company_row["company"]
+                stats_row = scan_map.get(company)
+                if stats_row is None:
+                    continue
+
+                next_scan = stats_row["next_full_scan_at"]
+                if next_scan is not None:
+                    next_ts = (
+                        next_scan.timestamp()
+                        if hasattr(next_scan, "timestamp")
+                        else float(next_scan)
+                    )
+                    if next_ts > now:
+                        continue  # fullscan already scheduled in the future
+
+                avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
+                # skip_if_future=True atomically checks the ZSET under the
+                # scheduling lock — eliminates the race between a pre-lock zscore
+                # check and the eventual ZADD. Returns None when skipped.
+                _sched_ts = _atomic_schedule(
+                    r, REDIS_POLL_FULLSCAN, company,
+                    now + SCHEDULER_FULL_SCAN_BUFFER_S,
+                    SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+                    deadline_ts    = _next_digest_deadline(now),
+                    avg_duration_s = avg_duration,
+                    skip_if_future = True,
+                )
+                if _sched_ts is None:
+                    logger.debug(
+                        "monitor: %r already in poll:fullscan — skipping",
+                        company,
+                    )
+                    continue
+                queued += 1
+                logger.info(
+                    "monitor: fullscan queued for missed company %r (next_full_scan_at=%s)",
+                    company, next_scan,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "monitor: failed to queue fullscan for company %r: %s",
+                    company_row.get("company", "?"), exc,
+                )
+                continue
+
+        if queued:
+            logger.info("monitor: queued fullscans for %d/%d missed companies", queued, len(missed))
+    finally:
+        r.close()
+
+
 def run():
     """
     Main entry point for --monitor-jobs.
@@ -433,6 +507,12 @@ def run():
                     }
 
                 _merge_company_stats(stats, stats_lock, company_stats)
+
+        # Queue a fullscan for each missed company whose next_full_scan_at
+        # is NULL or already past — the listing fallback only covers new job
+        # discovery; the fullscan handles expiration tracking and updates
+        # last_full_scan_at so the company isn't "missed" indefinitely.
+        _queue_fullscans_for_missed(missed)
     else:
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
@@ -785,6 +865,7 @@ def _process_company(company_row, position, total):
 
     with sem:
         # ── Fetch jobs ────────────────────────────────────
+        _scan_complete = True
         try:
             slug_info = _parse_slug(platform, slug, config)
             # custom: validate that the slug parsed to a usable dict
@@ -795,6 +876,32 @@ def _process_company(company_row, position, total):
                 return result
             logger.debug("%s fetch: %r slug=%s", platform, company, slug_info)
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            # Avature SearchJobs pagination cut short (deadline or fetch failure).
+            # Empty stubs means the very first page fetch failed — treat as a hard
+            # fetch failure rather than a zero-job scan so last_checked_at is not
+            # updated and the company remains eligible for the next scan cycle.
+            if not exc.stubs:
+                logger.error(
+                    "avature [%s]: IncompleteSearchError with 0 stubs — treating as fetch failure",
+                    company,
+                )
+                result["failed"]       = 1
+                result["failure_name"] = company
+                return result
+            # Partial stubs: use what was collected but skip absence tracking —
+            # the result set is incomplete and marking unseen jobs as missing
+            # would be incorrect.  Mark failed for alerting so the pipeline
+            # knows the scan did not complete, while still processing the stubs.
+            raw_jobs                 = exc.stubs
+            _scan_complete           = False
+            result["failed"]         = 1
+            result["failure_name"]   = company
+            logger.warning(
+                "avature [%s]: incomplete SearchJobs scan (%d stub(s)) — "
+                "absence tracking skipped",
+                company, len(raw_jobs),
+            )
         except Exception as e:
             logger.error("API fetch failed for %r (platform=%s): %s",
                          company, platform, e, exc_info=True)
@@ -823,14 +930,14 @@ def _process_company(company_row, position, total):
     fetched_urls = {job["job_url"] for job in raw_jobs}
     tracked      = get_tracked_urls_for_company(company)
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
-    missing_ids  = [tracked[url] for url in tracked
-                    if url not in fetched_urls]
     if present_ids:
         reset_missing_days(present_ids)
-    if missing_ids:
-        increment_missing_days(missing_ids)
-        logger.debug("Missing from scan: %d jobs for %r",
-                     len(missing_ids), company)
+    if _scan_complete:
+        missing_ids = [tracked[url] for url in tracked if url not in fetched_urls]
+        if missing_ids:
+            increment_missing_days(missing_ids)
+            logger.debug("Missing from scan: %d jobs for %r",
+                         len(missing_ids), company)
 
     if not raw_jobs:
         logger.info("No jobs returned for %r", company)
@@ -892,15 +999,18 @@ def _process_company(company_row, position, total):
         #           → stored as _country_code by fetch_job_detail(); definitive.
         #   Tier 3: is_us_location() on descriptor-embedded location string
         #           → fallback when alpha2Code absent (older/custom tenants).
-        if platform == "workday" and job.get("_external_path"):
+        if platform == "workday" and should_fetch_detail(job, platform, config, slug_info):
+            _snap_cc  = job.get("_country_code", "")
+            _snap_loc = job.get("location", "")
             with sem:
                 try:
                     job = ats_module.fetch_job_detail(job)
                 except Exception as e:
                     logger.error(
-                        "Workday fetch_job_detail failed %s/%s: %s",
+                        "Workday fetch_job_detail failed %s/%s: %s — skipping",
                         company, job.get("job_id"), e, exc_info=True,
                     )
+                    continue
             alpha2 = (job.get("_country_code") or "").upper()
             if alpha2:
                 # Tier 1: structured alpha-2 code — no text parsing needed
@@ -917,6 +1027,37 @@ def _process_company(company_row, position, total):
                     company, job.get("title"), job.get("location"),
                 )
                 continue
+            else:
+                # is_us_location returned True but alpha2 is absent.
+                # If detail fetch produced no new data (guard fired or API blank),
+                # the listing-level location alone is not trustworthy — skip rather
+                # than risk leaking a non-US job (e.g. empty locationsText or an
+                # ambiguous city name like "Glasgow Campus" matching Glasgow, KY).
+                _enriched = (
+                    job.get("_country_code", "") != _snap_cc
+                    or job.get("location", "") != _snap_loc
+                )
+                if not _enriched:
+                    logger.warning(
+                        "Workday detail returned no enrichment and no alpha2 for "
+                        "%s/%s (location=%r) — skipping to avoid leaking non-US job",
+                        company, job.get("job_id"), job.get("location"),
+                    )
+                    continue
+
+        elif platform == "workday":
+            # should_fetch_detail returned False — required detail keys (_external_path,
+            # _slug, _wd, _path) are missing.
+            if config.get("listing_filter") == "title_only":
+                # Without detail we cannot determine location for title_only
+                # platforms, so skip unconditionally to avoid leaking non-US jobs.
+                logger.debug(
+                    "Workday skipped (missing required detail keys): %r | %s | %s",
+                    company, job.get("title"), job.get("location"),
+                )
+                continue
+            # listing_filter="full": location reliable at listing level; fall through
+            # to the normal alpha-2 / text location gates below.
 
         # ── Alpha-2 listing-level gate ────────────────────────────────────────
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
@@ -942,12 +1083,12 @@ def _process_company(company_row, position, total):
             continue
 
         # ── Detail fetch for new jobs ─────────────────────────────────────────
-        # Registry has_detail + _should_fetch_detail() drive when to fetch.
+        # Registry has_detail + should_fetch_detail() drive when to fetch.
         # Each call re-acquires the semaphore to throttle detail HTTP requests.
         # Workday excluded — detail was fetched in the early-fetch path above.
         # Custom uses a different signature (passes slug_info_cached).
         if platform == "custom":
-            if _should_fetch_detail(job, platform, config, slug_info_cached):
+            if should_fetch_detail(job, platform, config, slug_info_cached):
                 with sem:
                     try:
                         job = ats_module.fetch_job_detail(job, slug_info_cached)
@@ -961,7 +1102,7 @@ def _process_company(company_row, position, total):
                             "Custom fetch_job_detail failed %s/%s: %s",
                             company, job.get("job_id"), e, exc_info=True,
                         )
-        elif platform != "workday" and _should_fetch_detail(job, platform, config):
+        elif platform != "workday" and should_fetch_detail(job, platform, config):
             with sem:
                 try:
                     job = ats_module.fetch_job_detail(job)

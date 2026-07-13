@@ -96,8 +96,6 @@ FLAG_PATTERNS: list[re.Pattern] = [
 
 # ── Patterns that SUPPRESS a line even if it matches FLAG_PATTERNS ────────────
 SUPPRESS_PATTERNS: list[tuple[str, re.Pattern]] = [
-    ("Accenture missing_keys (expected Workday behaviour)",
-     re.compile(r'MISSING required keys.*company=.accenture')),
     ("URL-extracted non-US location (expected filter behaviour)",
      re.compile(r'non-US location')),
     ("api_health default fallback (handled internally)",
@@ -401,15 +399,42 @@ def collect_raw_findings(
         if p not in priority and _mtime_safe(p) >= cutoff
     ]
 
+    # TimedRotatingFileHandler rotates scheduler.log → scheduler.log.YYYY-MM-DD
+    # at midnight.  These files end in a date suffix, not ".log", so glob("*.log")
+    # misses them entirely.  Include any such rotation backups within the cutoff
+    # window so errors from yesterday evening are not silently skipped.
+    rotation_backups = [
+        p for p in LOGS_DIR.glob("*.log.[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]")
+        if _mtime_safe(p) >= cutoff
+    ]
+
     new_offsets = dict(offsets)
     new_inodes: dict[str, int] = dict(inodes or {})
     raw: dict[str, list] = {}
 
-    for path in priority + recent_dated:
+    # For rotated backups whose inode matches the prior active log inode,
+    # inherit that log's offset so we don't re-scan already-processed content.
+    if inodes is not None:
+        for backup_path in rotation_backups:
+            backup_key = str(backup_path)
+            if backup_key in new_offsets:
+                continue  # already tracked
+            try:
+                backup_inode = backup_path.stat().st_ino
+            except OSError:
+                continue
+            if not backup_inode:
+                continue
+            for prior_key, prior_inode in inodes.items():
+                if prior_inode == backup_inode and prior_key != backup_key:
+                    new_offsets[backup_key] = offsets.get(prior_key, 0)
+                    break
+
+    for path in priority + recent_dated + rotation_backups:
         if not path.exists():
             continue
         key = str(path)
-        saved_offset = offsets.get(key, 0)
+        saved_offset = new_offsets.get(key, 0)
 
         # Reset offset when the file was replaced (log rotation where the new
         # file has grown past the old offset — the size<offset check in
@@ -455,7 +480,15 @@ def _ts_key(fp: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_frequency(r, fp: str, now: float) -> None:
-    """Push current timestamp into the history ring-buffer (newest-first)."""
+    """Push current timestamp into the history ring-buffer (newest-first).
+
+    Uses scan time (now), not the log line's own timestamp.  On first deploy
+    or after downtime, a backlog of errors is processed in one pass so all
+    timestamps collapse to ~now → avg_IAT≈0 → TTL=MIN_ACT_TTL_S (5 min).
+    Those errors resolve before the next scan if they stopped firing.
+    This is an accepted tradeoff: Sentry catches such errors in real-time;
+    log_monitor's role is ongoing pattern detection, not historical replay.
+    """
     key = _ts_key(fp)
     r.lpush(key, now)
     r.ltrim(key, 0, HISTORY_SIZE - 1)

@@ -72,6 +72,7 @@ import sys
 import time
 import logging
 from datetime import datetime
+from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
@@ -107,11 +108,20 @@ os.makedirs(_LOG_DIR, exist_ok=True)
 # Prefer `sudo systemctl restart recruiter-scheduler` over spawning a raw process —
 # systemd tracks PID, handles ordering, and writes to journald.
 # Fall back to direct subprocess spawn when systemd is not available (dev / cron).
-_SYSTEMCTL       = shutil.which("systemctl") or "/usr/bin/systemctl"
-_SYSTEMD_AVAILABLE = (
-    os.path.isfile(_SYSTEMCTL) and
-    os.path.isdir("/run/systemd/system")
-)
+_SYSTEMCTL = shutil.which("systemctl") or "/usr/bin/systemctl"
+
+def _systemd_available() -> bool:
+    """Check systemd availability at call time, not import time.
+
+    Evaluating once at import risks a False result during the boot race window
+    where the watchdog starts before /run/systemd/system is mounted. A stale
+    False would cause the watchdog to spawn detached subprocesses (ghost workers)
+    for its entire lifetime even after systemd is fully initialised.
+    """
+    return os.path.isfile(_SYSTEMCTL) and os.path.isdir("/run/systemd/system")
+
+# Keep the module-level name for backward-compat with _print_status / logging.
+_SYSTEMD_AVAILABLE = _systemd_available()
 
 # Managed systemd unit names — used for is-active checks and restarts
 _UNIT_SCHEDULER = "recruiter-scheduler"
@@ -196,7 +206,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
       • Workers are spawned directly as detached background processes.
       • Uses start_new_session=True so they survive watchdog exit.
     """
-    if _SYSTEMD_AVAILABLE:
+    if _systemd_available():
         # ── Systemd path — prefer managed restarts ────────────────────────
         # All workers (scan, detail, fullscan) are children of recruiter-scheduler.
         # A dead individual worker means the scheduler pool lost a child;
@@ -903,16 +913,22 @@ def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
         if consumer_name.startswith("scheduler-"):
             pid_str = consumer_name.rsplit("-", 1)[-1]
             int(pid_str)  # validate
-            for hb_key in ("worker:alive:scheduler:adaptive",
-                           "worker:alive:scheduler:fullscan"):
-                raw = r.get(hb_key)
-                if raw:
-                    try:
-                        hb_pid = str(json.loads(raw).get("pid", ""))
-                        if hb_pid == pid_str:
-                            return True
-                    except Exception:
-                        pass
+            # Check only the specific loop's heartbeat key — the fullscan and
+            # adaptive loops update independent keys.  Checking both would give a
+            # false-alive result if one loop died while the other still runs.
+            _hb_key = (
+                "worker:alive:scheduler:fullscan"
+                if worker_type == "fullscan_worker"
+                else "worker:alive:scheduler:adaptive"
+            )
+            raw = r.get(_hb_key)
+            if raw:
+                try:
+                    hb_pid = str(json.loads(raw).get("pid", ""))
+                    if hb_pid == pid_str:
+                        return True
+                except Exception:
+                    pass
             return False
 
         # Standard format: "worker-{hostname}-{pid}"
@@ -1477,7 +1493,7 @@ def check_systemd_services() -> list:
     Heal action: systemd_recruiter-scheduler → reset-failed + restart via systemctl
     (The watchdog unit itself restarting is handled by systemd automatically.)
     """
-    if not _SYSTEMD_AVAILABLE:
+    if not _systemd_available():
         return []
 
     issues = []
@@ -1557,6 +1573,289 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
 
 
 # ─────────────────────────────────────────
+# GHOST WORKER DETECTION + CLEANUP
+# ─────────────────────────────────────────
+
+# Worker subprocess command patterns spawned by the non-systemd self-heal path.
+# Any process matching these patterns whose PPID is not the scheduler's PID is
+# a ghost competing with the managed pool for the same Redis queues.
+_GHOST_WORKER_PATTERNS = (
+    "-m workers.detail_worker",
+    "-m workers.scan_worker",
+    "-m workers.fullscan",
+)
+
+
+def _get_scheduler_pid(r) -> int | None:
+    """
+    Return the confirmed live scheduler PID, or None if identity cannot be verified.
+
+    Validation steps:
+      1. Read PID from the Redis heartbeat key.
+      2. Confirm the process is alive (os.kill(pid, 0)).
+      3. Confirm its cmdline matches the scheduler entrypoint (-m workers.scheduler).
+      4. Fallback: if cmdline check fails, confirm via systemd MainPID for the
+         recruiter-scheduler unit (handles compiled or aliased entrypoints).
+
+    Returns None — skipping the ghost-worker kill pass entirely — if any
+    step cannot confirm the scheduler's identity.
+    """
+    try:
+        hb = r.get("worker:alive:scheduler:adaptive")
+        if not hb:
+            return None
+        pid = json.loads(hb).get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+
+        # Step 2: confirm process is alive
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            logger.debug(
+                "_get_scheduler_pid: heartbeat PID %d is no longer alive — skipping",
+                pid,
+            )
+            return None
+        except PermissionError:
+            pass  # process exists; we cannot signal it but it is alive
+
+        # Step 3: confirm cmdline identifies the scheduler entrypoint
+        try:
+            cmdline = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+            if "-m workers.scheduler" in cmdline:
+                return pid
+        except FileNotFoundError:
+            return None  # exited between kill(0) and cmdline read
+
+        # Step 4: cmdline check inconclusive — confirm via systemd MainPID
+        if _systemd_available():
+            try:
+                out = subprocess.run(
+                    [_SYSTEMCTL, "show", "-p", "MainPID", "--value",
+                     _UNIT_SCHEDULER],
+                    capture_output=True, text=True, timeout=3,
+                ).stdout.strip()
+                if out and int(out) == pid:
+                    return pid
+            except (subprocess.SubprocessError, ValueError, OSError):
+                pass
+
+        logger.debug(
+            "_get_scheduler_pid: PID %d could not be confirmed as the scheduler "
+            "— skipping ghost-worker kill pass",
+            pid,
+        )
+        return None
+
+    except Exception as exc:
+        logger.debug("_get_scheduler_pid: failed to read scheduler heartbeat: %s", exc)
+    return None
+
+
+def _kill_ghost_workers(r) -> None:
+    """
+    Detect and kill worker processes not parented to the scheduler.
+
+    Ghost workers arise when the watchdog's non-systemd self-heal path
+    (subprocess.Popen with start_new_session=True) spawns detached worker
+    subprocesses that survive after the server transitions to systemd management.
+    They compete with the scheduler's managed pool for the same Redis queues,
+    causing duplicate job processing and inflated queue metrics.
+
+    Detection: scan /proc for processes matching a worker command pattern whose
+    PPID is not the scheduler's PID. No psutil dependency — /proc is portable
+    across all Linux distros.
+
+    Action: SIGTERM → 10s grace period → SIGKILL any survivors.
+    Sends one alert email per kill batch (Redis-deduped, 1h cooldown).
+    Skipped entirely when the scheduler PID is unknown (avoids false kills).
+
+    ⚠  On systemd-managed hosts this will also terminate matching worker
+    processes started manually for debugging (e.g. `python -m workers.scan_worker`)
+    if they are not children of the scheduler PID.  Before running debug workers
+    alongside a live scheduler, either start them as children of the scheduler
+    (via `--spawn-worker` if available) or temporarily set `self_heal=False` in
+    the watchdog config to suppress ghost-worker detection.
+    """
+    import signal as _signal
+
+    scheduler_pid = _get_scheduler_pid(r)
+    if not scheduler_pid:
+        # Can't determine the legitimate scheduler PID — skip to avoid
+        # accidentally killing a valid worker during scheduler startup.
+        return
+
+    ghosts: list[int] = []
+    own_pid = os.getpid()
+
+    try:
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit():
+                continue
+            pid = int(pid_dir.name)
+            if pid == own_pid:
+                continue
+            try:
+                cmdline = (
+                    pid_dir / "cmdline"
+                ).read_bytes().replace(b"\x00", b" ").decode(errors="replace")
+                if not any(pat in cmdline for pat in _GHOST_WORKER_PATTERNS):
+                    continue
+                status_text = (pid_dir / "status").read_text()
+                ppid_line   = next(
+                    line for line in status_text.splitlines() if line.startswith("PPid:")
+                )
+                ppid = int(ppid_line.split()[1])
+                if ppid != scheduler_pid:
+                    ghosts.append(pid)
+            except (FileNotFoundError, PermissionError, StopIteration, ValueError, UnicodeDecodeError):
+                continue
+    except Exception as exc:
+        logger.warning("watchdog: ghost worker scan failed: %s", exc)
+        return
+
+    if not ghosts:
+        return
+
+    logger.warning(
+        "watchdog: %d ghost worker(s) detected (not children of scheduler PID %d) — PIDs %s",
+        len(ghosts), scheduler_pid, ghosts,
+    )
+
+    killed: list[int] = []
+    for pid in ghosts:
+        # Revalidate immediately before SIGTERM — the process may have exited or
+        # been adopted by the scheduler between the ghost scan and now.
+        try:
+            _pre_cmdline = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+            if not any(pat in _pre_cmdline for pat in _GHOST_WORKER_PATTERNS):
+                logger.debug(
+                    "watchdog: PID %d cmdline changed before SIGTERM — skipping (PID may have been reused): %r",
+                    pid, _pre_cmdline[:120],
+                )
+                continue
+            _pre_status = Path(f"/proc/{pid}/status").read_text()
+            _pre_ppid   = int(
+                next(
+                    line for line in _pre_status.splitlines()
+                    if line.startswith("PPid:")
+                ).split()[1]
+            )
+            if _pre_ppid == scheduler_pid:
+                logger.debug(
+                    "watchdog: PID %d was adopted by scheduler before SIGTERM — skipping",
+                    pid,
+                )
+                continue
+        except (FileNotFoundError, StopIteration, ValueError):
+            continue  # Process exited between scan and revalidation
+        try:
+            os.kill(pid, _signal.SIGTERM)
+            killed.append(pid)
+            logger.info("watchdog: SIGTERM → ghost PID %d", pid)
+        except ProcessLookupError:
+            pass  # Already dead between revalidation and kill
+        except PermissionError:
+            logger.warning("watchdog: no permission to kill ghost PID %d", pid)
+
+    if not killed:
+        return
+
+    # Grace period — let workers flush Redis cleanup (requeue inflight jobs etc.)
+    time.sleep(10)
+
+    for pid in killed:
+        try:
+            os.kill(pid, 0)  # Raises ProcessLookupError if already gone
+        except ProcessLookupError:
+            continue  # Exited cleanly after SIGTERM
+        # Re-read cmdline: PID may have been reused by a different process
+        # in the 10-second grace window between SIGTERM and SIGKILL.
+        try:
+            _recheck = (
+                Path(f"/proc/{pid}/cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode(errors="replace")
+            )
+        except FileNotFoundError:
+            continue  # process exited between kill(0) and cmdline read
+        if not any(pat in _recheck for pat in _GHOST_WORKER_PATTERNS):
+            logger.debug(
+                "watchdog: PID %d cmdline changed after SIGTERM — skipping SIGKILL "
+                "(PID may have been reused): %r",
+                pid, _recheck[:120],
+            )
+            continue
+        # Re-read PPID: if the process was adopted by the scheduler between
+        # SIGTERM and now it is no longer a ghost and must not be killed.
+        try:
+            _status_recheck = Path(f"/proc/{pid}/status").read_text()
+            _ppid_recheck   = int(
+                next(
+                    line for line in _status_recheck.splitlines()
+                    if line.startswith("PPid:")
+                ).split()[1]
+            )
+            if _ppid_recheck == scheduler_pid:
+                logger.debug(
+                    "watchdog: PID %d is now a child of scheduler (PPID=%d) — skipping SIGKILL",
+                    pid, scheduler_pid,
+                )
+                continue
+        except (FileNotFoundError, StopIteration, ValueError):
+            continue  # process exited; nothing to kill
+        try:
+            os.kill(pid, _signal.SIGKILL)
+            logger.warning("watchdog: ghost PID %d ignored SIGTERM — SIGKILLed", pid)
+        except ProcessLookupError:
+            pass  # Exited between re-check and SIGKILL
+
+    pid_list = ", ".join(str(p) for p in killed)
+    _send_email(
+        f"⚠ Ghost workers detected and killed ({len(killed)} PID{'s' if len(killed) > 1 else ''})",
+        f"""
+        <p style="color:#b45309;font-size:16px;font-weight:700;">
+          ⚠ Ghost worker processes were detected and terminated automatically.
+        </p>
+        <p style="color:#374151;">
+          These processes were running worker code but were
+          <strong>not children of the scheduler</strong> (PID {scheduler_pid}).
+          They were likely spawned by the watchdog's non-systemd self-heal path
+          before <code>install-systemd.sh</code> was configured, and survived
+          the transition to systemd management.
+        </p>
+        <p style="color:#374151;">
+          <strong>PIDs terminated:</strong> <code>{pid_list}</code><br>
+          <strong>Action:</strong> SIGTERM → 10s grace → SIGKILL for survivors.
+        </p>
+        <p style="color:#16a34a;">
+          The scheduler's managed worker pool is unaffected.
+          No manual intervention needed.
+        </p>
+        <p style="color:#64748b;font-size:12px;">
+          To prevent recurrence ensure <code>install-systemd.sh</code> has been
+          run and both <code>recruiter-scheduler</code> and
+          <code>recruiter-watchdog</code> are active systemd units.
+        </p>""",
+        dedup_key="watchdog:ghost_workers_killed",
+        dedup_ttl=3600,
+        r=r,
+    )
+
+
+# ─────────────────────────────────────────
 # SELF-HEALING
 # ─────────────────────────────────────────
 
@@ -1607,7 +1906,7 @@ def _attempt_heal(issue: Issue, r) -> bool:
     cmd_args  = action["cmd_args"]
     is_fg    = action.get("foreground", False)
 
-    mode = "systemd" if _SYSTEMD_AVAILABLE else "subprocess"
+    mode = "systemd" if _systemd_available() else "subprocess"
     logger.info(
         "watchdog: attempting self-heal for %r [%s] — %s",
         issue.alert_type, mode, action["description"],
@@ -2038,6 +2337,8 @@ def run_watchdog(once: bool = False,
 
     while True:
         try:
+            if self_heal and _systemd_available():
+                _kill_ghost_workers(r)
             issues = _run_all_checks(r)
 
             errors   = sum(1 for i in issues if i.level in ("ERROR", "CRITICAL"))

@@ -59,8 +59,6 @@ from config import (
     ADAPTIVE_DEFAULT_INTERVAL,
     SCAN_QUEUE,
     SCHEDULER_TICK_SECS,
-    SCHEDULER_DAWN_PATROL_WINDOW,
-    SCHEDULER_DAWN_PATROL_SPREAD,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
     SCHEDULER_HEARTBEAT_TTL,
@@ -78,6 +76,7 @@ from config import (
     WORKER_SLOW_CHECK_INTERVAL_S,
     WORKER_POOL_SCAN_FRACTION,
     WORKER_POOL_DETAIL_FRACTION,
+    WORKER_POOL_FULLSCAN_FRACTION,
     WORKER_FLOOR,
     WORKER_DEPRIORITISE_SECS,
     DETAIL_QUEUE_HIGH_WATERMARK,
@@ -96,6 +95,10 @@ from config import (
     WORKER_SCALING_LOCK_TTL,
     REDIS_INFLIGHT_PREFIX,
     INFLIGHT_STALE_WINDOW_S,
+    REDIS_INFLIGHT_FULLSCAN,
+    REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
+    WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
+    INFLIGHT_FULLSCAN_STALE_S,
     # Stream-based two-layer scheduler (Section 5 / 9 redesign)
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
@@ -147,11 +150,13 @@ _detail_pool: list = []
 _pool_lock: threading.Lock = threading.Lock()
 
 _hysteresis: dict = {
-    "scan_add":     0,
-    "scan_remove":  0,
-    "detail_add":   0,
-    "detail_remove": 0,
-    "detail_alert": 0,   # Phase 11: consecutive cycles with depth > watermark
+    "scan_add":       0,
+    "scan_remove":    0,
+    "detail_add":     0,
+    "detail_remove":  0,
+    "detail_alert":   0,   # Phase 11: consecutive cycles with depth > watermark
+    "fullscan_add":   0,
+    "fullscan_remove": 0,
 }
 
 # ── Pool health tracking (published to scheduler:health Redis key) ────────────
@@ -222,6 +227,33 @@ def _get_stream_pending_count(r, stream_key: str,
         return 0
 
 
+def _get_stream_undelivered_count(r, stream_key: str,
+                                   group: str = STREAM_CONSUMER_GROUP) -> int:
+    """Return the count of messages in the stream not yet delivered to any consumer.
+
+    Uses XINFO GROUPS `lag` (Redis 7.0+) which counts only undelivered entries,
+    excluding acknowledged history that XLEN would include.  Falls back to
+    XLEN - PEL for Redis < 7.0.
+    """
+    try:
+        for g in r.xinfo_groups(stream_key):
+            name = g.get("name", b"")
+            if isinstance(name, bytes):
+                name = name.decode()
+            if name == group:
+                lag = g.get("lag")
+                if lag is not None:
+                    return int(lag)
+                xlen = r.xlen(stream_key)
+                pel  = _get_stream_pending_count(r, stream_key, group)
+                return max(0, xlen - pel)
+        return 0
+    except Exception:
+        xlen = r.xlen(stream_key)
+        pel  = _get_stream_pending_count(r, stream_key, group)
+        return max(0, xlen - pel)
+
+
 def claim_stale_work(r, stream_key: str, group: str,
                      consumer: str, p95_ms: int,
                      op_type: str = "scan") -> None:
@@ -280,6 +312,11 @@ def claim_stale_work(r, stream_key: str, group: str,
         return
 
     for msg_id, fields in claimed:
+        if msg_id is None:
+            # Redis 7+ returns (None, None) for PEL entries whose backing stream
+            # message was trimmed/deleted.  These are already reported in
+            # deleted_ids above; skip silently rather than xack with None.
+            continue
         if not fields:
             r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
             continue
@@ -330,7 +367,6 @@ def record_cycle_start() -> float:
         2. job_postings status set to 'digested'
 
     Uses Redis TIME (not system clock) to avoid NTP skew issues.
-    Also computes the canonical 7 AM Eastern timestamp for dawn_patrol.
 
     Returns the cycle start Unix timestamp.
     """
@@ -493,48 +529,6 @@ def get_band_thresholds(r) -> dict:
 
 
 # ─────────────────────────────────────────
-# DAWN PATROL (Rule 2)
-# ─────────────────────────────────────────
-
-def dawn_patrol() -> int:
-    """
-    Redistribute adaptive polls that are due after DAWN_PATROL_WINDOW
-    into the first DAWN_PATROL_SPREAD seconds of the cycle.
-
-    Ensures dormant companies aren't clustered in the afternoon —
-    all companies get their adaptive poll before the full scan runs.
-
-    Returns number of companies redistributed.
-    """
-    r           = get_redis()
-    cycle_start = get_cycle_start()
-    if cycle_start is None:
-        logger.warning("dawn_patrol: no cycle:start in Redis — skipping")
-        return 0
-
-    threshold = cycle_start + SCHEDULER_DAWN_PATROL_WINDOW
-    late      = r.zrangebyscore(REDIS_POLL_ADAPTIVE, threshold, "+inf",
-                                withscores=False)
-    if not late:
-        logger.debug("dawn_patrol: no late polls to redistribute")
-        return 0
-
-    spread = SCHEDULER_DAWN_PATROL_SPREAD
-    step   = spread / max(len(late), 1)
-
-    new_scores = {}
-    for i, company in enumerate(late):
-        new_time = cycle_start + (i * step) + random.uniform(0, step)
-        new_scores[company] = new_time
-
-    r.zadd(REDIS_POLL_ADAPTIVE, new_scores)
-
-    logger.info("dawn_patrol: redistributed %d companies across 2h window",
-                len(late))
-    return len(late)
-
-
-# ─────────────────────────────────────────
 # HEARTBEAT
 # ─────────────────────────────────────────
 
@@ -632,7 +626,8 @@ def on_adaptive_complete(company: str, new_jobs: int,
             SELECT current_interval_s, recent_poll_counts,
                    last_full_scan_at, full_scan_interval_s,
                    consecutive_errors, last_success_at,
-                   warming_polls_remaining
+                   warming_polls_remaining,
+                   next_full_scan_at, avg_fullscan_duration_s
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
@@ -818,9 +813,9 @@ def on_adaptive_complete(company: str, new_jobs: int,
                     "on_adaptive_complete: reactivation lag check failed: %s", exc
                 )
 
-    # Rule 3 part 2: trigger full scan if due
-    if success and _should_trigger_full_scan(company, row):
-        _schedule_full_scan(company)
+    # Rule 3 part 2: queue fullscan if not scheduled or won't finish before digest
+    if success:
+        _maybe_reschedule_full_scan(company, row)
 
 
 def _next_digest_deadline(now: float) -> float:
@@ -995,6 +990,35 @@ end
 return 0
 """
 
+# Atomic ceiling check + slot claim for fullscan dispatch.
+#
+# Counts adaptive and fullscan inflight for the same DC key together so both
+# scan types share the learned ceiling.  Uses separate ZSET keys so each type
+# can have its own stale window (adaptive = 10 min; fullscan = 2 h).
+#
+# Returns 1 if slot was claimed, 0 if ceiling was hit (caller should re-queue).
+#
+# KEYS[1] = inflight:scans:{dc_key}      — adaptive inflight ZSET
+# KEYS[2] = inflight:fullscans:{dc_key}  — fullscan inflight ZSET
+# ARGV[1] = ceiling (int)
+# ARGV[2] = adaptive stale cutoff (epoch seconds, entries older than this pruned)
+# ARGV[3] = fullscan stale cutoff (epoch seconds)
+# ARGV[4] = company (member to ZADD on success)
+# ARGV[5] = now (score for ZADD)
+_FULLSCAN_INFLIGHT_CLAIM_LUA = """
+if redis.call('ZSCORE', KEYS[2], ARGV[4]) then
+    return 0
+end
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, ARGV[3])
+local total = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
+if total >= tonumber(ARGV[1]) then
+    return 0
+end
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
+return 1
+"""
+
 
 def _atomic_schedule(
     r,
@@ -1004,20 +1028,33 @@ def _atomic_schedule(
     interval_s:    float,
     tolerance_pct: float,
     *,
-    deadline_ts:    Optional[float] = None,
-    avg_duration_s: float           = 1800.0,
-) -> float:
+    deadline_ts:     Optional[float] = None,
+    avg_duration_s:  float           = 1800.0,
+    skip_if_future:  bool            = False,
+) -> Optional[float]:
     """
     Pick a gap-avoiding ZSET slot and immediately ZADD the company, all under a
     short-lived Redis lock so concurrent processes cannot select the same gap.
 
-    Returns the scheduled Unix timestamp.
+    If skip_if_future=True, the ZADD is skipped (under the lock) when the company
+    already has a valid future score in queue_key, preventing a race between a
+    pre-lock zscore check and the eventual ZADD.
+
+    Returns the scheduled Unix timestamp, or None when skip_if_future suppressed the ZADD.
     """
     lock_key = f"scheduling:lock:{queue_key}"
     token    = f"{os.getpid()}:{time.monotonic_ns()}"
     acquired = r.set(lock_key, token, px=2000, nx=True)
     try:
         if acquired:
+            if skip_if_future:
+                _existing = r.zscore(queue_key, company)
+                if _existing is not None and float(_existing) > time.time():
+                    logger.debug(
+                        "_atomic_schedule: %r already in %r at %.0f — skip_if_future suppressed ZADD",
+                        company, queue_key, float(_existing),
+                    )
+                    return None
             score = _pick_schedule_time(
                 target_ts      = target_ts,
                 queue_key      = queue_key,
@@ -1027,7 +1064,17 @@ def _atomic_schedule(
                 deadline_ts    = deadline_ts,
                 avg_duration_s = avg_duration_s,
             )
+            score = max(score, time.time())  # never insert a past-due ZADD score
         else:
+            # Lock contended — check skip_if_future before falling through to jitter.
+            if skip_if_future:
+                _existing_c = r.zscore(queue_key, company)
+                if _existing_c is not None and float(_existing_c) > time.time():
+                    logger.debug(
+                        "_atomic_schedule: %r already in %r at %.0f — skip_if_future suppressed ZADD (lock-contended path)",
+                        company, queue_key, float(_existing_c),
+                    )
+                    return None
             # Another process is scheduling — apply a deterministic per-company
             # offset so concurrent callers don't all land on the same timestamp
             # (thundering herd).  Use a hash of the company string to produce a
@@ -1094,42 +1141,69 @@ def _reschedule_adaptive(company: str, interval_s: int) -> None:
     )
 
 
-def _should_trigger_full_scan(company: str, row) -> bool:
+def _maybe_reschedule_full_scan(company: str, row) -> None:
     """
-    Return True if a full scan should be triggered for this company.
+    Queue or reschedule a fullscan only when necessary (Rule 3).
 
-    Conditions (Rule 3):
-        - Never been full-scanned (last_full_scan_at IS NULL), OR
-        - full_scan_interval_s has elapsed since last full scan
+    Does nothing when a fullscan is already scheduled AND will finish
+    comfortably before the next 7 AM digest deadline.
 
-    Suppressed when the company has an active scan backoff key
-    (retry:backoff:scan:{company}).  A full scan makes significantly more
-    requests than a listing scan — triggering one while the ATS is already
-    struggling accelerates the problem.
+    Triggers (re)scheduling when:
+      - next_full_scan_at IS NULL        → never scheduled
+      - next_full_scan_at is in the past → overdue / stale ZSET entry lost
+      - next_full_scan_at + avg_fullscan_duration_s >= next 7 AM deadline
+                                         → would miss the digest
+
+    Suppressed when the ATS has an active scan backoff (struggling ATS —
+    a fullscan makes far more requests than a listing scan).
     """
-    # Suppress full scan if listing scan is in backoff (ATS struggling)
     r = get_redis()
     if r.exists(f"{REDIS_BACKOFF_PREFIX}:scan:{company}"):
         logger.debug(
-            "_should_trigger_full_scan: %r has active scan backoff — "
-            "suppressing full scan trigger",
+            "_maybe_reschedule_full_scan: %r has active scan backoff — suppressing",
             company,
         )
-        return False
+        return
 
-    if row["last_full_scan_at"] is None:
-        return True   # never been full-scanned
-    elapsed  = time.time() - row["last_full_scan_at"].timestamp()
-    interval = row["full_scan_interval_s"] or SCHEDULER_FULL_SCAN_INTERVAL_S
-    return elapsed >= interval
+    if r.zscore(REDIS_INFLIGHT_FULLSCAN, company) is not None:
+        logger.debug(
+            "_maybe_reschedule_full_scan: %r is actively in-flight — suppressing",
+            company,
+        )
+        return
 
+    now          = time.time()
+    avg_duration = float(row["avg_fullscan_duration_s"] or 1800.0)
+    next_scan    = row["next_full_scan_at"]
 
-def _schedule_full_scan(company: str) -> None:
-    """Queue company for full scan with 5-minute buffer (Rule 3)."""
-    score = time.time() + SCHEDULER_FULL_SCAN_BUFFER_S
-    get_redis().zadd(REDIS_POLL_FULLSCAN, {company: score})
-    logger.info("scheduler: full scan queued for %r (in %ds)",
-                company, SCHEDULER_FULL_SCAN_BUFFER_S)
+    if next_scan is not None:
+        next_ts  = next_scan.timestamp() if hasattr(next_scan, "timestamp") else float(next_scan)
+        deadline = _next_digest_deadline(now)
+        if next_ts > now and (next_ts + avg_duration) < deadline:
+            return  # already scheduled and will finish before digest
+
+    # Guard against overwriting a valid ZSET entry when next_full_scan_at is NULL
+    # or stale (e.g., queued by _queue_fullscans_for_missed or a prior call here).
+    existing_zset = r.zscore(REDIS_POLL_FULLSCAN, company)
+    if existing_zset is not None and float(existing_zset) > now:
+        logger.debug(
+            "_maybe_reschedule_full_scan: %r already in poll:fullscan at %.0f — skipping",
+            company, float(existing_zset),
+        )
+        return
+
+    _atomic_schedule(
+        r, REDIS_POLL_FULLSCAN, company,
+        now + SCHEDULER_FULL_SCAN_BUFFER_S,
+        SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+        deadline_ts    = _next_digest_deadline(now),
+        avg_duration_s = avg_duration,
+        skip_if_future = True,
+    )
+    logger.info(
+        "scheduler: full scan queued for %r (next_full_scan_at=%s avg_duration=%.0fs)",
+        company, next_scan, avg_duration,
+    )
 
 
 def _write_scheduler_heartbeat(r, loop: str, dispatched: int) -> None:
@@ -1285,8 +1359,17 @@ def adaptive_loop() -> None:
                     # Remove stale entries before counting
                     stale_cutoff = now - INFLIGHT_STALE_WINDOW_S
                     r.zremrangebyscore(inflight_key, 0, stale_cutoff)
-                    # Per-DC in-flight count (populated by the XADD dispatch below)
-                    pending_count = r.zcard(inflight_key)
+                    # Count adaptive + fullscan inflight together — both share the
+                    # same DC ceiling.  Prune each ZSET with its own stale window
+                    # before counting so dead workers don't inflate pending_count.
+                    _fullscan_inflight_key = f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}"
+                    r.zremrangebyscore(
+                        _fullscan_inflight_key, 0, now - INFLIGHT_FULLSCAN_STALE_S
+                    )
+                    pending_count = (
+                        r.zcard(inflight_key)
+                        + r.zcard(_fullscan_inflight_key)
+                    )
                     if pending_count >= int(ceiling_raw):
                         r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})
                         logger.debug(
@@ -1296,7 +1379,11 @@ def adaptive_loop() -> None:
                         )
                         continue
 
-                # ── Dispatch: XADD → ZREM (two-layer pattern) ────────────────
+                # ── Dispatch: claim inflight slot → XADD → ZREM ──────────────
+                # Claim the adaptive inflight slot BEFORE XADD so the fullscan
+                # Lua script sees it and cannot consume the last ceiling slot
+                # between our pending_count check and the actual dispatch.
+                # Release the slot if XADD fails to prevent a slot leak.
                 canary_company_key = f"worker:outage:canary_company:{platform}"
                 dispatch_context = (
                     "canary"
@@ -1304,23 +1391,32 @@ def adaptive_loop() -> None:
                     else "normal"
                 )
 
-                r.xadd(
-                    REDIS_STREAM_ADAPTIVE,
-                    {
-                        "company":     company,
-                        "scan_type":   "adaptive",
-                        "dc_key":      dc_key,
-                        "context":     dispatch_context,
-                        "enqueued_at": datetime.utcnow().isoformat(),
-                        "request_id":  f"adp-{int(now)}",
-                    },
-                    maxlen=STREAM_MAXLEN_ADAPTIVE,
-                    approximate=True,
-                )
+                _adaptive_inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
+                r.zadd(_adaptive_inflight_key, {company: now})
+                try:
+                    r.xadd(
+                        REDIS_STREAM_ADAPTIVE,
+                        {
+                            "company":     company,
+                            "scan_type":   "adaptive",
+                            "dc_key":      dc_key,
+                            "context":     dispatch_context,
+                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "request_id":  f"adp-{int(now)}",
+                        },
+                        maxlen=STREAM_MAXLEN_ADAPTIVE,
+                        approximate=True,
+                    )
+                except Exception as _xadd_err:
+                    r.zrem(_adaptive_inflight_key, company)
+                    logger.error(
+                        "adaptive_loop: XADD failed for %r (dc=%s): %s — "
+                        "rescheduling in 60s",
+                        company, dc_key, _xadd_err,
+                    )
+                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 60})
+                    continue
                 r.zrem(REDIS_POLL_ADAPTIVE, company)
-
-                # Keep inflight ZSET for Phase 10 fast_error_check compatibility
-                r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
                 _hw_dispatched += 1
 
                 logger.debug(
@@ -1423,19 +1519,75 @@ def fullscan_loop() -> None:
 
                 dc_key = _get_dc_key_for_company(company)
 
-                r.xadd(
-                    REDIS_STREAM_FULLSCAN,
-                    {
-                        "company":     company,
-                        "scan_type":   "fullscan",
-                        "dc_key":      dc_key,
-                        "context":     "normal",
-                        "enqueued_at": datetime.utcnow().isoformat(),
-                        "request_id":  f"full-{int(now)}",
-                    },
-                    maxlen=STREAM_MAXLEN_FULLSCAN,
-                    approximate=True,
-                )
+                # ── Phase 10: per-DC learned ceiling throttle (atomic) ────────
+                # Fullscan and adaptive workers share the same learned ceiling for
+                # a DC key.  Use a Lua script so check + slot claim is atomic —
+                # no two dispatches can both read "slot available" and both proceed.
+                ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
+                if ceiling_raw:
+                    _now_ts      = time.time()
+                    _claimed     = r.eval(
+                        _FULLSCAN_INFLIGHT_CLAIM_LUA,
+                        2,
+                        f"{REDIS_INFLIGHT_PREFIX}:{dc_key}",
+                        f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
+                        int(ceiling_raw),
+                        _now_ts - INFLIGHT_STALE_WINDOW_S,
+                        _now_ts - INFLIGHT_FULLSCAN_STALE_S,
+                        company,
+                        _now_ts,
+                    )
+                    if not _claimed:
+                        r.zadd(REDIS_POLL_FULLSCAN, {company: now + 30})
+                        logger.debug(
+                            "fullscan_loop: ceiling throttle company=%r dc=%r ceil=%s",
+                            company, dc_key, ceiling_raw,
+                        )
+                        continue
+
+                try:
+                    r.xadd(
+                        REDIS_STREAM_FULLSCAN,
+                        {
+                            "company":     company,
+                            "scan_type":   "fullscan",
+                            "dc_key":      dc_key,
+                            "context":     "normal",
+                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "request_id":  f"full-{int(now)}",
+                        },
+                        maxlen=STREAM_MAXLEN_FULLSCAN,
+                        approximate=True,
+                    )
+                except Exception as _xadd_exc:
+                    # XADD failed — if the Lua script claimed a DC inflight slot
+                    # (ceiling_raw path), release it now so it doesn't leak until
+                    # the stale cleanup window expires.
+                    if ceiling_raw:
+                        try:
+                            r.zrem(
+                                f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
+                                company,
+                            )
+                        except Exception as _zrem_exc:
+                            logger.debug(
+                                "fullscan_loop: ZREM inflight slot failed for %r (dc=%s): %s — slot will expire via stale window",
+                                company, dc_key, _zrem_exc,
+                            )
+                    logger.error(
+                        "fullscan_loop: XADD failed for %r (dc=%s): %s — rescheduling",
+                        company, dc_key, _xadd_exc,
+                    )
+                    r.zadd(REDIS_POLL_FULLSCAN, {company: now + 60})
+                    continue
+                if not ceiling_raw:
+                    # No ceiling learned yet — slot was not claimed by Lua above;
+                    # ZADD here so the inflight ZSET is populated from day one and
+                    # the ceiling learner has data to work with.
+                    r.zadd(
+                        f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
+                        {company: time.time()},
+                    )
                 r.zrem(REDIS_POLL_FULLSCAN, company)
                 _hw_dispatched += 1
 
@@ -1580,7 +1732,7 @@ def calculate_worker_counts(r) -> tuple:
     """
     Calculate required scan and detail worker counts from 30-day api_health history.
 
-    Called at scheduler startup (after dawn_patrol).  Queries historical
+    Called at scheduler startup.  Queries historical
     average response times and today's expected workload to give a data-driven
     starting point.  The three monitoring layers (liveness, fast error, slow
     throughput) then fine-tune the counts throughout the day.
@@ -1596,10 +1748,12 @@ def calculate_worker_counts(r) -> tuple:
     """
     window_s = 23 * 3600   # 23-hour working window
 
-    # DB pool ceiling split 60/40 (no workers running yet at startup)
-    db_budget   = DB_POOL_MAXCONN - 3   # 3 reserved for scheduler + maintenance
-    scan_ceil   = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_SCAN_FRACTION))
-    detail_ceil = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_DETAIL_FRACTION))
+    # DB pool ceiling: subtract fullscan reservation first, then split remainder 60/40
+    db_budget       = DB_POOL_MAXCONN - 3   # 3 reserved for scheduler + maintenance
+    fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
+    remaining       = max(0, db_budget - fullscan_budget)
+    scan_ceil       = max(WORKER_FLOOR, int(remaining * WORKER_POOL_SCAN_FRACTION))
+    detail_ceil     = max(WORKER_FLOOR, int(remaining * WORKER_POOL_DETAIL_FRACTION))
 
     # Number of companies registered for adaptive polling today
     scan_polls_today = max(1, r.zcard(REDIS_POLL_ADAPTIVE))
@@ -2002,20 +2156,59 @@ def _replace_dead_workers() -> None:
                 ),
             )
 
+    # ── Release per-DC inflight slots for dead fullscan workers ──────────────
+    # _run_fullscan() writes worker:current_job:fullscan:{pid} = "company|dc_key"
+    # at scan start.  If the worker crashed, the finally block never ran, so the
+    # inflight:fullscans:{dc_key} slot is still held.  Release it here.
+    if any(ptype == "fullscan" for ptype, _, _ in replacements):
+        _r = get_redis()
+        for ptype, old_pid, _exit in replacements:
+            if ptype != "fullscan":
+                continue
+            job_key = f"{WORKER_CURRENT_JOB_FULLSCAN_PREFIX}:{old_pid}"
+            try:
+                raw = _r.get(job_key)
+                if raw:
+                    parts = raw.split("|", 1)
+                    if len(parts) == 2:
+                        dead_company, dead_dc_key = parts
+                        if dead_dc_key:
+                            _r.zrem(
+                                f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dead_dc_key}",
+                                dead_company,
+                            )
+                            logger.info(
+                                "scheduler: released inflight slot for dead "
+                                "fullscan_worker pid=%d company=%r dc=%r",
+                                old_pid, dead_company, dead_dc_key,
+                            )
+                _r.delete(job_key)
+            except Exception as exc:
+                logger.warning(
+                    "scheduler: inflight cleanup failed for dead "
+                    "fullscan_worker pid=%d: %s",
+                    old_pid, exc,
+                )
+
 
 def _add_one_worker(worker_type: str, ceil_: int) -> bool:
     """
     Add one worker to the given pool if below its ceiling.
 
     Args:
-        worker_type: "scan" or "detail"
+        worker_type: "scan", "detail", or "fullscan"
         ceil_:       maximum pool size for this worker type right now
 
     Returns:
         True if a worker was added, False if already at ceil_.
     """
     global _scan_pool, _detail_pool
-    pool = _scan_pool if worker_type == "scan" else _detail_pool
+    if worker_type == "fullscan":
+        pool = globals().get("_fullscan_pool_ref")
+        if pool is None:
+            return False
+    else:
+        pool = _scan_pool if worker_type == "scan" else _detail_pool
 
     with _pool_lock:
         if len(pool) >= ceil_:
@@ -2035,14 +2228,19 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
     check doesn't spawn a replacement for it.
 
     Args:
-        worker_type: "scan" or "detail"
+        worker_type: "scan", "detail", or "fullscan"
         floor_:      minimum pool size for this worker type right now
 
     Returns:
         True if a worker was removed, False if already at floor_.
     """
     global _scan_pool, _detail_pool
-    pool = _scan_pool if worker_type == "scan" else _detail_pool
+    if worker_type == "fullscan":
+        pool = globals().get("_fullscan_pool_ref")
+        if pool is None:
+            return False
+    else:
+        pool = _scan_pool if worker_type == "scan" else _detail_pool
 
     with _pool_lock:
         if len(pool) <= floor_:
@@ -2058,6 +2256,13 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
     )
     _write_scheduler_health()   # publish updated pool size
     return True
+
+
+def _get_fullscan_pool_size() -> int:
+    """Return current fullscan pool size — thread-safe."""
+    _fp = globals().get("_fullscan_pool_ref", [])
+    with _pool_lock:
+        return len(_fp)
 
 
 def _deprioritise_platform(r, platform: str) -> int:
@@ -2351,12 +2556,13 @@ def _slow_throughput_check_loop() -> None:
             detail_depth  = r.llen(REDIS_DETAIL_ADAPTIVE)
             scan_backlog  = r.zcard(REDIS_POLL_ADAPTIVE)
             n_scan, n_detail = _get_pool_snapshot()
+            n_fullscan       = _get_fullscan_pool_size()
 
-            db_budget    = DB_POOL_MAXCONN - 3
-            scan_ceil    = max(WORKER_FLOOR,
-                               int((db_budget - n_detail) * WORKER_POOL_SCAN_FRACTION))
-            detail_ceil  = max(WORKER_FLOOR,
-                               int((db_budget - n_scan) * WORKER_POOL_DETAIL_FRACTION))
+            db_budget        = DB_POOL_MAXCONN - 3
+            _fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
+            _remaining       = max(0, db_budget - _fullscan_budget)
+            scan_ceil        = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_SCAN_FRACTION))
+            detail_ceil      = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_DETAIL_FRACTION))
             dynamic_floor = _remaining_work_minimum(r)
 
             # ── Phase 11: Redis memory alert ──────────────────────────────────
@@ -2589,11 +2795,81 @@ def _slow_throughput_check_loop() -> None:
                     else:
                         _hysteresis["scan_remove"] = 0
 
+            # ── Fullscan scaling (independent of scan/detail cascade) ──────────
+            # Scale up whenever there is any undelivered fullscan work (lag > 0),
+            # not only when lag exceeds current worker count — workers may all be
+            # busy on long scans while new companies queue up behind them.
+            # Scale down when the stream is idle and pool is above the floor.
+            # Uses the same 2-consecutive-check hysteresis as scan/detail.
+            fullscan_stream_depth = _get_stream_undelivered_count(
+                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
+            )
+            fullscan_ceil = _fullscan_budget
+
+            if fullscan_stream_depth > 0:
+                _hysteresis["fullscan_add"]    += 1
+                _hysteresis["fullscan_remove"]  = 0
+
+                if _hysteresis["fullscan_add"] >= 2:
+                    if _add_one_worker("fullscan", fullscan_ceil):
+                        n_fullscan_a = _get_fullscan_pool_size()
+                        logger.info(
+                            "slow_throughput: fullscan_stream_depth=%d > "
+                            "n_fullscan=%d → added fullscan_worker (pool now %d)",
+                            fullscan_stream_depth, n_fullscan, n_fullscan_a,
+                        )
+                        record_scaling_event(
+                            "worker_add",
+                            trigger_layer="slow_throughput",
+                            worker_type="fullscan",
+                            scan_workers_before=n_scan,
+                            scan_workers_after=n_scan,
+                            detail_workers_before=n_detail,
+                            detail_workers_after=n_detail,
+                            notes=(
+                                f"fullscan pool {n_fullscan} → {n_fullscan_a} "
+                                f"stream_depth={fullscan_stream_depth} "
+                                f"fullscan_ceil={fullscan_ceil}"
+                            ),
+                        )
+                        _hysteresis["fullscan_add"] = 0
+            elif (fullscan_stream_depth == 0
+                  and _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN) == 0
+                  and n_fullscan > WORKER_FLOOR):
+                _hysteresis["fullscan_remove"] += 1
+                _hysteresis["fullscan_add"]     = 0
+
+                if _hysteresis["fullscan_remove"] >= 2:
+                    if _remove_one_worker("fullscan", WORKER_FLOOR):
+                        n_fullscan_a = _get_fullscan_pool_size()
+                        logger.info(
+                            "slow_throughput: fullscan stream idle, pool=%d > "
+                            "floor=%d → removed fullscan_worker (pool now %d)",
+                            n_fullscan, WORKER_FLOOR, n_fullscan_a,
+                        )
+                        record_scaling_event(
+                            "worker_remove",
+                            trigger_layer="slow_throughput",
+                            worker_type="fullscan",
+                            scan_workers_before=n_scan,
+                            scan_workers_after=n_scan,
+                            detail_workers_before=n_detail,
+                            detail_workers_after=n_detail,
+                            notes=(
+                                f"fullscan pool {n_fullscan} → {n_fullscan_a} "
+                                f"stream idle fullscan_ceil={fullscan_ceil}"
+                            ),
+                        )
+                        _hysteresis["fullscan_remove"] = 0
+            else:
+                _hysteresis["fullscan_add"]    = 0
+                _hysteresis["fullscan_remove"] = 0
+
             logger.debug(
-                "slow_throughput: scan=%d/%d detail=%d/%d "
-                "detail_q=%d scan_backlog=%d dynamic_floor=%d",
-                n_scan, scan_ceil, n_detail, detail_ceil,
-                detail_depth, scan_backlog, dynamic_floor,
+                "slow_throughput: scan=%d/%d detail=%d/%d fullscan=%d/%d "
+                "detail_q=%d scan_backlog=%d fullscan_stream=%d dynamic_floor=%d",
+                n_scan, scan_ceil, n_detail, detail_ceil, n_fullscan, fullscan_ceil,
+                detail_depth, scan_backlog, fullscan_stream_depth, dynamic_floor,
             )
 
         except KeyboardInterrupt:
@@ -2670,11 +2946,11 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
     Runs indefinitely:
         1. Rebuilds Redis from PostgreSQL on startup (unless skip_rebuild)
         2. Calibrates band thresholds and seeds concurrency limits
-        3. Runs dawn_patrol() to redistribute late adaptive polls
-        4. Calculates data-driven startup worker counts from 30-day history
-        5. Spawns two co-scheduled multiprocessing.Process pools:
-               scan_pool   — listing scan workers
-               detail_pool — detail fetch workers
+        3. Calculates data-driven startup worker counts from 30-day history
+        5. Spawns three co-scheduled multiprocessing.Process pools:
+               scan_pool     — listing scan workers
+               detail_pool   — detail fetch workers
+               fullscan_pool — fullscan workers (stream:fullscan consumers)
         6. Starts six daemon threads:
                adaptive_loop               — dispatches to stream:adaptive (two-layer)
                fullscan_loop               — dispatches to stream:fullscan (two-layer)
@@ -2721,9 +2997,6 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
             "-- workers will self-seed on first request", exc,
         )
 
-    # ── Dawn patrol ───────────────────────────────────────────────────────────
-    dawn_patrol()
-
     # ── Calculate initial worker counts ──────────────────────────────────────
     try:
         scan_count, detail_count = calculate_worker_counts(r)
@@ -2737,8 +3010,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
 
     # ── Spawn worker pools ────────────────────────────────────────────────────
     # Fullscan workers: floor at WORKER_FLOOR, cap at same ceiling as scan pool.
-    # Full scans are expensive (Bloom filters, all pages) — 2 workers is plenty
-    # for most portfolios. Scaling is done by the slow-throughput monitor.
+    # Start fullscan workers at the floor; _slow_throughput_check_loop scales
+    # up when stream:fullscan has more pending messages than workers, and scales
+    # back down to the floor when the stream is idle.
     fullscan_count = WORKER_FLOOR
 
     global _scan_pool, _detail_pool
@@ -2798,9 +3072,11 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
           f"{scan_count} scan + {detail_count} detail + {fullscan_count} fullscan workers "
           f"— Ctrl+C to stop")
 
+    from logger import cleanup_logs_if_due
     try:
         while True:
             time.sleep(60)
+            cleanup_logs_if_due()
     except KeyboardInterrupt:
         logger.info("scheduler: shutdown requested — draining worker pools")
         print("\n[scheduler] Shutting down workers...")

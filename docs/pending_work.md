@@ -239,13 +239,18 @@ Replaced `BRPOP` (destructive) with `LMOVE → per-PID inflight list` pattern:
 
 ## PHASE 4 — Known Issues / Ongoing Monitoring
 
-### 4.1 Accenture India jobs (393 already saved)
-**Status:** Future scans fixed — workers now run correct code, all four Workday
-keys (`_slug/_wd/_path/_external_path`) forwarded in detail payload.
-ATCI-* jobs correctly get `_country_code='IN'` → filtered before save.  
-**The 393 already-saved jobs:** In DB as `status='new'`, already included in
-a digest and marked digested. Will not reappear.  
-**Action needed:** None — monitor next digest to confirm no new Accenture India leakage.
+### 4.1 Accenture India jobs — RESOLVED
+**Status:** Root cause fully traced and fixed.  
+- **Before Jul 7 deploy:** `ats_slug` path keys were wrong → detail fetch guard fired
+  silently → Workday `_external_path`/`_slug`/`_wd` missing from payload → `_enriched=False`
+  (location/cc/description unchanged after "fetch") → URL-city fallback text matched Italian
+  cities (Torino/Milano/Roma) which are not in `_NON_US_CITY_OVERRIDES` → Signal 8 default
+  `True` → jobs leaked into digest.  
+- **Jul 7 deploy:** correct `{"slug":"accenture","wd":"wd103","path":"AccentureCareers"}`
+  in DB → Workday detail fetch makes real HTTP → `_country_code='IN'` for India jobs
+  → filtered before save.  
+- **All saved Accenture jobs** (1284 company-wide — US and India combined) are now `status='digested'`. 0 `status='new'`.  
+**Action needed:** None — Jul 8+ logs confirm 0 new Accenture India jobs saved.
 
 ### 4.2 General Motors [SKIP] in fullscan
 **Status:** One-off stale lock from crashed session (lock TTL=3600s, auto-expired).
@@ -266,12 +271,258 @@ all slots in a full 24h cycle (`slots_in_cycle = math.ceil(86400 / (bucket_minut
 
 ---
 
+## PHASE 5 — Concurrency Hardening ✅ DONE
+
+### 5.1 PEL consumer dead-detection fix ✅ DONE
+**File:** `workers/watchdog.py` — `_consumer_pid_alive()`  
+**Problem:** Scheduler consumers use the name format `scheduler-{hostname}-{pid}`, but
+`_consumer_pid_alive()` only handled `worker-{hostname}-{pid}` format.  All scheduler
+consumers were incorrectly reported as DEAD in the PEL health check.  
+**Root cause:** The heartbeat key lookup was being done with the wrong key name; the function
+also needed to parse PID from the consumer name and match it against the heartbeat JSON payload.  
+**Fix:** Added a `scheduler-` prefix branch that extracts the PID suffix from the consumer
+name and checks the specific loop's heartbeat key (`worker:alive:scheduler:fullscan` for
+`fullscan_worker`, `worker:alive:scheduler:adaptive` otherwise) for a matching `"pid"`.
+Checking both keys would give a false-alive result if one loop died while the other ran.  
+**Tests added:** 3 new test methods in `TestCheckPelHealthPID`
+(`test_scheduler_consumer_alive_same_pid_is_ok`,
+`test_scheduler_consumer_dead_different_pid_is_error`,
+`test_scheduler_consumer_no_heartbeat_is_error`).
+
+### 5.2 Fullscan worker auto-scaling ✅ DONE
+**Files:** `workers/scheduler.py`, `config.py`  
+**Problem:** Fullscan worker pool was fixed at `WORKER_FLOOR=2` and never scaled.
+`_slow_throughput_check_loop` only handled scan and detail workers.  
+**Fix:**
+- Added `WORKER_POOL_FULLSCAN_FRACTION = 0.25` to `config.py`
+- Added `"fullscan_add"` / `"fullscan_remove"` hysteresis counters to `_hysteresis` dict
+- Extended `_add_one_worker()` / `_remove_one_worker()` to handle `"fullscan"` type
+- Added `_get_fullscan_pool_size()` helper
+- Added fullscan scaling block in `_slow_throughput_check_loop`:
+  - Scale up when `stream:fullscan` has any positive undelivered lag (`lag > 0`), regardless of pool size (2-check hysteresis)
+  - Scale down when stream is idle and pool > `WORKER_FLOOR` (2-check hysteresis)
+  - Ceiling: `fullscan_ceil = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))`
+
+### 5.3 Per-DC ceiling enforcement for fullscan dispatch ✅ DONE
+**Files:** `workers/scheduler.py`, `workers/fullscan.py`, `config.py`  
+**Problem:** Adaptive scan workers respect a per-DC learned ceiling (`worker:ceil:learned:{dc_key}`)
+via `inflight:scans:{dc_key}` ZSET.  Fullscan workers bypassed this ceiling entirely — a running
+fullscan still occupied a DB connection toward the DC's limit but was invisible to the adaptive
+ceiling check.  A TOCTOU race also existed: if multiple companies were dispatched in the same loop
+iteration before any worker registered its slot, all could simultaneously read "slot available" and
+proceed.  
+**Fix — three parts:**
+
+**Part A — Atomic slot claim in `fullscan_loop` (scheduler.py):**
+- Added `_FULLSCAN_INFLIGHT_CLAIM_LUA` Lua script: atomically prunes stale entries from
+  both `inflight:scans:{dc_key}` (adaptive, 10-min stale window) and
+  `inflight:fullscans:{dc_key}` (fullscan, 2-h stale window), counts them together, and
+  ZADDs the company to `inflight:fullscans:{dc_key}` only if `total < ceiling`.  Returns 1 if
+  claimed, 0 if throttled.  Fullscan and adaptive workers share the same learned ceiling.
+- Dispatched after `_get_dc_key_for_company()`, before `XADD` to `stream:fullscan`.
+- If throttled: re-queue company in `poll:fullscan` at `+30s` and `continue`.
+
+**Part B — Current-job key in `_run_fullscan` (fullscan.py):**
+- Added `dc_key: str = ""` parameter to `_run_fullscan()`.
+- At scan start: `SET worker:current_job:fullscan:{pid} "{company}|{dc_key}" EX 3600`.
+  This key lets `_replace_dead_workers()` identify which inflight slot to release on crash.
+- In `finally`: `ZREM inflight:fullscans:{dc_key} {company}` + `DEL worker:current_job:fullscan:{pid}`.
+- `run_worker()` now extracts `dc_key = fields.get("dc_key", "")` from the stream message and
+  passes it to `_run_fullscan()`.
+
+**Part C — Dead-worker inflight cleanup in `_replace_dead_workers` (scheduler.py):**
+- After the existing `record_scaling_event` loop, if any dead fullscan workers were replaced:
+  - `GET worker:current_job:fullscan:{old_pid}` → parse `company|dc_key`
+  - `ZREM inflight:fullscans:{dead_dc_key} company` → release the per-DC slot
+  - `DEL worker:current_job:fullscan:{old_pid}` → clean up
+- Runs event-driven (~5s after crash) — no polling required.
+- If the worker died before `_run_fullscan()` SET the current_job key (e.g., died between
+  XREADGROUP and scan start), the slot remains until the 2-h stale window prunes it on
+  the next dispatch — acceptable backstop.
+
+**New config constants:**
+- `REDIS_INFLIGHT_FULLSCAN_DC_PREFIX = "inflight:fullscans"` — per-DC ZSET key prefix
+- `WORKER_CURRENT_JOB_FULLSCAN_PREFIX = "worker:current_job:fullscan"` — per-PID key prefix
+- `WORKER_CURRENT_JOB_FULLSCAN_TTL = 3600` — 1-h safety TTL on current-job key
+
+**Adaptive ceiling also updated:** `adaptive_loop` ceiling check now counts both
+`inflight:scans:{dc_key}` and `inflight:fullscans:{dc_key}` so a running fullscan is
+visible to adaptive throttling as well.
+
+**Why separate ZSET keys (not shared `inflight:scans:{dc_key}`):**
+Adaptive entries in `inflight:scans:{dc_key}` are pruned after 10 minutes (`INFLIGHT_STALE_WINDOW_S`).
+Fullscans take 20–30 min — sharing the key would cause the adaptive stale cleanup to prune active
+fullscan slots mid-scan, silently undercounting concurrent load.
+
+---
+
+## PHASE 6 — Correctness Fixes ✅ DONE (locally, awaiting deploy)
+
+Traced from the India Accenture leak investigation (Jun–Jul 2026). All fixes are
+implemented in this PR and awaiting deployment. Ship together — they address the same root-cause chain.
+
+### 6.1 scan_worker: empty-string detail keys treated as absent ✅ DONE
+**File:** `workers/scan_worker.py` — `_build_detail_payload()`  
+**Problem:** `if job.get(key) is not None:` forwarded empty strings (`""`) into the
+detail payload. `fetch_job_detail()` guard clauses use `not all([...])` which treats
+`""` as falsy — so the guard fires, the HTTP request is skipped, and the job returns
+unenriched. Downstream code can't distinguish this from a successful detail fetch.  
+**Fix:** Changed to `if job.get(key):` — empty strings are now treated as absent
+and not forwarded into the detail payload.  
+**Impact:** When `has_detail=True` and `listing_filter=="title_only"`, the absent
+key causes `should_fetch_detail()` in `detail_worker` to return `False`. The
+pre-fetch eligibility check (`not detail_attempted and has_detail and
+listing_filter=="title_only"`) then fires before any HTTP request or internal
+`fetch_job_detail()` guard is reached, returning `error/retryable` instead of
+silently entering the filter pipeline with incomplete data. Other filter modes
+(`full`, etc.) are unaffected; equivalent protection requires separate handling.
+
+### 6.2 job_monitor + registry: Workday `_should_fetch_detail` requires all 4 keys ✅ DONE
+**Files:** `jobs/job_monitor.py` — `_should_fetch_detail()`, `jobs/ats/registry.py` — `should_fetch_detail()`  
+**Problem:** Workday detail fetch was attempted when only `_external_path`, `_slug`, and
+`_wd` were present, even if `_path` was missing. `fetch_job_detail()` needs all four to
+construct the correct Workday URL — missing `_path` causes the guard to fire and the job
+returns unenriched. The same gap existed in both the local `_should_fetch_detail()` in
+`job_monitor.py` and the registry-level `should_fetch_detail()` in `registry.py`.  
+**Fix:**
+```python
+if platform == "workday":
+    return bool(
+        job.get("_external_path")
+        and job.get("_slug")
+        and job.get("_wd")
+        and job.get("_path")
+    )
+```
+All four must be truthy before the detail fetch is attempted. Applied identically in both
+`job_monitor.py` and `registry.py`.
+
+### 6.3 detail_worker Bug 1: missing detail keys + title_only → retryable ✅ DONE
+**File:** `workers/detail_worker.py`  
+**Problem:** If `should_fetch_detail()` returns `False` (required Workday keys absent in
+payload) but the company config has `has_detail=True` and `listing_filter="title_only"`,
+the detail fetch is silently skipped and the job proceeds through the filter pipeline with
+no location data. `is_us_location("")` returns `True` by default → non-US jobs leak into
+the digest.  
+**Fix:** After `detail_attempted = should_fetch_detail(...)`:
+```python
+if (
+    not detail_attempted
+    and config.get("has_detail")
+    and config.get("listing_filter") == "title_only"
+):
+    result["outcome"]   = "error"
+    result["retryable"] = True
+    return result   # retry: can't safely filter without location data
+```
+The job is retried (up to `_MAX_DETAIL_RETRIES`), giving scan_worker time to push a
+payload with the required keys. If retries are exhausted, it dead-letters with a full
+warning log rather than silently leaking.
+**Known limitation:** retries re-dispatch the original stream message; `slug_info` and
+`company_config` are not re-read from the DB between attempts. If they changed while the
+job was pending, the retry still uses the snapshot from the original dispatch.
+
+### 6.4 detail_worker Bug 2: `_enriched=False` after Workday fetch → retryable ✅ DONE
+**File:** `workers/detail_worker.py`  
+**Problem:** Even when `detail_attempted=True` and `fetch_job_detail()` was called, the
+function can silently return the original job unchanged if its internal guard fires
+(all required keys present at call time but the HTTP request returned nothing useful, or
+the guard fired for a different reason). Previously the job fell through to the filter
+pipeline with no location data.  
+**Fix:** Post-fetch enrichment audit compares location/cc/description against pre-fetch
+snapshots. If none changed (`_enriched=False`):
+```python
+result["outcome"]   = "error"
+result["retryable"] = True
+return result   # retry: guard fired or API returned empty data
+```
+A WARNING is logged so the pattern is visible in `scheduler_{date}.log`.
+
+### 6.5 scheduler: fullscan Path 2 thundering herd fix ✅ DONE
+**File:** `workers/scheduler.py` — `on_adaptive_complete()`  
+**Problem:** After each adaptive scan completion, `_should_trigger_full_scan()` used
+`last_full_scan_at` elapsed ≥ 24h to decide whether to queue a fullscan, then
+`_schedule_full_scan()` did a raw `zadd(now + 5min)` — clustering all overdue companies
+at the same timestamp and silently overwriting gap-filled entries from Path 1
+(`fullscan.py` post-completion rescheduling via `_atomic_schedule`).  
+**Fix:** Replaced both with `_maybe_reschedule_full_scan(company, row)`:
+
+```python
+def _maybe_reschedule_full_scan(company: str, row) -> None:
+    # Suppressed if ATS has active scan backoff
+    if r.exists(f"{REDIS_BACKOFF_PREFIX}:scan:{company}"):
+        return
+
+    avg_duration = float(row["avg_fullscan_duration_s"] or 1800.0)
+    next_scan    = row["next_full_scan_at"]
+
+    if next_scan is not None:
+        next_ts  = next_scan.timestamp()
+        deadline = _next_digest_deadline(now)
+        if next_ts > now and (next_ts + avg_duration) < deadline:
+            return   # already scheduled and will finish before 7 AM digest
+
+    # Only reschedule when needed — uses _atomic_schedule (gap-filling)
+    _atomic_schedule(
+        r, REDIS_POLL_FULLSCAN, company,
+        now + SCHEDULER_FULL_SCAN_BUFFER_S,
+        SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+        deadline_ts    = _next_digest_deadline(now),
+        avg_duration_s = avg_duration,
+    )
+```
+
+**Key differences from old path:**
+- Checks `next_full_scan_at` (DB truth) before touching `poll:fullscan` — never overwrites
+  a valid future schedule from Path 1
+- Checks deadline: if scheduled time + avg_duration would miss 7 AM, reschedule now
+- Uses `_atomic_schedule` with gap-filling — never clusters with other companies
+- Suppressed during ATS backoff (same guard as old `_should_trigger_full_scan`)
+
+**Also:** Added `next_full_scan_at` and `avg_fullscan_duration_s` to the `company_poll_stats`
+SELECT in `on_adaptive_complete` so these fields are available without an extra query.
+
+### 6.6 job_monitor: queue fullscans for missed companies ✅ DONE
+**File:** `jobs/job_monitor.py`  
+**Problem:** When the 7 AM job_monitor runs, it calls `_get_worker_missed_companies()` and
+performs a listing fallback scan for each missed company (all pages via `fetch_jobs()`).
+This catches new jobs but does NOT update `last_full_scan_at` and does NOT queue a fullscan.
+If `next_full_scan_at` is NULL or past, the company won't get a fullscan until the next
+adaptive completion triggers Path 2 — which may not happen until late in the day.  
+**Fix:** After the listing fallback scan, call `_queue_fullscans_for_missed(missed)`:
+
+```python
+def _queue_fullscans_for_missed(missed: list) -> None:
+    # For each missed company where next_full_scan_at is NULL or in the past:
+    # queue a fullscan via _atomic_schedule so the Bloom filter and
+    # last_full_scan_at get updated properly in the background.
+    for company in missed:
+        stats = get_stats(company)
+        if stats["next_full_scan_at"] is not None:
+            if stats["next_full_scan_at"].timestamp() > now:
+                continue   # already has a future fullscan scheduled
+        _atomic_schedule(
+            r, REDIS_POLL_FULLSCAN, company,
+            now + SCHEDULER_FULL_SCAN_BUFFER_S,
+            SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+            deadline_ts    = _next_digest_deadline(now),
+            avg_duration_s = avg_duration,
+        )
+```
+
+Redis or DB failures are non-fatal (warning logged, fullscan skipped for that company).
+The listing fallback result is still saved regardless.
+
+---
+
 ## Deployment Order
 
 ```text
-Phase 1  →  Phase 2  →  Phase 3  →  Phase 4 monitoring
-(fix + cleanup)  (thundering herd)  (reliability)  (observe)
+Phase 1  →  Phase 2  →  Phase 3  →  Phase 4 monitoring  →  Phase 5  →  Phase 6
+(fix + cleanup)  (thundering herd)  (reliability)  (observe)  (concurrency)  (correctness)
 
 All Phase 1 + Phase 2 changes ship in one commit.
 Phase 3 can ship incrementally (systemd first, then watchdog, then Redis).
+Phase 5 ships together (5.2 + 5.3 are interdependent; 5.1 is independent).
+Phase 6 ships together — all correctness fixes address the same root-cause chain.
 ```

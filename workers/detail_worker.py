@@ -73,6 +73,7 @@ from config import (
     REDIS_DETAIL_FULLSCAN,
     WORKER_BLOCK_SECS,
     REDIS_BACKOFF_PREFIX,
+    REDIS_ADAPTIVE_SEEN_PREFIX,
 )
 from workers.redis_client import get_redis
 from workers.heartbeat import Heartbeat
@@ -476,6 +477,55 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
 
         detail_attempted = should_fetch_detail(job, platform, config, slug_info)
 
+        # For listing_filter="title_only" platforms (e.g. Workday), the listing
+        # location is vague/absent — detail enrichment is the only reliable
+        # source of location and alpha2.  If detail was supposed to happen
+        # (has_detail=True) but required keys are missing so should_fetch_detail
+        # returned False, we cannot make a correct filter decision.  Retry rather
+        # than risk leaking a non-US job through is_us_location("") = True.
+        #
+        # Only retry on missing required inputs — intentional skips (XML sitemap
+        # jobs, custom jobs that already have a description) should fall through.
+        _pre_missing = [
+            k for k in _REQUIRED_DETAIL_KEYS.get(platform, [])
+            if not job.get(k)
+        ]
+        if (
+            not detail_attempted
+            and config.get("has_detail")
+            and config.get("listing_filter") == "title_only"
+            and _pre_missing
+        ):
+            logger.warning(
+                "detail_worker: detail required for listing_filter=title_only but "
+                "skipped (missing required keys in payload) — dropping malformed "
+                "payload; company will be rescanned at next adaptive interval. "
+                "platform=%s company=%r job_id=%s payload_underscore_keys=%s",
+                platform, company, job_id,
+                [k for k in job if k.startswith("_") and job.get(k)],
+            )
+            try:
+                delete_pending_detail(company, job_id)
+                if source_queue == REDIS_DETAIL_ADAPTIVE:
+                    try:
+                        get_redis().srem(
+                            f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}", job_id
+                        )
+                    except Exception as _srem_err:
+                        logger.debug(
+                            "detail_worker: adaptive_seen SREM failed for %s/%s: %s",
+                            company, job_id, _srem_err,
+                        )
+            except Exception as _del_err:
+                logger.error(
+                    "detail_worker: delete_pending_detail failed for %s/%s: %s",
+                    company, job_id, _del_err,
+                )
+                result["retryable"] = True  # keep in inflight until DB cleanup succeeds
+            result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+            result["outcome"]   = "error"
+            return result
+
         if detail_attempted:
             # ── Pre-flight key audit ──────────────────────────────────────────
             # Each fetch_job_detail() has a guard clause that returns the
@@ -496,7 +546,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 if not job.get(k)
             ]
             if _missing:
-                logger.warning(
+                logger.error(
                     "detail_worker: MISSING required keys — fetch_job_detail "
                     "guard will fire with NO HTTP request made. "
                     "platform=%s company=%r job_id=%s missing_keys=%s "
@@ -584,6 +634,37 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     platform, company, job_id,
                     job.get("location"), job.get("_country_code"),
                 )
+                if config.get("listing_filter") == "title_only" and _missing:
+                    # Required keys were absent — the fetch_job_detail guard
+                    # fired silently; without enriched location we cannot make a
+                    # safe filter decision.  Drop the malformed payload; the next
+                    # adaptive scan will re-enqueue a fresh request with correct keys.
+                    result["duration_ms"] = int(
+                        (time.monotonic() - start_mono) * 1000
+                    )
+                    result["outcome"]   = "error"
+                    try:
+                        delete_pending_detail(company, job_id)
+                        if source_queue == REDIS_DETAIL_ADAPTIVE:
+                            try:
+                                get_redis().srem(
+                                    f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}", job_id
+                                )
+                            except Exception as _srem_err:
+                                logger.debug(
+                                    "detail_worker: adaptive_seen SREM failed for %s/%s: %s",
+                                    company, job_id, _srem_err,
+                                )
+                    except Exception as _del_err:
+                        logger.error(
+                            "detail_worker: delete_pending_detail failed for %s/%s: %s",
+                            company, job_id, _del_err,
+                        )
+                        result["retryable"] = True  # keep in inflight until DB cleanup succeeds
+                    return result
+                # listing_filter="full" OR no missing required keys (fetch
+                # succeeded but data was genuinely unchanged): fall through into
+                # the filter pipeline so the job is processed correctly.
 
         # ── 3. Filter pipeline ────────────────────────────────────────────────
 

@@ -10,6 +10,11 @@
 #
 # Log files written to (all in logs/):
 #
+#   Scheduler       → scheduler.log               (active, rotates at midnight)
+#     TimedRotatingFileHandler — rotates to scheduler.log.YYYY-MM-DD at
+#     midnight so each day's entries are in a clearly-named file.
+#     backupCount=0: _cleanup_old_logs() owns 14-day retention for backups.
+#
 #   Daily commands  → {command}_YYYY-MM-DD.log   (14-day retention)
 #     monitor, outreach, sync, nightly, monday, weekly,
 #     detect, verify_filled, find, …
@@ -33,6 +38,7 @@ import logging.handlers
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -203,6 +209,7 @@ def init_logging(command: str = "pipeline") -> None:
                  "monitor"            → logs/monitor_YYYY-MM-DD.log
                  "detect"             → logs/detect_YYYY-MM-DD.log
                  "sync"               → logs/sync_YYYY-MM-DD.log
+                 "scheduler"          → logs/scheduler.log (rotates nightly)
                  "monthly"            → logs/monthly_YYYY-MM.log
                  "enrich"             → logs/enrich_YYYY-MM.log
                  "build_ats_slug_list"→ logs/build_ats_slug_list_YYYY-MM.log
@@ -224,7 +231,11 @@ def init_logging(command: str = "pipeline") -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
     # Run cleanup before configuring handlers so the stats can be logged below.
+    # Stamp _last_log_cleanup so cleanup_logs_if_due() treats this as the last
+    # run and waits a full 24h before triggering again.
+    global _last_log_cleanup
     _deleted, _errors = _cleanup_old_logs()
+    _last_log_cleanup = time.time()
 
     root = logging.getLogger()
     root.setLevel(LOG_LEVEL)
@@ -248,14 +259,34 @@ def init_logging(command: str = "pipeline") -> None:
         root.addHandler(console)
 
     # ── 2. Command-specific log file ────────────────────────────────
-    # Monthly commands accumulate into one YYYY-MM file per month.
-    # Daily commands get a fresh YYYY-MM-DD file each day.
-    # Plain FileHandler (append) — TimedRotatingFileHandler rotation
-    # never fires for short-lived cron processes; _cleanup_old_logs()
-    # handles deletion at startup instead.
-    date_fmt     = "%Y-%m" if command in _MONTHLY_COMMANDS else "%Y-%m-%d"
-    today        = datetime.now().strftime(date_fmt)
-    command_file = LOG_DIR / f"{command}_{today}.log"
+    # The scheduler is the only long-running process that reliably crosses
+    # midnight, so it uses TimedRotatingFileHandler on a fixed base name
+    # (scheduler.log).  At midnight the handler renames the file to
+    # scheduler.log.YYYY-MM-DD and opens a fresh scheduler.log, keeping
+    # each day's entries in a separate file with an unambiguous name.
+    # backupCount=0 disables the handler's own deletion — _cleanup_old_logs()
+    # owns the 14-day retention for *.log.YYYY-MM-DD files.
+    #
+    # All other commands are short-lived cron processes that terminate in
+    # minutes and are never alive at midnight, so TimedRotatingFileHandler
+    # would never fire for them.  They use plain FileHandler on a dated
+    # filename; _cleanup_old_logs() handles deletion at startup instead.
+    if command == "scheduler":
+        command_file = LOG_DIR / "scheduler.log"
+        file_handler = logging.handlers.TimedRotatingFileHandler(
+            command_file,
+            when="midnight",
+            backupCount=0,       # _cleanup_old_logs() handles deletion
+            encoding="utf-8",
+        )
+    else:
+        date_fmt     = "%Y-%m" if command in _MONTHLY_COMMANDS else "%Y-%m-%d"
+        today        = datetime.now().strftime(date_fmt)
+        command_file = LOG_DIR / f"{command}_{today}.log"
+        file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
+
+    file_handler.setLevel(LOG_LEVEL)
+    file_handler.setFormatter(formatter)
 
     # ── 3. Catch-all pipeline_YYYY-MM-DD.log ────────────────────────
     # Always-on daily file — useful for grepping across all commands.
@@ -268,15 +299,17 @@ def init_logging(command: str = "pipeline") -> None:
     # Adding two FileHandlers to the same path would duplicate every log line.
     # In that case skip the command-specific handler and rely on the catchall.
     if command_file != pipeline_file:
-        file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
-        file_handler.setLevel(LOG_LEVEL)
-        file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
 
-    catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
-    catchall.setLevel(LOG_LEVEL)
-    catchall.setFormatter(formatter)
-    root.addHandler(catchall)
+    # Scheduler runs for days and uses a TimedRotatingFileHandler that already
+    # captures everything.  Attaching a plain FileHandler for pipeline_<date>.log
+    # would cause it to grow indefinitely (never rotated).  Skip the catch-all
+    # for scheduler so output goes only through the rotating scheduler.log.
+    if command != "scheduler":
+        catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
+        catchall.setLevel(LOG_LEVEL)
+        catchall.setFormatter(formatter)
+        root.addHandler(catchall)
 
     # ── 4. Silence noisy third-party loggers ───────────────────────
     # These would flood DEBUG output with HTTP wire traces.
@@ -294,6 +327,34 @@ def init_logging(command: str = "pipeline") -> None:
             "Log cleanup ran at startup — deleted=%d errors=%d",
             _deleted, _errors,
         )
+
+
+_last_log_cleanup: float = 0.0
+_LOG_CLEANUP_INTERVAL_S: float = 86400.0  # 24 h
+
+
+def cleanup_logs_if_due() -> None:
+    """
+    Prune rotated log files older than 14 days if 24 hours have elapsed since
+    the last run. Intended for long-running processes (scheduler) that are never
+    restarted and would otherwise never re-trigger the startup cleanup in
+    init_logging(). Safe to call frequently — is a no-op until the interval elapses.
+    """
+    global _last_log_cleanup
+    now = time.time()
+    if now - _last_log_cleanup < _LOG_CLEANUP_INTERVAL_S:
+        return
+    _log = logging.getLogger(__name__)
+    try:
+        deleted, errors = _cleanup_old_logs()
+        _last_log_cleanup = now  # only advance after success so failures retry
+        if deleted or errors:
+            _log.info(
+                "logger: periodic log cleanup — deleted=%d errors=%d",
+                deleted, errors,
+            )
+    except Exception as _exc:
+        _log.warning("logger: periodic log cleanup failed — will retry next interval: %s", _exc)
 
 
 def get_logger(name: str) -> logging.Logger:

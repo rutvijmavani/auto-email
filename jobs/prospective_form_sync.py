@@ -855,9 +855,10 @@ def run():
 
                     if not existing_check:
                         conn.execute(
-                            "INSERT OR IGNORE INTO prospective_companies "
+                            "INSERT INTO prospective_companies "
                             "(company, domain, priority, status, created_at) "
-                            "VALUES (?, ?, 2, 'pending', ?)",
+                            "VALUES (?, ?, 2, 'pending', ?) "
+                            "ON CONFLICT (company) DO NOTHING",
                             (company, domain, datetime.utcnow())
                         )
 
@@ -883,6 +884,7 @@ def run():
                         sheet_row, company
                     )
                 except Exception as e:
+                    conn.rollback()
                     logger.warning(
                         "Row %d: could not store raw curls for %r: %s",
                         sheet_row, company, e
@@ -953,7 +955,8 @@ def run():
                         "INSERT INTO prospective_companies "
                         "(company, domain, ats_platform, ats_slug, "
                         "ats_detected_at, priority, status, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?)",
+                        "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?) "
+                        "ON CONFLICT (company) DO NOTHING",
                         (
                             company, domain, platform, slug,
                             datetime.utcnow(),   # always set — never NULL
@@ -964,6 +967,7 @@ def run():
                     print("       [OK] Added to pipeline")
 
             except Exception as e:
+                conn.rollback()
                 logger.error(
                     "Row %d: DB error for %r: %s",
                     sheet_row, company, e, exc_info=True

@@ -116,6 +116,7 @@ from workers.http_client import set_request_context
 from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db
 from db.job_monitor import (
@@ -317,8 +318,19 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
 
         set_request_context(_scan_ctx)
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
+        _fetch_complete = True
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            if not exc.stubs:
+                raise
+            logger.warning(
+                "scan_worker [%s]: avature partial fetch for %r — %d stubs "
+                "(HTTP failure mid-pagination)",
+                request_id, company, len(exc.stubs),
+            )
+            raw_jobs = exc.stubs
+            _fetch_complete = False
         finally:
             set_request_context("normal")   # always reset, even on exception
 
@@ -401,7 +413,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 config=config,
                 request_id=request_id,
             )
-            mark_first_scan_complete(company)
+            if _fetch_complete:
+                mark_first_scan_complete(company)
             duration_ms = int((time.monotonic() - start_mono) * 1000)
             result.update({
                 "success":     True,
@@ -732,7 +745,11 @@ def _build_detail_payload(
     }
 
     for key in PLATFORM_DETAIL_KEYS.get(platform, []):
-        if job.get(key) is not None:
+        # Use truthiness (not `is not None`) so that empty strings are treated as
+        # absent.  fetch_job_detail() guard clauses use `not all([...])` which
+        # treats empty strings as missing — forwarding "" would silently trigger
+        # the guard and return the job unenriched.
+        if job.get(key):
             payload[key] = job[key]
 
     # Country code available at listing level (Workday, SmartRecruiters, etc.)

@@ -109,6 +109,9 @@ from config import (
     REDIS_CYCLE_START,
     REDIS_DB_MAINTENANCE,
     REDIS_INFLIGHT_FULLSCAN,
+    REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
+    WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
+    WORKER_CURRENT_JOB_FULLSCAN_TTL,
     WORKER_BLOCK_SECS,
     SCHEDULER_FULL_SCAN_LOCK_TTL,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
@@ -134,6 +137,7 @@ from workers.scheduler import (
 from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.avature import IncompleteSearchError
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
 from db.job_monitor import (
@@ -742,6 +746,7 @@ def _build_detail_payload(
 # ─────────────────────────────────────────
 
 def _run_fullscan(company: str, r, skip_lock: bool = False,
+                  dc_key: str = "",
                   shutdown_event=None) -> dict:
     """
     Perform one complete full scan for a company.
@@ -778,11 +783,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         "completed_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    def _release_dc(reason: str) -> None:
+        if dc_key:
+            try:
+                r.zrem(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company)
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: dc inflight ZREM failed on early exit (%s): %s",
+                    company, reason, exc,
+                )
+
     # ── 1. Company metadata ───────────────────────────────────────────────────
     company_row = get_company_row(company)
     if not company_row:
         logger.warning("fullscan [%s]: company not found in DB — skipping", company)
         result["outcome"] = "skipped"
+        _release_dc("company-not-found")
         return result
 
     platform = company_row.get("ats_platform", "unknown")
@@ -793,6 +809,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             "fullscan [%s]: unknown ATS or missing slug — skipping", company
         )
         result["outcome"] = "skipped"
+        _release_dc("unknown-ats-or-missing-slug")
         return result
 
     # ── 2. ATS module + config ────────────────────────────────────────────────
@@ -802,6 +819,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         logger.error(
             "fullscan [%s]: no ATS module for platform=%s", company, platform
         )
+        _release_dc("missing-ats-module")
         return result
 
     slug_info = parse_slug(platform, slug, config)
@@ -823,6 +841,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             if last_poll_ts < cycle_start:
                 _defer_adaptive_first(company, r)
                 result["outcome"] = "deferred"
+                _release_dc("adaptive-first-defer")
                 return result
     else:
         # cycle:start not set → --monitor-jobs hasn't run yet today.
@@ -837,6 +856,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company,
             )
             result["outcome"] = "skipped"
+            # Do NOT call _release_dc here — this worker never claimed a DC slot;
+            # the worker that holds the lock owns the slot and will release it.
             return result
 
     try:
@@ -850,6 +871,21 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         except Exception as exc:
             # Non-fatal — missed inflight write at most delays 7 AM fallback exclusion.
             logger.debug("fullscan [%s]: inflight ZADD failed (non-fatal): %s", company, exc)
+        # Per-DC slot was claimed atomically in fullscan_loop's Lua script (ZADD to
+        # inflight:fullscans:{dc_key}).  Register current_job key so that
+        # _replace_dead_workers() can find company|dc_key on crash and release the slot.
+        if dc_key:
+            try:
+                r.set(
+                    f"{WORKER_CURRENT_JOB_FULLSCAN_PREFIX}:{os.getpid()}",
+                    f"{company}|{dc_key}",
+                    ex=WORKER_CURRENT_JOB_FULLSCAN_TTL,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: current_job SET failed (non-fatal): %s",
+                    company, exc,
+                )
         set_progress(company, "fullscan_start")
 
         is_resume    = fs_state.get("full_scan_interrupted", False)
@@ -891,7 +927,19 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         # all pages in one call and process in FULLSCAN_CHUNK_SIZE chunks.
         set_progress(company, "fullscan_fetching")
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
-        raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        _partial_fetch = False
+        try:
+            raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except IncompleteSearchError as exc:
+            if not exc.stubs:
+                raise
+            logger.warning(
+                "fullscan [%s]: avature partial fetch for %r — %d stubs "
+                "(HTTP failure mid-pagination)",
+                company, company, len(exc.stubs),
+            )
+            raw_jobs = exc.stubs
+            _partial_fetch = True
         set_progress(company, "fullscan_processing")
 
         # ── Persist slug_info mutations made in-place by ATS modules ──────────
@@ -1134,6 +1182,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company, page_num,
             )
 
+        elif _partial_fetch:
+            # Avature pagination cut short — presence-tracked jobs already
+            # queued for detail; bloom and DB left unchanged so the next
+            # scheduled fullscan starts from a clean, complete baseline.
+            result["outcome"]     = "partial"
+            result["success"]     = True
+            result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+            # Explicitly reschedule so the partial scan is retried in ~1h
+            # rather than waiting for the full scan interval.
+            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time() + 3600})
+            logger.warning(
+                "fullscan [%s]: partial avature fetch — bloom and DB not updated; "
+                "rescheduled retry in 1h",
+                company,
+            )
+
         else:
             # ── Successful completion ─────────────────────────────────────────
             # Capture whether this is the first full scan BEFORE updating DB
@@ -1264,6 +1328,22 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
         except Exception as exc:
             logger.debug("fullscan [%s]: inflight ZREM failed (non-fatal): %s", company, exc)
+        if dc_key:
+            _pid = os.getpid()
+            try:
+                r.zrem(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company)
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: dc inflight ZREM failed (non-fatal): %s",
+                    company, exc,
+                )
+            try:
+                r.delete(f"{WORKER_CURRENT_JOB_FULLSCAN_PREFIX}:{_pid}")
+            except Exception as exc:
+                logger.debug(
+                    "fullscan [%s]: current_job DEL failed (non-fatal): %s",
+                    company, exc,
+                )
         clear_heartbeat(company)
         if not skip_lock:
             _release_lock(company, r)
@@ -1400,8 +1480,11 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
                 continue
 
+            dc_key = fields.get("dc_key", "")
+
             # ── Run full scan ─────────────────────────────────────────────────
             result    = _run_fullscan(company, r, skip_lock=skip_lock,
+                                      dc_key=dc_key,
                                       shutdown_event=shutdown_event)
             _hw["count"] += 1
 
@@ -1416,6 +1499,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
             icon    = {
                 "completed": "[DONE]",
+                "partial":   "[PART]",
                 "paused":    "[PAUSE]",
                 "deferred":  "[DEFER]",
                 "skipped":   "[SKIP]",

@@ -364,9 +364,10 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
 
         if not existing:
             conn.execute(
-                "INSERT OR IGNORE INTO prospective_companies "
+                "INSERT INTO prospective_companies "
                 "(company, priority, status, created_at) "
-                "VALUES (?, 2, 'pending', ?)",
+                "VALUES (?, 2, 'pending', ?) "
+                "ON CONFLICT DO NOTHING",
                 (company, datetime.utcnow())
             )
 
@@ -390,6 +391,8 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
         conn.commit()
         return True
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.warning("could not store raw curls for %r: %s", company, e)
         return False
     finally:

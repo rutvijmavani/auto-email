@@ -1,5 +1,6 @@
 # ai_personalizer.py
 
+import logging
 import os
 from google import genai
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in .env file")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
 
 def generate_job_based_intro(company, job_text):
@@ -75,12 +77,15 @@ Return only the email body.
 Do not include any placeholder like [Dear Hiring manager].
 """
 
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=prompt
-    )
-
-    return response.text.strip()
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-lite",
+            contents=prompt
+        )
+        return response.text.strip()
+    except Exception as e:
+        logger.error("ai_personalizer: Gemini error (followup): %s", e)
+        return ""
 
 
 def generate_subject(company, job_title, stage="initial"):

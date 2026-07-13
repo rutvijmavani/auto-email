@@ -906,11 +906,17 @@ def run_quota_report(silent_if_healthy=False):
 
 
 def main():
+    args = sys.argv[1:]
+
+    # Initialize scheduler logging before anything else (including Sentry) so
+    # that Sentry init warnings and all startup messages go to scheduler.log.
+    if "--scheduler" in args:
+        from logger import init_logging
+        init_logging("scheduler")
+
     from workers.sentry_init import init_sentry
     if not init_sentry():
         logger.warning("pipeline: Sentry not initialized — error tracking disabled")
-
-    args = sys.argv[1:]
 
     # Only --monitor-jobs / --monitor-status actively query Redis worker state;
     # --detect-ats is DB + web scraping only, no Redis reads.
