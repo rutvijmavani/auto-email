@@ -301,7 +301,7 @@ Checking both keys would give a false-alive result if one loop died while the ot
 - Added fullscan scaling block in `_slow_throughput_check_loop`:
   - Scale up when `stream:fullscan` has more messages than current pool size (2-check hysteresis)
   - Scale down when stream is idle and pool > `WORKER_FLOOR` (2-check hysteresis)
-  - Ceiling: `max(WORKER_FLOOR, int((db_budget - n_scan - n_detail) * 0.25))`
+  - Ceiling: `fullscan_ceil = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))`
 
 ### 5.3 Per-DC ceiling enforcement for fullscan dispatch ✅ DONE
 **Files:** `workers/scheduler.py`, `workers/fullscan.py`, `config.py`  

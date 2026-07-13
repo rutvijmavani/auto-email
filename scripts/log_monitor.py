@@ -412,11 +412,29 @@ def collect_raw_findings(
     new_inodes: dict[str, int] = dict(inodes or {})
     raw: dict[str, list] = {}
 
+    # For rotated backups whose inode matches the prior active log inode,
+    # inherit that log's offset so we don't re-scan already-processed content.
+    if inodes is not None:
+        for backup_path in rotation_backups:
+            backup_key = str(backup_path)
+            if backup_key in new_offsets:
+                continue  # already tracked
+            try:
+                backup_inode = backup_path.stat().st_ino
+            except OSError:
+                continue
+            if not backup_inode:
+                continue
+            for prior_key, prior_inode in inodes.items():
+                if prior_inode == backup_inode and prior_key != backup_key:
+                    new_offsets[backup_key] = offsets.get(prior_key, 0)
+                    break
+
     for path in priority + recent_dated + rotation_backups:
         if not path.exists():
             continue
         key = str(path)
-        saved_offset = offsets.get(key, 0)
+        saved_offset = new_offsets.get(key, 0)
 
         # Reset offset when the file was replaced (log rotation where the new
         # file has grown past the old offset — the size<offset check in

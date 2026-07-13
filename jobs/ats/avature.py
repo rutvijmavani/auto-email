@@ -36,7 +36,7 @@ import re
 import json
 import time
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
 
@@ -360,9 +360,12 @@ def _anchors_to_urls(soup, page_url):
     """
     Extract all /JobDetail/ hrefs from a SearchJobs results page.
     Resolves relative hrefs against the page URL (per-spec base for relative links).
-    Absolute hrefs pass through unchanged. Filters out decoy apply-link texts.
+    Validates each resolved URL: must be HTTP(S), same origin as page_url, and have
+    /JobDetail/ in the path. Filters out decoy apply-link texts.
     """
     _DECOY = {"apply", "apply now", "apply online", "learn more", "view job", ""}
+    _expected = urlparse(page_url)
+    _netloc   = _expected.netloc
     urls = []
     for anchor in soup.select('a[href*="/JobDetail/"]'):
         if anchor.get_text(strip=True).lower() in _DECOY:
@@ -370,7 +373,15 @@ def _anchors_to_urls(soup, page_url):
         href = anchor.get("href", "")
         if not href:
             continue
-        urls.append(href if href.startswith("http") else urljoin(page_url, href))
+        resolved = urljoin(page_url, href)
+        parsed   = urlparse(resolved)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if parsed.netloc != _netloc:
+            continue
+        if "/JobDetail/" not in parsed.path:
+            continue
+        urls.append(resolved)
     return urls
 
 
