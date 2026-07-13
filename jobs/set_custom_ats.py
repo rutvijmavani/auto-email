@@ -391,6 +391,8 @@ def _store_raw_curls(company, curl_string, detail_curl=None):
         conn.commit()
         return True
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.warning("could not store raw curls for %r: %s", company, e)
         return False
     finally:

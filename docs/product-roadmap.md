@@ -283,7 +283,7 @@ Becomes essential when logs need to be aggregated across multiple servers. Not w
 
 #### 2c — Distributed Worker Fleet
 
-Each user optionally deploys worker-only instances on their own free cloud tier. Central server handles coordination + data only. Workers use each user's IP for scraping — distributes rate limiting risk.
+Each user optionally deploys worker-only instances on their own free cloud tier. Central server handles coordination + data only. Workers use each user's IP for scraping — distributes rate-limiting risk.
 
 ```text
 Central Server (your Oracle instance)

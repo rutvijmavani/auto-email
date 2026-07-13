@@ -1362,11 +1362,15 @@ def adaptive_loop() -> None:
                     stale_cutoff = now - INFLIGHT_STALE_WINDOW_S
                     r.zremrangebyscore(inflight_key, 0, stale_cutoff)
                     # Count adaptive + fullscan inflight together — both share the
-                    # same DC ceiling.  Fullscan entries have a separate ZSET and a
-                    # longer stale window so they are not prematurely pruned here.
+                    # same DC ceiling.  Prune each ZSET with its own stale window
+                    # before counting so dead workers don't inflate pending_count.
+                    _fullscan_inflight_key = f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}"
+                    r.zremrangebyscore(
+                        _fullscan_inflight_key, 0, now - INFLIGHT_FULLSCAN_STALE_S
+                    )
                     pending_count = (
                         r.zcard(inflight_key)
-                        + r.zcard(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}")
+                        + r.zcard(_fullscan_inflight_key)
                     )
                     if pending_count >= int(ceiling_raw):
                         r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})

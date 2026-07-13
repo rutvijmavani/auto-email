@@ -361,15 +361,12 @@ def _anchors_to_urls(soup, page_url):
     Extract all /JobDetail/ hrefs from a SearchJobs results page.
     Resolves relative hrefs against the page URL (per-spec base for relative links).
     Validates each resolved URL: must be HTTP(S), same origin as page_url, and have
-    /JobDetail/ in the path. Filters out decoy apply-link texts.
+    /JobDetail/ in the path. Duplicate card/action links are deduplicated downstream.
     """
-    _DECOY = {"apply", "apply now", "apply online", "learn more", "view job", ""}
     _expected = urlparse(page_url)
     _netloc   = _expected.netloc
     urls = []
     for anchor in soup.select('a[href*="/JobDetail/"]'):
-        if anchor.get_text(strip=True).lower() in _DECOY:
-            continue
         href = anchor.get("href", "")
         if not href:
             continue

@@ -497,14 +497,21 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         ):
             logger.warning(
                 "detail_worker: detail required for listing_filter=title_only but "
-                "skipped (missing required keys in payload) — retrying. "
+                "skipped (missing required keys in payload) — dropping malformed "
+                "payload; company will be rescanned at next adaptive interval. "
                 "platform=%s company=%r job_id=%s payload_underscore_keys=%s",
                 platform, company, job_id,
                 [k for k in job if k.startswith("_") and job.get(k)],
             )
+            try:
+                delete_pending_detail(company, job_id)
+            except Exception as _del_err:
+                logger.error(
+                    "detail_worker: delete_pending_detail failed for %s/%s: %s",
+                    company, job_id, _del_err,
+                )
             result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
             result["outcome"]   = "error"
-            result["retryable"] = True
             return result
 
         if detail_attempted:
@@ -618,13 +625,19 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 if config.get("listing_filter") == "title_only" and _missing:
                     # Required keys were absent — the fetch_job_detail guard
                     # fired silently; without enriched location we cannot make a
-                    # safe filter decision.  Retry so a later attempt with a
-                    # complete payload can enrich the job correctly.
+                    # safe filter decision.  Drop the malformed payload; the next
+                    # adaptive scan will re-enqueue a fresh request with correct keys.
                     result["duration_ms"] = int(
                         (time.monotonic() - start_mono) * 1000
                     )
                     result["outcome"]   = "error"
-                    result["retryable"] = True
+                    try:
+                        delete_pending_detail(company, job_id)
+                    except Exception as _del_err:
+                        logger.error(
+                            "detail_worker: delete_pending_detail failed for %s/%s: %s",
+                            company, job_id, _del_err,
+                        )
                     return result
                 # listing_filter="full" OR no missing required keys (fetch
                 # succeeded but data was genuinely unchanged): fall through into

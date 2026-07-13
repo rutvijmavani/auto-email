@@ -1047,13 +1047,17 @@ def _process_company(company_row, position, total):
 
         elif platform == "workday":
             # should_fetch_detail returned False — required detail keys (_external_path,
-            # _slug, _wd, _path) are missing.  Without detail we cannot determine
-            # location, so skip unconditionally to avoid leaking non-US jobs.
-            logger.debug(
-                "Workday skipped (missing required detail keys): %r | %s | %s",
-                company, job.get("title"), job.get("location"),
-            )
-            continue
+            # _slug, _wd, _path) are missing.
+            if config.get("listing_filter") == "title_only":
+                # Without detail we cannot determine location for title_only
+                # platforms, so skip unconditionally to avoid leaking non-US jobs.
+                logger.debug(
+                    "Workday skipped (missing required detail keys): %r | %s | %s",
+                    company, job.get("title"), job.get("location"),
+                )
+                continue
+            # listing_filter="full": location reliable at listing level; fall through
+            # to the normal alpha-2 / text location gates below.
 
         # ── Alpha-2 listing-level gate ────────────────────────────────────────
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
