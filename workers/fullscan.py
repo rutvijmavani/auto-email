@@ -1499,6 +1499,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
             icon    = {
                 "completed": "[DONE]",
+                "partial":   "[PART]",
                 "paused":    "[PAUSE]",
                 "deferred":  "[DEFER]",
                 "skipped":   "[SKIP]",

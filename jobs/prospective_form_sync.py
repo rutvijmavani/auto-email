@@ -858,7 +858,7 @@ def run():
                             "INSERT INTO prospective_companies "
                             "(company, domain, priority, status, created_at) "
                             "VALUES (?, ?, 2, 'pending', ?) "
-                            "ON CONFLICT DO NOTHING",
+                            "ON CONFLICT (company) DO NOTHING",
                             (company, domain, datetime.utcnow())
                         )
 
@@ -955,7 +955,8 @@ def run():
                         "INSERT INTO prospective_companies "
                         "(company, domain, ats_platform, ats_slug, "
                         "ats_detected_at, priority, status, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?)",
+                        "VALUES (?, ?, ?, ?, ?, 2, 'pending', ?) "
+                        "ON CONFLICT (company) DO NOTHING",
                         (
                             company, domain, platform, slug,
                             datetime.utcnow(),   # always set — never NULL

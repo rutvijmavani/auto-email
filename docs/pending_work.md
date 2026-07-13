@@ -249,7 +249,7 @@ Replaced `BRPOP` (destructive) with `LMOVE → per-PID inflight list` pattern:
 - **Jul 7 deploy:** correct `{"slug":"accenture","wd":"wd103","path":"AccentureCareers"}`
   in DB → Workday detail fetch makes real HTTP → `_country_code='IN'` for India jobs
   → filtered before save.  
-- **All saved Accenture jobs** (1284) are now `status='digested'`. 0 `status='new'`.  
+- **All saved Accenture jobs** (1284 company-wide — US and India combined) are now `status='digested'`. 0 `status='new'`.  
 **Action needed:** None — Jul 8+ logs confirm 0 new Accenture India jobs saved.
 
 ### 4.2 General Motors [SKIP] in fullscan
