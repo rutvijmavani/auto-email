@@ -83,9 +83,13 @@ _PFX_TS       = "log_monitor:ts:"
 _KEY_RESOLVED = "log_monitor:resolved"
 _KEY_DIGEST   = "log_monitor:digest_ts"
 
+# ── Levels that trigger an alert when detected via field-split ────────────────
+# WARNING is included; benign WARNINGs are filtered by SUPPRESS_PATTERNS below.
+_ALERT_LEVELS: frozenset[str] = frozenset({"WARNING", "ERROR", "CRITICAL"})
+
 # ── Patterns that flag a line as worth alerting on ────────────────────────────
+# Level-based detection is handled in _is_flagged() via field-split, not here.
 FLAG_PATTERNS: list[re.Pattern] = [
-    re.compile(r'\|\s*(ERROR|CRITICAL)\s*\|'),
     re.compile(r'^Traceback \(most recent call last\):'),
     re.compile(r'^(TypeError|ValueError|AttributeError|KeyError|IndexError'
                r'|RuntimeError|OSError|IOError|PermissionError'
@@ -110,6 +114,17 @@ SUPPRESS_PATTERNS: list[tuple[str, re.Pattern]] = [
      re.compile(r'worker:outage:')),
     ("Scheduler auto-pause / auto-resume (expected)",
      re.compile(r'(auto.paused|auto.resumed)')),
+    # Expected WARNINGs — benign operational noise
+    ("Redis BUSYGROUP on consumer group create (normal on restart)",
+     re.compile(r'BUSYGROUP')),
+    ("Brave Search API warning (external service, non-critical)",
+     re.compile(r'brave.*api|api.*brave', re.I)),
+    ("Log file cleanup warning (housekeeping, non-critical)",
+     re.compile(r'log.*(cleanup|rotation|removed|deleted)', re.I)),
+    ("Empty company name in form row (user data issue, not pipeline)",
+     re.compile(r'missing company name')),
+    ("Sentry not initialised (expected in dev/test environments)",
+     re.compile(r'Sentry is not initialized|sentry_sdk.*not.*init', re.I)),
 ]
 
 
@@ -270,6 +285,13 @@ def _is_suppressed(line: str) -> bool:
 
 
 def _is_flagged(line: str) -> bool:
+    # Fast path: check level by field position.
+    # Log format: "timestamp | LEVEL    | logger | message"
+    # Field-split is exact and immune to level strings appearing in message text.
+    parts = line.split('|', 3)
+    if len(parts) >= 2 and parts[1].strip() in _ALERT_LEVELS:
+        return True
+    # Slow path: tracebacks and exception type lines have no pipe-delimited level.
     return any(pat.search(line) for pat in FLAG_PATTERNS)
 
 
