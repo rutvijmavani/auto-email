@@ -1,4 +1,4 @@
-# Adaptive Job Monitoring Architecture
+﻿# Adaptive Job Monitoring Architecture
 
 ## Table of Contents
 
@@ -214,13 +214,13 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 ┌─────────────────────────────────────────────────────────────────┐
 │               FULL SCAN DISPATCHER (Tier 2 — scheduling layer)   │
 │  ZRANGEBYSCORE poll:fullscan -inf {now} → due companies          │
-│  XADD stream:fullscan:{dc_key}  then  ZREM poll:fullscan        │
+│  XADD stream:fullscan  then  ZREM poll:fullscan        │
 │  Rule 4 pre-check: adaptive run today? (else defer 15 min)      │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│          stream:fullscan:{dc_key}  (Redis Stream per DC key)     │
+│          stream:fullscan  (single shared Redis Stream)           │
 │  Crash-safe delivery: PEL tracks in-flight work                  │
 │  XAUTOCLAIM recovers from worker crashes (20 min idle timeout)  │
 └──────────────────────────┬──────────────────────────────────────┘
@@ -235,7 +235,7 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 │    4. Push new job IDs to queue:detail:fullscan                 │
 │    5. Build new Bloom filter for next cycle (36h TTL)           │
 │    6. Write checkpoint on pause signal                          │
-│    7. XACK stream:fullscan:{dc_key}                             │
+│    7. XACK stream:fullscan                                      │
 └─────────────────────────────────────────────────────────────────┘
 
 Supporting infrastructure:
@@ -370,22 +370,22 @@ Full scan workers (one pool per dc_key):
   consumer = f"worker-{hostname}-{pid}"
 
   Startup:
-       XGROUP CREATE stream:fullscan:{dc_key} fullscan-workers $ MKSTREAM
+       XGROUP CREATE stream:fullscan fullscan-workers $ MKSTREAM
        ↑ BUSYGROUP error = group exists → ignore
 
   Main loop:
   1. if pause_event.is_set(): wait_for_resume(); continue
   2. XREADGROUP GROUP fullscan-workers {consumer} COUNT 1 BLOCK 500
-          STREAMS stream:fullscan:{dc_key} >
+          STREAMS stream:fullscan >
   3. Run full scan (all pages, Bloom filter, checkpoint support)
-  4. XACK stream:fullscan:{dc_key} {msg_id}
+  4. XACK stream:fullscan {msg_id}
      Full scan does NOT self-reschedule — on_adaptive_complete() handles
      re-entry into poll:fullscan via Rules 3 and 5
 
   Crash recovery (run when step 2 returns empty):
        p95_ms = get_p95_full_scan_ms(redis, dc_key)   ← separate from listing scan p95
        idle_ms = max(p95_ms * 3, 300_000)             ← at least 5 min
-       XAUTOCLAIM stream:fullscan:{dc_key} fullscan-workers {consumer}
+       XAUTOCLAIM stream:fullscan fullscan-workers {consumer}
                   MIN-IDLE-TIME {idle_ms}
        → check delivery_count; dead-letter after MAX_REDELIVERIES (5)
 ```
@@ -886,8 +886,8 @@ poll:fullscan  (Redis ZSET — scheduling ledger)
   Written by: on_adaptive_complete() — Rules 3 and 5
   Read by: full scan dispatcher loop
 
-stream:fullscan:{dc_key}  (Redis Stream — delivery queue)
-  One stream per ATS / DC key (e.g. stream:fullscan:workday_wd1, stream:fullscan:greenhouse)
+stream:fullscan  (Redis Stream — single shared delivery queue)
+  One stream shared by all DC keys; dc_key is a field in each message, not part of the key.
   Written by: dispatcher — XADD when score ≤ now
   Read by: full scan workers — XREADGROUP (consumer groups, PEL, XCLAIM)
 ```
@@ -895,8 +895,8 @@ stream:fullscan:{dc_key}  (Redis Stream — delivery queue)
 **Why Streams instead of BLPOP LIST?**
 Redis Streams provide at-least-once delivery via the Pending Entries List (PEL). If a worker crashes mid-scan, the entry stays in the PEL and `XCLAIM` re-delivers it to another worker after a timeout. No job is silently dropped on worker crash — a property BLPOP/LPUSH cannot provide.
 
-**Why one stream per DC key (not one global stream)?**
-Full scan workers are DC-key-aware: a Workday wd1 ceiling of 2 must not be applied to Greenhouse workers. Separate streams let each worker pool consume exactly the right companies without cross-platform interference.
+**Why one shared stream (not one stream per DC key)?**
+A single `stream:fullscan` simplifies consumer group management — one `XGROUP CREATE` on startup covers all DC keys. Workers filter by the `dc_key` field in each message; per-DC ceiling enforcement is handled in the worker via the `inflight:fullscans:{dc_key}` ZSET and the atomic Lua script, not by stream routing.
 
 **Dispatcher loop (runs every 5 seconds):**
 
@@ -906,8 +906,9 @@ def fullscan_dispatcher_loop():
         due = redis.zrangebyscore("poll:fullscan", "-inf", time.time(), start=0, num=50)
         for company in due:
             dc_key = get_dc_key(company)   # e.g. workday_wd1, greenhouse
-            redis.xadd(f"stream:fullscan:{dc_key}", {
+            redis.xadd("stream:fullscan", {
                 "company": company,
+                "dc_key": dc_key,
                 "triggered_at": str(time.time()),
             })
             redis.zrem("poll:fullscan", company)
@@ -918,7 +919,7 @@ def fullscan_dispatcher_loop():
 
 ```python
 def fullscan_worker(dc_key: str, group: str, consumer: str):
-    stream_key = f"stream:fullscan:{dc_key}"
+    stream_key = "stream:fullscan"
     redis.xgroup_create(stream_key, group, id="$", mkstream=True)  # id="$": new messages only; BUSYGROUP ignored
     while True:
         msgs = redis.xreadgroup(group, consumer, {stream_key: ">"}, count=1, block=500)
@@ -980,7 +981,7 @@ def claim_stale_work(stream_key: str, group: str, consumer: str,
 # Called from full scan worker main loop when XREADGROUP returns empty:
 p95_ms = get_p95_full_scan_ms(redis, dc_key)   # from api_health — full scan duration only
 claim_stale_work(
-    f"stream:fullscan:{dc_key}", "fullscan-workers", consumer,
+    "stream:fullscan", "fullscan-workers", consumer,
     p95_ms=p95_ms, run_fn=run_full_scan, op_type="fullscan",
 )
 
@@ -1884,16 +1885,16 @@ ZADD poll:fullscan {timestamp} {company}               — schedule full scan
 ZRANGEBYSCORE poll:fullscan -inf {now} LIMIT 0 50      — dispatcher reads due companies
 ZREM poll:fullscan {company}                           — dispatcher removes after XADD
 
-Key: "stream:fullscan:{dc_key}"   e.g. stream:fullscan:greenhouse
+Key: "stream:fullscan"  (single shared stream; dc_key is a message field, not part of the key)
 Type: Stream (consumer groups, PEL)
 
-XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * company {name}   — dispatcher enqueues (capped)
-XGROUP CREATE stream:fullscan:{dc_key} fullscan-workers $ MKSTREAM  — id=$ = new only; BUSYGROUP → ignore
+XADD stream:fullscan MAXLEN ~ 500 * company {name} dc_key {dc_key}   — dispatcher enqueues (capped)
+XGROUP CREATE stream:fullscan fullscan-workers $ MKSTREAM  — id=$ = new only; BUSYGROUP → ignore
 consumer = f"worker-{hostname}-{pid}"                               — unique per process
 XREADGROUP GROUP fullscan-workers {consumer} COUNT 1 BLOCK 500      — 500ms block; reacts to pause signal
-  STREAMS stream:fullscan:{dc_key} >
-XACK stream:fullscan:{dc_key} fullscan-workers {msg_id}
-XAUTOCLAIM stream:fullscan:{dc_key} fullscan-workers {consumer}
+  STREAMS stream:fullscan >
+XACK stream:fullscan fullscan-workers {msg_id}
+XAUTOCLAIM stream:fullscan fullscan-workers {consumer}
   MIN-IDLE-TIME {p95_full_scan_ms * 3}                              — self-calibrating; separate from listing scan p95
 
 Key: "inflight:fullscans:{dc_key}"   e.g. inflight:fullscans:workday_wd1
@@ -2016,7 +2017,7 @@ db:maintenance   — set when DB maintenance starts, cleared when complete (no a
 
 #### 11. Full Scan Exclusive Lock (retired)
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan:{dc_key}` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. `XAUTOCLAIM` re-delivers to a *different* worker on crash, not a duplicate second dispatch.
+`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. `XAUTOCLAIM` re-delivers to a *different* worker on crash, not a duplicate second dispatch.
 
 #### 12. Company Stats Cache (Hash)
 
@@ -2379,7 +2380,7 @@ Full scan for company Workday_Corp:
 1. Full scan dispatcher: ZRANGEBYSCORE poll:fullscan -inf {now} → "Workday_Corp" due
    Pre-check: has adaptive polled today?
    last_poll_at >= cycle_start → YES → proceed
-   XADD stream:fullscan:workday_wd1 * company Workday_Corp
+   XADD stream:fullscan * company Workday_Corp dc_key workday_wd1
    ZREM poll:fullscan "Workday_Corp"
 
 2. Full scan worker: XREADGROUP → receives Workday_Corp message
@@ -2406,7 +2407,7 @@ Full scan for company Workday_Corp:
          interrupted_at_page=current_page,
          interrupted_at=NOW()
        ZADD poll:fullscan {time.time()-1} "Workday_Corp"  ← immediate re-pickup on resume
-       XACK stream:fullscan:workday_wd1 fullscan-workers {msg_id}
+       XACK stream:fullscan fullscan-workers {msg_id}
        Return — wait for resume
 
 4. Full scan completes:
@@ -2416,7 +2417,7 @@ Full scan for company Workday_Corp:
      last_full_scan_at=NOW(),
      next_full_scan_at=NOW() + full_scan_interval_s
    (on_adaptive_complete() will ZADD poll:fullscan next time — not self-scheduled)
-   XACK stream:fullscan:workday_wd1 fullscan-workers {msg_id}
+   XACK stream:fullscan fullscan-workers {msg_id}
 ```
 
 ### Nightly cron chain
@@ -2474,7 +2475,7 @@ Scan worker crashes no longer require a watchdog process. The Stream PEL tracks 
 
 ```text
 stream:adaptive:{dc_key}  → XAUTOCLAIM after 10 min idle (adaptive scans)
-stream:fullscan:{dc_key}  → XAUTOCLAIM after 20 min idle (full scans, longer timeout)
+stream:fullscan  → XAUTOCLAIM after 20 min idle (full scans, longer timeout)
 ```
 
 Re-delivery is automatic — no separate process polls for expired heartbeats. Each scan worker calls `XAUTOCLAIM` on its own stream at the top of its loop whenever `XREADGROUP` returns empty.
@@ -2622,7 +2623,7 @@ See Section 19 for dynamic concurrency details.
 
 ### Full scan double-dispatch protection
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan:{dc_key}` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; `XAUTOCLAIM` re-delivers it to exactly one other worker — not as a second concurrent dispatch.
+`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; `XAUTOCLAIM` re-delivers it to exactly one other worker — not as a second concurrent dispatch.
 
 ### Digest email safety
 
@@ -3209,7 +3210,7 @@ WORKER SCALING (from worker_scaling_events)
 
 **What:** `pipeline/scheduler.py`. Replace cron batch with continuous two-layer scheduler. Both Tier 1 and Tier 2 use ZSET (scheduling ledger) + Redis Stream per DC key (crash-safe delivery):
 - `poll:adaptive` ZSET → `stream:adaptive:{dc_key}` — adaptive dispatcher, scan workers via XREADGROUP
-- `poll:fullscan` ZSET → `stream:fullscan:{dc_key}` — full scan dispatcher, full scan workers via XREADGROUP
+- `poll:fullscan` ZSET → `stream:fullscan` — full scan dispatcher, full scan workers via XREADGROUP
 - `inflight:scans:{dc_key}` ZSET retired — ceiling enforcement uses Stream PEL size (`XPENDING`)
 - Watchdog process retired — `XAUTOCLAIM` handles crash recovery (10 min for adaptive, 20 min for full scan)
 - `ZPOPMIN` replaced by `ZRANGEBYSCORE` → `XADD` → `ZREM` pattern (crash between XADD and ZREM is idempotent)
@@ -3381,7 +3382,7 @@ NEW (last_poll_at IS NULL AND last_full_scan_at IS NULL)
   At registration:
     • Compute initial_slot_offset_s = slot_offset(batch_position)
       and persist to company_poll_stats immediately.
-    • XADD stream:fullscan:{dc_key} — full scan first, spread by
+    • XADD stream:fullscan — full scan first, spread by
       startup window formula.
     • Do NOT add to poll:adaptive yet.
 
@@ -3650,7 +3651,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **stream:adaptive:{dc_key}:** Redis Stream used as the crash-safe delivery queue for adaptive listing scans. One stream per DC key (e.g. `stream:adaptive:workday_wd1`, `stream:adaptive:greenhouse`). Companies are XADD'd (with `MAXLEN ~ 1000`) by the adaptive dispatcher when their `poll:adaptive` score is due and the DC ceiling allows. Workers consume via XREADGROUP with a 500ms block timeout (short enough to react to `pipeline:pause` within ~1s). PEL + XAUTOCLAIM handle crash recovery — idle timeout = `p95_listing_scan_ms × 3`, self-calibrating. Consumer names are `worker-{hostname}-{pid}` to prevent PEL theft between workers. Consumer group created with `id=$` (new messages only); `BUSYGROUP` error on re-create is ignored. Dead-letter path after `MAX_STREAM_REDELIVERIES` (5) moves company to `poll:adaptive` with exponential backoff. PEL size (`XPENDING`) replaces the retired `inflight:scans:{dc_key}` ZSET for ceiling enforcement.
 
-**stream:fullscan:{dc_key}:** Redis Stream used as the crash-safe delivery queue for full scan work. One stream per DC key. Companies are XADD'd (with `MAXLEN ~ 500`) by the full scan dispatcher when their `poll:fullscan` score becomes due. Workers consume via XREADGROUP with a 500ms block timeout. PEL + XAUTOCLAIM recover work from crashed workers — idle timeout = `p95_full_scan_ms × 3` (uses full scan duration from api_health, not listing scan duration). Consumer names are `worker-{hostname}-{pid}`. Consumer group created with `id=$`; `BUSYGROUP` ignored. Dead-letter after 5 redeliveries. Replaces the previous BLPOP/LIST approach.
+**stream:fullscan:** Redis Stream used as the crash-safe delivery queue for full scan work. Single shared stream for all DC keys; `dc_key` is a field in each message, not part of the key. Companies are XADD'd (with `MAXLEN ~ 500`) by the full scan dispatcher when their `poll:fullscan` score becomes due. Workers consume via XREADGROUP with a 500ms block timeout. PEL + XAUTOCLAIM recover work from crashed workers — idle timeout = `p95_full_scan_ms × 3` (uses full scan duration from api_health, not listing scan duration). Consumer names are `worker-{hostname}-{pid}`. Consumer group created with `id=$`; `BUSYGROUP` ignored. Dead-letter after 5 redeliveries. Replaces the previous BLPOP/LIST approach.
 
 **NEW → WARMING → STABLE:** The three lifecycle phases for a newly added company. NEW: full scan first (pre_existing mark), no adaptive yet. WARMING: 3 adaptive polls at fixed 2h interval using `initial_slot_offset_s` (stored in DB). STABLE: adaptive engine takes control, slot switches to `slot_offset(company_id)`, recurring Rules 3/5 govern full scans. Phase tracked by `warming_polls_remaining` column — NULL = STABLE, 1–3 = WARMING.
 
