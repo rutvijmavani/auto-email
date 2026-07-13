@@ -244,9 +244,9 @@ Supporting infrastructure:
 │  • poll:adaptive    │  │  • job_postings      │
 │  • poll:fullscan    │  │  • company_poll_stats│
 │  • stream:adaptive  │  │  • company_config    │
-│    :{dc_key}        │  │  • adaptive_poll_    │
+│    (shared stream)  │  │  • adaptive_poll_    │
 │  • stream:fullscan  │  │    metrics           │
-│    :{dc_key}        │  │  • api_health        │
+│    (shared stream)  │  │  • api_health        │
 │  • Bloom filters    │  │  • custom_ats_diag.  │
 │  • Detail queues    │  │                      │
 │  • Rate limiters    │  │                      │
@@ -3211,7 +3211,7 @@ WORKER SCALING (from worker_scaling_events)
 **What:** `pipeline/scheduler.py`. Replace cron batch with continuous two-layer scheduler. Both Tier 1 and Tier 2 use ZSET (scheduling ledger) + Redis Stream per DC key (crash-safe delivery):
 - `poll:adaptive` ZSET → `stream:adaptive:{dc_key}` — adaptive dispatcher, scan workers via XREADGROUP
 - `poll:fullscan` ZSET → `stream:fullscan` — full scan dispatcher, full scan workers via XREADGROUP
-- `inflight:scans:{dc_key}` ZSET retired — ceiling enforcement uses Stream PEL size (`XPENDING`)
+- `inflight:scans:{dc_key}` ZSET active — used with `inflight:fullscans:{dc_key}` for per-DC ceiling enforcement in the adaptive dispatch Lua script; Stream PEL (`XPENDING`) is monitoring-only
 - Watchdog process retired — `XAUTOCLAIM` handles crash recovery (10 min for adaptive, 20 min for full scan)
 - `ZPOPMIN` replaced by `ZRANGEBYSCORE` → `XADD` → `ZREM` pattern (crash between XADD and ZREM is idempotent)
 
@@ -3280,7 +3280,7 @@ Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Co
 ### Phase 10 — Adaptive ATS Protection + Resilience Hardening
 
 **What (ATS protection — Section 9):**
-Exponential backoff for all operation types (scan, detail, fullscan): 300s → 600s → 1200s → 2400s → 3600s → 86400s. Error-triggered worker removal re-queues in-progress company to `poll:adaptive` with backoff delay; message `XACK`'d so `XAUTOCLAIM` does not also re-deliver. Shutdown event checked at each page boundary in `_run_listing_scan()`. Per-DC in-flight tracking via Stream PEL (`XPENDING`) — `inflight:scans:{dc_key}` ZSET retired. Platform-isolated dispatch throttling in adaptive dispatcher — Workday DC ceiling has zero effect on Greenhouse/Lever. Per-DC learned ceiling (`worker:ceil:learned:{dc_key}`) discovered empirically, stored in Redis indefinitely, decays +1 per 24h of clean operation. ATS outage detection: 3 consecutive ineffective worker reductions → 60-min dispatch pause via `worker:outage:{platform}`. Canary probe at 30-min mark for early recovery. Scaling lock (`worker:scaling_lock:{platform}`) prevents slow throughput check from undoing fast error check interventions. Full scan suppressed while scan backoff is active. Watchdog process retired — `XAUTOCLAIM` handles scan worker crash recovery automatically.
+Exponential backoff for all operation types (scan, detail, fullscan): 300s → 600s → 1200s → 2400s → 3600s → 86400s. Error-triggered worker removal re-queues in-progress company to `poll:adaptive` with backoff delay; message `XACK`'d so `XAUTOCLAIM` does not also re-deliver. Shutdown event checked at each page boundary in `_run_listing_scan()`. Per-DC in-flight tracking via `inflight:scans:{dc_key}` ZSET (adaptive) and `inflight:fullscans:{dc_key}` ZSET (fullscan), enforced atomically in dispatch Lua scripts; Stream PEL (`XPENDING`) is monitoring-only. Platform-isolated dispatch throttling in adaptive dispatcher — Workday DC ceiling has zero effect on Greenhouse/Lever. Per-DC learned ceiling (`worker:ceil:learned:{dc_key}`) discovered empirically, stored in Redis indefinitely, decays +1 per 24h of clean operation. ATS outage detection: 3 consecutive ineffective worker reductions → 60-min dispatch pause via `worker:outage:{platform}`. Canary probe at 30-min mark for early recovery. Scaling lock (`worker:scaling_lock:{platform}`) prevents slow throughput check from undoing fast error check interventions. Full scan suppressed while scan backoff is active. Watchdog process retired — `XAUTOCLAIM` handles scan worker crash recovery automatically.
 
 **What (observability — Sections 16 and 22):**
 `context` column added to `api_health` (`normal` | `backoff` | `canary`). Baseline queries (`query_30day_avg_error_rate`, `query_30day_avg_response_ms`) filter `WHERE context = 'normal'` so managed-error periods do not inflate the historical baseline. `record_request()` accepts an optional `context` parameter; all call sites default to `'normal'` with no change needed unless in backoff or canary path. New `worker_scaling_events` table records every scaling decision (worker add/remove, outage start/end, canary probe, ceiling learned) with full health-signal context. Used for weekly health report and post-incident effectiveness analysis.
@@ -3629,7 +3629,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Learned ceiling:** The empirically discovered maximum safe in-flight scan count for a platform/DC key. Stored in Redis as `worker:ceil:learned:{dc_key}`. Set when error-triggered worker reduction fires; decays +1 per 24h of clean operation. Never pre-configured — only discovered through observed behaviour.
 
-**In-flight ZSET (retired):** The former `inflight:scans:{dc_key}` sorted set. Replaced by the Stream PEL. PEL size (`XPENDING` count) gives the current inflight count with zero maintenance overhead — no `ZADD`/`ZREM` writes, no stale-cleanup `ZREMRANGEBYSCORE`, no timeout constant to tune. Crashes cannot cause count drift because the PEL is maintained by Redis internals, not application bookkeeping.
+**In-flight ZSET (`inflight:scans:{dc_key}`):** Active sorted set tracking adaptive scan slots per DC key. Scored by dispatch timestamp; stale entries pruned by `ZREMRANGEBYSCORE` with `INFLIGHT_STALE_WINDOW_S`. Used together with `inflight:fullscans:{dc_key}` in the adaptive dispatch Lua script to enforce the per-DC ceiling atomically. Stream PEL (`XPENDING`) is monitoring-only — not used for ceiling enforcement.
 
 **ATS outage mode:** State entered when 3 consecutive worker reductions fail to improve a platform's error rate. All dispatches for that platform are paused for 60 minutes (`worker:outage:{platform}` TTL key). Workers continue serving all other healthy platforms. A canary probe fires at 30 minutes for early recovery detection.
 
@@ -3649,7 +3649,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Thundering herd:** The condition where many companies become due simultaneously, overloading workers and the ATS concurrency ceiling. Root cause: companies onboarded together drift to the same time-of-day slot. Fixed by hash-based slot assignment (Section 24).
 
-**stream:adaptive:{dc_key}:** Redis Stream used as the crash-safe delivery queue for adaptive listing scans. One stream per DC key (e.g. `stream:adaptive:workday_wd1`, `stream:adaptive:greenhouse`). Companies are XADD'd (with `MAXLEN ~ 1000`) by the adaptive dispatcher when their `poll:adaptive` score is due and the DC ceiling allows. Workers consume via XREADGROUP with a 500ms block timeout (short enough to react to `pipeline:pause` within ~1s). PEL + XAUTOCLAIM handle crash recovery — idle timeout = `p95_listing_scan_ms × 3`, self-calibrating. Consumer names are `worker-{hostname}-{pid}` to prevent PEL theft between workers. Consumer group created with `id=$` (new messages only); `BUSYGROUP` error on re-create is ignored. Dead-letter path after `MAX_STREAM_REDELIVERIES` (5) moves company to `poll:adaptive` with exponential backoff. PEL size (`XPENDING`) replaces the retired `inflight:scans:{dc_key}` ZSET for ceiling enforcement.
+**stream:adaptive:{dc_key}:** Redis Stream used as the crash-safe delivery queue for adaptive listing scans. One stream per DC key (e.g. `stream:adaptive:workday_wd1`, `stream:adaptive:greenhouse`). Companies are XADD'd (with `MAXLEN ~ 1000`) by the adaptive dispatcher when their `poll:adaptive` score is due and the DC ceiling allows. Workers consume via XREADGROUP with a 500ms block timeout (short enough to react to `pipeline:pause` within ~1s). PEL + XAUTOCLAIM handle crash recovery — idle timeout = `p95_listing_scan_ms × 3`, self-calibrating. Consumer names are `worker-{hostname}-{pid}` to prevent PEL theft between workers. Consumer group created with `id=$` (new messages only); `BUSYGROUP` error on re-create is ignored. Dead-letter path after `MAX_STREAM_REDELIVERIES` (5) moves company to `poll:adaptive` with exponential backoff. Per-DC ceiling enforcement uses the `inflight:scans:{dc_key}` ZSET (ZADD on dispatch, ZREM on completion); PEL size (`XPENDING`) is available for monitoring but is not the primary ceiling gate.
 
 **stream:fullscan:** Redis Stream used as the crash-safe delivery queue for full scan work. Single shared stream for all DC keys; `dc_key` is a field in each message, not part of the key. Companies are XADD'd (with `MAXLEN ~ 500`) by the full scan dispatcher when their `poll:fullscan` score becomes due. Workers consume via XREADGROUP with a 500ms block timeout. PEL + XAUTOCLAIM recover work from crashed workers — idle timeout = `p95_full_scan_ms × 3` (uses full scan duration from api_health, not listing scan duration). Consumer names are `worker-{hostname}-{pid}`. Consumer group created with `id=$`; `BUSYGROUP` ignored. Dead-letter after 5 redeliveries. Replaces the previous BLPOP/LIST approach.
 
@@ -3669,6 +3669,6 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Rule 5 (pre-7 AM full scan trigger):** An addition to `on_adaptive_complete()` that triggers a full scan tonight when the next adaptive poll crosses to tomorrow morning AND the full scan for the current cycle has not yet run AND sufficient time remains before 7 AM. Prevents a full scan cycle from being silently skipped for companies with long adaptive intervals.
 
-**Inflight expiry timestamp (retired):** Previously the score stored in `inflight:scans:{dc_key}`. The entire `inflight:scans:{dc_key}` ZSET is retired. In-flight count is now read directly from the Stream PEL via `XPENDING` — self-maintaining with zero application bookkeeping.
+**Inflight expiry timestamp:** The score stored in `inflight:scans:{dc_key}` — the Unix timestamp when the adaptive slot was claimed (dispatch time). Used by `ZREMRANGEBYSCORE` to prune stale entries that were never cleaned up (e.g. worker crash before ZREM). Also stored in `inflight:fullscans:{dc_key}` for fullscan slots with a separate longer stale window (`INFLIGHT_FULLSCAN_STALE_S`).
 
 **total_ms_ok (deferred):** A proposed `api_health` column tracking cumulative response time for successful (HTTP 200) requests only, separate from `total_ms` which includes all requests including timeouts. Deferred pending real data — the distortion from timeout inflation may be acceptable given that timed-out workers are genuinely occupied for that duration. To be revisited once production data confirms whether the difference is material for baseline accuracy.

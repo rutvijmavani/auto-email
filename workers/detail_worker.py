@@ -510,6 +510,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     "detail_worker: delete_pending_detail failed for %s/%s: %s",
                     company, job_id, _del_err,
                 )
+                result["retryable"] = True  # keep in inflight until DB cleanup succeeds
             result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
             result["outcome"]   = "error"
             return result
@@ -638,6 +639,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                             "detail_worker: delete_pending_detail failed for %s/%s: %s",
                             company, job_id, _del_err,
                         )
+                        result["retryable"] = True  # keep in inflight until DB cleanup succeeds
                     return result
                 # listing_filter="full" OR no missing required keys (fetch
                 # succeeded but data was genuinely unchanged): fall through into

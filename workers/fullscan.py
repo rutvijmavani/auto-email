@@ -1189,9 +1189,12 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             result["outcome"]     = "partial"
             result["success"]     = True
             result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+            # Explicitly reschedule so the partial scan is retried in ~1h
+            # rather than waiting for the full scan interval.
+            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time() + 3600})
             logger.warning(
                 "fullscan [%s]: partial avature fetch — bloom and DB not updated; "
-                "company will be rescanned at next scheduled interval",
+                "rescheduled retry in 1h",
                 company,
             )
 

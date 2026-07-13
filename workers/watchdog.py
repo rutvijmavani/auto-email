@@ -1628,10 +1628,7 @@ def _get_scheduler_pid(r) -> int | None:
                 .replace(b"\x00", b" ")
                 .decode(errors="replace")
             )
-            if (
-                "-m workers.scheduler" in cmdline
-                or ("pipeline.py" in cmdline and "--scheduler" in cmdline)
-            ):
+            if "-m workers.scheduler" in cmdline:
                 return pid
         except FileNotFoundError:
             return None  # exited between kill(0) and cmdline read

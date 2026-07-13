@@ -1106,11 +1106,6 @@ def _atomic_schedule(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,
             )
-            if skip_if_future:
-                # Use NX so a future score written by the lock-holder between our
-                # ZSCORE check and this ZADD is not overwritten.
-                r.zadd(queue_key, {company: score}, nx=True)
-                return score
         r.zadd(queue_key, {company: score})
         return score
     finally:
@@ -1409,9 +1404,15 @@ def adaptive_loop() -> None:
                         maxlen=STREAM_MAXLEN_ADAPTIVE,
                         approximate=True,
                     )
-                except Exception:
+                except Exception as _xadd_err:
                     r.zrem(_adaptive_inflight_key, company)
-                    raise
+                    logger.error(
+                        "adaptive_loop: XADD failed for %r (dc=%s): %s — "
+                        "rescheduling in 60s",
+                        company, dc_key, _xadd_err,
+                    )
+                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 60})
+                    continue
                 r.zrem(REDIS_POLL_ADAPTIVE, company)
                 _hw_dispatched += 1
 

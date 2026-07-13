@@ -344,14 +344,17 @@ def cleanup_logs_if_due() -> None:
     now = time.time()
     if now - _last_log_cleanup < _LOG_CLEANUP_INTERVAL_S:
         return
-    _last_log_cleanup = now
-    deleted, errors = _cleanup_old_logs()
     _log = logging.getLogger(__name__)
-    if deleted or errors:
-        _log.info(
-            "logger: periodic log cleanup — deleted=%d errors=%d",
-            deleted, errors,
-        )
+    try:
+        deleted, errors = _cleanup_old_logs()
+        _last_log_cleanup = now  # only advance after success so failures retry
+        if deleted or errors:
+            _log.info(
+                "logger: periodic log cleanup — deleted=%d errors=%d",
+                deleted, errors,
+            )
+    except Exception as _exc:
+        _log.warning("logger: periodic log cleanup failed — will retry next interval: %s", _exc)
 
 
 def get_logger(name: str) -> logging.Logger:
