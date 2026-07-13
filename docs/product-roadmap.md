@@ -206,7 +206,7 @@ Workers already scale horizontally via Redis Streams consumer groups — no sche
 - Signed task tokens on stream messages (prevent a rogue worker from injecting fake jobs)
 - Server-side result validation before DB writes (reject results from unauthenticated sources)
 - Redis ACLs: restrict each server to only the key namespaces it needs
-- Append-only database roles: workers get INSERT/UPDATE only; DROP/TRUNCATE restricted to operator sessions
+- Append-only database roles: workers get INSERT + bounded UPDATEs (poll stats, status fields, outreach tracking); DROP/TRUNCATE/DELETE restricted to operator sessions
 - Per-server rate limits on XADD (prevent one misbehaving node from flooding the stream)
 
 ```python

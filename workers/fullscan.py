@@ -927,6 +927,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         # all pages in one call and process in FULLSCAN_CHUNK_SIZE chunks.
         set_progress(company, "fullscan_fetching")
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
+        _partial_fetch = False
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except IncompleteSearchError as exc:
@@ -938,6 +939,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company, company, len(exc.stubs),
             )
             raw_jobs = exc.stubs
+            _partial_fetch = True
         set_progress(company, "fullscan_processing")
 
         # ── Persist slug_info mutations made in-place by ATS modules ──────────
@@ -1178,6 +1180,19 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 "fullscan [%s]: checkpointed at page=%d — "
                 "re-queued with score=now-1 (immediately due on resume)",
                 company, page_num,
+            )
+
+        elif _partial_fetch:
+            # Avature pagination cut short — presence-tracked jobs already
+            # queued for detail; bloom and DB left unchanged so the next
+            # scheduled fullscan starts from a clean, complete baseline.
+            result["outcome"]     = "partial"
+            result["success"]     = True
+            result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+            logger.warning(
+                "fullscan [%s]: partial avature fetch — bloom and DB not updated; "
+                "company will be rescanned at next scheduled interval",
+                company,
             )
 
         else:

@@ -418,6 +418,9 @@ if (
 The job is retried (up to `_MAX_DETAIL_RETRIES`), giving scan_worker time to push a
 payload with the required keys. If retries are exhausted, it dead-letters with a full
 warning log rather than silently leaking.
+**Known limitation:** retries re-dispatch the original stream message; `slug_info` and
+`company_config` are not re-read from the DB between attempts. If they changed while the
+job was pending, the retry still uses the snapshot from the original dispatch.
 
 ### 6.4 detail_worker Bug 2: `_enriched=False` after Workday fetch → retryable ✅ DONE
 **File:** `workers/detail_worker.py`  

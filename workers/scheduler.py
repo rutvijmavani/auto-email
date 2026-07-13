@@ -242,7 +242,11 @@ def _get_stream_undelivered_count(r, stream_key: str,
                 name = name.decode()
             if name == group:
                 lag = g.get("lag")
-                return int(lag) if lag is not None else 0
+                if lag is not None:
+                    return int(lag)
+                xlen = r.xlen(stream_key)
+                pel  = _get_stream_pending_count(r, stream_key, group)
+                return max(0, xlen - pel)
         return 0
     except Exception:
         xlen = r.xlen(stream_key)

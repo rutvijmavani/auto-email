@@ -763,13 +763,9 @@ def on_adaptive_complete(company):
     update_stats(company)
     reschedule_adaptive(company)   # e.g. 8:30 PM → next_poll_at = 8:30 AM tomorrow
 
-    # Rule 3: standard 24h trigger
-    if should_trigger_full_scan(company):
-        redis.zadd("poll:fullscan", {company.name: time.time() + 300})
-        return
-
-    # Rule 5: crossing-7AM trigger
-    _maybe_trigger_pre7am_fullscan(company)
+    # Rule 3 + Rule 5: _maybe_reschedule_full_scan handles both the standard
+    # 24h trigger and the crossing-7AM case via _atomic_schedule (gap-filling).
+    _maybe_reschedule_full_scan(company, row)
 
 
 def _maybe_trigger_pre7am_fullscan(company):
@@ -1038,9 +1034,11 @@ when scheduling is genuinely missing or stale, and uses `_atomic_schedule` (gap-
 rather than a raw `zadd` to prevent clustering with other companies.
 
 This makes the adaptive-first rule structural: full scan **cannot** enter `poll:fullscan`
-without an adaptive poll having just completed. The `SCHEDULER_FULL_SCAN_BUFFER_S` offset
-(default 5 min) gives detail workers a head start on any new jobs adaptive just found
-before the full scan begins.
+without an adaptive poll having just completed — **except** via Path 3
+(`_queue_fullscans_for_missed()` in `job_monitor.py`), which schedules a fullscan directly
+after a listing-scan fallback when `next_full_scan_at` is NULL or stale. The
+`SCHEDULER_FULL_SCAN_BUFFER_S` offset (default 5 min) gives detail workers a head start
+on any new jobs adaptive just found before the full scan begins.
 
 **Full scan frequency** is controlled entirely by `full_scan_interval_s` (default 24h) in `company_poll_stats`. Even if adaptive runs twice in a day (which it will for active companies at 3–6h intervals), only the first call after the 24h window has elapsed triggers a new full scan:
 
@@ -1389,6 +1387,10 @@ ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
 if ceiling_raw:
     inflight_key = f"inflight:scans:{dc_key}"
     r.zremrangebyscore(inflight_key, 0, now - INFLIGHT_STALE_WINDOW_S)  # prune stale adaptive
+    # inflight:fullscans:{dc_key} is NOT pruned here: fullscan slots have a
+    # 2 h stale window (INFLIGHT_FULLSCAN_STALE_S) so pruning with the 10 min
+    # adaptive window would remove active fullscan slots mid-scan.  Stale
+    # fullscan entries are pruned atomically inside the Lua dispatch script.
     pending_count = (
         r.zcard(inflight_key)
         + r.zcard(f"inflight:fullscans:{dc_key}")   # fullscan slots count toward ceiling too
