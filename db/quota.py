@@ -121,7 +121,7 @@ def increment_usage(model):
         INSERT INTO model_usage (model, date, count)
         VALUES (?, ?, 1)
         ON CONFLICT(model, date)
-        DO UPDATE SET count = count + 1
+        DO UPDATE SET count = model_usage.count + 1
     """, (model, today))
     conn.commit()
     conn.close()
