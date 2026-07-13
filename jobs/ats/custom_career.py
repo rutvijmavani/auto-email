@@ -1755,7 +1755,7 @@ def _scrape_html_listing(soup):
         jid = _extract_id_from_path(href)
         if not jid:
             qs = parse_qs(urlparse(href).query)
-            for _k in ("jobId", "id", "req_id", "jobID", "job_id", "jobid"):
+            for _k in ("jobId", "req_id", "jobID", "job_id", "jobid", "id"):
                 if _k in qs:
                     jid = qs[_k][0]
                     break
