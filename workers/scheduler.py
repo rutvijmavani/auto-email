@@ -1106,6 +1106,11 @@ def _atomic_schedule(
                 "_atomic_schedule: lock busy for %r — scheduling %r at target_ts+%ds",
                 queue_key, company, _jitter_s,
             )
+            if skip_if_future:
+                # Use NX so a future score written by the lock-holder between our
+                # ZSCORE check and this ZADD is not overwritten.
+                r.zadd(queue_key, {company: score}, nx=True)
+                return score
         r.zadd(queue_key, {company: score})
         return score
     finally:
@@ -1195,6 +1200,7 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
         SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
         deadline_ts    = _next_digest_deadline(now),
         avg_duration_s = avg_duration,
+        skip_if_future = True,
     )
     logger.info(
         "scheduler: full scan queued for %r (next_full_scan_at=%s avg_duration=%.0fs)",
@@ -1371,7 +1377,11 @@ def adaptive_loop() -> None:
                         )
                         continue
 
-                # ── Dispatch: XADD → ZREM (two-layer pattern) ────────────────
+                # ── Dispatch: claim inflight slot → XADD → ZREM ──────────────
+                # Claim the adaptive inflight slot BEFORE XADD so the fullscan
+                # Lua script sees it and cannot consume the last ceiling slot
+                # between our pending_count check and the actual dispatch.
+                # Release the slot if XADD fails to prevent a slot leak.
                 canary_company_key = f"worker:outage:canary_company:{platform}"
                 dispatch_context = (
                     "canary"
@@ -1379,23 +1389,26 @@ def adaptive_loop() -> None:
                     else "normal"
                 )
 
-                r.xadd(
-                    REDIS_STREAM_ADAPTIVE,
-                    {
-                        "company":     company,
-                        "scan_type":   "adaptive",
-                        "dc_key":      dc_key,
-                        "context":     dispatch_context,
-                        "enqueued_at": datetime.utcnow().isoformat(),
-                        "request_id":  f"adp-{int(now)}",
-                    },
-                    maxlen=STREAM_MAXLEN_ADAPTIVE,
-                    approximate=True,
-                )
+                _adaptive_inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
+                r.zadd(_adaptive_inflight_key, {company: now})
+                try:
+                    r.xadd(
+                        REDIS_STREAM_ADAPTIVE,
+                        {
+                            "company":     company,
+                            "scan_type":   "adaptive",
+                            "dc_key":      dc_key,
+                            "context":     dispatch_context,
+                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "request_id":  f"adp-{int(now)}",
+                        },
+                        maxlen=STREAM_MAXLEN_ADAPTIVE,
+                        approximate=True,
+                    )
+                except Exception:
+                    r.zrem(_adaptive_inflight_key, company)
+                    raise
                 r.zrem(REDIS_POLL_ADAPTIVE, company)
-
-                # Keep inflight ZSET for Phase 10 fast_error_check compatibility
-                r.zadd(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", {company: now})
                 _hw_dispatched += 1
 
                 logger.debug(
@@ -2775,8 +2788,9 @@ def _slow_throughput_check_loop() -> None:
                         _hysteresis["scan_remove"] = 0
 
             # ── Fullscan scaling (independent of scan/detail cascade) ──────────
-            # Scale up when the fullscan stream has more pending messages than
-            # workers (each worker is busy AND more work is waiting).
+            # Scale up whenever there is any undelivered fullscan work (lag > 0),
+            # not only when lag exceeds current worker count — workers may all be
+            # busy on long scans while new companies queue up behind them.
             # Scale down when the stream is idle and pool is above the floor.
             # Uses the same 2-consecutive-check hysteresis as scan/detail.
             fullscan_stream_depth = _get_stream_undelivered_count(
@@ -2784,7 +2798,7 @@ def _slow_throughput_check_loop() -> None:
             )
             fullscan_ceil = _fullscan_budget
 
-            if fullscan_stream_depth > n_fullscan:
+            if fullscan_stream_depth > 0:
                 _hysteresis["fullscan_add"]    += 1
                 _hysteresis["fullscan_remove"]  = 0
 

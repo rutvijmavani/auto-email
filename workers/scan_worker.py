@@ -318,6 +318,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
 
         set_request_context(_scan_ctx)
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
+        _fetch_complete = True
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except IncompleteSearchError as exc:
@@ -329,6 +330,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 request_id, company, len(exc.stubs),
             )
             raw_jobs = exc.stubs
+            _fetch_complete = False
         finally:
             set_request_context("normal")   # always reset, even on exception
 
@@ -411,7 +413,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 config=config,
                 request_id=request_id,
             )
-            mark_first_scan_complete(company)
+            if _fetch_complete:
+                mark_first_scan_complete(company)
             duration_ms = int((time.monotonic() - start_mono) * 1000)
             result.update({
                 "success":     True,

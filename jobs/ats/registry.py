@@ -336,9 +336,10 @@ def should_fetch_detail(job: dict, platform: str, config: dict,
     required_keys = {
         "icims":           "_base_url",
         "jobvite":         "_slug",
-        "taleo":           "_contest_no",
         "smartrecruiters": "_company_slug",
     }
+    if platform == "taleo":
+        return bool(job.get("_contest_no") and job.get("_base_url"))
     key = required_keys.get(platform)
     if key is not None:
         return bool(job.get(key))

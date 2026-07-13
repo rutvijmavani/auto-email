@@ -361,7 +361,7 @@ Full scan dispatcher (runs every 5 seconds):
            ZADD poll:fullscan {company: now+30}
            continue  ← re-queue and skip
          ZADD inflight:fullscans:{dc_key} {now} {company}  ← claim slot atomically
-       XADD stream:fullscan:{dc_key} MAXLEN ~ 500 * {company, dc_key, triggered_at}
+       XADD stream:fullscan (single shared stream) * {company, dc_key, triggered_at}
          On XADD failure: ZREM inflight:fullscans:{dc_key} {company}  ← release claimed slot
            and ZADD poll:fullscan {company: now+60}  ← reschedule; prevents slot leak
        ZREM poll:fullscan {company}

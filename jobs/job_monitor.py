@@ -891,9 +891,12 @@ def _process_company(company_row, position, total):
                 return result
             # Partial stubs: use what was collected but skip absence tracking —
             # the result set is incomplete and marking unseen jobs as missing
-            # would be incorrect.
-            raw_jobs       = exc.stubs
-            _scan_complete = False
+            # would be incorrect.  Mark failed for alerting so the pipeline
+            # knows the scan did not complete, while still processing the stubs.
+            raw_jobs                 = exc.stubs
+            _scan_complete           = False
+            result["failed"]         = 1
+            result["failure_name"]   = company
             logger.warning(
                 "avature [%s]: incomplete SearchJobs scan (%d stub(s)) — "
                 "absence tracking skipped",
@@ -1043,14 +1046,14 @@ def _process_company(company_row, position, total):
                     continue
 
         elif platform == "workday":
-            # should_fetch_detail returned False (missing _external_path or wd keys).
-            # Apply listing-level location fallback so non-US jobs are not leaked.
-            if not is_us_location(job.get("location", "")):
-                logger.debug(
-                    "Workday non-US dropped (no-detail listing fallback): %r | %s | %s",
-                    company, job.get("title"), job.get("location"),
-                )
-                continue
+            # should_fetch_detail returned False — required detail keys (_external_path,
+            # _slug, _wd, _path) are missing.  Without detail we cannot determine
+            # location, so skip unconditionally to avoid leaking non-US jobs.
+            logger.debug(
+                "Workday skipped (missing required detail keys): %r | %s | %s",
+                company, job.get("title"), job.get("location"),
+            )
+            continue
 
         # ── Alpha-2 listing-level gate ────────────────────────────────────────
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
