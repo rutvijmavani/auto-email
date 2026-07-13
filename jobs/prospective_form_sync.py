@@ -29,10 +29,13 @@ Flow:
 """
 
 import os
+import sys
 import re
 import json
 from datetime import datetime
 from urllib.parse import urlparse
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gspread
 from google.oauth2.service_account import Credentials
