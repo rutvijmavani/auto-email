@@ -960,8 +960,7 @@ class TestOnAdaptiveCompleteAlertIntegration(unittest.TestCase):
                    side_effect=[mock_conn_select, mock_conn_update]), \
              patch("workers.scheduler._reschedule_adaptive"), \
              patch("workers.scheduler.clear_heartbeat"), \
-             patch("workers.scheduler._should_trigger_full_scan",
-                   return_value=False), \
+             patch("workers.scheduler._maybe_reschedule_full_scan"), \
              patch("workers.scheduler.load_poll_counts",
                    return_value=[]), \
              patch("workers.scheduler.update_poll_interval",
