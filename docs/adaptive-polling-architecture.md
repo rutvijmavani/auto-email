@@ -1,4 +1,4 @@
-﻿# Adaptive Job Monitoring Architecture
+# Adaptive Job Monitoring Architecture
 
 ## Table of Contents
 
@@ -314,33 +314,33 @@ Adaptive dispatcher (runs every second):
   2. For each due company:
        dc_key  = get_dc_key(company)
        ceiling = get_ceiling(redis, dc_key)          ← worker:ceil:learned:{dc_key}
-       inflight = pel_size(stream:adaptive:{dc_key}) ← PEL replaces inflight ZSET
+       inflight = ZCARD(inflight:scans:{dc_key}) + ZCARD(inflight:fullscans:{dc_key})
        if inflight >= ceiling: skip (hold, retry next tick)
-       XADD stream:adaptive:{dc_key} MAXLEN ~ 1000 * {company, due_at}
+       XADD stream:adaptive (shared stream) MAXLEN ~ 1000 * {company, dc_key, due_at}
        ZREM poll:adaptive {company}   ← only after successful XADD
 
-Listing scan workers (one pool per dc_key):
+Listing scan workers (one shared pool, dc_key in message fields):
   consumer = f"worker-{hostname}-{pid}"   ← unique per process, prevents PEL theft
 
   Startup (once per worker):
-       XGROUP CREATE stream:adaptive:{dc_key} scan-workers $ MKSTREAM
+       XGROUP CREATE stream:adaptive scan-workers $ MKSTREAM
        ↑ id=$ → only new messages; BUSYGROUP error = group exists → ignore
 
   Main loop (500ms block, not 5000ms — must react to pipeline:pause within ~1s):
   1. if pause_event.is_set(): wait_for_resume(); continue
   2. XREADGROUP GROUP scan-workers {consumer} COUNT 1 BLOCK 500
-          STREAMS stream:adaptive:{dc_key} >
+          STREAMS stream:adaptive >
   3. Run listing scan for company
   4. on_adaptive_complete(company):
        a. Update stats (recent_poll_counts, score, interval)
        b. ZADD poll:adaptive {company: now + new_interval}  ← reschedule
        c. Rule 3 / Rule 5: ZADD poll:fullscan if full scan due
-  5. XACK stream:adaptive:{dc_key} {msg_id}  ← only after step 4 completes
+  5. XACK stream:adaptive {msg_id}  ← only after step 4 completes
 
   Crash recovery (run when step 2 returns empty — no new messages):
        p95_ms = get_p95_listing_scan_ms(redis, dc_key)   ← from api_health, 5-min cache
        idle_ms = max(p95_ms * 3, 60_000)                 ← at least 1 min
-       XAUTOCLAIM stream:adaptive:{dc_key} scan-workers {consumer}
+       XAUTOCLAIM stream:adaptive scan-workers {consumer}
                   MIN-IDLE-TIME {idle_ms}
        → re-delivers messages idle longer than 3× p95 from crashed workers
        → check delivery_count before running; dead-letter after MAX_REDELIVERIES (5)
@@ -366,7 +366,7 @@ Full scan dispatcher (runs every 5 seconds):
            and ZADD poll:fullscan {company: now+60}  ← reschedule; prevents slot leak
        ZREM poll:fullscan {company}
 
-Full scan workers (one pool per dc_key):
+Full scan workers (one shared pool):
   consumer = f"worker-{hostname}-{pid}"
 
   Startup:
@@ -379,8 +379,8 @@ Full scan workers (one pool per dc_key):
           STREAMS stream:fullscan >
   3. Run full scan (all pages, Bloom filter, checkpoint support)
   4. XACK stream:fullscan {msg_id}
-     Full scan does NOT self-reschedule — on_adaptive_complete() handles
-     re-entry into poll:fullscan via Rules 3 and 5
+     Full scan self-reschedules via Path 1: _atomic_schedule(r, poll:fullscan, now+interval) with gap-detection.
+     on_adaptive_complete() also triggers poll:fullscan entry via Rules 3 and 5
 
   Crash recovery (run when step 2 returns empty):
        p95_ms = get_p95_full_scan_ms(redis, dc_key)   ← separate from listing scan p95
@@ -1862,13 +1862,13 @@ Key: "stream:adaptive:{dc_key}"   e.g. stream:adaptive:workday_wd1
 Type: Stream (consumer groups, PEL)
 
 XADD stream:adaptive:{dc_key} MAXLEN ~ 1000 * company {name} due_at {ts}  — dispatcher enqueues (capped)
-XGROUP CREATE stream:adaptive:{dc_key} scan-workers $ MKSTREAM             — worker startup; id=$ = new only
+XGROUP CREATE stream:adaptive scan-workers $ MKSTREAM             — worker startup; id=$ = new only
   (BUSYGROUP error → group exists → ignore; do NOT use id=0 → re-delivers all history)
 consumer = f"worker-{hostname}-{pid}"                                       — unique per process
 XREADGROUP GROUP scan-workers {consumer} COUNT 1 BLOCK 500                 — 500ms block; reacts to pause signal
-  STREAMS stream:adaptive:{dc_key} >
+  STREAMS stream:adaptive >
 XACK stream:adaptive:{dc_key} scan-workers {msg_id}                        — after on_adaptive_complete
-XAUTOCLAIM stream:adaptive:{dc_key} scan-workers {consumer}
+XAUTOCLAIM stream:adaptive scan-workers {consumer}
   MIN-IDLE-TIME {p95_listing_scan_ms * 3}                                  — self-calibrating, not hardcoded
 XPENDING stream:adaptive:{dc_key} scan-workers                             — inflight count (ceiling check)
 ```

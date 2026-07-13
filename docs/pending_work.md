@@ -299,7 +299,7 @@ Checking both keys would give a false-alive result if one loop died while the ot
 - Extended `_add_one_worker()` / `_remove_one_worker()` to handle `"fullscan"` type
 - Added `_get_fullscan_pool_size()` helper
 - Added fullscan scaling block in `_slow_throughput_check_loop`:
-  - Scale up when `stream:fullscan` has more messages than current pool size (2-check hysteresis)
+  - Scale up when `stream:fullscan` has any positive undelivered lag (`lag > 0`), regardless of pool size (2-check hysteresis)
   - Scale down when stream is idle and pool > `WORKER_FLOOR` (2-check hysteresis)
   - Ceiling: `fullscan_ceil = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))`
 

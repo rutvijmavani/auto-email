@@ -967,6 +967,7 @@ def run():
                     print("       [OK] Added to pipeline")
 
             except Exception as e:
+                conn.rollback()
                 logger.error(
                     "Row %d: DB error for %r: %s",
                     sheet_row, company, e, exc_info=True

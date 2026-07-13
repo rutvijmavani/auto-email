@@ -1006,6 +1006,9 @@ return 0
 # ARGV[4] = company (member to ZADD on success)
 # ARGV[5] = now (score for ZADD)
 _FULLSCAN_INFLIGHT_CLAIM_LUA = """
+if redis.call('ZSCORE', KEYS[2], ARGV[4]) then
+    return 0
+end
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[2])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, ARGV[3])
 local total = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
@@ -2830,7 +2833,9 @@ def _slow_throughput_check_loop() -> None:
                             ),
                         )
                         _hysteresis["fullscan_add"] = 0
-            elif fullscan_stream_depth == 0 and n_fullscan > WORKER_FLOOR:
+            elif (fullscan_stream_depth == 0
+                  and _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN) == 0
+                  and n_fullscan > WORKER_FLOOR):
                 _hysteresis["fullscan_remove"] += 1
                 _hysteresis["fullscan_add"]     = 0
 

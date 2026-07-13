@@ -73,6 +73,7 @@ from config import (
     REDIS_DETAIL_FULLSCAN,
     WORKER_BLOCK_SECS,
     REDIS_BACKOFF_PREFIX,
+    REDIS_ADAPTIVE_SEEN_PREFIX,
 )
 from workers.redis_client import get_redis
 from workers.heartbeat import Heartbeat
@@ -505,6 +506,16 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
             )
             try:
                 delete_pending_detail(company, job_id)
+                if source_queue == REDIS_DETAIL_ADAPTIVE:
+                    try:
+                        get_redis().srem(
+                            f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}", job_id
+                        )
+                    except Exception as _srem_err:
+                        logger.debug(
+                            "detail_worker: adaptive_seen SREM failed for %s/%s: %s",
+                            company, job_id, _srem_err,
+                        )
             except Exception as _del_err:
                 logger.error(
                     "detail_worker: delete_pending_detail failed for %s/%s: %s",
@@ -634,6 +645,16 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     result["outcome"]   = "error"
                     try:
                         delete_pending_detail(company, job_id)
+                        if source_queue == REDIS_DETAIL_ADAPTIVE:
+                            try:
+                                get_redis().srem(
+                                    f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}", job_id
+                                )
+                            except Exception as _srem_err:
+                                logger.debug(
+                                    "detail_worker: adaptive_seen SREM failed for %s/%s: %s",
+                                    company, job_id, _srem_err,
+                                )
                     except Exception as _del_err:
                         logger.error(
                             "detail_worker: delete_pending_detail failed for %s/%s: %s",

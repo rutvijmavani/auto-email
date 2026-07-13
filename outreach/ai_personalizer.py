@@ -1,5 +1,6 @@
 # ai_personalizer.py
 
+import logging
 import os
 from google import genai
 from dotenv import load_dotenv
@@ -12,6 +13,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found in .env file")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+logger = logging.getLogger(__name__)
 
 
 def generate_job_based_intro(company, job_text):
@@ -82,7 +84,7 @@ Do not include any placeholder like [Dear Hiring manager].
         )
         return response.text.strip()
     except Exception as e:
-        print("Gemini error (followup):", e)
+        logger.error("ai_personalizer: Gemini error (followup): %s", e)
         return ""
 
 
