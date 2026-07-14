@@ -29,7 +29,7 @@ from jobs.ats import (
     greenhouse, lever, ashby, smartrecruiters, workday,
     oracle_hcm, icims, jobvite, avature, phenom,
     talentbrew, sitemap, successfactors, google,
-    taleo, eightfold, jibe, custom_career, adp,
+    taleo, eightfold, jibe, custom_career, adp, paycom,
 )
 
 ATS_REGISTRY = {
@@ -249,6 +249,19 @@ ATS_REGISTRY = {
         "listing_filter":  "full",
         "has_detail":      False,
         "country_source":  "alpha2",
+    },
+
+    "paycom": {
+        # Listing includes "locations" text ("Cranberry Township , PA") — filter at listing.
+        # Description and authoritative location require detail fetch.
+        # Slug is JSON {"host": "...", "key": "..."} — host and portal key vary per tenant.
+        "module":         paycom,
+        "slug_type":      "json",
+        "detect_phases":  [],
+        "site_search":    None,
+        "listing_filter": "full",
+        "has_detail":     True,
+        "country_source": "text",
     },
 
     # ── Custom: catch-all for companies with curl-captured ATS configs ────────
