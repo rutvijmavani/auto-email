@@ -531,27 +531,35 @@ def query_p95_response_ms(scan_type: str) -> int:
     from db.connection import get_conn
 
     since = (date.today() - timedelta(days=7)).isoformat()
-    conn  = None
-    try:
+
+    def _query():
         conn = get_conn()
-        row = conn.execute("""
-            SELECT AVG(max_response_ms) AS avg_max_ms
-            FROM api_health
-            WHERE platform = ANY(?)
-              AND date >= ?
-              AND context = 'normal'
-              AND max_response_ms > 0
-        """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
-    except Exception as _exc:
-        _default = 30_000 if scan_type == "listing_scan" else 120_000
-        logger.warning(
-            "query_p95_response_ms(%r): DB error (%s) — returning default %d ms",
-            scan_type, _exc, _default,
-        )
-        return _default
-    finally:
-        if conn:
+        try:
+            return conn.execute("""
+                SELECT AVG(max_response_ms) AS avg_max_ms
+                FROM api_health
+                WHERE platform = ANY(?)
+                  AND date >= ?
+                  AND context = 'normal'
+                  AND max_response_ms > 0
+            """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
+        finally:
             conn.close()
+
+    row = None
+    for _attempt in range(2):
+        try:
+            row = _query()
+            break
+        except Exception as _exc:
+            if _attempt == 0:
+                continue
+            _default = 30_000 if scan_type == "listing_scan" else 120_000
+            logger.warning(
+                "query_p95_response_ms(%r): DB error (%s) — returning default %d ms",
+                scan_type, _exc, _default,
+            )
+            return _default
 
     avg_max = (row["avg_max_ms"] or 0) if row else 0
     if avg_max <= 0:
@@ -599,7 +607,7 @@ def record_scaling_event(
         worker_add | worker_remove | ceiling_learned |
         outage_start | canary_probe | outage_end
     """
-    try:
+    def _do_insert():
         conn = get_conn()
         try:
             conn.execute("""
@@ -629,11 +637,19 @@ def record_scaling_event(
             conn.commit()
         finally:
             conn.close()
-    except Exception as exc:
-        logger.warning(
-            "api_health: record_scaling_event failed (event_type=%r platform=%r): %s",
-            event_type, platform, exc,
-        )
+
+    for _attempt in range(2):
+        try:
+            _do_insert()
+            return
+        except Exception as exc:
+            if _attempt == 0:
+                # Transient connection loss — retry once with a fresh connection
+                continue
+            logger.warning(
+                "api_health: record_scaling_event failed (event_type=%r platform=%r): %s",
+                event_type, platform, exc,
+            )
 
 
 def flush():
