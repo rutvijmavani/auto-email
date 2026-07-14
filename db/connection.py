@@ -262,15 +262,29 @@ def get_conn() -> _Connection:
             continue
         try:
             raw.reset()  # sends ROLLBACK; raises OperationalError if connection is dead
+        except psycopg2.Error:
+            try:
+                pool.putconn(raw, close=True)
+            except psycopg2.Error:
+                pass
+            continue
+        try:
+            raw.autocommit = False
+            return _Connection(raw, pool)
         except Exception:
             try:
                 pool.putconn(raw, close=True)
             except Exception:
                 pass
-            continue
-        raw.autocommit = False
-        return _Connection(raw, pool)
+            raise
     # Both attempts returned stale connections; get a fresh one and let errors surface
     raw = pool.getconn()
-    raw.autocommit = False
-    return _Connection(raw, pool)
+    try:
+        raw.autocommit = False
+        return _Connection(raw, pool)
+    except Exception:
+        try:
+            pool.putconn(raw, close=True)
+        except Exception:
+            pass
+        raise

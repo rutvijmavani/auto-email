@@ -69,8 +69,15 @@ Full privacy and authorization infrastructure (role-based access, self-service d
 
 | Task | Effort | Why |
 |------|--------|-----|
-| log_monitor: field-split level parsing (Option C) | 30 min | Current regex misses WARNING-level errors (e.g. Barclays missing keys). `line.split('\|')[1].strip()` is reliable and level-aware. Fixes the current known bug. |
+| log_monitor: field-split level parsing (Option C) | 30 min | Current regex misses WARNING-level errors (e.g. Barclays missing keys). Field-split on the pipe delimiter is reliable and level-aware. Fixes the current known bug. See implementation below. |
 | Commit + push all pending changes | 1–2 hrs | 15+ modified files uncommitted. Block everything else until this is done. |
+
+**Option C implementation pattern** (copy-pasteable — fenced to avoid Markdown pipe escaping):
+
+```python
+parts = line.split('|', 3)
+level = parts[1].strip() if len(parts) >= 2 else ""
+```
 
 #### log_monitor WARNING Detection — Full Options Evaluated
 
@@ -295,7 +302,7 @@ Becomes essential when logs need to be aggregated across multiple servers. Not w
 
 **Option D — JSON structured logging (do this):**
 - All `logging.Formatter` → emit JSON `{"time":…, "level":…, "logger":…, "msg":…}`
-- `log_monitor.py` → `json.loads(line)["level"]` replaces the field-split from Phase 0 (one-line change)
+- `log_monitor.py` → introduce a shared `_parse_log_level(line)` helper used by both `_is_flagged` and `_is_suppressed`: tries `json.loads(line)["level"]`, falls back to the Phase 0 field-split for non-JSON lines (e.g. tracebacks written as raw text), returns `""` for records with no level field; `_is_flagged` retains its existing regex fallback for bare tracebacks and exception-type lines that carry no level at all
 - TTY detection → pretty-print for local dev
 - Central log shipper (Loki, CloudWatch) → ingest JSON directly
 - **Effort:** 3–4 days
