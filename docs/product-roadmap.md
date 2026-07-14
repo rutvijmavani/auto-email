@@ -69,8 +69,28 @@ Full privacy and authorization infrastructure (role-based access, self-service d
 
 | Task | Effort | Why |
 |------|--------|-----|
-| log_monitor: field-split level parsing | 30 min | Current regex misses WARNING-level errors (e.g. Barclays missing keys). `line.split('\|')[1].strip()` is reliable and level-aware. Fixes the current known bug. |
+| log_monitor: field-split level parsing (Option C) | 30 min | Current regex misses WARNING-level errors (e.g. Barclays missing keys). `line.split('\|')[1].strip()` is reliable and level-aware. Fixes the current known bug. |
 | Commit + push all pending changes | 1–2 hrs | 15+ modified files uncommitted. Block everything else until this is done. |
+
+#### log_monitor WARNING Detection — Full Options Evaluated
+
+**The problem:** `log_monitor.py` only flags `ERROR` and `CRITICAL` lines. Important WARNING-level issues (missing keys, failed DB ops) go completely undetected.
+
+We have Sentry already (`LoggingIntegration(event_level=logging.ERROR)` + unhandled exception capture), which changes the calculus on how much in-process logging infrastructure to add.
+
+| Option | What it does | Effort | Verdict |
+|--------|-------------|--------|---------|
+| **A — Error-only log file** | Separate file handler that writes only ERROR+ lines; `log_monitor` scans only that file | ~2 hrs | **Skip** — gets completely thrown away when Option D (JSON logging) lands; no net value |
+| **B — Custom logging handler** | `logging.Handler` subclass with per-logger WARNING thresholds; fires alerts in-process | ~2 days | **Defer to Phase 2** — mostly redundant with Sentry for single-server solo use; becomes worthwhile at multi-server when Sentry free-tier limits bite |
+| **C — Field-split in log_monitor** | `line.split('\|')[1].strip()` instead of regex to parse level; broadens to WARNING for specific high-signal loggers | **30 min** | **Do now** — fixes the live blind spot; throwaway cost when D lands is ~5 min (one line change) |
+| **D — JSON structured logging** | All formatters emit `{"time":…,"level":…,"logger":…,"msg":…}`; `log_monitor` does `json.loads(line)["level"]` | ~4 days | **Defer to Phase 2** alongside multi-server — pays off immediately at that point; wasteful before it |
+
+**Decided sequence:**
+1. **Now:** C only (field-split fix)
+2. **Phase 2 (multi-server):** D alongside it — same work window, same deployment, pays off immediately
+3. **Phase 2 (multi-server):** B if Sentry free-tier limits become a problem; otherwise skip permanently
+
+**Why not B+D now?** B+D is ~6 days of work. During those 6 days, production has the WARNING blind spot. C costs 30 min and plugs it. When D lands, replacing C is one line: `line.split('|')[1]` → `json.loads(line)["level"]`.
 
 ---
 
@@ -269,17 +289,23 @@ If leader dies → lock expires → standby takes over. A paused former leader c
 
 **Effort:** ~30 lines of code, 2–3 days including testing
 
-#### 2b — JSON Structured Logging
+#### 2b — JSON Structured Logging + Custom Handler (Options D + B)
 
 Becomes essential when logs need to be aggregated across multiple servers. Not worth doing on a single server — human-readable logs are better there.
 
-**Changes:**
+**Option D — JSON structured logging (do this):**
 - All `logging.Formatter` → emit JSON `{"time":…, "level":…, "logger":…, "msg":…}`
-- `log_monitor.py` → `json.loads(line)["level"]` replaces regex/field-split
+- `log_monitor.py` → `json.loads(line)["level"]` replaces the field-split from Phase 0 (one-line change)
 - TTY detection → pretty-print for local dev
 - Central log shipper (Loki, CloudWatch) → ingest JSON directly
+- **Effort:** 3–4 days
 
-**Effort:** 3–4 days
+**Option B — Custom logging handler (evaluate at Phase 2, skip if Sentry covers it):**
+- `logging.Handler` subclass with per-logger WARNING thresholds (e.g. `detail_worker` at WARNING+, everything else at ERROR+)
+- Fires in-process alerts without waiting for the 15-min `log_monitor` cron cycle
+- Only worth adding if Sentry free-tier limits (5k events/month) are being hit
+- If Sentry limits aren't a problem: skip B permanently, Sentry already handles unhandled exceptions
+- **Effort:** ~2 days
 
 #### 2c — Distributed Worker Fleet
 
