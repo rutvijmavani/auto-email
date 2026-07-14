@@ -88,6 +88,7 @@ from db.db import init_db
 from db.job_monitor import (
     complete_pending_detail,
     delete_pending_detail,
+    ContentHashConflict,
 )
 
 logger = get_logger(__name__)
@@ -803,6 +804,22 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         logger.info(
             "detail_worker: NEW job | company=%r | %s | %s",
             company, job.get("title"), job.get("location"),
+        )
+
+    except ContentHashConflict:
+        # A different job already stored this exact content — permanent duplicate.
+        # Delete the pending_detail row and discard without retrying.
+        result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
+        result["outcome"]     = "duplicate"
+        result["retryable"]   = False
+        try:
+            delete_pending_detail(company, job_id)
+        except Exception:
+            pass
+        logger.info(
+            "detail_worker: duplicate content_hash — discarding job_id=%s company=%r "
+            "(identical content already stored under a different job_id)",
+            job_id, company,
         )
 
     except Exception as exc:
