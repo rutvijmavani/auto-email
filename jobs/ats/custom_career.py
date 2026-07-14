@@ -108,6 +108,16 @@ MAX_JOBS             = 5000
 ANALYSIS_SAMPLE_SIZE = 10
 PAGE_RETRY_DELAY     = 1.0
 
+# Akamai Bot Manager cookies — cryptographically bound to the original browser
+# session and validated server-side on every request.  Pre-seeding these from
+# stored config poisons the warm-up: Akamai detects the replayed token and
+# flags the session as a bot before it can issue fresh ones.  Stripping them
+# before the warm-up GET lets Akamai's edge set valid cookies from scratch.
+_AKAMAI_COOKIES: frozenset[str] = frozenset({
+    "_abck", "bm_sz", "bm_ss", "bm_so", "bm_sv",
+    "ak_bmsc", "bm_lso", "bm_s",
+})
+
 # REQUEST_TIMEOUT, SKIP_HEADERS, UNIX_TS_MIN, UNIX_TS_MS_MIN
 # imported from jobs.utils
 
@@ -289,6 +299,14 @@ def _warm_session(slug_info, company):
     for _name, _val in (slug_info.get("cookies") or {}).items():
         if _name not in session.cookies:
             session.cookies.set(_name, _val)
+
+    # Strip Akamai Bot Manager cookies before the warm-up GET.
+    # These are cryptographically bound to the original browser session —
+    # sending stale ones signals a replayed/bot request to Akamai's edge,
+    # poisoning the session before it can receive fresh tokens.  Starting
+    # clean lets the warm-up GET trigger proper Akamai cookie issuance.
+    for _ck in _AKAMAI_COOKIES:
+        session.cookies.delete(_ck)
 
     # Load career page
     try:
