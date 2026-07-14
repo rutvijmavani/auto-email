@@ -204,10 +204,11 @@ class _Connection:
     # ── Pool return ───────────────────────
 
     def close(self):
-        """Return this connection to the pool. Does NOT close the socket."""
+        """Return this connection to the pool, discarding it if broken."""
         if not self._returned:
             self._returned = True
-            self._pool.putconn(self._conn)
+            broken = getattr(self._conn, "closed", 0) != 0
+            self._pool.putconn(self._conn, close=broken)
 
     def __del__(self):
         """Safety net: return to pool if caller forgot to call close()."""
@@ -248,8 +249,42 @@ def get_conn() -> _Connection:
     Borrow a connection from the pool.
     Caller MUST call conn.close() (or use as context manager) to return it.
     The connection has autocommit=False — all writes require conn.commit().
+
+    Probes each borrowed connection with ROLLBACK before returning it so that
+    connections dropped by the server while idle (TCP timeout / server restart)
+    are detected and replaced rather than handed to callers as stale.
     """
     pool = _get_pool()
-    raw  = pool.getconn()
-    raw.autocommit = False
-    return _Connection(raw, pool)
+    for _attempt in range(2):
+        raw = pool.getconn()
+        if raw.closed:
+            pool.putconn(raw, close=True)
+            continue
+        try:
+            raw.reset()  # sends ROLLBACK; raises OperationalError if connection is dead
+        except psycopg2.Error:
+            try:
+                pool.putconn(raw, close=True)
+            except psycopg2.Error:
+                pass
+            continue
+        try:
+            raw.autocommit = False
+            return _Connection(raw, pool)
+        except Exception:
+            try:
+                pool.putconn(raw, close=True)
+            except Exception:
+                pass
+            raise
+    # Both attempts returned stale connections; get a fresh one and let errors surface
+    raw = pool.getconn()
+    try:
+        raw.autocommit = False
+        return _Connection(raw, pool)
+    except Exception:
+        try:
+            pool.putconn(raw, close=True)
+        except Exception:
+            pass
+        raise
