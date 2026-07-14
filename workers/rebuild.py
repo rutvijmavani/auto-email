@@ -20,9 +20,10 @@ Usage:
 """
 
 import json
-import logging
 import math
 import time
+
+from logger import get_logger
 
 from workers.redis_client import get_redis
 from db.db import get_conn, init_db, get_monitorable_companies
@@ -36,7 +37,7 @@ from config import (
     CYCLE_START_HOUR,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────

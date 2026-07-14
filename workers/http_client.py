@@ -36,10 +36,11 @@ HTTP timeouts (Section 18):
 """
 
 import json
-import logging
 import random
 import threading
 import time
+
+from logger import get_logger
 from typing import Optional
 
 import requests
@@ -68,7 +69,7 @@ from config import (
 )
 from workers.redis_client import get_redis
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # HTTP timeouts (Section 18 — Resilience)
 _CONNECT_TIMEOUT = 10

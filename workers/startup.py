@@ -17,9 +17,10 @@ Usage:
 
 import os
 import sys
-import logging
 
-logger = logging.getLogger(__name__)
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 # Config keys required for all pipeline workers.
 _REQUIRED_ENV_KEYS = [
