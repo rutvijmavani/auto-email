@@ -2,6 +2,9 @@
 
 from db.connection import get_conn, DAILY_LIMITS
 from config import MAX_CONTACTS_HARD_CAP, MAX_RECRUITERS_PER_APPLICATION
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def link_recruiter_to_application(application_id, recruiter_id):
@@ -44,20 +47,32 @@ def get_recruiters_for_application(application_id):
     return rows
 
 
-def get_unique_companies_needing_scraping(min_recruiters=2):
+def get_unique_companies_needing_scraping(min_recruiters=2, user_id: int | None = None):
     """Return unique company names with fewer than min_recruiters active recruiters."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT a.id, a.company, COUNT(r.id) as recruiter_count
-        FROM applications a
-        LEFT JOIN application_recruiters ar ON ar.application_id = a.id
-        LEFT JOIN recruiters r ON r.id = ar.recruiter_id AND r.recruiter_status = 'active'
-        WHERE a.status = 'active'
-        GROUP BY a.id, a.company
-        HAVING COUNT(r.id) < ?
-        ORDER BY a.applied_date ASC
-    """, (min_recruiters,))
+    if user_id is not None:
+        c.execute("""
+            SELECT a.id, a.company, COUNT(r.id) as recruiter_count
+            FROM applications a
+            LEFT JOIN application_recruiters ar ON ar.application_id = a.id
+            LEFT JOIN recruiters r ON r.id = ar.recruiter_id AND r.recruiter_status = 'active'
+            WHERE a.status = 'active' AND a.user_id = ?
+            GROUP BY a.id, a.company
+            HAVING COUNT(r.id) < ?
+            ORDER BY a.applied_date ASC
+        """, (user_id, min_recruiters))
+    else:
+        c.execute("""
+            SELECT a.id, a.company, COUNT(r.id) as recruiter_count
+            FROM applications a
+            LEFT JOIN application_recruiters ar ON ar.application_id = a.id
+            LEFT JOIN recruiters r ON r.id = ar.recruiter_id AND r.recruiter_status = 'active'
+            WHERE a.status = 'active'
+            GROUP BY a.id, a.company
+            HAVING COUNT(r.id) < ?
+            ORDER BY a.applied_date ASC
+        """, (min_recruiters,))
     rows = c.fetchall()
     conn.close()
 
@@ -67,31 +82,50 @@ def get_unique_companies_needing_scraping(min_recruiters=2):
         if row["company"] not in seen:
             seen.add(row["company"])
             unique.append(row["company"])
+    logger.debug("get_unique_companies_needing_scraping user_id=%s → %d companies",
+                 user_id, len(unique))
     return unique
 
 
-def get_companies_needing_more_recruiters():
+def get_companies_needing_more_recruiters(user_id: int | None = None):
     """
     Return companies with fewer than MAX_CONTACTS_HARD_CAP active recruiters,
     ordered by shortage then recency.
     """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT
-            a.company,
-            MAX(a.applied_date) as latest_applied,
-            COUNT(DISTINCT r.id) as recruiter_count,
-            (? - COUNT(DISTINCT r.id)) as shortage
-        FROM applications a
-        LEFT JOIN application_recruiters ar ON ar.application_id = a.id
-        LEFT JOIN recruiters r ON r.id = ar.recruiter_id
-            AND r.recruiter_status = 'active'
-        WHERE a.status = 'active'
-        GROUP BY a.company
-        HAVING COUNT(DISTINCT r.id) < ?
-        ORDER BY shortage DESC, latest_applied DESC
-    """, (MAX_CONTACTS_HARD_CAP, MAX_CONTACTS_HARD_CAP))
+    if user_id is not None:
+        c.execute("""
+            SELECT
+                a.company,
+                MAX(a.applied_date) as latest_applied,
+                COUNT(DISTINCT r.id) as recruiter_count,
+                (? - COUNT(DISTINCT r.id)) as shortage
+            FROM applications a
+            LEFT JOIN application_recruiters ar ON ar.application_id = a.id
+            LEFT JOIN recruiters r ON r.id = ar.recruiter_id
+                AND r.recruiter_status = 'active'
+            WHERE a.status = 'active' AND a.user_id = ?
+            GROUP BY a.company
+            HAVING COUNT(DISTINCT r.id) < ?
+            ORDER BY shortage DESC, latest_applied DESC
+        """, (MAX_CONTACTS_HARD_CAP, user_id, MAX_CONTACTS_HARD_CAP))
+    else:
+        c.execute("""
+            SELECT
+                a.company,
+                MAX(a.applied_date) as latest_applied,
+                COUNT(DISTINCT r.id) as recruiter_count,
+                (? - COUNT(DISTINCT r.id)) as shortage
+            FROM applications a
+            LEFT JOIN application_recruiters ar ON ar.application_id = a.id
+            LEFT JOIN recruiters r ON r.id = ar.recruiter_id
+                AND r.recruiter_status = 'active'
+            WHERE a.status = 'active'
+            GROUP BY a.company
+            HAVING COUNT(DISTINCT r.id) < ?
+            ORDER BY shortage DESC, latest_applied DESC
+        """, (MAX_CONTACTS_HARD_CAP, MAX_CONTACTS_HARD_CAP))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
@@ -124,11 +158,8 @@ def link_top_recruiters_for_company(application_id, company):
             linked += 1
     return linked
 
-# ─────────────────────────────────────────
-# ADD to db/application_recruiters.py
-# ─────────────────────────────────────────
 
-def get_sendable_count_for_date(date: str) -> int:
+def get_sendable_count_for_date(date: str, user_id: int | None = None) -> int:
     """
     Count applications with applied_date=date that have
     at least one active recruiter linked via application_recruiters.
@@ -141,15 +172,27 @@ def get_sendable_count_for_date(date: str) -> int:
     """
     conn = get_conn()
     try:
-        row = conn.execute("""
-            SELECT COUNT(DISTINCT a.id) AS sendable
-            FROM applications a
-            JOIN application_recruiters ar ON ar.application_id = a.id
-            JOIN recruiters r              ON r.id = ar.recruiter_id
-            WHERE a.applied_date = ?
-            AND   a.status = 'active'
-            AND   r.recruiter_status = 'active'
-        """, (date,)).fetchone()
+        if user_id is not None:
+            row = conn.execute("""
+                SELECT COUNT(DISTINCT a.id) AS sendable
+                FROM applications a
+                JOIN application_recruiters ar ON ar.application_id = a.id
+                JOIN recruiters r              ON r.id = ar.recruiter_id
+                WHERE a.applied_date = ?
+                AND   a.status = 'active'
+                AND   r.recruiter_status = 'active'
+                AND   a.user_id = ?
+            """, (date, user_id)).fetchone()
+        else:
+            row = conn.execute("""
+                SELECT COUNT(DISTINCT a.id) AS sendable
+                FROM applications a
+                JOIN application_recruiters ar ON ar.application_id = a.id
+                JOIN recruiters r              ON r.id = ar.recruiter_id
+                WHERE a.applied_date = ?
+                AND   a.status = 'active'
+                AND   r.recruiter_status = 'active'
+            """, (date,)).fetchone()
         return row["sendable"] if row else 0
     finally:
         conn.close()

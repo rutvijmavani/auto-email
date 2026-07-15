@@ -4,10 +4,13 @@ from datetime import datetime
 
 import psycopg2.errors
 from db.connection import get_conn
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def add_application(company, job_url, job_title=None, applied_date=None,
-                    expected_domain=None, status_override=None):
+                    expected_domain=None, status_override=None, user_id: int = 1):
     """
     Insert a new application.
     Returns (application_id, created) where created=True means newly inserted,
@@ -21,12 +24,12 @@ def add_application(company, job_url, job_title=None, applied_date=None,
         # RETURNING id replaces c.lastrowid (not available with psycopg2).
         c.execute("""
             INSERT INTO applications (company, job_url, job_title, applied_date,
-                                      expected_domain, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+                                      expected_domain, status, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             RETURNING id
         """, (company, job_url, job_title,
               applied_date or datetime.now().strftime("%Y-%m-%d"),
-              expected_domain, status))
+              expected_domain, status, user_id))
         row = c.fetchone()
         conn.commit()
         return row["id"], True
@@ -49,16 +52,24 @@ def add_application(company, job_url, job_title=None, applied_date=None,
         conn.close()
 
 
-def get_all_active_applications():
+def get_all_active_applications(user_id: int | None = None):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT * FROM applications
-        WHERE status = 'active'
-        ORDER BY applied_date ASC
-    """)
+    if user_id is not None:
+        c.execute("""
+            SELECT * FROM applications
+            WHERE status = 'active' AND user_id = ?
+            ORDER BY applied_date ASC
+        """, (user_id,))
+    else:
+        c.execute("""
+            SELECT * FROM applications
+            WHERE status = 'active'
+            ORDER BY applied_date ASC
+        """)
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
+    logger.debug("get_all_active_applications user_id=%s → %d rows", user_id, len(rows))
     return rows
 
 
@@ -160,7 +171,7 @@ def convert_prospective_to_active(company, real_job_url, job_title=None,
     except psycopg2.errors.UniqueViolation:
         # real_job_url already exists in applications table
         conn.rollback()
-        print(f"   [WARNING] Job URL already exists: {real_job_url}")
+        logger.warning("convert_prospective_to_active: job URL already exists: %s", real_job_url)
         return None
     finally:
         conn.close()
@@ -205,7 +216,7 @@ def get_existing_domain_for_company(company):
     return None
 
 
-def get_applications_by_date(date: str) -> list:
+def get_applications_by_date(date: str, user_id: int | None = None) -> list:
     """
     Return all applications with applied_date = date.
     date format: 'YYYY-MM-DD'
@@ -214,12 +225,20 @@ def get_applications_by_date(date: str) -> list:
     """
     conn = get_conn()
     try:
-        rows = conn.execute("""
-            SELECT id, company, job_url, job_title,
-                   applied_date, status, expected_domain
-            FROM applications
-            WHERE applied_date = ? AND status != 'prospective'
-        """, (date,)).fetchall()
+        if user_id is not None:
+            rows = conn.execute("""
+                SELECT id, company, job_url, job_title,
+                       applied_date, status, expected_domain
+                FROM applications
+                WHERE applied_date = ? AND status != 'prospective' AND user_id = ?
+            """, (date, user_id)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, company, job_url, job_title,
+                       applied_date, status, expected_domain
+                FROM applications
+                WHERE applied_date = ? AND status != 'prospective'
+            """, (date,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
