@@ -129,6 +129,7 @@ jobs:
 
             echo "[3/8] Checking out exact validated commit..."
             git reset --hard HEAD
+            git clean -fd
             git checkout -B main ${{ github.sha }}
 
             echo "[4/8] Installing dependencies..."
