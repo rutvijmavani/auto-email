@@ -37,19 +37,21 @@ def fetch_real_quota(page, user_id: int = 1):
                         remaining = int(cols[remaining_idx])
 
                         conn = get_conn()
-                        c = conn.cursor()
-                        today = datetime.now().strftime("%Y-%m-%d")
-                        used = 50 - remaining
-                        # Partial unique index: careershift_quota_user_date_key WHERE user_id IS NOT NULL
-                        c.execute("""
-                            INSERT INTO careershift_quota (user_id, date, total_limit, used, remaining)
-                            VALUES (?, ?, 50, ?, ?)
-                            ON CONFLICT(user_id, date) WHERE user_id IS NOT NULL DO UPDATE SET
-                                used = excluded.used,
-                                remaining = excluded.remaining
-                        """, (user_id, today, used, remaining))
-                        conn.commit()
-                        conn.close()
+                        try:
+                            c = conn.cursor()
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            used = 50 - remaining
+                            # Partial unique index: careershift_quota_user_date_key WHERE user_id IS NOT NULL
+                            c.execute("""
+                                INSERT INTO careershift_quota (user_id, date, total_limit, used, remaining)
+                                VALUES (?, ?, 50, ?, ?)
+                                ON CONFLICT(user_id, date) WHERE user_id IS NOT NULL DO UPDATE SET
+                                    used = excluded.used,
+                                    remaining = excluded.remaining
+                            """, (user_id, today, used, remaining))
+                            conn.commit()
+                        finally:
+                            conn.close()
 
                         logger.info("fetch_real_quota user_id=%d: remaining=%d/50", user_id, remaining)
                         print(f"[INFO] Real CareerShift quota user_id={user_id} — Remaining: {remaining}/50")

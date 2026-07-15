@@ -35,8 +35,8 @@ def add_application(company, job_url, job_title=None, applied_date=None,
         return row["id"], True
     except psycopg2.errors.UniqueViolation:
         conn.rollback()
-        c.execute("SELECT id, expected_domain FROM applications WHERE job_url = ?",
-                  (job_url,))
+        c.execute("SELECT id, expected_domain FROM applications WHERE job_url = ? AND user_id = ?",
+                  (job_url, user_id))
         row = c.fetchone()
         if not row:
             return (None, False)

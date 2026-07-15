@@ -103,7 +103,7 @@ def check_quota_health(user_id=None):
 
             if not _alert_already_sent(quota_type, alert_type, user_id=user_id):
                 suggested = _calculate_suggested_cap(
-                    alert_type, avg_used, total_limit, quota_type
+                    alert_type, avg_used, total_limit, quota_type, user_id=user_id
                 )
                 alerts.append({
                     "alert_type":    alert_type,
@@ -144,7 +144,7 @@ def _alert_already_sent(quota_type, alert_type, user_id=None):
     return row is not None
 
 
-def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
+def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type, user_id=None):
     if quota_type != "careershift":
         return None
 
@@ -159,15 +159,27 @@ def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
     else:
         conn = get_conn()
         c = conn.cursor()
-        c.execute("""
-            SELECT AVG(used) AS avg_used
-            FROM (
-                SELECT used
-                FROM careershift_quota
-                ORDER BY date DESC
-                LIMIT ?
-            ) sub
-        """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
+        if user_id is not None:
+            c.execute("""
+                SELECT AVG(used) AS avg_used
+                FROM (
+                    SELECT used
+                    FROM careershift_quota
+                    WHERE user_id = ?
+                    ORDER BY date DESC
+                    LIMIT ?
+                ) sub
+            """, (user_id, QUOTA_ALERT_CONSECUTIVE_DAYS))
+        else:
+            c.execute("""
+                SELECT AVG(used) AS avg_used
+                FROM (
+                    SELECT used
+                    FROM careershift_quota
+                    ORDER BY date DESC
+                    LIMIT ?
+                ) sub
+            """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
         row = c.fetchone()
         conn.close()
         avg_companies = (row["avg_used"] / current_cap) if row and row["avg_used"] else 1

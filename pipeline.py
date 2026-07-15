@@ -911,7 +911,7 @@ def run_quota_report(silent_if_healthy=False):
         try:
             to_email = get_user_email(user_id)
             send_email(to_email=to_email, body=body, company="Pipeline", subject=subject,
-                       user_id=user_id, attach_resume=False)
+                       attach_resume=False)
             logger.info("Quota alert email sent to user_id=%d (%s): %s", user_id, to_email, subject)
             print(f"[INFO] Quota alert sent to {to_email}: {subject}")
             for alert in alerts:

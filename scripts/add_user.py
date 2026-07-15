@@ -95,8 +95,14 @@ def main() -> int:
         logger.info("add_user: created user id=%d name=%r email=%r resume_path=%r",
                     new_id, args.name, args.email, args.resume_path)
 
-        if new_id == 2:
-            _run_deferred_backfills_for_user2(conn, new_id)
+        # Run deferred backfills whenever NULL rows remain — not only when new_id==2.
+        # This handles the case where user 3 is added but the backfill never ran for user 2.
+        # NULL rows always belong to user 2 (the original single-user account).
+        has_null = c.execute(
+            "SELECT 1 FROM careershift_quota WHERE user_id IS NULL LIMIT 1"
+        ).fetchone()
+        if has_null:
+            _run_deferred_backfills_for_user2(conn, 2)
 
         conn.commit()
 
@@ -117,14 +123,14 @@ def main() -> int:
     print(f"  CAREERSHIFT_USER_{uid}_PASS=<careershift-password>")
 
     if uid == 2:
-        print(f"\nExisting session file migration (run on SERVER):\n")
+        print("\nExisting session file migration (run on SERVER):\n")
         print(f"  mv data/careershift_session.json data/careershift_session_{uid}.json")
 
-    print(f"\nCareerShift session setup (run on LOCAL machine, then SCP to server):\n")
+    print("\nCareerShift session setup (run on LOCAL machine, then SCP to server):\n")
     print(f"  python careershift/auth_njit.py --user-id {uid}")
     print(f"  scp data/careershift_session_{uid}.json opc@<server>:/home/opc/mail/data/")
 
-    print(f"\nSession renewal every ~30 days:\n")
+    print("\nSession renewal every ~30 days:\n")
     print(f"  python careershift/auth_njit.py --user-id {uid}")
     print(f"  scp data/careershift_session_{uid}.json opc@<server>:/home/opc/mail/data/")
 

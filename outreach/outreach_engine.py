@@ -276,7 +276,7 @@ def process_outreach():
         # Schedule next stage if no reply
         try:
             if not row["replied"]:
-                schedule_next_outreach(recruiter_id, application_id)
+                schedule_next_outreach(recruiter_id, application_id, user_id=user_id)
         except Exception as e:
             print(f"   [WARNING] Could not schedule next outreach: {e}")
 

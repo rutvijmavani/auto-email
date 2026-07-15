@@ -310,7 +310,7 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
                   f"skipping AI field map for {company}")
             return None, None, None, False
 
-    if not can_call(FIELD_MAP_MODEL):
+    if not can_call(FIELD_MAP_MODEL, use_case="ats_detection"):
         print(f"[INFO] {FIELD_MAP_MODEL} daily limit reached — "
               f"skipping AI field map for {company}")
         return None, None, None, False
@@ -433,7 +433,7 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
                 "detect_field_map_with_ai: response received (chars=%d)",
                 len(response.text or "")
             )
-            increment_usage(FIELD_MAP_MODEL)
+            increment_usage(FIELD_MAP_MODEL, use_case="ats_detection")
 
             text  = response.text.strip()
             match = re.search(r"\{.*\}", text, re.DOTALL)

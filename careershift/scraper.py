@@ -184,7 +184,7 @@ def visit_and_extract(page, detail_url, name, position, confidence):
 # MAIN SCRAPING FUNCTION
 # ─────────────────────────────────────────
 
-def scrape_company(page, company, max_contacts, expected_domain):
+def scrape_company(page, company, max_contacts, expected_domain, user_id: int = 1):
     """
     Find recruiters for a company using set-level validation.
 
@@ -308,7 +308,7 @@ def scrape_company(page, company, max_contacts, expected_domain):
             logger.debug("Reached new contact target (%d) for %r — stopping", visit_limit, company)
             break
 
-        if get_remaining_quota() == 0:
+        if get_remaining_quota(user_id=user_id) == 0:
             logger.warning("Quota exhausted during profile visits for %r", company)
             print(f"   [INFO] Quota exhausted — stopping profile visits early")
             break
@@ -333,7 +333,7 @@ def scrape_company(page, company, max_contacts, expected_domain):
             continue
 
         # New email — charge quota now
-        increment_quota_used(1)
+        increment_quota_used(1, user_id=user_id)
         existing_emails.add(detail["email"])  # guard against duplicates within same run
         new_found += 1
 

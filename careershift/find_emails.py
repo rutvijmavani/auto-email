@@ -145,7 +145,7 @@ def _check_pipeline_degraded():
             METRIC_ALERT_CONSECUTIVE_DAYS,
         )
 
-        recent = get_coverage_stats(days=METRIC_ALERT_CONSECUTIVE_DAYS)
+        recent = get_coverage_stats(days=METRIC_ALERT_CONSECUTIVE_DAYS, user_id=1)
 
         if len(recent) < METRIC_ALERT_CONSECUTIVE_DAYS:
             logger.debug(
@@ -261,216 +261,222 @@ def run():
             browser, page = _open_user_session(p, user_id, user_name)
             if page is None:
                 continue
+            try:
+                # Fetch real quota for this user
+                remaining = fetch_real_quota(page, user_id)
+                logger.info("user_id=%d quota: %d/50 remaining", user_id, remaining)
+                print(f"[INFO] user_id={user_id} quota remaining: {remaining}/50\n")
 
-            # Fetch real quota for this user
-            remaining = fetch_real_quota(page, user_id)
-            logger.info("user_id=%d quota: %d/50 remaining", user_id, remaining)
-            print(f"[INFO] user_id={user_id} quota remaining: {remaining}/50\n")
+                user_apps = get_all_active_applications(user_id=user_id)
+                logger.info("user_id=%d active applications: %d", user_id, len(user_apps))
 
-            user_apps = get_all_active_applications(user_id=user_id)
-            logger.info("user_id=%d active applications: %d", user_id, len(user_apps))
+                # ─── STEP 1: Tiered verification for this user's recruiters ───
+                if user_apps:
+                    print("=" * 55)
+                    print(f"[INFO] STEP 1 (user_id={user_id}): Tiered recruiter verification")
+                    logger.info("Step 1 user_id=%d: verifying recruiters — %d applications",
+                                user_id, len(user_apps))
+                    run_tiered_verification(page, user_apps, found_by_user_id=user_id)
+                else:
+                    logger.info("Step 1 user_id=%d: skipped — no active applications", user_id)
+                    print(f"[INFO] STEP 1 (user_id={user_id}): Skipped — no active applications.")
 
-            # ─── STEP 1: Tiered verification for this user's recruiters ───
-            if user_apps:
-                print("=" * 55)
-                print(f"[INFO] STEP 1 (user_id={user_id}): Tiered recruiter verification")
-                logger.info("Step 1 user_id=%d: verifying recruiters — %d applications",
-                            user_id, len(user_apps))
-                run_tiered_verification(page, user_apps, found_by_user_id=user_id)
-            else:
-                logger.info("Step 1 user_id=%d: skipped — no active applications", user_id)
-                print(f"[INFO] STEP 1 (user_id={user_id}): Skipped — no active applications.")
+                # ─── STEP 2: Scrape companies for this user's applications ───
+                companies_to_scrape = (
+                    get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY, user_id=user_id)
+                    if user_apps else []
+                )
+                logger.info("Step 2 user_id=%d: %d companies need scraping",
+                            user_id, len(companies_to_scrape))
 
-            # ─── STEP 2: Scrape companies for this user's applications ───
-            companies_to_scrape = (
-                get_unique_companies_needing_scraping(MIN_RECRUITERS_PER_COMPANY, user_id=user_id)
-                if user_apps else []
-            )
-            logger.info("Step 2 user_id=%d: %d companies need scraping",
-                        user_id, len(companies_to_scrape))
-
-            scrape_stats = []
-            if not companies_to_scrape:
-                print(f"\n[OK] user_id={user_id}: All applications have enough recruiters.")
-            elif remaining == 0:
-                logger.warning("Step 2 user_id=%d: %d companies need scraping but quota is 0",
-                               user_id, len(companies_to_scrape))
-                print(f"\n[WARNING] user_id={user_id}: {len(companies_to_scrape)} companies need "
-                      f"scraping but quota is 0. Run again tomorrow when quota resets.")
-            else:
-                print(f"\n{'='*55}")
-                print(f"[INFO] STEP 2 (user_id={user_id}): Scraping {len(companies_to_scrape)} company/companies")
-                print(f"[INFO] Quota: {remaining} credits / {len(companies_to_scrape)} companies")
-
-                counts = calculate_distribution(remaining, len(companies_to_scrape))
-                logger.info("Step 2 user_id=%d distribution=%s", user_id, counts)
-                print(f"[INFO] Distribution: {counts}\n")
-
-                for i, company in enumerate(companies_to_scrape):
-                    max_contacts = counts[i] if i < len(counts) else 0
-                    if max_contacts == 0:
-                        logger.debug("Skipping %r — no quota for user_id=%d", company, user_id)
-                        print(f"[SKIP] Skipping {company} — no quota remaining")
-                        continue
-
+                scrape_stats = []
+                if not companies_to_scrape:
+                    print(f"\n[OK] user_id={user_id}: All applications have enough recruiters.")
+                elif remaining == 0:
+                    logger.warning("Step 2 user_id=%d: %d companies need scraping but quota is 0",
+                                   user_id, len(companies_to_scrape))
+                    print(f"\n[WARNING] user_id={user_id}: {len(companies_to_scrape)} companies need "
+                          f"scraping but quota is 0. Run again tomorrow when quota resets.")
+                else:
                     print(f"\n{'='*55}")
-                    print(f"[INFO] [{i+1}/{len(companies_to_scrape)}] {company} (max {max_contacts})")
-                    logger.info("Step 2 user_id=%d [%d/%d]: scraping %r (max_contacts=%d)",
-                                user_id, i + 1, len(companies_to_scrape), company, max_contacts)
+                    print(f"[INFO] STEP 2 (user_id={user_id}): Scraping {len(companies_to_scrape)} company/companies")
+                    print(f"[INFO] Quota: {remaining} credits / {len(companies_to_scrape)} companies")
 
-                    matching_apps, expected_domain = _get_apps_and_domain(user_apps, company)
-                    contacts = scrape_company(page, company, max_contacts, expected_domain)
+                    counts = calculate_distribution(remaining, len(companies_to_scrape))
+                    logger.info("Step 2 user_id=%d distribution=%s", user_id, counts)
+                    print(f"[INFO] Distribution: {counts}\n")
 
-                    if contacts is None:
-                        logger.info("Step 2 user_id=%d: %r — weak signal, skipping", user_id, company)
-                        print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
-                        scrape_stats.append({"name": company, "status": "skipped", "count": 0})
-                    elif not contacts:
-                        if pipeline_degraded:
-                            logger.warning(
-                                "Step 2 user_id=%d: %r — no recruiters but pipeline degraded "
-                                "— blocking exhaustion",
-                                user_id, company,
-                            )
-                            print(f"   [WARNING] {company} — no recruiters found but pipeline "
-                                  f"degraded — NOT exhausting (human review needed)")
-                            try:
-                                from db.pipeline_alerts import (
-                                    create_alert, ALERT_EXHAUSTION_BLOCKED, CRITICAL,
-                                )
-                                create_alert(
-                                    alert_type=ALERT_EXHAUSTION_BLOCKED,
-                                    severity=CRITICAL,
-                                    platform=company,
-                                    message=(
-                                        f"Exhaustion blocked for '{company}': "
-                                        f"no recruiters found but pipeline metrics "
-                                        f"are below threshold — manual review required"
-                                    ),
-                                )
-                            except Exception as _ae:
-                                logger.error("Failed to create exhaustion-blocked alert: %s", _ae)
-                            scrape_stats.append({"name": company, "status": "blocked", "count": 0})
-                        else:
-                            logger.info("Step 2 user_id=%d: %r — no valid recruiters, exhausting",
-                                        user_id, company)
-                            print(f"   [INFO] Exhausting {company} — no valid recruiters found")
-                            mark_applications_exhausted([app["id"] for app in matching_apps])
-                            scrape_stats.append({"name": company, "status": "exhausted", "count": 0})
-                    else:
-                        logger.info("Step 2 user_id=%d: %r — found %d contact(s)",
-                                    user_id, company, len(contacts))
-                        _save_contacts(contacts, company, user_apps, user_id=user_id)
-                        scrape_stats.append({
-                            "name": company, "status": "found", "count": len(contacts),
-                        })
+                    for i, company in enumerate(companies_to_scrape):
+                        max_contacts = counts[i] if i < len(counts) else 0
+                        if max_contacts == 0:
+                            logger.debug("Skipping %r — no quota for user_id=%d", company, user_id)
+                            print(f"[SKIP] Skipping {company} — no quota remaining")
+                            continue
 
-                    human_delay(3.0, 7.0)
+                        print(f"\n{'='*55}")
+                        print(f"[INFO] [{i+1}/{len(companies_to_scrape)}] {company} (max {max_contacts})")
+                        logger.info("Step 2 user_id=%d [%d/%d]: scraping %r (max_contacts=%d)",
+                                    user_id, i + 1, len(companies_to_scrape), company, max_contacts)
 
-            all_scrape_stats.extend(scrape_stats)
-
-            # ─── STEP 3 (Phase 2): Leftover quota — top-up + prospective ───
-            remaining_after = get_remaining_quota(user_id=user_id)
-            if remaining_after > 0:
-                # All active applications across users — needed for domain lookup + linking
-                all_applications = get_all_active_applications()
-
-                under_stocked = get_companies_needing_more_recruiters()
-                # Exclude companies already scrapped for this user in Step 2
-                under_stocked = [c for c in under_stocked
-                                 if c["company"] not in companies_to_scrape]
-
-                if under_stocked:
-                    logger.info("Step 3 user_id=%d: %d under-stocked companies, %d credits",
-                                user_id, len(under_stocked), remaining_after)
-                    print(f"\n{'='*55}")
-                    print(f"[INFO] STEP 3 (user_id={user_id}): Leftover quota — top-up")
-                    print(f"[INFO] {remaining_after} credits remaining — "
-                          f"topping up {len(under_stocked)} company/companies")
-
-                    for company_row in under_stocked:
-                        current_remaining = get_remaining_quota(user_id=user_id)
-                        if current_remaining == 0:
-                            logger.info("Step 3 user_id=%d: quota exhausted — stopping top-up", user_id)
-                            break
-
-                        company   = company_row["company"]
-                        shortage  = company_row["shortage"]
-                        max_extra = min(shortage, current_remaining)
-
-                        logger.info("Step 3 user_id=%d: topping up %r (shortage=%d max_extra=%d)",
-                                    user_id, company, shortage, max_extra)
-                        print(f"\n[INFO] {company} — needs {shortage} more recruiter(s), fetching {max_extra}")
-
-                        matching_apps, expected_domain = _get_apps_and_domain(all_applications, company)
-                        contacts = scrape_company(page, company, max_extra, expected_domain)
+                        matching_apps, expected_domain = _get_apps_and_domain(user_apps, company)
+                        contacts = scrape_company(page, company, max_contacts, expected_domain,
+                                                  user_id=user_id)
 
                         if contacts is None:
-                            logger.info("Step 3 user_id=%d: %r — weak signal, skipping", user_id, company)
-                            print(f"   [INFO] Skipping {company} — weak signal")
-                        elif contacts:
-                            logger.info("Step 3 user_id=%d: %r — found %d contact(s)",
+                            logger.info("Step 2 user_id=%d: %r — weak signal, skipping", user_id, company)
+                            print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
+                            scrape_stats.append({"name": company, "status": "skipped", "count": 0})
+                        elif not contacts:
+                            if pipeline_degraded:
+                                logger.warning(
+                                    "Step 2 user_id=%d: %r — no recruiters but pipeline degraded "
+                                    "— blocking exhaustion",
+                                    user_id, company,
+                                )
+                                print(f"   [WARNING] {company} — no recruiters found but pipeline "
+                                      f"degraded — NOT exhausting (human review needed)")
+                                try:
+                                    from db.pipeline_alerts import (
+                                        create_alert, ALERT_EXHAUSTION_BLOCKED, CRITICAL,
+                                    )
+                                    create_alert(
+                                        alert_type=ALERT_EXHAUSTION_BLOCKED,
+                                        severity=CRITICAL,
+                                        platform=company,
+                                        message=(
+                                            f"Exhaustion blocked for '{company}': "
+                                            f"no recruiters found but pipeline metrics "
+                                            f"are below threshold — manual review required"
+                                        ),
+                                    )
+                                except Exception as _ae:
+                                    logger.error("Failed to create exhaustion-blocked alert: %s", _ae)
+                                scrape_stats.append({"name": company, "status": "blocked", "count": 0})
+                            else:
+                                logger.info("Step 2 user_id=%d: %r — no valid recruiters, exhausting",
+                                            user_id, company)
+                                print(f"   [INFO] Exhausting {company} — no valid recruiters found")
+                                mark_applications_exhausted([app["id"] for app in matching_apps])
+                                scrape_stats.append({"name": company, "status": "exhausted", "count": 0})
+                        else:
+                            logger.info("Step 2 user_id=%d: %r — found %d contact(s)",
                                         user_id, company, len(contacts))
-                            _save_contacts(contacts, company, all_applications, user_id=user_id)
+                            _save_contacts(contacts, company, user_apps, user_id=user_id)
+                            scrape_stats.append({
+                                "name": company, "status": "found", "count": len(contacts),
+                            })
 
                         human_delay(3.0, 7.0)
 
-                # Prospective companies
-                remaining_prospective = get_remaining_quota(user_id=user_id)
-                if remaining_prospective > 0:
-                    pending = get_pending_prospective()
-                    if pending:
-                        logger.info("Step 3 (Priority 2) user_id=%d: %d prospective companies, %d credits",
-                                    user_id, len(pending), remaining_prospective)
-                        print(f"\n{'='*55}")
-                        print(f"[INFO] STEP 3 (Priority 2, user_id={user_id}): Pre-scraping prospective companies")
-                        print(f"[INFO] {remaining_prospective} credits remaining — "
-                              f"{len(pending)} prospective companies pending")
+                all_scrape_stats.extend(scrape_stats)
 
-                        for prospect in pending:
+                # ─── STEP 3 (Phase 2): Leftover quota — top-up + prospective ───
+                remaining_after = get_remaining_quota(user_id=user_id)
+                if remaining_after > 0:
+                    # All active applications across users — needed for domain lookup + linking
+                    all_applications = get_all_active_applications()
+
+                    under_stocked = get_companies_needing_more_recruiters(user_id=user_id)
+                    # Exclude companies already scrapped for this user in Step 2
+                    under_stocked = [c for c in under_stocked
+                                     if c["company"] not in companies_to_scrape]
+
+                    if under_stocked:
+                        logger.info("Step 3 user_id=%d: %d under-stocked companies, %d credits",
+                                    user_id, len(under_stocked), remaining_after)
+                        print(f"\n{'='*55}")
+                        print(f"[INFO] STEP 3 (user_id={user_id}): Leftover quota — top-up")
+                        print(f"[INFO] {remaining_after} credits remaining — "
+                              f"topping up {len(under_stocked)} company/companies")
+
+                        for company_row in under_stocked:
                             current_remaining = get_remaining_quota(user_id=user_id)
                             if current_remaining == 0:
-                                logger.info("Step 3 (Priority 2) user_id=%d: quota exhausted — stopping",
-                                            user_id)
+                                logger.info("Step 3 user_id=%d: quota exhausted — stopping top-up", user_id)
                                 break
 
-                            company   = prospect["company"]
-                            max_extra = min(3, current_remaining)
+                            company   = company_row["company"]
+                            shortage  = company_row["shortage"]
+                            max_extra = min(shortage, current_remaining)
 
-                            logger.info("Prospective scrape user_id=%d: %r (max_extra=%d)",
-                                        user_id, company, max_extra)
-                            print(f"\n[INFO] Prospective: {company} (max {max_extra})")
+                            logger.info("Step 3 user_id=%d: topping up %r (shortage=%d max_extra=%d)",
+                                        user_id, company, shortage, max_extra)
+                            print(f"\n[INFO] {company} — needs {shortage} more recruiter(s), fetching {max_extra}")
 
-                            prospective_domain = get_domain_for_prospective(company)
-                            contacts = scrape_company(page, company, max_extra, prospective_domain)
+                            matching_apps, expected_domain = _get_apps_and_domain(all_applications, company)
+                            contacts = scrape_company(page, company, max_extra, expected_domain,
+                                                      user_id=user_id)
 
                             if contacts is None:
-                                logger.info("Prospective %r — weak signal, skipping", company)
-                                print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
-                            elif not contacts:
-                                logger.info("Prospective %r — no contacts found, exhausting", company)
-                                print(f"   [INFO] Exhausting prospective {company}")
-                                mark_prospective_exhausted(company)
-                                all_prospective_stats["exhausted"] += 1
-                            else:
-                                logger.info("Prospective %r — found %d contact(s), saving",
-                                            company, len(contacts))
-                                saved = _save_prospective_contacts(contacts, company, user_id=user_id)
-                                if saved:
-                                    mark_prospective_scraped(company)
-                                    all_prospective_stats["scraped"] += 1
-                                    logger.info("Prospective %r — marked scraped", company)
-                                else:
-                                    logger.warning(
-                                        "Prospective %r — could not persist contacts, not marking scraped",
-                                        company,
-                                    )
-                                    print(f"   [WARNING] Could not persist contacts for {company} "
-                                          f"— not marking scraped")
+                                logger.info("Step 3 user_id=%d: %r — weak signal, skipping", user_id, company)
+                                print(f"   [INFO] Skipping {company} — weak signal")
+                            elif contacts:
+                                logger.info("Step 3 user_id=%d: %r — found %d contact(s)",
+                                            user_id, company, len(contacts))
+                                _save_contacts(contacts, company, all_applications, user_id=user_id)
 
                             human_delay(3.0, 7.0)
 
-            browser.close()
+                    # Prospective companies
+                    remaining_prospective = get_remaining_quota(user_id=user_id)
+                    if remaining_prospective > 0:
+                        pending = get_pending_prospective()
+                        if pending:
+                            logger.info("Step 3 (Priority 2) user_id=%d: %d prospective companies, %d credits",
+                                        user_id, len(pending), remaining_prospective)
+                            print(f"\n{'='*55}")
+                            print(f"[INFO] STEP 3 (Priority 2, user_id={user_id}): Pre-scraping prospective companies")
+                            print(f"[INFO] {remaining_prospective} credits remaining — "
+                                  f"{len(pending)} prospective companies pending")
+
+                            for prospect in pending:
+                                current_remaining = get_remaining_quota(user_id=user_id)
+                                if current_remaining == 0:
+                                    logger.info("Step 3 (Priority 2) user_id=%d: quota exhausted — stopping",
+                                                user_id)
+                                    break
+
+                                company   = prospect["company"]
+                                max_extra = min(3, current_remaining)
+
+                                logger.info("Prospective scrape user_id=%d: %r (max_extra=%d)",
+                                            user_id, company, max_extra)
+                                print(f"\n[INFO] Prospective: {company} (max {max_extra})")
+
+                                prospective_domain = get_domain_for_prospective(company)
+                                contacts = scrape_company(page, company, max_extra, prospective_domain,
+                                                          user_id=user_id)
+
+                                if contacts is None:
+                                    logger.info("Prospective %r — weak signal, skipping", company)
+                                    print(f"   [INFO] Skipping {company} — weak signal, retry tomorrow")
+                                elif not contacts:
+                                    logger.info("Prospective %r — no contacts found, exhausting", company)
+                                    print(f"   [INFO] Exhausting prospective {company}")
+                                    mark_prospective_exhausted(company)
+                                    all_prospective_stats["exhausted"] += 1
+                                else:
+                                    logger.info("Prospective %r — found %d contact(s), saving",
+                                                company, len(contacts))
+                                    saved = _save_prospective_contacts(contacts, company, user_id=user_id)
+                                    if saved:
+                                        mark_prospective_scraped(company)
+                                        all_prospective_stats["scraped"] += 1
+                                        logger.info("Prospective %r — marked scraped", company)
+                                    else:
+                                        logger.warning(
+                                            "Prospective %r — could not persist contacts, not marking scraped",
+                                            company,
+                                        )
+                                        print(f"   [WARNING] Could not persist contacts for {company} "
+                                              f"— not marking scraped")
+
+                                human_delay(3.0, 7.0)
+
+            except Exception:
+                logger.error("Error processing user_id=%d (%s)", user_id, user_name, exc_info=True)
+            finally:
+                browser.close()
 
     # ─── Summary ───
     total_quota_used = sum(
@@ -524,7 +530,7 @@ def run():
             "metric2":             metric2,
         }
 
-        save_coverage_stats(coverage_stats)
+        save_coverage_stats(coverage_stats, user_id=1)
         logger.info(
             "Coverage stats saved: yesterday=%s total_apps=%d attempted=%d "
             "auto_found=%d exhausted=%d metric1=%s metric2=%s",

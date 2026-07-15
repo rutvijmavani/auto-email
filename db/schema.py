@@ -1022,12 +1022,19 @@ def init_db():
     )
 
     # applications — add user_id; all existing rows → operator (user_id=1)
+    # Drop the global UNIQUE(job_url) that prevents two users from applying to
+    # the same URL, then replace with a per-user unique index.
     c.execute("""
         ALTER TABLE applications
           ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
     """)
     c.execute("UPDATE applications SET user_id = 1 WHERE user_id IS NULL")
     c.execute("ALTER TABLE applications ALTER COLUMN user_id SET NOT NULL")
+    c.execute("ALTER TABLE applications DROP CONSTRAINT IF EXISTS applications_job_url_key")
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS applications_user_job_url_key
+          ON applications(user_id, job_url)
+    """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications(user_id)
     """)
