@@ -91,20 +91,28 @@ def update_recruiter(recruiter_id, name=None, position=None,
         conn.close()
 
 
-def get_recruiters_by_tier(days_tier1=30, days_tier2=60):
+def get_recruiters_by_tier(days_tier1=30, days_tier2=60, found_by_user_id=None):
     """
     Return all active recruiters grouped by verification tier.
     tier1: verified < days_tier1 ago → trust
     tier2: verified days_tier1-days_tier2 ago → lightweight check
     tier3: verified > days_tier2 ago or never → full profile visit
+    found_by_user_id: when set, only returns recruiters found by that user's account.
     """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT * FROM recruiters
-        WHERE recruiter_status = 'active'
-        ORDER BY verified_at ASC
-    """)
+    if found_by_user_id is not None:
+        c.execute("""
+            SELECT * FROM recruiters
+            WHERE recruiter_status = 'active' AND found_by_user_id = ?
+            ORDER BY verified_at ASC
+        """, (found_by_user_id,))
+    else:
+        c.execute("""
+            SELECT * FROM recruiters
+            WHERE recruiter_status = 'active'
+            ORDER BY verified_at ASC
+        """)
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
 

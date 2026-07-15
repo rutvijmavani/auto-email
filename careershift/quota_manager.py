@@ -3,16 +3,19 @@
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+from logger import get_logger
 from db.db import get_conn, get_remaining_quota, increment_quota_used
 from careershift.utils import human_delay
 from careershift.constants import CAREERSHIFT_QUOTA_URL
 from config import MAX_CONTACTS_HARD_CAP
 
+logger = get_logger(__name__)
 
-def fetch_real_quota(page):
+
+def fetch_real_quota(page, user_id: int = 1):
     """
-    Fetch actual remaining quota from CareerShift Account Usage page.
-    Syncs local DB with real value.
+    Fetch actual remaining quota from CareerShift Account Usage page
+    for the given user's session. Syncs local DB with real value.
     Returns remaining quota as integer.
     """
     try:
@@ -37,25 +40,29 @@ def fetch_real_quota(page):
                         c = conn.cursor()
                         today = datetime.now().strftime("%Y-%m-%d")
                         used = 50 - remaining
+                        # Partial unique index: careershift_quota_user_date_key WHERE user_id IS NOT NULL
                         c.execute("""
-                            INSERT INTO careershift_quota (date, total_limit, used, remaining)
-                            VALUES (?, 50, ?, ?)
-                            ON CONFLICT(date) DO UPDATE SET
+                            INSERT INTO careershift_quota (user_id, date, total_limit, used, remaining)
+                            VALUES (?, ?, 50, ?, ?)
+                            ON CONFLICT(user_id, date) WHERE user_id IS NOT NULL DO UPDATE SET
                                 used = excluded.used,
                                 remaining = excluded.remaining
-                        """, (today, used, remaining))
+                        """, (user_id, today, used, remaining))
                         conn.commit()
                         conn.close()
 
-                        print(f"[INFO] Real CareerShift quota — Remaining: {remaining}/50")
+                        logger.info("fetch_real_quota user_id=%d: remaining=%d/50", user_id, remaining)
+                        print(f"[INFO] Real CareerShift quota user_id={user_id} — Remaining: {remaining}/50")
                         return remaining
 
+        logger.warning("fetch_real_quota user_id=%d: could not parse quota page — using DB value", user_id)
         print("[WARNING] Could not parse quota from account usage page. Using local DB value.")
-        return get_remaining_quota()
+        return get_remaining_quota(user_id=user_id)
 
     except Exception as e:
+        logger.warning("fetch_real_quota user_id=%d failed: %s — using DB value", user_id, e)
         print(f"[WARNING] Could not fetch real quota: {e}. Using local DB value.")
-        return get_remaining_quota()
+        return get_remaining_quota(user_id=user_id)
 
 
 def calculate_distribution(remaining_quota, company_count):

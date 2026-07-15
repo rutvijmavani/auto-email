@@ -3,6 +3,14 @@
 import os
 
 SESSION_FILE = os.path.join(os.path.dirname(__file__), "..", "data", "careershift_session.json")
+
+
+def session_file_for_user(user_id: int) -> str:
+    """Return the per-user CareerShift session file path."""
+    return os.path.join(
+        os.path.dirname(__file__), "..", "data",
+        f"careershift_session_{user_id}.json"
+    )
 CAREERSHIFT_SEARCH_URL = "https://www.careershift.com/App/Contacts/Search"
 CAREERSHIFT_QUOTA_URL  = "https://www.careershift.com/App/Settings/ResetPassword"
 
