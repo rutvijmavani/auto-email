@@ -199,7 +199,9 @@ def check_pipeline_health():
 
     alerts = []
     days   = METRIC_ALERT_CONSECUTIVE_DAYS
-    stats  = get_coverage_stats(days=days)
+    # coverage_stats are written as aggregate rows by find_emails.py (user_id=1).
+    # Scope to user_id=1 so multi-user rows don't break the contiguous-days check.
+    stats  = get_coverage_stats(days=days, user_id=1)
 
     if len(stats) < days:
         logger.debug(
