@@ -7,6 +7,7 @@ External code continues to import from db.db unchanged.
 Submodules:
     db.connection             → get_conn, DB_FILE, DAILY_LIMITS
     db.schema                 → init_db
+    db.users                  → user record accessors
     db.applications           → application helpers
     db.recruiters             → recruiter helpers
     db.application_recruiters → join table helpers
@@ -27,6 +28,17 @@ from db.connection import get_conn, DB_FILE, DAILY_LIMITS
 # SCHEMA
 # ─────────────────────────────────────────
 from db.schema import init_db
+
+# ─────────────────────────────────────────
+# USERS
+# ─────────────────────────────────────────
+from db.users import (
+    get_all_active_users,
+    get_user,
+    get_user_email,
+    get_user_name,
+    get_resume_path,
+)
 
 # ─────────────────────────────────────────
 # APPLICATIONS
