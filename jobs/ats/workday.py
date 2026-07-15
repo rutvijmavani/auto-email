@@ -377,6 +377,17 @@ def _normalize(job, company, domain, path, slug_info=None):
     external_path = (job.get("externalPath") or "").strip()
     external_url  = (job.get("externalUrl") or "").strip()
 
+    # When externalPath is absent but externalUrl is a job-specific URL (not just
+    # the careers homepage), derive external_path from it so fetch_job_detail()
+    # can build the CXS detail endpoint.  This handles tenants that omit the
+    # relative-path field but return an absolute job URL.
+    if not external_path and external_url and external_url.startswith("http"):
+        from urllib.parse import urlparse as _urlparse
+        _parsed_path = _urlparse(external_url).path  # e.g. "/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
+        _path_prefix = "/" + path.strip("/")          # e.g. "/NVIDIAExternalCareerSite"
+        if _parsed_path.startswith(_path_prefix + "/"):
+            external_path = _parsed_path[len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
+
     if external_path:
         # Relative path from real Workday API — prepend domain + career site name
         job_url = domain.rstrip("/") + "/" + path.strip("/") + "/" + external_path.lstrip("/")

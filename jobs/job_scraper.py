@@ -23,7 +23,6 @@ from bs4 import BeautifulSoup
 
 from logger import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = get_logger(__name__)
 
 

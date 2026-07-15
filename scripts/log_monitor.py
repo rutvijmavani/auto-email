@@ -283,24 +283,37 @@ def _save_offsets(offsets: dict[str, int],
 # Log scanning
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_log_level(line: str) -> str:
+    """
+    Extract log level from either JSON lines (new format) or pipe-delimited
+    lines (old format / tracebacks).  Returns the level string or "".
+
+    JSON:          {"level": "WARNING", ...}
+    Pipe-delimited: "2026-07-15 10:45:17.281 | WARNING  | workers.foo | msg"
+    Tracebacks/exceptions: no level field — returns "".
+    """
+    try:
+        level = json.loads(line).get("level", "")
+        return level if isinstance(level, str) else ""
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        m = re.search(r'\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b', line)
+        return m.group(1) if m else ""
+
+
 def _is_suppressed(line: str) -> bool:
     if any(pat.search(line) for _, pat in SUPPRESS_PATTERNS):
         return True
     # WARNING-only suppressions must not silence ERROR or CRITICAL lines
-    parts = line.split('|', 3)
-    if len(parts) >= 2 and parts[1].strip() == 'WARNING':
+    if _parse_log_level(line) == "WARNING":
         return any(pat.search(line) for _, pat in SUPPRESS_WARNING_PATTERNS)
     return False
 
 
 def _is_flagged(line: str) -> bool:
-    # Fast path: check level by field position.
-    # Log format: "timestamp | LEVEL    | logger | message"
-    # Field-split is exact and immune to level strings appearing in message text.
-    parts = line.split('|', 3)
-    if len(parts) >= 2 and parts[1].strip() in _ALERT_LEVELS:
+    # Fast path: check level — works for both JSON and pipe-delimited formats.
+    if _parse_log_level(line) in _ALERT_LEVELS:
         return True
-    # Slow path: tracebacks and exception type lines have no pipe-delimited level.
+    # Slow path: tracebacks and exception type lines have no level field.
     return any(pat.search(line) for pat in FLAG_PATTERNS)
 
 
@@ -966,4 +979,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("log_monitor")
     main()

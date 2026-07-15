@@ -971,5 +971,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("scan_worker")
     once = "--once" in sys.argv
     run_worker(once=once)

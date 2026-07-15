@@ -33,6 +33,7 @@
 #
 # Format: 2026-03-12 09:14:32.401 | DEBUG | jobs.serper | Slug rejected: ...
 
+import json
 import logging
 import logging.handlers
 import os
@@ -63,6 +64,25 @@ _active_command: str = "pipeline"
 
 # Module-level guard — init_logging() called only once per process
 _initialized: bool = False
+
+
+# ─────────────────────────────────────────
+# JSON FORMATTER
+# ─────────────────────────────────────────
+
+class JsonFormatter(logging.Formatter):
+    """Emit one JSON object per log line for file handlers."""
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict = {
+            "time":   self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "ms":     record.msecs,
+            "level":  record.levelname,
+            "logger": record.name,
+            "msg":    record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
 
 
 # ─────────────────────────────────────────
@@ -243,19 +263,18 @@ def init_logging(command: str = "pipeline") -> None:
     # Remove any handlers added by third-party libs before we configure
     root.handlers.clear()
 
-    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    human_formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+    json_formatter  = JsonFormatter()
 
     # ── 1. Console handler ──────────────────────────────────────────
     # Only active when running interactively (TTY present).
     # Under cron, stdout is NOT a TTY, so we skip this handler.
-    # Previously cron redirected stdout to the same file the
-    # FileHandler already writes to — causing every log line to
-    # appear twice.  Skipping the console handler under cron
-    # eliminates the duplication while keeping the file handlers.
+    # Console stays human-readable (pipe-delimited) for operator UX.
+    # File handlers always use JSON so log files are machine-parseable.
     if sys.stdout.isatty():
         console = logging.StreamHandler(sys.stdout)
         console.setLevel(LOG_LEVEL)
-        console.setFormatter(formatter)
+        console.setFormatter(human_formatter)
         root.addHandler(console)
 
     # ── 2. Command-specific log file ────────────────────────────────
@@ -286,7 +305,7 @@ def init_logging(command: str = "pipeline") -> None:
         file_handler = logging.FileHandler(command_file, mode="a", encoding="utf-8")
 
     file_handler.setLevel(LOG_LEVEL)
-    file_handler.setFormatter(formatter)
+    file_handler.setFormatter(json_formatter)
 
     # ── 3. Catch-all pipeline_YYYY-MM-DD.log ────────────────────────
     # Always-on daily file — useful for grepping across all commands.
@@ -308,7 +327,7 @@ def init_logging(command: str = "pipeline") -> None:
     if command != "scheduler":
         catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
         catchall.setLevel(LOG_LEVEL)
-        catchall.setFormatter(formatter)
+        catchall.setFormatter(json_formatter)
         root.addHandler(catchall)
 
     # ── 4. Silence noisy third-party loggers ───────────────────────
