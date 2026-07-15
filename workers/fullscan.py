@@ -1299,7 +1299,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # worker activity — without this, covered companies appear frozen.
                 try:
                     from db.job_monitor import update_company_check
-                    update_company_check(company, found_jobs=(new_count > 0))
+                    update_company_check(company, found_jobs=(len(title_matched) > 0))
                 except Exception as _uc_exc:
                     logger.warning(
                         "fullscan [%s]: update_company_check failed (non-fatal): %s",

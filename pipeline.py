@@ -915,7 +915,7 @@ def main():
     from logger import init_logging
     if "--scheduler" in args:
         init_logging("scheduler")
-    elif "--monitor-jobs" in args:
+    elif "--monitor-jobs" in args or "--monitor-status" in args:
         init_logging("monitor")
     elif "--sync-forms" in args or "--sync-prospective" in args:
         init_logging("sync")
