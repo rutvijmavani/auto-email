@@ -14,6 +14,7 @@
 #   company_poll_stats  — per-company adaptive polling state (Phase 5)
 #   adaptive_poll_metrics — daily observability metrics (Phase 8)
 
+import os
 import time
 from datetime import datetime, timedelta
 
@@ -300,6 +301,18 @@ def init_db():
     """)
 
     # ── Core pipeline tables ──────────────────────────────────────────────────
+
+    # users — must be defined before any table that references it via FK
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id          SERIAL PRIMARY KEY,
+            email       TEXT UNIQUE NOT NULL,
+            name        TEXT NOT NULL,
+            resume_path TEXT NOT NULL DEFAULT 'Resume.pdf',
+            is_active   BOOLEAN DEFAULT TRUE,
+            created_at  TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS applications (
@@ -982,22 +995,132 @@ def init_db():
 
     # ── Misc index / constraint migrations ───────────────────────────────────
 
-    # Ensure coverage_stats.date has a unique index
-    # (deduplicate any pre-existing rows first)
-    c.execute("""
-        DELETE FROM coverage_stats
-        WHERE id NOT IN (
-            SELECT MAX(id) FROM coverage_stats GROUP BY date
-        )
-    """)
-    c.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_date
-        ON coverage_stats(date)
-    """)
-
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
         ON prospective_companies(company)
+    """)
+
+    # ── Multi-user migrations (2026-07-15) ───────────────────────────────────
+    # All statements are idempotent (IF NOT EXISTS / ON CONFLICT / IF EXISTS).
+    # Safe to run repeatedly on an already-migrated database.
+
+    # Seed operator (user 1) before FK backfills — required so the
+    # user_id=1 FK reference in backfill UPDATEs below resolves.
+    # Falls back to old GMAIL_EMAIL env var name if new name not set yet.
+    _op_email = (
+        os.environ.get("GMAIL_USER_1_EMAIL")
+        or os.environ.get("GMAIL_EMAIL", "operator@localhost")
+    )
+    c.execute("""
+        INSERT INTO users (id, email, name)
+        VALUES (1, %s, 'Operator')
+        ON CONFLICT (id) DO NOTHING
+    """, (_op_email,))
+    # Advance sequence past manual id=1 so next add_user.py INSERT gets id=2+
+    c.execute(
+        "SELECT setval('users_id_seq', GREATEST((SELECT MAX(id) FROM users), 1))"
+    )
+
+    # applications — add user_id; all existing rows → operator (user_id=1)
+    c.execute("""
+        ALTER TABLE applications
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
+    """)
+    c.execute("UPDATE applications SET user_id = 1 WHERE user_id IS NULL")
+    c.execute("ALTER TABLE applications ALTER COLUMN user_id SET NOT NULL")
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_applications_user_id ON applications(user_id)
+    """)
+
+    # outreach — add user_id; all existing rows → operator (user_id=1)
+    c.execute("""
+        ALTER TABLE outreach
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
+    """)
+    c.execute("UPDATE outreach SET user_id = 1 WHERE user_id IS NULL")
+    c.execute("ALTER TABLE outreach ALTER COLUMN user_id SET NOT NULL")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_outreach_user_id ON outreach(user_id)")
+
+    # recruiters — add found_by_user_id (nullable; ON DELETE SET NULL by design)
+    # Backfill to user_id=2 deferred to add_user.py — user 2 does not exist yet.
+    c.execute("""
+        ALTER TABLE recruiters
+          ADD COLUMN IF NOT EXISTS found_by_user_id INT REFERENCES users(id) ON DELETE SET NULL
+    """)
+
+    # careershift_quota — add user_id (nullable until user 2 is seeded by add_user.py)
+    # Drop the old single-column UNIQUE on date; add composite partial unique index.
+    c.execute("""
+        ALTER TABLE careershift_quota
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
+    """)
+    c.execute("""
+        ALTER TABLE careershift_quota
+          DROP CONSTRAINT IF EXISTS careershift_quota_date_key
+    """)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS careershift_quota_user_date_key
+          ON careershift_quota(user_id, date)
+          WHERE user_id IS NOT NULL
+    """)
+
+    # model_usage — add user_id, use_case, key_slot; replace (model, date) PK
+    # with partial unique indexes that support both per-user and shared ATS rows.
+    c.execute("""
+        ALTER TABLE model_usage
+          ADD COLUMN IF NOT EXISTS user_id  INT  REFERENCES users(id) ON DELETE RESTRICT,
+          ADD COLUMN IF NOT EXISTS use_case TEXT NOT NULL DEFAULT 'email_content',
+          ADD COLUMN IF NOT EXISTS key_slot TEXT
+    """)
+    c.execute("""
+        UPDATE model_usage SET user_id = 1
+        WHERE user_id IS NULL AND use_case = 'email_content'
+    """)
+    c.execute("ALTER TABLE model_usage DROP CONSTRAINT IF EXISTS model_usage_pkey")
+    # Per-user rows: unique on (model, date, use_case, user_id)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS model_usage_per_user
+          ON model_usage(model, date, use_case, user_id)
+          WHERE user_id IS NOT NULL
+    """)
+    # Shared ATS-detection rows: unique on (model, date, use_case, key_slot)
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS model_usage_shared
+          ON model_usage(model, date, use_case, key_slot)
+          WHERE user_id IS NULL
+    """)
+
+    # coverage_stats — add user_id; replace (date UNIQUE) with (user_id, date) index.
+    # Old single-column unique index/constraint is dropped to allow per-user rows
+    # with the same date (each user writes one row per day).
+    c.execute("""
+        ALTER TABLE coverage_stats
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
+    """)
+    c.execute("UPDATE coverage_stats SET user_id = 1 WHERE user_id IS NULL")
+    c.execute("ALTER TABLE coverage_stats ALTER COLUMN user_id SET NOT NULL")
+    c.execute("""
+        ALTER TABLE coverage_stats DROP CONSTRAINT IF EXISTS coverage_stats_date_key
+    """)
+    c.execute("DROP INDEX IF EXISTS idx_coverage_stats_date")
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_coverage_stats_user_date
+          ON coverage_stats(user_id, date)
+    """)
+
+    # quota_alerts — add user_id; all existing rows → operator (user_id=1)
+    c.execute("""
+        ALTER TABLE quota_alerts
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT
+    """)
+    c.execute("UPDATE quota_alerts SET user_id = 1 WHERE user_id IS NULL")
+    c.execute("ALTER TABLE quota_alerts ALTER COLUMN user_id SET NOT NULL")
+
+    # prospective_companies — add added_by_user_id (nullable; attribution only)
+    # No backfill: pre-multi-user rows have no submitter to attribute.
+    c.execute("""
+        ALTER TABLE prospective_companies
+          ADD COLUMN IF NOT EXISTS added_by_user_id INT REFERENCES users(id) ON DELETE SET NULL
     """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
