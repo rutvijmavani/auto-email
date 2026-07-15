@@ -735,7 +735,7 @@ def run_performance_report():
 
     try:
         send_email(to_email=EMAIL, body=body,
-                   company="Pipeline", subject=subject)
+                   company="Pipeline", subject=subject, attach_resume=False)
         # Only mark alerts as notified after successful email delivery
         logger.info("Performance alert email sent: %s", subject)
         print(f"[INFO] Alert email sent: {subject}")
@@ -819,7 +819,7 @@ def run_pipeline_alert_report():
 
         try:
             send_email(to_email=EMAIL, body=body,
-                       company="Pipeline", subject=subject)
+                       company="Pipeline", subject=subject, attach_resume=False)
             # Only mark alerts as notified after successful email delivery
             logger.info("Pipeline alert email sent: %s", subject)
             print(f"[INFO] Alert email sent: {subject}")
@@ -910,7 +910,8 @@ def run_quota_report(silent_if_healthy=False):
 
         try:
             to_email = get_user_email(user_id)
-            send_email(to_email=to_email, body=body, company="Pipeline", subject=subject)
+            send_email(to_email=to_email, body=body, company="Pipeline", subject=subject,
+                       user_id=user_id, attach_resume=False)
             logger.info("Quota alert email sent to user_id=%d (%s): %s", user_id, to_email, subject)
             print(f"[INFO] Quota alert sent to {to_email}: {subject}")
             for alert in alerts:
