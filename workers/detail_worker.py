@@ -814,13 +814,19 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         result["retryable"]   = False
         try:
             delete_pending_detail(company, job_id)
-        except Exception:
-            pass
-        logger.info(
-            "detail_worker: duplicate content_hash — discarding job_id=%s company=%r "
-            "(identical content already stored under a different job_id)",
-            job_id, company,
-        )
+        except Exception as _cleanup_exc:
+            logger.warning(
+                "detail_worker: cleanup failed for duplicate job_id=%s company=%r: %s"
+                " — leaving inflight for retry",
+                job_id, company, _cleanup_exc,
+            )
+            result["retryable"] = True
+        else:
+            logger.info(
+                "detail_worker: duplicate content_hash — discarding job_id=%s company=%r "
+                "(identical content already stored under a different job_id)",
+                job_id, company,
+            )
 
     except Exception as exc:
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)

@@ -36,6 +36,7 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger(__name__)
 
 _TAKE = 100  # jobs per listing request
+_MAX_SESSION_CACHE = 50  # cap sessions to avoid unbounded memory as portals accumulate
 
 # Cache: "{host}|{key}" → (session, jwt, api_base, expires_at_epoch)
 # JWT server expiry is 2 hours; we refresh after 90 minutes.
@@ -72,7 +73,7 @@ def fetch_jobs(slug, company):
 
     session, jwt, api_base = _get_session(host, key)
     if not jwt:
-        return []
+        raise RuntimeError(f"paycom: failed to obtain JWT for {host}/{key}")
 
     previews = []
     skip = 0
@@ -111,37 +112,31 @@ def fetch_job_detail(job):
 
     url     = f"{api_base}/api/ats/job-postings/{job_id}"
     headers = _api_headers(jwt, host, key, f"jobs/{job_id}")
-    try:
-        resp = session.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            logger.debug("paycom detail %s → %s", job_id, resp.status_code)
-            return job
+    resp = session.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
 
-        data = resp.json().get("jobPosting", {})
-        job  = dict(job)
+    data = resp.json().get("jobPosting", {})
+    job  = dict(job)
 
-        raw_desc = data.get("description", "")
-        if raw_desc:
-            job["description"] = _strip_html(raw_desc)
+    raw_desc = data.get("description", "")
+    if raw_desc:
+        job["description"] = _strip_html(raw_desc)
 
-        loc = data.get("location", "")
-        if loc:
-            job["location"] = loc
+    loc = data.get("location", "")
+    if loc:
+        job["location"] = loc
 
-        # legalRevisionDate is the closest date Paycom exposes
-        date_obj = data.get("legalRevisionDate") or {}
-        if isinstance(date_obj, dict) and date_obj.get("date"):
-            try:
-                job["posted_at"] = datetime.strptime(
-                    date_obj["date"][:10], "%Y-%m-%d"
-                )
-            except ValueError:
-                pass
+    # legalRevisionDate is the closest date Paycom exposes
+    date_obj = data.get("legalRevisionDate") or {}
+    if isinstance(date_obj, dict) and date_obj.get("date"):
+        try:
+            job["posted_at"] = datetime.strptime(
+                date_obj["date"][:10], "%Y-%m-%d"
+            )
+        except ValueError:
+            pass
 
-        return job
-    except Exception:
-        logger.debug("paycom detail fetch failed job_id=%s", job_id, exc_info=True)
-        return job
+    return job
 
 
 # ─────────────────────────────────────────
@@ -186,6 +181,8 @@ def _get_session(host: str, key: str) -> tuple:
         if not api_base:
             logger.warning("paycom: atsPortalMantleServiceUrl not found in %s", career_url)
             return session, "", ""
+        if len(_session_cache) >= _MAX_SESSION_CACHE:
+            _session_cache.clear()
         _session_cache[cache_key] = (session, jwt, api_base, time.time() + 5400)
         return session, jwt, api_base
     except Exception:
@@ -263,13 +260,11 @@ def _search_page(session, jwt: str, api_base: str,
             headers=_api_headers(jwt, host, key, "career-page"),
             timeout=20,
         )
-        if resp.status_code != 200:
-            logger.warning("paycom search skip=%s → %s", skip, resp.status_code)
-            return []
+        resp.raise_for_status()
         return resp.json().get("jobPostingPreviews", [])
-    except Exception:
+    except Exception as exc:
         logger.warning("paycom search failed skip=%s", skip, exc_info=True)
-        return []
+        raise RuntimeError(f"paycom search failed (skip={skip})") from exc
 
 
 def _preview_to_stub(preview: dict, host: str, key: str, company: str) -> dict:

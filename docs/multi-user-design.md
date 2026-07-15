@@ -160,6 +160,8 @@ CREATE TABLE users (
 > **No authentication columns.** Phase 1 is operator-managed only. No passwords, tokens, or sessions.
 >
 > **Non-secret per-user config belongs here.** Resume path is not a secret — storing it in the DB means adding a new user requires only one `INSERT`, with zero env var or code changes. Secrets (SMTP passwords, API keys) stay in env vars where they can't be queried from SQL.
+>
+> **Never hard-delete users.** All child tables (`applications`, `outreach`, `model_usage`, `coverage_stats`, `quota_alerts`, `careershift_quota`) use `ON DELETE RESTRICT`, so a `DELETE FROM users` will fail if any history exists. Use `UPDATE users SET is_active = FALSE` to disable a user. This preserves all historical data and prevents accidental cascade-wipe of application/outreach history.
 
 ---
 
@@ -169,7 +171,7 @@ CREATE TABLE users (
 
 ```sql
 ALTER TABLE applications
-  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE;
+  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
 -- Backfill: assign all existing rows to operator (user_id = 1)
 UPDATE applications SET user_id = 1 WHERE user_id IS NULL;
@@ -188,9 +190,11 @@ ALTER TABLE applications ALTER COLUMN user_id SET NOT NULL;
 
 ```sql
 ALTER TABLE outreach
-  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE;
+  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
 UPDATE outreach SET user_id = 1 WHERE user_id IS NULL;
+
+ALTER TABLE outreach ALTER COLUMN user_id SET NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_outreach_user_id ON outreach(user_id);
 ```
@@ -234,17 +238,21 @@ def get_resume_path(user_id: int) -> str:
         row = conn.execute(
             "SELECT resume_path FROM users WHERE id = %s", (user_id,)
         ).fetchone()
-    return row["resume_path"] if row else RESUME_PATH
+    if not row:
+        raise ValueError(f"get_resume_path: no user found with id={user_id}")
+    return row["resume_path"]
 ```
+
+> The DB column has `DEFAULT 'Resume.pdf'` so every `INSERT` without an explicit `resume_path` gets the fallback — no Python code needs a fallback. Raising on a missing `user_id` catches misconfiguration before a wrong resume is attached to an email.
 
 **`send_email()` signature change:**
 ```python
-# Before
+# Before (single-user)
 def send_email(to_email, body, company, subject=None):
     with open(RESUME_PATH, "rb") as f: ...
 
-# After
-def send_email(to_email, body, company, subject=None, user_id=1):
+# After (multi-user — user_id required, no default)
+def send_email(to_email, body, company, subject=None, *, user_id: int):
     with open(get_resume_path(user_id), "rb") as f: ...
 ```
 
@@ -282,10 +290,12 @@ UPDATE recruiters SET found_by_user_id = 1 WHERE found_by_user_id IS NULL;
 
 ```sql
 ALTER TABLE careershift_quota
-  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE;
+  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
 -- Backfill
 UPDATE careershift_quota SET user_id = 1 WHERE user_id IS NULL;
+
+ALTER TABLE careershift_quota ALTER COLUMN user_id SET NOT NULL;
 
 -- Replace (date UNIQUE) with (user_id, date) composite unique key
 ALTER TABLE careershift_quota DROP CONSTRAINT IF EXISTS careershift_quota_date_key;
@@ -305,21 +315,41 @@ user_id=2, date='2026-07-14', used=0,  remaining=50
 
 ```sql
 ALTER TABLE model_usage
-  ADD COLUMN IF NOT EXISTS user_id   INT  REFERENCES users(id) ON DELETE CASCADE,
-  ADD COLUMN IF NOT EXISTS use_case  TEXT NOT NULL DEFAULT 'email_content';
-
--- use_case values:
---   'email_content'  → outreach email generation (per-user Gemini key)
---   'ats_detection'  → custom ATS structure detection (shared pool, user_id = NULL)
+  ADD COLUMN IF NOT EXISTS user_id   INT  REFERENCES users(id) ON DELETE RESTRICT,
+  ADD COLUMN IF NOT EXISTS use_case  TEXT NOT NULL DEFAULT 'email_content',
+  ADD COLUMN IF NOT EXISTS key_slot  TEXT;
+-- user_id:  NULL for shared ats_detection rows; set for per-user email_content rows
+-- use_case: 'email_content' | 'ats_detection'
+-- key_slot: 'primary' | 'fallback' for ats_detection rows; NULL for email_content rows
 
 -- Backfill existing rows (all were email_content on behalf of operator)
 UPDATE model_usage SET user_id = 1, use_case = 'email_content'
 WHERE user_id IS NULL;
 
--- New PK: (model, date, use_case, user_id)
--- user_id IS NULL = shared pool usage (ats_detection)
+-- PRIMARY KEY cannot include a nullable column in PostgreSQL.
+-- Use partial unique indexes instead so NULL user_id (shared ATS rows) is supported.
 ALTER TABLE model_usage DROP CONSTRAINT IF EXISTS model_usage_pkey;
-ALTER TABLE model_usage ADD PRIMARY KEY (model, date, use_case, user_id);
+
+-- Per-user rows: unique on (model, date, use_case, user_id)
+CREATE UNIQUE INDEX IF NOT EXISTS model_usage_per_user
+  ON model_usage(model, date, use_case, user_id)
+  WHERE user_id IS NOT NULL;
+
+-- Shared ATS rows: unique on (model, date, use_case, key_slot)
+CREATE UNIQUE INDEX IF NOT EXISTS model_usage_shared
+  ON model_usage(model, date, use_case, key_slot)
+  WHERE user_id IS NULL;
+```
+
+`get_ats_gemini_key()` in §7 must check each slot separately:
+```python
+def get_ats_gemini_key() -> str:
+    """Return the ATS Gemini key with remaining quota; raise QuotaExhausted if both are empty."""
+    if get_model_usage_remaining(use_case='ats_detection', key_slot='primary') > 0:
+        return os.environ["GEMINI_ATS_KEY_PRIMARY"]
+    if get_model_usage_remaining(use_case='ats_detection', key_slot='fallback') > 0:
+        return os.environ["GEMINI_ATS_KEY_FALLBACK"]
+    raise QuotaExhausted("both ATS Gemini keys exhausted for today")
 ```
 
 ---
@@ -328,9 +358,11 @@ ALTER TABLE model_usage ADD PRIMARY KEY (model, date, use_case, user_id);
 
 ```sql
 ALTER TABLE coverage_stats
-  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE;
+  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
 UPDATE coverage_stats SET user_id = 1 WHERE user_id IS NULL;
+
+ALTER TABLE coverage_stats ALTER COLUMN user_id SET NOT NULL;
 
 DROP INDEX IF EXISTS idx_coverage_stats_date;
 CREATE UNIQUE INDEX idx_coverage_stats_user_date ON coverage_stats(user_id, date);
@@ -342,9 +374,11 @@ CREATE UNIQUE INDEX idx_coverage_stats_user_date ON coverage_stats(user_id, date
 
 ```sql
 ALTER TABLE quota_alerts
-  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE CASCADE;
+  ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
 UPDATE quota_alerts SET user_id = 1 WHERE user_id IS NULL;
+
+ALTER TABLE quota_alerts ALTER COLUMN user_id SET NOT NULL;
 ```
 
 ---
@@ -546,9 +580,9 @@ Quota alerts (CareerShift underutilisation, Gemini exhaustion) are personal — 
 **Routing rule:**
 | Alert type | Recipient |
 |---|---|
-| CareerShift quota exhausted / underutilised — User N | `GMAIL_USER_N_EMAIL` |
-| Gemini quota exhausted — User N | `GMAIL_USER_N_EMAIL` |
-| Watchdog worker death | Operator inbox (`GMAIL_USER_1_EMAIL`) |
+| CareerShift quota exhausted / underutilised — User N | `users.email` (from DB) |
+| Gemini quota exhausted — User N | `users.email` (from DB) |
+| Watchdog worker death | Operator inbox (`users.email` where `id=1`) |
 | Log monitor ERROR/WARNING | Operator inbox |
 | ATS API health / pipeline alerts | Operator inbox |
 | Find / verify / outreach reports | Operator inbox |
@@ -557,12 +591,26 @@ Quota alerts (CareerShift underutilisation, Gemini exhaustion) are personal — 
 **Helper function** (add to `outreach/report_templates/base.py` or a new `db/users.py`):
 ```python
 def get_user_email(user_id: int) -> str:
-    return os.environ[f"GMAIL_USER_{user_id}_EMAIL"]
+    """Return the notification recipient email from the users table."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT email FROM users WHERE id = %s", (user_id,)
+        ).fetchone()
+    if not row:
+        raise ValueError(f"get_user_email: no user found with id={user_id}")
+    return row["email"]
 
 def get_user_name(user_id: int) -> str:
-    # query users table by id, return users.name
-    ...
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT name FROM users WHERE id = %s", (user_id,)
+        ).fetchone()
+    if not row:
+        raise ValueError(f"get_user_name: no user found with id={user_id}")
+    return row["name"]
 ```
+
+> **`users.email` is the canonical notification address.** It is stored in the DB at `add_user` time and is the single source of truth for where alerts are delivered. `GMAIL_USER_{id}_EMAIL` is for SMTP authentication (send-from) only and must not be used as the delivery address — the two may differ (e.g., alias vs primary address).
 
 **`send_quota_alert(user_id, subject, body)`** — calls `get_user_email(user_id)` as the `to_email`. The alert is sent FROM the operator SMTP account (no need to use the user's App Password — this is an internal notification, not an outreach email).
 
@@ -633,7 +681,7 @@ User created (id=2). Add these to .env:
 
 7. **Per-user metrics and alerts** — Update `coverage_stats` writes to include `user_id`. Update quota alert checks to run per-user. Route quota alert emails to `GMAIL_USER_{id}_EMAIL` (not operator inbox) with user name in subject. Serper alert stays operator-only (shared resource).
 
-8. **Per-user Gmail SMTP + resume** — Add `GMAIL_USER_{id}_EMAIL`, `GMAIL_USER_{id}_APP_PASS`, and `RESUME_PATH_USER_{id}` to `.env` for each user. Update `email_sender.py`: add `user_id` param, resolve SMTP credentials and resume path at send time. Add `get_resume_path(user_id)` helper. Add structured logging to `email_sender.py` and `outreach_engine.py` (currently has no logging). Each user generates their own Gmail App Password via Google account settings → Security → App Passwords.
+8. **Per-user Gmail SMTP + resume** — Add `GMAIL_USER_{id}_EMAIL` and `GMAIL_USER_{id}_APP_PASS` to `.env` for each user (SMTP credentials only — resume path comes from `users.resume_path` in the DB, not an env var). Update `email_sender.py`: make `user_id` a required keyword argument with no default, resolve SMTP credentials from env and resume path from DB at send time. Add `get_resume_path(user_id)` helper that raises if user not found. Add structured logging to `email_sender.py` and `outreach_engine.py` (currently has no logging). Each user generates their own Gmail App Password via Google account settings → Security → App Passwords.
 
    Also update `workers/startup.py`: the `_GMAIL_ENV_KEYS` list currently checks for `GMAIL_EMAIL` and `GMAIL_APP_PASSWORD` (the single-user names). With multi-user these are replaced by `GMAIL_USER_{id}_EMAIL` / `GMAIL_USER_{id}_APP_PASS`. Update the `check_gmail=True` path to validate that at least `GMAIL_USER_1_EMAIL` and `GMAIL_USER_1_APP_PASS` are present, or iterate over all active `user_id`s from the DB.
 

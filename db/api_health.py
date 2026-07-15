@@ -535,7 +535,7 @@ def query_p95_response_ms(scan_type: str) -> int:
     def _query():
         conn = get_conn()
         try:
-            return conn.execute("""
+            row = conn.execute("""
                 SELECT AVG(max_response_ms) AS avg_max_ms
                 FROM api_health
                 WHERE platform = ANY(?)
@@ -543,6 +543,14 @@ def query_p95_response_ms(scan_type: str) -> int:
                   AND context = 'normal'
                   AND max_response_ms > 0
             """, (list(_LISTING_SCAN_PLATFORMS), since)).fetchone()
+            conn.commit()
+            return row
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
@@ -635,6 +643,12 @@ def record_scaling_event(
                 learned_ceiling, consec_reductions, notes,
             ))
             conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 

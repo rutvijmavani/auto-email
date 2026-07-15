@@ -652,10 +652,9 @@ def _scan_career_page(company, career_page_url, domain=None):
     for _chk_url in (career_page_url, final_url):
         _pm = _paycom_re.search(_chk_url or "")
         if _pm:
-            import json as _json
             return {
                 "platform": "paycom",
-                "slug": _json.dumps({"host": _pm.group(1), "key": _pm.group(2)}),
+                "slug": json.dumps({"host": _pm.group(1), "key": _pm.group(2)}),
             }
 
     if ("cdn.phenompeople.com" in html or
