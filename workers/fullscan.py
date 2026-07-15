@@ -1293,6 +1293,18 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                                 "company will be rescheduled by next adaptive cycle",
                                 company, _zadd_err,
                             )
+
+                # Sync prospective_companies.last_checked_at and
+                # consecutive_empty_days so the monitor table reflects actual
+                # worker activity — without this, covered companies appear frozen.
+                try:
+                    from db.job_monitor import update_company_check
+                    update_company_check(company, found_jobs=(len(title_matched) > 0))
+                except Exception as _uc_exc:
+                    logger.warning(
+                        "fullscan [%s]: update_company_check failed (non-fatal): %s",
+                        company, _uc_exc,
+                    )
             else:
                 result["outcome"] = "error"
                 result["success"] = False
@@ -1506,10 +1518,11 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 "error":     "[ERR]",
             }.get(outcome, "[?]")
 
-            print(
-                f"  {icon} {company} — "
-                f"{result['new_jobs']} new / {result['fetched']} fetched "
-                f"({result['pages']} pages, {result['duration_ms']}ms)"
+            logger.info(
+                "%s %s — %d new / %d fetched (%d pages, %dms)",
+                icon, company,
+                result["new_jobs"], result["fetched"],
+                result["pages"], result["duration_ms"],
             )
 
             if once:

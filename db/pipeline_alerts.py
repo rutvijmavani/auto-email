@@ -33,6 +33,7 @@ ALERT_ERROR_STREAK       = "error_streak"        # company: N consecutive scan f
 ALERT_DETAIL_QUEUE_DEPTH = "detail_queue_depth"  # detail queue sustained above watermark
 ALERT_REDIS_MEMORY       = "redis_memory"        # Redis used_memory near maxmemory limit
 ALERT_REACTIVATION_LAG   = "reactivation_lag"    # company dark > threshold after recovery
+ALERT_REDIS_RESTART      = "redis_restart"       # Redis restarted while scheduler was running; ZSETs auto-rebuilt
 
 # Severity
 CRITICAL = "critical"

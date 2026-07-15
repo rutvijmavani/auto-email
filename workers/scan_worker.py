@@ -931,9 +931,11 @@ def run_worker(once: bool = False, shutdown_event=None,
             _hw["count"] += 1
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""
-            print(f"  [{status}] {result['company']}{first} — "
-                  f"{result['fetched']} fetched, {result['new_jobs']} new "
-                  f"({result['duration_ms']}ms)")
+            logger.info(
+                "[%s] %s%s — %d fetched, %d new (%dms)",
+                status, result["company"], first,
+                result["fetched"], result["new_jobs"], result["duration_ms"],
+            )
 
             if once:
                 break
