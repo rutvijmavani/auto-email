@@ -293,7 +293,8 @@ def _parse_log_level(line: str) -> str:
     Tracebacks/exceptions: no level field — returns "".
     """
     try:
-        return json.loads(line).get("level", "")
+        level = json.loads(line).get("level", "")
+        return level if isinstance(level, str) else ""
     except (json.JSONDecodeError, ValueError, AttributeError):
         m = re.search(r'\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b', line)
         return m.group(1) if m else ""
