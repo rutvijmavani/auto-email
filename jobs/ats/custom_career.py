@@ -60,6 +60,7 @@ LISTING RESPONSE TYPES
 import re
 import json
 import time
+import uuid
 import logging
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -1353,6 +1354,29 @@ def _scrape_description_from_html(soup):
     return ""
 
 
+_CLIENT_THREAD_ID_RE = re.compile(
+    r'^S-\d{10,15}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+)
+
+
+def _refresh_client_thread_ids(obj):
+    """Recursively replace S-{unix_ms}-{uuid4} thread IDs in a JSON body.
+
+    Walmart's chat API generates these client-side — they carry no server
+    secret, so we can mint a fresh one before every request.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if (k == "thread_id" and isinstance(v, str)
+                    and _CLIENT_THREAD_ID_RE.match(v)):
+                obj[k] = f"S-{int(time.time() * 1000)}-{uuid.uuid4()}"
+            else:
+                _refresh_client_thread_ids(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            _refresh_client_thread_ids(item)
+
+
 # Detect starting page number from stored body (0-indexed vs 1-indexed APIs)
 def _get_initial_page(slug_info):
     """Return the page number stored in the original curl body/params."""
@@ -1433,6 +1457,16 @@ def _fetch_page(session, slug_info, page=1, offset=0, cursor=None):
         # Meta requires x-fb-lsd header to match lsd value in body
         if lsd:
             session.headers["x-fb-lsd"] = lsd
+
+    # Regenerate client-generated thread IDs (Walmart-style chat APIs).
+    # Pattern: "S-{unix_ms}-{uuid4}" — client constructs this; no server secret.
+    if method == "POST" and body and _is_json(body):
+        try:
+            body_data = json.loads(body)
+            _refresh_client_thread_ids(body_data)
+            body = json.dumps(body_data)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     # Inject CSRF into POST body
     csrf_token = slug_info.get("_csrf_token")

@@ -2335,6 +2335,69 @@ def _liveness_check_loop() -> None:
             time.sleep(10)
 
 
+# Module-level: recorded once at import time so the watchdog can compare
+# Redis uptime against scheduler process uptime.
+_SCHEDULER_START_TS = time.time()
+
+
+def _redis_watchdog_loop() -> None:
+    """
+    Detect Redis restarts while the scheduler process is still running and
+    automatically rebuild both ZSETs from PostgreSQL.
+
+    Redis exposes its own uptime via INFO server → uptime_in_seconds.
+    If that value is less than how long the scheduler has been running
+    (minus a 90-second grace period for slow Redis starts), Redis must have
+    restarted after us — the ZSETs are gone.
+
+    Runs every 60 seconds.  rebuild_redis() is idempotent and handles both
+    the "all companies lost" and "some companies still have valid DB scores"
+    cases through its STALE / CURRENT / NEW classification.
+    """
+    r = get_redis()
+    logger.info("redis_watchdog_loop: started")
+
+    while True:
+        try:
+            time.sleep(60)
+            info = r.info("server")
+            redis_uptime_s = float(info.get("uptime_in_seconds", 0))
+            scheduler_uptime_s = time.time() - _SCHEDULER_START_TS
+
+            # Grace: allow 90 s for Redis to start up before we consider it
+            # a restart (handles intentional Redis restarts before the scheduler).
+            if redis_uptime_s < scheduler_uptime_s - 90:
+                logger.warning(
+                    "redis_watchdog_loop: Redis uptime=%.0fs < scheduler uptime=%.0fs "
+                    "— Redis restarted while scheduler was running; rebuilding ZSETs",
+                    redis_uptime_s, scheduler_uptime_s,
+                )
+                try:
+                    from db.pipeline_alerts import create_alert, ALERT_REDIS_RESTART, WARNING
+                    create_alert(
+                        alert_type=ALERT_REDIS_RESTART,
+                        severity=WARNING,
+                        platform="redis",
+                        value=redis_uptime_s,
+                        threshold=scheduler_uptime_s,
+                        message=(
+                            f"Redis restarted (uptime={redis_uptime_s:.0f}s) while "
+                            f"scheduler was running (uptime={scheduler_uptime_s:.0f}s) "
+                            f"— ZSETs rebuilt automatically"
+                        ),
+                    )
+                except Exception:
+                    pass  # alert failure must not block the rebuild
+                rebuild_redis()
+                logger.info("redis_watchdog_loop: rebuild complete")
+        except KeyboardInterrupt:
+            logger.info("redis_watchdog_loop: stopping")
+            break
+        except Exception as exc:
+            logger.error("redis_watchdog_loop: error: %s", exc, exc_info=True)
+            time.sleep(30)
+
+
 def _fast_error_check_loop() -> None:
     """
     Layer 2: fast error monitor — runs every WORKER_FAST_CHECK_INTERVAL_S (5 min).
@@ -3063,6 +3126,8 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
                          name="fast_error_check",        daemon=True),
         threading.Thread(target=_slow_throughput_check_loop,
                          name="slow_throughput_check",   daemon=True),
+        threading.Thread(target=_redis_watchdog_loop,
+                         name="redis_watchdog",          daemon=True),
     ]
 
     for t in threads:

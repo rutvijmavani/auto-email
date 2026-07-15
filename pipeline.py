@@ -908,11 +908,25 @@ def run_quota_report(silent_if_healthy=False):
 def main():
     args = sys.argv[1:]
 
-    # Initialize scheduler logging before anything else (including Sentry) so
-    # that Sentry init warnings and all startup messages go to scheduler.log.
+    # Initialize logging before anything else (including Sentry) so that
+    # Sentry init warnings and all startup messages go to the right log file.
+    # Each command gets its own log file; scheduler gets a rotating file
+    # because it is the only long-running process that crosses midnight.
+    from logger import init_logging
     if "--scheduler" in args:
-        from logger import init_logging
         init_logging("scheduler")
+    elif "--monitor-jobs" in args:
+        init_logging("monitor")
+    elif "--sync-forms" in args or "--sync-prospective" in args:
+        init_logging("sync")
+    elif "--detect-ats" in args:
+        init_logging("detect")
+    elif "--find-only" in args:
+        init_logging("find")
+    elif "--outreach-only" in args:
+        init_logging("outreach")
+    else:
+        init_logging("pipeline")
 
     from workers.sentry_init import init_sentry
     if not init_sentry():

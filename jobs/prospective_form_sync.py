@@ -251,6 +251,27 @@ def _resolve_from_curl(company, curl_str, career_page_url=None,
         return None
 
     if not detected:
+        # GraphQL endpoints (non-Meta) may succeed at replay but return no
+        # detectable structure because the body used stale session tokens or
+        # the response format isn't recognized yet. Save the parsed config and
+        # let custom_career.fetch_jobs() detect structure at runtime with a
+        # fresh warm session — same escape hatch as the 400 path above.
+        if slug_info.get("graphql_config"):
+            logger.info(
+                "[sync] %r: GraphQL replay returned no detectable structure — "
+                "saving config for runtime detection",
+                company,
+            )
+            print(
+                "       [Curl] GraphQL endpoint: structure detection deferred "
+                "to runtime (stale session or unrecognized format)"
+            )
+            slug_info["_replay_skipped"] = True
+            return {
+                "platform": "custom",
+                "slug":     json.dumps(slug_info),
+            }
+
         print("       [Curl] No jobs found in response — "
               "ensure curl is from the job listing endpoint")
         logger.warning(

@@ -283,13 +283,15 @@ class TestQueryP95ErrorHandling(unittest.TestCase):
         conn.close.assert_called_once()
 
     def test_conn_close_called_on_exception(self):
-        """conn.close() called even when execute raises."""
+        """conn.close() called even when execute raises (once per attempt; retry=2)."""
         conn = MagicMock()
         conn.execute.side_effect = Exception("timeout")
         with patch("db.connection.get_conn", return_value=conn):
             from db.api_health import query_p95_response_ms
             query_p95_response_ms("listing_scan")
-        conn.close.assert_called_once()
+        # The retry loop calls _query() twice on failure; each attempt closes its
+        # own connection — the mock returns the same object so close() == 2 total.
+        self.assertEqual(conn.close.call_count, 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

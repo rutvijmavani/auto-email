@@ -1241,8 +1241,11 @@ def run_worker(once: bool = False, shutdown_event=None,
             icon    = {"new": "[NEW]", "filtered": "[skip]", "error": "[ERR]"}.get(
                 outcome, "[?]"
             )
-            print(f"  {icon} [{tier}] {result['company']} "
-                  f"{result.get('job_id', '?')} ({result['duration_ms']}ms)")
+            logger.info(
+                "%s [%s] %s %s (%dms)",
+                icon, tier, result["company"],
+                result.get("job_id", "?"), result["duration_ms"],
+            )
 
             if once:
                 break
