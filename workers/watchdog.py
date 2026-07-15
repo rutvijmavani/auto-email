@@ -2415,10 +2415,8 @@ def _try_redis_down_email(r_info: str) -> None:
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    from logger import init_logging
+    init_logging("watchdog")
     once        = "--once"    in sys.argv
     status_only = "--status"  in sys.argv
     no_heal     = "--no-heal" in sys.argv

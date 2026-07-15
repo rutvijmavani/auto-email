@@ -200,4 +200,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("reschedule_on_deploy")
     sys.exit(main())

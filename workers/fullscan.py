@@ -1554,6 +1554,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("fullscan")
     once      = "--once"      in sys.argv
     skip_lock = "--skip-lock" in sys.argv
     run_worker(once=once, skip_lock=skip_lock)

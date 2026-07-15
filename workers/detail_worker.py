@@ -501,8 +501,9 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 "detail_worker: detail required for listing_filter=title_only but "
                 "skipped (missing required keys in payload) — dropping malformed "
                 "payload; company will be rescanned at next adaptive interval. "
-                "platform=%s company=%r job_id=%s payload_underscore_keys=%s",
+                "platform=%s company=%r job_id=%s missing_keys=%s payload_underscore_keys=%s",
                 platform, company, job_id,
+                _pre_missing,
                 [k for k in job if k.startswith("_") and job.get(k)],
             )
             try:
@@ -1281,5 +1282,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("detail_worker")
     once = "--once" in sys.argv
     run_worker(once=once)

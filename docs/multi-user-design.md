@@ -278,11 +278,14 @@ The caller (`outreach_engine.py`) already knows `user_id` from the application r
 ALTER TABLE recruiters
   ADD COLUMN IF NOT EXISTS found_by_user_id INT REFERENCES users(id) ON DELETE SET NULL;
 
--- Backfill: all existing recruiters were found by operator (user_id = 1)
-UPDATE recruiters SET found_by_user_id = 1 WHERE found_by_user_id IS NULL;
+-- Backfill: all existing recruiters were found using User 2's CareerShift account
+-- (operator ran find_emails.py with her credentials before multi-user was implemented)
+UPDATE recruiters SET found_by_user_id = 2 WHERE found_by_user_id IS NULL;
 ```
 
 > **Note:** `found_by_user_id` is NOT about attribution — it is purely a routing key so recruiter verification always uses the CareerShift account that originally cached this profile. Re-visiting a profile from a different account counts as a new visit and burns that account's quota. The `recruiters` table itself remains shared with no `user_id` partition.
+>
+> **Why user_id=2 for the backfill:** All recruiter scraping before multi-user was done using User 2's (fiancée's) CareerShift credentials. Those profiles are cached under her account. Routing verification to User 1's account would burn quota re-visiting already-cached profiles.
 
 ---
 
@@ -292,8 +295,8 @@ UPDATE recruiters SET found_by_user_id = 1 WHERE found_by_user_id IS NULL;
 ALTER TABLE careershift_quota
   ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE RESTRICT;
 
--- Backfill
-UPDATE careershift_quota SET user_id = 1 WHERE user_id IS NULL;
+-- Backfill: existing quota rows tracked User 2's account (her credentials were in use)
+UPDATE careershift_quota SET user_id = 2 WHERE user_id IS NULL;
 
 ALTER TABLE careershift_quota ALTER COLUMN user_id SET NOT NULL;
 
@@ -465,22 +468,24 @@ Each user is processed in sequence, sorted by `users.id ASC` (User 1 always befo
 6. Run `scrape_company()` for each application. New recruiters inserted into shared `recruiters` table with `found_by_user_id = current_user.id`.
 7. Record final remaining quota.
 
-> **Overflow tracking:** If quota runs out before all of this user's applications are served, the unserved applications are recorded as *overflow* and promoted to Phase 2 Priority 1. They are not dropped — they become the highest-priority work in Phase 2.
+> **Overflow tracking:** If quota runs out before all of this user's applications are served, the unserved applications are recorded as *overflow*. They are not dropped — they are eligible for Phase 2 as the lowest-priority work.
 
 ### 4.3 Phase 2 — Pooled Leftover Queue
 
 After Phase 1 completes for all users, confirmed remaining quota is pooled. Spent on the following priority queue in strict order.
 
-**Account selection within Phase 2:** Exhaust-one-first. Use User 1's account until it hits 0, then switch to User 2's account. Minimises login switches. If User 1 has 0 remaining, start directly with User 2.
+**Account selection within Phase 2:** Exhaust-one-first. Use User 1's account until it hits 0, then switch to User 2's account (and so on for more users). Minimises login switches. If User 1 has 0 remaining, start directly with User 2.
 
 ### 4.4 Phase 2 Priority Queue
 
 | Priority | Work item | Description |
 |---|---|---|
-| **1** | Overflow new applications | Any user whose Phase 1 ran out of quota before all applications were served. Same class of work as Phase 1, just deferred. Process all overflow before moving to Priority 2. |
-| **2** | Top-up under-stocked companies | Companies (from any user's applications) where active recruiter count is below `MAX_CONTACTS_HARD_CAP` (currently 3). Same scoring as existing: `(MAX_CONTACTS_HARD_CAP − recruiter_count) × recency_weight`. |
-| **3** | Prospective companies | Companies in `prospective_companies` with no recruiter in the `recruiters` table yet. Uses whatever pool remains after Priorities 1 and 2. |
+| **1** | Top-up under-stocked companies | Companies (from any user's applications) where active recruiter count is below `MAX_CONTACTS_HARD_CAP` (currently 3). Shared benefit — more contacts per company helps all users. Scored by `(MAX_CONTACTS_HARD_CAP − recruiter_count) × recency_weight`. |
+| **2** | Prospective companies | Companies in `prospective_companies` with no recruiter yet. Shared benefit — new companies added to the pool help all users. |
+| **3** | Overflow new applications | Any user whose Phase 1 ran out of quota before all applications were served. Only reached after Priorities 1 and 2 are exhausted. Within Priority 3, process users in `users.id ASC` order. |
 
+> **Why overflow is last:** Personal applications are personal work — each user's quota is their own responsibility. Shared work (top-up, prospective) benefits everyone and takes precedence over one user's overflow. Overflow work only consumes truly idle quota that would otherwise go unused that day.
+>
 > **When to borrow:** Borrowing only happens in Phase 2 with *confirmed* leftover quota — i.e., what remains after every user's Phase 1 has fully completed. There is no pre-emptive borrowing. A user's Phase 1 quota is never at risk from another user's run.
 
 ---
@@ -647,7 +652,7 @@ Steps are ordered to avoid breaking production between them. Each step leaves th
 
 JSON logging (surgical Option D) is woven into each step alongside the multi-user changes — wherever a file is already being opened, logging is upgraded at the same time to avoid touching files twice. Files not touched by multi-user retain existing logging until Phase 2 (multi-server).
 
-1. **DB migrations** — Add `users` table. Add `user_id` columns to `applications`, `outreach`, `coverage_stats`, `quota_alerts`, `careershift_quota`, `model_usage`. Add `found_by_user_id` to `recruiters`. Add `added_by_user_id` to `prospective_companies`. Run as `ADD COLUMN IF NOT EXISTS` in `init_db()`. Backfill all to `user_id = 1`. System continues working single-user throughout.
+1. **DB migrations** — Add `users` table. Add `user_id` columns to `applications`, `outreach`, `coverage_stats`, `quota_alerts`, `careershift_quota`, `model_usage`. Add `found_by_user_id` to `recruiters`. Add `added_by_user_id` to `prospective_companies`. Run as `ADD COLUMN IF NOT EXISTS` in `init_db()`. Backfill values per §4 (note: `recruiters.found_by_user_id` and `careershift_quota.user_id` backfill to 2, not 1). System continues working single-user throughout.
 
 2. **Admin script: `scripts/add_user.py`** — CLI to insert a `users` row (with `name`, `email`, `resume_path`) and print the exact env vars to add to `.env`. This is the checklist that prevents silent omissions when onboarding a new user.
 
@@ -854,3 +859,98 @@ Also standardise env vars: `GMAIL_EMAIL` → `EMAIL`, `GMAIL_APP_PASSWORD` → `
 - `scripts/test_wayfair.py` — has `basicConfig` but is a diagnostic script; excluded
 
 **Total files to edit: 10.** All other files (`db/`, `careershift/`, `outreach/`, `jobs/`) get JSON logging for free with zero changes.
+
+---
+
+## 12. CareerShift Session Files
+
+### Problem
+
+CareerShift login does not work in headless mode. The existing flow is:
+
+1. **Local machine** (headed Chrome): `python careershift/auth_njit.py` → browser opens → manual login → session saved to `data/careershift_session.json`
+2. **SCP to server**: `scp data/careershift_session.json opc@server:/home/opc/mail/data/`
+3. **Server** (headless): `--find-only` loads the session file into Playwright — no login needed, just cookie replay
+
+In multi-user mode each CareerShift account needs its own session file. A single shared file would be overwritten mid-run if both accounts are logged in sequentially.
+
+### Solution: Per-user session files
+
+```
+data/careershift_session_1.json   # User 1 (operator)
+data/careershift_session_2.json   # User 2 (fiancée)
+data/careershift_session_N.json   # User N — scales to any number of users
+```
+
+### Code changes
+
+**`careershift/constants.py`** — replace `SESSION_FILE` constant with a function:
+
+```python
+def get_session_file(user_id: int) -> str:
+    return os.path.join(os.path.dirname(__file__), "..", "data", f"careershift_session_{user_id}.json")
+```
+
+**`careershift/auth_njit.py` + `careershift/auth.py`** — accept `--user-id` CLI flag:
+
+```bash
+python careershift/auth_njit.py --user-id 1   # saves data/careershift_session_1.json
+python careershift/auth_njit.py --user-id 2   # saves data/careershift_session_2.json
+```
+
+**`careershift/find_emails.py`** — in Phase 1 loop, load the correct session file per user:
+
+```python
+context = browser.new_context(
+    storage_state=get_session_file(user.id),
+    ...
+)
+```
+
+**`.gitignore`** — update pattern to cover all users:
+
+```
+# Before
+careershift_session.json
+
+# After
+careershift_session_*.json
+```
+
+### Migration from single-user
+
+The existing `data/careershift_session.json` was generated using User 2's credentials (her account was used for all scraping before multi-user). On migration:
+
+```bash
+# On server — rename existing session to user 2
+mv data/careershift_session.json data/careershift_session_2.json
+
+# On local machine — authenticate user 1's account fresh
+python careershift/auth_njit.py --user-id 1
+scp data/careershift_session_1.json opc@server:/home/opc/mail/data/
+```
+
+### Ongoing session renewal (~30 days)
+
+Sessions expire after approximately 30 days. When a session expires:
+
+```bash
+# On local machine
+python careershift/auth_njit.py --user-id N
+scp data/careershift_session_N.json opc@server:/home/opc/mail/data/
+```
+
+`add_user.py` prints these exact commands when a new user is created so the operator always knows what to run.
+
+### Session file check in find_emails.py
+
+Phase 1 should check that each user's session file exists before starting, and skip (with a warning) rather than crash if it's missing — this prevents one missing session from blocking all other users:
+
+```python
+session_path = get_session_file(user.id)
+if not os.path.exists(session_path):
+    logger.warning("find_emails: session file missing for user_id=%d (%s) — skipping. "
+                   "Run auth_njit.py --user-id %d and SCP to server.",
+                   user.id, user.name, user.id)
+    continue
+```
