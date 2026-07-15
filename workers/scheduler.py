@@ -29,6 +29,8 @@ import logging
 import math
 import multiprocessing
 import os
+
+from logger import get_logger
 import random
 import threading
 import time
@@ -111,7 +113,7 @@ from config import (
     WARMING_INTERVAL_S,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Pause / resume events — set by pubsub listener, read by dispatch loops.
 # _pause_event: set when pipeline:pause received; cleared on resume.

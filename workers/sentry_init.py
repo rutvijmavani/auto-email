@@ -50,6 +50,8 @@ import logging
 import os
 import threading
 import time
+
+from logger import get_logger
 from pathlib import Path
 from typing import Any, Optional
 
@@ -68,7 +70,7 @@ _PFX_ERR = "sentry:err:"
 _PFX_ACT = "sentry:act:"
 _PFX_TS  = "sentry:ts:"
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

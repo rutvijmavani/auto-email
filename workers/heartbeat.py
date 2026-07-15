@@ -39,9 +39,10 @@ import os
 import socket
 import threading
 import time
-import logging
 
-logger = logging.getLogger(__name__)
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 _HOSTNAME = socket.gethostname()   # resolved once at import time; stable for process lifetime
 

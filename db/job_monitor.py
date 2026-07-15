@@ -9,6 +9,10 @@ from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
 
+class ContentHashConflict(Exception):
+    """Raised by complete_pending_detail when content_hash already exists for a different job."""
+
+
 def job_url_exists(job_url):
     """
     Check if job URL already exists in job_postings (any status).
@@ -745,6 +749,14 @@ def complete_pending_detail(company: str, job_id: str, job: dict,
         ))
         conn.commit()
         return cursor.rowcount > 0
+    except Exception as exc:
+        if getattr(exc, "pgcode", None) == "23505":  # unique_violation
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise ContentHashConflict(job.get("content_hash")) from exc
+        raise
     finally:
         conn.close()
 

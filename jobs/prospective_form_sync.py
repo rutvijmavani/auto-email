@@ -643,6 +643,20 @@ def _scan_career_page(company, career_page_url, domain=None):
         if result and result.get("platform") not in HARD_ATS:
             return result
 
+    # Paycom: portal key embedded in career-page URL; host and key vary per tenant
+    _paycom_re = re.compile(
+        r"https?://([\w.-]*paycomonline\.(?:net|com))"
+        r"/v4/ats/web\.php/portal/([A-Za-z0-9]+)",
+        re.IGNORECASE,
+    )
+    for _chk_url in (career_page_url, final_url):
+        _pm = _paycom_re.search(_chk_url or "")
+        if _pm:
+            return {
+                "platform": "paycom",
+                "slug": json.dumps({"host": _pm.group(1), "key": _pm.group(2)}),
+            }
+
     if ("cdn.phenompeople.com" in html or
             ("use-widget" in html and "ph-" in html)):
         slug = _extract_phenom_slug(html, career_page_url)

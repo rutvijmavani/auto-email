@@ -23,8 +23,9 @@ are passed in as a dict so every function here stays pure and testable.
 """
 
 import json
-import logging
 from typing import Optional
+
+from logger import get_logger
 
 import math
 
@@ -44,7 +45,7 @@ from config import (
     ADAPTIVE_MIN_COMPANIES_CALIBRATE,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────
