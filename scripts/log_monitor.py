@@ -294,7 +294,7 @@ def _parse_log_level(line: str) -> str:
     """
     try:
         return json.loads(line).get("level", "")
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, AttributeError):
         m = re.search(r'\b(DEBUG|INFO|WARNING|ERROR|CRITICAL)\b', line)
         return m.group(1) if m else ""
 
