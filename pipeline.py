@@ -297,10 +297,11 @@ def run_find_emails():
 
 def _generate_ai_content_for_all():
     """
-    Generate and cache AI email content for every active application.
-    Uses leftover Gemini quota for applications missing cache.
+    Generate and cache AI email content for every active application, per user.
+    Each user's apps are generated with their own Gemini API key and quota.
     """
     from db.db import get_all_active_applications, get_applications_missing_ai_cache
+    from db.users import get_all_active_users
     from jobs.job_fetcher import fetch_job_description
     from outreach.ai_full_personalizer import (
         generate_all_content,
@@ -308,83 +309,94 @@ def _generate_ai_content_for_all():
         all_models_exhausted,
     )
 
-    apps = get_all_active_applications()
-
-    if not apps:
-        logger.info("No active applications found for AI content generation")
-        print("[INFO] No active applications found.")
+    users = get_all_active_users()
+    if not users:
+        logger.info("No active users found for AI content generation")
+        print("[INFO] No active users found.")
         return
 
     generated = 0
     skipped   = 0
     failed    = 0
 
-    for app in apps:
-        company   = app["company"]
-        job_url   = app["job_url"]
-        job_title = app["job_title"] or "Software Engineer"
+    for user in users:
+        user_id   = user["id"]
+        user_name = user.get("name") or user.get("email") or f"user_{user_id}"
+        print(f"\n[INFO] Generating AI content for {user_name} (user_id={user_id})...")
+        logger.info("AI content generation start for user_id=%d", user_id)
 
-        print(f"\n  [INFO] {company} | {job_title}")
-        logger.debug("Generating AI content for %r | %s", company, job_title)
+        apps = get_all_active_applications(user_id=user_id)
+        if not apps:
+            logger.info("No active applications for user_id=%d", user_id)
+            print(f"  [INFO] No active applications for {user_name}.")
+            continue
 
-        job_data = fetch_job_description(job_url)
+        for app in apps:
+            company   = app["company"]
+            job_url   = app["job_url"]
+            job_title = app["job_title"] or "Software Engineer"
 
-        if not job_data:
-            print(f"  [WARNING] No job description for {company}. Using role-based fallback.")
-            result = generate_all_content_without_jd(company, job_title)
-        else:
-            if isinstance(job_data, dict):
-                job_text  = job_data.get("job_text", "")
-                job_title = job_data.get("job_title") or job_title
+            print(f"\n  [INFO] {company} | {job_title}")
+            logger.debug("Generating AI content for %r | %s (user_id=%d)", company, job_title, user_id)
+
+            job_data = fetch_job_description(job_url)
+
+            if not job_data:
+                print(f"  [WARNING] No job description for {company}. Using role-based fallback.")
+                result = generate_all_content_without_jd(company, job_title, user_id=user_id)
             else:
-                job_text = job_data
-
-            if not job_text:
-                print(f"  [WARNING] Empty job description for {company}. Using role-based fallback.")
-                result = generate_all_content_without_jd(company, job_title)
-            else:
-                result = generate_all_content(company, job_title, job_text)
-
-        if result:
-            logger.info("AI content generated for %r", company)
-            print(f"  [OK] AI content ready for {company}")
-            generated += 1
-        else:
-            logger.warning("AI generation failed for %r (quota exhausted?)", company)
-            print(f"  [WARNING] AI generation failed for {company} (quota exhausted?)")
-            failed += 1
-
-    # Leftover Gemini quota utilization
-    if not all_models_exhausted():
-        missing = get_applications_missing_ai_cache()
-        if missing:
-            logger.info("Using leftover Gemini quota for %d application(s) missing cache",
-                        len(missing))
-            print(f"\n[INFO] Using leftover Gemini quota for {len(missing)} application(s) missing cache...")
-            for app in missing:
-                if all_models_exhausted():
-                    break
-                company   = app["company"]
-                job_title = app["job_title"] or "Software Engineer"
-                job_url   = app["job_url"]
-                job_data  = fetch_job_description(job_url)
-
                 if isinstance(job_data, dict):
-                    job_text = job_data.get("job_text", "")
-                elif isinstance(job_data, str):
-                    job_text = job_data
+                    job_text  = job_data.get("job_text", "")
+                    job_title = job_data.get("job_title") or job_title
                 else:
-                    job_text = None
+                    job_text = job_data
 
-                result = (
-                    generate_all_content(company, job_title, job_text)
-                    if job_text
-                    else generate_all_content_without_jd(company, job_title)
-                )
-                if result:
-                    logger.info("Leftover quota used for: %r", company)
-                    print(f"  [OK] Leftover quota used for: {company}")
-                    generated += 1
+                if not job_text:
+                    print(f"  [WARNING] Empty job description for {company}. Using role-based fallback.")
+                    result = generate_all_content_without_jd(company, job_title, user_id=user_id)
+                else:
+                    result = generate_all_content(company, job_title, job_text, user_id=user_id)
+
+            if result:
+                logger.info("AI content generated for %r (user_id=%d)", company, user_id)
+                print(f"  [OK] AI content ready for {company}")
+                generated += 1
+            else:
+                logger.warning("AI generation failed for %r user_id=%d (quota exhausted?)", company, user_id)
+                print(f"  [WARNING] AI generation failed for {company} (quota exhausted?)")
+                failed += 1
+
+        # Leftover quota: fill any remaining missing-cache apps for this user
+        if not all_models_exhausted(user_id=user_id):
+            missing = get_applications_missing_ai_cache(user_id=user_id)
+            if missing:
+                logger.info("Using leftover Gemini quota for %d application(s) missing cache (user_id=%d)",
+                            len(missing), user_id)
+                print(f"\n[INFO] Using leftover Gemini quota for {len(missing)} application(s) missing cache ({user_name})...")
+                for app in missing:
+                    if all_models_exhausted(user_id=user_id):
+                        break
+                    company   = app["company"]
+                    job_title = app["job_title"] or "Software Engineer"
+                    job_url   = app["job_url"]
+                    job_data  = fetch_job_description(job_url)
+
+                    if isinstance(job_data, dict):
+                        job_text = job_data.get("job_text", "")
+                    elif isinstance(job_data, str):
+                        job_text = job_data
+                    else:
+                        job_text = None
+
+                    result = (
+                        generate_all_content(company, job_title, job_text, user_id=user_id)
+                        if job_text
+                        else generate_all_content_without_jd(company, job_title, user_id=user_id)
+                    )
+                    if result:
+                        logger.info("Leftover quota used for: %r (user_id=%d)", company, user_id)
+                        print(f"  [OK] Leftover quota used for: {company}")
+                        generated += 1
 
     logger.info("AI content complete: generated=%d skipped=%d failed=%d",
                 generated, skipped, failed)

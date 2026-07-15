@@ -16,20 +16,36 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-_client = None
+# Per-user Gemini clients keyed by user_id
+_clients: dict = {}
+# Shared client for ATS field-map detection (not per-user)
+_ats_client = None
 
 
-def _get_client():
-    """Lazy-initialize Gemini client. Returns None if API key is not set."""
-    global _client
-    if _client is not None:
-        return _client
-    api_key = os.getenv("GEMINI_API_KEY")
+def _get_client(user_id: int = 1):
+    """Lazy-initialize per-user Gemini client from GEMINI_API_KEY_USER_{user_id}."""
+    global _clients
+    if user_id in _clients:
+        return _clients[user_id]
+    api_key = os.getenv(f"GEMINI_API_KEY_USER_{user_id}")
     if not api_key:
-        print("[WARNING] GEMINI_API_KEY not set. AI generation will be skipped.")
+        print(f"[WARNING] GEMINI_API_KEY_USER_{user_id} not set. AI generation will be skipped.")
         return None
-    _client = genai.Client(api_key=api_key)
-    return _client
+    _clients[user_id] = genai.Client(api_key=api_key)
+    return _clients[user_id]
+
+
+def _get_ats_client():
+    """Lazy-initialize shared Gemini client for ATS detection (GEMINI_ATS_KEY_PRIMARY)."""
+    global _ats_client
+    if _ats_client is not None:
+        return _ats_client
+    api_key = os.getenv("GEMINI_ATS_KEY_PRIMARY") or os.getenv("GEMINI_ATS_KEY_FALLBACK")
+    if not api_key:
+        print("[WARNING] GEMINI_ATS_KEY_PRIMARY not set. ATS field-map AI will be skipped.")
+        return None
+    _ats_client = genai.Client(api_key=api_key)
+    return _ats_client
 
 # -----------------------
 # CONFIG
@@ -61,17 +77,17 @@ def _fallback_cache_key(company, job_title):
 # SHARED AI CALL
 # -----------------------
 
-def _call_model(prompt, cache_key, company, job_title):
+def _call_model(prompt, cache_key, company, job_title, user_id: int = 1):
     """
-    Call Gemini with the given prompt.
+    Call Gemini with the given prompt using user_id's API key and quota.
     Saves result to ai_cache and returns the parsed data dict.
     Returns {} if all models exhausted or both fail.
     """
-    if all_models_exhausted():
-        print("All model quotas exhausted for today.")
+    if all_models_exhausted(user_id=user_id):
+        print(f"All model quotas exhausted for today (user_id={user_id}).")
         return {}
 
-    client = _get_client()
+    client = _get_client(user_id)
     if client is None:
         return {}
 
@@ -86,8 +102,8 @@ def _call_model(prompt, cache_key, company, job_title):
                 print(f"{model} still unavailable after wait — trying next model.")
                 continue
 
-        if not can_call(model):
-            print(f"{model} daily limit reached — trying next model.")
+        if not can_call(model, user_id=user_id):
+            print(f"{model} daily limit reached (user_id={user_id}) — trying next model.")
             continue
 
         try:
@@ -96,7 +112,7 @@ def _call_model(prompt, cache_key, company, job_title):
                 contents=prompt
             )
 
-            increment_usage(model)
+            increment_usage(model, user_id=user_id)
 
             text = response.text.strip()
 
@@ -123,14 +139,15 @@ def _call_model(prompt, cache_key, company, job_title):
 # MAIN GENERATION FUNCTION (with JD)
 # -----------------------
 
-def generate_all_content(company, job_title, job_text):
+def generate_all_content(company, job_title, job_text, user_id: int = 1):
     """
     Generate personalized email content using the full job description.
     Falls back to generate_all_content_without_jd() if job_text is empty.
+    Uses user_id's Gemini API key and quota.
     """
     if not job_text:
         print(f"[WARNING] No job description available for {company}. Using role-based fallback.")
-        return generate_all_content_without_jd(company, job_title)
+        return generate_all_content_without_jd(company, job_title, user_id=user_id)
 
     key = _cache_key(company, job_title, job_text)
 
@@ -180,18 +197,19 @@ Rules:
 - Write 3 concise professional sentences explaining why I am a strong fit in a body.
 """
 
-    return _call_model(prompt, key, company, job_title)
+    return _call_model(prompt, key, company, job_title, user_id=user_id)
 
 
 # -----------------------
 # FALLBACK GENERATION (without JD)
 # -----------------------
 
-def generate_all_content_without_jd(company, job_title):
+def generate_all_content_without_jd(company, job_title, user_id: int = 1):
     """
     Generate role-specific email content using only company name and job title.
     Used when job description scraping fails.
     Cached separately from JD-based content.
+    Uses user_id's Gemini API key and quota.
     """
     key = _fallback_cache_key(company, job_title)
 
@@ -246,7 +264,7 @@ Rules:
 """
 
     print(f"[INFO] Generating fallback AI content for {company} | {job_title} (no JD available)")
-    return _call_model(prompt, key, company, job_title)
+    return _call_model(prompt, key, company, job_title, user_id=user_id)
 
 
 # -----------------------
@@ -297,7 +315,7 @@ def detect_field_map_with_ai(company, first_job_raw, base_url,
               f"skipping AI field map for {company}")
         return None, None, None, False
 
-    client = _get_client()
+    client = _get_ats_client()
     if client is None:
         return None, None, None , False
 
