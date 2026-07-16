@@ -322,9 +322,9 @@ class TestQuotaHealthIntegration(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("""
-            INSERT INTO careershift_quota (date, total_limit, used, remaining)
-            VALUES (?, 50, ?, ?)
-            ON CONFLICT (date) DO UPDATE SET
+            INSERT INTO careershift_quota (user_id, date, total_limit, used, remaining)
+            VALUES (1, ?, 50, ?, ?)
+            ON CONFLICT (user_id, date) WHERE user_id IS NOT NULL DO UPDATE SET
                 total_limit = EXCLUDED.total_limit,
                 used        = EXCLUDED.used,
                 remaining   = EXCLUDED.remaining
@@ -429,8 +429,8 @@ class TestDataRetentionIntegration(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("""
-            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at)
-            VALUES (?, ?, 'initial', 'sent', ?, ?)
+            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at, user_id)
+            VALUES (?, ?, 'initial', 'sent', ?, ?, 1)
         """, (self.rid, self.app_id, old, old))
         conn.commit()
         conn.close()
@@ -447,8 +447,8 @@ class TestDataRetentionIntegration(unittest.TestCase):
         conn = db_module.get_conn()
         c = conn.cursor()
         c.execute("""
-            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at)
-            VALUES (?, ?, 'initial', 'sent', ?, ?)
+            INSERT INTO outreach (recruiter_id, application_id, stage, status, sent_at, created_at, user_id)
+            VALUES (?, ?, 'initial', 'sent', ?, ?, 1)
         """, (self.rid, self.app_id, today, today))
         conn.commit()
         conn.close()

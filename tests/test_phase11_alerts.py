@@ -85,6 +85,7 @@ def _make_alerts_db():
             alert_type  TEXT    NOT NULL,
             severity    TEXT    NOT NULL,
             platform    TEXT,
+            user_id     INTEGER,
             value       REAL,
             threshold   REAL,
             message     TEXT,

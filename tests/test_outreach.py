@@ -378,14 +378,14 @@ class TestAIPersonalizer(unittest.TestCase):
         with patch("outreach.ai_full_personalizer.generate_all_content_without_jd") as mock_fallback:
             mock_fallback.return_value = self._sample_response()
             result = generate_all_content("Google", "SWE", "")
-            mock_fallback.assert_called_once_with("Google", "SWE")
+            mock_fallback.assert_called_once_with("Google", "SWE", user_id=1)
 
     def test_none_job_text_falls_back_to_no_jd(self):
         from outreach.ai_full_personalizer import generate_all_content
         with patch("outreach.ai_full_personalizer.generate_all_content_without_jd") as mock_fallback:
             mock_fallback.return_value = self._sample_response()
             result = generate_all_content("Google", "SWE", None)
-            mock_fallback.assert_called_once_with("Google", "SWE")
+            mock_fallback.assert_called_once_with("Google", "SWE", user_id=1)
 
     def test_fallback_uses_separate_cache_key(self):
         from outreach.ai_full_personalizer import _cache_key, _fallback_cache_key
@@ -427,7 +427,7 @@ class TestAIPersonalizer(unittest.TestCase):
             with patch("outreach.ai_full_personalizer._get_client", return_value=mock_client):
                 # Primary model at limit, fallback available
                 with patch("outreach.ai_full_personalizer.can_call",
-                           side_effect=lambda m: m == "gemini-2.5-flash"):
+                           side_effect=lambda m, **kw: m == "gemini-2.5-flash"):
                     with patch("outreach.ai_full_personalizer.increment_usage"):
                         result = _call_model("prompt", "newkey123", "Google", "SWE")
                         # Should have used fallback model
