@@ -58,6 +58,11 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Everything else uses YYYY-MM-DD and gets LOG_RETENTION_DAILY_DAYS retention.
 _MONTHLY_COMMANDS = frozenset({"monthly", "enrich", "build_ats_slug_list"})
 
+# Long-running processes that use TimedRotatingFileHandler (rotates at midnight)
+# instead of a dated filename so the file doesn't grow unbounded for weeks.
+# Log files: scheduler.log, api.log → rotate to scheduler.log.YYYY-MM-DD etc.
+_LONG_RUNNING_COMMANDS = frozenset({"scheduler", "api"})
+
 # Map CLI flag → log filename prefix
 # Pipeline sets this via init_logging(command="monitor") at startup
 _active_command: str = "pipeline"
@@ -290,8 +295,8 @@ def init_logging(command: str = "pipeline") -> None:
     # minutes and are never alive at midnight, so TimedRotatingFileHandler
     # would never fire for them.  They use plain FileHandler on a dated
     # filename; _cleanup_old_logs() handles deletion at startup instead.
-    if command == "scheduler":
-        command_file = LOG_DIR / "scheduler.log"
+    if command in _LONG_RUNNING_COMMANDS:
+        command_file = LOG_DIR / f"{command}.log"
         file_handler = logging.handlers.TimedRotatingFileHandler(
             command_file,
             when="midnight",
@@ -320,11 +325,11 @@ def init_logging(command: str = "pipeline") -> None:
     if command_file != pipeline_file:
         root.addHandler(file_handler)
 
-    # Scheduler runs for days and uses a TimedRotatingFileHandler that already
-    # captures everything.  Attaching a plain FileHandler for pipeline_<date>.log
-    # would cause it to grow indefinitely (never rotated).  Skip the catch-all
-    # for scheduler so output goes only through the rotating scheduler.log.
-    if command != "scheduler":
+    # Long-running processes use TimedRotatingFileHandler that already captures
+    # everything. Attaching a plain FileHandler for pipeline_<date>.log would
+    # cause it to grow indefinitely (never rotated). Skip the catch-all for
+    # long-running commands so output goes only through their rotating log.
+    if command not in _LONG_RUNNING_COMMANDS:
         catchall = logging.FileHandler(pipeline_file, mode="a", encoding="utf-8")
         catchall.setLevel(LOG_LEVEL)
         catchall.setFormatter(json_formatter)

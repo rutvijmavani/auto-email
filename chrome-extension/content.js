@@ -88,7 +88,13 @@
   function detectUser(callback) {
     try {
       chrome.identity.getAuthToken({ interactive: false }, (token) => {
-        if (chrome.runtime.lastError || !token) { callback(null); return; }
+        if (chrome.runtime.lastError || !token) {
+          reportToServer('warning', 'identity detection failed — OAuth token unavailable', {
+            error: chrome.runtime.lastError?.message || 'no token',
+          });
+          callback(null);
+          return;
+        }
         fetch('https://www.googleapis.com/oauth2/v1/userinfo', {
           headers: { Authorization: `Bearer ${token}` },
         })
@@ -162,6 +168,21 @@
 
   function removeOverlay() {
     document.getElementById(OVERLAY_ID)?.remove();
+  }
+
+  // ── Server-side error reporting ────────────────────────────────────────────
+
+  function reportToServer(level, message, context) {
+    try {
+      const endpoint = API_ENDPOINT.replace('/add-application', '/log-error');
+      const headers  = { 'Content-Type': 'application/json' };
+      if (API_KEY) headers['X-API-Key'] = API_KEY;
+      fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ level, message, context }),
+      }).catch(() => {});
+    } catch (_) {}
   }
 
   // ── API call ───────────────────────────────────────────────────────────────
@@ -257,12 +278,19 @@
       return;
     }
 
-    // API unreachable — try Google Sheets fallback
+    // API returned an error response (reachable but failed)
+    if (result.status) {
+      reportToServer('error', 'API error response', { status: result.status, company, job_url });
+    }
+
+    // API unreachable or errored — try Google Sheets fallback
+    reportToServer('warning', 'API unreachable — falling back to Sheets', { company, job_url });
     const saved = await postToSheet(payload);
     if (saved) {
       showBanner(overlay, 'Saved to sheet — will sync automatically', 'sheet');
       setTimeout(removeOverlay, 2500);
     } else {
+      reportToServer('error', 'both API and Sheets fallback failed', { company, job_url });
       showBanner(overlay, 'Failed to save. Check your connection.', 'error');
       btn.disabled = false;
       btn.textContent = 'Add to Pipeline';
