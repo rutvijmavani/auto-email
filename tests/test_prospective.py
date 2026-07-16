@@ -836,7 +836,7 @@ class TestFindEmailsEarlyReturn(unittest.TestCase):
     def test_no_apps_no_prospects_returns_early(self):
         """No active apps and no pending prospects → return early, no Playwright."""
         output, mock_pw = self._mock_run()
-        self.assertIn("No active applications", output)
+        self.assertIn("Skipped — no active applications", output)
         mock_pw.assert_not_called()
 
     def test_no_apps_with_pending_prospects_continues(self):
