@@ -269,6 +269,28 @@ old version may still be tracked.
 
 ---
 
+## Observability
+
+### ⚪ Silent payload drops — no stack trace, no callsite *(resolved 2026-07-16)*
+**Discovered:** 2026-07-16 during Accenture 866-drop incident investigation  
+**Symptom:** Alert emails showed `detail_worker` dropping hundreds of payloads with a WARNING, but the email body contained a raw JSON blob — no Python callsite, no call stack, no indication of where in the code the payload was built incorrectly. Investigation took 5 hours; root cause was ultimately self-resolving.  
+**Root causes:**
+1. `JsonFormatter` emitted `msg` embedded in a raw JSON object — unreadable in HTML email
+2. No stack trace injection for WARNING/ERROR records without an active exception
+3. `_build_detail_payload` pushed malformed payloads silently; drop was detected by `detail_worker` minutes later without any traceback
+4. Dropped payloads were discarded with no persistent record for post-incident inspection
+
+**4-layer fix applied:**
+1. `logger.JsonFormatter` auto-injects `stack` field (call stack) for every WARNING/ERROR that doesn't already have `exc_info`. Dedup: once per 60s per `logger.name:levelno` key.
+2. `_build_detail_payload()` in both `scan_worker.py` and `fullscan.py` raises `ValueError` when required platform keys are absent. Callers log `exc_info=True` → full traceback in logs + Sentry.
+3. `log_monitor._error_table_row()` parses JSON log lines and renders `msg`, `logger`, `time`, and `stack`/`exc` fields in a structured HTML layout.
+4. `detail_worker._push_to_dlq()` preserves dropped payloads in `queue:detail:dlq` (200-entry cap, 7-day retention). Watchdog alerts at depth > 50.
+
+**Files:** `logger.py`, `workers/scan_worker.py`, `workers/fullscan.py`, `workers/detail_worker.py`, `workers/watchdog.py`, `scripts/log_monitor.py`, `config.py`  
+**See also:** `docs/adaptive-polling-architecture.md` §22 — Log Observability
+
+---
+
 ## Resolved Issues ⚪
 
 ### ⚪ --monitor-jobs cycle-boundary bug — all companies always "missed"

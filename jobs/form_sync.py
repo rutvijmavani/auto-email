@@ -46,11 +46,12 @@ COL_JOB_TITLE    = 3
 COL_APPLIED_DATE = 4
 COL_USER_NAME    = 5
 
-# Maps Google Form user name values → pipeline user_id
-_USER_NAME_MAP = {
-    'rutvij': 1,
-    'disha':  2,
-}
+# Maps Google Form user name values → pipeline user_id.
+# Loaded from USER_NAME_MAP env var (JSON string) so real names are never
+# committed to the repo.  Example .env entry:
+#   USER_NAME_MAP={"alice": 1, "bob": 2}
+import json as _json
+_USER_NAME_MAP: dict[str, int] = _json.loads(os.environ.get('USER_NAME_MAP', '{}'))
 
 
 def _get_sheet():
@@ -204,12 +205,25 @@ def run():
         job_url      = row[COL_JOB_URL].strip()
         job_title    = row[COL_JOB_TITLE].strip() or None
         applied_date = _parse_date(row[COL_APPLIED_DATE])
-        user_name    = row[COL_USER_NAME].strip().lower()
-        user_id      = _USER_NAME_MAP.get(user_name, 1)
+        user_name = row[COL_USER_NAME].strip().lower()
+        user_id   = _USER_NAME_MAP.get(user_name)
 
         logger.info("── Row %d: company=%r  url=%r  title=%r  date=%s",
                     sheet_row_index, company, job_url, job_title, applied_date)
         print(f"  [{i+1}] {company} | {job_url[:50]}...")
+
+        # Reject rows with blank or unrecognised user names — never silently
+        # attribute them to a default user_id.  Leave the row in the sheet so
+        # the operator can fix the name and re-run.
+        if user_id is None:
+            logger.warning(
+                "Row %d: unrecognised user name %r (not in USER_NAME_MAP) — "
+                "skipping; row left in sheet for manual review",
+                sheet_row_index, user_name or "(blank)",
+            )
+            print(f"       [WARNING]  Unknown user name {user_name!r} — skipping (left in sheet)")
+            skipped += 1
+            continue
 
         # Validate required fields
         if not company:

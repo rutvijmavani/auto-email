@@ -84,11 +84,13 @@ _rollback_to_previous() {
         || echo "  [WARN] could not restart recruiter-scheduler"
     sudo systemctl restart recruiter-watchdog \
         || echo "  [WARN] could not restart recruiter-watchdog"
+    sudo systemctl restart pipeline-api \
+        || echo "  [WARN] could not restart pipeline-api"
 
     # Post-rollback verification
     sleep 3
     local _all_active=true
-    for svc in recruiter-scheduler recruiter-watchdog; do
+    for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
         if systemctl is-active --quiet "$svc"; then
             echo "  [OK] $svc is active after rollback"
         else
@@ -100,6 +102,7 @@ _rollback_to_previous() {
     echo "  [ROLLBACK] Check logs:"
     echo "             journalctl -u recruiter-scheduler -n 50"
     echo "             journalctl -u recruiter-watchdog  -n 20"
+    echo "             journalctl -u pipeline-api        -n 20"
     $_all_active || return 1
 }
 
@@ -160,7 +163,7 @@ if $NO_RESTART; then
     echo ""
     echo "════════════════════════════════════════════════════════════"
     echo "  Code updated. Restart skipped (--no-restart)."
-    echo "  To restart manually: sudo systemctl restart recruiter-scheduler recruiter-watchdog"
+    echo "  To restart manually: sudo systemctl restart recruiter-scheduler recruiter-watchdog pipeline-api"
     echo "════════════════════════════════════════════════════════════"
     exit 0
 fi
@@ -185,7 +188,7 @@ fi
 # If a unit file changed in this commit and install-systemd.sh was not re-run,
 # install-pipeline-units would silently install the stale staged copy.
 _stale_units=0
-for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service"; do
+for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service"; do
     _src="$DEPLOY_DIR/systemd/$_unit"
     _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
     if [[ ! -f "$_staged" ]]; then
@@ -230,6 +233,11 @@ sudo systemctl restart recruiter-watchdog || {
     _rollback_to_previous; exit 1
 }
 
+sudo systemctl restart pipeline-api || {
+    echo "  [ERROR] pipeline-api failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
+
 echo ""
 echo "  Waiting for services to come up..."
 sleep 5
@@ -238,7 +246,7 @@ sleep 5
 echo ""
 echo "► Service status:"
 _svc_fail=0
-for svc in recruiter-scheduler recruiter-watchdog; do
+for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
     if [[ "$status" == "active" ]]; then

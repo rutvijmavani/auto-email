@@ -738,6 +738,24 @@ def _build_detail_payload(
     if job.get("_country_code"):
         payload["_country_code"] = job["_country_code"]
 
+    # Validate required keys — same contract as detail_worker._REQUIRED_DETAIL_KEYS.
+    # Raising here instead of silently forwarding an empty payload means the
+    # caller catches ValueError and logs exc_info=True → full stack trace.
+    _REQUIRED = {
+        "workday":         ["_external_path", "_slug", "_wd", "_path"],
+        "taleo":           ["_base_url", "_contest_no"],
+        "smartrecruiters": ["_company_slug"],
+        "icims":           ["_base_url"],
+        "jobvite":         ["_slug"],
+    }
+    _missing_required = [k for k in _REQUIRED.get(platform, []) if not payload.get(k)]
+    if _missing_required:
+        raise ValueError(
+            f"detail payload missing required keys for {company!r}/{platform} "
+            f"job_id={job.get('job_id')} missing={_missing_required} "
+            f"raw_underscore_keys={[k for k in job if k.startswith('_')]}"
+        )
+
     return payload
 
 
@@ -1106,11 +1124,20 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     company, platform, job, found_by="tier2_fullscan"
                 )
                 if inserted:
-                    detail_payload = _build_detail_payload(
-                        company, platform, job, slug_info,
-                    )
-                    r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
-                    new_count += 1
+                    try:
+                        detail_payload = _build_detail_payload(
+                            company, platform, job, slug_info,
+                        )
+                        r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
+                        new_count += 1
+                    except ValueError:
+                        logger.error(
+                            "fullscan: _build_detail_payload raised — malformed payload "
+                            "will NOT be queued for detail fetch. "
+                            "company=%r platform=%s job_id=%s",
+                            company, platform, job.get("job_id"),
+                            exc_info=True,
+                        )
 
                 # ALL fetched jobs go into NEW bloom regardless of outcome —
                 # this ensures closed/filled jobs fall out naturally next cycle.

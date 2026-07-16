@@ -85,6 +85,7 @@ from config import (
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_ADAPTIVE,
     REDIS_DETAIL_FULLSCAN,
+    REDIS_DETAIL_DLQ,
     STREAM_CONSUMER_GROUP,
     EMAIL,
     APP_PASSWORD,
@@ -940,6 +941,58 @@ def _consumer_pid_alive(r, worker_type: str, consumer_name) -> bool:
         return False
 
 
+_DLQ_ALERT_THRESHOLD = 50   # entries before WARNING fires
+_DLQ_AGE_DAYS        = 7    # entries older than this are purged
+
+# Atomic Lua: remove DLQ entries whose _dlq_added_at < ARGV[1] (ISO timestamp).
+# Unparseable entries are kept rather than silently discarded.
+_DLQ_CLEANUP_LUA = """
+local all = redis.call('LRANGE', KEYS[1], 0, -1)
+local cutoff = ARGV[1]
+local keep = {}
+for _, v in ipairs(all) do
+    local ok, entry = pcall(cjson.decode, v)
+    if ok and entry._dlq_added_at and entry._dlq_added_at >= cutoff then
+        table.insert(keep, v)
+    elseif not ok then
+        table.insert(keep, v)
+    end
+end
+if #keep == #all then return 0 end
+redis.call('DEL', KEYS[1])
+for _, v in ipairs(keep) do
+    redis.call('RPUSH', KEYS[1], v)
+end
+return #all - #keep
+"""
+
+
+def _check_dlq_health(r, issues: list) -> None:
+    """Run age-based DLQ cleanup and alert if depth exceeds threshold."""
+    try:
+        cutoff_ts = time.time() - (_DLQ_AGE_DAYS * 86400)
+        cutoff    = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        r.eval(_DLQ_CLEANUP_LUA, 1, REDIS_DETAIL_DLQ, cutoff)
+    except Exception:
+        pass  # Lua cleanup is best-effort; depth check still runs
+
+    try:
+        depth = int(r.llen(REDIS_DETAIL_DLQ) or 0)
+    except Exception:
+        return
+
+    if depth > _DLQ_ALERT_THRESHOLD:
+        issues.append(Issue(Issue.WARNING, "queue:detail:dlq",
+            f"depth={depth} — {depth} malformed payloads in dead-letter queue "
+            f"(threshold={_DLQ_ALERT_THRESHOLD}). "
+            f"Inspect: redis-cli lrange {REDIS_DETAIL_DLQ} 0 4",
+            alert_type="dlq_depth_high",
+        ))
+    else:
+        issues.append(Issue(Issue.OK, "queue:detail:dlq",
+            f"depth={depth} (≤{_DLQ_ALERT_THRESHOLD} OK)"))
+
+
 def _check_pel_health(r, issues: list) -> None:
     """
     PEL liveness checks for stream:adaptive and stream:fullscan.
@@ -1196,6 +1249,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                     f"depth={depth:,} (baseline) — elevated, delta tracking starts next cycle"))
             else:
                 issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
+        _check_dlq_health(r, issues)
         _check_pel_health(r, issues)
         return issues
 
@@ -1358,7 +1412,8 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                     f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
                     f"small backlog, {direction}{proc_note}"))
 
-    # ── 9. PEL checks (unchanged) ─────────────────────────────────────────────
+    # ── 9. PEL checks + DLQ depth ────────────────────────────────────────────
+    _check_dlq_health(r, issues)
     _check_pel_health(r, issues)
     return issues
 

@@ -222,13 +222,16 @@ The existing cron that runs `form_sync.py` picks it up on its next run — no ne
 cron or tab needed.
 
 **Fallback column format** (matches existing Google Form responses):
-```
+```text
 Timestamp | Company Name | Job URL | Job Title | Applied Date | User Name
 ```
 
 `form_sync.py` reads column F (`COL_USER_NAME = 5`), maps the display name to
-`user_id` via `_USER_NAME_MAP = {'rutvij': 1, 'disha': 2}`, and passes it to
-`add_application(user_id=...)`. Rows with a blank column F default to `user_id=1`.
+`user_id` via `_USER_NAME_MAP` (e.g. `{'alice': 1, 'bob': 2}`), and passes it to
+`add_application(user_id=...)`. Load the actual mapping from the `USER_NAME_MAP`
+environment variable (JSON string) in `.env` — do not commit real names to the
+repo. Rows with a blank or unrecognised column F are **skipped** and left in
+the sheet for manual review.
 
 The extension needs `https://www.googleapis.com/auth/spreadsheets` scope added to
 the OAuth config in `manifest.json` (alongside `userinfo.profile` already there).
@@ -278,8 +281,25 @@ in `chrome://extensions`. No other changes needed.
 ### 14. `api.py` process management on the VM
 
 `api.py` runs as a `systemd` service alongside the main pipeline — always-on,
-auto-restarts on crash, survives VM reboots. A `nohup` one-liner is an alternative
-for quick testing but dies on reboot.
+auto-restarts on crash, survives VM reboots.
+
+**Local / SSH-tunnel testing** — Flask's built-in dev server is fine:
+```bash
+python api.py          # runs on 0.0.0.0:5000
+```
+
+**Production** — the systemd unit (`deploy/systemd/pipeline-api.service`) launches
+via **Gunicorn** (a production WSGI server):
+```bash
+gunicorn -w 2 -b 0.0.0.0:5000 api:app
+```
+After changing the service file, re-stage and restart manually — `deploy.sh` does
+not manage `pipeline-api`:
+```bash
+sudo bash deploy/install-systemd.sh   # re-stage the updated unit file
+bash deploy/deploy.sh                 # pulls code, installs gunicorn, daemon-reload
+sudo systemctl restart pipeline-api   # deploy.sh does not restart this service
+```
 
 The systemd unit file lives at `/etc/systemd/system/pipeline-api.service`. Starting
 it: `sudo systemctl start pipeline-api`. Logs: `journalctl -u pipeline-api -f`.
@@ -317,6 +337,163 @@ POST /log-error
 ```
 The endpoint logs `[extension] <message> | <context>` at the specified level.
 The log monitor then alerts on new `ERROR` or `WARNING` lines within 15 minutes.
+
+### 17. Prospective Company Capture — Design (not yet implemented)
+
+**Goal:** Expand the extension to also bookmark company career pages into the
+`prospective_companies` table, not just log job applications.
+
+---
+
+#### Dual-mode overlay
+
+A single overlay with a **tab toggle at the top** instead of two separate overlays:
+
+```
+[ Save Job ● ]  [ Save Company ]
+```
+
+The active tab controls which fields are shown and which API endpoint is called.
+User can switch at any time before submitting.
+
+---
+
+#### Auto-detecting which tab to default to
+
+The extension detects whether the current page is a **job listing/career page**
+or a **specific job description page** from the URL alone, then pre-selects the
+appropriate tab:
+
+| URL example | Detection | Default tab |
+|---|---|---|
+| `boards.greenhouse.io/stripe` | no `/jobs/` segment after slug | Save Company |
+| `boards.greenhouse.io/stripe/jobs/123` | has `/jobs/` + numeric ID | Save Job |
+| `jobs.lever.co/stripe` | only 1 path segment | Save Company |
+| `jobs.lever.co/stripe/uuid-here` | 2+ path segments | Save Job |
+| `jobs.ashbyhq.com/stripe` | 1 path segment | Save Company |
+| `jobs.ashbyhq.com/stripe/uuid` | 2+ path segments | Save Job |
+| `*.myworkdayjobs.com/External` | no `/job/` in path | Save Company |
+| `*.myworkdayjobs.com/External/job/123` | has `/job/` in path | Save Job |
+| `careers.somecompany.com` | custom page, no JSON-LD `JobPosting` | Save Company |
+| `careers.somecompany.com/engineer` | JSON-LD `@type: JobPosting` present | Save Job |
+
+User can always override by clicking the other tab.
+
+---
+
+#### Career page URL pre-fill
+
+- **"Save Company" tab:** Career Page URL is pre-filled with `window.location.href`
+  — when the user is on a listing page, the current URL IS the career page URL.
+- **"Save Job" tab:** JD URL is `window.location.href` — same as today.
+- If user is on a job page but switches to "Save Company": career page URL
+  field is editable; for known ATS platforms the listing URL can be derived by
+  stripping the job ID segment. User can also paste the correct URL manually.
+
+---
+
+#### Apply form pages — suppress auto-trigger entirely
+
+Apply form pages are not useful to capture. Auto-trigger is suppressed when the
+URL matches apply form patterns:
+
+```js
+const APPLY_URL_PATTERNS = [
+  /\/applications\/new/,
+  /\/apply/,
+  /\/application\//,
+  /[?&]apply=/,
+];
+```
+
+Manual trigger (icon click) still works on these pages if the user needs it.
+
+---
+
+#### Apply button opens in a new tab — cross-tab URL recovery
+
+When the user clicks Apply and the apply form opens in a **new tab**, that tab
+has an apply form URL (e.g. `/applications/new`), not the JD URL. We want to
+save the JD URL, not the apply form URL.
+
+**Solution: `background.js` records the opener tab's URL when any new tab is
+created.**
+
+Chrome provides `tab.openerTabId` on new tab creation. Background.js stores a
+mapping of `newTabId → openerUrl` in `chrome.storage.session`:
+
+```js
+// background.js
+chrome.tabs.onCreated.addListener((tab) => {
+  if (!tab.openerTabId) return;
+  chrome.tabs.get(tab.openerTabId, (opener) => {
+    if (opener?.url) {
+      chrome.storage.session.set({ [`opener_${tab.id}`]: opener.url });
+    }
+  });
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'GET_OPENER_URL') {
+    const key = `opener_${sender.tab.id}`;
+    chrome.storage.session.get(key, (r) => sendResponse({ url: r[key] || null }));
+    return true; // keep channel open for async response
+  }
+});
+```
+
+When `content.js` loads on an apply page, it detects the apply URL pattern,
+asks background.js for the opener's URL, and uses that as the job URL instead
+of `window.location.href`:
+
+```js
+async function getJobUrl() {
+  if (!isApplyPage()) return window.location.href;
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'GET_OPENER_URL' }, (res) => {
+      resolve(res?.url || window.location.href);
+    });
+  });
+}
+```
+
+**Full flow:**
+1. User lands on JD page → auto-trigger fires after 4s → "Save Job" overlay
+   with JD URL → user can submit here directly
+2. OR user dismisses overlay / ignores it → clicks Apply → new tab opens →
+   background.js records `newTabId → JD URL`
+3. Apply form tab loads → content.js detects apply page → fetches opener URL
+   from background.js → overlay shows "Save Job" with the **JD URL** pre-filled
+4. User submits → correct URL saved
+
+**Edge case:** If the opener was a listing page (not a JD page), the job URL
+field will show the listing URL. User can edit it or switch to "Save Company"
+tab. This is an acceptable rare path.
+
+---
+
+#### User's actual workflow this feature supports
+
+1. Google a company → land on their careers listing page
+2. Extension detects listing page → defaults to "Save Company" tab
+3. User verifies Company Name + Career Page URL → submits → saved to `prospective_companies`
+4. Click an open position → JD page → extension detects job page → defaults to "Save Job" tab
+5. Click Apply → new tab (apply form) → extension recovers JD URL via opener tracking →
+   "Save Job" overlay pre-filled with JD URL from step 4
+6. User submits → saved to `applications`
+
+---
+
+#### New API endpoint needed
+
+```
+POST /add-prospective
+{ "company": "Stripe", "career_page_url": "https://stripe.com/jobs" }
+→ 201 { "id": 5, "created": true }
+→ 200 { "id": 5, "created": false }   (duplicate)
+```
+
+Maps to `db/prospective_companies.py` → `add_prospective_company()` (to be written).
 
 ---
 
@@ -381,13 +558,14 @@ Required fields: `company`, `job_url`. Everything else has defaults
 
 **`GET /health`** — returns `{"status": "ok", "time": "..."}`. Use to verify the SSH tunnel is live before testing.
 
-**`POST /log-error`** — accepts `{"level": "error|warning|info", "message": "...", "context": {...}}` from the extension and logs it to `logs/api.log`. Picked up by `log_monitor.py` within 15 minutes. Returns `204 No Content`.
+**`POST /log-error`** — accepts `{"level": "error|warning|info", "message": "...", "context": {...}}` from the extension and logs it to `logs/api.log`. Picked up by `log_monitor.py` within 15 minutes. Returns `204 No Content`. **Requires `X-API-Key` in production** (same rule as `/add-application` — gated when `EXTENSION_API_KEY` is set; unauthenticated only when the env var is absent, i.e. during SSH-tunnel testing).
 
 `api.py` lives at the project root and imports from `db.applications` the same
-way `main.py` does. Started separately from the main pipeline:
+way `main.py` does. For local testing (SSH tunnel), start it directly:
 ```bash
-python api.py          # runs on 0.0.0.0:5000
+python api.py          # Flask dev server — SSH-tunnel testing only
 ```
+In production the systemd service uses Gunicorn instead (see §14).
 
 ---
 

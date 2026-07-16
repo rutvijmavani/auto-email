@@ -483,13 +483,22 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
 
             if inserted:
                 # Genuinely new job — push to detail queue for full hydration
-                detail_payload = _build_detail_payload(
-                    company, platform, job, slug_info,
-                    request_id=request_id,
-                    found_by="tier1_adaptive",
-                )
-                r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
-                new_count += 1
+                try:
+                    detail_payload = _build_detail_payload(
+                        company, platform, job, slug_info,
+                        request_id=request_id,
+                        found_by="tier1_adaptive",
+                    )
+                    r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
+                    new_count += 1
+                except ValueError:
+                    logger.error(
+                        "scan_worker: _build_detail_payload raised — malformed payload "
+                        "will NOT be queued for detail fetch. "
+                        "company=%r platform=%s job_id=%s",
+                        company, platform, job.get("job_id"),
+                        exc_info=True,
+                    )
 
             # Mark as processed in adaptive_seen regardless of outcome so
             # subsequent adaptive scans today skip the DB lookup entirely.
@@ -627,13 +636,22 @@ def _handle_first_scan(
                     company, platform, job, found_by="first_scan_fresh"
                 )
                 if inserted:
-                    detail_payload = _build_detail_payload(
-                        company, platform, job, slug_info,
-                        request_id=request_id,
-                        found_by="first_scan_fresh",
-                    )
-                    r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
-                    fresh_queued += 1
+                    try:
+                        detail_payload = _build_detail_payload(
+                            company, platform, job, slug_info,
+                            request_id=request_id,
+                            found_by="first_scan_fresh",
+                        )
+                        r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
+                        fresh_queued += 1
+                    except ValueError:
+                        logger.error(
+                            "scan_worker: _build_detail_payload raised — malformed payload "
+                            "will NOT be queued for detail fetch. "
+                            "company=%r platform=%s job_id=%s",
+                            company, platform, job.get("job_id"),
+                            exc_info=True,
+                        )
                 # Always mark in adaptive_seen — repeat adaptive scans today
                 # must not re-check this job regardless of whether it was a
                 # new DB insert (inserted=True) or a duplicate (inserted=False).
@@ -755,6 +773,25 @@ def _build_detail_payload(
     # Country code available at listing level (Workday, SmartRecruiters, etc.)
     if job.get("_country_code"):
         payload["_country_code"] = job["_country_code"]
+
+    # Validate that keys required by fetch_job_detail()'s guard clauses made it
+    # into the payload.  A missing required key causes the guard to return the
+    # job unchanged with no HTTP request — raising here produces a stack trace
+    # (via exc_info=True at the caller) instead of a silent bad-enrichment.
+    _REQUIRED = {
+        "workday":         ["_external_path", "_slug", "_wd", "_path"],
+        "taleo":           ["_base_url", "_contest_no"],
+        "smartrecruiters": ["_company_slug"],
+        "icims":           ["_base_url"],
+        "jobvite":         ["_slug"],
+    }
+    _missing_required = [k for k in _REQUIRED.get(platform, []) if not payload.get(k)]
+    if _missing_required:
+        raise ValueError(
+            f"detail payload missing required keys for {company!r}/{platform} "
+            f"job_id={job.get('job_id')} missing={_missing_required} "
+            f"raw_underscore_keys={[k for k in job if k.startswith('_')]}"
+        )
 
     return payload
 

@@ -305,6 +305,7 @@ REDIS_POLL_ADAPTIVE    = "poll:adaptive"          # ZSET — next adaptive poll 
 REDIS_POLL_FULLSCAN    = "poll:fullscan"           # ZSET — next full scan time per company
 REDIS_DETAIL_ADAPTIVE  = "queue:detail:adaptive"  # LIST — high priority detail fetches
 REDIS_DETAIL_FULLSCAN  = "queue:detail:fullscan"  # LIST — low priority detail fetches
+REDIS_DETAIL_DLQ       = "queue:detail:dlq"       # LIST — dead-letter queue for dropped payloads (≤200)
 REDIS_CYCLE_START      = "cycle:start"             # STRING — Unix ts of today's cycle start
 REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintenance pause
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume

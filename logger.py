@@ -39,7 +39,9 @@ import logging.handlers
 import os
 import re
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -75,6 +77,30 @@ _initialized: bool = False
 # JSON FORMATTER
 # ─────────────────────────────────────────
 
+# Per-logger:level dedup guard — same key suppresses repeated stack injections
+# for _STACK_DEDUP_TTL seconds, preventing tight-loop floods from bloating logs.
+_STACK_DEDUP_TTL: float = 60.0   # seconds per unique logger:level key
+_STACK_DEDUP_MAX: int   = 500    # purge all entries when dict exceeds this
+_STACK_SEEN: dict[str, float] = {}
+_STACK_LOCK = threading.Lock()
+
+
+def _auto_stack() -> str:
+    """Return the current call stack with logging-internal frames trimmed off the bottom."""
+    frames = traceback.extract_stack()
+    while frames:
+        fname = frames[-1].filename
+        if (
+            (os.sep + "logging" + os.sep + "__init__") in fname
+            or fname.endswith(os.sep + "logger.py")
+            or fname == __file__
+        ):
+            frames = frames[:-1]
+        else:
+            break
+    return "".join(traceback.format_list(frames))
+
+
 class JsonFormatter(logging.Formatter):
     """Emit one JSON object per log line for file handlers."""
     def format(self, record: logging.LogRecord) -> str:
@@ -87,6 +113,21 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
+        # Auto-inject call stack for WARNING+ when no exception traceback is present.
+        # Dedup guard prevents the same logger:level from flooding logs — once per
+        # 60 s per unique key.  Dict is purged when it exceeds _STACK_DEDUP_MAX entries.
+        elif record.levelno >= logging.WARNING:
+            dedup_key = f"{record.name}:{record.levelno}"
+            _now = time.time()
+            _inject = False
+            with _STACK_LOCK:
+                if _now - _STACK_SEEN.get(dedup_key, 0.0) >= _STACK_DEDUP_TTL:
+                    if len(_STACK_SEEN) >= _STACK_DEDUP_MAX:
+                        _STACK_SEEN.clear()
+                    _STACK_SEEN[dedup_key] = _now
+                    _inject = True
+            if _inject:
+                payload["stack"] = _auto_stack()
         return json.dumps(payload)
 
 

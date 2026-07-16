@@ -71,6 +71,7 @@ from logger import get_logger
 from config import (
     REDIS_DETAIL_ADAPTIVE,
     REDIS_DETAIL_FULLSCAN,
+    REDIS_DETAIL_DLQ,
     WORKER_BLOCK_SECS,
     REDIS_BACKOFF_PREFIX,
     REDIS_ADAPTIVE_SEEN_PREFIX,
@@ -375,6 +376,25 @@ _REQUIRED_DETAIL_KEYS: dict = {
     "jobvite":         ["_slug"],
 }
 
+_DLQ_MAX_ENTRIES = 200  # LPUSH+LTRIM hard cap; entries beyond this are evicted
+
+
+def _push_to_dlq(job: dict) -> None:
+    """Wrap job in a timestamped envelope and push to the dead-letter queue."""
+    try:
+        entry = json.dumps({
+            "_dlq_added_at": datetime.now(timezone.utc).isoformat(),
+            "payload": job,
+        })
+        r = get_redis()
+        pipe = r.pipeline()
+        pipe.lpush(REDIS_DETAIL_DLQ, entry)
+        pipe.ltrim(REDIS_DETAIL_DLQ, 0, _DLQ_MAX_ENTRIES - 1)
+        pipe.execute()
+    except Exception as _dlq_err:
+        logger.debug("detail_worker: DLQ push failed (non-critical): %s", _dlq_err)
+
+
 # Per-ATS semaphores for detail fetches — each detail_worker makes one
 # HTTP call per job, so semaphores throttle cross-worker pressure on
 # the same ATS domain. Import lazily to avoid circular imports.
@@ -501,11 +521,16 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 "detail_worker: detail required for listing_filter=title_only but "
                 "skipped (missing required keys in payload) — dropping malformed "
                 "payload; company will be rescanned at next adaptive interval. "
-                "platform=%s company=%r job_id=%s missing_keys=%s payload_underscore_keys=%s",
+                "platform=%s company=%r job_id=%s missing_keys=%s payload_underscore_keys=%s "
+                "found_by=%s enqueued_at=%s source_queue=%s",
                 platform, company, job_id,
                 _pre_missing,
                 [k for k in job if k.startswith("_") and job.get(k)],
+                found_by,
+                job.get("enqueued_at", "unknown"),
+                source_queue,
             )
+            _push_to_dlq(job)
             try:
                 delete_pending_detail(company, job_id)
                 if source_queue == REDIS_DETAIL_ADAPTIVE:
@@ -552,10 +577,14 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     "detail_worker: MISSING required keys — fetch_job_detail "
                     "guard will fire with NO HTTP request made. "
                     "platform=%s company=%r job_id=%s missing_keys=%s "
-                    "payload_underscore_keys=%s",
+                    "payload_underscore_keys=%s found_by=%s enqueued_at=%s source_queue=%s",
                     platform, company, job_id, _missing,
                     [k for k in job if k.startswith("_") and job.get(k)],
+                    found_by,
+                    job.get("enqueued_at", "unknown"),
+                    source_queue,
                 )
+                _push_to_dlq(job)
             else:
                 logger.debug(
                     "detail_worker: detail fetch starting "
