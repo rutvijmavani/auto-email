@@ -14,6 +14,7 @@
   function escHtml(str) {
     return (str || '')
       .replace(/&/g, '&amp;')
+      .replace(/'/g, '&#39;')
       .replace(/"/g, '&quot;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
@@ -158,45 +159,53 @@
     b.style.display = '';
   }
 
-  // ── Remove overlay ─────────────────────────────────────────────────────────
+  // ── Remove / hide overlay ──────────────────────────────────────────────────
 
+  // hideOverlay: user explicitly closed — keep DOM so reopening is instant
+  // and doesn't need a new detectUser() round-trip.
+  function hideOverlay() {
+    const el = document.getElementById(OVERLAY_ID);
+    if (el) el.style.display = 'none';
+  }
+
+  // removeOverlay: navigation or post-submit — purge so next showOverlay()
+  // builds a fresh form with the new page's job data.
   function removeOverlay() {
     document.getElementById(OVERLAY_ID)?.remove();
   }
 
-  // ── Server-side error reporting ────────────────────────────────────────────
+  // ── API URL resolution ─────────────────────────────────────────────────────
+  // Returns the base URL (no trailing slash, no path).
+  // Priority: Gist-cached cloudflare URL → API_BASE from config.js.
 
-  function reportToServer(level, message, context) {
-    try {
-      const endpoint = API_ENDPOINT.replace('/add-application', '/log-error');
-      const headers  = { 'Content-Type': 'application/json' };
-      if (API_KEY) headers['X-API-Key'] = API_KEY;
-      fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ level, message, context }),
-      }).catch(() => {});
-    } catch (_) {}
+  async function _getApiBase() {
+    if (GIST_CONFIG_URL) {
+      const { api_base } = await chrome.storage.local.get('api_base');
+      if (api_base) return api_base;
+    }
+    return API_BASE;
   }
 
   // ── API call ───────────────────────────────────────────────────────────────
 
   async function postToApi(payload) {
+    const base = await _getApiBase();
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
-      const headers = { 'Content-Type': 'application/json' };
+      const headers = {
+        'Content-Type': 'application/json',
+        'X-Extension-Id': chrome.runtime.id,
+      };
       if (API_KEY) headers['X-API-Key'] = API_KEY;
-      const res = await fetch(API_ENDPOINT, {
+      const res = await fetch(base + '/add-application', {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
         signal: ctrl.signal,
       });
       clearTimeout(t);
-      let data;
-      try { data = await res.json(); } catch (_) { data = {}; }
-      return { ok: res.ok, data, status: res.status };
+      return { ok: true, data: await res.json(), status: res.status };
     } catch (err) {
       clearTimeout(t);
       return { ok: false, error: err };
@@ -213,8 +222,7 @@
           const now = new Date();
           const ts   = `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`;
           const date = now.toISOString().split('T')[0];
-          const userName = USERS.find(u => u.id === payload.user_id)?.nameMatch || '';
-          const row  = [ts, payload.company, payload.job_url, payload.job_title || '', date, titleCase(userName)];
+          const row  = [ts, payload.company, payload.job_url, payload.job_title || '', date];
           const url  = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_TAB)}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
           try {
             const res = await fetch(url, {
@@ -272,18 +280,12 @@
       return;
     }
 
-    // API reachable but returned error vs network/timeout failure — mutually exclusive telemetry
-    if (result.status) {
-      reportToServer('error', 'API error response', { status: result.status, company, job_url });
-    } else {
-      reportToServer('warning', 'API unreachable — falling back to Sheets', { company, job_url });
-    }
+    // API unreachable — try Google Sheets fallback
     const saved = await postToSheet(payload);
     if (saved) {
       showBanner(overlay, 'Saved to sheet — will sync automatically', 'sheet');
       setTimeout(removeOverlay, 2500);
     } else {
-      reportToServer('error', 'both API and Sheets fallback failed', { company, job_url });
       showBanner(overlay, 'Failed to save. Check your connection.', 'error');
       btn.disabled = false;
       btn.textContent = 'Add to Pipeline';
@@ -293,9 +295,10 @@
   // ── Show overlay ───────────────────────────────────────────────────────────
 
   function showOverlay() {
-    // Guard: focus existing overlay instead of stacking
+    // If overlay was hidden by close button, un-hide and focus.
     const existing = document.getElementById(OVERLAY_ID);
     if (existing) {
+      existing.style.display = '';
       existing.querySelector('select, input:not([readonly])')?.focus();
       return;
     }
@@ -310,7 +313,7 @@
       overlay.innerHTML = buildOverlayHTML(title, company, url, detectedUser);
       document.body.appendChild(overlay);
 
-      overlay.querySelector('.jco-close').addEventListener('click', removeOverlay);
+      overlay.querySelector('.jco-close').addEventListener('click', hideOverlay);
 
       overlay.querySelectorAll('input').forEach(inp => {
         inp.addEventListener('input', () => inp.classList.remove('jco-error'));
@@ -345,9 +348,21 @@
     armTimer();
   }
 
-  // Intercept pushState (LinkedIn, Indeed SPA navigation)
-  const _origPush = history.pushState.bind(history);
-  history.pushState = (...args) => { _origPush(...args); onUrlChange(); };
+  // Intercept pushState/replaceState via a main-world script injection.
+  // Isolated-world assignment to history.pushState does not intercept the
+  // page's own SPA navigation calls in Chrome MV3.
+  (function () {
+    const s = document.createElement('script');
+    s.textContent = `(function(){['pushState','replaceState'].forEach(function(m){
+      var orig=history[m].bind(history);
+      history[m]=function(){orig.apply(history,arguments);
+        window.postMessage({type:'__jcp_nav'},'*');};});})();`;
+    (document.head || document.documentElement).appendChild(s);
+    s.remove();
+  })();
+  window.addEventListener('message', function (e) {
+    if (e.source === window && e.data && e.data.type === '__jcp_nav') onUrlChange();
+  });
   window.addEventListener('popstate', onUrlChange);
 
   // ── Visibility change ──────────────────────────────────────────────────────
@@ -364,7 +379,7 @@
   // ── Keyboard ───────────────────────────────────────────────────────────────
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') removeOverlay();
+    if (e.key === 'Escape') hideOverlay();
   });
 
   // ── Message listener (from background.js on manual icon click) ─────────────

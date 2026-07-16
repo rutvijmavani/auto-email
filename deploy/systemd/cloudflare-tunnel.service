@@ -1,11 +1,11 @@
 [Unit]
-Description=Job Pipeline Extension API
+Description=Cloudflare Tunnel — Job Pipeline API
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target
+After=network-online.target pipeline-api.service
 Wants=network-online.target
+Requires=pipeline-api.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple
@@ -13,21 +13,15 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
-ExecStart=/home/opc/mail/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 api:app
+ExecStart=/home/opc/mail/venv/bin/python scripts/tunnel_manager.py
 Restart=always
 RestartSec=15s
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30s
-LimitNOFILE=4096
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=no
-ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=pipeline-api
+SyslogIdentifier=cloudflare-tunnel
 
 [Install]
 WantedBy=multi-user.target
