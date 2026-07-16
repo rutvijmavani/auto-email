@@ -108,7 +108,7 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service"; do
+for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service; do
     src="$DEPLOY_DIR/systemd/$unit"
     if [[ ! -f "$src" ]]; then
         echo "[ERROR] Unit file not found: $src"
@@ -143,6 +143,7 @@ ALLOWED_UNITS=(
     "recruiter-scheduler.service"
     "recruiter-watchdog.service"
     "recruiter-pipeline-alert@.service"
+    "pipeline-api.service"
 )
 for unit in "\${ALLOWED_UNITS[@]}"; do
     src="\$SRC_DIR/\$unit"
@@ -227,6 +228,7 @@ systemctl daemon-reload
 
 systemctl enable recruiter-scheduler
 systemctl enable recruiter-watchdog
+systemctl enable pipeline-api
 
 if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."
