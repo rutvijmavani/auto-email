@@ -20,10 +20,10 @@ const API_ENDPOINT = API_BASE + '/add-application';
 // the result in chrome.storage.local, and content.js reads it for every API
 // call.  Set to '' to skip Gist discovery and use API_ENDPOINT directly
 // (SSH tunnel mode or when you have a real domain).
-const GIST_CONFIG_URL = '';
+const GIST_CONFIG_URL = 'https://gist.githubusercontent.com/rutvijmavani/4f400d820fd0b390c15dd7d6592d8053/raw/api-config.json';
 
 // Shared API key — leave empty for SSH tunnel testing; set in production.
-const API_KEY = '';
+const API_KEY = '7df822f9d051c53fc32fd36b441e29d88afa0bba34493cee6de81633a79733c2';
 
 // Copy the value of GOOGLE_SHEET_ID from your .env file.
 const SHEET_ID = 'YOUR_GOOGLE_SHEET_ID';
