@@ -18,8 +18,8 @@ What these tests verify
     · Base payload always contains the standard fields
     · For each Mode B platform, all keys in PLATFORM_DETAIL_KEYS are forwarded
       when present on the listing-level job dict
-    · Keys whose value is None are NOT forwarded (guard: job.get(key) is not None)
-    · Keys whose value is "" (empty string) ARE forwarded (not None)
+    · Keys whose value is falsy (None or "") are NOT forwarded (truthiness guard)
+    · Required keys with a falsy value raise ValueError instead of forwarding a broken payload
     · _country_code is forwarded when present
     · _country_code is not forwarded when absent or falsy
     · Mode A platforms (greenhouse, lever, …) receive no extra keys
@@ -117,26 +117,22 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
         # _site=None → not forwarded (falsy value excluded)
         self.assertNotIn("_site", payload)
 
-    def test_workday_empty_string_not_forwarded(self):
-        """Empty strings must NOT be forwarded — they are falsy and would silently
-        trigger fetch_job_detail()'s guard (not all([slug, wd, path, external_path]))
-        returning the job unenriched, identical to having a None value."""
+    def test_workday_empty_string_required_key_raises(self):
+        """Empty string for a required Workday key raises ValueError — it is
+        falsy and would silently trigger fetch_job_detail()'s guard returning
+        the job unenriched.  The builder rejects this instead of forwarding a
+        broken payload."""
         job = _minimal_job(_external_path="", _slug="acme", _wd="wd1", _path="")
-        payload = _build_detail_payload("Acme", "workday", job, {})
-        # _external_path="" and _path="" are falsy → must NOT be forwarded
-        self.assertNotIn("_external_path", payload)
-        self.assertNotIn("_path", payload)
-        # non-empty keys ARE still forwarded
-        self.assertIn("_slug", payload)
-        self.assertIn("_wd", payload)
+        with self.assertRaises(ValueError):
+            _build_detail_payload("Acme", "workday", job, {})
 
-    def test_workday_none_value_not_forwarded(self):
-        """Key with None value must NOT appear in the payload."""
+    def test_workday_none_required_key_raises(self):
+        """None value for a required Workday key raises ValueError — required
+        keys must be truthy so detail_worker can enrich the job."""
         job = _minimal_job(_slug=None, _wd="wd1", _path="careers",
                            _external_path="/job/test")
-        payload = _build_detail_payload("Acme", "workday", job, {})
-        # _slug=None → skipped (falsy)
-        self.assertNotIn("_slug", payload)
+        with self.assertRaises(ValueError):
+            _build_detail_payload("Acme", "workday", job, {})
 
     def test_taleo_keys_forwarded(self):
         """Taleo required keys: _base_url, _contest_no, _section."""
@@ -180,7 +176,13 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
 
     def test_country_code_forwarded_when_present(self):
         """_country_code is forwarded when truthy."""
-        job = _minimal_job(_country_code="IN")
+        job = _minimal_job(
+            _country_code="IN",
+            _external_path="/job/test",
+            _slug="infosys",
+            _wd="wd1",
+            _path="careers",
+        )
         payload = _build_detail_payload("Infosys", "workday", job, {})
         self.assertEqual(payload["_country_code"], "IN")
 
@@ -214,13 +216,18 @@ class TestBuildDetailPayloadKeyForwarding(unittest.TestCase):
     def test_slug_info_serialized(self):
         """slug_info is stored as-is (dict or str are both valid)."""
         slug_dict = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
-        job = _minimal_job()
+        job = _minimal_job(
+            _external_path="/job/test",
+            _slug="att",
+            _wd="wd1",
+            _path="careers",
+        )
         payload = _build_detail_payload("AT&T", "workday", job, slug_dict)
         self.assertEqual(payload["slug_info"], slug_dict)
 
     def test_slug_info_string(self):
         slug_str = "acme-corp"
-        job = _minimal_job()
+        job = _minimal_job(_slug="acme-corp")
         payload = _build_detail_payload("Acme", "jobvite", job, slug_str)
         self.assertEqual(payload["slug_info"], slug_str)
 

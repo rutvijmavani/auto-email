@@ -545,16 +545,149 @@ Maps to `db/prospective_companies.py` → `add_prospective_company()` (to be wri
 
 ---
 
+### 18. Cloudflare Tunnel — public access without a domain
+
+The extension connects to `api.py` on the VM via a cloudflared quick tunnel.
+This gives a free `https://` URL with no domain, no firewall changes on OCI,
+and no SSH tunnel setup required for other users.
+
+**How it works:**
+
+```text
+VM boots
+  → pipeline-api.service starts api.py on :5000
+  → cloudflare-tunnel.service starts tunnel_manager.py
+  → cloudflared assigns https://abc123.trycloudflare.com
+  → tunnel_manager.py captures URL from cloudflared output
+  → POSTs base URL to GitHub Gist as {"api_base": "https://abc123..."}
+
+Extension starts (any laptop)
+  → background.js fetches stable Gist raw URL
+  → reads api_base, caches in chrome.storage.local
+  → refreshes every 30 min via chrome.alarms
+
+User saves a job
+  → content.js._getApiBase() reads api_base from storage
+  → calls https://abc123.trycloudflare.com/add-application
+  → if Gist not set (GIST_CONFIG_URL = ''), falls back to API_BASE from config.js
+```
+
+**One-time VM setup:**
+
+```bash
+# 1. Install cloudflared on the VM
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.rpm
+sudo rpm -ivh cloudflared-linux-amd64.rpm
+
+# 2. Install the systemd service
+sudo cp deploy/systemd/cloudflare-tunnel.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable cloudflare-tunnel
+sudo systemctl start cloudflare-tunnel
+```
+
+**One-time GitHub Gist setup:**
+
+1. Go to gist.github.com → New gist
+2. Filename: `api-config.json`, content: `{"api_base": ""}` → Create **secret** gist
+3. Copy the Gist ID from the URL: `gist.github.com/user/{GIST_ID}`
+4. Go to github.com → Settings → Developer settings → Personal access tokens
+5. Generate a token with only `gist` scope → copy it
+6. Add to `.env` on the VM:
+   ```dotenv
+   GITHUB_PAT=ghp_xxxxxxxxxxxx
+   GIST_ID=xxxxxxxxxxxxxxxxxxxx
+   ```
+
+**One-time extension setup (per user):**
+
+In `chrome-extension/config.js`, set `GIST_CONFIG_URL` to the raw Gist URL:
+```javascript
+const GIST_CONFIG_URL = 'https://gist.githubusercontent.com/YOUR_USERNAME/YOUR_GIST_ID/raw/api-config.json';
+```
+Reload the extension once. After that, URL changes are handled automatically.
+
+**Security:** Set `EXTENSION_API_KEY` in `.env` on the VM. The extension sends
+it as `X-API-Key` on every request, which blocks unauthenticated traffic. Note
+that the key is bundled in `config.js` and visible to anyone who installs the
+extension, so it is not a secret — add server-side rate limiting and
+per-user authentication if the endpoint needs stronger protection.
+
+**What happens when the tunnel URL changes (VM restart):**
+1. `tunnel_manager.py` detects the new URL from cloudflared output
+2. Updates the Gist automatically
+3. Next time `background.js` polls (within 30 min), it picks up the new URL
+4. Users see at most one failed save during the window; retry works
+
+---
+
+### 19. Development auto-reload
+
+During active extension development, manually clicking the reload button in
+`chrome://extensions` after every file save adds friction. The project includes
+an auto-reload mechanism gated behind a `DEV_MODE` flag so it never ships.
+
+**How it works:**
+
+```text
+You save content.js
+  → scripts/watch_ext.py detects the change (watchdog)
+  → POSTs /dev-bump to Flask → version counter increments (0 → 1)
+  → background.js is polling /dev-ping every second
+  → sees version changed → calls chrome.runtime.reload()
+  → extension reloads automatically
+```
+
+**To enable during development:**
+
+1. In `chrome-extension/config.js`, set `DEV_MODE = true`
+2. Reload the extension once manually in `chrome://extensions`
+3. In a terminal, run the file watcher:
+   ```bash
+   pip install watchdog requests   # one-time
+   python scripts/watch_ext.py
+   ```
+4. Now every file save in `chrome-extension/` triggers an automatic reload.
+   Refresh the job page tab to pick up the new content script.
+
+**Before every commit:** set `DEV_MODE = false`. A pre-commit hook
+(`.git/hooks/pre-commit`) blocks the commit if `DEV_MODE = true` is staged,
+so it's enforced automatically.
+
+**Why it's safe to ship with `DEV_MODE = false`:**
+The polling block in `background.js` is inside `if (DEV_MODE) { ... }`.
+When `false`, the code loads but never executes — zero network overhead.
+The `/dev-ping` and `/dev-bump` routes in `api.py` are always present but
+harmless; they're behind the SSH tunnel during testing and have no side effects.
+
+**Implementation files:**
+- `chrome-extension/config.js` — `DEV_MODE` flag (one source of truth)
+- `chrome-extension/background.js` — `importScripts('config.js')` at top,
+  polling loop inside `if (DEV_MODE)`
+- `api.py` — `/dev-ping` (GET, returns `{v: int}`) and `/dev-bump` (POST, increments)
+- `scripts/watch_ext.py` — watchdog observer; `EXTENSION_API_BASE` env var
+  overrides the default `http://localhost:5001`
+- `.git/hooks/pre-commit` — blocks commit if `DEV_MODE = true` is staged
+
+---
+
 ## File Structure
 
 ```text
 mail/
-├── api.py                        ← new: Flask REST API (runs on VM)
-└── chrome-extension/             ← new: load unpacked in Chrome for testing
+├── api.py                        ← Flask REST API (runs on VM)
+├── scripts/
+│   ├── tunnel_manager.py         ← cloudflared process manager + Gist URL updater
+│   └── watch_ext.py              ← dev file watcher → triggers extension auto-reload
+├── deploy/
+│   └── systemd/
+│       ├── pipeline-api.service  ← systemd unit for api.py (gunicorn)
+│       └── cloudflare-tunnel.service ← systemd unit for tunnel_manager.py
+└── chrome-extension/             ← load unpacked in Chrome developer mode
     ├── manifest.json
-    ├── config.js                 ← user list, API endpoint, shared API key
-    ├── background.js             ← handles icon click → inject on demand
-    ├── content.js                ← extraction + identity + auto-trigger + overlay
+    ├── config.js                 ← PROD, DEV_MODE, API_BASE, GIST_CONFIG_URL, USERS
+    ├── background.js             ← Gist URL fetch, icon click handler, DEV_MODE reload
+    ├── content.js                ← extraction + identity + overlay + dynamic API URL
     ├── overlay.css               ← styles for the injected panel
     └── icons/
         ├── icon16.png
@@ -604,16 +737,15 @@ Google display name match. Server stores it as-is, no mapping needed.
 Required fields: `company`, `job_url`. Everything else has defaults
 (`job_title=null`, `status="active"`, `user_id=1`).
 
-**`GET /health`** — returns `{"status": "ok", "time": "..."}`. Use to verify the SSH tunnel is live before testing.
+**`GET /health`** — returns `{"status": "ok", "time": "..."}`. Use to verify the tunnel is live.
 
-**`POST /log-error`** — accepts `{"level": "error|warning|info", "message": "...", "context": {...}}` from the extension and logs it to `logs/api.log`. Picked up by `log_monitor.py` within 15 minutes. Returns `204 No Content`. **Requires `X-API-Key` in production** (same rule as `/add-application` — gated when `EXTENSION_API_KEY` is set; unauthenticated only when the env var is absent, i.e. during SSH-tunnel testing).
+**`POST /log-error`** — accepts `{"level": "error|warning|info", "message": "...", "context": {...}}` from the extension and logs it to `logs/api.log`. Picked up by `log_monitor.py` within 15 minutes. Returns `204 No Content`. Requires `X-API-Key` when `EXTENSION_API_KEY` is set in env.
 
-`api.py` lives at the project root and imports from `db.applications` the same
-way `main.py` does. For local testing (SSH tunnel), start it directly:
-```bash
-python api.py          # Flask dev server — SSH-tunnel testing only
-```
-In production the systemd service uses Gunicorn instead (see §14).
+**`GET /dev-ping`** — returns `{"v": int}`. Dev-only: background.js polls this when `DEV_MODE = true` to detect file changes. See §19.
+
+**`POST /dev-bump`** — increments the version counter. Called by `scripts/watch_ext.py` on every file-save in `chrome-extension/`. See §19.
+
+`api.py` lives at the project root and imports from `db.applications`. In production the systemd service uses Gunicorn (see §14).
 
 ---
 
@@ -626,7 +758,7 @@ In production the systemd service uses Gunicorn instead (see §14).
   "manifest_version": 3,
   "name": "Job Pipeline Capture",
   "version": "1.0",
-  "permissions": ["activeTab", "scripting", "storage", "identity"],
+  "permissions": ["activeTab", "scripting", "storage", "identity", "alarms"],
   "oauth2": {
     "client_id": "<your-client-id-from-google-cloud-console>",
     "scopes": [
@@ -662,11 +794,14 @@ are available as globals.
 
 ### `background.js` responsibilities
 
-- Listen for `chrome.action.onClicked` (icon click)
-- Use `chrome.scripting.executeScript` to inject `content.js` into the active tab
-- Also inject `overlay.css` via `chrome.scripting.insertCSS`
-- Send a message to the tab telling `content.js` to skip the 4s delay and show
-  the overlay immediately
+- `importScripts('config.js')` — loads all config constants into the service worker scope
+- **Gist URL discovery** (when `GIST_CONFIG_URL` set): fetches current cloudflare tunnel
+  base URL from GitHub Gist on startup and every 30 min via `chrome.alarms`; caches
+  result in `chrome.storage.local` as `api_base` for `content.js` to read
+- **DEV_MODE auto-reload** (when `DEV_MODE = true`): polls `/dev-ping` every second;
+  calls `chrome.runtime.reload()` when version changes (see §19)
+- **Icon click** (`chrome.action.onClicked`): injects `config.js` + `content.js` +
+  `overlay.css` into the active tab on demand for non-allowlisted pages
 
 ### `content.js` responsibilities
 
@@ -674,9 +809,12 @@ are available as globals.
 - On message from background (manual-trigger flow): skip timer, extract immediately
 - Extract title, company, URL using the priority chain above
 - Inject the overlay `<div>` into `document.body`
-- On form submit: `fetch()` POST to the configured endpoint
+- **`_getApiBase()`**: reads `api_base` from `chrome.storage.local` (set by
+  background.js Gist fetch) when `GIST_CONFIG_URL` is set; falls back to `API_BASE`
+  from `config.js` (SSH tunnel / production domain)
+- On form submit: `fetch()` POST to `(await _getApiBase()) + '/add-application'`
 - Handle all response states (success, duplicate, error) by updating overlay UI
-- On Escape key or close button: remove overlay from DOM
+- On Escape key or close button: hide overlay (keeps DOM; reopen via icon is instant)
 
 ### Overlay fields
 
@@ -693,22 +831,29 @@ dismiss and navigate to the correct page before triggering again.
 
 ---
 
-## SSH Tunnel Setup (Testing)
+## Connecting the Extension to the VM
+
+### Option A — Cloudflare Tunnel (recommended, no domain needed)
+
+The extension discovers the current tunnel URL automatically via GitHub Gist.
+See **§18** for full setup. Once configured:
+- No per-session setup for any user
+- URL changes on VM restart are handled automatically within 30 min
+- Other users install the extension and set `GIST_CONFIG_URL` in `config.js` once (§18 extension setup)
+
+### Option B — SSH Tunnel (dev / single-user fallback)
 
 ```bash
 # Run once before using the extension. Keep terminal open (or use tmux).
-ssh -L 5001:localhost:5000 ubuntu@<VM-IP> -N
+ssh -L 5001:localhost:5000 opc@<VM-IP> -N
 
 # Verify tunnel is working:
 curl http://localhost:5001/health
 # → {"status": "ok"}
 ```
 
-Extension endpoint during testing: `http://localhost:5001`
-Extension endpoint in production: `https://yourdomain.com`
-
-The endpoint URL is hardcoded in `content.js` for now. Configurable via
-Options page when moving to production.
+Set `GIST_CONFIG_URL = ''` in `config.js` to disable Gist discovery.
+Extension will call `http://localhost:5001` (the `API_BASE` default).
 
 ---
 

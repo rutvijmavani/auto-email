@@ -515,7 +515,7 @@ class TestBuildDetailPayload(unittest.TestCase):
 
     def test_workday_external_path_forwarded(self):
         """Workday _external_path forwarded."""
-        job = self._job(_external_path="/d/1/2/3")
+        job = self._job(_external_path="/d/1/2/3", _slug="co", _wd="wd1", _path="careers")
         payload = self._run(platform="workday", job=job)
         self.assertEqual(payload["_external_path"], "/d/1/2/3")
 
@@ -534,7 +534,7 @@ class TestBuildDetailPayload(unittest.TestCase):
 
     def test_taleo_contest_no_forwarded(self):
         """Taleo _contest_no forwarded."""
-        job = self._job(_contest_no="CONTEST001")
+        job = self._job(_contest_no="CONTEST001", _base_url="https://taleo.net")
         payload = self._run(platform="taleo", job=job)
         self.assertEqual(payload["_contest_no"], "CONTEST001")
 
@@ -570,10 +570,16 @@ class TestBuildDetailPayload(unittest.TestCase):
         self.assertNotIn("_country_code", payload)
 
     def test_platform_specific_key_not_added_when_none(self):
-        """Platform-specific key NOT added when job value is None."""
-        job = self._job(_external_path=None)
+        """Optional platform-specific key NOT added when job value is None."""
+        job = self._job(
+            _external_path="/d/1/2/3",
+            _slug="co",
+            _wd="wd1",
+            _path="careers",
+            _site=None,  # optional — None → excluded from payload
+        )
         payload = self._run(platform="workday", job=job)
-        self.assertNotIn("_external_path", payload)
+        self.assertNotIn("_site", payload)
 
     def test_slug_info_stored_in_payload(self):
         """slug_info is stored in payload."""
