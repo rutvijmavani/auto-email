@@ -104,7 +104,7 @@ except Exception as exc:
 
 print(f"  fetch_jobs returned {len(raw_jobs)} jobs")
 if slug_info_before is not None and slug_info != slug_info_before:
-    print(f"  WARNING: slug_info was MUTATED by fetch_jobs!")
+    print("  WARNING: slug_info was MUTATED by fetch_jobs!")
     show("before", slug_info_before)
     show("after",  slug_info)
 
@@ -112,10 +112,10 @@ if not raw_jobs:
     print("  No jobs returned — cannot continue")
     sys.exit(1)
 
-print(f"\n  slug_info after fetch_jobs call:")
+print("\n  slug_info after fetch_jobs call:")
 show("  slug_info", slug_info)
 
-print(f"\n  Sample — first 3 jobs (all _ keys shown):")
+print("\n  Sample — first 3 jobs (all _ keys shown):")
 for i, job in enumerate(raw_jobs[:3]):
     print(f"\n  job[{i}]:")
     underscore_keys = {k: v for k, v in job.items() if k.startswith("_")}
@@ -129,7 +129,7 @@ missing_ext = [j for j in raw_jobs if not j.get("_external_path")]
 print(f"\n  Jobs with empty/missing _external_path: {len(missing_ext)} / {len(raw_jobs)}")
 if missing_ext:
     sample = missing_ext[0]
-    print(f"  Sample with empty _external_path:")
+    print("  Sample with empty _external_path:")
     show("  title",   sample.get("title"))
     show("  job_id",  sample.get("job_id"))
     show("  job_url", sample.get("job_url"))
@@ -154,16 +154,25 @@ if not all_samples:
 for label, sample_job in all_samples:
     print(f"\n  ── Sample: {label} ──")
     print(f"  job_id={sample_job.get('job_id')!r}  title={sample_job.get('title')!r}")
-    print(f"  Input _ keys:")
+    print("  Input _ keys:")
     for k, v in sample_job.items():
         if k.startswith("_"):
             print(f"    {k}: {v!r}  (truthy={bool(v)})")
 
-    payload_fs  = _build_detail_payload_fullscan(COMPANY, platform, sample_job, slug_info)
-    payload_adp = _build_detail_payload_adaptive(COMPANY, platform, sample_job, slug_info)
+    results = {}
+    for tag, builder in [
+        ("FULLSCAN (is not None check)", _build_detail_payload_fullscan),
+        ("ADAPTIVE (truthy check)     ", _build_detail_payload_adaptive),
+    ]:
+        try:
+            results[tag] = builder(COMPANY, platform, sample_job, slug_info)
+        except ValueError as exc:
+            results[tag] = exc
 
-    for tag, payload in [("FULLSCAN (is not None check)", payload_fs),
-                         ("ADAPTIVE (truthy check)     ", payload_adp)]:
+    for tag, payload in results.items():
+        if isinstance(payload, ValueError):
+            print(f"\n    [{tag}]  → !! ValueError: {payload}")
+            continue
         ukeys = {k: v for k, v in payload.items() if k.startswith("_")}
         missing = [k for k in _REQUIRED_DETAIL_KEYS.get(platform, []) if not payload.get(k)]
         status = "OK" if not missing else f"!! MISSING {missing}"
@@ -174,8 +183,13 @@ for label, sample_job in all_samples:
             print("      (no underscore keys in payload)")
 
 # Use fullscan payload for simulation (it's the stricter reference)
-payload = _build_detail_payload_fullscan(COMPANY, platform,
-                                         all_samples[0][1], slug_info)
+try:
+    payload = _build_detail_payload_fullscan(COMPANY, platform,
+                                             all_samples[0][1], slug_info)
+except ValueError as exc:
+    print(f"\n  !! fullscan _build_detail_payload raised: {exc}")
+    print("  Skipping simulation (step 5) — fix the payload builder first.")
+    sys.exit(0)
 
 # ── 5. detail_worker simulation ───────────────────────────────────────────────
 checkpoint(5, "detail_worker simulation (fullscan payload)")
@@ -184,7 +198,7 @@ payload_json      = json.dumps(payload)
 payload_roundtrip = json.loads(payload_json)
 job_sim = dict(payload_roundtrip)
 
-print(f"  After JSON round-trip (as detail_worker sees it):")
+print("  After JSON round-trip (as detail_worker sees it):")
 for k, v in job_sim.items():
     if k.startswith("_"):
         print(f"    {k}: {v!r}  (truthy: {bool(v)})")
@@ -211,8 +225,12 @@ else:
     print(f"  OK: payload has all required keys: {payload_underscore_keys}")
     print("  New fullscan payloads look correct")
 
-print(f"\n  Adaptive path would produce missing_keys: "
-      f"{[k for k in _REQUIRED_DETAIL_KEYS.get(platform, []) if not _build_detail_payload_adaptive(COMPANY, platform, all_samples[0][1], slug_info).get(k)]}")
+try:
+    _adp_summary = _build_detail_payload_adaptive(COMPANY, platform, all_samples[0][1], slug_info)
+    _adp_missing = [k for k in _REQUIRED_DETAIL_KEYS.get(platform, []) if not _adp_summary.get(k)]
+    print(f"\n  Adaptive path would produce missing_keys: {_adp_missing}")
+except ValueError as exc:
+    print(f"\n  Adaptive path raised ValueError: {exc}")
 
 if detail_attempted:
     print("  detail fetch would proceed (all required keys present)")

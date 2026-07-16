@@ -3180,16 +3180,16 @@ The Accenture drop incident (2026-07-16) exposed a critical observability gap: `
 
 Four layers were added to make every future incident answerable from the first alert email.
 
-#### Layer 1 — Automatic stack traces in every WARNING/ERROR
+#### Layer 1 — Automatic stack traces in WARNING/ERROR (first per 60 s)
 
-`logger.JsonFormatter.format()` now auto-injects a `stack` field for WARNING+ records that do not already have an exception traceback (`exc_info`). The field contains the application call stack with logging-internal frames trimmed off the bottom.
+`logger.JsonFormatter.format()` auto-injects a `stack` field for WARNING+ records that do not already have an exception traceback (`exc_info`). The field contains the application call stack with logging-internal frames trimmed off the bottom.
 
 **Dedup guard** (prevents tight-loop log floods):
-- Per key `{logger.name}:{levelno}`: first injection fires immediately, subsequent injections within 60 s are suppressed
+- Per key `{logger.name}:{levelno}`: first injection fires immediately; subsequent injections within 60 s are suppressed
 - `_STACK_SEEN` dict is purged when it exceeds 500 entries (clear-all — all unique keys get a fresh trace on the next occurrence)
 - Thread-safe via `threading.Lock()`
 
-**Result:** Any WARNING or ERROR now includes the exact Python callsite in the alert email, viewable without touching the VM.
+**Result:** The first WARNING or ERROR from each unique logger/level includes the exact Python callsite in the alert email, viewable without touching the VM. Repeat fires within 60 s omit the stack to avoid floods.
 
 #### Layer 2 — `_build_detail_payload` raises instead of silently forwarding bad payloads
 
@@ -3203,7 +3203,7 @@ Both `workers/scan_worker.py` and `workers/fullscan.py` now **raise `ValueError`
 | icims | `_base_url` |
 | jobvite | `_slug` |
 
-Both lpush call sites wrap `_build_detail_payload` in `try/except ValueError` and log with `exc_info=True`. Because Layer 1 is active, the log entry will contain the full exception traceback plus the call stack — not just the error message.
+Both lpush call sites wrap `_build_detail_payload` in `try/except ValueError` and log with `exc_info=True`. The `exc_info=True` produces the `exc` field (exception traceback). Because `exc` and `stack` are mutually exclusive in Layer 1's `elif` branch, the same record does **not** also get an auto-injected `stack` — the exception traceback is the diagnostic artifact.
 
 **Before:** Bad payload pushed to queue:detail:* silently → `detail_worker` drops it 1–5 minutes later with a WARNING and no traceback.  
 **After:** Error detected at the point of construction → full traceback logged immediately → `exc_info=True` also sends the traceback to Sentry automatically.
@@ -3269,8 +3269,14 @@ end
 
 **Inspect the DLQ:**
 ```bash
-redis-cli lrange queue:detail:dlq 0 4 | python -c \
-  "import sys, json; [print(json.dumps(json.loads(l), indent=2)) for l in sys.stdin]"
+redis-cli lrange queue:detail:dlq 0 4 | python -c "
+import sys, json
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try: print(json.dumps(json.loads(l), indent=2))
+    except Exception: print(l)
+"
 ```
 
 ---

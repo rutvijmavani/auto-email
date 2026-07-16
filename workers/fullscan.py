@@ -1120,24 +1120,24 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     # Fall through to DB check (no continue) — source of truth.
 
                 # Layer 4: DB check — source of truth for new/known decision.
-                inserted = save_pending_detail(
-                    company, platform, job, found_by="tier2_fullscan"
-                )
-                if inserted:
-                    try:
-                        detail_payload = _build_detail_payload(
-                            company, platform, job, slug_info,
-                        )
+                try:
+                    detail_payload = _build_detail_payload(
+                        company, platform, job, slug_info,
+                    )
+                except ValueError:
+                    logger.error(
+                        "fullscan: _build_detail_payload raised — job skipped "
+                        "to avoid orphaned DB record. "
+                        "company=%r platform=%s job_id=%s",
+                        company, platform, job.get("job_id"),
+                        exc_info=True,
+                    )
+                else:
+                    if save_pending_detail(
+                        company, platform, job, found_by="tier2_fullscan"
+                    ):
                         r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
                         new_count += 1
-                    except ValueError:
-                        logger.error(
-                            "fullscan: _build_detail_payload raised — malformed payload "
-                            "will NOT be queued for detail fetch. "
-                            "company=%r platform=%s job_id=%s",
-                            company, platform, job.get("job_id"),
-                            exc_info=True,
-                        )
 
                 # ALL fetched jobs go into NEW bloom regardless of outcome —
                 # this ensures closed/filled jobs fall out naturally next cycle.

@@ -11,7 +11,7 @@ logging a job you applied to.
 
 ## Architecture
 
-```
+```text
 Chrome Extension (laptop)
         │
         │  POST /add-application  (JSON)
@@ -174,7 +174,7 @@ const USERS = [
 
 The overlay always shows an "Applying as" dropdown, pre-selected automatically:
 
-```
+```text
 Applying as: [ Rutvi ▼ ]   ← auto-detected, correct 99% of the time
 ```
 
@@ -242,25 +242,63 @@ LinkedIn Jobs and Indeed are single-page apps — clicking from one job to anoth
 changes the URL via `pushState` but does not reload the page. The content script
 stays alive but the 4-second timer already fired and won't re-trigger naturally.
 
-**Fix:** Intercept `history.pushState` and listen for `popstate` events. On each
-URL change that still matches the ATS pattern, reset and re-arm the 4-second timer.
-Also clear any existing overlay before re-injecting on the new page.
+**Fix:** Inject a tiny inline script into the **main world** that wraps
+`pushState`/`replaceState` and posts a message back to the content script via
+`window.postMessage`. The content script listens for those messages and calls
+`onUrlChange()`.
 
 ```js
-const _push = history.pushState.bind(history);
-history.pushState = (...args) => { _push(...args); onUrlChange(); };
+// Inject into main world — isolated-world override does NOT intercept
+// the page's own history calls in Chrome MV3.
+(function () {
+  const s = document.createElement('script');
+  s.textContent = `(function(){['pushState','replaceState'].forEach(function(m){
+    var orig=history[m].bind(history);
+    history[m]=function(){orig.apply(history,arguments);
+      window.postMessage({type:'__jcp_nav'},'*');};});})();`;
+  (document.head || document.documentElement).appendChild(s);
+  s.remove();
+})();
+window.addEventListener('message', function (e) {
+  if (e.source === window && e.data && e.data.type === '__jcp_nav') onUrlChange();
+});
 window.addEventListener('popstate', onUrlChange);
 ```
 
-### 12. Overlay already open guard
+**Why not assign directly to `history.pushState`?** In Chrome MV3 content scripts
+run in an isolated JavaScript world. Assigning to `history.pushState` in the
+isolated world creates a shadow property that doesn't affect the page's own
+`window.history` object, so the page's SPA navigation bypasses the hook entirely.
+The inline script injection runs in the main world where the page's history lives.
 
-If the auto-trigger fires and the user also clicks the icon manually, two overlays
-would stack. Before injecting, check if one already exists:
+### 12. Overlay close and reopen
+
+**Two removal functions with different semantics:**
+
+- `hideOverlay()` — sets `display:none` on the overlay div. Used by the close
+  button (×) and Escape key. Keeps the DOM element alive so reopening is instant.
+- `removeOverlay()` — fully removes the element from the DOM. Used on SPA
+  navigation and after a successful submit. Forces a fresh form build with new
+  page data on the next `showOverlay()` call.
+
+**Reopen:** clicking the extension icon after closing sends a `SHOW_OVERLAY`
+message from `background.js` → `showOverlay()` → finds the hidden element →
+un-hides it and re-focuses the first field. No new network round-trip or
+`detectUser()` call needed.
+
+**Double-inject guard:** if `showOverlay()` is called while the overlay is
+already visible (e.g. auto-trigger fires and user also clicks the icon),
+it just re-focuses the first field rather than stacking a second overlay:
 
 ```js
-if (document.getElementById('job-capture-overlay')) {
-  document.getElementById('job-capture-overlay').focus();
-  return;
+function showOverlay() {
+  const existing = document.getElementById('job-capture-overlay');
+  if (existing) {
+    existing.style.display = '';        // un-hide if hidden
+    existing.querySelector('select, input:not([readonly])')?.focus();
+    return;
+  }
+  // ... build and inject new overlay
 }
 ```
 
@@ -306,10 +344,20 @@ it: `sudo systemctl start pipeline-api`. Logs: `journalctl -u pipeline-api -f`.
 
 ### 15. CORS
 
-Flask only sets `Access-Control-Allow-Origin` when the request `Origin` header
-starts with `chrome-extension://` — it echoes the exact origin back rather than
-returning `*`. Implemented via a manual `after_request` hook in `api.py` (no
-`flask-cors` dependency needed).
+Flask validates two headers together before setting `Access-Control-Allow-Origin`:
+
+| Header | Who sets it | Value |
+|---|---|---|
+| `Origin` | Browser (cannot be overridden by JS) | `chrome-extension://<real-ext-id>` |
+| `X-Extension-Id` | `content.js` via `chrome.runtime.id` | `<same-ext-id>` |
+
+The server only echoes the origin back when `Origin == f"chrome-extension://{X-Extension-Id}"`. If they don't agree (e.g. a webpage tries to fake it), no CORS header is set and the browser blocks the response.
+
+**Why this is dynamic:** the extension always knows its own ID via `chrome.runtime.id` and sends it on every request. The server validates consistency rather than comparing against a hardcoded value — so reinstalling the extension and getting a new ID just works automatically.
+
+**Why `Origin` can't be spoofed by a webpage:** browsers set the `Origin` header from the actual document origin and forbid JavaScript from overriding it. A webpage at `https://evil.com` cannot produce `Origin: chrome-extension://...` no matter what JS it runs.
+
+Implemented via a manual `after_request` hook in `api.py` (no `flask-cors` dependency needed). `X-Extension-Id` is listed in `Access-Control-Allow-Headers` so the preflight OPTIONS request approves it.
 
 ### 16. Logging and observability
 
@@ -349,7 +397,7 @@ The log monitor then alerts on new `ERROR` or `WARNING` lines within 15 minutes.
 
 A single overlay with a **tab toggle at the top** instead of two separate overlays:
 
-```
+```text
 [ Save Job ● ]  [ Save Company ]
 ```
 
@@ -486,7 +534,7 @@ tab. This is an acceptable rare path.
 
 #### New API endpoint needed
 
-```
+```http
 POST /add-prospective
 { "company": "Stripe", "career_page_url": "https://stripe.com/jobs" }
 → 201 { "id": 5, "created": true }
@@ -499,7 +547,7 @@ Maps to `db/prospective_companies.py` → `add_prospective_company()` (to be wri
 
 ## File Structure
 
-```
+```text
 mail/
 ├── api.py                        ← new: Flask REST API (runs on VM)
 └── chrome-extension/             ← new: load unpacked in Chrome for testing

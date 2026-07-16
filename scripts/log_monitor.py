@@ -714,7 +714,7 @@ def _error_table_row(record: dict) -> str:
         if ts:
             label_parts.append(ts)
         label_row = (
-            f'<tr><td style="padding:1px 10px 3px 28px;font-size:11px;color:#64748b">'
+            '<tr><td style="padding:1px 10px 3px 28px;font-size:11px;color:#64748b">'
             + " &nbsp;·&nbsp; ".join(label_parts)
             + '</td></tr>'
         ) if label_parts else ""

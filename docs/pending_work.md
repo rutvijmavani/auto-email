@@ -535,8 +535,8 @@ Root-cause driver: The Accenture 866-drop incident (2026-07-16) took 5 hours to 
 Both `_build_detail_payload()` implementations now validate that required platform keys are present and truthy in the built payload before returning. Raises `ValueError` with full context (company, platform, job_id, missing keys, raw underscore keys).
 
 Both call sites (lpush points) wrap in `try/except ValueError` → `logger.error(..., exc_info=True)`:
-- Layer 1 auto-injects a call stack for all WARNINGs/ERRORs
-- `exc_info=True` additionally includes the `ValueError` traceback
+- `exc_info=True` produces the `exc` field (full `ValueError` traceback)
+- Layer 1's `stack` injection is skipped for this record (`exc` and `stack` are mutually exclusive via the `elif` branch)
 - Sentry captures `exc_info=True` errors automatically
 
 **Before:** Malformed payload pushed to queue silently → `detail_worker` drops it 1–5 min later with no traceback.  
@@ -560,8 +560,14 @@ Tries `json.loads(sample_line)`. On success: shows `msg` field cleanly in red, `
 
 **How to inspect:**
 ```bash
-redis-cli lrange queue:detail:dlq 0 4 | python -c \
-  "import sys, json; [print(json.dumps(json.loads(l), indent=2)) for l in sys.stdin]"
+redis-cli lrange queue:detail:dlq 0 4 | python -c "
+import sys, json
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try: print(json.dumps(json.loads(l), indent=2))
+    except Exception: print(l)
+"
 ```
 
 ---

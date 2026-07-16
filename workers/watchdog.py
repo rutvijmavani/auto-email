@@ -952,7 +952,7 @@ local cutoff = ARGV[1]
 local keep = {}
 for _, v in ipairs(all) do
     local ok, entry = pcall(cjson.decode, v)
-    if ok and entry._dlq_added_at and entry._dlq_added_at >= cutoff then
+    if ok and type(entry._dlq_added_at) == "string" and entry._dlq_added_at >= cutoff then
         table.insert(keep, v)
     elseif not ok then
         table.insert(keep, v)
