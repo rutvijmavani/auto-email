@@ -6,17 +6,85 @@ All configuration lives in `config.py` in the project root. Change values here �
 
 ## Email Credentials
 
+### Operator account (system notifications)
+
 ```python
-EMAIL        = os.getenv("EMAIL")         # your Gmail address
-APP_PASSWORD = os.getenv("APP_PASSWORD")  # Gmail app password (not account password)
-RESUME_PATH  = "Resume.pdf"               # path to your resume file
+EMAIL        = os.getenv("EMAIL")         # operator Gmail address
+APP_PASSWORD = os.getenv("APP_PASSWORD")  # operator Gmail app password
+RESUME_PATH  = "Resume.pdf"               # fallback resume file
 ```
+
+The operator account (`EMAIL` / `APP_PASSWORD`) is used for all system-level emails: quota alerts, log monitor errors, pipeline health reports. These are infrastructure notifications, not outreach emails.
 
 **Gmail App Password setup:**
 1. Enable 2-factor authentication on your Google account
 2. Go to Google Account → Security → App Passwords
 3. Generate a password for "Mail"
 4. Add it to your `.env` file as `APP_PASSWORD`
+
+---
+
+## Per-User Credentials
+
+Each user who sends outreach emails through the pipeline needs their own set of credentials. These are stored in `.env` — never in the database (secrets stay out of SQL). The pipeline reads them dynamically using the user's ID from the database at runtime.
+
+### Adding a new user
+
+Run the admin script — it creates the database row and prints exactly which `.env` vars to add:
+
+```bash
+python scripts/add_user.py --name "Fiancée" --email fiancee@gmail.com --resume-path Resume_Fiancee.pdf
+```
+
+Output:
+```
+User created (id=2). Add these to .env:
+
+  GMAIL_USER_2_EMAIL=fiancee@gmail.com
+  GMAIL_USER_2_APP_PASS=<gmail-app-password>
+  GEMINI_API_KEY_USER_2=<gemini-api-key>
+  CAREERSHIFT_USER_2_EMAIL=<careershift-login-email>
+  CAREERSHIFT_USER_2_PASS=<careershift-password>
+```
+
+### Per-user env var reference
+
+| Variable | What it's for |
+|---|---|
+| `GMAIL_USER_{id}_EMAIL` | Gmail address used as the **send-from** address for outreach emails. May differ from the notification email stored in the `users` table (e.g. an alias). |
+| `GMAIL_USER_{id}_APP_PASS` | Gmail App Password for the above account. NOT the account's login password. Generate one at Google Account → Security → App Passwords. |
+| `GEMINI_API_KEY_USER_{id}` | Gemini API key used for generating personalized email content for this user's applications. Each user uses their own key so one user's heavy usage doesn't exhaust the other's quota. |
+| `CAREERSHIFT_USER_{id}_EMAIL` | Login email for this user's CareerShift account. |
+| `CAREERSHIFT_USER_{id}_PASS` | Login password for this user's CareerShift account. |
+
+**Example for two users:**
+```bash
+# User 1 (operator)
+GMAIL_USER_1_EMAIL=rutvi@gmail.com
+GMAIL_USER_1_APP_PASS=xxxx
+GEMINI_API_KEY_USER_1=AIza...
+CAREERSHIFT_USER_1_EMAIL=rutvi@njit.edu
+CAREERSHIFT_USER_1_PASS=secret
+
+# User 2 (fiancée)
+GMAIL_USER_2_EMAIL=fiancee@gmail.com
+GMAIL_USER_2_APP_PASS=xxxx
+GEMINI_API_KEY_USER_2=AIza...
+CAREERSHIFT_USER_2_EMAIL=fiancee@neu.edu
+CAREERSHIFT_USER_2_PASS=secret
+```
+
+### Resume path
+
+Resume path is **not** an env var — it's stored in the `users` table under `resume_path`. Non-secret configuration like file paths lives in the database so adding a new user requires only one `INSERT` and the env vars above. No code changes, no new env vars beyond the credentials listed above.
+
+The resume file itself must be placed at the repo root (same location as `Resume.pdf`). The filename you pass to `--resume-path` should match the actual file name.
+
+### What happens if a per-user credential is missing
+
+The pipeline is fail-closed on per-user credentials — if `GMAIL_USER_{id}_EMAIL` or `GMAIL_USER_{id}_APP_PASS` is missing for a user, the outreach engine raises a `ValueError` immediately rather than silently falling back to the operator's Gmail account. This prevents outreach from going out under the wrong sender identity.
+
+System alert emails (quota reports, pipeline errors) always use the operator account (`EMAIL` / `APP_PASSWORD`) regardless of which user they're about.
 
 ---
 

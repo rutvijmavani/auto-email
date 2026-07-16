@@ -5,6 +5,9 @@ import hashlib
 from datetime import datetime, timedelta
 
 from db.connection import get_conn
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 # ─────────────────────────────────────────
@@ -70,24 +73,40 @@ def save_ai_cache(cache_key, company, job_title, data, ttl_days=21):
     conn.close()
 
 
-def get_applications_missing_ai_cache():
+def get_applications_missing_ai_cache(user_id: int | None = None):
     """Return active applications with no valid ai_cache entry."""
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT a.id, a.company, a.job_url, a.job_title, a.applied_date
-        FROM applications a
-        WHERE a.status = 'active'
-        AND NOT EXISTS (
-            SELECT 1 FROM ai_cache ac
-            WHERE ac.company = a.company
-            AND COALESCE(ac.job_title, '') = COALESCE(a.job_title, '')
-            AND ac.expires_at > CURRENT_TIMESTAMP
-        )
-        ORDER BY a.applied_date DESC
-    """)
+    if user_id is not None:
+        c.execute("""
+            SELECT a.id, a.company, a.job_url, a.job_title, a.applied_date
+            FROM applications a
+            WHERE a.status = 'active'
+            AND a.user_id = %s
+            AND NOT EXISTS (
+                SELECT 1 FROM ai_cache ac
+                WHERE ac.company = a.company
+                AND COALESCE(ac.job_title, '') = COALESCE(a.job_title, '')
+                AND ac.expires_at > CURRENT_TIMESTAMP
+            )
+            ORDER BY a.applied_date DESC
+        """, (user_id,))
+    else:
+        c.execute("""
+            SELECT a.id, a.company, a.job_url, a.job_title, a.applied_date
+            FROM applications a
+            WHERE a.status = 'active'
+            AND NOT EXISTS (
+                SELECT 1 FROM ai_cache ac
+                WHERE ac.company = a.company
+                AND COALESCE(ac.job_title, '') = COALESCE(a.job_title, '')
+                AND ac.expires_at > CURRENT_TIMESTAMP
+            )
+            ORDER BY a.applied_date DESC
+        """)
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
+    logger.debug("get_applications_missing_ai_cache user_id=%s → %d apps", user_id, len(rows))
     return rows
 
 

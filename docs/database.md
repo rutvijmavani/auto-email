@@ -2,51 +2,78 @@
 
 ## Overview
 
-All data lives in a single SQLite database at `data/recruiter_pipeline.db` with WAL (Write-Ahead Logging) mode enabled. WAL mode allows simultaneous reads and writes without blocking, which is important since you can add new applications while the pipeline is running.
+All pipeline data lives in a PostgreSQL database. PostgreSQL was adopted as part of the multi-user architecture migration — it supports concurrent writes from multiple users simultaneously and the partitioned unique indexes required for per-user deduplication.
 
 ---
 
 ## Tables
 
-### `applications`
-Jobs you applied to. This is the entry point for the entire pipeline.
+### `users`
+The central user registry. One row per person using the pipeline.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
+| `id` | SERIAL PK | Auto-incremented |
+| `email` | TEXT UNIQUE | Notification delivery address — quota alerts and digest emails go here |
+| `name` | TEXT | Display name shown in alert email subjects (e.g. `Rutvi`, `Fiancée`) |
+| `resume_path` | TEXT | Filename of their resume at repo root (e.g. `Resume.pdf`, `Resume_Fiancee.pdf`) |
+| `is_active` | BOOLEAN | `TRUE` = active; `FALSE` = soft-disabled without deleting history |
+| `created_at` | TIMESTAMPTZ | When the user was added |
+
+**Non-secrets only.** Credentials (Gmail passwords, Gemini API keys, CareerShift passwords) are never stored here — those live in `.env`. The DB stores only non-sensitive per-user configuration like display name and resume path.
+
+**Never hard-delete users.** All tables that belong to a user (`applications`, `outreach`, `model_usage`, etc.) use `ON DELETE RESTRICT`, so a `DELETE FROM users` fails if any history exists. Use `UPDATE users SET is_active = FALSE` to disable a user instead. This preserves all historical data.
+
+**Adding a new user:** Run `python scripts/add_user.py --name "Name" --email user@gmail.com`. The script creates the DB row and prints the exact `.env` vars to add. See [configuration.md](./configuration.md) for the per-user env var list.
+
+---
+
+### `applications`
+Jobs each user applied to. This is the entry point for the entire pipeline.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | SERIAL PK | Auto-incremented |
 | `company` | TEXT | Company name |
-| `job_url` | TEXT UNIQUE | Job posting URL |
+| `job_url` | TEXT | Job posting URL |
 | `job_title` | TEXT | Role title |
 | `applied_date` | DATE | Date you applied |
-| `status` | TEXT | `active` / `closed` / `exhausted` |
-| `created_at` | TIMESTAMP | When added to DB |
+| `expected_domain` | TEXT | Email domain root extracted from the job URL (e.g. `stripe` from `stripe.com`) — used to validate recruiter emails during scraping |
+| `status` | TEXT | `active` / `closed` / `exhausted` / `prospective` |
+| `user_id` | INT FK → `users.id` | Which user this application belongs to |
+| `created_at` | TIMESTAMPTZ | When added to DB |
+
+**Unique constraint:** `UNIQUE(user_id, job_url)` — each user can only have one row per job URL, but two different users may both apply to the same URL independently.
 
 **Retention:** Auto-closed after `APPLICATION_AUTO_CLOSE_DAYS` (60 days) from `applied_date`. Applications are never deleted — only their status changes to `closed`. This assumes no response within 60 days means the application is no longer active. Configurable in `config.py`.
 
 ---
 
 ### `recruiters`
-Company-level recruiter contacts. One row per person, shared across all applications at the same company.
+Company-level recruiter contacts. One row per person, shared across all applications at the same company and across all users.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
+| `id` | SERIAL PK | Auto-incremented |
 | `company` | TEXT | Company name |
 | `name` | TEXT | Recruiter full name |
 | `position` | TEXT | Job title |
 | `email` | TEXT UNIQUE | Email address |
 | `confidence` | TEXT | `auto` / `manual_review` |
 | `recruiter_status` | TEXT | `active` / `inactive` |
-| `last_scraped_at` | TIMESTAMP | Last CareerShift scrape |
+| `last_scraped_at` | TIMESTAMPTZ | Last CareerShift scrape |
 | `used_search_terms` | TEXT | JSON array of tried HR terms |
-| `verified_at` | TIMESTAMP | Last verification timestamp |
-| `created_at` | TIMESTAMP | When added to DB |
+| `verified_at` | TIMESTAMPTZ | Last verification timestamp |
+| `found_by_user_id` | INT FK → `users.id` (nullable) | Which user's CareerShift account originally found this recruiter — used for **verification routing** (see note below) |
+| `created_at` | TIMESTAMPTZ | When added to DB |
 
 **Retention:** Permanent — never auto-deleted. Inactive recruiters are soft-deleted (`recruiter_status = inactive`) to preserve history and prevent re-scraping.
 
 **Confidence levels:**
 - `auto` — matched strong HR keywords (Recruiter, Talent Acquisition, HR Manager, etc.)
 - `manual_review` — matched loose keywords or found via fallback search
+
+**`found_by_user_id` is a routing key, not attribution.** CareerShift caches profiles per account — re-visiting a profile found by User 1's account is free from User 1's account, but costs quota if done from User 2's account. The pipeline always verifies a recruiter using the same account that originally found them. This column records which account that was. Backfill: all recruiters found before multi-user was implemented have `found_by_user_id = 2` because User 2's (fiancée's) CareerShift credentials were in use at the time.
 
 ---
 
@@ -71,15 +98,16 @@ Email sequences per recruiter+application pair. Each stage gets its own row, bui
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
-| `recruiter_id` | INTEGER FK | References `recruiters.id` |
-| `application_id` | INTEGER FK | References `applications.id` |
+| `id` | SERIAL PK | Auto-incremented |
+| `recruiter_id` | INT FK → `recruiters.id` | Which recruiter to contact |
+| `application_id` | INT FK → `applications.id` | Which application this is for |
+| `user_id` | INT FK → `users.id` | Which user is sending this email — determines which Gmail account is used for SMTP |
 | `stage` | TEXT | `initial` / `followup1` / `followup2` |
 | `status` | TEXT | `pending` / `sent` / `failed` / `bounced` / `cancelled` |
 | `replied` | INTEGER | `0` = no reply, `1` = replied |
 | `scheduled_for` | DATE | When to send |
-| `sent_at` | TIMESTAMP | When actually sent |
-| `created_at` | TIMESTAMP | When row created |
+| `sent_at` | TIMESTAMPTZ | When actually sent |
+| `created_at` | TIMESTAMPTZ | When row created |
 
 **Retention:** Auto-deleted based on status (see Retention Policies below).
 
@@ -137,15 +165,24 @@ Cached job descriptions scraped from job posting URLs. Content stored compressed
 ---
 
 ### `model_usage`
-Tracks daily Gemini API call counts per model. Used to enforce daily limits locally before hitting the API. Works in combination with an in-memory RPM (requests-per-minute) sliding window to enforce both daily and per-minute limits simultaneously.
+Tracks daily Gemini API call counts per model, per user, and per use-case. Used to enforce daily limits locally before hitting the API. Works in combination with an in-memory RPM (requests-per-minute) sliding window to enforce both daily and per-minute limits simultaneously.
 
 | Column | Type | Description |
 |---|---|---|
 | `model` | TEXT | Model name |
 | `date` | TEXT | YYYY-MM-DD |
 | `count` | INTEGER | Calls made today |
+| `user_id` | INT FK → `users.id` (nullable) | Which user's Gemini key was used. `NULL` for shared ATS detection rows. |
+| `use_case` | TEXT | `email_content` (per-user outreach generation) or `ats_detection` (shared pool for ATS structure detection) |
+| `key_slot` | TEXT (nullable) | For `ats_detection` rows: `primary` or `fallback`. `NULL` for `email_content` rows. |
 
-**Primary key:** `(model, date)`
+**Why two separate buckets?** Each user has their own Gemini API key for generating outreach emails (`email_content`). ATS structure detection is independent work that benefits all users equally — it uses a shared pool (`ats_detection`) so its calls don't eat into any user's personal email quota. Without this split, a heavy day of ATS detection could exhaust a user's Gemini quota before any outreach emails were generated.
+
+**Unique indexes (partial):**
+- Per-user rows: `UNIQUE(model, date, use_case, user_id) WHERE user_id IS NOT NULL`
+- Shared ATS rows: `UNIQUE(model, date, use_case, key_slot) WHERE user_id IS NULL`
+
+These are partial indexes (not a simple primary key) because `user_id` can be NULL for ATS rows, and PostgreSQL doesn't allow NULL in a primary key.
 
 **Retention:** Auto-deleted after 21 days.
 
@@ -165,26 +202,38 @@ The RPM window is in-memory and resets on process restart — acceptable since R
 ---
 
 ### `careershift_quota`
-Tracks daily CareerShift profile view usage. Synced with real value from CareerShift account page at start of each `--find-only` run.
+Tracks daily CareerShift profile view usage **per user**. Each user has their own CareerShift account with a separate 50/day limit. Synced with the real value from the CareerShift account page at the start of each `--find-only` run.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
-| `date` | DATE UNIQUE | YYYY-MM-DD |
+| `id` | SERIAL PK | Auto-incremented |
+| `user_id` | INT FK → `users.id` | Which user's CareerShift account this row is for |
+| `date` | DATE | YYYY-MM-DD |
 | `total_limit` | INTEGER | Daily limit (50) |
 | `used` | INTEGER | Profile views used |
 | `remaining` | INTEGER | Profile views left |
+
+**Unique constraint:** `UNIQUE(user_id, date)` — one row per user per day.
+
+**Example:** Two users, same day:
+```
+user_id=1, date='2026-07-15', used=12, remaining=38
+user_id=2, date='2026-07-15', used=0,  remaining=50
+```
+
+**Backfill:** Existing rows (before multi-user) had `user_id = NULL`. On first multi-user run, these are backfilled to `user_id = 2` because User 2's (fiancée's) CareerShift credentials were in use during the single-user era. After backfill, `user_id` is set to `NOT NULL`.
 
 **Retention:** Auto-deleted after 30 days.
 
 ---
 
 ### `quota_alerts`
-Records quota health alerts sent by email. Prevents duplicate alerts from being sent repeatedly.
+Records quota health alerts sent by email **per user**. Prevents duplicate alerts from being sent repeatedly.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
+| `id` | SERIAL PK | Auto-incremented |
+| `user_id` | INT FK → `users.id` | Which user this alert is about. Quota alerts are personal — only the affected user receives them. |
 | `alert_type` | TEXT | `underutilized` / `exhausted` |
 | `quota_type` | TEXT | `careershift` / `gemini` |
 | `start_date` | DATE | First day of streak |
@@ -193,7 +242,9 @@ Records quota health alerts sent by email. Prevents duplicate alerts from being 
 | `avg_remaining` | REAL | Average daily remaining over streak |
 | `suggested_cap` | INTEGER | Auto-calculated suggested MAX_CONTACTS_HARD_CAP |
 | `notified` | INTEGER | `0` = pending, `1` = email sent |
-| `created_at` | TIMESTAMP | When alert was created |
+| `created_at` | TIMESTAMPTZ | When alert was created |
+
+**Alert delivery:** Quota alerts are sent FROM the operator's Gmail account (system notification) but delivered TO the affected user's email address (`users.email`). Subject format: `Quota Alert [Rutvi] — CareerShift Underutilized (3 days)`.
 
 **Retention:** Auto-deleted after 30 days.
 
@@ -392,22 +443,25 @@ Daily performance metrics for `--verify-filled` runs. Tracks how many stale job 
 ---
 
 ### `coverage_stats`
-Daily performance metrics for the `--find-only` and `--outreach-only` pipelines. Tracks how effectively the recruiter sourcing pipeline is working — are we finding recruiters for the companies we apply to, and are those recruiters ready to be emailed?
+Daily performance metrics for the `--find-only` and `--outreach-only` pipelines **per user**. Tracks how effectively the recruiter sourcing pipeline is working — are we finding recruiters for the companies we apply to, and are those recruiters ready to be emailed?
 
-Think of this as the "health dashboard" for the recruiter pipeline specifically, complementing `monitor_stats` which tracks the job monitoring pipeline.
+Think of this as the "health dashboard" for the recruiter pipeline specifically, complementing `monitor_stats` which tracks the job monitoring pipeline. Coverage stats are per-user because Metric 1 and Metric 2 are computed from a specific user's application set — mixing both users' applications into one row would produce a meaningless blended number.
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER PK | Auto-incremented |
-| `date` | DATE NOT NULL UNIQUE | YYYY-MM-DD |
-| `total_applications` | INTEGER | Total active applications that day |
+| `id` | SERIAL PK | Auto-incremented |
+| `user_id` | INT FK → `users.id` | Which user these metrics belong to |
+| `date` | DATE NOT NULL | YYYY-MM-DD |
+| `total_applications` | INTEGER | Total active applications that day (for this user) |
 | `companies_attempted` | INTEGER | Companies where scraping was attempted (excludes already-stocked) |
 | `auto_found` | INTEGER | Companies where recruiters were found with `auto` confidence |
 | `rejected_count` | INTEGER | Companies where buffer was discarded (domain mismatch, low confidence) |
 | `exhausted_count` | INTEGER | Companies marked `exhausted` (CareerShift has no data) |
 | `metric1` | REAL | Find-only performance % — see below |
 | `metric2` | REAL | Outreach coverage % — see below |
-| `created_at` | TIMESTAMP | When row created |
+| `created_at` | TIMESTAMPTZ | When row created |
+
+**Unique constraint:** `UNIQUE(user_id, date)` — one row per user per day.
 
 **Metric 1 — Find-Only Pipeline Performance:**
 ```text

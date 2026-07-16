@@ -18,6 +18,7 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
+from logger import get_logger
 from config import SEND_WINDOW_START, SEND_WINDOW_END, GRACE_PERIOD_HOURS, SEND_TIMEZONE
 from outreach.template_engine import get_template
 from outreach.email_sender import send_email
@@ -35,6 +36,8 @@ from db.db import (
     get_all_active_applications,
     get_conn,
 )
+
+logger = get_logger(__name__)
 
 HARD_CUTOFF_HOUR = SEND_WINDOW_END + GRACE_PERIOD_HOURS  # 12 PM
 
@@ -96,29 +99,38 @@ def reschedule_remaining(pending):
 
 def schedule_initial_outreach():
     """
-    For every recruiter linked to an application with no outreach yet,
-    schedule the initial email for today.
+    For every recruiter linked to an active application with no outreach yet,
+    schedule the initial email for today. Loops per user so outreach rows get
+    the correct user_id for SMTP sender selection at send time.
     """
-    apps = get_all_active_applications()
+    from db.users import get_all_active_users
+    users     = get_all_active_users()
     scheduled = 0
 
-    for app in apps:
-        recruiters = get_recruiters_for_application(app["id"])
-        for recruiter in recruiters:
-            if has_pending_or_sent_outreach(recruiter["id"], app["id"]):
-                continue
+    for user in users:
+        user_id = user["id"]
+        apps    = get_all_active_applications(user_id=user_id)
+        for app in apps:
+            recruiters = get_recruiters_for_application(app["id"])
+            for recruiter in recruiters:
+                if has_pending_or_sent_outreach(recruiter["id"], app["id"]):
+                    continue
 
-            today = _now().strftime("%Y-%m-%d")
-            schedule_outreach(
-                recruiter_id=recruiter["id"],
-                application_id=app["id"],
-                stage="initial",
-                scheduled_for=today,
-            )
-            print(f"   [INFO] Scheduled initial: {recruiter['name']} @ {recruiter['company']}")
-            scheduled += 1
+                today = _now().strftime("%Y-%m-%d")
+                schedule_outreach(
+                    recruiter_id=recruiter["id"],
+                    application_id=app["id"],
+                    stage="initial",
+                    scheduled_for=today,
+                    user_id=user_id,
+                )
+                logger.debug("Scheduled initial outreach: %r @ %r (user_id=%d)",
+                             recruiter["name"], recruiter["company"], user_id)
+                print(f"   [INFO] Scheduled initial: {recruiter['name']} @ {recruiter['company']}")
+                scheduled += 1
 
     if scheduled:
+        logger.info("Scheduled %d initial outreach email(s)", scheduled)
         print(f"[OK] Scheduled {scheduled} initial outreach email(s)")
     else:
         print("[OK] No new initial emails to schedule")
@@ -181,8 +193,11 @@ def process_outreach():
         recruiter_id    = row["recruiter_id"]
         job_title       = row.get("job_title") or "Software Engineer"
         application_id  = row["application_id"]
+        user_id         = row.get("user_id", 1)
 
         print(f"[INFO] [{stage}] {recruiter_name} @ {company} -> {recruiter_email}")
+        logger.debug("Processing outreach id=%d stage=%s user_id=%d %r @ %r",
+                     outreach_id, stage, user_id, recruiter_name, company)
 
         # Check AI cache — warn and skip if missing
         # NOTE: quota check is done AFTER template fetch so cached content
@@ -211,9 +226,13 @@ def process_outreach():
                 body=body,
                 company=company,
                 subject=subject,
+                user_id=user_id,
+                attach_resume=True,
             )
 
         except smtplib.SMTPRecipientsRefused:
+            logger.warning("Hard bounce for %s (outreach_id=%d) — marking recruiter inactive",
+                           recruiter_email, outreach_id)
             print(f"   [ERROR] Hard bounce for {recruiter_email} — marking recruiter inactive")
             mark_outreach_bounced(outreach_id, recruiter_id)
             bounced      += 1
@@ -228,6 +247,7 @@ def process_outreach():
             continue
 
         except Exception as e:
+            logger.error("Email send failed outreach_id=%d to=%s: %s", outreach_id, recruiter_email, e)
             print(f"   [ERROR] Failed to send: {e}")
             mark_outreach_failed(outreach_id)
             failed_count += 1
@@ -243,6 +263,8 @@ def process_outreach():
         # Only reached if send succeeded
         mark_outreach_sent(outreach_id)
         sent_count += 1
+        logger.info("Sent outreach_id=%d stage=%s to=%s user_id=%d",
+                    outreach_id, stage, recruiter_email, user_id)
         print(f"   [OK] Sent | Subject: {subject}")
         emails.append({
             "name":    recruiter_name,
@@ -254,7 +276,7 @@ def process_outreach():
         # Schedule next stage if no reply
         try:
             if not row["replied"]:
-                schedule_next_outreach(recruiter_id, application_id)
+                schedule_next_outreach(recruiter_id, application_id, user_id=user_id)
         except Exception as e:
             print(f"   [WARNING] Could not schedule next outreach: {e}")
 

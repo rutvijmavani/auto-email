@@ -139,13 +139,14 @@ def verify_tier3_recruiter(page, recruiter):
         return False
 
 
-def run_tiered_verification(page, applications):
+def run_tiered_verification(page, applications, found_by_user_id=None):
     """
-    Run tiered verification for all existing recruiters.
+    Run tiered verification for recruiters found by found_by_user_id's account.
     After verification, link active recruiters to their applications.
+    found_by_user_id=None verifies ALL recruiters (single-user backward compat).
     Returns stats dict with tier counts and changes.
     """
-    tiers = get_recruiters_by_tier(TIER1_DAYS, TIER2_DAYS)
+    tiers = get_recruiters_by_tier(TIER1_DAYS, TIER2_DAYS, found_by_user_id=found_by_user_id)
 
     tier1 = tiers["tier1"]
     tier2 = tiers["tier2"]

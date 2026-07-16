@@ -5,6 +5,9 @@ from datetime import datetime, timedelta
 
 import psycopg2.errors
 from db.connection import get_conn
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def get_recruiters_by_company(company):
@@ -19,17 +22,18 @@ def get_recruiters_by_company(company):
     return rows
 
 
-def add_recruiter(company, name, position, email, confidence):
+def add_recruiter(company, name, position, email, confidence, found_by_user_id: int = 1):
     """Insert recruiter at company level. Returns new id or existing id."""
     conn = get_conn()
     c = conn.cursor()
     try:
         # RETURNING id replaces c.lastrowid (not available with psycopg2).
         c.execute("""
-            INSERT INTO recruiters (company, name, position, email, confidence, verified_at)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO recruiters (company, name, position, email, confidence,
+                                    verified_at, found_by_user_id)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
             RETURNING id
-        """, (company, name, position, email, confidence))
+        """, (company, name, position, email, confidence, found_by_user_id))
         row = c.fetchone()
         conn.commit()
         return row["id"]
@@ -79,28 +83,36 @@ def update_recruiter(recruiter_id, name=None, position=None,
                 retry_values
             )
             conn.commit()
-            print("[WARNING] update_recruiter: email already exists — applied non-email updates only")
+            logger.warning("update_recruiter id=%d: email already exists — applied non-email updates only", recruiter_id)
             return True
-        print("[WARNING] update_recruiter: email already exists — no other fields to update")
+        logger.warning("update_recruiter id=%d: email already exists — no other fields to update", recruiter_id)
         return False
     finally:
         conn.close()
 
 
-def get_recruiters_by_tier(days_tier1=30, days_tier2=60):
+def get_recruiters_by_tier(days_tier1=30, days_tier2=60, found_by_user_id=None):
     """
     Return all active recruiters grouped by verification tier.
     tier1: verified < days_tier1 ago → trust
     tier2: verified days_tier1-days_tier2 ago → lightweight check
     tier3: verified > days_tier2 ago or never → full profile visit
+    found_by_user_id: when set, only returns recruiters found by that user's account.
     """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT * FROM recruiters
-        WHERE recruiter_status = 'active'
-        ORDER BY verified_at ASC
-    """)
+    if found_by_user_id is not None:
+        c.execute("""
+            SELECT * FROM recruiters
+            WHERE recruiter_status = 'active' AND found_by_user_id = ?
+            ORDER BY verified_at ASC
+        """, (found_by_user_id,))
+    else:
+        c.execute("""
+            SELECT * FROM recruiters
+            WHERE recruiter_status = 'active'
+            ORDER BY verified_at ASC
+        """)
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
 
@@ -142,7 +154,7 @@ def mark_recruiter_inactive(recruiter_id, reason=""):
     conn.commit()
     conn.close()
     if reason:
-        print(f"[INFO] Recruiter id={recruiter_id} marked inactive: {reason}")
+        logger.info("mark_recruiter_inactive id=%d: %s", recruiter_id, reason)
 
 
 def recruiter_email_exists(email):

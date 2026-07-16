@@ -1,7 +1,7 @@
 # Multi-User Architecture — Design Document
 
-> **Status:** Design only — no code written yet.  
-> **Date:** 2026-07-14  
+> **Status:** ✅ Fully implemented — all 8 steps complete as of 2026-07-15.  
+> **Design date:** 2026-07-14  
 > **Initial scope:** 2 users (operator + fiancée). Design is extensible to more.
 
 ---
@@ -648,49 +648,82 @@ Subject: Quota Alert [Fiancée] — Gemini Exhausted
 
 ## 11. Implementation Order
 
-Steps are ordered to avoid breaking production between them. Each step leaves the system in a working state.
+Steps are ordered to avoid breaking production between them. Each step leaves the system in a working state. **All steps are now complete.**
 
-JSON logging (surgical Option D) is woven into each step alongside the multi-user changes — wherever a file is already being opened, logging is upgraded at the same time to avoid touching files twice. Files not touched by multi-user retain existing logging until Phase 2 (multi-server).
+JSON logging (surgical Option D) was woven into each step alongside the multi-user changes — wherever a file was already being opened, logging was upgraded at the same time to avoid touching files twice.
 
-1. **DB migrations** — Add `users` table. Add `user_id` columns to `applications`, `outreach`, `coverage_stats`, `quota_alerts`, `careershift_quota`, `model_usage`. Add `found_by_user_id` to `recruiters`. Add `added_by_user_id` to `prospective_companies`. Run as `ADD COLUMN IF NOT EXISTS` in `init_db()`. Backfill values per §4 (note: `recruiters.found_by_user_id` and `careershift_quota.user_id` backfill to 2, not 1). System continues working single-user throughout.
+1. ✅ **DB migrations** — Added `users` table. Added `user_id` columns to `applications`, `outreach`, `coverage_stats`, `quota_alerts`, `careershift_quota`, `model_usage`. Added `found_by_user_id` to `recruiters`. Added `added_by_user_id` to `prospective_companies`. All run as `ADD COLUMN IF NOT EXISTS` in `init_db()`. Backfills applied per §4 (`recruiters.found_by_user_id` and `careershift_quota.user_id` backfilled to 2). Also: replaced the global `UNIQUE(job_url)` constraint on `applications` with a per-user `UNIQUE(user_id, job_url)` index — this allows two different users to apply to the same job URL independently.
 
-2. **Admin script: `scripts/add_user.py`** — CLI to insert a `users` row (with `name`, `email`, `resume_path`) and print the exact env vars to add to `.env`. This is the checklist that prevents silent omissions when onboarding a new user.
+2. ✅ **Admin script: `scripts/add_user.py`** — CLI that inserts a `users` row (with `name`, `email`, `resume_path`) and prints the exact env vars to add to `.env`. This is the checklist that prevents silent omissions when onboarding a new user.
 
-Example:
-```
-$ python scripts/add_user.py --name "Fiancée" --email fiancee@gmail.com --resume-path Resume_Fiancee.pdf
+   ```
+   $ python scripts/add_user.py --name "Fiancée" --email fiancee@gmail.com --resume-path Resume_Fiancee.pdf
 
-User created (id=2). Add these to .env:
+   User created (id=2). Add these to .env:
 
-  GMAIL_USER_2_EMAIL=fiancee@gmail.com
-  GMAIL_USER_2_APP_PASS=<gmail-app-password>
-  GEMINI_API_KEY_USER_2=<gemini-key>
-  CAREERSHIFT_USER_2_EMAIL=<careershift-login>
-  CAREERSHIFT_USER_2_PASS=<careershift-password>
-```
+     GMAIL_USER_2_EMAIL=fiancee@gmail.com
+     GMAIL_USER_2_APP_PASS=<gmail-app-password>
+     GEMINI_API_KEY_USER_2=<gemini-key>
+     CAREERSHIFT_USER_2_EMAIL=<careershift-login>
+     CAREERSHIFT_USER_2_PASS=<careershift-password>
+   ```
 
-**Why env vars scale fine for secrets:** The code reads `os.environ[f"GMAIL_USER_{user_id}_APP_PASS"]` dynamically — `user_id` comes from the DB at runtime, never hardcoded. Adding user 3 is one `INSERT` + five `.env` lines + zero code changes. The `.env` grows with users, which is fine for a personal tool at this scale. If the project ever grows to many users, the pattern is identical under a proper secret manager (AWS Secrets Manager, Vault) — both surface secrets as env vars, so no code changes even then.
+   **Backfill logic:** Rather than triggering the deferred backfills only when `new_id == 2`, the script now checks for any NULL rows in `careershift_quota` — this means if user 3 is added before the backfill ever ran for user 2, the backfill still fires correctly. NULL rows always belong to user 2 (the original single-user account).
 
-3. **JSON logging infrastructure** — `logger.py` already exists at repo root with `init_logging()`, `get_logger()`, TTY detection, and file rotation. No new file needed. Changes: (a) add `JsonFormatter` class to `logger.py`; (b) swap file handler formatter from pipe-delimited to JSON inside `init_logging()`; (c) add `jq` aliases to `~/.bashrc` on the server (`logwatch`, `logerr`); (d) update `log_monitor.py`: replace `line.split('|', 3)` level parsing with `json.loads(line)["level"]` in BOTH `_is_flagged()` and `_is_suppressed()` (both must change together or WARNING suppression silently breaks); (e) add `init_logging()` to entry points that currently lack it (`pipeline.py` non-scheduler branches, `workers/watchdog.py`, `scripts/reschedule_on_deploy.py`); (f) remove module-level `logging.basicConfig()` from `jobs/job_scraper.py` (line 26) and `workers/watchdog.py` (line 2418).
+   **Why env vars scale fine for secrets:** The code reads `os.environ[f"GMAIL_USER_{user_id}_APP_PASS"]` dynamically — `user_id` comes from the DB at runtime, never hardcoded. Adding user 3 is one `INSERT` + five `.env` lines + zero code changes.
 
-4. **Update all DB query functions to filter by `user_id`** — Every function that reads `applications` or `outreach` must accept a `user_id` param. Audit: `db/applications.py`, `db/outreach.py`, `db/application_recruiters.py`, `db/cache.py`, the CareerShift find-emails flow, `pipeline.py`. Add assertions to catch unfiltered queries in dev.
+3. ✅ **JSON logging infrastructure** — `JsonFormatter` class added to `logger.py`. File handlers now write JSON. TTY console handler keeps human-readable format. `log_monitor.py` upgraded from field-split to JSON parse with plain-text fallback for tracebacks. `init_logging()` added to all entry points that previously lacked it.
 
-   Key functions identified during full repo scan:
-   - `db/outreach.py` — `get_pending_outreach()`, `schedule_outreach()`, `schedule_next_outreach()` all need `user_id` param; without it `get_pending_outreach()` returns every user's pending outreach to `outreach_engine.py`
-   - `db/application_recruiters.py` — `get_companies_needing_scraping()` and `get_companies_needing_more_recruiters()` JOIN through `applications` but don't filter by `user_id`; the CareerShift Phase 1 loop must pass `user_id` so each user only scrapes their own applications
-   - `db/cache.py` — `get_applications_missing_ai_cache()` queries the `applications` table unfiltered; without `user_id` scoping, AI content generation in Step 6 would try to fill cache for ALL users using the current user's Gemini key (wrong key, wrong quota tracking)
+4. ✅ **Update all DB query functions to filter by `user_id`** — Every function that reads `applications` or `outreach` now accepts a `user_id` param. Key updates: `db/outreach.py` (`get_pending_outreach`, `schedule_next_outreach`), `db/application_recruiters.py` (`get_companies_needing_scraping`, `get_companies_needing_more_recruiters`), `db/cache.py` (`get_applications_missing_ai_cache`), CareerShift flow, `pipeline.py`. The dedup handler in `db/applications.py` (triggered after a duplicate job URL insert) now also filters by `user_id` so a collision on one user's row never returns the other user's application ID.
 
-5. **Multi-user `--find-only` cron loop** — Refactor Phase 1 to iterate over all active users. Each iteration: login to that user's CareerShift account, sync quota, run verification (routed via `found_by_user_id`), scrape that user's applications, track overflow. After all users complete Phase 1, run Phase 2 pooled queue. Add structured logging throughout (`find_emails.py`, `quota_manager.py`, `careershift/`).
+5. ✅ **Multi-user `--find-only` cron loop** — Phase 1 iterates over all active users from the `users` table. For each user: login to their CareerShift account, sync quota, run verification (routed via `found_by_user_id`), scrape their applications. Browser lifecycle wrapped in `try/except/finally: browser.close()` to guarantee the browser is released even if an exception occurs mid-processing. All CareerShift quota functions (`scrape_company`, `get_remaining_quota`, `increment_quota_used`) accept `user_id` so quota is tracked per-account. `save_coverage_stats` explicitly passes `user_id=1` for the aggregate row (operator account), not the per-user being processed.
 
-6. **Multi-user Gemini key selection** — Update email content generation to use `get_gemini_key(user_id)`. Update ATS detection to use pool logic. Update `model_usage` writes to include `user_id` and `use_case`. Add structured logging to `ai_full_personalizer.py` (currently has no logging).
+6. ✅ **Multi-user Gemini key selection** — Email content generation uses `get_gemini_key(user_id)`. ATS detection calls use `use_case="ats_detection"` so they draw from the shared ATS pool bucket, not the per-user email content bucket. `can_call` and `increment_usage` in `ai_full_personalizer.py` both pass `use_case="ats_detection"` for field-map detection. This prevents ATS detection from exhausting the per-user email generation quota.
 
-7. **Per-user metrics and alerts** — Update `coverage_stats` writes to include `user_id`. Update quota alert checks to run per-user. Route quota alert emails to `GMAIL_USER_{id}_EMAIL` (not operator inbox) with user name in subject. Serper alert stays operator-only (shared resource).
+7. ✅ **Per-user metrics and alerts** — `coverage_stats` writes include `user_id`. Quota alert checks run per-user. Alert subject format: `Quota Alert [Rutvi] — CareerShift Underutilized (3 days)`. The `_calculate_suggested_cap` helper in `db/alerts.py` accepts `user_id` and filters `careershift_quota` by that user on the exhausted branch, so cap suggestions are based only on that user's usage history. Serper alert stays operator-only (shared resource).
 
-8. **Per-user Gmail SMTP + resume** — Add `GMAIL_USER_{id}_EMAIL` and `GMAIL_USER_{id}_APP_PASS` to `.env` for each user (SMTP credentials only — resume path comes from `users.resume_path` in the DB, not an env var). Update `email_sender.py`: make `user_id` a required keyword argument with no default, resolve SMTP credentials from env and resume path from DB at send time. Add `get_resume_path(user_id)` helper that raises if user not found. Add structured logging to `email_sender.py` and `outreach_engine.py` (currently has no logging). Each user generates their own Gmail App Password via Google account settings → Security → App Passwords.
+8. ✅ **Per-user Gmail SMTP + resume** — `email_sender.py` revised with `user_id=None` default:
+   - `user_id=None` (no user context) → operator path: uses `EMAIL` / `APP_PASSWORD` env vars. This is the path for quota alert emails and system notifications — never for personal outreach.
+   - `user_id=int` (per-user outreach) → per-user path: reads `GMAIL_USER_{id}_EMAIL` and `GMAIL_USER_{id}_APP_PASSWORD`. **Fail-closed:** raises `ValueError` if either env var is missing. This prevents outreach from silently falling back to the operator's Gmail account.
+   - `_resume_path_for(user_id)`: operator path returns `RESUME_PATH`; per-user path returns the path from `users.resume_path` in the DB. Never crosses to another user's resume.
+   - `outreach_engine.py` now passes `user_id=user_id` to `schedule_next_outreach` so follow-up emails are sent from the same account as the initial email.
+   - `pipeline.py` does NOT pass `user_id` to quota alert `send_email` calls — alerts go from operator SMTP regardless of which user's quota is being reported.
 
-   Also update `workers/startup.py`: the `_GMAIL_ENV_KEYS` list currently checks for `GMAIL_EMAIL` and `GMAIL_APP_PASSWORD` (the single-user names). With multi-user these are replaced by `GMAIL_USER_{id}_EMAIL` / `GMAIL_USER_{id}_APP_PASS`. Update the `check_gmail=True` path to validate that at least `GMAIL_USER_1_EMAIL` and `GMAIL_USER_1_APP_PASS` are present, or iterate over all active `user_id`s from the DB.
+9. **Frontend** — Pending. Will build after full multi-user backend is verified working in production. Tool candidates: NocoDB (zero code, connects directly to PostgreSQL) or Retool (drag-and-drop, more polished).
 
-9. **Frontend** — Build after the full multi-user backend is verified working. At this point both users' data exists in the DB, making the frontend immediately useful: browse all 39K+ jobs with filters, see per-user application and outreach status, verify job descriptions and locations are storing correctly. Tool: NocoDB (zero code, connects directly to PostgreSQL) or Retool (drag-and-drop, more polished).
+---
+
+## 12. Implementation Notes & Deviations from Original Design
+
+These are differences between what was designed in §1–§10 and what was actually implemented, discovered during the implementation code review.
+
+### 12.1 `email_sender.py` default changed to `user_id=None` (not required)
+
+The original design proposed making `user_id` a required keyword argument with no default. In practice, the pipeline also sends non-outreach emails (quota alerts, system notifications) that must come from the operator SMTP account — not the user's personal Gmail. Making `user_id` required would force every alert email to pass `user_id=1`, which is fragile.
+
+**Actual implementation:** `user_id=None` (optional). `None` = operator path (uses shared `EMAIL`/`APP_PASSWORD`); `int` = per-user path (fail-closed — raises if env vars missing). Callers sending outreach pass the user's ID explicitly; callers sending system alerts omit it entirely.
+
+### 12.2 `use_case="ats_detection"` required in `ai_full_personalizer.py`
+
+The original design covered Gemini key selection but did not explicitly address the `use_case` bucket used for ATS field-map detection calls inside `ai_full_personalizer.py`. These calls were going into the `email_content` bucket, which would exhaust the per-user email quota. Fixed to use `use_case="ats_detection"` so ATS calls draw from the shared pool.
+
+### 12.3 Browser lifecycle safety in `find_emails.py`
+
+The per-user browser block was wrapped in `try/except/finally: browser.close()`. Without this, an exception raised mid-processing (e.g. CareerShift quota hit, network error) would leave a Playwright Chrome process running indefinitely on the server. The `finally` guarantees cleanup on every exit path including crashes.
+
+### 12.4 Global UNIQUE(job_url) dropped in favor of per-user index
+
+The original design added a `user_id` column to `applications` but didn't explicitly address the pre-existing `UNIQUE(job_url)` constraint. That global constraint would prevent two different users from applying to the same job URL. Fixed in `db/schema.py`:
+- Drop `applications_job_url_key` (PostgreSQL's auto-generated name for `UNIQUE(job_url)`)
+- Create `UNIQUE(user_id, job_url)` instead — two users can now each have their own row for the same URL
+
+### 12.5 Backfill trigger: NULL-row check instead of `if new_id == 2`
+
+The original design noted "run deferred backfills when user 2 is created." The implementation used `if new_id == 2` as the trigger. This would fail silently if user 3 was added before the backfill ever ran. Fixed to check for any NULL rows in `careershift_quota` — if NULL rows exist, the backfill runs immediately (always attributing them to user 2, which is correct since they predated multi-user).
+
+### 12.6 `_calculate_suggested_cap` needs user_id scoping
+
+The original design didn't cover this detail: on the "exhausted" branch of `_calculate_suggested_cap` in `db/alerts.py`, the function was querying `careershift_quota` without filtering by user. This averaged usage across ALL users when calculating a suggested cap for one user. Fixed to filter by `user_id` when provided.
 
 ---
 

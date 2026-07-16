@@ -297,10 +297,11 @@ def run_find_emails():
 
 def _generate_ai_content_for_all():
     """
-    Generate and cache AI email content for every active application.
-    Uses leftover Gemini quota for applications missing cache.
+    Generate and cache AI email content for every active application, per user.
+    Each user's apps are generated with their own Gemini API key and quota.
     """
     from db.db import get_all_active_applications, get_applications_missing_ai_cache
+    from db.users import get_all_active_users
     from jobs.job_fetcher import fetch_job_description
     from outreach.ai_full_personalizer import (
         generate_all_content,
@@ -308,83 +309,94 @@ def _generate_ai_content_for_all():
         all_models_exhausted,
     )
 
-    apps = get_all_active_applications()
-
-    if not apps:
-        logger.info("No active applications found for AI content generation")
-        print("[INFO] No active applications found.")
+    users = get_all_active_users()
+    if not users:
+        logger.info("No active users found for AI content generation")
+        print("[INFO] No active users found.")
         return
 
     generated = 0
     skipped   = 0
     failed    = 0
 
-    for app in apps:
-        company   = app["company"]
-        job_url   = app["job_url"]
-        job_title = app["job_title"] or "Software Engineer"
+    for user in users:
+        user_id   = user["id"]
+        user_name = user.get("name") or user.get("email") or f"user_{user_id}"
+        print(f"\n[INFO] Generating AI content for {user_name} (user_id={user_id})...")
+        logger.info("AI content generation start for user_id=%d", user_id)
 
-        print(f"\n  [INFO] {company} | {job_title}")
-        logger.debug("Generating AI content for %r | %s", company, job_title)
+        apps = get_all_active_applications(user_id=user_id)
+        if not apps:
+            logger.info("No active applications for user_id=%d", user_id)
+            print(f"  [INFO] No active applications for {user_name}.")
+            continue
 
-        job_data = fetch_job_description(job_url)
+        for app in apps:
+            company   = app["company"]
+            job_url   = app["job_url"]
+            job_title = app["job_title"] or "Software Engineer"
 
-        if not job_data:
-            print(f"  [WARNING] No job description for {company}. Using role-based fallback.")
-            result = generate_all_content_without_jd(company, job_title)
-        else:
-            if isinstance(job_data, dict):
-                job_text  = job_data.get("job_text", "")
-                job_title = job_data.get("job_title") or job_title
+            print(f"\n  [INFO] {company} | {job_title}")
+            logger.debug("Generating AI content for %r | %s (user_id=%d)", company, job_title, user_id)
+
+            job_data = fetch_job_description(job_url)
+
+            if not job_data:
+                print(f"  [WARNING] No job description for {company}. Using role-based fallback.")
+                result = generate_all_content_without_jd(company, job_title, user_id=user_id)
             else:
-                job_text = job_data
-
-            if not job_text:
-                print(f"  [WARNING] Empty job description for {company}. Using role-based fallback.")
-                result = generate_all_content_without_jd(company, job_title)
-            else:
-                result = generate_all_content(company, job_title, job_text)
-
-        if result:
-            logger.info("AI content generated for %r", company)
-            print(f"  [OK] AI content ready for {company}")
-            generated += 1
-        else:
-            logger.warning("AI generation failed for %r (quota exhausted?)", company)
-            print(f"  [WARNING] AI generation failed for {company} (quota exhausted?)")
-            failed += 1
-
-    # Leftover Gemini quota utilization
-    if not all_models_exhausted():
-        missing = get_applications_missing_ai_cache()
-        if missing:
-            logger.info("Using leftover Gemini quota for %d application(s) missing cache",
-                        len(missing))
-            print(f"\n[INFO] Using leftover Gemini quota for {len(missing)} application(s) missing cache...")
-            for app in missing:
-                if all_models_exhausted():
-                    break
-                company   = app["company"]
-                job_title = app["job_title"] or "Software Engineer"
-                job_url   = app["job_url"]
-                job_data  = fetch_job_description(job_url)
-
                 if isinstance(job_data, dict):
-                    job_text = job_data.get("job_text", "")
-                elif isinstance(job_data, str):
-                    job_text = job_data
+                    job_text  = job_data.get("job_text", "")
+                    job_title = job_data.get("job_title") or job_title
                 else:
-                    job_text = None
+                    job_text = job_data
 
-                result = (
-                    generate_all_content(company, job_title, job_text)
-                    if job_text
-                    else generate_all_content_without_jd(company, job_title)
-                )
-                if result:
-                    logger.info("Leftover quota used for: %r", company)
-                    print(f"  [OK] Leftover quota used for: {company}")
-                    generated += 1
+                if not job_text:
+                    print(f"  [WARNING] Empty job description for {company}. Using role-based fallback.")
+                    result = generate_all_content_without_jd(company, job_title, user_id=user_id)
+                else:
+                    result = generate_all_content(company, job_title, job_text, user_id=user_id)
+
+            if result:
+                logger.info("AI content generated for %r (user_id=%d)", company, user_id)
+                print(f"  [OK] AI content ready for {company}")
+                generated += 1
+            else:
+                logger.warning("AI generation failed for %r user_id=%d (quota exhausted?)", company, user_id)
+                print(f"  [WARNING] AI generation failed for {company} (quota exhausted?)")
+                failed += 1
+
+        # Leftover quota: fill any remaining missing-cache apps for this user
+        if not all_models_exhausted(user_id=user_id):
+            missing = get_applications_missing_ai_cache(user_id=user_id)
+            if missing:
+                logger.info("Using leftover Gemini quota for %d application(s) missing cache (user_id=%d)",
+                            len(missing), user_id)
+                print(f"\n[INFO] Using leftover Gemini quota for {len(missing)} application(s) missing cache ({user_name})...")
+                for app in missing:
+                    if all_models_exhausted(user_id=user_id):
+                        break
+                    company   = app["company"]
+                    job_title = app["job_title"] or "Software Engineer"
+                    job_url   = app["job_url"]
+                    job_data  = fetch_job_description(job_url)
+
+                    if isinstance(job_data, dict):
+                        job_text = job_data.get("job_text", "")
+                    elif isinstance(job_data, str):
+                        job_text = job_data
+                    else:
+                        job_text = None
+
+                    result = (
+                        generate_all_content(company, job_title, job_text, user_id=user_id)
+                        if job_text
+                        else generate_all_content_without_jd(company, job_title, user_id=user_id)
+                    )
+                    if result:
+                        logger.info("Leftover quota used for: %r (user_id=%d)", company, user_id)
+                        print(f"  [OK] Leftover quota used for: {company}")
+                        generated += 1
 
     logger.info("AI content complete: generated=%d skipped=%d failed=%d",
                 generated, skipped, failed)
@@ -723,7 +735,7 @@ def run_performance_report():
 
     try:
         send_email(to_email=EMAIL, body=body,
-                   company="Pipeline", subject=subject)
+                   company="Pipeline", subject=subject, attach_resume=False)
         # Only mark alerts as notified after successful email delivery
         logger.info("Performance alert email sent: %s", subject)
         print(f"[INFO] Alert email sent: {subject}")
@@ -807,7 +819,7 @@ def run_pipeline_alert_report():
 
         try:
             send_email(to_email=EMAIL, body=body,
-                       company="Pipeline", subject=subject)
+                       company="Pipeline", subject=subject, attach_resume=False)
             # Only mark alerts as notified after successful email delivery
             logger.info("Pipeline alert email sent: %s", subject)
             print(f"[INFO] Alert email sent: {subject}")
@@ -822,87 +834,97 @@ def run_pipeline_alert_report():
 
 def run_quota_report(silent_if_healthy=False):
     """
-    Check quota health for CareerShift and Gemini.
-    Sends alert email if conditions are met.
+    Check quota health per user and send alert to each user's registered email.
     Can be run standalone via --quota-report or automatically after --find-only.
     """
     from db.db import check_quota_health, save_quota_alert
+    from db.users import get_all_active_users, get_user_email
     from outreach.email_sender import send_email
     from config import MAX_CONTACTS_HARD_CAP, QUOTA_ALERT_CONSECUTIVE_DAYS
 
-    alerts = check_quota_health()
+    users = get_all_active_users()
+    any_alert = False
 
-    if not alerts:
-        if not silent_if_healthy:
-            logger.info("Quota health: no issues detected")
-            print("[OK] Quota health: no issues detected.")
-        return
+    for user in users:
+        user_id   = user["id"]
+        user_name = user.get("name") or f"user_{user_id}"
 
-    logger.warning("Quota alerts detected: %d issue(s)", len(alerts))
+        alerts = check_quota_health(user_id=user_id)
 
-    # Build combined alert email
-    subject    = "Quota Alert - Action Required"
-    body_parts = []
+        if not alerts:
+            if not silent_if_healthy:
+                logger.info("Quota health user_id=%d: no issues", user_id)
+                print(f"[OK] Quota health for {user_name}: no issues detected.")
+            continue
 
-    for alert in alerts:
-        quota_label = "CAREERSHIFT QUOTA" if alert["quota_type"] == "careershift" else "GEMINI QUOTA"
-        alert_label = alert["alert_type"].upper()
-        total       = alert["total_limit"]
-        threshold   = int(total * 0.4) if alert["alert_type"] == "underutilized" else 0
+        any_alert = True
+        logger.warning("Quota alerts user_id=%d: %d issue(s)", user_id, len(alerts))
 
-        body_parts.append(f"{quota_label} - {alert_label} ({QUOTA_ALERT_CONSECUTIVE_DAYS} consecutive days)")
-        body_parts.append("")
+        body_parts = []
+        for alert in alerts:
+            quota_label = "CAREERSHIFT QUOTA" if alert["quota_type"] == "careershift" else "GEMINI QUOTA"
+            alert_label = alert["alert_type"].upper()
+            total       = alert["total_limit"]
 
-        for row in reversed(alert["history"]):
-            pct = round((row["used"] / row["total_limit"]) * 100) if row["total_limit"] > 0 else 0
-            body_parts.append(f"  {row['date']}: used {row['used']}/{row['total_limit']} ({pct}%)")
+            body_parts.append(f"{quota_label} - {alert_label} ({QUOTA_ALERT_CONSECUTIVE_DAYS} consecutive days)")
+            body_parts.append("")
 
-        body_parts.append("")
-        body_parts.append(f"Average usage: {alert['avg_used']}/{total}")
+            for row in reversed(alert["history"]):
+                pct = round((row["used"] / row["total_limit"]) * 100) if row["total_limit"] > 0 else 0
+                body_parts.append(f"  {row['date']}: used {row['used']}/{row['total_limit']} ({pct}%)")
 
-        if alert["alert_type"] == "underutilized":
-            if alert.get("suggested_cap"):
-                body_parts.append(
-                    f"Recommendation: Increase MAX_CONTACTS_HARD_CAP "
-                    f"from {MAX_CONTACTS_HARD_CAP} to {alert['suggested_cap']}"
-                )
-            else:
-                body_parts.append(f"Recommendation: Increase MAX_CONTACTS_HARD_CAP in config.py")
-        else:
-            if alert["quota_type"] == "careershift":
+            body_parts.append("")
+            body_parts.append(f"Average usage: {alert['avg_used']}/{total}")
+
+            if alert["alert_type"] == "underutilized":
                 if alert.get("suggested_cap"):
                     body_parts.append(
-                        f"Recommendation: Decrease MAX_CONTACTS_HARD_CAP "
-                        f"from {MAX_CONTACTS_HARD_CAP} to {alert['suggested_cap']}, "
-                        f"or reduce daily job applications."
+                        f"Recommendation: Increase MAX_CONTACTS_HARD_CAP "
+                        f"from {MAX_CONTACTS_HARD_CAP} to {alert['suggested_cap']}"
                     )
+                else:
+                    body_parts.append("Recommendation: Increase MAX_CONTACTS_HARD_CAP in config.py")
             else:
-                body_parts.append(
-                    "Recommendation: Reduce daily applications or upgrade Gemini plan."
-                )
+                if alert["quota_type"] == "careershift":
+                    if alert.get("suggested_cap"):
+                        body_parts.append(
+                            f"Recommendation: Decrease MAX_CONTACTS_HARD_CAP "
+                            f"from {MAX_CONTACTS_HARD_CAP} to {alert['suggested_cap']}, "
+                            f"or reduce daily job applications."
+                        )
+                else:
+                    body_parts.append(
+                        "Recommendation: Reduce daily applications or upgrade Gemini plan."
+                    )
 
-        body_parts.append("")
-        body_parts.append("-" * 40)
-        body_parts.append("")
+            body_parts.append("")
+            body_parts.append("-" * 40)
+            body_parts.append("")
 
-    body = "\n".join(body_parts)
+        body    = "\n".join(body_parts)
+        subject = (
+            f"Quota Alert - {user_name} - Action Required"
+            if len(alerts) == 1
+            else f"Quota Alert - {user_name} - Action Required ({len(alerts)} issues)"
+        )
 
-    if len(alerts) > 1:
-        subject = f"Quota Alert - Action Required ({len(alerts)} issues)"
+        try:
+            to_email = get_user_email(user_id)
+            send_email(to_email=to_email, body=body, company="Pipeline", subject=subject,
+                       attach_resume=False)
+            logger.info("Quota alert email sent to user_id=%d (%s): %s", user_id, to_email, subject)
+            print(f"[INFO] Quota alert sent to {to_email}: {subject}")
+            for alert in alerts:
+                save_quota_alert(alert)
+        except Exception as e:
+            logger.error("Could not send quota alert for user_id=%d: %s", user_id, e, exc_info=True)
+            print(f"[WARNING] Could not send quota alert for {user_name}: {e}")
+            print(f"[INFO] Alert details:\n{body}")
+            for alert in alerts:
+                save_quota_alert({**alert, "notified": False})
 
-    try:
-        from config import EMAIL
-        send_email(to_email=EMAIL, body=body, company="Pipeline", subject=subject)
-        logger.info("Quota alert email sent: %s", subject)
-        print(f"[INFO] Quota alert email sent: {subject}")
-        for alert in alerts:
-            save_quota_alert(alert)
-    except Exception as e:
-        logger.error("Could not send quota alert email: %s", e, exc_info=True)
-        print(f"[WARNING] Could not send quota alert email: {e}")
-        print(f"[INFO] Alert details:\n{body}")
-        for alert in alerts:
-            save_quota_alert({**alert, "notified": False})
+    if not any_alert and not silent_if_healthy:
+        print("[OK] Quota health: no issues detected for any user.")
 
 
 def main():

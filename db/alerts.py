@@ -2,62 +2,90 @@
 
 from datetime import datetime, timedelta
 from db.connection import get_conn, DAILY_LIMITS
+from logger import get_logger
 from config import (
     QUOTA_UNDERUTILIZED_THRESHOLD,
     QUOTA_ALERT_CONSECUTIVE_DAYS,
     MAX_CONTACTS_HARD_CAP,
 )
 
+logger = get_logger(__name__)
+
 
 # ─────────────────────────────────────────
 # QUOTA HEALTH CHECK
 # ─────────────────────────────────────────
 
-def get_quota_history(quota_type, days=None):
+def get_quota_history(quota_type, days=None, user_id=None):
     """
-    Return last N days of quota records.
+    Return last N days of quota records for the given user.
     quota_type: 'careershift' or 'gemini'
+    user_id: when given, scopes to that user; None aggregates across all users.
     """
     if days is None:
         days = QUOTA_ALERT_CONSECUTIVE_DAYS
 
     conn = get_conn()
     c = conn.cursor()
+    total_gemini = sum(DAILY_LIMITS.values())
 
     if quota_type == "careershift":
-        c.execute("""
-            SELECT date, used, remaining, total_limit
-            FROM careershift_quota
-            ORDER BY date DESC
-            LIMIT ?
-        """, (days,))
+        if user_id is not None:
+            c.execute("""
+                SELECT date, used, remaining, total_limit
+                FROM careershift_quota
+                WHERE user_id = ?
+                ORDER BY date DESC
+                LIMIT ?
+            """, (user_id, days))
+        else:
+            c.execute("""
+                SELECT date, used, remaining, total_limit
+                FROM careershift_quota
+                ORDER BY date DESC
+                LIMIT ?
+            """, (days,))
     else:  # gemini
-        c.execute("""
-            SELECT date,
-                   SUM(count) as used,
-                   ? - SUM(count) as remaining,
-                   ? as total_limit
-            FROM model_usage
-            GROUP BY date
-            ORDER BY date DESC
-            LIMIT ?
-        """, (sum(DAILY_LIMITS.values()), sum(DAILY_LIMITS.values()), days))
+        if user_id is not None:
+            c.execute("""
+                SELECT date,
+                       SUM(count) as used,
+                       ? - SUM(count) as remaining,
+                       ? as total_limit
+                FROM model_usage
+                WHERE user_id = ?
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT ?
+            """, (total_gemini, total_gemini, user_id, days))
+        else:
+            c.execute("""
+                SELECT date,
+                       SUM(count) as used,
+                       ? - SUM(count) as remaining,
+                       ? as total_limit
+                FROM model_usage
+                GROUP BY date
+                ORDER BY date DESC
+                LIMIT ?
+            """, (total_gemini, total_gemini, days))
 
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
 
 
-def check_quota_health():
+def check_quota_health(user_id=None):
     """
     Check quota health for CareerShift and Gemini.
+    user_id: when given, scopes to that user; None checks across all users (operator view).
     Returns list of alert dicts, empty if healthy.
     """
     alerts = []
     total_gemini = sum(DAILY_LIMITS.values())
 
     for quota_type, total_limit in [("careershift", 50), ("gemini", total_gemini)]:
-        history = get_quota_history(quota_type, QUOTA_ALERT_CONSECUTIVE_DAYS)
+        history = get_quota_history(quota_type, QUOTA_ALERT_CONSECUTIVE_DAYS, user_id=user_id)
 
         if len(history) < QUOTA_ALERT_CONSECUTIVE_DAYS:
             continue
@@ -73,13 +101,14 @@ def check_quota_health():
             avg_used = sum(r["used"] for r in history) / len(history)
             avg_remaining = sum(r["remaining"] for r in history) / len(history)
 
-            if not _alert_already_sent(quota_type, alert_type):
+            if not _alert_already_sent(quota_type, alert_type, user_id=user_id):
                 suggested = _calculate_suggested_cap(
-                    alert_type, avg_used, total_limit, quota_type
+                    alert_type, avg_used, total_limit, quota_type, user_id=user_id
                 )
                 alerts.append({
                     "alert_type":    alert_type,
                     "quota_type":    quota_type,
+                    "user_id":       user_id if user_id is not None else 1,
                     "start_date":    history[-1]["date"],
                     "end_date":      history[0]["date"],
                     "avg_used":      round(avg_used, 1),
@@ -92,22 +121,30 @@ def check_quota_health():
     return alerts
 
 
-def _alert_already_sent(quota_type, alert_type):
+def _alert_already_sent(quota_type, alert_type, user_id=None):
     conn = get_conn()
     c = conn.cursor()
     cutoff = (datetime.now() - timedelta(days=QUOTA_ALERT_CONSECUTIVE_DAYS)).strftime("%Y-%m-%d")
-    c.execute("""
-        SELECT id FROM quota_alerts
-        WHERE quota_type = ? AND alert_type = ?
-        AND notified = 1
-        AND created_at >= ?
-    """, (quota_type, alert_type, cutoff))
+    if user_id is not None:
+        c.execute("""
+            SELECT id FROM quota_alerts
+            WHERE quota_type = ? AND alert_type = ? AND user_id = ?
+            AND notified = 1
+            AND created_at >= ?
+        """, (quota_type, alert_type, user_id, cutoff))
+    else:
+        c.execute("""
+            SELECT id FROM quota_alerts
+            WHERE quota_type = ? AND alert_type = ?
+            AND notified = 1
+            AND created_at >= ?
+        """, (quota_type, alert_type, cutoff))
     row = c.fetchone()
     conn.close()
     return row is not None
 
 
-def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
+def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type, user_id=None):
     if quota_type != "careershift":
         return None
 
@@ -122,15 +159,27 @@ def _calculate_suggested_cap(alert_type, avg_used, total_limit, quota_type):
     else:
         conn = get_conn()
         c = conn.cursor()
-        c.execute("""
-            SELECT AVG(used) AS avg_used
-            FROM (
-                SELECT used
-                FROM careershift_quota
-                ORDER BY date DESC
-                LIMIT ?
-            ) sub
-        """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
+        if user_id is not None:
+            c.execute("""
+                SELECT AVG(used) AS avg_used
+                FROM (
+                    SELECT used
+                    FROM careershift_quota
+                    WHERE user_id = ?
+                    ORDER BY date DESC
+                    LIMIT ?
+                ) sub
+            """, (user_id, QUOTA_ALERT_CONSECUTIVE_DAYS))
+        else:
+            c.execute("""
+                SELECT AVG(used) AS avg_used
+                FROM (
+                    SELECT used
+                    FROM careershift_quota
+                    ORDER BY date DESC
+                    LIMIT ?
+                ) sub
+            """, (QUOTA_ALERT_CONSECUTIVE_DAYS,))
         row = c.fetchone()
         conn.close()
         avg_companies = (row["avg_used"] / current_cap) if row and row["avg_used"] else 1
@@ -145,14 +194,16 @@ def save_quota_alert(alert):
     conn = get_conn()
     c = conn.cursor()
     notified = 1 if alert.get("notified", True) else 0
+    user_id  = alert.get("user_id", 1)
     c.execute("""
         INSERT INTO quota_alerts (
-            alert_type, quota_type, start_date, end_date,
+            alert_type, quota_type, user_id, start_date, end_date,
             avg_used, avg_remaining, suggested_cap, notified
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         alert["alert_type"],
         alert["quota_type"],
+        user_id,
         alert["start_date"],
         alert["end_date"],
         alert["avg_used"],
@@ -168,11 +219,10 @@ def save_quota_alert(alert):
 # COVERAGE STATS
 # ─────────────────────────────────────────
 
-def save_coverage_stats(stats: dict):
+def save_coverage_stats(stats: dict, user_id: int = 1):
     """
-    Save daily pipeline performance metrics.
-    Takes a dict — same pattern as save_monitor_stats().
-    Uses ON CONFLICT DO UPDATE to handle re-runs on the same day.
+    Save daily pipeline performance metrics for user_id.
+    Uses ON CONFLICT(user_id, date) to handle re-runs on the same day.
 
     Expected keys:
       total_applications, companies_attempted,
@@ -182,14 +232,13 @@ def save_coverage_stats(stats: dict):
     conn = get_conn()
     c = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
-    # ON CONFLICT(date) DO UPDATE replaces INSERT OR REPLACE (SQLite).
     c.execute("""
         INSERT INTO coverage_stats (
-            date, total_applications, companies_attempted,
+            user_id, date, total_applications, companies_attempted,
             auto_found, rejected_count, exhausted_count,
             metric1, metric2
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(date) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET
             total_applications  = EXCLUDED.total_applications,
             companies_attempted = EXCLUDED.companies_attempted,
             auto_found          = EXCLUDED.auto_found,
@@ -198,6 +247,7 @@ def save_coverage_stats(stats: dict):
             metric1             = EXCLUDED.metric1,
             metric2             = EXCLUDED.metric2
     """, (
+        user_id,
         today,
         stats.get("total_applications",  0),
         stats.get("companies_attempted", 0),
@@ -211,15 +261,25 @@ def save_coverage_stats(stats: dict):
     conn.close()
 
 
-def get_coverage_stats(days: int = 3) -> list:
-    """Return last N days of coverage stats, newest first."""
+def get_coverage_stats(days: int = 3, user_id=None) -> list:
+    """Return last N days of coverage stats, newest first.
+    user_id: when given, returns only that user's rows; None returns all users.
+    """
     conn = get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT * FROM coverage_stats
-        ORDER BY date DESC
-        LIMIT ?
-    """, (days,))
+    if user_id is not None:
+        c.execute("""
+            SELECT * FROM coverage_stats
+            WHERE user_id = ?
+            ORDER BY date DESC
+            LIMIT ?
+        """, (user_id, days))
+    else:
+        c.execute("""
+            SELECT * FROM coverage_stats
+            ORDER BY date DESC
+            LIMIT ?
+        """, (days,))
     rows = [dict(r) for r in c.fetchall()]
     conn.close()
     return rows
