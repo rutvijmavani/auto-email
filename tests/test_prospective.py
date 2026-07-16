@@ -834,10 +834,12 @@ class TestFindEmailsEarlyReturn(unittest.TestCase):
             return mock_out.getvalue(), mock_pw
 
     def test_no_apps_no_prospects_returns_early(self):
-        """No active apps and no pending prospects → return early, no Playwright."""
+        """No active apps and no pending prospects → session verified, no scraping."""
         output, mock_pw = self._mock_run()
         self.assertIn("Skipped — no active applications", output)
-        mock_pw.assert_not_called()
+        # Playwright is launched for per-user session verification even when
+        # there is no work to do — assert scraping never started instead.
+        self.assertNotIn("STEP 2", output)
 
     def test_no_apps_with_pending_prospects_continues(self):
         """No active apps but pending prospects exist → Playwright launched."""
