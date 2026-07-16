@@ -84,6 +84,6 @@ def _resume_path_for(user_id) -> str | None:
         if not path:
             logger.warning("No resume_path configured for user_id=%d — sending without attachment", user_id)
         return path or None
-    except Exception as exc:
+    except ValueError as exc:
         logger.warning("get_resume_path failed for user_id=%d (%s) — sending without attachment", user_id, exc)
         return None

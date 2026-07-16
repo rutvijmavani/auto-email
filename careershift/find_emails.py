@@ -343,8 +343,10 @@ def run():
                                         alert_type=ALERT_EXHAUSTION_BLOCKED,
                                         severity=CRITICAL,
                                         platform=company,
+                                        user_id=user_id,
                                         message=(
-                                            f"Exhaustion blocked for '{company}': "
+                                            f"Exhaustion blocked for '{company}' "
+                                            f"(user_id={user_id}): "
                                             f"no recruiters found but pipeline metrics "
                                             f"are below threshold — manual review required"
                                         ),

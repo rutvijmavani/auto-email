@@ -95,12 +95,19 @@ def main() -> int:
         logger.info("add_user: created user id=%d name=%r email=%r resume_path=%r",
                     new_id, args.name, args.email, args.resume_path)
 
-        # Run deferred backfills whenever NULL rows remain — not only when new_id==2.
-        # This handles the case where user 3 is added but the backfill never ran for user 2.
-        # NULL rows always belong to user 2 (the original single-user account).
-        has_null = c.execute(
-            "SELECT 1 FROM careershift_quota WHERE user_id IS NULL LIMIT 1"
-        ).fetchone()
+        # Run deferred backfills whenever NULL rows remain in either legacy table.
+        # Check both: careershift_quota.user_id and recruiters.found_by_user_id.
+        # Either table may have NULLs independently — e.g. careershift_quota was
+        # already backfilled on a previous add_user run but recruiters still has
+        # rows added before multi-user support.
+        has_null = (
+            c.execute(
+                "SELECT 1 FROM careershift_quota WHERE user_id IS NULL LIMIT 1"
+            ).fetchone()
+            or c.execute(
+                "SELECT 1 FROM recruiters WHERE found_by_user_id IS NULL LIMIT 1"
+            ).fetchone()
+        )
         if has_null:
             _run_deferred_backfills_for_user2(conn, 2)
 

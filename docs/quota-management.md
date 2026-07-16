@@ -4,15 +4,18 @@
 
 The pipeline manages three quotas:
 
-| Quota | Limit | Resets |
-|---|---|---|
-| CareerShift profile views | 50 new contacts/day | Daily |
-| Gemini AI calls | 40 calls/day (20 per model) | Daily |
-| Serper API credits | 2500 total (one-time) | Never |
-| Brave Search API calls | 1000/month (hard stop: 950) | Monthly |
-| AWS Athena queries | ~$0.00024/query | Pay-per-use |
+| Quota | Limit | Resets | Per-user? |
+|---|---|---|---|
+| CareerShift profile views | 50 new contacts/day | Daily | ✅ Yes — each user has their own 50/day limit |
+| Gemini AI calls (email content) | 40 calls/day (20 per model) | Daily | ✅ Yes — each user has their own Gemini API key |
+| Gemini AI calls (ATS detection) | Shared pool | Daily | ❌ No — shared across all users |
+| Serper API credits | 2500 total (one-time) | Never | ❌ No — shared |
+| Brave Search API calls | 1000/month (hard stop: 950) | Monthly | ❌ No — shared |
+| AWS Athena queries | ~$0.00024/query | Pay-per-use | ❌ No — shared |
 
 All quotas are tracked locally in the database and synced with real values at runtime.
+
+> **What "per-user" means in practice:** Each user's CareerShift scraping and email outreach runs independently. User 1 consuming their full CareerShift quota for the day has no effect on User 2's ability to scrape contacts. Similarly, User 1 generating 20 emails does not reduce the Gemini quota available to User 2. The shared quotas (Serper, Brave, Athena) are used only for ATS platform discovery — a background task that runs once per day and is not tied to any individual user.
 
 ---
 
@@ -30,6 +33,25 @@ This means:
 ### Quota tracking
 
 At the start of every `--find-only` run, the pipeline navigates to the CareerShift account page and reads the real remaining quota. This syncs the local `careershift_quota` table with the actual value, accounting for any manual browsing done outside the pipeline.
+
+Each user's quota is tracked separately. The `careershift_quota` table stores one row per user per day — so if User 1 uses 30 of their 50 credits and User 2 uses 10 of their 50 credits, both rows coexist in the table for that day without interfering with each other.
+
+### Profile caching and the "found by" user
+
+CareerShift caches recruiter profiles per account. When the pipeline first visits a recruiter's profile, that visit is recorded in the `recruiters` table with a `found_by_user_id` column — the id of the user whose CareerShift account made the original visit.
+
+This matters for quota efficiency:
+
+```text
+Scenario: User 1 first visits Recruiter A's profile (costs 1 credit from User 1's quota)
+
+Later, the pipeline needs to verify Recruiter A is still at their company:
+  → Using User 1's account: FREE  (profile is cached for User 1)
+  → Using User 2's account: costs 1 credit from User 2's quota
+                             (different account → different cache → not free)
+```
+
+The pipeline always uses the `found_by_user_id` account for re-verification, so cached profile re-visits are free. The first-visit cost is the only time a profile ever burns quota.
 
 ### Quota distribution
 
@@ -104,7 +126,11 @@ CEO, CTO, COO, CFO, CMO, CIO, Founder, President, Board Member, EVP, SVP, VP
 
 ### How it works
 
-Gemini AI is used to generate personalized email content. The pipeline uses two models with a primary/fallback pattern:
+Gemini AI is used for two separate jobs in the pipeline, each with its own quota pool:
+
+**1. Email content generation (per-user)**
+
+When the pipeline prepares outreach emails, it uses the Gemini key belonging to the user who will send those emails (`GEMINI_API_KEY_USER_{id}` in `.env`). The quota for this is per-user and completely independent between users.
 
 | Model | Daily limit | Role |
 |---|---|---|
@@ -112,6 +138,14 @@ Gemini AI is used to generate personalized email content. The pipeline uses two 
 | `gemini-2.5-flash` | 20 calls | Fallback |
 
 Each application requires **one AI call** which generates all three email stages at once (initial, follow-up 1, follow-up 2).
+
+**2. ATS detection (shared)**
+
+When the pipeline detects which Applicant Tracking System (ATS) a company uses, it uses a shared Gemini key (`GEMINI_API_KEY` in `.env`) that is not tied to any user. This prevents ATS detection from accidentally consuming any individual user's email generation quota.
+
+The two pools are tracked separately in the `model_usage` table using a `use_case` column:
+- `use_case = "email_content"` → per-user pool (tied to a specific `user_id`)
+- `use_case = "ats_detection"` → shared pool (no `user_id`)
 
 ### Cache strategy
 
@@ -200,10 +234,12 @@ The pipeline monitors quota health and sends email alerts when patterns suggest 
 | Underutilized | usage < 40% of daily limit | 3 days |
 | Exhausted | remaining = 0 | 3 days |
 
-### Applies to both quotas
+### Applies to both per-user quotas
 
-- CareerShift: 50/day limit
-- Gemini: 40/day combined limit
+Quota alerts are evaluated **per user**. If User 1 is consistently exhausting their CareerShift quota but User 2 is not, the pipeline sends an alert only about User 1's account — User 2 is unaffected and does not receive an alert.
+
+- CareerShift: 50/day per user
+- Gemini: 40/day per user (email content quota only; ATS detection has its own shared pool)
 
 ### Auto-calculated suggestions
 

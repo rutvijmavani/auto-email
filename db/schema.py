@@ -649,6 +649,7 @@ def init_db():
             alert_type   TEXT    NOT NULL,
             severity     TEXT    NOT NULL,
             platform     TEXT,
+            user_id      INT     REFERENCES users(id) ON DELETE SET NULL,
             value        REAL,
             threshold    REAL,
             message      TEXT,
@@ -1128,6 +1129,14 @@ def init_db():
     c.execute("""
         ALTER TABLE prospective_companies
           ADD COLUMN IF NOT EXISTS added_by_user_id INT REFERENCES users(id) ON DELETE SET NULL
+    """)
+
+    # pipeline_alerts: add user_id so operators can identify which account
+    # triggered an exhaustion-blocked (or other per-user) alert.
+    # Nullable: most alert types are not user-specific.
+    c.execute("""
+        ALTER TABLE pipeline_alerts
+          ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE SET NULL
     """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────

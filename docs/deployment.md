@@ -192,6 +192,9 @@ python -c "import pyathena; print('[OK] pyathena')"
 nano /home/opc/mail/.env
 
 # Add your credentials:
+
+# Operator account — used ONLY for system notifications and quota alerts
+# (not for outreach; outreach uses per-user Gmail accounts below)
 GMAIL_EMAIL=your@gmail.com
 GMAIL_APP_PASSWORD=your-app-password
 GOOGLE_SHEET_ID=your-sheet-id
@@ -208,6 +211,24 @@ ATHENA_S3_OUTPUT=s3://your-bucket/athena-results/
 
 # Brave Search API (ATS discovery fallback)
 BRAVE_API_KEY=your-key               # api.search.brave.com (1000 free/month)
+
+# Per-user credentials — add one block per pipeline user
+# (run "python scripts/add_user.py --help" to onboard a new user and get the
+#  exact env var names printed for you)
+#
+# User 1 example:
+GMAIL_USER_1_EMAIL=user1@gmail.com
+GMAIL_USER_1_APP_PASS=xxxx-xxxx-xxxx-xxxx
+GEMINI_API_KEY_USER_1=AIza...
+CAREERSHIFT_USER_1_EMAIL=user1@gmail.com
+CAREERSHIFT_USER_1_PASS=careershift-password
+#
+# User 2 example (fiancée):
+# GMAIL_USER_2_EMAIL=user2@gmail.com
+# GMAIL_USER_2_APP_PASS=xxxx-xxxx-xxxx-xxxx
+# GEMINI_API_KEY_USER_2=AIza...
+# CAREERSHIFT_USER_2_EMAIL=user2@gmail.com
+# CAREERSHIFT_USER_2_PASS=careershift-password
 
 # Create data and log directories
 mkdir -p /home/opc/mail/data
@@ -258,15 +279,25 @@ sudo chown opc:opc /mnt/backups
 df -h /mnt/backups
 ```
 
-### Step 7 — CareerShift session
+### Step 7 — CareerShift sessions (one per user)
+
+Each pipeline user needs their own CareerShift login session. Sessions expire after ~30 days and must be refreshed interactively — they cannot be automated because CareerShift requires a real browser login.
+
 ```bash
-# Run auth once interactively to create session file
+# First, make sure each user exists in the database.
+# If you haven't run add_user.py yet, do that now:
 cd /home/opc/mail
 source venv/bin/activate
-python careershift/auth.py
+python scripts/add_user.py --name "Your Name" --email you@gmail.com --resume-path Resume_You.pdf
+# (repeat for each additional user)
 
-# Session saved to: data/careershift_session.json
-# Valid for ~30 days — re-run auth.py when it expires
+# Then authenticate each user's CareerShift account.
+# Replace N with the user's id (printed by add_user.py above).
+python careershift/auth_njit.py --user-id 1
+python careershift/auth_njit.py --user-id 2   # repeat for each additional user
+
+# Each session is saved as: data/careershift_session_{user_id}.json
+# Re-run auth_njit.py --user-id N when a user's session expires (~30 days)
 ```
 
 ### Step 8 — Set up cron jobs
@@ -321,42 +352,18 @@ Risk of reclamation: LOW
 
 4. Code always on GitHub (you're already doing this ✓)
    → VM terminated → git clone → 30 min to restore
-   → Only SQLite DBs need separate backup
+   → Only the PostgreSQL database and ATS file need separate backup
 ```
 
 ---
 
-## SQLite vs Oracle Database
+## Database
 
-**Short answer: Keep SQLite. Don't migrate.**
+**The pipeline uses PostgreSQL.** It was migrated from SQLite when multi-user support was added — PostgreSQL handles concurrent writes from multiple users simultaneously and supports the per-user unique indexes the pipeline needs (for example, two users can independently apply to the same job URL without conflicting with each other).
 
-```text
-Your data scale:
-  ~50-200 applications
-  ~100-400 recruiters
-  ~300-1000 outreach records
-  Single user, single process
+You do not need to install or configure PostgreSQL manually. The `deploy/first_time_setup.sh` script handles the full database setup automatically on a new server.
 
-SQLite advantages for this use case:
-  ✓ Zero configuration
-  ✓ File-based — backup = copy the file
-  ✓ No network latency
-  ✓ Runs anywhere
-  ✓ Already working perfectly
-  ✓ Portable — move between machines easily
-
-Oracle DB advantages (none apply here):
-  → Multiple servers writing simultaneously → not your case
-  → Millions of rows → not your case
-  → Multiple users → not your case
-  → High availability → not your case
-
-Recommended stack:
-  Oracle VM (free compute) + SQLite (local file)
-  → Best of both worlds
-  → No migration needed
-  → Fast, reliable, simple
-```
+For a complete description of every table and column, see [`docs/database.md`](database.md).
 
 ---
 
@@ -580,7 +587,7 @@ Log aggregation if needed
 OS + Ubuntu base:              ~3.0 GB
 Python packages + Chromium:    ~0.8 GB
 Project code:                  ~0.005 GB
-SQLite DBs (6 months):         ~0.050 GB
+PostgreSQL DB (6 months):      ~0.050 GB
 PDF digests (30 day retention):~0.008 GB
 Log files (14/35 day retention):~0.010 GB
 Athena CSV (2 day retention):  ~0.010 GB
@@ -816,10 +823,10 @@ Run daily enrichment?              → python enrich_ats_companies.py --daily
 ### What to backup
 ```text
 Critical (must backup):
-  data/recruiter_pipeline.db    → all pipeline data
-  data/ats_discovery.db         → ATS enrichment data
-  data/careershift_session.json → CareerShift login session
-  .env                          → all credentials
+  PostgreSQL pipeline database         → all pipeline data (backed up by backup_db.py)
+  data/ats_discovery.db                → ATS enrichment data (SQLite — copied directly)
+  data/careershift_session_*.json      → CareerShift sessions — one file per user
+  .env                                 → all credentials
 
 Safe on GitHub (no backup needed):
   All .py files
@@ -830,32 +837,35 @@ Safe on GitHub (no backup needed):
 
 ### Backup script — scripts/backup_db.py
 
-Both DBs are backed up using SQLite's native backup API which guarantees
-a consistent snapshot even if a write is in progress.
+The PostgreSQL pipeline database is exported with `pg_dump`, which produces a
+logically consistent SQL snapshot even while the pipeline is actively writing.
+The ATS enrichment data (`ats_discovery.db`) is a separate SQLite file and is
+copied directly.
 
 ```text
-Source DBs:
-  /home/opc/mail/data/recruiter_pipeline.db
-  /home/opc/mail/data/ats_discovery.db
+Source:
+  PostgreSQL pipeline database         → pg_dump snapshot
+  /home/opc/mail/data/ats_discovery.db → direct file copy
 
 Destination:
-  /mnt/backups/recruiter_pipeline_YYYY-MM-DD_HH-MM.db
+  /mnt/backups/recruiter_pipeline_YYYY-MM-DD_HH-MM.sql
   /mnt/backups/ats_discovery_YYYY-MM-DD_HH-MM.db
 
 Retention: 7 days (enforced automatically on every backup run)
 ```
 
-**Why SQLite backup API instead of cp:**
+**Why pg_dump instead of copying files directly:**
 ```text
-Plain cp on live SQLite DB:
-  → Copies file mid-write → corrupted backup
-  → NEVER use cp on a live SQLite DB
+Copying PostgreSQL's data directory while it is running:
+  → Unsafe — files can be in a mid-write state
+  → Can produce a corrupt backup that cannot be restored
+  → NEVER copy /var/lib/postgresql directly on a live server
 
-sqlite3.backup():
-  → Uses SQLite built-in online backup API
-  → Atomic and consistent snapshot
-  → Safe while DB is being written to
-  → Even if --sync-forms ran seconds before
+pg_dump:
+  → Produces a clean, portable SQL export
+  → Safe while the database is being written to
+  → Restores cleanly with: psql -d pipeline_db < backup.sql
+  → Works across PostgreSQL versions
 ```
 
 **Why block storage instead of local data/backups/:**
@@ -899,10 +909,14 @@ DB is always quiet at backup time:
 4. Install dependencies (Step 4 above)
 5. Clone repo: git clone https://github.com/you/auto-email.git
 6. Restore .env file (keep a local copy on your laptop)
-7. Copy latest DB backup from block volume:
-   cp /mnt/backups/recruiter_pipeline_<latest>.db /home/opc/mail/data/recruiter_pipeline.db
+7. Restore databases from the latest backup:
+   # PostgreSQL pipeline database:
+   psql -U pipeline_user -d pipeline_db < /mnt/backups/recruiter_pipeline_<latest>.sql
+   # ATS enrichment file (SQLite):
    cp /mnt/backups/ats_discovery_<latest>.db /home/opc/mail/data/ats_discovery.db
-8. Run: python careershift/auth.py (re-authenticate)
+8. Re-authenticate each user's CareerShift session:
+   python careershift/auth_njit.py --user-id 1
+   (repeat for each user — sessions do not survive VM termination)
 9. Run: chmod +x setup_cron.sh && ./setup_cron.sh
 10. Resume normal operation
 
@@ -916,8 +930,10 @@ Max data loss:       24 hours (daily backup cadence)
 
 ### Monthly
 ```text
-□ Re-run careershift/auth.py if session expired
-  (session valid ~30 days)
+□ Re-run CareerShift auth for any user whose session has expired
+  (sessions valid ~30 days — one per user)
+  python careershift/auth_njit.py --user-id 1
+  python careershift/auth_njit.py --user-id 2   (repeat for each user)
 □ Check log files for recurring errors
 □ Verify DB backup files exist on block storage:
   ls -lh /mnt/backups/
@@ -949,10 +965,12 @@ Outreach not sending:
   → Verify GMAIL_APP_PASSWORD still valid
   → Check send window config (9 AM - 11 AM)
 
-CareerShift session expired:
+CareerShift session expired (for a specific user):
+  → Check logs to identify which user's session failed
   → SSH into VM
-  → python careershift/auth.py
-  → Re-authenticate interactively
+  → python careershift/auth_njit.py --user-id N
+    (replace N with the affected user's id — printed in the error log)
+  → Re-authenticate interactively in the browser window that opens
 
 Backup failed (nightly chain stopped):
   → Check if block volume is mounted: df -h /mnt/backups
@@ -986,30 +1004,11 @@ VM not responding:
 
 ## Database Strategy & Long-term Scalability
 
-### SQLite is sufficient for this application
+### PostgreSQL is the pipeline's database
 
-```text
-Single user (you):
-  → SQLite designed for this use case ✓
-  → No concurrent write conflicts ✓
-  → All pipelines run sequentially ✓
+The pipeline runs on **PostgreSQL**. It was migrated from SQLite when multi-user support was added. PostgreSQL allows multiple users to write to the database at the same time without conflicts, and it supports the per-user unique indexes the pipeline requires — for example, two users can independently apply to the same job URL without triggering a constraint violation.
 
-Expected DB size over time:
-  1 year:   ~50 MB
-  2 years:  ~100 MB
-  5 years:  ~200 MB
-  → Well within SQLite comfort zone (< 1 GB)
-
-Query performance with proper indexes:
-  200,000 job_postings rows:
-    Without index: ~200ms (table scan)
-    With index:    ~1ms (index scan) ✓
-
-  All critical queries use indexed columns:
-    → status + first_seen (job monitoring)
-    → content_hash (deduplication)
-    → company + recruiter_status (outreach)
-```
+If you are setting up a new server, `deploy/first_time_setup.sh` installs and configures PostgreSQL automatically. You do not need to create the schema manually.
 
 ### What keeps the DB lean
 
@@ -1022,72 +1021,35 @@ Retention policies (automatic):
   → Old AI cache deleted after 21 days
   → PDF digests deleted after 30 days
 
-Monthly VACUUM (run_monthly.sh — 1st of every month):
-  → Reclaims space from deleted rows
-  → Prevents DB file from growing stale
-  → Keeps file size proportional to active data
-```
-
-### When to consider migrating to PostgreSQL
-
-```text
-Migrate only if:
-  □ You share this with multiple users simultaneously
-    (SQLite write lock becomes bottleneck)
-  □ DB consistently exceeds 500 MB
-    (unlikely with retention policies)
-  □ You productize this for others
-    (need proper multi-tenancy)
-  □ Query latency becomes noticeable
-    (index + VACUUM should prevent this)
-
-Migration is straightforward when needed:
-  → sqlite3 dump → PostgreSQL import
-  → Well-documented process
-  → All SQL in this app is standard SQL
-    (no SQLite-specific syntax)
-  → Estimated migration time: ~2-4 hours
+Monthly VACUUM ANALYZE (run_monthly.sh — 1st of every month):
+  → Reclaims disk space from deleted rows
+  → Refreshes PostgreSQL's query planner statistics
+    (without this, the planner may choose slow query plans as data grows)
+  → Keeps queries fast as the database grows over time
 ```
 
 ### DB health monitoring
 
 ```text
 Add to weekly checklist:
-  □ Check DB file size:
-    ls -lh data/recruiter_pipeline.db data/ats_discovery.db
+  □ Check table sizes (connect to the PostgreSQL database and run):
+    SELECT relname AS table,
+           pg_size_pretty(pg_total_relation_size(relid)) AS total_size
+    FROM   pg_catalog.pg_statio_user_tables
+    ORDER  BY pg_total_relation_size(relid) DESC;
 
-  □ Check largest tables:
-    python -c "
-    import sqlite3
-    conn = sqlite3.connect('data/recruiter_pipeline.db')
-    for table in ['job_postings', 'outreach', 'recruiters',
-                  'applications', 'ai_cache']:
-        count = conn.execute(
-            f'SELECT COUNT(*) FROM {table}'
-        ).fetchone()[0]
-        print(f'{table}: {count} rows')
-    conn.close()
-    "
+  □ Check ATS enrichment file (still SQLite — file size check only):
+    ls -lh data/ats_discovery.db
 
   □ Check backup volume usage:
     df -h /mnt/backups
     ls -lh /mnt/backups/
 
-  □ Check verify-filled stats:
-    python -c "
-    import sqlite3
-    conn = sqlite3.connect('data/recruiter_pipeline.db')
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        'SELECT date, verified, filled, active, inconclusive, remaining '
-        'FROM verify_filled_stats ORDER BY date DESC LIMIT 7'
-    ).fetchall()
-    for r in rows:
-        print(dict(r))
-    conn.close()
-    "
+  □ Check quota and verify-filled stats via the pipeline:
+    python pipeline.py --quota-report
 
-  □ Alert if DB > 500 MB (early warning)
+  □ Alert if PostgreSQL DB exceeds 500 MB (early warning — retention
+    policies should prevent this from ever happening)
 ```
 
 ---
@@ -1856,6 +1818,15 @@ The two scripts below are called by `first_time_setup.sh` automatically. Only ru
 □ 2.  Block volume (50 GB) created, attached, formatted, and mounted at /mnt/backups
 □ 3.  Dependencies installed (pip install -r requirements.txt)
 □ 4.  .env file created with all credentials
+       (operator account + per-user credentials — see docs/configuration.md §Per-User Credentials)
+□ 4b. Register each pipeline user in the database:
+       python scripts/add_user.py --name "Your Name" --email you@gmail.com --resume-path Resume_You.pdf
+       python scripts/add_user.py --name "User 2" --email user2@gmail.com --resume-path Resume_User2.pdf
+       (each call prints the user's id and the exact env var names to add to .env)
+□ 4c. Authenticate each user's CareerShift session:
+       python careershift/auth_njit.py --user-id 1
+       python careershift/auth_njit.py --user-id 2
+       (saves data/careershift_session_{id}.json — expires after ~30 days)
 □ 5.  AWS Athena table created (one-time, already done)
 □ 6.  Boto3 + pyathena working (python -c "import boto3, pyathena")
 □ 7.  prospects.txt uploaded with domains

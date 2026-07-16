@@ -45,12 +45,17 @@ WARNING  = "warning"
 # ─────────────────────────────────────────
 
 def create_alert(alert_type, severity, platform=None,
-                 value=None, threshold=None, message=None):
+                 value=None, threshold=None, message=None, user_id=None):
     """
     Create a new alert record.
     Returns alert id or None if duplicate within dedup window.
+
+    user_id: optional — pass when the alert is specific to one pipeline user
+    (e.g. exhaustion-blocked for user 2's scraping run).  Included in the
+    dedup key so alerts for different users on the same company are not
+    collapsed into one.
     """
-    if has_recent_alert(alert_type, platform):
+    if has_recent_alert(alert_type, platform, user_id=user_id):
         return None  # already alerted recently
 
     conn = get_conn()
@@ -58,11 +63,11 @@ def create_alert(alert_type, severity, platform=None,
         # RETURNING id replaces cursor.lastrowid (not available with psycopg2).
         row = conn.execute("""
             INSERT INTO pipeline_alerts
-                (alert_type, severity, platform,
+                (alert_type, severity, platform, user_id,
                  value, threshold, message)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             RETURNING id
-        """, (alert_type, severity, platform,
+        """, (alert_type, severity, platform, user_id,
               value, threshold, message)).fetchone()
         conn.commit()
         return row["id"] if row else None
@@ -70,30 +75,31 @@ def create_alert(alert_type, severity, platform=None,
         conn.close()
 
 
-def has_recent_alert(alert_type, platform=None, hours=None):
+def has_recent_alert(alert_type, platform=None, hours=None, user_id=None):
     """
     Check if same alert was created recently (any notified status).
     Prevents duplicate alert records within dedup window.
     Checks ALL rows regardless of notified flag — a pending unnotified
     alert should still prevent a duplicate from being inserted.
+
+    user_id: when provided, only matches alerts for that specific user.
+    This ensures alerts for different users on the same platform are not
+    treated as duplicates of each other.
     """
     hours  = hours or ALERT_DEDUP_HOURS
     cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     conn   = get_conn()
     try:
+        clauses = ["alert_type = ?", "created_at > ?"]
+        params  = [alert_type, cutoff]
         if platform:
-            row = conn.execute("""
-                SELECT id FROM pipeline_alerts
-                WHERE alert_type = ?
-                AND platform = ?
-                AND created_at > ?
-            """, (alert_type, platform, cutoff)).fetchone()
-        else:
-            row = conn.execute("""
-                SELECT id FROM pipeline_alerts
-                WHERE alert_type = ?
-                AND created_at > ?
-            """, (alert_type, cutoff)).fetchone()
+            clauses.append("platform = ?")
+            params.append(platform)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        sql = "SELECT id FROM pipeline_alerts WHERE " + " AND ".join(clauses)
+        row = conn.execute(sql, params).fetchone()
         return row is not None
     finally:
         conn.close()
