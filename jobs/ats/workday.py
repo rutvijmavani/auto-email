@@ -383,10 +383,13 @@ def _normalize(job, company, domain, path, slug_info=None):
     # relative-path field but return an absolute job URL.
     if not external_path and external_url and external_url.startswith("http"):
         from urllib.parse import urlparse as _urlparse
-        _parsed_path = _urlparse(external_url).path  # e.g. "/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
+        _parsed_path = _urlparse(external_url).path  # e.g. "/en-US/NVIDIAExternalCareerSite/job/Loc/Title_R-1"
         _path_prefix = "/" + path.strip("/")          # e.g. "/NVIDIAExternalCareerSite"
-        if _parsed_path.startswith(_path_prefix + "/"):
-            external_path = _parsed_path[len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
+        # Use find so locale-prefixed URLs (e.g. /en-US/NVIDIAExternalCareerSite/...)
+        # are handled the same as unprefixed ones (/NVIDIAExternalCareerSite/...).
+        _path_idx = _parsed_path.find(_path_prefix + "/")
+        if _path_idx != -1:
+            external_path = _parsed_path[_path_idx + len(_path_prefix):]  # e.g. "/job/Loc/Title_R-1"
 
     if external_path:
         # Relative path from real Workday API — prepend domain + career site name
