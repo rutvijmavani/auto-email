@@ -17,6 +17,12 @@ logs/
 careershift_session.json
 
 # ─────────────────────────────────────────
+# Chrome Extension build artefacts
+# ─────────────────────────────────────────
+*.crx
+*.pem
+
+# ─────────────────────────────────────────
 # Resume (personal file)
 # ─────────────────────────────────────────
 Resume.pdf

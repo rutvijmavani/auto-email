@@ -88,13 +88,7 @@
   function detectUser(callback) {
     try {
       chrome.identity.getAuthToken({ interactive: false }, (token) => {
-        if (chrome.runtime.lastError || !token) {
-          reportToServer('warning', 'identity detection failed — OAuth token unavailable', {
-            error: chrome.runtime.lastError?.message || 'no token',
-          });
-          callback(null);
-          return;
-        }
+        if (chrome.runtime.lastError || !token) { callback(null); return; }
         fetch('https://www.googleapis.com/oauth2/v1/userinfo', {
           headers: { Authorization: `Bearer ${token}` },
         })
@@ -278,13 +272,12 @@
       return;
     }
 
-    // API returned an error response (reachable but failed)
+    // API reachable but returned error vs network/timeout failure — mutually exclusive telemetry
     if (result.status) {
       reportToServer('error', 'API error response', { status: result.status, company, job_url });
+    } else {
+      reportToServer('warning', 'API unreachable — falling back to Sheets', { company, job_url });
     }
-
-    // API unreachable or errored — try Google Sheets fallback
-    reportToServer('warning', 'API unreachable — falling back to Sheets', { company, job_url });
     const saved = await postToSheet(payload);
     if (saved) {
       showBanner(overlay, 'Saved to sheet — will sync automatically', 'sheet');

@@ -45,6 +45,9 @@ def health():
 
 @app.route('/log-error', methods=['POST'])
 def log_error_endpoint():
+    if _API_KEY and not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
+        return jsonify({'error': 'unauthorized'}), 401
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return '', 204
@@ -73,7 +76,7 @@ def add_application_options():
 @app.route('/add-application', methods=['POST'])
 def add_application_endpoint():
     if _API_KEY and not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
-        logger.warning("unauthorized request from origin=%s", request.headers.get('Origin', ''))
+        logger.warning("unauthorized request from origin=%r", request.headers.get('Origin', ''))
         return jsonify({'error': 'unauthorized'}), 401
 
     data = request.get_json(silent=True)
@@ -85,7 +88,13 @@ def add_application_endpoint():
     job_url   = (data.get('job_url')   or '').strip()
     job_title = (data.get('job_title') or '').strip() or None
     status    = data.get('status', 'active')
-    user_id   = int(data.get('user_id', 1))
+    try:
+        user_id = int(data.get('user_id', 1))
+        if user_id <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        logger.warning("rejected request — invalid user_id %r", data.get('user_id'))
+        return jsonify({'error': 'user_id must be a positive integer'}), 400
 
     if not company:
         logger.warning("rejected request — missing company")

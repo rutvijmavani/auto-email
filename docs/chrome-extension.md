@@ -221,16 +221,14 @@ to the existing Google Sheet ("Responses" tab, same sheet `form_sync.py` reads).
 The existing cron that runs `form_sync.py` picks it up on its next run — no new
 cron or tab needed.
 
-**Fallback column format** (same as existing Google Form responses):
+**Fallback column format** (matches existing Google Form responses):
 ```
-Timestamp | Company Name | Job URL | Job Title | Applied Date
+Timestamp | Company Name | Job URL | Job Title | Applied Date | User Name
 ```
 
-**Note:** The sheet currently has no `user_id` column. The fallback always writes
-without `user_id` and `form_sync.py` inserts with its default (`user_id=1`). This
-will be wrong for User 2's fallback entries. A 6th `User ID` column will be added
-to the sheet later — `form_sync.py` will be updated at that point to read it.
-Until then, any fallback entries from User 2 must be manually re-attributed.
+`form_sync.py` reads column F (`COL_USER_NAME = 5`), maps the display name to
+`user_id` via `_USER_NAME_MAP = {'rutvij': 1, 'disha': 2}`, and passes it to
+`add_application(user_id=...)`. Rows with a blank column F default to `user_id=1`.
 
 The extension needs `https://www.googleapis.com/auth/spreadsheets` scope added to
 the OAuth config in `manifest.json` (alongside `userinfo.profile` already there).
@@ -288,10 +286,37 @@ it: `sudo systemctl start pipeline-api`. Logs: `journalctl -u pipeline-api -f`.
 
 ### 15. CORS
 
-Flask must accept requests from the Chrome extension origin
-(`chrome-extension://<extension-id>`). Using `flask-cors` with
-`origins=["chrome-extension://*"]` is the cleanest approach. Added to `api.py`
-only — no changes to existing code.
+Flask only sets `Access-Control-Allow-Origin` when the request `Origin` header
+starts with `chrome-extension://` — it echoes the exact origin back rather than
+returning `*`. Implemented via a manual `after_request` hook in `api.py` (no
+`flask-cors` dependency needed).
+
+### 16. Logging and observability
+
+**Server-side (`api.py`):**
+- `init_logging('api')` at startup → writes to `logs/api.log`
+- `TimedRotatingFileHandler` rotates at midnight → `api.log.YYYY-MM-DD`
+- Rotation backups deleted after **14 days** by `_cleanup_old_logs()` (same rule as `scheduler.log.*`)
+- `cleanup_logs_if_due()` called on every incoming request via `@app.before_request` (no-op until 24h elapsed)
+- `log_monitor.py` (cron every 15 min) scans `logs/api.log` automatically — no config change needed
+- All file output is **JSON format** (one object per line); console output when running interactively stays human-readable
+
+**Client-side (`content.js`):**
+- `reportToServer(level, message, context)` — fire-and-forget `POST /log-error` to the API; never throws, failure is silently swallowed so it never affects the user flow
+- Called on:
+  - OAuth token unavailable → `warning` ("identity detection failed")
+  - API call returned non-ok HTTP status → `error` ("API error response")  
+  - API unreachable, falling back to Sheets → `warning` ("API unreachable — falling back to Sheets")
+  - Both API and Sheets failed → `error` ("both API and Sheets fallback failed")
+
+**`POST /log-error` endpoint (`api.py`):**
+```json
+POST /log-error
+{ "level": "error|warning|info", "message": "...", "context": { ... } }
+→ 204 No Content
+```
+The endpoint logs `[extension] <message> | <context>` at the specified level.
+The log monitor then alerts on new `ERROR` or `WARNING` lines within 15 minutes.
 
 ---
 
@@ -353,6 +378,10 @@ Google display name match. Server stores it as-is, no mapping needed.
 
 Required fields: `company`, `job_url`. Everything else has defaults
 (`job_title=null`, `status="active"`, `user_id=1`).
+
+**`GET /health`** — returns `{"status": "ok", "time": "..."}`. Use to verify the SSH tunnel is live before testing.
+
+**`POST /log-error`** — accepts `{"level": "error|warning|info", "message": "...", "context": {...}}` from the extension and logs it to `logs/api.log`. Picked up by `log_monitor.py` within 15 minutes. Returns `204 No Content`.
 
 `api.py` lives at the project root and imports from `db.applications` the same
 way `main.py` does. Started separately from the main pipeline:
