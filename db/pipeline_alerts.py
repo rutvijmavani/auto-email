@@ -98,6 +98,8 @@ def has_recent_alert(alert_type, platform=None, hours=None, user_id=None):
         if user_id is not None:
             clauses.append("user_id = ?")
             params.append(user_id)
+        else:
+            clauses.append("user_id IS NULL")
         sql = "SELECT id FROM pipeline_alerts WHERE " + " AND ".join(clauses)
         row = conn.execute(sql, params).fetchone()
         return row is not None

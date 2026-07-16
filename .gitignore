@@ -8,6 +8,7 @@ credentials.json
 # Runtime Data (never commit)
 # ─────────────────────────────────────────
 data/
+logs/
 *.db
 
 # ─────────────────────────────────────────
