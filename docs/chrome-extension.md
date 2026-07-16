@@ -553,7 +553,7 @@ and no SSH tunnel setup required for other users.
 
 **How it works:**
 
-```
+```text
 VM boots
   → pipeline-api.service starts api.py on :5000
   → cloudflare-tunnel.service starts tunnel_manager.py
@@ -594,7 +594,7 @@ sudo systemctl start cloudflare-tunnel
 4. Go to github.com → Settings → Developer settings → Personal access tokens
 5. Generate a token with only `gist` scope → copy it
 6. Add to `.env` on the VM:
-   ```
+   ```dotenv
    GITHUB_PAT=ghp_xxxxxxxxxxxx
    GIST_ID=xxxxxxxxxxxxxxxxxxxx
    ```
@@ -607,9 +607,11 @@ const GIST_CONFIG_URL = 'https://gist.githubusercontent.com/YOUR_USERNAME/YOUR_G
 ```
 Reload the extension once. After that, URL changes are handled automatically.
 
-**Security:** Set `EXTENSION_API_KEY` in `.env` on the VM — the tunnel URL is
-accessible to anyone who knows it, so the API key is the real protection.
-The extension sends it as `X-API-Key` on every request.
+**Security:** Set `EXTENSION_API_KEY` in `.env` on the VM. The extension sends
+it as `X-API-Key` on every request, which blocks unauthenticated traffic. Note
+that the key is bundled in `config.js` and visible to anyone who installs the
+extension, so it is not a secret — add server-side rate limiting and
+per-user authentication if the endpoint needs stronger protection.
 
 **What happens when the tunnel URL changes (VM restart):**
 1. `tunnel_manager.py` detects the new URL from cloudflared output
@@ -627,7 +629,7 @@ an auto-reload mechanism gated behind a `DEV_MODE` flag so it never ships.
 
 **How it works:**
 
-```
+```text
 You save content.js
   → scripts/watch_ext.py detects the change (watchdog)
   → POSTs /dev-bump to Flask → version counter increments (0 → 1)
@@ -837,7 +839,7 @@ The extension discovers the current tunnel URL automatically via GitHub Gist.
 See **§18** for full setup. Once configured:
 - No per-session setup for any user
 - URL changes on VM restart are handled automatically within 30 min
-- Other users just install the extension — zero configuration needed
+- Other users install the extension and set `GIST_CONFIG_URL` in `config.js` once (§18 extension setup)
 
 ### Option B — SSH Tunnel (dev / single-user fallback)
 
