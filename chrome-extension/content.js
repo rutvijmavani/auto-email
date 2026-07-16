@@ -179,7 +179,9 @@
         signal: ctrl.signal,
       });
       clearTimeout(t);
-      return { ok: true, data: await res.json(), status: res.status };
+      let data;
+      try { data = await res.json(); } catch (_) { data = {}; }
+      return { ok: res.ok, data, status: res.status };
     } catch (err) {
       clearTimeout(t);
       return { ok: false, error: err };

@@ -1,3 +1,4 @@
+import hmac
 import os
 from datetime import datetime
 
@@ -14,7 +15,9 @@ _API_KEY = os.environ.get('EXTENSION_API_KEY', '')
 
 
 def _cors(response):
-    response.headers['Access-Control-Allow-Origin'] = '*'
+    origin = request.headers.get('Origin', '')
+    if origin.startswith('chrome-extension://'):
+        response.headers['Access-Control-Allow-Origin'] = origin
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
     response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
     return response
@@ -37,10 +40,12 @@ def add_application_options():
 
 @app.route('/add-application', methods=['POST'])
 def add_application_endpoint():
-    if _API_KEY and request.headers.get('X-API-Key') != _API_KEY:
+    if _API_KEY and not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
         return jsonify({'error': 'unauthorized'}), 401
 
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
 
     company  = (data.get('company')   or '').strip()
     job_url  = (data.get('job_url')   or '').strip()
