@@ -683,21 +683,73 @@ def _format_ts(ts: float) -> str:
 
 
 def _error_table_row(record: dict) -> str:
-    line    = _esc(record.get("sample_line", ""))
-    ctx     = "".join(
-        f'<tr><td style="padding:2px 10px 2px 28px;font-family:monospace;'
-        f'font-size:11px;color:#64748b;word-break:break-all">'
-        f'{_esc(c)}</td></tr>'
-        for c in record.get("sample_context", []) if c.strip()
-    )
-    return (
-        f'<tr><td style="padding:5px 10px;font-family:monospace;font-size:12px;'
-        f'color:#dc2626;word-break:break-all">{line}</td></tr>{ctx}'
-        f'<tr><td style="padding:2px 10px 4px;font-size:11px;color:#94a3b8">'
+    sample = record.get("sample_line", "")
+    meta_row = (
+        f'<tr><td style="padding:2px 10px 6px;font-size:11px;color:#94a3b8">'
         f'📄 {_esc(record.get("log_file","?"))} &nbsp;·&nbsp; '
         f'first seen {_format_ts(record.get("first_seen", 0))} &nbsp;·&nbsp; '
         f'{record.get("count", 1):,} occurrence(s)</td></tr>'
     )
+
+    # Try to parse the sample line as JSON (produced by JsonFormatter).
+    parsed = None
+    try:
+        parsed = json.loads(sample) if sample else None
+        if not isinstance(parsed, dict):
+            parsed = None
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+
+    if parsed:
+        msg     = _esc(parsed.get("msg", sample))
+        logger_name = _esc(parsed.get("logger", ""))
+        ts      = _esc(parsed.get("time", ""))
+        header  = (
+            f'<tr><td style="padding:5px 10px 2px;font-family:monospace;font-size:12px;'
+            f'color:#dc2626;word-break:break-all">{msg}</td></tr>'
+        )
+        label_parts = []
+        if logger_name:
+            label_parts.append(f'<b>{logger_name}</b>')
+        if ts:
+            label_parts.append(ts)
+        label_row = (
+            '<tr><td style="padding:1px 10px 3px 28px;font-size:11px;color:#64748b">'
+            + " &nbsp;·&nbsp; ".join(label_parts)
+            + '</td></tr>'
+        ) if label_parts else ""
+
+        # Stack trace from Layer 1 auto-injection or Layer 2 exc_info
+        trace_field = parsed.get("stack") or parsed.get("exc")
+        trace_row = ""
+        if trace_field:
+            trace_row = (
+                f'<tr><td style="padding:3px 10px 4px 28px;font-family:monospace;'
+                f'font-size:10px;color:#7c3aed;white-space:pre-wrap;word-break:break-all">'
+                f'Stack:\n{_esc(trace_field.rstrip())}</td></tr>'
+            )
+
+        ctx = "".join(
+            f'<tr><td style="padding:1px 10px 1px 28px;font-family:monospace;'
+            f'font-size:11px;color:#94a3b8;word-break:break-all">'
+            f'{_esc(c)}</td></tr>'
+            for c in record.get("sample_context", []) if c.strip()
+        )
+        return header + label_row + trace_row + ctx + meta_row
+    else:
+        # Non-JSON (pipe-delimited or raw text)
+        line = _esc(sample)
+        ctx  = "".join(
+            f'<tr><td style="padding:2px 10px 2px 28px;font-family:monospace;'
+            f'font-size:11px;color:#64748b;word-break:break-all">'
+            f'{_esc(c)}</td></tr>'
+            for c in record.get("sample_context", []) if c.strip()
+        )
+        return (
+            f'<tr><td style="padding:5px 10px;font-family:monospace;font-size:12px;'
+            f'color:#dc2626;word-break:break-all">{line}</td></tr>{ctx}'
+            + meta_row
+        )
 
 
 def _send_email(subject: str, body_html: str):

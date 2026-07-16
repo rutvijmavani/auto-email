@@ -3174,6 +3174,113 @@ WORKER SCALING (from worker_scaling_events)
 
 ---
 
+### Log Observability — 4-Layer System *(implemented 2026-07-16)*
+
+The Accenture drop incident (2026-07-16) exposed a critical observability gap: `detail_worker` dropped 866 malformed payloads with a WARNING, but the alert email showed only a raw JSON blob — no stack trace, no payload origin, no callsite. The investigation took 5 hours; the root cause (stale inflight payloads from a prior deploy) was ultimately self-resolving and not reproducible from logs alone.
+
+Four layers were added to make every future incident answerable from the first alert email.
+
+#### Layer 1 — Automatic stack traces in WARNING/ERROR (first per 60 s)
+
+`logger.JsonFormatter.format()` auto-injects a `stack` field for WARNING+ records that do not already have an exception traceback (`exc_info`). The field contains the application call stack with logging-internal frames trimmed off the bottom.
+
+**Dedup guard** (prevents tight-loop log floods):
+- Per key `{logger.name}:{levelno}`: first injection fires immediately; subsequent injections within 60 s are suppressed
+- `_STACK_SEEN` dict is purged when it exceeds 500 entries (clear-all — all unique keys get a fresh trace on the next occurrence)
+- Thread-safe via `threading.Lock()`
+
+**Result:** The first WARNING or ERROR from each unique logger/level includes the exact Python callsite in the alert email, viewable without touching the VM. Repeat fires within 60 s omit the stack to avoid floods.
+
+#### Layer 2 — `_build_detail_payload` raises instead of silently forwarding bad payloads
+
+Both `workers/scan_worker.py` and `workers/fullscan.py` now **raise `ValueError`** from `_build_detail_payload()` when a required platform key is absent from the built payload. The required keys match `detail_worker._REQUIRED_DETAIL_KEYS`:
+
+| Platform | Required keys |
+|---|---|
+| workday | `_external_path`, `_slug`, `_wd`, `_path` |
+| taleo | `_base_url`, `_contest_no` |
+| smartrecruiters | `_company_slug` |
+| icims | `_base_url` |
+| jobvite | `_slug` |
+
+Both lpush call sites wrap `_build_detail_payload` in `try/except ValueError` and log with `exc_info=True`. The `exc_info=True` produces the `exc` field (exception traceback). Because `exc` and `stack` are mutually exclusive in Layer 1's `elif` branch, the same record does **not** also get an auto-injected `stack` — the exception traceback is the diagnostic artifact.
+
+**Before:** Bad payload pushed to queue:detail:* silently → `detail_worker` drops it 1–5 minutes later with a WARNING and no traceback.  
+**After:** Error detected at the point of construction → full traceback logged immediately → `exc_info=True` also sends the traceback to Sentry automatically.
+
+#### Layer 3 — Structured alert emails from log_monitor
+
+`scripts/log_monitor._error_table_row()` now parses each `sample_line` as JSON. When it succeeds:
+
+- Shows the `msg` field (the human-readable formatted message) instead of a raw JSON blob
+- Shows `logger` + `time` as a compact metadata row below the message
+- Renders the `stack` field (from Layer 1) as a purple pre-formatted block labeled "Stack:"
+- Renders the `exc` field (from Layer 2's `exc_info=True`) the same way, labeled "Stack:"
+- Falls back to the old raw-line display for non-JSON lines (tracebacks, legacy pipe-delimited)
+
+**Before:** Alert email showed `{"time": "...", "ms": 312.5, "level": "WARNING", "logger": "workers.detail_worker", "msg": "detail_worker: detail required for listing_filter=title_only..."}` — unreadable without parsing.  
+**After:** Alert email shows the clean `msg` string with logger name, timestamp, and the full call stack in a distinct visual block.
+
+#### Layer 4 — Dead Letter Queue (DLQ)
+
+Dropped payloads are preserved for post-incident inspection instead of being lost forever.
+
+**Redis key:** `queue:detail:dlq` (`REDIS_DETAIL_DLQ` in `config.py`)
+
+**Write path** (`workers/detail_worker._push_to_dlq(job)`):
+```python
+# Called at both drop sites:
+# 1. WARNING: title_only + missing keys (early return, job not fetched)
+# 2. ERROR: missing keys detected before detail fetch (fetch will silently fail)
+entry = json.dumps({
+    "_dlq_added_at": datetime.now(timezone.utc).isoformat(),
+    "payload": job,
+})
+pipe = r.pipeline()
+pipe.lpush("queue:detail:dlq", entry)
+pipe.ltrim("queue:detail:dlq", 0, 199)   # hard cap: 200 entries
+pipe.execute()
+```
+
+The `_dlq_added_at` timestamp distinguishes stale-inflight payloads (`enqueued_at` old, `_dlq_added_at` recent) from current-code bugs (both timestamps recent).
+
+**Retention (age-based Lua cleanup** in `watchdog._check_dlq_health()`):
+```lua
+-- Atomic: remove entries where _dlq_added_at < cutoff (7 days ago)
+-- Unparseable entries are kept rather than silently discarded
+local all = redis.call('LRANGE', KEYS[1], 0, -1)
+local cutoff = ARGV[1]  -- ISO timestamp 7 days ago
+local keep = {}
+for _, v in ipairs(all) do
+    local ok, entry = pcall(cjson.decode, v)
+    if ok and entry._dlq_added_at and entry._dlq_added_at >= cutoff then
+        table.insert(keep, v)
+    elseif not ok then
+        table.insert(keep, v)  -- keep unparseable
+    end
+end
+if #keep < #all then
+    redis.call('DEL', KEYS[1])
+    for _, v in ipairs(keep) do redis.call('RPUSH', KEYS[1], v) end
+end
+```
+
+**Watchdog alert:** `_check_dlq_health()` fires `Issue.WARNING` when DLQ depth > 50.
+
+**Inspect the DLQ:**
+```bash
+redis-cli lrange queue:detail:dlq 0 4 | python -c "
+import sys, json
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try: print(json.dumps(json.loads(l), indent=2))
+    except Exception: print(l)
+"
+```
+
+---
+
 ## 23. Implementation Roadmap
 
 ### Phase 1 — PostgreSQL Migration

@@ -1,0 +1,33 @@
+[Unit]
+Description=Job Pipeline Extension API
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 api:app
+Restart=always
+RestartSec=15s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pipeline-api
+
+[Install]
+WantedBy=multi-user.target

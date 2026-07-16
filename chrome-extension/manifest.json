@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Job Pipeline Capture",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt6x812vDDs+7TB44oezV2qgmJcbdEdSyDGtSRhxqYtXIXfFDIwUKJztFr4dBmlOhNEIR7PVrsE0u9HlLmI7nYeYzfBlb20TFfNCqMwStnE/G73yHYWdKxAjYmbchVv+iQDKoa6pKv6JAelemprDQazbdRSdq76KdnE5pZu2areTRz1akX1lYbPskJAJm5ase2vgyYWRzIs0IIzA3cozin2ubWKmMxzJYbSQ9/y6JJBS0BywUJ/v6cS8VMb3gQ74vmHkUUbhZ8jvArGUCkM6vX07uJh+RLiaBcKyi5f0HaByqa7L+CEDi/Y7KMUJvZOw2fOrF6efwJIpDkn6x3xB4OwIDAQAB",
+  "version": "1.0",
+  "description": "Save job postings directly to your recruiter pipeline.",
+  "permissions": ["activeTab", "scripting", "storage", "identity"],
+  "host_permissions": [
+    "http://localhost:5001/*",
+    "https://*/*",
+    "https://www.googleapis.com/*"
+  ],
+  "oauth2": {
+    "client_id": "491302012157-t0crnv40nkpmvhb55813kmj66i2j99cl.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/userinfo.profile",
+      "https://www.googleapis.com/auth/spreadsheets"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://boards.greenhouse.io/*",
+        "*://jobs.lever.co/*",
+        "*://jobs.ashbyhq.com/*",
+        "*://*.myworkdayjobs.com/*",
+        "*://careers.smartrecruiters.com/*",
+        "*://www.linkedin.com/jobs/*",
+        "*://www.indeed.com/viewjob*"
+      ],
+      "js": ["config.js", "content.js"],
+      "css": ["overlay.css"]
+    }
+  ],
+  "action": {
+    "default_title": "Capture this job"
+  }
+}

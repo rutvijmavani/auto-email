@@ -515,6 +515,63 @@ The listing fallback result is still saved regardless.
 
 ---
 
+## PHASE 7 — Log Observability ✅ DONE (2026-07-16)
+
+Root-cause driver: The Accenture 866-drop incident (2026-07-16) took 5 hours to investigate because alert emails showed raw JSON blobs with no stack traces, no callsite, no payload origin. The root cause was ultimately self-resolving (stale inflight payloads from a prior deploy). Four layers were added so every future incident is answerable from the first alert email.
+
+### 7.1 Auto stack traces in JsonFormatter ✅ DONE
+**File:** `logger.py` — `JsonFormatter.format()`  
+`_auto_stack()` captures the Python call stack via `traceback.extract_stack()`, trims logging-internal frames (matches on `logging/__init__` and `logger.py` filenames), and injects it as a `stack` field for WARNING+ records that don't already have `exc_info`.
+
+**Dedup guard** prevents tight-loop log floods:
+- Per `{logger.name}:{levelno}` key: suppresses repeat injections for 60 s
+- `_STACK_SEEN` dict purged (clear-all) when it exceeds 500 entries
+- Thread-safe via `threading.Lock()`
+
+**How it interacts with `exc_info=True`:** Uses `elif` in `format()`, so `exc` and `stack` are mutually exclusive. A record with an active exception gets the traceback via `exc`; all other WARNING/ERROR records get the call stack via `stack`.
+
+### 7.2 `_build_detail_payload` raises ValueError ✅ DONE
+**Files:** `workers/scan_worker.py`, `workers/fullscan.py`  
+Both `_build_detail_payload()` implementations now validate that required platform keys are present and truthy in the built payload before returning. Raises `ValueError` with full context (company, platform, job_id, missing keys, raw underscore keys).
+
+Both call sites (lpush points) wrap in `try/except ValueError` → `logger.error(..., exc_info=True)`:
+- `exc_info=True` produces the `exc` field (full `ValueError` traceback)
+- Layer 1's `stack` injection is skipped for this record (`exc` and `stack` are mutually exclusive via the `elif` branch)
+- Sentry captures `exc_info=True` errors automatically
+
+**Before:** Malformed payload pushed to queue silently → `detail_worker` drops it 1–5 min later with no traceback.  
+**After:** Error detected at construction time → full traceback logged immediately + Sentry.
+
+### 7.3 Structured alert emails ✅ DONE
+**File:** `scripts/log_monitor.py` — `_error_table_row()`  
+Tries `json.loads(sample_line)`. On success: shows `msg` field cleanly in red, `logger`+`time` as metadata, and `stack`/`exc` as a purple pre-formatted block. Falls back to raw line display for non-JSON lines.
+
+**Before:** Alert email showed entire raw JSON blob — unreadable without manual parsing.  
+**After:** Structured, human-readable layout with call stack visible inline in the email.
+
+### 7.4 Dead Letter Queue (DLQ) ✅ DONE
+**Files:** `config.py`, `workers/detail_worker.py`, `workers/watchdog.py`
+
+**Config:** `REDIS_DETAIL_DLQ = "queue:detail:dlq"` in `config.py`
+
+**Write path** (`detail_worker._push_to_dlq(job)`): Called at both drop sites (title_only WARNING + pre-flight ERROR). Each entry is wrapped `{"_dlq_added_at": ISO, "payload": job}`. LPUSH + LTRIM 0 199 (200-entry hard cap, atomic via Redis pipeline).
+
+**Retention:** `watchdog._check_dlq_health()` runs a Lua-atomic age cleanup on every watchdog cycle. Entries older than 7 days are removed. Unparseable entries are kept (not silently discarded). Fires `Issue.WARNING` when DLQ depth > 50.
+
+**How to inspect:**
+```bash
+redis-cli lrange queue:detail:dlq 0 4 | python -c "
+import sys, json
+for l in sys.stdin:
+    l = l.strip()
+    if not l: continue
+    try: print(json.dumps(json.loads(l), indent=2))
+    except Exception: print(l)
+"
+```
+
+---
+
 ## Deployment Order
 
 ```text
