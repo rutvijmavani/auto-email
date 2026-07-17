@@ -19,9 +19,7 @@ _API_KEY = os.environ.get('EXTENSION_API_KEY', '')
 
 
 def _cors(response):
-    origin = request.headers.get('Origin', '')
-    if origin.startswith('chrome-extension://'):
-        response.headers['Access-Control-Allow-Origin'] = origin
+    response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
     response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
     return response

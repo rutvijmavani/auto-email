@@ -32,8 +32,8 @@ const SHEET_TAB = 'Responses';
 // nameMatch is a lowercase substring of the Google account display name.
 // e.g. if your name is "Rutvi Mavani", set nameMatch to "rutvi".
 const USERS = [
-  { id: 1, nameMatch: 'rutvi' },
-  { id: 2, nameMatch: '' },   // ← fill in User 2's first name
+  { id: 1, nameMatch: 'rutvij' },
+  { id: 2, nameMatch: 'disha' },   // ← fill in User 2's first name
 ];
 
 const FETCH_TIMEOUT_MS = 10000;
