@@ -184,7 +184,7 @@
     // ── ATS fingerprints in attributes + iframes ───────────────────────────
     const foundAts = new Set();
     const SCAN_ATTRS = ['src', 'href', 'action', 'data-src', 'data-href', 'data-url', 'data-apply-url', 'data-job-url'];
-    for (const el of document.querySelectorAll('*')) {
+    atsLoop: for (const el of document.querySelectorAll('*')) {
       for (const attr of SCAN_ATTRS) {
         const val = el.getAttribute(attr) || '';
         for (const hint of ATS_HINTS) {
@@ -193,6 +193,7 @@
             score += 4;
           }
         }
+        if (foundAts.size === ATS_HINTS.length) break atsLoop;
       }
     }
 

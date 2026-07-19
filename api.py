@@ -2,6 +2,7 @@ import base64
 import hmac
 import json
 import os
+import secrets
 from datetime import datetime, timezone
 
 from flask import Flask, request, jsonify, make_response, redirect
@@ -155,9 +156,17 @@ def email_push():
     The base64-decoded data is:
         {"emailAddress": "user@gmail.com", "historyId": "12345"}
 
+    Authentication: the Pub/Sub push subscription URL must include
+    ?token=<EXTENSION_API_KEY> so only Google's authenticated calls are
+    accepted. Unauthenticated requests are rejected before any decoding.
+
     We write this to the Redis queue and return 200 immediately.
     Pub/Sub retries if we return non-200, so Redis write failures return 500.
     """
+    if _API_KEY and not hmac.compare_digest(request.args.get("token", ""), _API_KEY):
+        logger.warning("email-push: unauthorized request from %s", request.remote_addr)
+        return '', 401
+
     envelope = request.get_json(silent=True)
     if not envelope or "message" not in envelope:
         logger.warning("email-push: malformed envelope — ignoring")
@@ -199,6 +208,9 @@ def _make_flow() -> Flow:
     )
 
 
+_OAUTH_NONCE_TTL = 600   # seconds — nonce expires after 10 minutes
+
+
 @app.route('/oauth/start')
 def oauth_start():
     """
@@ -208,16 +220,25 @@ def oauth_start():
     Query param: user_id (int) — must already exist in the users table.
 
     Redirects to Google's consent screen. On approval, Google calls /oauth/callback.
+    The OAuth state param carries a one-time server-generated nonce (not user_id
+    directly) so user_id is never exposed in the redirect URI.
     """
     user_id = request.args.get("user_id", type=int)
     if not user_id:
         return jsonify({"error": "user_id required"}), 400
 
+    nonce = secrets.token_urlsafe(32)
+    try:
+        get_redis().set(f"oauth:nonce:{nonce}", str(user_id), ex=_OAUTH_NONCE_TTL)
+    except Exception as e:
+        logger.error("oauth/start: failed to store nonce for user_id=%s: %s", user_id, e)
+        return jsonify({"error": "internal error"}), 500
+
     auth_url, _ = _make_flow().authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",   # force refresh token on every auth
-        state=str(user_id),
+        state=nonce,
     )
     logger.info("oauth/start redirecting user_id=%s to Google consent", user_id)
     return redirect(auth_url)
@@ -229,17 +250,37 @@ def oauth_callback():
     OAuth callback — Google redirects here after the user grants access.
     Exchanges the auth code for tokens, stores the encrypted refresh token,
     and starts the Gmail watch for this user.
+
+    The state param is a one-time nonce mapped to user_id in Redis. The nonce
+    is consumed exactly once — missing, expired, or replayed nonces are rejected.
     """
-    code    = request.args.get("code")
-    user_id = request.args.get("state", type=int)
-    error   = request.args.get("error")
+    nonce = request.args.get("state", "")
+    code  = request.args.get("code")
+    error = request.args.get("error")
 
     if error:
-        logger.warning("oauth/callback: user_id=%s denied access: %s", user_id, error)
+        logger.warning("oauth/callback: nonce=%s denied access: %s", nonce, error)
         return jsonify({"error": "access denied", "detail": error}), 400
 
-    if not code or not user_id:
+    if not code or not nonce:
         return jsonify({"error": "missing code or state"}), 400
+
+    # Resolve and consume the nonce — reject if missing, expired, or replayed
+    try:
+        raw = get_redis().getdel(f"oauth:nonce:{nonce}")
+    except Exception as e:
+        logger.error("oauth/callback: Redis error resolving nonce: %s", e)
+        return jsonify({"error": "internal error"}), 500
+
+    if raw is None:
+        logger.warning("oauth/callback: unknown or expired nonce=%s", nonce)
+        return jsonify({"error": "invalid or expired state"}), 400
+
+    try:
+        user_id = int(raw)
+    except (ValueError, TypeError):
+        logger.error("oauth/callback: corrupt nonce value for nonce=%s", nonce)
+        return jsonify({"error": "internal error"}), 500
 
     try:
         flow = _make_flow()
