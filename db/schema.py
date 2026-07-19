@@ -16,7 +16,7 @@
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from db.connection import get_conn
 from config import (
@@ -223,7 +223,7 @@ def _cleanup_custom_ats_inspection(c):
 
 
 def _cleanup_unmatched_emails(c):
-    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     c.execute("DELETE FROM unmatched_emails WHERE created_at < %s", (cutoff,))
 
 

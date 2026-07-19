@@ -29,8 +29,8 @@ Usage:
 """
 
 import base64
-import concurrent.futures
 import json
+import multiprocessing
 import os
 import re
 import socket
@@ -38,6 +38,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import google.auth.exceptions
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -126,13 +127,30 @@ def _load_model() -> None:
 
 
 def _run_with_timeout(fn, timeout: int = _INFERENCE_TIMEOUT):
-    """Run fn() in a thread; raise RuntimeError if it exceeds timeout seconds."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn)
+    """Run fn() in a forked child process; terminate it if timeout expires."""
+    def _worker(q, fn):
         try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise RuntimeError(f"inference timed out after {timeout}s")
+            q.put(("ok", fn()))
+        except Exception as exc:
+            try:
+                q.put(("err", exc))
+            except Exception:
+                q.put(("err", RuntimeError(str(exc))))
+
+    q: multiprocessing.Queue = multiprocessing.Queue()
+    p = multiprocessing.Process(target=_worker, args=(q, fn))
+    p.start()
+    p.join(timeout)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        raise RuntimeError(f"inference timed out after {timeout}s")
+    if not q.empty():
+        kind, val = q.get_nowait()
+        if kind == "ok":
+            return val
+        raise val
+    raise RuntimeError("inference process exited without result")
 
 
 def _strip_think(text: str) -> str:
@@ -560,6 +578,7 @@ def _process_notification(raw_str: str, r) -> str:
 
     email_address = payload.get("email", "")
     history_id    = payload.get("history_id", "")
+    direct_msg_id = payload.get("msg_id")  # set by catch-up path; skip history.list
 
     if not email_address or not history_id:
         logger.warning("notification missing email or history_id: %s", payload)
@@ -580,15 +599,20 @@ def _process_notification(raw_str: str, r) -> str:
     # Build an authenticated Gmail service
     try:
         gmail = _build_gmail_service(token_row)
+    except google.auth.exceptions.RefreshError as exc:
+        logger.error(
+            "OAuth revoked for user_id=%s email=%s — "
+            "user must re-authorize at /oauth/start?user_id=%s: %s",
+            user_id, email_address, user_id, exc,
+        )
+        return "discard"
     except HttpError as exc:
         if "invalid_grant" in str(exc):
-            # User revoked OAuth access — permanent, never retries on its own
             logger.error(
                 "OAuth revoked for user_id=%s email=%s — "
                 "user must re-authorize at /oauth/start?user_id=%s",
                 user_id, email_address, user_id,
             )
-            # TODO: send re-auth alert email to the user via outreach.report_templates.base
             return "discard"
         logger.error("Gmail auth failed user_id=%s: %s", user_id, exc, exc_info=True)
         return "retry"
@@ -596,44 +620,60 @@ def _process_notification(raw_str: str, r) -> str:
         logger.error("Gmail service build failed user_id=%s: %s", user_id, exc, exc_info=True)
         return "retry"
 
-    # history.list: expand notification → individual message IDs
-    start_id = token_row.get("last_history_id") or history_id
-    try:
-        history_resp = gmail.users().history().list(
-            userId="me",
-            startHistoryId=start_id,
-            historyTypes=["messageAdded"],
-        ).execute()
-    except Exception as exc:
-        logger.error("history.list failed user_id=%s: %s", user_id, exc, exc_info=True)
-        return "retry"
-
-    message_ids = [
-        added["message"]["id"]
-        for record in history_resp.get("history", [])
-        for added in record.get("messagesAdded", [])
-        if added.get("message", {}).get("id")
-    ]
-    new_history_id = history_resp.get("historyId", history_id)
+    # history.list: expand notification → individual message IDs (paginated)
+    # Catch-up payloads include msg_id directly — skip history.list entirely.
+    if direct_msg_id:
+        message_ids = [direct_msg_id]
+        new_history_id = history_id
+    else:
+        start_id = token_row.get("last_history_id") or history_id
+        message_ids = []
+        new_history_id = history_id
+        page_token = None
+        while True:
+            kwargs = dict(userId="me", startHistoryId=start_id, historyTypes=["messageAdded"])
+            if page_token:
+                kwargs["pageToken"] = page_token
+            try:
+                history_resp = gmail.users().history().list(**kwargs).execute()
+            except Exception as exc:
+                logger.error("history.list failed user_id=%s: %s", user_id, exc, exc_info=True)
+                return "retry"
+            new_history_id = history_resp.get("historyId", new_history_id)
+            message_ids.extend(
+                added["message"]["id"]
+                for record in history_resp.get("history", [])
+                for added in record.get("messagesAdded", [])
+                if added.get("message", {}).get("id")
+            )
+            page_token = history_resp.get("nextPageToken")
+            if not page_token:
+                break
 
     logger.info(
         "history.list returned %d message(s) for user_id=%s email=%s",
         len(message_ids), user_id, email_address,
     )
 
-    # Process each message; per-message errors are logged but don't abort the batch
+    # Process each message; track failures so the cursor is not advanced on error
+    any_failed = False
     for message_id in message_ids:
         try:
             _process_message(gmail, user_id, message_id)
         except RuntimeError as exc:
-            # Inference timeout or model error — log and continue; don't retry whole batch
             logger.error("inference error message_id=%s: %s", message_id, exc, exc_info=True)
+            any_failed = True
         except HttpError as exc:
             logger.error("Gmail API error message_id=%s: %s", message_id, exc, exc_info=True)
+            any_failed = True
         except Exception as exc:
             logger.error("unexpected error message_id=%s: %s", message_id, exc, exc_info=True)
+            any_failed = True
 
-    # Advance the cursor so we don't reprocess these messages on the next notification
+    if any_failed:
+        return "retry"
+
+    # Advance the cursor only after all messages processed successfully
     try:
         update_history_id(user_id, new_history_id)
     except Exception as exc:

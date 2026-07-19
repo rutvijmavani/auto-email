@@ -17,6 +17,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import google.auth.exceptions
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -75,16 +76,17 @@ def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None
     email_address = profile["emailAddress"]
     new_history_id = resp.get("historyId", last_history_id)
 
+    import json
     message_count = 0
     for record in resp.get("history", []):
         for added in record.get("messagesAdded", []):
             msg_id = added.get("message", {}).get("id")
             if not msg_id:
                 continue
-            import json
             payload = json.dumps({
                 "email": email_address,
                 "history_id": new_history_id,
+                "msg_id": msg_id,
             })
             get_redis().lpush(REDIS_EMAIL_PUSH, payload)
             message_count += 1
@@ -146,6 +148,14 @@ def main() -> int:
 
         try:
             gmail = _build_gmail_service(token_row)
+        except google.auth.exceptions.RefreshError as exc:
+            logger.error(
+                "OAuth revoked for user_id=%s email=%s — "
+                "user must re-authorize at /oauth/start?user_id=%s: %s",
+                user_id, gmail_email, user_id, exc,
+            )
+            errors += 1
+            continue
         except HttpError as exc:
             if "invalid_grant" in str(exc):
                 logger.error(

@@ -184,7 +184,8 @@
     // ── ATS fingerprints in attributes + iframes ───────────────────────────
     const foundAts = new Set();
     const SCAN_ATTRS = ['src', 'href', 'action', 'data-src', 'data-href', 'data-url', 'data-apply-url', 'data-job-url'];
-    atsLoop: for (const el of document.querySelectorAll('*')) {
+    const attrSelector = SCAN_ATTRS.map(a => '[' + a + ']').join(',');
+    atsLoop: for (const el of document.querySelectorAll(attrSelector)) {
       for (const attr of SCAN_ATTRS) {
         const val = el.getAttribute(attr) || '';
         for (const hint of ATS_HINTS) {
@@ -503,14 +504,18 @@
                        payload.career_page || '', '', '', '', payload.notes || ''];
           const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/` +
                       `${encodeURIComponent(PROSPECTIVE_SHEET_TAB)}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
           try {
             const res = await fetch(url, {
               method: 'POST',
               headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
               body: JSON.stringify({ values: [row] }),
+              signal: ctrl.signal,
             });
+            clearTimeout(t);
             resolve(res.ok);
-          } catch (_) { resolve(false); }
+          } catch (_) { clearTimeout(t); resolve(false); }
         });
       } catch (_) { resolve(false); }
     });

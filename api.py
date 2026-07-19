@@ -165,7 +165,7 @@ def email_push():
     We write this to the Redis queue and return 200 immediately.
     Pub/Sub retries if we return non-200, so Redis write failures return 500.
     """
-    if _API_KEY and not hmac.compare_digest(request.args.get("token", ""), _API_KEY):
+    if not _API_KEY or not hmac.compare_digest(request.args.get("token", ""), _API_KEY):
         logger.warning("email-push: unauthorized request from %s", request.remote_addr)
         return '', 401
 
