@@ -222,6 +222,11 @@ def _cleanup_custom_ats_inspection(c):
     """)
 
 
+def _cleanup_unmatched_emails(c):
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    c.execute("DELETE FROM unmatched_emails WHERE created_at < %s", (cutoff,))
+
+
 def _cleanup_seen_job_ids(c):
     """
     Remove seen_job_ids entries for companies no longer in prospective_companies.
@@ -711,6 +716,50 @@ def init_db():
         ON custom_ats_inspection(company)
     """)
 
+    # ── Email status tracking tables ─────────────────────────────────────────
+
+    # gmail_tokens: one row per user — OAuth credentials and Gmail watch state.
+    # refresh_token_enc is AES-256 encrypted (Fernet); never store the raw token.
+    # last_history_id: last Gmail historyId processed for this user — required
+    # to call history.list() correctly on each Pub/Sub notification and to
+    # catch up on missed emails after a watch gap.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS gmail_tokens (
+            user_id           INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            gmail_email       TEXT NOT NULL UNIQUE,
+            refresh_token_enc TEXT NOT NULL,
+            watch_id          TEXT,
+            watch_expires_at  TIMESTAMPTZ,
+            last_history_id   TEXT,
+            created_at        TIMESTAMPTZ DEFAULT NOW(),
+            updated_at        TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+    # unmatched_emails: job-related emails where the matching funnel returned
+    # 0 candidates. Surfaced in the daily digest so the user can manually act.
+    # Cleaned up after 30 days by _cleanup_unmatched_emails.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS unmatched_emails (
+            id                BIGSERIAL PRIMARY KEY,
+            user_id           INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            email_from        TEXT,
+            email_subject     TEXT,
+            extracted_company TEXT,
+            extracted_title   TEXT,
+            extracted_status  TEXT,
+            email_snippet     TEXT,
+            received_at       TIMESTAMPTZ,
+            dismissed         BOOLEAN DEFAULT FALSE,
+            created_at        TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_unmatched_emails_user_created
+        ON unmatched_emails(user_id, created_at)
+    """)
+
     # ── Phase 1: Incremental dedup tables ────────────────────────────────────
 
     # seen_job_ids: one row per (company, job_id) pair.
@@ -1139,6 +1188,31 @@ def init_db():
           ADD COLUMN IF NOT EXISTS user_id INT REFERENCES users(id) ON DELETE SET NULL
     """)
 
+    # ── Email status tracking migrations (2026-07-18) ─────────────────────────
+    # New columns on applications for email-driven status tracking.
+    # All nullable — existing rows are unaffected.
+    for col, defn in [
+        # email_status: hiring process dimension set exclusively by email_processor.
+        # Values: phone_screen / interview / assessment / offer / rejected
+        # NULL means no email received yet.
+        ("email_status", "TEXT"),
+        # ats_company: canonical company name as written by the ATS in their email.
+        # e.g. user typed "stripe", ATS says "Stripe Inc." — stored here.
+        # Matching funnel uses this over user-typed company when available.
+        ("ats_company",  "TEXT"),
+        # ats_title: canonical job title from the ATS email.
+        ("ats_title",    "TEXT"),
+    ]:
+        c.execute(
+            f"ALTER TABLE applications ADD COLUMN IF NOT EXISTS {col} {defn}"
+        )
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_applications_email_status
+        ON applications(email_status)
+        WHERE email_status IS NOT NULL
+    """)
+
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
     _cleanup_closed_application_recruiters(c)
@@ -1159,6 +1233,7 @@ def init_db():
     _cleanup_resolved_diagnostics(c)
     _cleanup_custom_ats_inspection(c)
     _cleanup_seen_job_ids(c)
+    _cleanup_unmatched_emails(c)
 
     conn.commit()
     conn.close()

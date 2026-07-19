@@ -71,7 +71,7 @@ import subprocess
 import sys
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -86,6 +86,7 @@ from config import (
     REDIS_DETAIL_ADAPTIVE,
     REDIS_DETAIL_FULLSCAN,
     REDIS_DETAIL_DLQ,
+    REDIS_EMAIL_DLQ,
     STREAM_CONSUMER_GROUP,
     EMAIL,
     APP_PASSWORD,
@@ -125,8 +126,9 @@ def _systemd_available() -> bool:
 _SYSTEMD_AVAILABLE = _systemd_available()
 
 # Managed systemd unit names — used for is-active checks and restarts
-_UNIT_SCHEDULER = "recruiter-scheduler"
-_UNIT_WATCHDOG  = "recruiter-watchdog"
+_UNIT_SCHEDULER  = "recruiter-scheduler"
+_UNIT_WATCHDOG   = "recruiter-watchdog"
+_UNIT_EMAIL_PROC = "email-processor"
 
 
 # ─────────────────────────────────────────
@@ -969,28 +971,32 @@ return #all - #keep
 
 def _check_dlq_health(r, issues: list) -> None:
     """Run age-based DLQ cleanup and alert if depth exceeds threshold."""
-    try:
-        cutoff_ts = time.time() - (_DLQ_AGE_DAYS * 86400)
-        cutoff    = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%dT%H:%M:%S+00:00")
-        r.eval(_DLQ_CLEANUP_LUA, 1, REDIS_DETAIL_DLQ, cutoff)
-    except Exception:
-        pass  # Lua cleanup is best-effort; depth check still runs
+    for dlq_key, label in [
+        (REDIS_DETAIL_DLQ, "queue:detail:dlq"),
+        (REDIS_EMAIL_DLQ,  "queue:email:dlq"),
+    ]:
+        try:
+            cutoff_ts = time.time() - (_DLQ_AGE_DAYS * 86400)
+            cutoff    = datetime.utcfromtimestamp(cutoff_ts).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            r.eval(_DLQ_CLEANUP_LUA, 1, dlq_key, cutoff)
+        except Exception:
+            pass  # Lua cleanup is best-effort; depth check still runs
 
-    try:
-        depth = int(r.llen(REDIS_DETAIL_DLQ) or 0)
-    except Exception:
-        return
+        try:
+            depth = int(r.llen(dlq_key) or 0)
+        except Exception:
+            continue
 
-    if depth > _DLQ_ALERT_THRESHOLD:
-        issues.append(Issue(Issue.WARNING, "queue:detail:dlq",
-            f"depth={depth} — {depth} malformed payloads in dead-letter queue "
-            f"(threshold={_DLQ_ALERT_THRESHOLD}). "
-            f"Inspect: redis-cli lrange {REDIS_DETAIL_DLQ} 0 4",
-            alert_type="dlq_depth_high",
-        ))
-    else:
-        issues.append(Issue(Issue.OK, "queue:detail:dlq",
-            f"depth={depth} (≤{_DLQ_ALERT_THRESHOLD} OK)"))
+        if depth > _DLQ_ALERT_THRESHOLD:
+            issues.append(Issue(Issue.WARNING, label,
+                f"depth={depth} — {depth} malformed payloads in dead-letter queue "
+                f"(threshold={_DLQ_ALERT_THRESHOLD}). "
+                f"Inspect: redis-cli lrange {dlq_key} 0 4",
+                alert_type=f"dlq_depth_high_{label.replace(':', '_')}",
+            ))
+        else:
+            issues.append(Issue(Issue.OK, label,
+                f"depth={depth} (≤{_DLQ_ALERT_THRESHOLD} OK)"))
 
 
 def _check_pel_health(r, issues: list) -> None:
@@ -1489,6 +1495,30 @@ def check_coverage(r) -> list:
     return issues
 
 
+def _check_unmatched_emails(issues: list) -> None:
+    """Purge unmatched_emails rows older than 30 days and report current count."""
+    try:
+        from db.db import get_conn
+        conn = get_conn()
+        try:
+            cutoff = (datetime.utcnow() - timedelta(days=30)).isoformat()
+            conn.execute(
+                "DELETE FROM unmatched_emails WHERE created_at < %s", (cutoff,)
+            )
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM unmatched_emails"
+            ).fetchone()
+            count = row["c"] if row else 0
+            conn.commit()
+        finally:
+            conn.close()
+        issues.append(Issue(Issue.OK, "unmatched_emails",
+            f"{count} unmatched email(s) pending manual review"))
+    except Exception as exc:
+        issues.append(Issue(Issue.WARNING, "unmatched_emails",
+            f"Could not query unmatched_emails table: {exc}"))
+
+
 def check_redis_persistence(r) -> list:
     try:
         info     = r.info("persistence")
@@ -1556,8 +1586,9 @@ def check_systemd_services() -> list:
     # Check watchdog itself for informational awareness (we can't restart
     # ourselves from inside, but the OnFailure alert will fire if we're dead)
     for unit, healable in [
-        (_UNIT_SCHEDULER, True),
-        (_UNIT_WATCHDOG,  False),   # we're the watchdog — can't self-heal
+        (_UNIT_SCHEDULER,  True),
+        (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
+        (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
     ]:
         try:
             result = subprocess.run(
@@ -1624,6 +1655,7 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     issues.extend(check_coverage(r))
     issues.extend(check_hung_workers(r))
     issues.extend(check_redis_persistence(r))
+    _check_unmatched_emails(issues)
     return issues
 
 
