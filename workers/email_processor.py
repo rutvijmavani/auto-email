@@ -140,17 +140,22 @@ def _run_with_timeout(fn, timeout: int = _INFERENCE_TIMEOUT):
     q: multiprocessing.Queue = multiprocessing.Queue()
     p = multiprocessing.Process(target=_worker, args=(q, fn))
     p.start()
-    p.join(timeout)
-    if p.is_alive():
-        p.terminate()
-        p.join()
-        raise RuntimeError(f"inference timed out after {timeout}s")
-    if not q.empty():
-        kind, val = q.get_nowait()
-        if kind == "ok":
-            return val
-        raise val
-    raise RuntimeError("inference process exited without result")
+    try:
+        p.join(timeout)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+            raise RuntimeError(f"inference timed out after {timeout}s")
+        if not q.empty():
+            kind, val = q.get_nowait()
+            if kind == "ok":
+                return val
+            raise val
+        raise RuntimeError("inference process exited without result")
+    finally:
+        q.close()
+        q.join_thread()
+        p.close()
 
 
 def _strip_think(text: str) -> str:
@@ -413,15 +418,20 @@ def _write_unmatched(
     status: "str | None",
     body: str,
     received_at: "str | None",
+    gmail_message_id: "str | None" = None,
 ) -> None:
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO unmatched_emails
-                (user_id, email_from, email_subject, extracted_company,
-                 extracted_title, extracted_status, email_snippet, received_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (user_id, email_from, subject, company, title, status,
-              body[:300] if body else None,
+                (user_id, gmail_message_id, email_from, email_subject,
+                 extracted_company, extracted_title, extracted_status,
+                 email_snippet, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (gmail_message_id)
+            WHERE gmail_message_id IS NOT NULL
+            DO NOTHING
+        """, (user_id, gmail_message_id, email_from, subject, company,
+              title, status, body[:300] if body else None,
               received_at or None))
 
 
@@ -534,7 +544,7 @@ def _process_message(gmail, user_id: int, message_id: str) -> None:
     candidates = _match_candidates(user_id, company, title, sender)
 
     if not candidates:
-        _write_unmatched(user_id, sender, subject, company, title, status, snippet, date_str)
+        _write_unmatched(user_id, sender, subject, company, title, status, snippet, date_str, message_id)
         logger.info("unmatched: 0 candidates for company=%r user_id=%s message_id=%s", company, user_id, message_id)
         return
 
@@ -549,7 +559,7 @@ def _process_message(gmail, user_id: int, message_id: str) -> None:
                 "disambiguation failed company=%r candidates=%s message_id=%s",
                 company, [c["id"] for c in top3], message_id,
             )
-            _write_unmatched(user_id, sender, subject, company, title, status, snippet, date_str)
+            _write_unmatched(user_id, sender, subject, company, title, status, snippet, date_str, message_id)
             return
 
     _update_application(app_id, status, company, title)
@@ -636,6 +646,20 @@ def _process_notification(raw_str: str, r) -> str:
                 kwargs["pageToken"] = page_token
             try:
                 history_resp = gmail.users().history().list(**kwargs).execute()
+            except HttpError as exc:
+                if exc.resp.status == 404:
+                    logger.warning(
+                        "history.list: startHistoryId=%s expired for user_id=%s — "
+                        "resetting cursor to notification history_id=%s",
+                        start_id, user_id, history_id,
+                    )
+                    try:
+                        update_history_id(user_id, history_id)
+                    except Exception as update_exc:
+                        logger.error("failed to reset history cursor user_id=%s: %s", user_id, update_exc)
+                    return "discard"
+                logger.error("history.list failed user_id=%s: %s", user_id, exc, exc_info=True)
+                return "retry"
             except Exception as exc:
                 logger.error("history.list failed user_id=%s: %s", user_id, exc, exc_info=True)
                 return "retry"

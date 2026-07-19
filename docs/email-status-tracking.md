@@ -461,13 +461,13 @@ The only blocked transitions are backward intermediate moves
 
 ### Dynamic tunnel URL — fully automatic
 
-Both the Pub/Sub push endpoint and the OAuth redirect URI follow the
-current Cloudflare tunnel URL automatically. No manual intervention is
-ever needed when the tunnel restarts.
+The Cloudflare tunnel URL changes every time `cloudflared` restarts
+(trycloudflare.com quick tunnels are ephemeral). Two mechanisms keep the
+system working automatically:
 
-`scripts/tunnel_manager.py` already patches the GitHub Gist when a new
-tunnel URL is detected. It is extended to also update the Pub/Sub push
-subscription in the same step:
+**Pub/Sub push endpoint:** `scripts/tunnel_manager.py` patches the GitHub
+Gist when a new tunnel URL is detected. It is extended to also update the
+Pub/Sub push subscription in the same step:
 
 ```text
 Tunnel restarts → new trycloudflare.com URL detected
@@ -477,29 +477,45 @@ tunnel_manager.py calls Pub/Sub API    →  push endpoint updated instantly
     subscription.modify_push_config(new_url + '/email-push?token=<key>')
 ```
 
-The OAuth redirect URI is resolved dynamically by `api.py` at the moment
-the user visits `/oauth/start` — it reads `api_base` from the Gist and
-appends `/oauth/callback`:
+**OAuth redirect URI — Cloudflare Worker shim:** Google does not allow
+wildcard redirect URIs for Web Application OAuth clients. The solution is
+a permanent Cloudflare Worker (`mail-oauth-redirect.rutvijmavani.workers.dev`)
+that acts as a stable redirect shim — registered once in Google Console,
+never changes, and always follows the current tunnel:
 
 ```text
 User visits /oauth/start
     ↓
 api.py fetches GIST_CONFIG_URL → reads current api_base
     ↓
-redirect_uri = api_base + '/oauth/callback'   (stored in nonce alongside user_id)
+redirect_uri = 'https://mail-oauth-redirect.rutvijmavani.workers.dev/oauth/callback'
+(stored in nonce alongside user_id)
     ↓
-Google consent screen → redirects back to the current tunnel URL
+Google consent screen → redirects to Worker URL
     ↓
-/oauth/callback reads redirect_uri from nonce → builds flow with same URI → works ✓
+Worker fetches Gist → gets current tunnel URL → 302 to tunnel/oauth/callback
+    ↓
+api.py /oauth/callback handles token exchange using Worker URL as redirect_uri ✓
 ```
 
-If the Gist fetch fails (network blip), `api.py` falls back to
-`GMAIL_OAUTH_REDIRECT_URI` env var — set this to any valid static URI
-as a safety net.
+The Worker code (~10 lines):
+```javascript
+export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const gist = await fetch('https://gist.githubusercontent.com/rutvijmavani/4f400d820fd0b390c15dd7d6592d8053/raw/api-config.json');
+    const { api_base } = await gist.json();
+    const target = api_base.replace(/\/$/, '') + url.pathname + url.search;
+    return Response.redirect(target, 302);
+  }
+};
+```
 
-**One-time Google Console setup:** add `https://*.trycloudflare.com/*`
-as an authorized redirect URI pattern — this wildcard covers every future
-tunnel URL permanently. Do this once and never touch it again.
+Free tier: 100,000 requests/day. Actual usage: ~2 requests total
+(one per user authorization, which happens once per user ever).
+
+If the Gist fetch fails (network blip), `api.py` falls back to
+`GMAIL_OAUTH_REDIRECT_URI` env var.
 
 ---
 
@@ -798,22 +814,87 @@ body = " ".join(body.split()[:2000])
 ### Model inference hangs indefinitely
 
 `llm.create_chat_completion()` has no built-in timeout. If the model hangs,
-the worker blocks forever and no further emails are processed.
+the worker blocks forever and no further emails are processed. A thread-based
+timeout cannot actually kill a hung C++ inference call — the thread keeps
+running after the timeout fires.
 
-**Fix:** run inference in a thread with a 120-second timeout; treat a timeout
-as a transient failure so the retry mechanism handles it:
+**Fix:** run inference in a forked child process with a 120-second timeout.
+`process.terminate()` sends SIGTERM to the child, actually killing the C++
+call. The parent continues immediately:
 
 ```python
-import concurrent.futures
+import multiprocessing
 
-def run_with_timeout(fn, timeout=120):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        future = ex.submit(fn)
+def _run_with_timeout(fn, timeout=120):
+    def _worker(q, fn):
         try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            raise RuntimeError("inference timeout")
+            q.put(("ok", fn()))
+        except Exception as exc:
+            try:
+                q.put(("err", exc))
+            except Exception:
+                q.put(("err", RuntimeError(str(exc))))
+
+    q = multiprocessing.Queue()
+    p = multiprocessing.Process(target=_worker, args=(q, fn))
+    p.start()
+    try:
+        p.join(timeout)
+        if p.is_alive():
+            p.terminate()
+            p.join()
+            raise RuntimeError(f"inference timed out after {timeout}s")
+        if not q.empty():
+            kind, val = q.get_nowait()
+            if kind == "ok":
+                return val
+            raise val
+        raise RuntimeError("inference process exited without result")
+    finally:
+        q.close()
+        q.join_thread()  # drain feeder thread
+        p.close()        # release process handle
 ```
+
+On Linux, `fork()` gives the child process a copy-on-write view of the
+parent's memory — the loaded `_llm` object is available in the child
+without reloading the model. Terminating the child does not affect the
+parent's model state (model weights are mmap'd read-only).
+
+### Gmail historyId expiry (404)
+
+Gmail retains history records for approximately 7 days. If
+`last_history_id` stored in the DB is older than that, `history.list`
+returns HTTP 404. The generic retry path would loop forever on a stale
+cursor that will never become valid.
+
+**Fix:** detect `HttpError` with status 404 on `history.list`, reset the
+cursor to the current notification's `history_id` (which is always fresh),
+and return `"discard"`:
+
+```python
+except HttpError as exc:
+    if exc.resp.status == 404:
+        logger.warning("startHistoryId expired — resetting cursor to %s", history_id)
+        update_history_id(user_id, history_id)
+        return "discard"   # missed messages unrecoverable; cursor now valid
+    return "retry"
+```
+
+Missed messages during the gap are unrecoverable, but the cursor is
+immediately reset so all future notifications work correctly.
+
+### Unmatched email duplicates on retry
+
+When `any_failed=True` after processing a batch, the notification returns
+`"retry"` without advancing the cursor. On the next attempt, all messages
+in the batch are reprocessed — including any that already wrote a row to
+`unmatched_emails`. A plain `INSERT` would create duplicate rows.
+
+**Fix:** `unmatched_emails` has a `gmail_message_id` column with a partial
+unique index (`WHERE gmail_message_id IS NOT NULL`). `_write_unmatched`
+uses `ON CONFLICT (gmail_message_id) WHERE gmail_message_id IS NOT NULL DO NOTHING`
+so retry attempts are silent no-ops for already-written rows.
 
 ### OAuth token revoked
 
@@ -920,6 +1001,7 @@ cleanup.
 |---|---|---|
 | `id` | SERIAL PK | Auto-increment |
 | `user_id` | INT (FK → users) | Which user this email belongs to |
+| `gmail_message_id` | TEXT (UNIQUE partial) | Gmail message ID — deduplication key; partial unique index `WHERE NOT NULL` so retry attempts are silent no-ops |
 | `email_from` | TEXT | Sender address |
 | `email_subject` | TEXT | Subject line |
 | `extracted_company` | TEXT | Company name as extracted by Qwen |
@@ -929,6 +1011,11 @@ cleanup.
 | `received_at` | TIMESTAMPTZ | When the email arrived in the inbox |
 | `dismissed` | BOOLEAN | True if user dismissed without linking |
 | `created_at` | TIMESTAMPTZ | When this record was written |
+
+**Indexes:**
+- `idx_unmatched_emails_user_created` on `(user_id, created_at)` — user-scoped queries
+- `idx_unmatched_emails_message_id` unique partial on `(gmail_message_id) WHERE NOT NULL` — retry dedup
+- `idx_unmatched_emails_created_at` on `(created_at)` — global retention delete in `_cleanup_unmatched_emails`
 
 ---
 
@@ -1074,16 +1161,22 @@ deployment environment:
 2. **Pub/Sub topic and subscription** — Create a push subscription pointing
    to `<tunnel-url>/email-push?token=<EXTENSION_API_KEY>`; `tunnel_manager.py`
    keeps the URL current automatically after the first setup
-3. **OAuth2 credentials** — Reuse the existing OAuth 2.0 Client ID (already
-   created for the Chrome extension). Add `https://*.trycloudflare.com/*` as
-   an authorized redirect URI — this wildcard covers every future tunnel URL
-   permanently. Each user authorizes once via `/oauth/start?user_id=N`.
-4. **`GIST_CONFIG_URL` env var** — Set to the raw Gist URL (same value as in
+3. **OAuth2 credentials** — Create a new Web Application OAuth 2.0 Client ID
+   in Google Console (separate from the Chrome Extension client). Add exactly
+   one authorized redirect URI:
+   `https://mail-oauth-redirect.rutvijmavani.workers.dev/oauth/callback`
+   This never changes — the Cloudflare Worker handles all future tunnel URL
+   changes automatically. Each user authorizes once via `/oauth/start?user_id=N`.
+4. **Cloudflare Worker** — Deploy `mail-oauth-redirect` to Cloudflare Workers
+   (free tier). Already live at
+   `https://mail-oauth-redirect.rutvijmavani.workers.dev`. Reads `api_base`
+   from the Gist and 302-redirects all OAuth callbacks to the current tunnel.
+5. **`GIST_CONFIG_URL` env var** — Set to the raw Gist URL (same value as in
    `chrome-extension/config.js`). `api.py` reads it to build the dynamic
    redirect URI at OAuth start time.
-5. **`GMAIL_OAUTH_REDIRECT_URI` env var** — Set to any valid static fallback
-   URI (e.g. `http://localhost:5000/oauth/callback`) used when the Gist is
-   unreachable.
+6. **`GMAIL_OAUTH_REDIRECT_URI` env var** — Set to the Worker URL
+   (`https://mail-oauth-redirect.rutvijmavani.workers.dev/oauth/callback`).
+   Used as fallback when the Gist is unreachable.
 6. **Model download** — Download the model to the server (one-time):
    ```bash
    wget https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf \

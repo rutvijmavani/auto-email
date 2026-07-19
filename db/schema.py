@@ -743,6 +743,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS unmatched_emails (
             id                BIGSERIAL PRIMARY KEY,
             user_id           INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            gmail_message_id  TEXT,
             email_from        TEXT,
             email_subject     TEXT,
             extracted_company TEXT,
@@ -756,8 +757,24 @@ def init_db():
     """)
 
     c.execute("""
+        ALTER TABLE unmatched_emails
+        ADD COLUMN IF NOT EXISTS gmail_message_id TEXT
+    """)
+
+    c.execute("""
         CREATE INDEX IF NOT EXISTS idx_unmatched_emails_user_created
         ON unmatched_emails(user_id, created_at)
+    """)
+
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unmatched_emails_message_id
+        ON unmatched_emails(gmail_message_id)
+        WHERE gmail_message_id IS NOT NULL
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_unmatched_emails_created_at
+        ON unmatched_emails(created_at)
     """)
 
     # ── Phase 1: Incremental dedup tables ────────────────────────────────────
