@@ -5,6 +5,7 @@ import os
 import secrets
 from datetime import datetime, timezone
 
+import requests as _requests
 from flask import Flask, request, jsonify, make_response, redirect
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
@@ -22,8 +23,9 @@ from workers.redis_client import get_redis
 _GMAIL_SCOPES       = ["https://www.googleapis.com/auth/gmail.readonly"]
 _CLIENT_ID          = os.environ.get("GMAIL_CLIENT_ID", "")
 _CLIENT_SECRET      = os.environ.get("GMAIL_CLIENT_SECRET", "")
-_REDIRECT_URI       = os.environ.get("GMAIL_OAUTH_REDIRECT_URI", "")
+_REDIRECT_URI       = os.environ.get("GMAIL_OAUTH_REDIRECT_URI", "")  # fallback when Gist unavailable
 _PUBSUB_TOPIC       = os.environ.get("GMAIL_PUBSUB_TOPIC", "")
+_GIST_CONFIG_URL    = os.environ.get("GIST_CONFIG_URL", "")  # same Gist used by Chrome extension
 
 init_logging('api')
 logger = get_logger(__name__)
@@ -193,7 +195,26 @@ def email_push():
 
 # ── Gmail OAuth ───────────────────────────────────────────────────────────────
 
-def _make_flow() -> Flow:
+def _get_redirect_uri() -> str:
+    """
+    Return the OAuth redirect URI for the current tunnel URL.
+
+    Fetches api_base from the GitHub Gist (kept current by tunnel_manager.py)
+    and appends /oauth/callback. Falls back to GMAIL_OAUTH_REDIRECT_URI env var
+    when the Gist is unreachable or GIST_CONFIG_URL is not set.
+    """
+    if _GIST_CONFIG_URL:
+        try:
+            resp = _requests.get(_GIST_CONFIG_URL, timeout=5)
+            base = resp.json().get("api_base", "").rstrip("/")
+            if base:
+                return f"{base}/oauth/callback"
+        except Exception as exc:
+            logger.warning("oauth: Gist fetch failed, falling back to env var: %s", exc)
+    return _REDIRECT_URI
+
+
+def _make_flow(redirect_uri: str) -> Flow:
     return Flow.from_client_config(
         client_config={
             "web": {
@@ -204,7 +225,7 @@ def _make_flow() -> Flow:
             }
         },
         scopes=_GMAIL_SCOPES,
-        redirect_uri=_REDIRECT_URI,
+        redirect_uri=redirect_uri,
     )
 
 
@@ -227,14 +248,19 @@ def oauth_start():
     if not user_id:
         return jsonify({"error": "user_id required"}), 400
 
+    redirect_uri = _get_redirect_uri()
     nonce = secrets.token_urlsafe(32)
     try:
-        get_redis().set(f"oauth:nonce:{nonce}", str(user_id), ex=_OAUTH_NONCE_TTL)
+        get_redis().set(
+            f"oauth:nonce:{nonce}",
+            json.dumps({"user_id": user_id, "redirect_uri": redirect_uri}),
+            ex=_OAUTH_NONCE_TTL,
+        )
     except Exception as e:
         logger.error("oauth/start: failed to store nonce for user_id=%s: %s", user_id, e)
         return jsonify({"error": "internal error"}), 500
 
-    auth_url, _ = _make_flow().authorization_url(
+    auth_url, _ = _make_flow(redirect_uri).authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",   # force refresh token on every auth
@@ -277,13 +303,15 @@ def oauth_callback():
         return jsonify({"error": "invalid or expired state"}), 400
 
     try:
-        user_id = int(raw)
-    except (ValueError, TypeError):
+        data = json.loads(raw)
+        user_id      = int(data["user_id"])
+        redirect_uri = data.get("redirect_uri") or _REDIRECT_URI
+    except (ValueError, TypeError, KeyError):
         logger.error("oauth/callback: corrupt nonce value for nonce=%s", nonce)
         return jsonify({"error": "internal error"}), 500
 
     try:
-        flow = _make_flow()
+        flow = _make_flow(redirect_uri)
         flow.fetch_token(code=code)
         creds = flow.credentials
     except Exception as e:

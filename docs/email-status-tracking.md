@@ -459,27 +459,47 @@ NULL → phone_screen → offer                  ✓
 The only blocked transitions are backward intermediate moves
 (`interview → phone_screen`) which have no real-world meaning.
 
-### Push subscription URL stability
+### Dynamic tunnel URL — fully automatic
 
-Pub/Sub requires a fixed push endpoint URL registered at subscription
-creation time. The Cloudflare tunnel URL can change, which would break
-delivery. The existing `scripts/tunnel_manager.py` already handles tunnel
-URL changes by updating the GitHub Gist (used by the Chrome extension).
-It is extended to also update the Pub/Sub push endpoint in the same step:
+Both the Pub/Sub push endpoint and the OAuth redirect URI follow the
+current Cloudflare tunnel URL automatically. No manual intervention is
+ever needed when the tunnel restarts.
+
+`scripts/tunnel_manager.py` already patches the GitHub Gist when a new
+tunnel URL is detected. It is extended to also update the Pub/Sub push
+subscription in the same step:
 
 ```text
-Tunnel URL changes
+Tunnel restarts → new trycloudflare.com URL detected
     ↓
-tunnel_manager.py detects new URL
-    ↓
-├── Updates GitHub Gist         (Chrome extension picks up new URL)
-└── Calls Pub/Sub API:
-    subscription.modify_push_config(new_url + '/email-push')
-    (Pub/Sub push endpoint updated instantly, no messages lost)
+tunnel_manager.py patches GitHub Gist  →  Chrome extension picks up new URL
+tunnel_manager.py calls Pub/Sub API    →  push endpoint updated instantly
+    subscription.modify_push_config(new_url + '/email-push?token=<key>')
 ```
 
-One script, one trigger, both consumers updated automatically. No manual
-intervention required and no money spent.
+The OAuth redirect URI is resolved dynamically by `api.py` at the moment
+the user visits `/oauth/start` — it reads `api_base` from the Gist and
+appends `/oauth/callback`:
+
+```text
+User visits /oauth/start
+    ↓
+api.py fetches GIST_CONFIG_URL → reads current api_base
+    ↓
+redirect_uri = api_base + '/oauth/callback'   (stored in nonce alongside user_id)
+    ↓
+Google consent screen → redirects back to the current tunnel URL
+    ↓
+/oauth/callback reads redirect_uri from nonce → builds flow with same URI → works ✓
+```
+
+If the Gist fetch fails (network blip), `api.py` falls back to
+`GMAIL_OAUTH_REDIRECT_URI` env var — set this to any valid static URI
+as a safety net.
+
+**One-time Google Console setup:** add `https://*.trycloudflare.com/*`
+as an authorized redirect URI pattern — this wildcard covers every future
+tunnel URL permanently. Do this once and never touch it again.
 
 ---
 
@@ -1052,12 +1072,20 @@ deployment environment:
 
 1. **Google Cloud project** — Enable Gmail API and Pub/Sub API
 2. **Pub/Sub topic and subscription** — Create a push subscription pointing
-   to the `/email-push` webhook URL
-3. **OAuth2 credentials** — Create credentials for the Gmail read scope;
-   each user authorizes once via the setup URL
-4. **Model download** — Download the model to the server (one-time):
+   to `<tunnel-url>/email-push?token=<EXTENSION_API_KEY>`; `tunnel_manager.py`
+   keeps the URL current automatically after the first setup
+3. **OAuth2 credentials** — Reuse the existing OAuth 2.0 Client ID (already
+   created for the Chrome extension). Add `https://*.trycloudflare.com/*` as
+   an authorized redirect URI — this wildcard covers every future tunnel URL
+   permanently. Each user authorizes once via `/oauth/start?user_id=N`.
+4. **`GIST_CONFIG_URL` env var** — Set to the raw Gist URL (same value as in
+   `chrome-extension/config.js`). `api.py` reads it to build the dynamic
+   redirect URI at OAuth start time.
+5. **`GMAIL_OAUTH_REDIRECT_URI` env var** — Set to any valid static fallback
+   URI (e.g. `http://localhost:5000/oauth/callback`) used when the Gist is
+   unreachable.
+6. **Model download** — Download the model to the server (one-time):
    ```bash
-   hf download lmstudio-community/Qwen3-8B-GGUF \
-     --include "*Q4_K_M*" \
-     --local-dir ~/models/qwen3-8b
+   wget https://huggingface.co/Qwen/Qwen3-8B-GGUF/resolve/main/Qwen3-8B-Q4_K_M.gguf \
+     -O /home/opc/mail/models/Qwen3-8B-Q4_K_M.gguf
    ```
