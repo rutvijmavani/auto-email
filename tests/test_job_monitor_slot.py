@@ -132,14 +132,14 @@ class TestUpsertPollStatsSlotOffset(unittest.TestCase):
             msg="DO UPDATE SET should use COALESCE for initial_slot_offset_s (preserve-or-backfill)",
         )
 
-    def test_binding_tuple_has_four_values(self):
-        """conn.execute receives a 4-value binding: (company, platform, new_jobs, offset)."""
+    def test_binding_tuple_has_five_values(self):
+        """conn.execute receives a 5-value binding: (company, platform, new_jobs, offset, duration_s)."""
         conn, sql, params = _run_upsert(
             company="Stripe", platform="greenhouse", new_jobs=5, duration_ms=1000
         )
         self.assertIsNotNone(params)
-        self.assertEqual(len(params), 4,
-                         msg=f"Expected 4 binding values, got {len(params)}: {params}")
+        self.assertEqual(len(params), 5,
+                         msg=f"Expected 5 binding values, got {len(params)}: {params}")
 
     def test_binding_order_company_platform_new_jobs_offset(self):
         """Binding tuple order: (company, platform, new_jobs, slot_offset(company))."""

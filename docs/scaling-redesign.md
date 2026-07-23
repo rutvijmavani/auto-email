@@ -2272,7 +2272,7 @@ Rationale: RPUSH/BLPOP decouples manager from scheduler's dispatch loop and pres
 
 No `CATCHUP_WINDOW_S` constant needed. The threshold is fully derived from existing per-cycle values:
 
-```
+```text
 est_fetch_s        = scaling_params["detail"]["fetch_p75"]   (detail pool's P75 — this formula always measures detail queue capacity)
 throughput         = n_detail_workers / est_fetch_s
 time_left          = max(DELAY_WARN_S_detail - actual_delay_s, 0)
