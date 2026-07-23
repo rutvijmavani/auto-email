@@ -260,8 +260,8 @@ Two co-scheduled worker pools (see Section 9 for full design):
   detail_workers: calculated at 7 AM from expected new jobs + avg detail duration
   Both pools managed by scheduler as multiprocessing.Process children
   Liveness check every tick (5s) — dead workers replaced immediately
-  Fast error check every 5 min — error-triggered worker reduction
-  Slow throughput check every 30 min — queue-depth-driven scaling
+  Error spike check every 60s — manager.py _check_error_spikes() drives worker reduction
+  Slow throughput check every 60s — manager.py queue-delay-driven scaling
   DB pool split proportionally between the two pools (combined ≤ DB_POOL_MAXCONN - 3)
 ```
 
@@ -1222,7 +1222,7 @@ avg_detail_fetch_s    = get_30day_avg_detail_duration()    # from api_health
 detail_workers_needed = ceil((expected_new_jobs * avg_detail_fetch_s) / window_s)
 
 # Hard ceiling: both pools share the DB connection pool
-hard_ceil_combined = DB_POOL_MAXCONN - 3     # 3 reserved for scheduler + maintenance
+hard_ceil_combined = DB_POOL_MAXCONN - 3     # 3 reserved for scheduler + watchdog + API
 scan_ceil   = floor(hard_ceil_combined * 0.6)
 detail_ceil = floor(hard_ceil_combined * 0.4)
 
@@ -1466,13 +1466,12 @@ Worker reduction resolves concurrency-induced errors. But if the ATS is experien
 
 **Detection: consecutive ineffective reductions**
 
-Before every worker reduction, snapshot the current state:
+Before every deprioritize action, snapshot the current error rate:
 ```
-worker:reduction:before_rate:{platform}    # error_rate at time of reduction
-worker:reduction:ts:{platform}             # timestamp of reduction
+worker:reduction:before_rate:{platform}    # error_rate at time of deprioritize action
 ```
 
-At the next fast check (5 min later): if `current_error_rate < CONCURRENCY_ERROR_RATE_REDUCE`, the reduction worked — record the learned ceiling, reset the counter. If still high, increment:
+At the next manager cycle (60 seconds later): if `current_error_rate < CONCURRENCY_ERROR_RATE_REDUCE`, the deprioritize worked — reset the counter. If still high, increment:
 ```
 worker:consec_reductions:{platform}    TTL = 3600 (auto-clears after 1h)
 ```
