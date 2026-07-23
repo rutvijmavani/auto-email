@@ -129,6 +129,7 @@ _SYSTEMD_AVAILABLE = _systemd_available()
 _UNIT_SCHEDULER  = "recruiter-scheduler"
 _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
+_UNIT_MANAGER    = "recruiter-manager"
 
 
 # ─────────────────────────────────────────
@@ -259,6 +260,18 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "description": f"Restarted {_UNIT_SCHEDULER} via systemd (service was inactive/failed)",
                 "foreground":  True,
             },
+            f"systemd_{_UNIT_EMAIL_PROC}": {
+                "cmd_args":    _systemd_restart_cmd(_UNIT_EMAIL_PROC),
+                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
+                "description": f"Restarted {_UNIT_EMAIL_PROC} via systemd (service was inactive/failed)",
+                "foreground":  True,
+            },
+            f"systemd_{_UNIT_MANAGER}": {
+                "cmd_args":    _systemd_restart_cmd(_UNIT_MANAGER),
+                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
+                "description": f"Restarted {_UNIT_MANAGER} via systemd (service was inactive/failed)",
+                "foreground":  True,
+            },
             # Queue empty → rebuild.  Queue stall → restart workers (rebuild
             # won't help if the queue has entries but workers aren't draining it).
             "queue_poll_adaptive_empty": {
@@ -335,6 +348,16 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:fullscan stalled)",
+            },
+            f"systemd_{_UNIT_EMAIL_PROC}": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.email_processor"],
+                "log_file":    f"{_LOG_DIR}/email_processor.log",
+                "description": "Restarted email_processor process (subprocess fallback)",
+            },
+            f"systemd_{_UNIT_MANAGER}": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.manager"],
+                "log_file":    f"{_LOG_DIR}/manager.log",
+                "description": "Restarted manager process (subprocess fallback)",
             },
             # Detail queues — depth growing/stalled at CRITICAL level.
             "queue_detail_adaptive": {
@@ -1589,6 +1612,7 @@ def check_systemd_services() -> list:
         (_UNIT_SCHEDULER,  True),
         (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
+        (_UNIT_MANAGER,    True),    # standalone daemon; healable via reset-failed + restart
     ]:
         try:
             result = subprocess.run(

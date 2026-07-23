@@ -289,6 +289,32 @@ def run_health_check() -> int:
                 _row("WARNING", _label, "alive but heartbeat payload unparseable")
                 warnings += 1
 
+    # ── Manager heartbeat ─────────────────────────────────────────────────────
+    try:
+        mgr_keys = []
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:manager:*", count=50)
+            mgr_keys.extend(keys)
+            if cursor == 0:
+                break
+        if not mgr_keys:
+            _row("ERROR", "manager", "DEAD — heartbeat key missing (recruiter-manager.service down?)")
+            errors += 1
+        else:
+            raw = r.get(mgr_keys[0])
+            d   = json.loads(raw) if raw else {}
+            age_s = time.time() - float(d.get("ts", 0))
+            status = f"pid={d.get('pid','?')}  cycles={d.get('cycles',0)}  heartbeat {age_s:.0f}s ago"
+            if age_s > 180:
+                _row("ERROR", "manager", status + "  (STALE)")
+                errors += 1
+            else:
+                _row("OK", "manager", status)
+    except Exception as _mgr_err:
+        _row("WARNING", "manager", f"heartbeat check failed: {_mgr_err}")
+        warnings += 1
+
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")
     if health_raw is None:

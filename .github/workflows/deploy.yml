@@ -156,7 +156,7 @@ jobs:
             # install-systemd.sh the staging would be stale and the new directives
             # would be silently dropped.  Fail closed here so the operator knows.
             _stale_units=0
-            for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service"; do
+            for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service" "email-processor.service" "recruiter-manager.service"; do
               _src="deploy/systemd/$_unit"
               _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
               if [[ ! -f "$_staged" ]]; then
