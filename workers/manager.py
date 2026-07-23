@@ -26,8 +26,12 @@ Layer 2 signals:
 import json
 import math
 import os
+import socket
 import time
 from datetime import datetime, timezone
+
+_HOSTNAME = socket.gethostname()
+_MANAGER_HB_TTL = 180  # 3× cycle length; stale after 3 missed cycles
 
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -1253,9 +1257,11 @@ def run_manager() -> None:
 
     # ── Midnight recompute tracking ────────────────────────────────────────────
     last_midnight_date: str = ""
+    _cycle_count: int = 0
 
     while True:
         cycle_start = time.time()
+        _cycle_count += 1
 
         try:
             # ── Distributed lock — skip cycle if already running ──────────────
@@ -1367,6 +1373,16 @@ def run_manager() -> None:
             break
         except Exception as exc:
             logger.error("manager: cycle error: %s", exc, exc_info=True)
+
+        # Heartbeat — written every cycle (including lock-skip cycles)
+        try:
+            r.set(
+                f"worker:alive:manager:{_HOSTNAME}:{os.getpid()}",
+                json.dumps({"pid": os.getpid(), "ts": time.time(), "cycles": _cycle_count}),
+                ex=_MANAGER_HB_TTL,
+            )
+        except Exception:
+            pass
 
         # Sleep for remainder of cycle
         elapsed = time.time() - cycle_start

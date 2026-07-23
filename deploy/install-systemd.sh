@@ -189,12 +189,15 @@ cat > "$_SUDOERS_TMP" << EOF
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed email-processor
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-manager
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart email-processor
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-manager
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active email-processor
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-manager
 # Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
