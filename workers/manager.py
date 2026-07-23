@@ -1259,6 +1259,17 @@ def run_manager() -> None:
     last_midnight_date: str = ""
     _cycle_count: int = 0
 
+    # Write an initial heartbeat immediately so health checks during the first
+    # 60-second cycle don't report the manager as dead.
+    try:
+        r.set(
+            f"worker:alive:manager:{_HOSTNAME}:{os.getpid()}",
+            json.dumps({"pid": os.getpid(), "ts": time.time(), "cycles": 0}),
+            ex=_MANAGER_HB_TTL,
+        )
+    except Exception:
+        pass
+
     while True:
         cycle_start = time.time()
         _cycle_count += 1
