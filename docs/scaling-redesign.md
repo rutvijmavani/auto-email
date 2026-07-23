@@ -1414,7 +1414,8 @@ Fix: when lifting detail backpressure, rate-limit the flush:
     max_push_rate = n_detail_workers / est_fetch_s    (jobs/s detail can absorb; P75 from cache)
 
   Rate-limiting applies per individual job, not per batch:
-    inter_job_interval = batch_size / max_push_rate   (seconds between each job push within a batch)
+    inter_job_interval = 1 / max_push_rate            (seconds between each individual job push)
+    total_batch_time   = batch_size / max_push_rate   (total time to flush a full batch at this rate)
 
   scan_worker:  enforce inter_job_interval between each job pushed from a batch
   fullscan:     same rate
@@ -2257,7 +2258,7 @@ Single 60s cycle for everything. Scale-up confirmation = 2 cycles = 2 min. Scale
 
 Manager pushes commands to a Redis LIST; scheduler's `_manager_cmds_loop()` thread reads them via BLPOP.
 
-- Manager writes commands via `LPUSH manager:cmds <command>` each cycle
+- Manager writes commands via `RPUSH manager:cmds <command>` each cycle (FIFO — commands consumed in insertion order)
 - Scheduler daemon thread reads via `BLPOP manager:cmds 0` and applies commands:
   - `{pool}:target:{n}` — spawn or terminate workers until pool size equals N
   - `platform:deprioritize:{platform}` — push platform companies forward 300s in `poll:adaptive`
@@ -2265,14 +2266,14 @@ Manager pushes commands to a Redis LIST; scheduler's `_manager_cmds_loop()` thre
   - `platform:outage:{platform}:clear` — exit outage mode early
 - Lever 1 halt/resume uses `manager:lever1:{pool}:active` key as before (direct Redis key, no command needed)
 
-Rationale: LPUSH/BLPOP decouples manager from scheduler's dispatch loop. Commands survive a manager restart (LIST persists in Redis); BLPOP in the scheduler daemon gives sub-second latency without polling. Option A (pub/sub) loses messages during scheduler restart. Option B (embed manager in scheduler) couples failure domains.
+Rationale: RPUSH/BLPOP decouples manager from scheduler's dispatch loop and preserves FIFO ordering (BLPOP pops from the head; RPUSH appends to the tail, so the oldest command is always consumed first). Commands survive a manager restart (LIST persists in Redis); BLPOP in the scheduler daemon gives sub-second latency without polling. Option A (pub/sub) loses messages during scheduler restart. Option B (embed manager in scheduler) couples failure domains.
 
 **3. Backpressure threshold (resolved — 2026-07-21)**
 
 No `CATCHUP_WINDOW_S` constant needed. The threshold is fully derived from existing per-cycle values:
 
 ```
-est_fetch_s        = scaling_params[pool]["fetch_p75"]   (P75 from cache, same for all pools)
+est_fetch_s        = scaling_params["detail"]["fetch_p75"]   (detail pool's P75 — this formula always measures detail queue capacity)
 throughput         = n_detail_workers / est_fetch_s
 time_left          = max(DELAY_WARN_S_detail - actual_delay_s, 0)
 backpressure_depth = throughput × time_left
@@ -2757,7 +2758,7 @@ New keys manager introduces (must not collide with existing keys):
 | `manager:scaling_params` | String (JSON) | manager (every 25h) | manager | est_fetch_s + DELAY_WARN_S per pool |
 | `manager:worker_ceil:{pool}` | STRING | manager (Layer 1) | manager, scheduler | Pool ceiling from latest recompute |
 | `daily_peak:running:{pool}:{date}` | STRING | manager (Layer 0) | manager (Layer 1) | Peak util≥0.50 worker count for peak_Nd formula |
-| `manager:cmds` | List | manager | scheduler daemon thread | Worker add/remove/deprioritize/outage commands (LPUSH by manager, BLPOP by scheduler) |
+| `manager:cmds` | List | manager | scheduler daemon thread | Worker add/remove/deprioritize/outage commands (RPUSH by manager for FIFO, BLPOP by scheduler) |
 | `manager:backpressure:threshold:{pool}` | STRING | manager (Layer 0) | watchdog | Computed backpressure_depth for this pool |
 | `manager:borrow:{source}:{target}` | STRING | manager | manager | Recovery borrow count (survives restart) |
 | `manager:lever1:{pool}:active` | STRING | manager | scheduler dispatch | Backpressure active flag |
@@ -2770,7 +2771,7 @@ Existing keys manager READS but does NOT write:
 | Key | Written by | Manager reads for |
 |---|---|---|
 | `queue:detail:adaptive` / `queue:detail:fullscan` | detail_worker | Queue delay (LINDEX -1) |
-| `queue:scan:adaptive` / `queue:scan:fullscan` | scheduler dispatch | Queue delay (LINDEX -1) |
+| `poll:adaptive` / `poll:fullscan` | scheduler dispatch | Overdue job count (ZCOUNT −inf now) + delay = now − min(score ≤ now) via ZRANGEBYSCORE |
 | `worker:ceil:learned:{dc_key}` | scheduler / fast_error | Awareness only (HTTP concurrency, separate from pool ceiling) |
 | `worker:outage:{platform}` | manager (new owner) | Manager sets; scheduler reads |
 | `worker:consec_reductions:{platform}` | fast_error (moving to manager) | Part of outage-mode state machine |

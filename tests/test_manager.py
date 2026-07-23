@@ -346,8 +346,8 @@ class TestUrgentMode(unittest.TestCase):
         r = _make_redis()
         with patch.object(mgr, 'SHADOW_MODE', False):
             mgr._run_pool_cycle(r, "scan", 3, 0, 50, 46.0, self.PARAMS, 10, peak_nd=5)
-        r.lpush.assert_called_once()
-        cmd = r.lpush.call_args[0][1]
+        r.rpush.assert_called_once()
+        cmd = r.rpush.call_args[0][1]
         self.assertTrue(cmd.startswith("scan:target:"))
 
     def test_urgent_release_when_right_sized(self):
@@ -446,7 +446,7 @@ class TestInflationRegression(unittest.TestCase):
         # No command should jump by more than 1 in a single step
         sent_targets = [
             int(c[0][1].split(":")[-1])
-            for c in r.lpush.call_args_list
+            for c in r.rpush.call_args_list
             if c[0][1].startswith("scan:target:")
         ]
         for i in range(1, len(sent_targets)):
@@ -519,7 +519,7 @@ class TestInflationRegression(unittest.TestCase):
                 mgr._run_pool_cycle(r, "scan", n_workers, pool_busy_ms,
                                      0, 0.0, {"fetch_p75": 40.0, "delay_warn_s": 1800.0},
                                      10, peak_nd=2)
-        for c in r.lpush.call_args_list:
+        for c in r.rpush.call_args_list:
             cmd = c[0][1]
             if cmd.startswith("scan:target:"):
                 target = int(cmd.split(":")[-1])
@@ -1112,18 +1112,18 @@ class TestPoolSizes(unittest.TestCase):
 class TestSendCmd(unittest.TestCase):
 
     def test_shadow_mode_true_does_not_push(self):
-        """SHADOW_MODE=True → no lpush, only log."""
+        """SHADOW_MODE=True → no rpush, only log."""
         r = MagicMock()
         with patch.object(mgr, 'SHADOW_MODE', True):
             mgr._send_cmd(r, "scan:target:5")
-        r.lpush.assert_not_called()
+        r.rpush.assert_not_called()
 
     def test_shadow_mode_false_pushes_to_list(self):
-        """SHADOW_MODE=False → lpush to manager:cmds."""
+        """SHADOW_MODE=False → rpush to manager:cmds (FIFO)."""
         r = MagicMock()
         with patch.object(mgr, 'SHADOW_MODE', False):
             mgr._send_cmd(r, "scan:target:5")
-        r.lpush.assert_called_once_with("manager:cmds", "scan:target:5")
+        r.rpush.assert_called_once_with("manager:cmds", "scan:target:5")
 
     def test_all_command_types_routed_correctly(self):
         """All three command types push correct strings when live."""
@@ -1132,7 +1132,7 @@ class TestSendCmd(unittest.TestCase):
             mgr._send_cmd(r, "detail:target:3")
             mgr._send_cmd(r, "platform:deprioritize:workday")
             mgr._send_cmd(r, "platform:outage:eightfold:set")
-        self.assertEqual(r.lpush.call_count, 3)
+        self.assertEqual(r.rpush.call_count, 3)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

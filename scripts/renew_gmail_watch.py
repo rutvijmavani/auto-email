@@ -51,22 +51,26 @@ def _build_gmail_service(token_row: dict):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None:
+def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> bool:
     """
     After renewing a watch, call history.list from last_history_id to enqueue
     any messages that arrived since the last processing cycle (gap coverage).
     Each found message_id is pushed to REDIS_EMAIL_PUSH as a minimal payload
     so email_processor picks it up normally.
+
+    Returns True on success (or when there is nothing to catch up), False on
+    any error so the caller can skip watch renewal rather than advancing the
+    history cursor over un-processed messages.
     """
     if not last_history_id:
         logger.info("no last_history_id for user_id=%s — skipping gap catch-up", user_id)
-        return
+        return True
 
     try:
         profile = gmail.users().getProfile(userId="me").execute()
     except HttpError as exc:
         logger.warning("getProfile failed during catch-up user_id=%s: %s", user_id, exc)
-        return
+        return False
 
     email_address = profile["emailAddress"]
 
@@ -86,7 +90,7 @@ def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None
             resp = req.execute()
         except HttpError as exc:
             logger.warning("history.list failed during catch-up user_id=%s: %s", user_id, exc)
-            return
+            return False
 
         # Track the latest historyId seen across all pages
         page_history_id = resp.get("historyId")
@@ -121,6 +125,8 @@ def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None
         update_history_id(user_id, new_history_id)
     except Exception as exc:
         logger.error("failed to update last_history_id user_id=%s: %s", user_id, exc)
+
+    return True
 
 
 def main() -> int:
@@ -192,8 +198,16 @@ def main() -> int:
             errors += 1
             continue
 
-        # Catch up on any missed emails before renewing (gap coverage)
-        _catch_up_missed(gmail, user_id, token_row.get("last_history_id"))
+        # Catch up on any missed emails before renewing (gap coverage).
+        # If catch-up fails, skip renewal: renewing would advance the history
+        # cursor past un-processed messages, losing them permanently.
+        if not _catch_up_missed(gmail, user_id, token_row.get("last_history_id")):
+            logger.error(
+                "catch-up failed for user_id=%s — skipping watch renewal to avoid losing messages",
+                user_id,
+            )
+            errors += 1
+            continue
 
         # Renew the watch
         try:

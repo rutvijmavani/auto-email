@@ -561,7 +561,7 @@ def _send_cmd(r, cmd: str) -> None:
     if SHADOW_MODE:
         logger.info("manager [SHADOW]: would send cmd=%r", cmd)
         return
-    r.lpush("manager:cmds", cmd)
+    r.rpush("manager:cmds", cmd)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

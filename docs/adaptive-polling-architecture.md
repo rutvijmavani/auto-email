@@ -1234,7 +1234,7 @@ Fallback when <7 days of `api_health` data: use `MONITOR_MAX_WORKERS` as the sta
 
 #### DB connection pool — combined ceiling, not independent
 
-Scan workers and detail workers share the same PostgreSQL connection pool. The ceiling must apply to their **combined** total. Pool allocation (how many workers of each type to run within that combined ceiling) is owned exclusively by `workers/manager.py`.
+Scan, detail, and fullscan workers all share the same PostgreSQL connection pool (`DB_POOL_MAXCONN - 3` connections available to workers; 3 reserved for the scheduler, watchdog, and API). The ceiling must apply to their **combined** total — scan + detail + fullscan worker counts must not exceed `DB_POOL_MAXCONN - 3`. Pool allocation (how many workers of each type to run within that combined ceiling) is owned exclusively by `workers/manager.py`.
 
 #### Worker management components
 
@@ -2739,15 +2739,15 @@ def adjust_concurrency(r, key, error_rate):
 
 `CONCURRENCY_FLOOR` and `CONCURRENCY_CEIL` are per-platform constants in `config.py`. The floor ensures the system never reaches zero concurrency (minimum 1).
 
-### Known fix — utilization-gated probing (NOT YET IMPLEMENTED)
+### Utilization-gated probing *(shipped 2026-07-23)*
 
-**The current feedback loop has a blind-climb problem.**
+**The blind-climb problem it solves.**
 
-The current `adjust_concurrency()` increments the limit after every successful request
-as long as error rate is below 2% — regardless of whether the current limit is
-actually being used:
+Without gating, `adjust_concurrency()` would increment the limit after every
+successful request as long as error rate is below 2% — regardless of whether the
+current limit is actually being used:
 
-```
+```text
 limit=2, only 1 worker ever hitting talentbrew at a time
   active never exceeds 1
   error_rate = 0%  →  below 2%
@@ -2760,9 +2760,9 @@ The limit climbed to ceil=4 without ever proving that 2, 3, or 4 concurrent
 requests are actually safe for this platform. The permission was granted without
 earning it.
 
-**The correct behaviour: utilization-gated probing.**
+**Shipped behaviour: utilization-gated probing.**
 
-Only increase the limit when a request actually pressed against it — meaning the
+The limit only increases when a request actually pressed against it — meaning the
 current limit was a real constraint, not just unused headroom:
 
 ```python
@@ -2800,12 +2800,11 @@ this check, the system grants concurrency permissions it never had to earn.
   regularly sees 3-4 workers competing advances to a higher limit that is actually
   proven safe.
 
-**Where to fix:** `workers/http_client.py` → `adjust_concurrency()` (line 332).
-Read `concurrency:active:{key}` before the increase branch and gate on
-`active >= current`.
-
-**Ship with:** the manager.py implementation — both touch the concurrency system
-and should be shipped together to avoid partial states.
+**Implemented in:** `workers/http_client.py` → `adjust_concurrency()`. Reads
+`concurrency:active:{key}` before the increase branch and gates on `active >= current`.
+Also writes the learned-ceiling high-water mark (`worker:ceil:learned:{key}`) on each
+successful increase, replacing the stale ZCARD-inflight approach that `_fast_error_check_loop`
+formerly used. Shipped together with `workers/manager.py`.
 
 ---
 
@@ -4057,19 +4056,19 @@ workers_target = clamp(workers_target, WORKER_FLOOR, worker_ceil)
 ### Three scaling modes
 
 **Urgent** (fires in 1 cycle, no utilisation gate):
-```
+```text
 delay >= DELAY_WARN × 0.75  OR  demand trigger
 ```
 The new target is applied immediately on the next cycle. No consecutive-check requirement — prevents accumulating debt when the pool is severely behind.
 
 **Scale-up** (2 consecutive cycles required):
-```
+```text
 util > 0.80  AND  delay > DELAY_WARN × 0.50  AND  target > current
 ```
 Both conditions must hold across 2 straight 60-second cycles. Prevents reacting to a momentary burst that self-resolves within a cycle.
 
 **Scale-down** (5 consecutive cycles required):
-```
+```text
 util < 0.50  AND  delay < DELAY_WARN × 0.25  AND  target <= current - 1
 ```
 Longer hysteresis than scale-up — prevents premature shrinkage when work arrives in bursts with quiet gaps between them.
@@ -4082,10 +4081,12 @@ Utilisation is the fraction of pool capacity occupied in the current 60-second w
 # Completed-job time published by workers after each job
 completed_ms = sum(int(r.get(f"worker:{type}:busy_ms:{pid}") or 0) for pid in pool_pids)
 
-# Active-job time: time elapsed since job start for workers currently running a job
+# Active-job time: time elapsed since job start for workers currently running a job.
+# Capped at 60,000 ms so a single long-running job cannot push a worker's
+# contribution above the 60-second window represented by capacity_ms.
 now_ms = time.time() * 1000
 active_ms = sum(
-    max(0, now_ms - float(r.get(f"worker:{type}:job_start_ms:{pid}") or now_ms))
+    min(max(0, now_ms - float(r.get(f"worker:{type}:job_start_ms:{pid}") or now_ms)), 60_000)
     for pid in pool_pids
     if r.exists(f"worker:{type}:job_start_ms:{pid}")
 )
@@ -4115,7 +4116,7 @@ The gate also prevents false scale-down when utilisation is temporarily low due 
 
 ### manager:cmds channel contract
 
-`manager.py` issues decisions over the `manager:cmds` Redis LIST (LPUSH). `_manager_cmds_loop()` in `scheduler.py` reads via BLPOP and applies:
+`manager.py` issues decisions over the `manager:cmds` Redis LIST (RPUSH for FIFO insertion order). `_manager_cmds_loop()` in `scheduler.py` reads via BLPOP and applies:
 
 | Command | Effect |
 |---------|--------|
