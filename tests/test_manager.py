@@ -251,7 +251,7 @@ class TestHysteresis(unittest.TestCase):
         """scale_up fires on the 2nd consecutive cycle meeting conditions, not the 1st."""
         _reset_cycle_state()
         pool_busy_ms = int(0.90 * 3 * 60 * 1000)  # 90% util
-        decisions = self._cycle_n(3, pool_busy_ms, depth=50, delay_s=35, n_workers=3)
+        decisions = self._cycle_n(3, pool_busy_ms, depth=25, delay_s=35, n_workers=3)
         self.assertNotEqual(decisions[0], "scale_up")  # first cycle: pending
         self.assertIn("scale_up", decisions[1:])       # fires by cycle 2 or 3
 
@@ -364,10 +364,11 @@ class TestUrgentMode(unittest.TestCase):
     def test_urgent_hold_when_still_understaffed_at_ceiling(self):
         """Urgent active but workers at ceiling → urgent_hold."""
         r = _make_redis()
-        # Fire urgent
+        # Fire urgent (delay spike)
         mgr._run_pool_cycle(r, "scan", 3, 0, 50, 46.0, self.PARAMS, 10, peak_nd=5)
-        # Still understaffed: n_workers=6, target=10 → urgent_hold
-        d, _ = mgr._run_pool_cycle(r, "scan", 6, 0, 50, 46.0, self.PARAMS, 10, peak_nd=5)
+        # Delay eases but still understaffed (3 workers, target=5) → urgent_hold
+        # depth=25 → workers_target=5, delay=35 → both urgent triggers off → urgent_hold
+        d, _ = mgr._run_pool_cycle(r, "scan", 3, 0, 25, 35.0, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(d, "urgent_hold")
 
     def test_urgent_resets_streak_counters(self):
@@ -825,7 +826,8 @@ class TestCeilingDecay(unittest.TestCase):
         new_ceil_val = [None]
 
         def fake_set(key, val):
-            if "ceil:learned" in key:
+            k = key.decode() if isinstance(key, bytes) else key
+            if "ceil:learned" in k:
                 new_ceil_val[0] = int(val)
 
         r.set.side_effect = fake_set
@@ -840,8 +842,9 @@ class TestCeilingDecay(unittest.TestCase):
                 last_err = r.get(f"worker:ceil:last_error:{dc}")
                 if last_err and (now - float(last_err)) > 86400:
                     old_ceil = int(r.get(key) or WORKER_FLOOR)
-                    new_ceil = min(old_ceil + 1, MONITOR_MAX_WORKERS)
-                    r.set(key, new_ceil)
+                    if old_ceil < MONITOR_MAX_WORKERS:
+                        new_ceil = old_ceil + 1
+                        r.set(key, new_ceil)
             if cursor == 0:
                 break
 
@@ -1025,20 +1028,18 @@ class TestScalingParams(unittest.TestCase):
         r.set.assert_called_once()  # cached in Redis
 
     def test_fallback_on_db_error(self):
-        """DB error during compute → returns fallback params, no exception."""
+        """DB error during compute → _load_scaling_params returns fallback params."""
         r = MagicMock()
-        r.get.return_value = None
+        r.get.return_value = None  # no cached value → forces compute path
+        # Simulate DB failure: _compute_scaling_params returns fallback dict
+        # (the real function catches DB errors internally and returns _FALLBACK_PARAMS)
         with patch('workers.manager._compute_scaling_params',
-                   side_effect=Exception("DB connection refused")):
-            # _load_scaling_params calls _compute_scaling_params internally
-            # which handles errors and returns fallback — test that the outer
-            # function doesn't propagate the exception
-            try:
-                # If _compute_scaling_params raises, _load_scaling_params
-                # should either catch it or propagate gracefully
-                mgr._load_scaling_params(r)
-            except Exception:
-                pass  # acceptable — key thing is test infrastructure works
+                   return_value={**mgr._FALLBACK_PARAMS, "computed_at": "fallback"}):
+            params = mgr._load_scaling_params(r)
+        for pool in ("detail", "scan", "fullscan"):
+            self.assertIn(pool, params)
+            self.assertIn("fetch_p75",    params[pool])
+            self.assertIn("delay_warn_s", params[pool])
 
     def test_fallback_params_have_required_keys(self):
         """_FALLBACK_PARAMS has fetch_p75 and delay_warn_s for all three pools."""
@@ -1152,7 +1153,7 @@ class TestFullCycleIntegration(unittest.TestCase):
         """
         _reset_cycle_state()
         params  = {"fetch_p75": 5.0, "delay_warn_s": 60.0}
-        r       = MagicMock()
+        r       = _make_redis()
 
         n = 3  # start with 3 detail workers
         n_cap = 10
@@ -1191,7 +1192,7 @@ class TestFullCycleIntegration(unittest.TestCase):
         """
         _reset_cycle_state()
         params  = {"fetch_p75": 5.0, "delay_warn_s": 60.0}
-        r       = MagicMock()
+        r       = _make_redis()
         n       = 4
         # 65% util, 20s delay (< 30s = WARN×0.5)
         pool_busy_ms = int(0.65 * n * mgr.MANAGER_CYCLE_S * 1000)
@@ -1213,7 +1214,7 @@ class TestFullCycleIntegration(unittest.TestCase):
         """
         _reset_cycle_state()
         params  = {"fetch_p75": 40.0, "delay_warn_s": 1800.0}
-        r       = MagicMock()
+        r       = _make_redis()
         n       = 10
 
         decisions = []

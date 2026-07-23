@@ -63,33 +63,52 @@ def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None
         return
 
     try:
-        resp = gmail.users().history().list(
-            userId="me",
-            startHistoryId=last_history_id,
-            historyTypes=["messageAdded"],
-        ).execute()
+        profile = gmail.users().getProfile(userId="me").execute()
     except HttpError as exc:
-        logger.warning("history.list failed during catch-up user_id=%s: %s", user_id, exc)
+        logger.warning("getProfile failed during catch-up user_id=%s: %s", user_id, exc)
         return
 
-    profile = gmail.users().getProfile(userId="me").execute()
     email_address = profile["emailAddress"]
-    new_history_id = resp.get("historyId", last_history_id)
 
     import json
     message_count = 0
-    for record in resp.get("history", []):
-        for added in record.get("messagesAdded", []):
-            msg_id = added.get("message", {}).get("id")
-            if not msg_id:
-                continue
-            payload = json.dumps({
-                "email": email_address,
-                "history_id": new_history_id,
-                "msg_id": msg_id,
-            })
-            get_redis().lpush(REDIS_EMAIL_PUSH, payload)
-            message_count += 1
+    new_history_id = last_history_id
+    page_token = None
+
+    while True:
+        try:
+            req = gmail.users().history().list(
+                userId="me",
+                startHistoryId=last_history_id,
+                historyTypes=["messageAdded"],
+                pageToken=page_token,
+            )
+            resp = req.execute()
+        except HttpError as exc:
+            logger.warning("history.list failed during catch-up user_id=%s: %s", user_id, exc)
+            return
+
+        # Track the latest historyId seen across all pages
+        page_history_id = resp.get("historyId")
+        if page_history_id:
+            new_history_id = page_history_id
+
+        for record in resp.get("history", []):
+            for added in record.get("messagesAdded", []):
+                msg_id = added.get("message", {}).get("id")
+                if not msg_id:
+                    continue
+                payload = json.dumps({
+                    "email": email_address,
+                    "history_id": new_history_id,
+                    "msg_id": msg_id,
+                })
+                get_redis().lpush(REDIS_EMAIL_PUSH, payload)
+                message_count += 1
+
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
 
     if message_count:
         logger.info(
@@ -97,7 +116,7 @@ def _catch_up_missed(gmail, user_id: int, last_history_id: "str | None") -> None
             message_count, user_id,
         )
 
-    # Advance cursor so next normal processing picks up from the right point
+    # Advance cursor only after all pages processed successfully
     try:
         update_history_id(user_id, new_history_id)
     except Exception as exc:

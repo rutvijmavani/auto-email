@@ -470,7 +470,7 @@
           const ts   = `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`;
           const date = now.toISOString().split('T')[0];
           const row  = [ts, payload.company, payload.job_url, payload.job_title || '', date];
-          const url  = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_TAB)}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+          const url  = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_TAB)}!A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
           try {
             const res = await fetch(url, {
               method: 'POST',
@@ -503,7 +503,7 @@
           const row = [ts, payload.company, payload.job_url || '', payload.domain || '',
                        payload.career_page || '', '', '', '', payload.notes || ''];
           const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/` +
-                      `${encodeURIComponent(PROSPECTIVE_SHEET_TAB)}!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+                      `${encodeURIComponent(PROSPECTIVE_SHEET_TAB)}!A1:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`;
           const ctrl = new AbortController();
           const t = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
           try {

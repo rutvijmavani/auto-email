@@ -1,4 +1,4 @@
-# Adaptive Job Monitoring Architecture
+﻿# Adaptive Job Monitoring Architecture
 
 ## Table of Contents
 
@@ -1234,7 +1234,7 @@ Fallback when <7 days of `api_health` data: use `MONITOR_MAX_WORKERS` as the sta
 
 #### DB connection pool — combined ceiling, not independent
 
-Scan workers and detail workers share the same PostgreSQL connection pool. The ceiling must apply to their **combined** total. The 60/40 split is a starting point; the slow check recalculates the ratio based on observed queue drain rates each cycle.
+Scan workers and detail workers share the same PostgreSQL connection pool. The ceiling must apply to their **combined** total. Pool allocation (how many workers of each type to run within that combined ceiling) is owned exclusively by `workers/manager.py`.
 
 #### Worker management components
 
@@ -1266,7 +1266,13 @@ the next fullscan dispatch for that DC key.
 
 **Layer 2 — `manager._check_error_spikes()` (every 60 seconds, inside manager cycle)**
 
-Replaced `_fast_error_check_loop` (was a 5-min scheduler thread). Error spikes are now detected at the source: `adjust_concurrency()` in `http_client.py` writes a `manager:platform:{platform}:error_spike` Redis key (JSON payload with `error_rate`, `baseline`, `spike_factor`, TTL=90s) every time it reduces concurrency. `_check_error_spikes()` in `manager.py` SCANs for these keys each cycle and runs the outage state machine:
+Replaced `_fast_error_check_loop` (was a 5-min scheduler thread). Error spikes are now detected at the source: `adjust_concurrency()` in `http_client.py` writes a `manager:platform:{platform}:error_spike` Redis key (TTL=90s, String type, JSON-encoded) every time it reduces concurrency. Canonical JSON payload:
+
+```json
+{"error_rate": <float>, "baseline": <float>, "spike_factor": <float>, "inflight_at_spike": <int>, "ts": <unix_float>}
+```
+
+`_check_error_spikes()` in `manager.py` SCANs for these keys each cycle and runs the outage state machine:
 
 ```
 adjust_concurrency() writes:  manager:platform:{p}:error_spike  (90s TTL)
@@ -1421,10 +1427,11 @@ worker:ceil:learned:{dc_key}      # max safe concurrent scans (int, no TTL)
 worker:ceil:last_error:{dc_key}   # Unix ts of last error-triggered event
 ```
 
-Set by `adjust_concurrency()` in `http_client.py` when it reduces the concurrency limit due to a spike. The in-flight count at the moment errors peaked = ceiling + 1, so:
+Set by `manager.py` when an error-spike reduction proves effective (error rate drops on the subsequent cycle). The ceiling is the clean-load high-water mark: the maximum in-flight count that has sustained error-free operation since the last spike event. Manager records `inflight_at_spike` at spike time and writes the learned ceiling only after confirming the reduction helped:
 
 ```python
-ceiling = max(WORKER_FLOOR, current_inflight - 1)
+# ceiling = highest clean in-flight count observed before the spike, not current_inflight - 1
+ceiling = max(WORKER_FLOOR, inflight_at_spike - 1)
 r.set(f"worker:ceil:learned:{dc_key}", ceiling)
 r.set(f"worker:ceil:last_error:{dc_key}", now)
 ```
@@ -3873,129 +3880,6 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 ---
 
-## 26. Worker Autoscaler — manager.py Design
-
-### The inflation problem with depth-based scaling
-
-`_slow_throughput_check_loop` used queue **depth** (`ZCARD poll:adaptive`) as its primary scaling signal: scale up if depth is growing, scale down when depth reaches zero. This caused workers to stay permanently inflated in production.
-
-`ZCARD poll:adaptive` is **never zero** in a running system. The ZSET always contains future-scheduled companies — even after all currently-due work is drained, entries scheduled 4h, 6h, or 12h from now keep the ZSET populated. The scale-down condition (`scan_backlog == 0`) was structurally unreachable, so workers added on demand were never reclaimed.
-
-### Queue delay as the primary signal
-
-The new primary signal is **delay**: how overdue is the most-overdue job in the queue?
-
-```python
-delay_s = now - r.zrangebyscore(queue, "-inf", now, start=0, num=1, withscores=True)[0][1]
-```
-
-A delay of zero means work is being dispatched on time. A delay of 1800s means the scan pool is 30 minutes behind — actionable. A growing delay means the pool cannot keep up; a shrinking delay means it is recovering. This signal is well-defined at any queue depth and has a natural zero regardless of how many future-scheduled entries exist.
-
-### The formula
-
-`workers/manager.py` runs a 60-second cycle under a distributed lock (`manager:lock`, NX EX 90):
-
-```python
-# For each pool: scan, detail, fullscan
-delay_s   = now - most_overdue_score   # seconds the head of queue is overdue
-depth     = zcard_overdue(queue)       # items with score ≤ now
-
-drain_rate     = depth / max(delay_warn_s - delay_s, 1)   # jobs/s to catch up
-workers_target = ceil(drain_rate * fetch_p75)              # workers at p75 throughput
-workers_target = clamp(workers_target, WORKER_FLOOR, worker_ceil)
-```
-
-**DELAY_WARN_S thresholds:**
-
-| Pool | Value | Rationale |
-|------|-------|-----------|
-| detail | 60s | Product SLA — jobs should not wait more than 1 minute for detail fetch |
-| scan | 1800s (30 min) | p10 of `current_interval_s` × 0.10 |
-| fullscan | 7200s (2h) | AVG(`full_scan_interval_s`) × 0.10 |
-
-**fetch_p75 (cached in `manager:scaling_params`, 25h TTL):**
-
-| Pool | Typical value | Source |
-|------|--------------|--------|
-| detail | ~3–5s | P75 of `api_health` durations, all platforms, last 30 days |
-| scan | ~40s | P75 of `company_poll_stats.avg_scan_duration_s` |
-| fullscan | ~95s | P75 of `company_poll_stats.avg_fullscan_duration_s` |
-
-### Three scaling modes
-
-**Urgent** (fires in 1 cycle, no utilisation gate):
-```
-delay >= DELAY_WARN × 0.75  OR  demand trigger
-```
-The new target is applied immediately on the next cycle. No consecutive-check requirement — prevents accumulating debt when the pool is severely behind.
-
-**Scale-up** (2 consecutive cycles required):
-```
-util > 0.80  AND  delay > DELAY_WARN × 0.50  AND  target > current
-```
-Both conditions must hold across 2 straight 60-second cycles. Prevents reacting to a momentary burst that self-resolves within a cycle.
-
-**Scale-down** (5 consecutive cycles required):
-```
-util < 0.50  AND  delay < DELAY_WARN × 0.25  AND  target <= current - 1
-```
-Longer hysteresis than scale-up — prevents premature shrinkage when work arrives in bursts with quiet gaps between them.
-
-### Utilisation gate and why it prevents premature scaling
-
-Utilisation is the fraction of pool capacity occupied in the current 60-second window:
-
-```python
-busy_ms     = sum(r.get(f"worker:{type}:busy_ms:{pid}") for pid in pool_pids)
-capacity_ms = len(pool_pids) * 60_000   # one 60s window per worker
-util        = busy_ms / capacity_ms
-```
-
-Workers publish `worker:{type}:busy_ms:{pid}` (rolling 60s window, TTL = 120s) after every completed job.
-
-The gate prevents false scale-up when a pool appears mathematically understaffed but workers are mostly idle — for example, when all workers are blocked on a slow ATS and throughput is I/O-bound rather than worker-count-bound. Adding workers in that state increases concurrency pressure on the ATS without improving throughput.
-
-The gate also prevents false scale-down when utilisation is temporarily low due to a burst of very-fast jobs — the delay signal must also confirm that the queue is genuinely draining ahead of schedule before workers are removed.
-
-### Bootstrap mode and Layer 1 midnight recompute
-
-**Bootstrap mode** (`manager:bootstrap` key is set): fewer than 28 days of `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` records exist. The delay formula is bypassed and fixed ceilings are used:
-
-| Pool | Bootstrap ceiling |
-|------|------------------|
-| scan | 10 |
-| detail | 6 |
-| fullscan | 5 |
-
-**Layer 1 midnight recompute** runs once nightly inside `manager.py`. It reads the recent daily-peak keys, computes `peak_Nd + max(growth_buffer, volatility_buffer)`, and writes the result to `manager:worker_ceil:{pool}`. This ceiling is what `workers_target` is clamped to during the day. The 7 AM startup calculation in `scheduler.py` remains the initial count; all intraday adjustments go through `manager.py`.
-
-### manager:cmds channel contract
-
-`manager.py` issues decisions over the `manager:cmds` Redis LIST (LPUSH). `_manager_cmds_loop()` in `scheduler.py` reads via BLPOP and applies:
-
-| Command | Effect |
-|---------|--------|
-| `{pool}:target:{n}` | Spawn or terminate workers until pool size equals N |
-| `platform:deprioritize:{platform}` | Push platform companies forward 300s in `poll:adaptive` |
-| `platform:outage:{platform}:set` | Enter outage mode (60-min dispatch pause for that platform) |
-| `platform:outage:{platform}:clear` | Exit outage mode early (e.g. after a successful canary probe) |
-
-### Key Redis keys
-
-| Key | Type | Purpose |
-|-----|------|---------|
-| `manager:scaling_params` | String (JSON) | Cached `fetch_p75` + `delay_warn_s` per pool, 25h TTL |
-| `manager:worker_ceil:{pool}` | String | Ceiling set by midnight recompute |
-| `manager:pool:{type}:daily_peak:running` | String | Intraday high-water mark, updated when pool expands |
-| `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` | String | Historical daily peak (input to midnight recompute) |
-| `manager:cmds` | List | Command channel; BLPOP'd by `_manager_cmds_loop` in scheduler.py |
-| `manager:lock` | String | NX EX 90 distributed lock; one manager cycle at a time |
-| `manager:bootstrap` | String | Present while < 28 days of history; disables delay formula |
-| `manager:backpressure:threshold:{pool}` | String | `delay_warn_s` value for the watchdog alert |
-| `worker:{type}:busy_ms:{pid}` | String | Per-worker busy time in current 60s window, TTL = 120s |
-
----
-
 ## 25. Glossary
 
 **Adaptive interval:** A polling frequency that automatically adjusts based on observed company behavior. Computed from a 5-poll weighted queue with asymmetric smoothing.
@@ -4119,3 +4003,137 @@ The gate also prevents false scale-down when utilisation is temporarily low due 
 **Inflight expiry timestamp:** The score stored in `inflight:scans:{dc_key}` — the Unix timestamp when the adaptive slot was claimed (dispatch time). Used by `ZREMRANGEBYSCORE` to prune stale entries that were never cleaned up (e.g. worker crash before ZREM). Also stored in `inflight:fullscans:{dc_key}` for fullscan slots with a separate longer stale window (`INFLIGHT_FULLSCAN_STALE_S`).
 
 **total_ms_ok (deferred):** A proposed `api_health` column tracking cumulative response time for successful (HTTP 200) requests only, separate from `total_ms` which includes all requests including timeouts. Deferred pending real data — the distortion from timeout inflation may be acceptable given that timed-out workers are genuinely occupied for that duration. To be revisited once production data confirms whether the difference is material for baseline accuracy.
+---
+
+## 26. Worker Autoscaler — manager.py Design
+
+### The inflation problem with depth-based scaling
+
+`_slow_throughput_check_loop` used queue **depth** (`ZCARD poll:adaptive`) as its primary scaling signal: scale up if depth is growing, scale down when depth reaches zero. This caused workers to stay permanently inflated in production.
+
+`ZCARD poll:adaptive` is **never zero** in a running system. The ZSET always contains future-scheduled companies — even after all currently-due work is drained, entries scheduled 4h, 6h, or 12h from now keep the ZSET populated. The scale-down condition (`scan_backlog == 0`) was structurally unreachable, so workers added on demand were never reclaimed.
+
+### Queue delay as the primary signal
+
+The new primary signal is **delay**: how overdue is the most-overdue job in the queue?
+
+```python
+overdue = r.zrangebyscore(queue, "-inf", now, start=0, num=1, withscores=True)
+delay_s = (now - overdue[0][1]) if overdue else 0   # zero delay when no overdue entries
+```
+
+A delay of zero means work is being dispatched on time (or no work is overdue yet). A delay of 1800s means the scan pool is 30 minutes behind — actionable. A growing delay means the pool cannot keep up; a shrinking delay means it is recovering. This signal is well-defined at any queue depth and has a natural zero regardless of how many future-scheduled entries exist.
+
+### The formula
+
+`workers/manager.py` runs a 60-second cycle under a distributed lock (`manager:lock`, NX EX 90):
+
+```python
+# For each pool: scan, detail, fullscan
+delay_s   = now - most_overdue_score   # seconds the head of queue is overdue
+depth     = zcard_overdue(queue)       # items with score ≤ now
+
+drain_rate     = depth / max(delay_warn_s - delay_s, 1)   # jobs/s to catch up
+workers_target = ceil(drain_rate * fetch_p75)              # workers at p75 throughput
+workers_target = clamp(workers_target, WORKER_FLOOR, worker_ceil)
+```
+
+**DELAY_WARN_S thresholds (scan and fullscan values are fallbacks):**
+
+| Pool | Value | Rationale |
+|------|-------|-----------|
+| detail | 60s | Product SLA — jobs should not wait more than 1 minute for detail fetch |
+| scan | 1800s (30 min) — **fallback** | Used until `manager:scaling_params` is populated with real p10 data; runtime value is p10 of `current_interval_s` × 0.10 |
+| fullscan | 7200s (2h) — **fallback** | Used until `manager:scaling_params` is populated; runtime value is AVG(`full_scan_interval_s`) × 0.10 |
+
+**fetch_p75 (cached in `manager:scaling_params`, 25h TTL):**
+
+| Pool | Typical value | Source |
+|------|--------------|--------|
+| detail | ~3–5s | P75 of `api_health` durations, all platforms, last 30 days |
+| scan | ~40s | P75 of `company_poll_stats.avg_scan_duration_s` |
+| fullscan | ~95s | P75 of `company_poll_stats.avg_fullscan_duration_s` |
+
+### Three scaling modes
+
+**Urgent** (fires in 1 cycle, no utilisation gate):
+```
+delay >= DELAY_WARN × 0.75  OR  demand trigger
+```
+The new target is applied immediately on the next cycle. No consecutive-check requirement — prevents accumulating debt when the pool is severely behind.
+
+**Scale-up** (2 consecutive cycles required):
+```
+util > 0.80  AND  delay > DELAY_WARN × 0.50  AND  target > current
+```
+Both conditions must hold across 2 straight 60-second cycles. Prevents reacting to a momentary burst that self-resolves within a cycle.
+
+**Scale-down** (5 consecutive cycles required):
+```
+util < 0.50  AND  delay < DELAY_WARN × 0.25  AND  target <= current - 1
+```
+Longer hysteresis than scale-up — prevents premature shrinkage when work arrives in bursts with quiet gaps between them.
+
+### Utilisation gate and why it prevents premature scaling
+
+Utilisation is the fraction of pool capacity occupied in the current 60-second window. Both completed-job time and currently-active job time are included:
+
+```python
+# Completed-job time published by workers after each job
+completed_ms = sum(int(r.get(f"worker:{type}:busy_ms:{pid}") or 0) for pid in pool_pids)
+
+# Active-job time: time elapsed since job start for workers currently running a job
+now_ms = time.time() * 1000
+active_ms = sum(
+    max(0, now_ms - float(r.get(f"worker:{type}:job_start_ms:{pid}") or now_ms))
+    for pid in pool_pids
+    if r.exists(f"worker:{type}:job_start_ms:{pid}")
+)
+
+busy_ms     = completed_ms + active_ms
+capacity_ms = len(pool_pids) * 60_000   # one 60s window per worker
+util        = busy_ms / capacity_ms
+```
+
+Workers publish `worker:{type}:busy_ms:{pid}` (rolling 60s window, TTL = 120s) after every completed job, and `worker:{type}:job_start_ms:{pid}` (TTL = job timeout) at the start of each job so the active portion can be included.
+
+The gate prevents false scale-up when a pool appears mathematically understaffed but workers are mostly idle — for example, when all workers are blocked on a slow ATS and throughput is I/O-bound rather than worker-count-bound. Adding workers in that state increases concurrency pressure on the ATS without improving throughput.
+
+The gate also prevents false scale-down when utilisation is temporarily low due to a burst of very-fast jobs — the delay signal must also confirm that the queue is genuinely draining ahead of schedule before workers are removed.
+
+### Bootstrap mode and Layer 1 midnight recompute
+
+**Bootstrap mode** (`manager:bootstrap` key is set): fewer than 28 days of `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` records exist. The delay formula is bypassed and fixed ceilings are used:
+
+| Pool | Bootstrap ceiling |
+|------|------------------|
+| scan | 10 |
+| detail | 6 |
+| fullscan | 5 |
+
+**Layer 1 midnight recompute** runs once nightly inside `manager.py`. It reads the recent daily-peak keys, computes `peak_Nd + max(growth_buffer, volatility_buffer)`, and writes the result to `manager:worker_ceil:{pool}`. This ceiling is what `workers_target` is clamped to during the day. The 7 AM startup calculation in `scheduler.py` remains the initial count; all intraday adjustments go through `manager.py`.
+
+### manager:cmds channel contract
+
+`manager.py` issues decisions over the `manager:cmds` Redis LIST (LPUSH). `_manager_cmds_loop()` in `scheduler.py` reads via BLPOP and applies:
+
+| Command | Effect |
+|---------|--------|
+| `{pool}:target:{n}` | Spawn or terminate workers until pool size equals N |
+| `platform:deprioritize:{platform}` | Push platform companies forward 300s in `poll:adaptive` |
+| `platform:outage:{platform}:set` | Enter outage mode (60-min dispatch pause for that platform) |
+| `platform:outage:{platform}:clear` | Exit outage mode early (e.g. after a successful canary probe) |
+
+### Key Redis keys
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `manager:scaling_params` | String (JSON) | Cached `fetch_p75` + `delay_warn_s` per pool, 25h TTL |
+| `manager:worker_ceil:{pool}` | String | Ceiling set by midnight recompute |
+| `manager:pool:{type}:daily_peak:running` | String | Intraday high-water mark, updated when pool expands |
+| `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` | String | Historical daily peak (input to midnight recompute) |
+| `manager:cmds` | List | Command channel; BLPOP'd by `_manager_cmds_loop` in scheduler.py |
+| `manager:lock` | String | NX EX 90 distributed lock; one manager cycle at a time |
+| `manager:bootstrap` | String | Present while < 28 days of history; disables delay formula |
+| `manager:backpressure:threshold:{pool}` | String | `delay_warn_s` value for the watchdog alert |
+| `worker:{type}:busy_ms:{pid}` | String | Per-worker busy time in current 60s window, TTL = 120s |

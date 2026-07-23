@@ -50,6 +50,7 @@ from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ
 from db.connection import get_conn
 from db.gmail_tokens import get_token_by_email, update_history_id
 from logger import get_logger, init_logging
+from workers.heartbeat import Heartbeat
 from workers.redis_client import get_redis
 
 logger = get_logger(__name__)
@@ -714,10 +715,15 @@ def _process_notification(raw_str: str, r) -> str:
 def run_worker(once: bool = False) -> None:
     global _INFLIGHT_KEY
     _INFLIGHT_KEY = f"queue:email:push:inflight:{WORKER_ID}"
-    heartbeat_key = f"worker:alive:email_processor:{WORKER_ID}"
 
     r = get_redis()
     _recover_stuck_jobs(r)
+
+    # Start heartbeat daemon BEFORE model loading so the worker is visible to
+    # the watchdog during the ~2-minute model-load phase.
+    _hw = {"count": 0}
+    _hb = Heartbeat(r, "email_processor", lambda: _hw["count"], interval_s=30).start()
+
     _load_model()
 
     logger.info(
@@ -726,7 +732,6 @@ def run_worker(once: bool = False) -> None:
     )
 
     while True:
-        r.setex(heartbeat_key, 120, "1")
 
         # LMOVE: atomically pop from source tail → push to inflight head
         # Producers lpush (left); we consume from right → FIFO order
@@ -784,10 +789,12 @@ def run_worker(once: bool = False) -> None:
                     attempts + 1, delay, payload.get("email"),
                 )
 
+        _hw["count"] += 1
+
         if once:
             break
 
-    r.delete(heartbeat_key)
+    _hb.stop()
     logger.info("email-processor stopped")
 
 

@@ -1,7 +1,7 @@
 # Pipeline Scaling Redesign — Decision Record
 
-> **Status**: Design-only document. Current code is NOT yet changed.  
-> **Purpose**: Capture every agreed architectural decision before implementation. Do not modify `adaptive-polling-architecture.md` or `ats-fetch-strategy.md` until this doc is signed off.  
+> **Status**: Manager architecture implemented. `workers/manager.py` and the `manager:cmds` channel are live; remaining scaffolding (config constants, watchdog extensions) is in progress.  
+> **Purpose**: Capture every agreed architectural decision. `adaptive-polling-architecture.md` Section 26 is the companion implementation reference.  
 > **Date**: 2026-07-20
 
 ---
@@ -58,13 +58,11 @@ oldest_job      = json.loads(oldest_job_raw)
 queue_delay_s   = (now_utc - parse_iso(oldest_job["enqueued_at"])).total_seconds()
 ```
 
-This applies to **all four queues**:
+This `LINDEX -1` delay calculation applies to the **two detail queues only**:
 - `queue:detail:adaptive`
 - `queue:detail:fullscan`
-- `queue:scan:adaptive` (adaptive poll queue — used by scan workers)
-- `queue:scan:fullscan` (fullscan scan queue — used by fullscan workers)
 
-Queue delay replaces depth as the scaling trigger for ALL of them, not just detail queues.
+Scan work does not use Redis LISTs. Scan delay is measured differently: the score stored in the `poll:adaptive` and `poll:fullscan` ZSETs is the scheduled time, so `delay = now - min(score ≤ now)` via `ZRANGEBYSCORE`. Manager uses this ZSET approach for scan and fullscan pools; LINDEX is only for detail queues.
 
 ---
 
@@ -91,9 +89,9 @@ Where `est_fetch_s` is the P75 of job durations from the last 30 days, cached in
 **Queue length still gates backpressure** (pausing ingestion when the queue is too long to catch up before hitting the delay SLA), but the threshold is fully derived — no hardcoded constant:
 
 ```
-est_fetch_s        = scaling_params[pool]["fetch_p75"]   (P75 from cache, same for all pools)
+est_fetch_s        = scaling_params["detail"]["fetch_p75"]   (P75 of detail fetch durations from cache)
 throughput         = n_detail_workers / est_fetch_s
-time_left          = max(DELAY_WARN_S - actual_delay_s, 0)
+time_left          = max(DELAY_WARN_S_detail - actual_delay_s, 0)
 backpressure_depth = throughput × time_left
 
 if queue_depth > backpressure_depth → pause ingestion
@@ -1415,7 +1413,10 @@ Fix: when lifting detail backpressure, rate-limit the flush:
   Resume scan + fullscan pushes at:
     max_push_rate = n_detail_workers / est_fetch_s    (jobs/s detail can absorb; P75 from cache)
 
-  scan_worker:  push 1 batch every (1 / max_push_rate) seconds
+  Rate-limiting applies per individual job, not per batch:
+    inter_job_interval = batch_size / max_push_rate   (seconds between each job push within a batch)
+
+  scan_worker:  enforce inter_job_interval between each job pushed from a batch
   fullscan:     same rate
 
   Return to unrestricted push only after detail delay < DELAY_WARN_S × RECOVERY_STABILITY_RATIO for 3 cycles.
@@ -2254,14 +2255,17 @@ Single 60s cycle for everything. Scale-up confirmation = 2 cycles = 2 min. Scale
 
 **2. Worker add/remove mechanism (resolved — 2026-07-21)**
 
-Option C: manager writes a Redis key → scheduler polls it at the top of each dispatch iteration.
+Manager pushes commands to a Redis LIST; scheduler's `_manager_cmds_loop()` thread reads them via BLPOP.
 
-- Manager writes: `SET manager:directive:{pool}:target {n}` each cycle when the target changes
-- Scheduler reads the key at the start of each loop; spawns or removes workers to match target
-- Lever 1 halt: `SET manager:lever1:{pool}:active 1` (no TTL) → scheduler skips dispatch for that pool
-- Lever 1 resume: `DEL manager:lever1:{pool}:active`
+- Manager writes commands via `LPUSH manager:cmds <command>` each cycle
+- Scheduler daemon thread reads via `BLPOP manager:cmds 0` and applies commands:
+  - `{pool}:target:{n}` — spawn or terminate workers until pool size equals N
+  - `platform:deprioritize:{platform}` — push platform companies forward 300s in `poll:adaptive`
+  - `platform:outage:{platform}:set` — enter 60-min dispatch pause for that platform
+  - `platform:outage:{platform}:clear` — exit outage mode early
+- Lever 1 halt/resume uses `manager:lever1:{pool}:active` key as before (direct Redis key, no command needed)
 
-Rationale: scheduler is working and should not be restructured (open/closed principle). The key is already needed for restart recovery — it doubles as the IPC surface at zero additional cost. Option A (pub/sub) loses messages during scheduler restart. Option B (embed manager in scheduler) couples failure domains — a manager bug could kill dispatch.
+Rationale: LPUSH/BLPOP decouples manager from scheduler's dispatch loop. Commands survive a manager restart (LIST persists in Redis); BLPOP in the scheduler daemon gives sub-second latency without polling. Option A (pub/sub) loses messages during scheduler restart. Option B (embed manager in scheduler) couples failure domains.
 
 **3. Backpressure threshold (resolved — 2026-07-21)**
 
@@ -2358,7 +2362,7 @@ for key in spike_keys:
   - **Probe-worker removal on error spike** → manager each 60s cycle (above)
   - **Effectiveness tracking + learned ceiling from inflight** → manager records `inflight_at_spike` at spike time and writes `pipeline:platform:{platform_key}:learned_ceil` if the removal proved effective (error_rate drops on next cycle)
   - **Consecutive-ineffective-reduction tracking** → manager increments a per-platform counter; after `WORKER_CONSEC_REDUCTIONS_THRESHOLD` consecutive ineffective reductions → write `worker:outage:{platform} EX 3600` + alert
-  - **Scan worker removal + platform deprioritization** → when outage declared, manager sends a scan worker removal directive and writes `worker:scaling_lock:{platform} EX WORKER_SCALING_LOCK_TTL`
+  - **Scan worker removal + platform deprioritization** → when outage declared, manager sends a scan worker removal directive via `manager:cmds` and sends `platform:deprioritize:{platform}` (no scaling lock written — manager owns both error detection and pool sizing in the same 60s cycle, so no cross-loop race exists)
 - `adjust_concurrency()` rate-limiting stays exactly as-is (fires per-request, no changes)
 - Detection latency drops from up to 5 min → at most 60s (one manager cycle)
 - Manager never reads errwin directly — only reads the flag, keeping the errwin abstraction inside `http_client.py`
@@ -2750,10 +2754,10 @@ New keys manager introduces (must not collide with existing keys):
 
 | Key | Type | Writer | Reader(s) | Purpose |
 |---|---|---|---|---|
-| `manager:scaling_params` | HASH | manager (every 25h) | manager | est_fetch_s + DELAY_WARN_S per pool |
+| `manager:scaling_params` | String (JSON) | manager (every 25h) | manager | est_fetch_s + DELAY_WARN_S per pool |
 | `manager:worker_ceil:{pool}` | STRING | manager (Layer 1) | manager, scheduler | Pool ceiling from latest recompute |
 | `daily_peak:running:{pool}:{date}` | STRING | manager (Layer 0) | manager (Layer 1) | Peak util≥0.50 worker count for peak_Nd formula |
-| `manager:cmds` | STREAM/LIST | manager | scheduler daemon thread | Worker add/remove/deprioritize/outage commands |
+| `manager:cmds` | List | manager | scheduler daemon thread | Worker add/remove/deprioritize/outage commands (LPUSH by manager, BLPOP by scheduler) |
 | `manager:backpressure:threshold:{pool}` | STRING | manager (Layer 0) | watchdog | Computed backpressure_depth for this pool |
 | `manager:borrow:{source}:{target}` | STRING | manager | manager | Recovery borrow count (survives restart) |
 | `manager:lever1:{pool}:active` | STRING | manager | scheduler dispatch | Backpressure active flag |

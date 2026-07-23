@@ -415,8 +415,9 @@ def _midnight_recompute(r, pools: list[str]) -> None:
                 )
                 continue
 
-            # Collect last 28 days of daily_peak records
-            peaks: list[int] = []
+            # Collect all daily_peak records as (date_key, value) tuples.
+            # Sort by date descending; take the 28 most recent.
+            daily_peaks: list[tuple[str, int]] = []
             cursor = 0
             while True:
                 cursor, keys = r.scan(
@@ -428,40 +429,31 @@ def _midnight_recompute(r, pools: list[str]) -> None:
                     val = r.get(k)
                     if val:
                         try:
-                            peaks.append(int(val))
+                            date_str = k if isinstance(k, str) else k.decode()
+                            daily_peaks.append((date_str, int(val)))
                         except (ValueError, TypeError):
                             pass
                 if cursor == 0:
                     break
 
-            # Only use last 28 days (sort by key date desc, take 28)
-            peaks = sorted(peaks, reverse=True)[:28]
+            # Sort by date desc and keep only the 28 most recent days
+            daily_peaks.sort(key=lambda x: x[0], reverse=True)
+            daily_peaks = daily_peaks[:28]
 
+            peaks = [v for _, v in daily_peaks]
             peak_nd = max(peaks) if peaks else WORKER_FLOOR
-            peak_28d = peak_nd
 
-            # growth_buffer: week-over-week growth rate × peak_Nd
-            # Needs at least 7 days of data
-            peaks_7d: list[int] = []
-            cursor = 0
-            while True:
-                cursor, keys = r.scan(
-                    cursor,
-                    match=f"manager:pool:{pool}:daily_peak:20*",
-                    count=50,
-                )
-                for k in keys:
-                    # crude cutoff — collect all and sort by key name desc
-                    peaks_7d.append((k if isinstance(k, str) else k.decode(), int(r.get(k) or 0)))
-                if cursor == 0:
-                    break
-            peaks_7d.sort(key=lambda x: x[0], reverse=True)
-            recent_7 = [v for _, v in peaks_7d[:7]]
+            # growth_buffer: compare recent 7-day peak vs older 21-day baseline.
+            # Using the max of the older window (days 8-28) as baseline means
+            # positive week-over-week growth produces a non-zero growth_buffer.
+            recent_7  = [v for _, v in daily_peaks[:7]]
+            baseline  = [v for _, v in daily_peaks[7:]]   # days 8-28
 
-            if len(recent_7) >= 7:
-                peak_7d = max(recent_7)
-                if peak_28d > 0:
-                    weekly_growth_rate = max(0.0, (peak_7d - peak_28d) / peak_28d / 3)
+            if len(recent_7) >= 7 and baseline:
+                peak_7d      = max(recent_7)
+                baseline_val = max(baseline)
+                if baseline_val > 0:
+                    weekly_growth_rate = max(0.0, (peak_7d - baseline_val) / baseline_val / 3)
                     growth_buffer = math.ceil(peak_nd * weekly_growth_rate)
                 else:
                     growth_buffer = 0

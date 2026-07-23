@@ -141,11 +141,14 @@ The user is never involved in renewal. The server handles everything using
 the refresh token stored at setup time.
 
 > **OAuth tokens vs Gmail watch:** These are two separate things. The OAuth
-> refresh token (stored at first-time setup) never expires unless the user
-> explicitly revokes access. The Gmail watch (a subscription telling Gmail
-> where to send notifications) is what expires every 7 days. Renewing the
-> watch does not require the user to re-authorize anything — it is a
-> server-to-server API call.
+> refresh token (stored at first-time setup) does not expire on a fixed
+> schedule, but Google may invalidate it for inactivity (no use for 6+ months),
+> a user password change, security policy limits, explicit revocation, or other
+> account-level events. The renewal flow must handle `invalid_grant` / `RefreshError`
+> by sending a reauthorization alert — a dead refresh token cannot be recovered
+> automatically. The Gmail watch (a subscription telling Gmail where to send
+> notifications) is what expires every 7 days. Renewing the watch does not
+> require the user to re-authorize anything — it is a server-to-server API call.
 
 ---
 
@@ -408,7 +411,7 @@ status        TEXT   — pipeline dimension (existing, unchanged)
                        active / closed / prospective / exhausted
 
 email_status  TEXT   — hiring process dimension (new)
-                       NULL / phone_screen / interview / offer / rejected
+                       NULL / phone_screen / assessment / interview / offer / rejected
 ```
 
 `email_status` is set exclusively by `email_processor.py`. No other part of
@@ -474,7 +477,7 @@ Tunnel restarts → new trycloudflare.com URL detected
     ↓
 tunnel_manager.py patches GitHub Gist  →  Chrome extension picks up new URL
 tunnel_manager.py calls Pub/Sub API    →  push endpoint updated instantly
-    subscription.modify_push_config(new_url + '/email-push?token=<key>')
+    subscription.modify_push_config(new_url + '/email-push')  # OIDC JWT auth; no token in URL
 ```
 
 **OAuth redirect URI — Cloudflare Worker shim:** Google does not allow
@@ -506,6 +509,9 @@ export default {
     const gist = await fetch('https://gist.githubusercontent.com/rutvijmavani/4f400d820fd0b390c15dd7d6592d8053/raw/api-config.json');
     const { api_base } = await gist.json();
     const target = api_base.replace(/\/$/, '') + url.pathname + url.search;
+    // Validate before redirecting: target must use https:// and a known tunnel hostname
+    // (e.g. *.trycloudflare.com or *.ngrok-free.app). Reject anything else to prevent
+    // open-redirect abuse if the Gist is tampered with.
     return Response.redirect(target, 302);
   }
 };
@@ -514,8 +520,11 @@ export default {
 Free tier: 100,000 requests/day. Actual usage: ~2 requests total
 (one per user authorization, which happens once per user ever).
 
-If the Gist fetch fails (network blip), `api.py` falls back to
-`GMAIL_OAUTH_REDIRECT_URI` env var.
+If the Gist fetch fails (network blip), the Worker should return a 503 or
+redirect to the `FALLBACK_REDIRECT_URI` Worker environment variable (set to the
+current tunnel URL at deploy time). `api.py` also has a server-side fallback:
+if the Worker URL cannot be reached, it falls back to the `GMAIL_OAUTH_REDIRECT_URI`
+env var for the redirect_uri parameter.
 
 ---
 
@@ -592,10 +601,12 @@ If restart fails 3 times → escalation email sent → auto-heal paused 24h
 
 This makes `pipeline-api` a first-class monitored service, not a blind spot.
 
-### Two-layer durability — no email notification is ever lost
+### Two-layer durability — at-least-once delivery
 
-Two independent systems ensure that a notification is never dropped, even
-if the server crashes at any point during processing:
+Two independent systems provide at-least-once delivery while Pub/Sub and
+Gmail history remain available. Expired history IDs or watch gaps (e.g. watch
+not renewed within 7 days) can permanently lose messages that arrived while
+the watch was inactive. Within normal operation:
 
 ### Implementation notes — history.list
 
@@ -605,11 +616,23 @@ arrive in quick succession, Gmail may bundle them under a single `historyId`.
 entry:
 
 ```python
-history = gmail.users.history().list(userId="me", startHistoryId=last_id).execute()
-for record in history.get("history", []):
-    for msg in record.get("messagesAdded", []):
-        redis.lpush("stream:email-push", msg["message"]["id"])
-update_last_history_id(user_id, history["historyId"])
+page_token = None
+all_history_id = None
+while True:
+    resp = gmail.users.history().list(
+        userId="me", startHistoryId=last_id, pageToken=page_token
+    ).execute()
+    for record in resp.get("history", []):
+        for msg in record.get("messagesAdded", []):
+            redis.lpush("stream:email-push", msg["message"]["id"])
+    # historyId is only on the first page; capture from any page that has it
+    if "historyId" in resp:
+        all_history_id = resp["historyId"]
+    page_token = resp.get("nextPageToken")
+    if not page_token:
+        break
+if all_history_id:
+    update_last_history_id(user_id, all_history_id)
 ```
 
 **Filter for `messagesAdded` only.** `history.list` also returns label
@@ -626,28 +649,32 @@ delivery with exponential backoff. If `pipeline-api` is down, Pub/Sub keeps
 retrying. When the server comes back up, all queued notifications are
 delivered automatically. This handles the server-down scenario completely.
 
-**Layer 2 — Redis stream (internal)**
+**Layer 2 — Redis List (internal)**
 
-When a notification is received, it is written to a Redis stream
-(`stream:email-push`) before Pub/Sub is acknowledged. The acknowledgment
-(HTTP 200) is only sent after the Redis write succeeds — a fast operation
-taking under 100ms.
+When a notification is received, it is written to a Redis List
+(`stream:email-push`, accessed via LPUSH/LMOVE/LREM) before Pub/Sub is
+acknowledged. The acknowledgment (HTTP 200) is only sent after the Redis
+write succeeds — a fast operation taking under 100ms.
 
 ```text
 Pub/Sub delivers notification
     ↓
-Write to stream:email-push  (Redis, AOF-persistent)
+LPUSH stream:email-push  (Redis List, AOF-persistent)
     ↓  (< 100ms)
 Return HTTP 200 to Pub/Sub  ← notification acknowledged
     ↓
-Background processor reads and processes from Redis
+Background processor reads and processes from Redis List
 ```
 
-Redis already has AOF persistence enabled (writes every ~1 second), meaning
-jobs in the stream survive a server restart. This handles the crash-after-
-acknowledgment scenario — if the server crashes after returning 200 to
-Pub/Sub but before processing the email, the job remains in the Redis stream
-and is processed when the server restarts.
+Redis already has AOF persistence enabled (writes approximately every 1 second
+with `appendfsync everysec`). Jobs in the list survive a planned restart. However,
+the approximately one-second write interval does not guarantee durability
+immediately after LPUSH: returning HTTP 200 to Pub/Sub after a successful LPUSH
+does not guarantee the write survived a crash if it occurred before the next AOF
+flush. In practice, at most ~1 second of writes can be lost on an unclean shutdown.
+For crash-after-acknowledgment scenarios involving that window, Pub/Sub will not
+retry (it already received 200). This handles the common crash-after-acknowledgment
+case but is not a zero-loss guarantee under all failure modes.
 
 Together, these two layers mean:
 
@@ -785,15 +812,31 @@ the `text/html` part:
 
 ```python
 def extract_body(payload):
-    for part in payload.get("parts", []):
-        if part["mimeType"] == "text/plain":
-            return base64.urlsafe_b64decode(part["body"]["data"]).decode()
-    for part in payload.get("parts", []):
-        if part["mimeType"] == "text/html":
-            html = base64.urlsafe_b64decode(part["body"]["data"]).decode()
-            return re.sub(r"<[^>]+>", " ", html)   # strip tags
-    # single-part email
-    return base64.urlsafe_b64decode(payload["body"]["data"]).decode()
+    """Recursively traverse MIME parts; return text/plain or stripped text/html."""
+    def _walk(part):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        # Skip attachments (have attachmentId, no inline data)
+        if body.get("attachmentId"):
+            return None
+        if mime == "text/plain" and body.get("data"):
+            return base64.urlsafe_b64decode(body["data"]).decode()
+        if mime == "text/html" and body.get("data"):
+            html = base64.urlsafe_b64decode(body["data"]).decode()
+            return re.sub(r"<[^>]+>", " ", html)
+        # Recurse into nested multipart/*
+        for sub in part.get("parts", []):
+            result = _walk(sub)
+            if result:
+                return result
+        return None
+
+    text = _walk(payload)
+    if text:
+        return text
+    # Fallback: single-part email with data directly on payload body
+    data = payload.get("body", {}).get("data")
+    return base64.urlsafe_b64decode(data).decode() if data else ""
 ```
 
 ### Email body too long
@@ -803,12 +846,16 @@ notices, and company boilerplate. With `n_ctx=2048`, anything beyond ~1500
 words is silently truncated by llama-cpp. If the actual rejection sentence is
 buried at the end, the model never sees it.
 
-**Fix:** truncate the body to the first 2000 words before passing to the
-model. The actionable content (rejection, invite, offer language) is always
-near the top of job-related emails — the tail is always boilerplate:
+**Fix:** truncate the body before passing to the model. The budget must
+account for the model token budget: `n_ctx=2048` must accommodate the system
+prompt, the JSON output schema, and the email body together. At ~1 token per
+word, roughly 1,200–1,400 words of body text leaves adequate headroom for
+prompt overhead and the required JSON output. The actionable content
+(rejection, invite, offer language) is always near the top of job-related
+emails — the tail is always boilerplate:
 
 ```python
-body = " ".join(body.split()[:2000])
+body = " ".join(body.split()[:1400])   # adjust based on measured prompt overhead
 ```
 
 ### Model inference hangs indefinitely
@@ -844,12 +891,13 @@ def _run_with_timeout(fn, timeout=120):
             p.terminate()
             p.join()
             raise RuntimeError(f"inference timed out after {timeout}s")
-        if not q.empty():
-            kind, val = q.get_nowait()
+        try:
+            kind, val = q.get(timeout=1)   # q.empty() is unreliable across processes
             if kind == "ok":
                 return val
             raise val
-        raise RuntimeError("inference process exited without result")
+        except queue.Empty:
+            raise RuntimeError("inference process exited without result")
     finally:
         q.close()
         q.join_thread()  # drain feeder thread
@@ -909,6 +957,13 @@ alert email asking them to re-authorize. Do not retry: the token will not
 become valid again on its own.
 
 ```python
+from google.auth.exceptions import RefreshError
+
+except RefreshError:
+    # Token refresh failed at the credentials layer (e.g. token expired/revoked
+    # before the API call was even made). Treat as permanent.
+    send_reauth_alert(user_id)
+    return  # permanent — do not retry
 except HttpError as e:
     if "invalid_grant" in str(e):
         send_reauth_alert(user_id)
@@ -1063,7 +1118,7 @@ cleanup.
 | Custom domain for stable Pub/Sub URL | Costs money; not needed — `tunnel_manager.py` already handles URL changes and is extended to update the Pub/Sub push endpoint automatically |
 | Retry 0-match emails like transient failures | A missing application will not appear in the DB between retry attempts; 0-match is a permanent outcome and goes directly to unmatched_emails, not the retry queue |
 | Ack email normalization + pending_acks table | Use acknowledgement emails to retroactively set ats_company/ats_title on applications; store unmatched acks in a pending_acks table and resolve them when the application is later added via Chrome extension or Google Form. Rejected — over-engineering at current volume (5–10 emails/day, 2 users). Fuzzy matching already handles most company name mismatches; unmatched_emails + daily digest is the safety net for the rest. ats_company and ats_title columns are added to the schema as nullable for future use but not populated from acks |
-| Pass all 500 candidates to Qwen for disambiguation | Exceeds Qwen's context window; inference is slow and unreliable with hundreds of candidates. The 5-layer funnel ensures Qwen never sees more than 2–3 |
+| Pass hundreds of candidates to Qwen for disambiguation | Exceeds Qwen's context window; inference is slow and unreliable at that scale. The 4-layer funnel (rapidfuzz exact → fuzzy → title → Qwen) ensures Qwen never sees more than 2–3 candidates |
 | Company name alone as the match key | Multiple open applications at the same company would return multiple candidates with no way to distinguish them; title is needed as a second signal |
 
 ---
@@ -1072,14 +1127,14 @@ cleanup.
 
 | File | Status | Purpose |
 |---|---|---|
-| `workers/email_processor.py` | To be created | Long-running daemon — reads Redis stream, runs Qwen inference, 4-layer matching funnel, DB status update, retry/DLQ for transient failures, unmatched_emails write for 0-match |
-| `scripts/renew_gmail_watch.py` | To be created | Daily watch renewal — checks all users' watch_expires_at, renews those within 48 hours |
-| `api.py` | To be modified | Add `POST /email-push` webhook endpoint (writes to Redis stream, returns 200); add `GET /oauth/start` and `GET /oauth/callback` endpoints for one-time user authorization |
-| `db/schema.py` | To be modified | Add `gmail_tokens` table and `unmatched_emails` table |
-| `workers/watchdog.py` | To be modified | Add `pipeline-api` and `email-processor` to `check_systemd_services()`; extend `_check_dlq_health()` to cover `queue:email:dlq`; add 30-day cleanup for `unmatched_emails` |
-| `deploy/systemd/email-processor.service` | To be created | systemd unit for the email processor daemon |
-| `deploy/install-systemd.sh` | To be modified | Install `email-processor.service` alongside existing units |
-| `setup_cron.sh` | To be modified | Add daily 2 AM renewal job for `renew_gmail_watch.py` |
+| `workers/email_processor.py` | Implemented | Long-running daemon — reads Redis List, runs Qwen inference, 4-layer matching funnel, DB status update, retry/DLQ for transient failures, unmatched_emails write for 0-match |
+| `scripts/renew_gmail_watch.py` | Implemented | Daily watch renewal — checks all users' watch_expires_at, renews those within 48 hours |
+| `api.py` | Modified | Added `POST /email-push` webhook endpoint (writes to Redis List, returns 200); added `GET /oauth/start` and `GET /oauth/callback` endpoints for one-time user authorization |
+| `db/schema.py` | Modified | Added `gmail_tokens` table and `unmatched_emails` table |
+| `workers/watchdog.py` | Modified | Added `pipeline-api` and `email-processor` to `check_systemd_services()`; extended `_check_dlq_health()` to cover `queue:email:dlq`; added 30-day cleanup for `unmatched_emails` |
+| `deploy/systemd/email-processor.service` | Implemented | systemd unit for the email processor daemon |
+| `deploy/install-systemd.sh` | Modified | Installs `email-processor.service` alongside existing units |
+| `setup_cron.sh` | Modified | Daily 2 AM renewal job for `renew_gmail_watch.py` added |
 | `requirements.txt` | To be modified | Add `rapidfuzz` (fuzzy matching), `llama-cpp-python` (Qwen inference), `cryptography` (token encryption) |
 
 ---
@@ -1092,7 +1147,7 @@ One row per user. Stores OAuth credentials and Gmail watch state.
 |---|---|---|
 | `user_id` | INT (FK → users) | Primary key — one row per user |
 | `gmail_email` | TEXT | User's Gmail address — matched against incoming Pub/Sub `emailAddress` field to identify which user an email belongs to |
-| `refresh_token_enc` | TEXT | AES-256 encrypted, base64-encoded OAuth refresh token. Named `_enc` to make encryption explicit — never use the raw value |
+| `refresh_token_enc` | TEXT | Fernet-encrypted (AES-128-CBC + HMAC-SHA256), base64-encoded OAuth refresh token. Named `_enc` to make encryption explicit — never use the raw value |
 | `watch_id` | TEXT | ID returned by `gmail.watch()` — required to stop or renew the watch |
 | `watch_expires_at` | TIMESTAMPTZ | Expiry timestamp of the active Gmail watch — renewal cron checks this daily |
 | `last_history_id` | TEXT | Last Gmail historyId successfully processed for this user. Pub/Sub delivers a historyId (not the email itself) — the processor calls `gmail.users.history.list(startHistoryId=last_history_id)` to fetch new messages, then updates this value. Must be persisted: if the service restarts without it, the processor cannot know where it left off and will either miss emails or reprocess old ones. |
@@ -1125,8 +1180,9 @@ to read a user's Gmail.
 - Simpler to implement and audit
 - Key rotation is straightforward: update `GMAIL_TOKEN_ENCRYPTION_KEY` in
   `.env` and re-encrypt all rows in one migration script
-- Library: `cryptography` (Fernet, AES-128-CBC under the hood — standard
-  Python choice for symmetric encryption)
+- Library: `cryptography` (Fernet — AES-128-CBC with HMAC-SHA256 and a
+  128-bit AES key derived from a 32-byte Fernet key; standard Python choice
+  for symmetric authenticated encryption)
 
 **Column naming convention:** `refresh_token_enc` (not `refresh_token`) makes
 the encryption contract explicit in the schema itself. Any developer reading
@@ -1159,8 +1215,11 @@ deployment environment:
 
 1. **Google Cloud project** — Enable Gmail API and Pub/Sub API
 2. **Pub/Sub topic and subscription** — Create a push subscription pointing
-   to `<tunnel-url>/email-push?token=<EXTENSION_API_KEY>`; `tunnel_manager.py`
-   keeps the URL current automatically after the first setup
+   to `<tunnel-url>/email-push` with authentication type **OIDC token** and a
+   Google-managed service account email; `tunnel_manager.py` keeps the URL
+   current automatically after the first setup. Do not use a query-string token
+   (`?token=...`) — bearer tokens in URLs appear in server logs. Verify the
+   incoming OIDC JWT in `api.py` on every `/email-push` request before processing.
 3. **OAuth2 credentials** — Create a new Web Application OAuth 2.0 Client ID
    in Google Console (separate from the Chrome Extension client). Add exactly
    one authorized redirect URI:
