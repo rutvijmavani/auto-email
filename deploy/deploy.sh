@@ -86,11 +86,15 @@ _rollback_to_previous() {
         || echo "  [WARN] could not restart recruiter-watchdog"
     sudo systemctl restart pipeline-api \
         || echo "  [WARN] could not restart pipeline-api"
+    sudo systemctl restart recruiter-manager \
+        || echo "  [WARN] could not restart recruiter-manager"
+    sudo systemctl restart email-processor \
+        || echo "  [WARN] could not restart email-processor"
 
     # Post-rollback verification
     sleep 3
     local _all_active=true
-    for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+    for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
         if systemctl is-active --quiet "$svc"; then
             echo "  [OK] $svc is active after rollback"
         else
@@ -238,6 +242,16 @@ sudo systemctl restart pipeline-api || {
     _rollback_to_previous; exit 1
 }
 
+sudo systemctl restart recruiter-manager || {
+    echo "  [ERROR] recruiter-manager failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
+
+sudo systemctl restart email-processor || {
+    echo "  [ERROR] email-processor failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
+
 echo ""
 echo "  Waiting for services to come up..."
 sleep 5
@@ -246,7 +260,7 @@ sleep 5
 echo ""
 echo "► Service status:"
 _svc_fail=0
-for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
     if [[ "$status" == "active" ]]; then

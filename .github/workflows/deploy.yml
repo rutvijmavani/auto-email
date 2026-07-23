@@ -101,7 +101,7 @@ jobs:
               else
                 echo "[WARN] Skipping pip install and unit sync — code state unknown"
               fi
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
             }
@@ -114,7 +114,7 @@ jobs:
               _rollback_to_sha "$PREVIOUS_SHA"
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
@@ -180,7 +180,7 @@ jobs:
             echo "  systemd daemon reloaded"
 
             echo "[7/8] Restarting services..."
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
                 false  # trigger ERR trap → _early_rollback runs
@@ -190,7 +190,7 @@ jobs:
 
             echo "[8/8] Verifying services are active..."
             sleep 3   # brief settle: systemctl restart returns once the process starts, not fully active
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
               if ! systemctl is-active --quiet "$svc"; then
                 echo "[ERROR] $svc failed to start after restart:"
                 journalctl -u "$svc" -n 30 --no-pager || true
@@ -213,7 +213,7 @@ jobs:
 
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
