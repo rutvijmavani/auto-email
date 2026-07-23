@@ -39,6 +39,16 @@ from config import (
 
 logger = get_logger(__name__)
 
+# Platforms whose detail payloads require ephemeral keys extracted from the
+# listing-scan API response (_slug, _wd, _path, _base_url, etc.). job_postings
+# only stores job_url/job_id — rebuild cannot reconstruct those keys. Skip
+# these during rebuild; their pending_detail rows will be re-discovered on the
+# next adaptive/fullscan cycle.  Keep in sync with _REQUIRED_DETAIL_KEYS in
+# workers/detail_worker.py.
+_REBUILD_SKIP_PLATFORMS = frozenset({
+    "workday", "taleo", "smartrecruiters", "icims", "jobvite",
+})
+
 
 # ─────────────────────────────────────────
 # CYCLE BOUNDARY HELPER
@@ -343,7 +353,7 @@ def rebuild_detail_queue() -> int:
     conn = get_conn()
     try:
         rows = conn.execute("""
-            SELECT company, job_url, job_id, ats_platform
+            SELECT company, job_url, job_id, ats_platform, detail_payload
             FROM job_postings
             WHERE status = 'pending_detail'
             ORDER BY first_seen ASC
@@ -351,20 +361,38 @@ def rebuild_detail_queue() -> int:
     finally:
         conn.close()
 
+    skipped = 0
     count = 0
     for row in rows:
-        payload = json.dumps({
-            "company":      row["company"],
-            "job_url":      row["job_url"],
-            "job_id":       row["job_id"],
-            "ats_platform": row["ats_platform"],
-            "source":       "rebuild",
-        })
+        stored = row["detail_payload"]
+        if stored:
+            # Full payload persisted at scan time — push it verbatim so
+            # detail_worker gets every platform-specific key it needs.
+            payload = json.dumps(stored) if isinstance(stored, dict) else stored
+        elif row["ats_platform"] in _REBUILD_SKIP_PLATFORMS:
+            # Old row (pre detail_payload column) for a platform that needs
+            # ephemeral keys we can't reconstruct.  Skip; next scan re-queues
+            # with a complete payload.
+            skipped += 1
+            continue
+        else:
+            # Old row for a platform whose minimal payload is sufficient.
+            payload = json.dumps({
+                "company":      row["company"],
+                "job_url":      row["job_url"],
+                "job_id":       row["job_id"],
+                "ats_platform": row["ats_platform"],
+                "found_by":     "rebuild",
+            })
         r.lpush(REDIS_DETAIL_ADAPTIVE, payload)
         count += 1
 
-    if count:
-        logger.info("rebuild: re-queued %d pending_detail jobs", count)
+    if count or skipped:
+        logger.info(
+            "rebuild: re-queued %d pending_detail jobs, skipped %d "
+            "(old rows for platforms requiring ephemeral keys)",
+            count, skipped,
+        )
 
     return count
 

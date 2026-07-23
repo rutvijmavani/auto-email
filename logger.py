@@ -63,7 +63,7 @@ _MONTHLY_COMMANDS = frozenset({"monthly", "enrich", "build_ats_slug_list"})
 # Long-running processes that use TimedRotatingFileHandler (rotates at midnight)
 # instead of a dated filename so the file doesn't grow unbounded for weeks.
 # Log files: scheduler.log, api.log → rotate to scheduler.log.YYYY-MM-DD etc.
-_LONG_RUNNING_COMMANDS = frozenset({"scheduler", "api"})
+_LONG_RUNNING_COMMANDS = frozenset({"scheduler", "api", "email_processor"})
 
 # Map CLI flag → log filename prefix
 # Pipeline sets this via init_logging(command="monitor") at startup

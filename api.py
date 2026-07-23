@@ -1,14 +1,31 @@
+import base64
 import hmac
+import json
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify, make_response
+import requests as _requests
+from flask import Flask, request, jsonify, make_response, redirect
 from dotenv import load_dotenv
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
 
 load_dotenv()
 
 from logger import get_logger, init_logging, cleanup_logs_if_due
+from config import REDIS_EMAIL_PUSH
 from db.applications import add_application
+from db.gmail_tokens import upsert_token, update_watch
+from workers.redis_client import get_redis
+
+_GMAIL_SCOPES       = ["https://www.googleapis.com/auth/gmail.readonly"]
+_CLIENT_ID          = os.environ.get("GMAIL_CLIENT_ID", "")
+_CLIENT_SECRET      = os.environ.get("GMAIL_CLIENT_SECRET", "")
+_REDIRECT_URI       = os.environ.get("GMAIL_OAUTH_REDIRECT_URI", "")  # fallback when Gist unavailable
+_PUBSUB_TOPIC       = os.environ.get("GMAIL_PUBSUB_TOPIC", "")
+_GIST_CONFIG_URL    = os.environ.get("GIST_CONFIG_URL", "")  # same Gist used by Chrome extension
 
 init_logging('api')
 logger = get_logger(__name__)
@@ -125,6 +142,210 @@ def add_application_endpoint():
         logger.info("duplicate application id=%s company=%r user_id=%s", app_id, company, user_id)
 
     return jsonify({'id': app_id, 'created': created}), 201 if created else 200
+
+
+# ── Gmail Push Notifications ──────────────────────────────────────────────────
+
+@app.route('/email-push', methods=['POST'])
+def email_push():
+    """
+    Pub/Sub push endpoint. Called by Google Cloud Pub/Sub when a new email
+    arrives in a monitored Gmail inbox.
+
+    Pub/Sub delivers a JSON envelope:
+        {"message": {"data": "<base64>", "messageId": "..."}, "subscription": "..."}
+
+    The base64-decoded data is:
+        {"emailAddress": "user@gmail.com", "historyId": "12345"}
+
+    Authentication: the Pub/Sub push subscription URL must include
+    ?token=<EXTENSION_API_KEY> so only Google's authenticated calls are
+    accepted. Unauthenticated requests are rejected before any decoding.
+
+    We write this to the Redis queue and return 200 immediately.
+    Pub/Sub retries if we return non-200, so Redis write failures return 500.
+    """
+    if not _API_KEY or not hmac.compare_digest(request.args.get("token", ""), _API_KEY):
+        logger.warning("email-push: unauthorized request from %s", request.remote_addr)
+        return '', 401
+
+    envelope = request.get_json(silent=True)
+    if not envelope or "message" not in envelope:
+        logger.warning("email-push: malformed envelope — ignoring")
+        return '', 204
+
+    try:
+        data = json.loads(base64.b64decode(envelope["message"]["data"]).decode())
+        email_address = data["emailAddress"]
+        history_id    = str(data["historyId"])
+    except Exception as e:
+        logger.warning("email-push: failed to decode message: %s", e)
+        return '', 204
+
+    payload = json.dumps({"email": email_address, "history_id": history_id})
+    try:
+        get_redis().lpush(REDIS_EMAIL_PUSH, payload)
+    except Exception as e:
+        logger.error("email-push: Redis write failed for %s: %s", email_address, e)
+        return '', 500  # tell Pub/Sub to retry
+
+    logger.info("email-push queued email=%s history_id=%s", email_address, history_id)
+    return '', 200
+
+
+# ── Gmail OAuth ───────────────────────────────────────────────────────────────
+
+def _get_redirect_uri() -> str:
+    """
+    Return the OAuth redirect URI for the current tunnel URL.
+
+    Fetches api_base from the GitHub Gist (kept current by tunnel_manager.py)
+    and appends /oauth/callback. Falls back to GMAIL_OAUTH_REDIRECT_URI env var
+    when the Gist is unreachable or GIST_CONFIG_URL is not set.
+    """
+    if _GIST_CONFIG_URL:
+        try:
+            resp = _requests.get(_GIST_CONFIG_URL, timeout=5)
+            base = resp.json().get("api_base", "").rstrip("/")
+            if base:
+                return f"{base}/oauth/callback"
+        except Exception as exc:
+            logger.warning("oauth: Gist fetch failed, falling back to env var: %s", exc)
+    return _REDIRECT_URI
+
+
+def _make_flow(redirect_uri: str) -> Flow:
+    return Flow.from_client_config(
+        client_config={
+            "web": {
+                "client_id":     _CLIENT_ID,
+                "client_secret": _CLIENT_SECRET,
+                "auth_uri":      "https://accounts.google.com/o/oauth2/auth",
+                "token_uri":     "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=_GMAIL_SCOPES,
+        redirect_uri=redirect_uri,
+    )
+
+
+_OAUTH_NONCE_TTL = 600   # seconds — nonce expires after 10 minutes
+
+
+@app.route('/oauth/start')
+def oauth_start():
+    """
+    Begin the OAuth flow for a user. Visit this URL once per user to grant
+    Gmail read access.
+
+    Query param: user_id (int) — must already exist in the users table.
+
+    Redirects to Google's consent screen. On approval, Google calls /oauth/callback.
+    The OAuth state param carries a one-time server-generated nonce (not user_id
+    directly) so user_id is never exposed in the redirect URI.
+    """
+    user_id = request.args.get("user_id", type=int)
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+
+    redirect_uri = _get_redirect_uri()
+    nonce = secrets.token_urlsafe(32)
+    try:
+        get_redis().set(
+            f"oauth:nonce:{nonce}",
+            json.dumps({"user_id": user_id, "redirect_uri": redirect_uri}),
+            ex=_OAUTH_NONCE_TTL,
+        )
+    except Exception as e:
+        logger.error("oauth/start: failed to store nonce for user_id=%s: %s", user_id, e)
+        return jsonify({"error": "internal error"}), 500
+
+    auth_url, _ = _make_flow(redirect_uri).authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",   # force refresh token on every auth
+        state=nonce,
+    )
+    logger.info("oauth/start redirecting user_id=%s to Google consent", user_id)
+    return redirect(auth_url)
+
+
+@app.route('/oauth/callback')
+def oauth_callback():
+    """
+    OAuth callback — Google redirects here after the user grants access.
+    Exchanges the auth code for tokens, stores the encrypted refresh token,
+    and starts the Gmail watch for this user.
+
+    The state param is a one-time nonce mapped to user_id in Redis. The nonce
+    is consumed exactly once — missing, expired, or replayed nonces are rejected.
+    """
+    nonce = request.args.get("state", "")
+    code  = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        logger.warning("oauth/callback: nonce=%s denied access: %s", nonce, error)
+        return jsonify({"error": "access denied", "detail": error}), 400
+
+    if not code or not nonce:
+        return jsonify({"error": "missing code or state"}), 400
+
+    # Resolve and consume the nonce — reject if missing, expired, or replayed
+    try:
+        raw = get_redis().getdel(f"oauth:nonce:{nonce}")
+    except Exception as e:
+        logger.error("oauth/callback: Redis error resolving nonce: %s", e)
+        return jsonify({"error": "internal error"}), 500
+
+    if raw is None:
+        logger.warning("oauth/callback: unknown or expired nonce=%s", nonce)
+        return jsonify({"error": "invalid or expired state"}), 400
+
+    try:
+        data = json.loads(raw)
+        user_id      = int(data["user_id"])
+        redirect_uri = data.get("redirect_uri") or _REDIRECT_URI
+    except (ValueError, TypeError, KeyError):
+        logger.error("oauth/callback: corrupt nonce value for nonce=%s", nonce)
+        return jsonify({"error": "internal error"}), 500
+
+    try:
+        flow = _make_flow(redirect_uri)
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+    except Exception as e:
+        logger.error("oauth/callback: token exchange failed for user_id=%s: %s", user_id, e)
+        return jsonify({"error": "token exchange failed"}), 500
+
+    # Persist encrypted refresh token
+    try:
+        gmail = build("gmail", "v1", credentials=creds)
+        profile = gmail.users().getProfile(userId="me").execute()
+        gmail_email = profile["emailAddress"]
+        upsert_token(user_id, gmail_email, creds.refresh_token)
+    except Exception as e:
+        logger.error("oauth/callback: failed to store token for user_id=%s: %s", user_id, e)
+        return jsonify({"error": "failed to store token"}), 500
+
+    # Start Gmail push notifications watch
+    try:
+        watch = gmail.users().watch(
+            userId="me",
+            body={"topicName": _PUBSUB_TOPIC, "labelIds": ["INBOX"]},
+        ).execute()
+        expires_ms  = int(watch["expiration"])
+        expires_at  = datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc).isoformat()
+        update_watch(user_id, str(watch["historyId"]), expires_at)
+        logger.info(
+            "oauth/callback: watch started for user_id=%s email=%s expires=%s",
+            user_id, gmail_email, expires_at,
+        )
+    except Exception as e:
+        logger.error("oauth/callback: watch setup failed for user_id=%s: %s", user_id, e)
+        return jsonify({"error": "token stored but watch failed — retry /oauth/start"}), 500
+
+    return jsonify({"status": "authorized", "email": gmail_email})
 
 
 if __name__ == '__main__':

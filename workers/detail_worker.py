@@ -78,7 +78,7 @@ from config import (
 )
 from workers.redis_client import get_redis
 from workers.heartbeat import Heartbeat
-from workers.http_client import set_request_context
+from workers.http_client import set_request_context, CeilingExceeded
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.job_filter import (
@@ -444,7 +444,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
     company     = payload.get("company", "")
     job_id      = payload.get("job_id", "")
     platform    = payload.get("ats_platform", "")
-    found_by    = payload.get("found_by", "tier1_adaptive")
+    found_by    = payload.get("found_by", "unknown")
     slug_info   = payload.get("slug_info")
 
     start_mono  = time.monotonic()
@@ -616,6 +616,8 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                         job = ats_module.fetch_job_detail(job, slug_info)
                     else:
                         job = ats_module.fetch_job_detail(job)
+                except CeilingExceeded:
+                    raise   # propagate to main loop for priority requeue
                 except Exception as exc:
                     logger.error(
                         "detail_worker: fetch_job_detail failed "
@@ -979,6 +981,15 @@ def run_worker(once: bool = False, shutdown_event=None,
 
     r = get_redis()
 
+    # Signal manager that this worker is now online (reduces pending_spawns counter)
+    try:
+        _ps_key = "manager:pool:detail:pending_spawns"
+        if r.exists(_ps_key):
+            if r.decr(_ps_key) < 0:
+                r.set(_ps_key, 0)
+    except Exception:
+        pass
+
     # ── Set per-PID inflight key names ───────────────────────────────────────
     # Must use os.getpid() HERE (inside the child process after fork) so each
     # worker process gets its own inflight namespace.  Module-level constants
@@ -1033,6 +1044,14 @@ def run_worker(once: bool = False, shutdown_event=None,
     # without adding meaningful overhead (SCAN returns empty in the common case).
     _PEER_RECOVERY_INTERVAL_S = 300   # 5 minutes
     _last_peer_recovery = time.monotonic()
+
+    # ── Busy-time tracking for manager.py utilization signal ─────────────────
+    # Accumulates actual job-processing ms in a rolling 60s window.
+    # Published to worker:detail:busy_ms:{pid} after each job so manager.py can
+    # compute pool_utilization = pool_busy_ms / (n_workers × 60s × 1000).
+    _BUSY_CYCLE_S    = 60
+    _busy_ms_acc     = 0
+    _busy_window_t   = time.monotonic()
 
     while True:
         try:
@@ -1137,7 +1156,42 @@ def run_worker(once: bool = False, shutdown_event=None,
                     break
                 continue
 
-            result = _process_detail(payload, source_queue)
+            _job_t0 = time.monotonic()
+            try:
+                result = _process_detail(payload, source_queue)
+            except CeilingExceeded as _ce:
+                # Platform at concurrency ceiling — put job back at tail of
+                # source queue (tail = next consumed, since LMOVE reads RIGHT)
+                # so it gets retried on the next free slot without losing priority.
+                # _ATOMIC_REQUEUE_LUA: LREM from inflight + RPUSH to source, atomic.
+                try:
+                    r.eval(_ATOMIC_REQUEUE_LUA, 2, inflight_key, source_queue, raw)
+                    logger.debug(
+                        "detail_worker: CeilingExceeded platform=%r — "
+                        "requeued to tail of %s",
+                        str(_ce), source_queue,
+                    )
+                except Exception as _re_err:
+                    logger.error(
+                        "detail_worker: CeilingExceeded requeue failed "
+                        "— item may be stranded in inflight: %s", _re_err,
+                    )
+                if once:
+                    break
+                continue
+            # ── Publish busy_ms for manager.py utilization ───────────────────
+            _elapsed_ms = int((time.monotonic() - _job_t0) * 1000)
+            _now_m = time.monotonic()
+            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
+                _busy_ms_acc   = 0
+                _busy_window_t = _now_m
+            _busy_ms_acc += _elapsed_ms
+            try:
+                r.set(f"worker:detail:busy_ms:{own_pid}", _busy_ms_acc,
+                      ex=_BUSY_CYCLE_S * 2)
+            except Exception:
+                pass
+
             _hw["count"] += 1
 
             # ── Acknowledge or retain in inflight ─────────────────────────────

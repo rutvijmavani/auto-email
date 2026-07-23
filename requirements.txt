@@ -58,6 +58,7 @@ joblib==1.5.3
 kiwisolver==1.4.9
 logging==0.4.9.6
 loguru==0.7.3
+llama-cpp-python==0.3.34
 lxml==6.0.2
 mailjet-rest==1.5.1
 markdown-it-py==4.0.0
@@ -123,6 +124,7 @@ pytweening==1.2.0
 pytz==2025.2
 pywhatkit==5.4
 PyYAML==6.0.3
+rapidfuzz==3.13.0
 redis==5.2.1
 reportlab==4.4.5
 requests==2.32.5

@@ -5,6 +5,7 @@ Key change: get_monitorable_companies() now includes custom platform
 companies when they have a valid ats_slug (curl has been captured).
 """
 
+import json
 from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
@@ -612,7 +613,8 @@ def get_company_row(company: str) -> "dict | None":
 
 
 def save_pending_detail(company: str, platform: str, job: dict,
-                        found_by: str = "tier1_adaptive") -> bool:
+                        found_by: str = "tier1_adaptive",
+                        detail_payload: "dict | None" = None) -> bool:
     """
     Insert a job as status='pending_detail' for the detail queue.
 
@@ -620,12 +622,16 @@ def save_pending_detail(company: str, platform: str, job: dict,
     confirms the job_id is new, and by fullscan_worker
     (found_by='tier2_fullscan') for jobs found during a full scan.
 
+    detail_payload: the full Redis payload dict (including platform-specific
+    keys like _slug, _wd, etc.). Stored as JSONB so rebuild_detail_queue()
+    can re-push the exact same payload after a scheduler restart without
+    losing platform-specific keys.
+
     The detail_worker will later UPDATE this to 'new' after fetching full
     detail and applying filters.
 
     Returns True if inserted (new row), False if job_url already exists.
     """
-    from datetime import datetime
     conn = get_conn()
     today = datetime.now().strftime("%Y-%m-%d")
     posted_at = job.get("posted_at")
@@ -637,9 +643,9 @@ def save_pending_detail(company: str, platform: str, job: dict,
             INSERT INTO job_postings
               (company, title, job_url, job_id, ats_platform,
                location, posted_at, description, skill_score,
-               status, found_by, first_seen)
+               status, found_by, first_seen, detail_payload)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    'pending_detail', %s, %s)
+                    'pending_detail', %s, %s, %s)
             ON CONFLICT (job_url) DO NOTHING
         """, (
             company,
@@ -653,6 +659,7 @@ def save_pending_detail(company: str, platform: str, job: dict,
             job.get("skill_score", 0),
             found_by,
             today,
+            json.dumps(detail_payload) if detail_payload else None,
         ))
         conn.commit()
         return cursor.rowcount > 0
@@ -798,12 +805,14 @@ def upsert_poll_stats(company: str, platform: str,
     but NULL legacy rows (added before the column existed) are backfilled
     automatically on the next scan.
 
-    duration_ms is stored for scheduler latency tracking but not
-    persisted here — the scheduler reads it from the result payload.
+    duration_ms is persisted as last_scan_duration_s and rolled into
+    avg_scan_duration_s via EMA (alpha=0.3, seed=120s).  The manager reads
+    avg_scan_duration_s as avg_fetch_s for the universal scaling formula.
     next_poll_at and adaptive_score are left for the scheduler to set.
     """
     from workers.slot import slot_offset as _slot_offset
-    offset_s = _slot_offset(company)
+    offset_s  = _slot_offset(company)
+    duration_s = max(0, duration_ms // 1000)
 
     conn = get_conn()
     try:
@@ -811,8 +820,9 @@ def upsert_poll_stats(company: str, platform: str,
             INSERT INTO company_poll_stats
                 (company, ats_platform, last_poll_at,
                  total_polls, total_new_jobs,
-                 consecutive_empty, initial_slot_offset_s, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, CURRENT_TIMESTAMP)
+                 consecutive_empty, initial_slot_offset_s,
+                 last_scan_duration_s, avg_scan_duration_s, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, ?, 120.0, CURRENT_TIMESTAMP)
             ON CONFLICT(company) DO UPDATE SET
                 ats_platform          = EXCLUDED.ats_platform,
                 last_poll_at          = CURRENT_TIMESTAMP,
@@ -828,8 +838,14 @@ def upsert_poll_stats(company: str, platform: str,
                 initial_slot_offset_s = COALESCE(
                     company_poll_stats.initial_slot_offset_s,
                     EXCLUDED.initial_slot_offset_s
-                )
-        """, (company, platform, new_jobs, offset_s))
+                ),
+                last_scan_duration_s  = EXCLUDED.last_scan_duration_s,
+                avg_scan_duration_s   = 0.3 * EXCLUDED.last_scan_duration_s
+                                        + 0.7 * COALESCE(
+                                            company_poll_stats.avg_scan_duration_s,
+                                            120.0
+                                        )
+        """, (company, platform, new_jobs, offset_s, duration_s))
         # NOTE: initial_slot_offset_s uses COALESCE so the original
         # registration slot is preserved once set, but legacy NULL rows
         # (created before the column existed) are backfilled on next scan.

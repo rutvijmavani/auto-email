@@ -1,0 +1,33 @@
+[Unit]
+Description=Gmail Email Status Processor (Qwen3-8B)
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/python -m workers.email_processor
+Restart=always
+RestartSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=no
+ReadWritePaths=/home/opc/mail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=email-processor
+
+[Install]
+WantedBy=multi-user.target

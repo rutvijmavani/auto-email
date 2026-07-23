@@ -108,7 +108,7 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service; do
+for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service; do
     src="$DEPLOY_DIR/systemd/$unit"
     if [[ ! -f "$src" ]]; then
         echo "[ERROR] Unit file not found: $src"
@@ -144,6 +144,7 @@ ALLOWED_UNITS=(
     "recruiter-watchdog.service"
     "recruiter-pipeline-alert@.service"
     "pipeline-api.service"
+    "email-processor.service"
 )
 for unit in "\${ALLOWED_UNITS[@]}"; do
     src="\$SRC_DIR/\$unit"
@@ -187,10 +188,13 @@ cat > "$_SUDOERS_TMP" << EOF
 # Watchdog commands:
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdog
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active email-processor
 # Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
@@ -229,6 +233,7 @@ systemctl daemon-reload
 systemctl enable recruiter-scheduler
 systemctl enable recruiter-watchdog
 systemctl enable pipeline-api
+systemctl enable email-processor
 
 if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."

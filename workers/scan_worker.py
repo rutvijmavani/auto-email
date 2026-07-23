@@ -112,7 +112,7 @@ from config import (
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import Heartbeat
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
-from workers.http_client import set_request_context
+from workers.http_client import set_request_context, CeilingExceeded
 from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
@@ -321,6 +321,20 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         _fetch_complete = True
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except CeilingExceeded:
+            # Platform at concurrency ceiling — reschedule via poll:adaptive
+            # with a 30s delay. Leave stream message in PEL (no XACK) so
+            # XAUTOCLAIM reclaims it if this worker dies before the ZADD.
+            # result["requeued"] = True triggers the "leave in PEL" path in
+            # the main loop (line 944 check).
+            r.zadd("poll:adaptive", {company: time.time() + 30})
+            result["requeued"] = True
+            logger.debug(
+                "scan_worker [%s]: CeilingExceeded for %r — "
+                "rescheduled poll:adaptive +30s, leaving in PEL",
+                request_id, company,
+            )
+            return result
         except IncompleteSearchError as exc:
             if not exc.stubs:
                 raise
@@ -450,14 +464,24 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         new_count        = 0
         adaptive_skipped = 0
 
-        # Backpressure: check detail queue depth before pushing
-        queue_depth = r.llen(REDIS_DETAIL_ADAPTIVE)
-        if queue_depth > DETAIL_QUEUE_MAX_ADAPTIVE:
+        # ── Layer 2 Lever 1: manager signals that detail queue is overloaded ──
+        # When manager:lever1:detail:active is set, hold all pushes to
+        # queue:detail:adaptive.  Scan processing (title matching, DB checks)
+        # still runs so scan is XACKed normally.  Jobs not pushed here will be
+        # re-discovered next time this company is scanned (adaptive_seen is not
+        # updated for held jobs, so they register as new again on the next cycle).
+        _lever1_detail_active = bool(r.exists("manager:lever1:detail:active"))
+        _reintro_detail_active = (
+            not _lever1_detail_active
+            and bool(r.exists("manager:reintro:detail:active"))
+        )
+        _reintro_detail_count = 0   # pushes this cycle during re-intro
+        _REINTRO_DETAIL_BATCH_MAX = 3
+        if _lever1_detail_active:
             logger.warning(
-                "scan_worker [%s]: detail queue backpressure "
-                "(depth=%d > max=%d) — scan will proceed but "
-                "new jobs may be delayed",
-                request_id, queue_depth, DETAIL_QUEUE_MAX_ADAPTIVE,
+                "scan_worker [%s]: Layer 2 Lever 1 active — "
+                "holding %d matched jobs; will re-discover on next scan cycle",
+                request_id, len(title_matched),
             )
 
         for job in title_matched:
@@ -494,13 +518,23 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                     exc_info=True,
                 )
             else:
-                if save_pending_detail(company, platform, job):
-                    r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
-                    new_count += 1
-
-            # Mark as processed in adaptive_seen regardless of outcome so
-            # subsequent adaptive scans today skip the DB lookup entirely.
-            r.sadd(adaptive_seen_key, job_id)
+                if save_pending_detail(company, platform, job,
+                                       detail_payload=detail_payload):
+                    if _lever1_detail_active:
+                        adaptive_skipped += 1
+                        continue  # held — do not mark adaptive_seen
+                    elif (_reintro_detail_active
+                          and _reintro_detail_count >= _REINTRO_DETAIL_BATCH_MAX):
+                        # Re-intro trickle: held for this cycle; re-discovered next scan.
+                        adaptive_skipped += 1
+                        continue  # do not mark adaptive_seen
+                    else:
+                        r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
+                        new_count += 1
+                        _reintro_detail_count += 1
+                        # Mark seen only after successful push.  When held (Lever 1
+                        # or re-intro), don't mark — job must be re-discovered.
+                        r.sadd(adaptive_seen_key, job_id)
 
         # Refresh adaptive_seen TTL after each adaptive scan so it stays alive
         # until the next full scan (which will DEL it explicitly).
@@ -646,7 +680,8 @@ def _handle_first_scan(
                     )
                 else:
                     if save_pending_detail(
-                        company, platform, job, found_by="first_scan_fresh"
+                        company, platform, job, found_by="first_scan_fresh",
+                        detail_payload=detail_payload,
                     ):
                         r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
                         fresh_queued += 1
@@ -847,6 +882,15 @@ def run_worker(once: bool = False, shutdown_event=None,
     r = get_redis()
     _ensure_consumer_group(r)
 
+    # Signal manager that this worker is now online (reduces pending_spawns counter)
+    try:
+        _ps_key = "manager:pool:scan:pending_spawns"
+        if r.exists(_ps_key):
+            if r.decr(_ps_key) < 0:
+                r.set(_ps_key, 0)
+    except Exception:
+        pass
+
     logger.info(
         "scan_worker started | worker_id=%s consumer=%s stream=%s once=%s",
         WORKER_ID, _CONSUMER_NAME, REDIS_STREAM_ADAPTIVE, once,
@@ -865,6 +909,12 @@ def run_worker(once: bool = False, shutdown_event=None,
     # daemon=True means the thread dies with the process — no ghost heartbeats.
     _hw = {"count": 0}
     _hb = Heartbeat(r, "scan_worker", lambda: _hw["count"]).start()
+
+    # ── Busy-time tracking for manager.py utilization signal ─────────────────
+    _BUSY_CYCLE_S  = 60
+    _busy_ms_acc   = 0
+    _busy_window_t = time.monotonic()
+    _own_pid       = os.getpid()
 
     while True:
         try:
@@ -962,6 +1012,19 @@ def run_worker(once: bool = False, shutdown_event=None,
                         "leaving in PEL for XAUTOCLAIM retry",
                         company, oac_exc, exc_info=True,
                     )
+
+            # ── Publish busy_ms for manager.py utilization ───────────────────
+            _elapsed_ms = result.get("duration_ms", 0)
+            _now_m = time.monotonic()
+            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
+                _busy_ms_acc   = 0
+                _busy_window_t = _now_m
+            _busy_ms_acc += _elapsed_ms
+            try:
+                r.set(f"worker:scan:busy_ms:{_own_pid}", _busy_ms_acc,
+                      ex=_BUSY_CYCLE_S * 2)
+            except Exception:
+                pass
 
             _hw["count"] += 1
             status = "OK" if result["success"] else "FAIL"

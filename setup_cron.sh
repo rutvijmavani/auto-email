@@ -389,6 +389,30 @@ echo "[CRON] enrichment finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CO
 exit $EXIT_CODE
 EOF
 
+# ── Gmail watch renewal (daily 2 AM) ──────────────────────────
+cat > "$PROJECT_DIR/run_renew_watch.sh" << 'EOF'
+#!/bin/bash
+# run_renew_watch.sh — Daily 2 AM: renew Gmail Pub/Sub watches expiring within 48h
+# Also catches up on any emails missed during a watch gap via history.list.
+PROJECT_DIR="/home/opc/mail"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/renew_watch_$(date +%Y-%m-%d).log"
+
+cd "$PROJECT_DIR" || exit 1
+echo "" >> "$LOG_FILE"
+echo "══════════════════════════════════════════════" >> "$LOG_FILE"
+echo "[CRON] renew_gmail_watch started at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
+echo "══════════════════════════════════════════════" >> "$LOG_FILE"
+
+source venv/bin/activate
+python scripts/renew_gmail_watch.py >> "$LOG_FILE" 2>&1
+EXIT_CODE=$?
+
+echo "[CRON] renew_gmail_watch finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CODE" >> "$LOG_FILE"
+find "$LOG_DIR" -name "renew_watch_*.log" -mtime +14 -delete
+exit $EXIT_CODE
+EOF
+
 # ── verify-filled (manual use / standalone) ────────────────────
 cat > "$PROJECT_DIR/run_verify_filled.sh" << 'EOF'
 #!/bin/bash
@@ -425,6 +449,7 @@ chmod +x \
   "$PROJECT_DIR/run_detect.sh" \
   "$PROJECT_DIR/run_weekly_summary.sh" \
   "$PROJECT_DIR/run_enrich.sh" \
+  "$PROJECT_DIR/run_renew_watch.sh" \
   "$PROJECT_DIR/run_verify_filled.sh"
 
 echo "[OK] All wrapper scripts created"
@@ -497,6 +522,13 @@ CRON_TZ=America/New_York
 # sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
 # ─────────────────────────────────────────
 0 1 1 * * /home/opc/mail/run_monthly.sh
+
+# ─────────────────────────────────────────
+# GMAIL WATCH RENEWAL — 2 AM daily
+# Renews Gmail Pub/Sub watches expiring within 48 hours.
+# Also calls history.list to catch up on emails missed during any watch gap.
+# ─────────────────────────────────────────
+0 2 * * * /home/opc/mail/run_renew_watch.sh
 
 # ─────────────────────────────────────────
 # DAILY ENRICHMENT — 3 AM (standalone, 18hr background job)

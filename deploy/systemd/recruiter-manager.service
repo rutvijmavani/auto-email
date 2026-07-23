@@ -1,0 +1,58 @@
+[Unit]
+Description=Recruiter Pipeline Manager (auto-scaling decisions)
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target
+Wants=network-online.target
+
+# Manager reads worker pool state that scheduler publishes to Redis,
+# so wait for scheduler to be up first.
+After=recruiter-scheduler.service
+Wants=recruiter-scheduler.service
+
+# Soft-require Redis and Postgres.
+Wants=redis.service
+After=redis.service
+Wants=postgresql.service
+After=postgresql.service
+
+# Start manager before watchdog so watchdog doesn't false-alarm on boot.
+Before=recruiter-watchdog.service
+
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+
+ExecStart=/home/opc/mail/venv/bin/python -m workers.manager
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# Fast restart — manager is stateless (all state in Redis) and lightweight.
+# A restarted manager reads Redis on startup and resumes mid-stream with no
+# state loss. Maximum scaling gap = RestartSec + one missed 60s cycle.
+Restart=always
+RestartSec=10s
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+# NoNewPrivileges is intentionally omitted: manager communicates add/remove
+# worker directives to the scheduler via a Redis channel (no direct systemctl
+# calls from manager). If the design changes to direct systemctl calls,
+# add the same sudoers entry used by watchdog and keep this omitted.
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/opc/mail
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recruiter-manager
+
+[Install]
+WantedBy=multi-user.target

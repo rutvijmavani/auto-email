@@ -26,7 +26,7 @@ const GIST_CONFIG_URL = 'https://gist.githubusercontent.com/rutvijmavani/4f400d8
 const API_KEY = '7df822f9d051c53fc32fd36b441e29d88afa0bba34493cee6de81633a79733c2';
 
 // Copy the value of GOOGLE_SHEET_ID from your .env file.
-const SHEET_ID = 'YOUR_GOOGLE_SHEET_ID';
+const SHEET_ID = '15B3jTyMkb1Af1GLZOn7-ZWiX1hyKBAX43AidZmYyQdg';
 const SHEET_TAB = 'Responses';
 
 // nameMatch is a lowercase substring of the Google account display name.
@@ -37,3 +37,5 @@ const USERS = [
 ];
 
 const FETCH_TIMEOUT_MS = 10000;
+
+const PROSPECTIVE_SHEET_TAB = 'Prospective';

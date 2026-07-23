@@ -3,7 +3,7 @@
   "name": "Job Pipeline Capture",
   "version": "1.0",
   "description": "Save job postings directly to your recruiter pipeline.",
-  "permissions": ["activeTab", "scripting", "storage", "identity", "alarms"],
+  "permissions": ["activeTab", "scripting", "storage", "identity", "alarms", "tabs"],
   "host_permissions": [
     "http://localhost:5001/*",
     "https://*/*",
@@ -23,10 +23,24 @@
     {
       "matches": [
         "*://boards.greenhouse.io/*",
+        "*://job-boards.greenhouse.io/*",
         "*://jobs.lever.co/*",
         "*://jobs.ashbyhq.com/*",
         "*://*.myworkdayjobs.com/*",
+        "*://*.myworkdaysite.com/*",
         "*://careers.smartrecruiters.com/*",
+        "*://*.icims.com/*",
+        "*://*.successfactors.com/*",
+        "*://*.jobs2web.com/*",
+        "*://jobs.jobvite.com/*",
+        "*://*.taleo.net/*",
+        "*://*.eightfold.ai/*",
+        "*://*.avature.net/*",
+        "*://*.phenompeople.com/*",
+        "*://*.talentbrew.com/*",
+        "*://app.jibecdn.com/*",
+        "*://myjobs.adp.com/*",
+        "*://*.oraclecloud.com/hcmUI/CandidateExperience/*",
         "*://www.linkedin.com/jobs/*",
         "*://www.indeed.com/viewjob*"
       ],
