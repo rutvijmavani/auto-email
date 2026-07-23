@@ -657,6 +657,7 @@ def _process_notification(raw_str: str, r) -> str:
                         update_history_id(user_id, history_id)
                     except Exception as update_exc:
                         logger.error("failed to reset history cursor user_id=%s: %s", user_id, update_exc)
+                        return "retry"
                     return "discard"
                 logger.error("history.list failed user_id=%s: %s", user_id, exc, exc_info=True)
                 return "retry"

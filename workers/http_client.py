@@ -71,6 +71,18 @@ from workers.redis_client import get_redis
 
 logger = get_logger(__name__)
 
+
+class CeilingExceeded(Exception):
+    """
+    Raised by ats_get() when the distributed concurrency semaphore cannot be
+    acquired after all retries — the platform is at its ceiling.
+
+    Each worker type catches this and puts the job back without processing it:
+      detail_worker  → RPUSH to tail of source queue (next pop)
+      scan_worker    → ZADD poll:adaptive score=now+30s, leave in PEL
+      fullscan       → ZADD poll:fullscan score=now+30s, return ceiling_exceeded
+    """
+
 # HTTP timeouts (Section 18 — Resilience)
 _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT    = 30
@@ -372,6 +384,22 @@ def adjust_concurrency(r, key: str, error_rate: float) -> None:
         baseline     = get_baseline_error_rate(r, platform)
         spike_factor = error_rate / (baseline + 0.001)
 
+        # Signal manager._check_error_spikes() — TTL is 1.5× manager cycle (90s)
+        # so the flag survives until the next 60s cycle even if written mid-cycle.
+        try:
+            r.set(
+                f"manager:platform:{platform}:error_spike",
+                json.dumps({
+                    "error_rate":   error_rate,
+                    "baseline":     baseline,
+                    "spike_factor": spike_factor,
+                    "ts":           time.time(),
+                }),
+                ex=90,
+            )
+        except Exception:
+            pass
+
         if baseline > 0.0 and spike_factor > CONCURRENCY_SPIKE_FACTOR_THRESHOLD:
             # Concurrency-induced spike — aggressive reduction
             step      = 2
@@ -390,11 +418,29 @@ def adjust_concurrency(r, key: str, error_rate: float) -> None:
         )
 
     elif error_rate < CONCURRENCY_ERROR_RATE_INCREASE:
-        new_limit = min(current + 1, ceil_)
+        # error_rate is a 20-min rolling window across ALL concurrent workers —
+        # if < 2%, the collective concurrent load has been clean. Record the
+        # current active count as the proven high-water mark (learned ceiling).
+        # active is read BEFORE _release() so it still includes this request.
+        active_raw = r.get(f"{REDIS_CONCURRENCY_ACTIVE_PREFIX}:{key}")
+        active = int(active_raw) if active_raw is not None else 0
+        if active > 0:
+            learned_raw = r.get(f"worker:ceil:learned:{key}")
+            learned = int(learned_raw) if learned_raw is not None else 0
+            if active > learned:
+                r.set(f"worker:ceil:learned:{key}", active)
+
+        # Utilization-gated probing: only increase limit when actually using
+        # the current limit — prevents blind climbing when workers are idle.
+        if active >= current:
+            new_limit = min(current + 1, ceil_)
+        else:
+            return   # underutilised — hold limit, don't climb
         logger.info(
             "http_client: concurrency increased key=%r %d→%d "
-            "(error_rate=%.1f%%)",
-            key, current, new_limit, error_rate * 100,
+            "(error_rate=%.1f%% active=%d learned_ceil=%d)",
+            key, current, new_limit, error_rate * 100, active,
+            int(r.get(f"worker:ceil:learned:{key}") or 0),
         )
 
     else:
@@ -550,13 +596,7 @@ def ats_get(
             time.sleep(backoff)
 
     if not acquired:
-        # All retries exhausted — proceed anyway rather than silently dropping
-        # the request, but log so the operator can tune limits or worker counts.
-        logger.warning(
-            "http_client: semaphore retries exhausted key=%r — proceeding "
-            "without slot (limit may be too low for current worker count)",
-            key,
-        )
+        raise CeilingExceeded(key)
 
     # ── HTTP call ─────────────────────────────────────────────────────────────
     start_ms    = int(time.monotonic() * 1000)

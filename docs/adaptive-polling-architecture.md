@@ -27,6 +27,7 @@
 23. [Implementation Roadmap](#23-implementation-roadmap)
 24. [Thundering Herd Prevention — Hash-Based Slot Distribution](#24-thundering-herd-prevention--hash-based-slot-distribution)
 25. [Glossary](#25-glossary)
+26. [Worker Autoscaler — manager.py Design](#26-worker-autoscaler--managepy-design)
 
 ---
 
@@ -1235,9 +1236,9 @@ Fallback when <7 days of `api_health` data: use `MONITOR_MAX_WORKERS` as the sta
 
 Scan workers and detail workers share the same PostgreSQL connection pool. The ceiling must apply to their **combined** total. The 60/40 split is a starting point; the slow check recalculates the ratio based on observed queue drain rates each cycle.
 
-#### Three monitoring layers
+#### Worker management components
 
-**Layer 1 — Liveness check (every scheduler tick, ~5 seconds)**
+**Layer 1 — `_liveness_check_loop` (every scheduler tick, ~5 seconds)**
 
 ```python
 for proc in all_worker_processes:
@@ -1263,62 +1264,40 @@ This runs event-driven within ~5s of the crash. If the worker died before it wro
 `worker:current_job:fullscan:{pid}` key, the slot remains until the 2-h stale prune on
 the next fullscan dispatch for that DC key.
 
-**Layer 2 — Fast error check (every 5 minutes)**
+**Layer 2 — `manager._check_error_spikes()` (every 60 seconds, inside manager cycle)**
 
-Reacts to error spikes that the semaphore alone cannot resolve (semaphore already at floor):
+Replaced `_fast_error_check_loop` (was a 5-min scheduler thread). Error spikes are now detected at the source: `adjust_concurrency()` in `http_client.py` writes a `manager:platform:{platform}:error_spike` Redis key (JSON payload with `error_rate`, `baseline`, `spike_factor`, TTL=90s) every time it reduces concurrency. `_check_error_spikes()` in `manager.py` SCANs for these keys each cycle and runs the outage state machine:
 
-```python
-for platform in active_platforms:
-    error_rate   = get_error_rate(r, platform)          # errwin sliding window
-    semaphore_at_floor = get_limit(r, platform) <= CONCURRENCY_FLOOR[platform]
-
-    if error_rate > CONCURRENCY_ERROR_RATE_REDUCE and semaphore_at_floor:
-        # Semaphore can't go lower — workers themselves are the variable
-        reduce_scan_workers(by=1)
-        deprioritise_platform_in_queue(platform)        # push its companies back
-        # Do NOT reduce below floor=2 or remaining_work_minimum, whichever is higher
+```
+adjust_concurrency() writes:  manager:platform:{p}:error_spike  (90s TTL)
+                                    ↓  read each 60s cycle
+_check_error_spikes():
+  1. Skip if worker:outage:{platform} already set
+  2. Check effectiveness of previous deprioritize (before_rate snapshot):
+       resolved  → delete worker:consec_reductions:{p}
+       still bad → incr worker:consec_reductions:{p}
+                   if count >= 3 → send platform:outage:{p}:set via manager:cmds
+  3. If error still high AND concurrency at floor:
+       snapshot before_rate, send platform:deprioritize:{p} via manager:cmds
 ```
 
-Worker reduction is **platform-aware**: a Workday spike deprioritises Workday companies in `poll:adaptive` (pushes their scores forward by 300s) rather than killing workers that Greenhouse/Lever/Ashby companies still need.
+The deprioritisation is **platform-aware**: a Workday spike pushes only Workday companies back in `poll:adaptive`, leaving Greenhouse/Lever/Ashby capacity untouched.
 
-**Layer 3 — Slow throughput check (every 30 minutes)**
+**Layer 3 — `workers/manager.py` (60-second cycle, replaced `_slow_throughput_check_loop`)**
 
-```python
-# Recalculate ceiling from current state (handles mid-cycle company additions)
-scan_ceil   = floor((DB_POOL_MAXCONN - 3 - current_detail_workers) * 0.6)
-detail_ceil = floor((DB_POOL_MAXCONN - 3 - current_scan_workers)   * 0.4)
+`_slow_throughput_check_loop` (every 30 min, depth-based) is replaced by `workers/manager.py`, which runs as a separate process under a distributed lock (`manager:lock`, NX EX 90). The key change: scaling is driven by **queue delay** (how overdue is the most-overdue job) rather than queue depth. See §26 for the full formula, three scaling modes, and Redis key contracts.
 
-# Scan worker adjustment
-if scan_queue_growing for 2 consecutive checks:
-    if detail_queue_depth < DETAIL_QUEUE_HIGH_WATERMARK:
-        add_scan_worker()       # production can increase safely
-    else:
-        add_detail_worker()     # drain backlog first, don't add more production
+**`_ceiling_decay_loop` (standalone thread in `scheduler.py`)**
 
-if scan_queue_empty for 2 consecutive checks:
-    remove_scan_worker(floor=max(2, remaining_work_minimum))
+Extracted from `_slow_throughput_check_loop`. Handles the inching-upward of per-DC learned ceilings (`worker:ceil:learned:{dc_key}`) after 24 hours of clean operation — unchanged logic, now decoupled from the throughput check that was removed.
 
-# Detail worker adjustment
-if detail_queue_growing for 2 consecutive checks:
-    add_detail_worker()
+**`_manager_cmds_loop` (standalone thread in `scheduler.py`)**
 
-if detail_queue_empty for 2 consecutive checks:
-    remove_detail_worker(floor=2)
+Reads the `manager:cmds` Redis LIST via BLPOP and executes commands issued by `manager.py`:
 
-# Cascade: detail ceiling reached AND queue still growing → slow production
-if detail_workers == detail_ceil and detail_queue_still_growing for 2 checks:
-    remove_scan_worker()        # reduce production to match consumption capacity
-```
-
-The **2-consecutive-checks hysteresis** on every add/remove decision prevents thrashing — a single noisy measurement never triggers an action.
-
-`remaining_work_minimum` is recalculated on every slow check:
-```python
-remaining_companies = companies not yet polled this cycle
-remaining_window_s  = seconds until 6 AM
-remaining_work_minimum = ceil((remaining_companies * avg_listing_scan_s) / remaining_window_s)
-```
-The floor shrinks naturally as the day progresses and work completes.
+- `{pool}:target:{n}` — spawn or terminate workers until the pool size equals N
+- `platform:deprioritize:{platform}` — push platform companies forward 300s in `poll:adaptive`
+- `platform:outage:{platform}:set` / `:clear` — enter or exit outage mode for a platform
 
 #### Pace mismatch — scan workers producing faster than detail workers consume
 
@@ -1342,7 +1321,7 @@ Each worker process receives a `multiprocessing.Event` at spawn. On full schedul
 
 **Error-triggered worker removal (mid-cycle)**
 
-When `_fast_error_check_loop` removes a worker due to platform errors, that worker may be mid-scan when the shutdown event fires. With the Stream delivery model, the company's message remains in the PEL — it will be re-delivered by `XAUTOCLAIM` to another worker after the idle timeout. No explicit re-queuing logic is needed for the "removed cleanly before scan starts" case.
+When manager sends a `{pool}:target:{n}` command and the scheduler terminates a worker, that worker may be mid-scan when the shutdown event fires. With the Stream delivery model, the company's message remains in the PEL — it will be re-delivered by `XAUTOCLAIM` to another worker after the idle timeout. No explicit re-queuing logic is needed for the "removed cleanly before scan starts" case.
 
 However, for the worker that is **already mid-scan** when shutdown fires: the worker should re-queue with exponential backoff (not rely on `XAUTOCLAIM`) so the delay is proportional to the ATS error state rather than a fixed idle timeout.
 
@@ -1442,7 +1421,7 @@ worker:ceil:learned:{dc_key}      # max safe concurrent scans (int, no TTL)
 worker:ceil:last_error:{dc_key}   # Unix ts of last error-triggered event
 ```
 
-Set when `_fast_error_check_loop` triggers a reduction for that platform. The in-flight count at the moment errors peaked = ceiling + 1, so:
+Set by `adjust_concurrency()` in `http_client.py` when it reduces the concurrency limit due to a spike. The in-flight count at the moment errors peaked = ceiling + 1, so:
 
 ```python
 ceiling = max(WORKER_FLOOR, current_inflight - 1)
@@ -1454,7 +1433,7 @@ r.set(f"worker:ceil:last_error:{dc_key}", now)
 
 **Decay — gradual capacity re-testing**
 
-Learned ceilings never expire (ATS capacity changes slowly) but inch upward after sustained clean operation. Checked in `_slow_throughput_check_loop` every 30 minutes:
+Learned ceilings never expire (ATS capacity changes slowly) but inch upward after sustained clean operation. Checked in `_ceiling_decay_loop` (standalone scheduler thread) every 30 minutes:
 
 ```python
 last_error = float(r.get(f"worker:ceil:last_error:{dc_key}") or 0)
@@ -1468,15 +1447,9 @@ The ceiling probes upward +1 per 24h clean window. If the higher count triggers 
 
 The ceiling is clamped: `max(WORKER_FLOOR, ceiling)` — never stored below the redundancy minimum.
 
-**Scaling lock — preventing fast/slow loop conflicts**
+**Scaling lock — no longer needed**
 
-`_fast_error_check_loop` (5 min) and `_slow_throughput_check_loop` (30 min) run on independent timers and can conflict: fast check reduces workers due to errors while slow check simultaneously sees a backlog and adds them back.
-
-After any error-triggered action, the fast check sets:
-```
-worker:scaling_lock:{platform}    TTL = WORKER_SLOW_CHECK_INTERVAL_S (30 min)
-```
-The slow throughput check skips scale-up for any platform with an active scaling lock, preventing it from immediately undoing a deliberate error-driven reduction.
+`worker:scaling_lock:{platform}` was set by the old `_fast_error_check_loop` to prevent `_slow_throughput_check_loop` from immediately undoing an error-triggered reduction. Both loops are now deleted — `manager._check_error_spikes()` and the Layer 0 formula run in the same 60-second cycle with shared in-memory state, so there is no cross-loop race to guard against. The scaling lock key is no longer written.
 
 ---
 
@@ -2226,8 +2199,7 @@ CREATE TABLE worker_scaling_events (
 
     -- Why it happened
     trigger_layer         TEXT,
-    -- fast_error        : _fast_error_check_loop (5-min cycle)
-    -- slow_throughput   : _slow_throughput_check_loop (30-min cycle)
+    -- manager           : manager._check_error_spikes() or Layer 0 formula (60s cycle)
     -- cascade           : detail queue full → scan worker removed
     -- liveness          : dead worker replaced
 
@@ -2760,6 +2732,251 @@ def adjust_concurrency(r, key, error_rate):
 
 `CONCURRENCY_FLOOR` and `CONCURRENCY_CEIL` are per-platform constants in `config.py`. The floor ensures the system never reaches zero concurrency (minimum 1).
 
+### Known fix — utilization-gated probing (NOT YET IMPLEMENTED)
+
+**The current feedback loop has a blind-climb problem.**
+
+The current `adjust_concurrency()` increments the limit after every successful request
+as long as error rate is below 2% — regardless of whether the current limit is
+actually being used:
+
+```
+limit=2, only 1 worker ever hitting talentbrew at a time
+  active never exceeds 1
+  error_rate = 0%  →  below 2%
+  → limit bumped to 3   (2 concurrent never tested)
+  → limit bumped to 4   (3 concurrent never tested)
+  → limit bumped to 4   (at ceil — but we never verified 4 is safe)
+```
+
+The limit climbed to ceil=4 without ever proving that 2, 3, or 4 concurrent
+requests are actually safe for this platform. The permission was granted without
+earning it.
+
+**The correct behaviour: utilization-gated probing.**
+
+Only increase the limit when a request actually pressed against it — meaning the
+current limit was a real constraint, not just unused headroom:
+
+```python
+def adjust_concurrency(r, key, error_rate):
+    current = _get_limit(r, key)
+    active  = int(r.get(f"concurrency:active:{key}") or 0)
+
+    if error_rate > CONCURRENCY_ERROR_RATE_REDUCE:
+        # Error spike — reduce immediately regardless of utilization
+        ...
+
+    elif error_rate < CONCURRENCY_ERROR_RATE_INCREASE:
+        # Only probe upward if we're actually hitting the current limit
+        if active >= current:
+            new_limit = min(current + 1, ceil_)
+            r.set(f"concurrency:limit:{key}", new_limit)
+        # else: limit is fine, nobody is pressing it — leave it alone
+
+    else:
+        return   # stable band, no change
+```
+
+`active >= current` means at least one worker had to compete for the last slot
+during this request — proving the current limit is a real bottleneck. Without
+this check, the system grants concurrency permissions it never had to earn.
+
+**Why this matters:**
+
+- Without the fix: limit climbs to ceil silently. First time many workers
+  simultaneously hit a platform, the limit is already at 4 — a level never tested.
+  If 4 concurrent is too many, the first spike is worse than it needed to be.
+
+- With the fix: limit only advances when real concurrent pressure exists. A platform
+  that rarely gets multiple simultaneous workers stays at a low limit. One that
+  regularly sees 3-4 workers competing advances to a higher limit that is actually
+  proven safe.
+
+**Where to fix:** `workers/http_client.py` → `adjust_concurrency()` (line 332).
+Read `concurrency:active:{key}` before the increase branch and gate on
+`active >= current`.
+
+**Ship with:** the manager.py implementation — both touch the concurrency system
+and should be shipped together to avoid partial states.
+
+---
+
+### Phase 4 corrections — new design (NOT YET IMPLEMENTED)
+
+These are corrections to the current `_fast_error_check_loop` behavior identified during design review. They apply to the new manager.py design.
+
+---
+
+#### a) Deprioritize duration
+
+`_deprioritise_platform()` adds `WORKER_DEPRIORITISE_SECS = 300s` (5 minutes) to all talentbrew company scores in `poll:adaptive`. Capped at `now + 900s` (15 min) — won't cascade beyond three firing cycles. No explicit expiry — companies come back naturally when their scheduled time arrives.
+
+---
+
+#### b) Learned ceiling — replace with high water mark of successful concurrent execution
+
+**Current design (wrong):** `worker:ceil:learned:{dc_key}` is written at error spike time using `ZCARD inflight:scans:{dc_key}`. This is a noisy signal — inflight count at the moment of error is not the same as the proven safe ceiling. Breaks entirely when inflight=0 (sets ceiling to 1 with no real observation).
+
+**New design:** High water mark of proven concurrent execution — recorded inside `adjust_concurrency()` when error rate is clean, not on individual request success.
+
+**Why not simply "before `_release()`":** A single request succeeding with `active=3` does not mean the other 2 concurrent requests also succeeded. They may still be in-flight and may return 429, 404, or timeout. Recording at individual success is premature.
+
+**The right place: `adjust_concurrency()` increase branch.** `error_rate` there is a rolling 20-minute window across ALL requests to this platform — including every concurrent worker. If `error_rate < 2%`, the concurrent load has been collectively clean. That is the strongest available signal.
+
+```python
+def adjust_concurrency(r, key, dc_key, error_rate):
+    current = _get_limit(r, key)
+    active  = int(r.get(f"concurrency:active:{key}") or 0)  # BEFORE _release()
+
+    if error_rate > CONCURRENCY_ERROR_RATE_REDUCE:
+        # errors — reduce limit, do NOT touch learned_ceil
+        ...
+
+    elif error_rate < CONCURRENCY_ERROR_RATE_INCREASE:   # below 2%
+        # error rate clean across ALL recent concurrent requests
+        # → safe to record current active as proven concurrent level
+        current_learned = int(r.get(f"worker:ceil:learned:{dc_key}") or 0)
+        if active > current_learned:
+            r.set(f"worker:ceil:learned:{dc_key}", active)
+
+        # utilization-gated probing (existing fix — see §19 above)
+        if active >= current:
+            r.set(f"concurrency:limit:{key}", min(current + 1, ceil_))
+```
+
+Why `adjust_concurrency()` is the right gate:
+- Called BEFORE `_release()` — `active` still includes the current request
+- `error_rate` is a 20-min rolling window — accounts for ALL concurrent workers, not just this one
+- Same 2% threshold already used for limit increases — consistent, no new signal needed
+- Already reads `active` for the utilization check — zero extra Redis calls
+
+Behaviour over time:
+```
+Start: learned_ceil = 0
+
+1 talentbrew request succeeds, error_rate=0% → active=1 → learned_ceil = max(0,1) = 1
+3 concurrent requests, all clean, error_rate=0% → active=3 → learned_ceil = max(1,3) = 3
+2 concurrent, error_rate=1.5% (still <2%) → active=2 → learned_ceil unchanged = 3
+error spike, error_rate=18% → in reduce branch → learned_ceil untouched
+```
+
+`learned_ceil` only ever moves UP, only when overall error rate is clean, naturally converges to the true safe ceiling over time. Inflight=0 edge case is impossible — `active=0` only when no requests are running, so no writes occur.
+
+**Key distinction between the two ceiling keys:**
+
+| Key | What it is | Movement |
+|---|---|---|
+| `concurrency:limit:{platform}` | Operational HTTP throttle — current allowed concurrency | Up AND down per request based on error rate |
+| `worker:ceil:learned:{dc_key}` | High water mark of proven safe concurrent execution | Only UP, only when overall error rate clean |
+
+`concurrency:limit` can exceed config `CONCURRENCY_CEIL` when probing upward and error rate stays clean — the system is OK with a small error rate at higher concurrency. `learned_ceil` independently tracks what has actually been proven safe across ALL concurrent workers.
+
+**Ship alongside:** utilization-gated probing fix — both live in `adjust_concurrency()` increase branch.
+
+---
+
+#### c) Worker removal — only manager, not fast_error_check
+
+**Current design (wrong):** `_fast_error_check_loop` directly removes a scan worker when `limit=floor` and `error_rate > 10%`.
+
+**New design:** Workers do not remove other workers. When a worker hits `CeilingExceeded` at floor, it puts the job back and moves to the next item in queue (see `docs/capacity-aware-queue-consumption.md`). The manager independently observes sustained error rates across its 60s cycle and decides whether to reduce worker count — it has the global view to make that call safely.
+
+---
+
+#### d) Scaling lock — not needed in new design
+
+**Current design:** `worker:scaling_lock:{platform}` (TTL=900s) prevents `_slow_throughput_check_loop` from adding workers back after a deliberate fast_error reduction.
+
+**New design:** Not needed. With `blocked_platforms` SET + `CeilingExceeded`, workers naturally skip talentbrew when it is at ceiling or erroring — no explicit lock required to coordinate two loops. The manager, which owns all scaling decisions, independently observes error rates and does not add workers for a platform under stress. Two loops fighting each other no longer exists as a problem.
+
+---
+
+#### Corrected Phase 4 summary
+
+Old fast_error_check Phase 4 (when `limit=floor` AND `error_rate > 10%`):
+- a) Deprioritize talentbrew ✓ — still valid, +300s per firing, cap 15 min
+- b) Write learned_ceil from inflight ZCARD ✗ → replace with high water mark on success (tracked continuously, not at error time)
+- c) Remove scan worker ✗ → manager's decision independently, not fast_error_check
+- d) SET scaling_lock ✗ → not needed, blocked_platforms + CeilingExceeded handles it
+
+New Phase 4 is simply: **deprioritize the platform.** Workers skip naturally. Manager scales independently.
+
+---
+
+### Phase 5 — Recovery (new design, NOT YET IMPLEMENTED)
+
+After Phase 4 fires, one of two paths plays out depending on whether the manager's reductions actually improve the error rate.
+
+---
+
+#### Path A — errors die down (natural recovery)
+
+Manager's worker reduction takes effect. Error rate drops below `CONCURRENCY_ERROR_RATE_REDUCE` (10%) within one or two 60s manager cycles.
+
+```
+manager cycle N+1: error_rate < 10%
+→ worker:consec_reductions:talentbrew  reset to 0
+→ no further reductions
+```
+
+- Deprioritization decays naturally — talentbrew company scores age past `now`, normal dispatch resumes without any explicit action
+- `adjust_concurrency()` sees `error_rate < 2%` → starts incrementing `concurrency:limit` back up (+1 per clean request batch)
+- `worker:ceil:learned` acts as the safe restart ceiling — limit climbs toward it without overshooting
+- Manager's next 60s cycle sees healthy utilization → may add workers back (Layer 0 scale-up path)
+
+**No explicit recovery action needed.** The system heals itself.
+
+---
+
+#### Path B — escalation to outage mode (3 consecutive ineffective reductions)
+
+Manager fires a reduction. Error rate stays above 10% at the next cycle. Counter increments:
+
+```
+worker:consec_reductions:talentbrew    TTL = 3600s (auto-clears after 1h of no new reductions)
+```
+
+At `consec_reductions >= 3`:
+
+```python
+r.set("worker:outage:talentbrew", "1", ex=3600)   # 60-min dispatch pause
+```
+
+**During outage:**
+- All talentbrew companies in `poll:adaptive` are skipped and pushed forward by the remaining outage TTL
+- Workers continue serving all other healthy platforms at full capacity — no further worker removal
+- `worker:consec_reductions` is reset; further reductions are suspended during the outage window
+
+**At 30 minutes — canary probe:**
+
+One test request is sent to talentbrew with `context='canary'` (excluded from 30-day baseline so it doesn't corrupt future spike_factor calculations):
+
+- **Success** → `DEL worker:outage:talentbrew`, resume normal dispatch immediately
+- **Failure** → reset TTL to 3600s (full 60-min extension), increase outage backoff
+
+**After TTL expires (or canary clears it):**
+
+Normal dispatch resumes. `adjust_concurrency()` starts seeing requests again:
+- `error_rate < 2%` → `concurrency:limit` climbs +1 per clean batch
+- `worker:ceil:learned` provides the safe ceiling — limit does not overshoot the proven high-water mark
+- Manager observes rising utilization → adds workers back via Layer 0
+
+---
+
+#### Phase 5 summary
+
+| State | Trigger | Action |
+|---|---|---|
+| Path A — natural recovery | `error_rate < 10%` at next manager cycle | `consec_reductions` reset; deprioritization decays; limit climbs back via `adjust_concurrency()` |
+| Path B — escalation | `consec_reductions >= 3` | `worker:outage:talentbrew` set (TTL=3600s); dispatch paused; workers keep serving other platforms |
+| Path B — early exit | Canary probe succeeds at 30 min | Outage flag deleted; normal dispatch resumes immediately |
+| Path B — full recovery | Outage TTL expires | Normal dispatch resumes; limit and workers rebuild from learned ceiling |
+
+**Key invariant:** `worker:ceil:learned` is never cleared during recovery — it is the anchor that prevents the system from re-discovering a painful ceiling the hard way on every incident. It only grows (on clean error rate) and decays at +1/24h of clean operation.
+
+---
+
 ### Workday DC-level semaphores
 
 Workday uses regional data centers. Requests to different companies may hit different DCs, each with its own rate limits.
@@ -2958,7 +3175,7 @@ Bloom filters add ~4.5MB total across all 5,000 companies (trivial).
 
 ### Dynamic worker scaling
 
-See Section 9 for the full two-pool design (scan workers + detail workers, co-scheduled, multiprocessing.Process, three monitoring layers, cascade backpressure, pace mismatch handling).
+See Section 9 for the two-pool design (scan workers + detail workers, co-scheduled, `multiprocessing.Process`, liveness check, and the `_ceiling_decay_loop` / `_manager_cmds_loop` threads). Intraday worker-count scaling is handled by `workers/manager.py` using a **delay-based formula** rather than queue depth — error spike detection also runs inside the manager cycle via `_check_error_spikes()`. See §26 for the full design.
 
 **Graceful degradation:** Full scan queue is ordered score-ascending (dormant first). If workers can't finish all full scans before next 7 AM, active companies are the last to be skipped — and adaptive polling has already been covering them throughout the day.
 
@@ -3376,7 +3593,7 @@ Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Co
 
 **What (error differentiation):** Fix 1 already complete (4 sub-type columns, `classify_error()`, wired through `ats_get()`). Fix 2: extend `errwin` sliding window to track `errors_timeout` and `errors_5xx` in addition to 429 + 404. Baseline error rate cached in Redis (`baseline:error_rate:{platform}`, 1h TTL) from 30-day `api_health` average. Feedback loop in `ats_get()` uses spike_factor (anomalous vs normal variance) to choose aggressive vs cautious concurrency reduction. Safe fallback when <7 days history: skip spike_factor, use raw error_rate only.
 
-**What (dynamic worker scaling):** Replace fixed thread pools with `multiprocessing.Process` worker pools managed by the scheduler. Both scan and detail worker pools calculated at 7 AM from historical averages — not starting at minimum. Three monitoring layers: (1) liveness check every tick (dead worker replaced immediately), (2) fast error check every 5 min (error-triggered worker reduction, platform-aware deprioritisation), (3) slow throughput check every 30 min (queue-depth-driven scaling with 2-consecutive-checks hysteresis). Cascade backpressure: detail queue growing → add detail workers first; detail at ceiling → stop adding scan workers; detail at ceiling + queue still growing → reduce scan workers. DB pool split proportionally between pools (combined ≤ DB_POOL_MAXCONN - 3). Graceful shutdown via `multiprocessing.Event`.
+**What (dynamic worker scaling):** Replace fixed thread pools with `multiprocessing.Process` worker pools managed by the scheduler. Both scan and detail worker pools calculated at 7 AM from historical averages — not starting at minimum. Two scheduler threads: (1) liveness check every 5s (dead worker replaced immediately), (2) `_ceiling_decay_loop` every 30 min (learned ceilings inch up after 24h clean). `workers/manager.py` runs as a separate process on a 60s cycle and handles all scaling decisions via delay-based formula + error spike detection. DB pool split proportionally between pools (combined ≤ DB_POOL_MAXCONN - 3). Graceful shutdown via `multiprocessing.Event`.
 
 **Deliverable:** Concurrency-induced errors distinguishable from genuine API failures. Worker count self-adjusts from a data-driven starting point and heals under load, including detail/scan pace mismatch.
 
@@ -3387,7 +3604,7 @@ Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Co
 ### Phase 10 — Adaptive ATS Protection + Resilience Hardening
 
 **What (ATS protection — Section 9):**
-Exponential backoff for all operation types (scan, detail, fullscan): 300s → 600s → 1200s → 2400s → 3600s → 86400s. Error-triggered worker removal re-queues in-progress company to `poll:adaptive` with backoff delay; message `XACK`'d so `XAUTOCLAIM` does not also re-deliver. Shutdown event checked at each page boundary in `_run_listing_scan()`. Per-DC in-flight tracking via `inflight:scans:{dc_key}` ZSET (adaptive) and `inflight:fullscans:{dc_key}` ZSET (fullscan), enforced atomically in dispatch Lua scripts; Stream PEL (`XPENDING`) is monitoring-only. Platform-isolated dispatch throttling in adaptive dispatcher — Workday DC ceiling has zero effect on Greenhouse/Lever. Per-DC learned ceiling (`worker:ceil:learned:{dc_key}`) discovered empirically, stored in Redis indefinitely, decays +1 per 24h of clean operation. ATS outage detection: 3 consecutive ineffective worker reductions → 60-min dispatch pause via `worker:outage:{platform}`. Canary probe at 30-min mark for early recovery. Scaling lock (`worker:scaling_lock:{platform}`) prevents slow throughput check from undoing fast error check interventions. Full scan suppressed while scan backoff is active. Watchdog process retired — `XAUTOCLAIM` handles scan worker crash recovery automatically.
+Exponential backoff for all operation types (scan, detail, fullscan): 300s → 600s → 1200s → 2400s → 3600s → 86400s. Error-triggered worker removal re-queues in-progress company to `poll:adaptive` with backoff delay; message `XACK`'d so `XAUTOCLAIM` does not also re-deliver. Shutdown event checked at each page boundary in `_run_listing_scan()`. Per-DC in-flight tracking via `inflight:scans:{dc_key}` ZSET (adaptive) and `inflight:fullscans:{dc_key}` ZSET (fullscan), enforced atomically in dispatch Lua scripts; Stream PEL (`XPENDING`) is monitoring-only. Platform-isolated dispatch throttling in adaptive dispatcher — Workday DC ceiling has zero effect on Greenhouse/Lever. Per-DC learned ceiling (`worker:ceil:learned:{dc_key}`) discovered empirically, stored in Redis indefinitely, decays +1 per 24h of clean operation. ATS outage detection: `adjust_concurrency()` writes `manager:platform:{p}:error_spike`; `manager._check_error_spikes()` runs the state machine — 3 consecutive ineffective deprioritizations → 60-min dispatch pause via `worker:outage:{platform}`. Canary probe at 30-min mark for early recovery. Scaling lock concept retired — manager owns both error detection and scaling, eliminating the cross-loop race that required it. Full scan suppressed while scan backoff is active. Watchdog process retired — `XAUTOCLAIM` handles scan worker crash recovery automatically.
 
 **What (observability — Sections 16 and 22):**
 `context` column added to `api_health` (`normal` | `backoff` | `canary`). Baseline queries (`query_30day_avg_error_rate`, `query_30day_avg_response_ms`) filter `WHERE context = 'normal'` so managed-error periods do not inflate the historical baseline. `record_request()` accepts an optional `context` parameter; all call sites default to `'normal'` with no change needed unless in backoff or canary path. New `worker_scaling_events` table records every scaling decision (worker add/remove, outage start/end, canary probe, ceiling learned) with full health-signal context. Used for weekly health report and post-incident effectiveness analysis.
@@ -3656,6 +3873,129 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 ---
 
+## 26. Worker Autoscaler — manager.py Design
+
+### The inflation problem with depth-based scaling
+
+`_slow_throughput_check_loop` used queue **depth** (`ZCARD poll:adaptive`) as its primary scaling signal: scale up if depth is growing, scale down when depth reaches zero. This caused workers to stay permanently inflated in production.
+
+`ZCARD poll:adaptive` is **never zero** in a running system. The ZSET always contains future-scheduled companies — even after all currently-due work is drained, entries scheduled 4h, 6h, or 12h from now keep the ZSET populated. The scale-down condition (`scan_backlog == 0`) was structurally unreachable, so workers added on demand were never reclaimed.
+
+### Queue delay as the primary signal
+
+The new primary signal is **delay**: how overdue is the most-overdue job in the queue?
+
+```python
+delay_s = now - r.zrangebyscore(queue, "-inf", now, start=0, num=1, withscores=True)[0][1]
+```
+
+A delay of zero means work is being dispatched on time. A delay of 1800s means the scan pool is 30 minutes behind — actionable. A growing delay means the pool cannot keep up; a shrinking delay means it is recovering. This signal is well-defined at any queue depth and has a natural zero regardless of how many future-scheduled entries exist.
+
+### The formula
+
+`workers/manager.py` runs a 60-second cycle under a distributed lock (`manager:lock`, NX EX 90):
+
+```python
+# For each pool: scan, detail, fullscan
+delay_s   = now - most_overdue_score   # seconds the head of queue is overdue
+depth     = zcard_overdue(queue)       # items with score ≤ now
+
+drain_rate     = depth / max(delay_warn_s - delay_s, 1)   # jobs/s to catch up
+workers_target = ceil(drain_rate * fetch_p75)              # workers at p75 throughput
+workers_target = clamp(workers_target, WORKER_FLOOR, worker_ceil)
+```
+
+**DELAY_WARN_S thresholds:**
+
+| Pool | Value | Rationale |
+|------|-------|-----------|
+| detail | 60s | Product SLA — jobs should not wait more than 1 minute for detail fetch |
+| scan | 1800s (30 min) | p10 of `current_interval_s` × 0.10 |
+| fullscan | 7200s (2h) | AVG(`full_scan_interval_s`) × 0.10 |
+
+**fetch_p75 (cached in `manager:scaling_params`, 25h TTL):**
+
+| Pool | Typical value | Source |
+|------|--------------|--------|
+| detail | ~3–5s | P75 of `api_health` durations, all platforms, last 30 days |
+| scan | ~40s | P75 of `company_poll_stats.avg_scan_duration_s` |
+| fullscan | ~95s | P75 of `company_poll_stats.avg_fullscan_duration_s` |
+
+### Three scaling modes
+
+**Urgent** (fires in 1 cycle, no utilisation gate):
+```
+delay >= DELAY_WARN × 0.75  OR  demand trigger
+```
+The new target is applied immediately on the next cycle. No consecutive-check requirement — prevents accumulating debt when the pool is severely behind.
+
+**Scale-up** (2 consecutive cycles required):
+```
+util > 0.80  AND  delay > DELAY_WARN × 0.50  AND  target > current
+```
+Both conditions must hold across 2 straight 60-second cycles. Prevents reacting to a momentary burst that self-resolves within a cycle.
+
+**Scale-down** (5 consecutive cycles required):
+```
+util < 0.50  AND  delay < DELAY_WARN × 0.25  AND  target <= current - 1
+```
+Longer hysteresis than scale-up — prevents premature shrinkage when work arrives in bursts with quiet gaps between them.
+
+### Utilisation gate and why it prevents premature scaling
+
+Utilisation is the fraction of pool capacity occupied in the current 60-second window:
+
+```python
+busy_ms     = sum(r.get(f"worker:{type}:busy_ms:{pid}") for pid in pool_pids)
+capacity_ms = len(pool_pids) * 60_000   # one 60s window per worker
+util        = busy_ms / capacity_ms
+```
+
+Workers publish `worker:{type}:busy_ms:{pid}` (rolling 60s window, TTL = 120s) after every completed job.
+
+The gate prevents false scale-up when a pool appears mathematically understaffed but workers are mostly idle — for example, when all workers are blocked on a slow ATS and throughput is I/O-bound rather than worker-count-bound. Adding workers in that state increases concurrency pressure on the ATS without improving throughput.
+
+The gate also prevents false scale-down when utilisation is temporarily low due to a burst of very-fast jobs — the delay signal must also confirm that the queue is genuinely draining ahead of schedule before workers are removed.
+
+### Bootstrap mode and Layer 1 midnight recompute
+
+**Bootstrap mode** (`manager:bootstrap` key is set): fewer than 28 days of `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` records exist. The delay formula is bypassed and fixed ceilings are used:
+
+| Pool | Bootstrap ceiling |
+|------|------------------|
+| scan | 10 |
+| detail | 6 |
+| fullscan | 5 |
+
+**Layer 1 midnight recompute** runs once nightly inside `manager.py`. It reads the recent daily-peak keys, computes `peak_Nd + max(growth_buffer, volatility_buffer)`, and writes the result to `manager:worker_ceil:{pool}`. This ceiling is what `workers_target` is clamped to during the day. The 7 AM startup calculation in `scheduler.py` remains the initial count; all intraday adjustments go through `manager.py`.
+
+### manager:cmds channel contract
+
+`manager.py` issues decisions over the `manager:cmds` Redis LIST (LPUSH). `_manager_cmds_loop()` in `scheduler.py` reads via BLPOP and applies:
+
+| Command | Effect |
+|---------|--------|
+| `{pool}:target:{n}` | Spawn or terminate workers until pool size equals N |
+| `platform:deprioritize:{platform}` | Push platform companies forward 300s in `poll:adaptive` |
+| `platform:outage:{platform}:set` | Enter outage mode (60-min dispatch pause for that platform) |
+| `platform:outage:{platform}:clear` | Exit outage mode early (e.g. after a successful canary probe) |
+
+### Key Redis keys
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `manager:scaling_params` | String (JSON) | Cached `fetch_p75` + `delay_warn_s` per pool, 25h TTL |
+| `manager:worker_ceil:{pool}` | String | Ceiling set by midnight recompute |
+| `manager:pool:{type}:daily_peak:running` | String | Intraday high-water mark, updated when pool expands |
+| `manager:pool:{type}:daily_peak:{YYYY-MM-DD}` | String | Historical daily peak (input to midnight recompute) |
+| `manager:cmds` | List | Command channel; BLPOP'd by `_manager_cmds_loop` in scheduler.py |
+| `manager:lock` | String | NX EX 90 distributed lock; one manager cycle at a time |
+| `manager:bootstrap` | String | Present while < 28 days of history; disables delay formula |
+| `manager:backpressure:threshold:{pool}` | String | `delay_warn_s` value for the watchdog alert |
+| `worker:{type}:busy_ms:{pid}` | String | Per-worker busy time in current 60s window, TTL = 120s |
+
+---
+
 ## 25. Glossary
 
 **Adaptive interval:** A polling frequency that automatically adjusts based on observed company behavior. Computed from a 5-poll weighted queue with asymmetric smoothing.
@@ -3742,7 +4082,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Canary probe:** A single test request sent to a platform at the halfway point of an outage window. Success → outage mode cleared early. Failure → TTL reset for another full window.
 
-**Scaling lock:** Short-TTL Redis key (`worker:scaling_lock:{platform}`, TTL = 30 min) set by `_fast_error_check_loop` after any error-triggered action. Prevents `_slow_throughput_check_loop` from immediately adding workers back and undoing a deliberate reduction.
+**Scaling lock:** *(retired)* Was a short-TTL Redis key (`worker:scaling_lock:{platform}`) set by `_fast_error_check_loop` to prevent `_slow_throughput_check_loop` from undoing error-triggered reductions. Both loops were deleted when `workers/manager.py` took over all scaling — manager runs error detection and pool sizing in the same 60s cycle with shared in-memory state, so no cross-loop lock is needed.
 
 **Consecutive reductions counter:** `worker:consec_reductions:{platform}` (TTL = 1h). Incremented each time a worker reduction fires for a platform without improving its error rate. Reaching 3 triggers outage mode detection.
 

@@ -138,6 +138,7 @@ from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
+from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
 from db.job_monitor import (
@@ -948,6 +949,18 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         _partial_fetch = False
         try:
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
+        except CeilingExceeded:
+            # Platform at concurrency ceiling — reschedule and return without
+            # processing. No checkpoint needed (no pages processed yet).
+            # XACK happens in the outer loop for "ceiling_exceeded" outcome.
+            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time() + 30})
+            result["outcome"] = "ceiling_exceeded"
+            logger.debug(
+                "fullscan [%s]: CeilingExceeded for %r — "
+                "rescheduled poll:fullscan +30s",
+                company, company,
+            )
+            return result
         except IncompleteSearchError as exc:
             if not exc.stubs:
                 raise
@@ -1016,6 +1029,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         paused        = False
         early_exit    = False
         overlap_pages = 0
+        _reintro_detail_active = bool(r.exists("manager:reintro:detail:active"))
+        _reintro_detail_count  = 0
+        _REINTRO_DETAIL_BATCH_MAX = 3
 
         # Backpressure: check detail queue depth before starting.
         # Cast to int explicitly — r.llen() always returns int in production,
@@ -1134,10 +1150,27 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     )
                 else:
                     if save_pending_detail(
-                        company, platform, job, found_by="tier2_fullscan"
+                        company, platform, job, found_by="tier2_fullscan",
+                        detail_payload=detail_payload,
                     ):
-                        r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
-                        new_count += 1
+                        # Layer 2 Lever 1: skip push when detail backpressure active.
+                        # Job will be re-discovered on next fullscan cycle.
+                        if r.exists("manager:lever1:detail:active"):
+                            logger.debug(
+                                "fullscan [%s]: Lever 1 active — held job %s",
+                                company, job.get("job_id"),
+                            )
+                        elif (_reintro_detail_active
+                              and _reintro_detail_count >= _REINTRO_DETAIL_BATCH_MAX):
+                            # Re-intro trickle: held for this company; re-discovered next scan.
+                            logger.debug(
+                                "fullscan [%s]: re-intro rate limit — held job %s",
+                                company, job.get("job_id"),
+                            )
+                        else:
+                            r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
+                            new_count += 1
+                            _reintro_detail_count += 1
 
                 # ALL fetched jobs go into NEW bloom regardless of outcome —
                 # this ensures closed/filled jobs fall out naturally next cycle.
@@ -1443,6 +1476,15 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     r = get_redis()
     _ensure_consumer_group(r)
 
+    # Signal manager that this worker is now online (reduces pending_spawns counter)
+    try:
+        _ps_key = "manager:pool:fullscan:pending_spawns"
+        if r.exists(_ps_key):
+            if r.decr(_ps_key) < 0:
+                r.set(_ps_key, 0)
+    except Exception:
+        pass
+
     logger.info(
         "fullscan worker started | worker_id=%s consumer=%s stream=%s "
         "once=%s skip_lock=%s",
@@ -1473,6 +1515,12 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     _hw = {"count": 0}
     _hb = Heartbeat(r, "fullscan_worker", lambda: _hw["count"],
                     interval_s=60).start()
+
+    # ── Busy-time tracking for manager.py utilization signal ─────────────────
+    _BUSY_CYCLE_S  = 60
+    _busy_ms_acc   = 0
+    _busy_window_t = time.monotonic()
+    _own_pid       = os.getpid()
 
     while True:
         try:
@@ -1525,6 +1573,20 @@ def run_worker(once: bool = False, skip_lock: bool = False,
             result    = _run_fullscan(company, r, skip_lock=skip_lock,
                                       dc_key=dc_key,
                                       shutdown_event=shutdown_event)
+
+            # ── Publish busy_ms for manager.py utilization ───────────────────
+            _elapsed_ms = result.get("duration_ms", 0)
+            _now_m = time.monotonic()
+            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
+                _busy_ms_acc   = 0
+                _busy_window_t = _now_m
+            _busy_ms_acc += _elapsed_ms
+            try:
+                r.set(f"worker:fullscan:busy_ms:{_own_pid}", _busy_ms_acc,
+                      ex=_BUSY_CYCLE_S * 2)
+            except Exception:
+                pass
+
             _hw["count"] += 1
 
             outcome = result["outcome"]
@@ -1534,15 +1596,19 @@ def run_worker(once: bool = False, skip_lock: bool = False,
             # XAUTOCLAIM recovery — the scan was aborted, not finished.
             # For all other outcomes, _run_fullscan() handled rescheduling
             # internally, so marking this delivery done is safe.
+            # XACK for all outcomes except "shutdown" (aborted mid-scan —
+            # leave in PEL for XAUTOCLAIM recovery) and "ceiling_exceeded"
+            # is XACK'd here too — ZADD to poll:fullscan is the reschedule.
             if outcome != "shutdown":
                 r.xack(REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, msg_id)
             icon    = {
-                "completed": "[DONE]",
-                "partial":   "[PART]",
-                "paused":    "[PAUSE]",
-                "deferred":  "[DEFER]",
-                "skipped":   "[SKIP]",
-                "error":     "[ERR]",
+                "completed":       "[DONE]",
+                "partial":         "[PART]",
+                "paused":          "[PAUSE]",
+                "deferred":        "[DEFER]",
+                "skipped":         "[SKIP]",
+                "error":           "[ERR]",
+                "ceiling_exceeded": "[CEIL]",
             }.get(outcome, "[?]")
 
             logger.info(

@@ -879,6 +879,7 @@ def init_db():
         ("last_updated",    "TIMESTAMP"),
         ("last_polled",     "TIMESTAMP"),
         ("_country_code",   "CHAR(2)"),
+        ("detail_payload",  "JSONB"),
     ]:
         c.execute(f"ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS {col} {defn}")
 
@@ -935,6 +936,13 @@ def init_db():
         # EMA formula (a=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
         ("last_fullscan_duration_s", "INTEGER"),
         ("avg_fullscan_duration_s",  "DOUBLE PRECISION DEFAULT 1800.0"),
+        # Adaptive scan duration EMA — mirrors fullscan pattern.
+        # Written by upsert_poll_stats() on every adaptive scan completion.
+        # Read by manager.py to compute avg_fetch_s for the scaling formula.
+        # EMA formula (a=0.3): new = 0.3 * last_duration + 0.7 * prev_avg
+        # Seed 120s = conservative 2-min estimate; converges after a few real scans.
+        ("last_scan_duration_s", "INTEGER"),
+        ("avg_scan_duration_s",  "DOUBLE PRECISION DEFAULT 120.0"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"

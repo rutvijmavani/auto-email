@@ -74,7 +74,6 @@ from config import (
     CONCURRENCY_FLOOR,
     CONCURRENCY_FLOOR_DEFAULT,
     WORKER_SHUTDOWN_TIMEOUT_S,
-    WORKER_FAST_CHECK_INTERVAL_S,
     WORKER_SLOW_CHECK_INTERVAL_S,
     WORKER_POOL_SCAN_FRACTION,
     WORKER_POOL_DETAIL_FRACTION,
@@ -1279,7 +1278,18 @@ def adaptive_loop() -> None:
                 _check_auto_resume()
                 continue
 
+            # ── Layer 2 Lever 1: halt scan dispatch when manager signals ──────
+            if r.exists("manager:lever1:scan:active"):
+                logger.debug(
+                    "adaptive_loop: Layer 2 Lever 1 active — halting scan dispatch"
+                )
+                time.sleep(SCHEDULER_TICK_SECS)
+                continue
+
             now = time.time()
+
+            # ── Layer 2 re-intro: trickle dispatch during post-Lever-1 recovery ─
+            _reintro_scan = bool(r.exists("manager:reintro:scan:active"))
 
             # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
             # p95 listing scan time (5-min cached from api_health)
@@ -1426,6 +1436,13 @@ def adaptive_loop() -> None:
                     company, REDIS_STREAM_ADAPTIVE, dc_key, dispatch_context,
                 )
 
+                # Re-intro: dispatch at most 1 company per tick during recovery
+                if _reintro_scan:
+                    logger.debug(
+                        "adaptive_loop: re-intro active — halting after 1 dispatch"
+                    )
+                    break
+
             time.sleep(SCHEDULER_TICK_SECS)
 
         except KeyboardInterrupt:
@@ -1486,7 +1503,18 @@ def fullscan_loop() -> None:
                 _check_auto_resume()
                 continue
 
+            # ── Layer 2 Lever 1: halt fullscan dispatch when manager signals ──
+            if r.exists("manager:lever1:fullscan:active"):
+                logger.debug(
+                    "fullscan_loop: Layer 2 Lever 1 active — halting fullscan dispatch"
+                )
+                time.sleep(SCHEDULER_TICK_SECS)
+                continue
+
             now = time.time()
+
+            # ── Layer 2 re-intro: trickle dispatch during post-Lever-1 recovery ─
+            _reintro_fullscan = bool(r.exists("manager:reintro:fullscan:active"))
 
             # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
             try:
@@ -1592,6 +1620,13 @@ def fullscan_loop() -> None:
                     )
                 r.zrem(REDIS_POLL_FULLSCAN, company)
                 _hw_dispatched += 1
+
+                # Re-intro: dispatch at most 1 company per tick during recovery
+                if _reintro_fullscan:
+                    logger.debug(
+                        "fullscan_loop: re-intro active — halting after 1 dispatch"
+                    )
+                    break
 
                 logger.info(
                     "fullscan_loop: dispatched %r to %s (dc=%s)",
@@ -2271,9 +2306,9 @@ def _deprioritise_platform(r, platform: str) -> int:
     """
     Push all companies for a given ATS platform forward in poll:adaptive.
 
-    Called by _fast_error_check_loop() when a platform's error rate is high
-    but its concurrency limit is already at floor (errors are not concurrency-
-    induced).  Pushing companies forward gives the platform breathing room to
+    Called by manager._check_error_spikes() (via manager:cmds) when a
+    platform's error rate is high but its concurrency limit is already at
+    floor.  Pushing companies forward gives the platform breathing room to
     recover before their next scan is attempted.
 
     Only companies currently in poll:adaptive are affected, and only those
@@ -2406,192 +2441,170 @@ def _redis_watchdog_loop() -> None:
             time.sleep(30)
 
 
-def _fast_error_check_loop() -> None:
+def _manager_cmds_loop() -> None:
     """
-    Layer 2: fast error monitor — runs every WORKER_FAST_CHECK_INTERVAL_S (5 min).
+    Reads commands from the `manager:cmds` Redis LIST (BLPOP, 5s timeout) and
+    dispatches them to the appropriate scheduler primitives.
 
-    Phase 10 full logic (Section 9 — ATS outage detection):
+    Command format (plain strings pushed by manager.py):
+        "{pool}:target:{n}"                 — adjust pool to exactly n workers
+        "platform:deprioritize:{platform}"  — call _deprioritise_platform()
+        "platform:outage:{platform}:set"    — set worker:outage:{platform} (TTL from config)
+        "platform:outage:{platform}:clear"  — delete worker:outage:{platform}
 
-    For each platform per cycle:
-      1. If in outage mode → skip (canary dispatch is handled in adaptive_loop).
-      2. Check effectiveness of the PREVIOUS reduction (if a before_rate snapshot
-         exists from last cycle): if error rate improved → reset consec_reductions
-         and update learned ceiling; if not → increment consec_reductions.
-      3. If consec_reductions reaches WORKER_CONSEC_REDUCTIONS_THRESHOLD → declare
-         outage, workers untouched, log outage_start event.
-      4. If error rate is above threshold AND concurrency is at floor → two-lever:
-         a. Snapshot before_rate for next-cycle effectiveness check.
-         b. Set scaling lock (prevents slow check from undoing this).
-         c. Update learned ceiling (inflight at error time - 1).
-         d. Remove one scan worker.
-         e. Deprioritise platform companies in poll:adaptive.
-         f. Record scaling event.
+    Zero-risk when manager.py is not running: the list stays empty, BLPOP
+    returns None every 5s, loop sleeps and tries again.  No state is changed.
     """
-    from workers.http_client import get_error_rate, get_baseline_error_rate
-    from db.api_health import record_scaling_event
+    from config import WORKER_OUTAGE_TTL_S, WORKER_FLOOR, DB_POOL_MAXCONN
 
     r = get_redis()
-    logger.info("fast_error_check_loop: started")
+    logger.info("manager_cmds_loop: started — listening on manager:cmds")
 
     while True:
         try:
-            time.sleep(WORKER_FAST_CHECK_INTERVAL_S)
+            result = r.blpop("manager:cmds", timeout=5)
+            if result is None:
+                continue
 
-            for platform in MONITOR_PLATFORM_CONCURRENCY:
-                # ── Skip platforms in outage mode ─────────────────────────────
-                if r.exists(f"worker:outage:{platform}"):
+            _, raw = result
+            cmd = raw.decode() if isinstance(raw, bytes) else raw
+            parts = cmd.split(":")
+
+            # ── {pool}:target:{n} ─────────────────────────────────────────────
+            if len(parts) == 3 and parts[1] == "target":
+                pool, _, n_str = parts
+                try:
+                    target = int(n_str)
+                except ValueError:
+                    logger.warning("manager_cmds: bad target command %r", cmd)
                     continue
 
-                error_rate    = get_error_rate(r, platform)
-                baseline_rate = get_baseline_error_rate(r, platform)
-                spike_factor  = (error_rate / (baseline_rate + 0.001)
-                                 if baseline_rate > 0.0 else None)
+                # Derive ceiling from DB pool budget (same formula as slow_throughput)
+                db_budget = DB_POOL_MAXCONN - 3
+                ceil_map = {
+                    "scan":     max(WORKER_FLOOR, db_budget // 2),
+                    "detail":   max(WORKER_FLOOR, db_budget // 3),
+                    "fullscan": max(WORKER_FLOOR, db_budget // 5),
+                }
+                ceil_ = ceil_map.get(pool, WORKER_FLOOR)
+                target = max(WORKER_FLOOR, min(target, ceil_))
 
-                # ── Check effectiveness of previous reduction ─────────────────
-                before_rate_key = f"worker:reduction:before_rate:{platform}"
-                before_raw      = r.get(before_rate_key)
-                if before_raw is not None:
-                    before_rate = float(before_raw)
-                    r.delete(before_rate_key)
-
-                    if error_rate <= CONCURRENCY_ERROR_RATE_REDUCE:
-                        # Reduction was effective — reset counter
-                        r.delete(f"worker:consec_reductions:{platform}")
-                        # Update learned ceiling: inflight count at improvement time
-                        dc_key       = platform   # platform-level ceiling update
-                        stale_cutoff = time.time() - INFLIGHT_STALE_WINDOW_S
-                        r.zremrangebyscore(
-                            f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", 0, stale_cutoff
-                        )
-                        inflight = r.zcard(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}")
-                        new_ceil = max(WORKER_FLOOR, inflight)
-                        r.set(f"worker:ceil:learned:{dc_key}", new_ceil)
-                        r.set(f"worker:ceil:last_error:{dc_key}", int(time.time()))
-                        logger.info(
-                            "fast_error_check: platform=%r reduction EFFECTIVE "
-                            "(%.1f%% → %.1f%%) — learned ceiling set to %d",
-                            platform, before_rate * 100, error_rate * 100, new_ceil,
-                        )
-                        n_scan, n_detail = _get_pool_snapshot()
-                        record_scaling_event(
-                            "ceiling_learned",
-                            trigger_layer="fast_error",
-                            platform=platform,
-                            dc_key=dc_key,
-                            scan_workers_before=n_scan,
-                            scan_workers_after=n_scan,
-                            detail_workers_before=n_detail,
-                            detail_workers_after=n_detail,
-                            error_rate=error_rate,
-                            baseline_error_rate=baseline_rate if baseline_rate > 0 else None,
-                            spike_factor=spike_factor,
-                            inflight_count=inflight,
-                            learned_ceiling=new_ceil,
-                            notes=f"effective reduction: {before_rate*100:.1f}% → {error_rate*100:.1f}%",
-                        )
+                if pool in ("scan", "detail", "fullscan"):
+                    if pool == "fullscan":
+                        current = _get_fullscan_pool_size()
                     else:
-                        # Reduction was NOT effective — increment consec counter
-                        count = r.incr(f"worker:consec_reductions:{platform}")
-                        r.expire(
-                            f"worker:consec_reductions:{platform}",
-                            WORKER_CONSEC_REDUCTIONS_TTL,
-                        )
-                        logger.warning(
-                            "fast_error_check: platform=%r reduction INEFFECTIVE "
-                            "(%.1f%% → %.1f%%) consec_reductions=%d",
-                            platform, before_rate * 100, error_rate * 100, count,
-                        )
+                        n_scan, n_detail = _get_pool_snapshot()
+                        current = n_scan if pool == "scan" else n_detail
 
-                        if count >= WORKER_CONSEC_REDUCTIONS_THRESHOLD:
-                            # Outage detected — pause dispatching for this platform
-                            r.set(
-                                f"worker:outage:{platform}", "1",
-                                ex=WORKER_OUTAGE_TTL_S,
-                            )
-                            r.delete(f"worker:consec_reductions:{platform}")
-                            logger.warning(
-                                "fast_error_check: OUTAGE DECLARED for platform=%r "
-                                "after %d consecutive ineffective reductions — "
-                                "dispatching paused for %ds",
-                                platform, count, WORKER_OUTAGE_TTL_S,
-                            )
-                            n_scan, n_detail = _get_pool_snapshot()
-                            record_scaling_event(
-                                "outage_start",
-                                trigger_layer="fast_error",
-                                platform=platform,
-                                scan_workers_before=n_scan,
-                                scan_workers_after=n_scan,
-                                detail_workers_before=n_detail,
-                                detail_workers_after=n_detail,
-                                error_rate=error_rate,
-                                baseline_error_rate=baseline_rate if baseline_rate > 0 else None,
-                                spike_factor=spike_factor,
-                                consec_reductions=count,
-                            )
-                            continue   # skip reduction this cycle; outage mode handles it
+                    if target > current:
+                        for _ in range(target - current):
+                            _add_one_worker(pool, ceil_)
+                    elif target < current:
+                        for _ in range(current - target):
+                            _remove_one_worker(pool, WORKER_FLOOR)
 
-                # ── Check if action is needed this cycle ──────────────────────
-                if error_rate <= CONCURRENCY_ERROR_RATE_REDUCE:
-                    continue
+                    n_scan_a, n_detail_a = _get_pool_snapshot()
+                    logger.info(
+                        "manager_cmds: %s:target:%d applied "
+                        "(was %d → scan=%d detail=%d fullscan=%d)",
+                        pool, target, current,
+                        n_scan_a, n_detail_a, _get_fullscan_pool_size(),
+                    )
+                else:
+                    logger.warning("manager_cmds: unknown pool %r in cmd %r", pool, cmd)
 
-                floor   = CONCURRENCY_FLOOR.get(platform, CONCURRENCY_FLOOR_DEFAULT)
-                raw     = r.get(f"{REDIS_CONCURRENCY_LIMIT_PREFIX}:{platform}")
-                current = int(raw) if raw is not None else floor + 1
-
-                if current > floor:
-                    # Concurrency still above floor → feedback loop is handling it
-                    continue
-
-                # Concurrency at floor AND errors still high → worker-level response
-                logger.warning(
-                    "fast_error_check: platform=%r error_rate=%.1f%% "
-                    "concurrency at floor=%d — reducing workers",
-                    platform, error_rate * 100, floor,
+            # ── platform:deprioritize:{platform} ──────────────────────────────
+            elif len(parts) == 3 and parts[0] == "platform" and parts[1] == "deprioritize":
+                platform = parts[2]
+                n = _deprioritise_platform(r, platform)
+                logger.info(
+                    "manager_cmds: deprioritized platform=%r (%d companies pushed forward)",
+                    platform, n,
                 )
 
-                dynamic_floor = _remaining_work_minimum(r)
-                n_scan, n_detail = _get_pool_snapshot()
+            # ── platform:outage:{platform}:set / :clear ───────────────────────
+            elif len(parts) == 4 and parts[0] == "platform" and parts[1] == "outage":
+                platform, action = parts[2], parts[3]
+                if action == "set":
+                    r.set(f"worker:outage:{platform}", "1", ex=WORKER_OUTAGE_TTL_S)
+                    logger.warning(
+                        "manager_cmds: outage DECLARED for platform=%r (TTL=%ds)",
+                        platform, WORKER_OUTAGE_TTL_S,
+                    )
+                elif action == "clear":
+                    r.delete(f"worker:outage:{platform}")
+                    logger.info(
+                        "manager_cmds: outage CLEARED for platform=%r", platform,
+                    )
+                else:
+                    logger.warning("manager_cmds: unknown outage action %r in cmd %r", action, cmd)
 
-                # Snapshot before_rate for next-cycle effectiveness check
-                r.set(
-                    f"worker:reduction:before_rate:{platform}",
-                    str(error_rate),
-                    ex=WORKER_FAST_CHECK_INTERVAL_S * 3,
-                )
-
-                # Set scaling lock — prevents slow check from adding workers back
-                r.set(
-                    f"worker:scaling_lock:{platform}", "1",
-                    ex=WORKER_SCALING_LOCK_TTL,
-                )
-
-                removed = _remove_one_worker("scan", dynamic_floor)
-                _deprioritise_platform(r, platform)
-
-                n_scan_after, n_detail_after = _get_pool_snapshot()
-                record_scaling_event(
-                    "worker_remove",
-                    trigger_layer="fast_error",
-                    platform=platform,
-                    worker_type="scan",
-                    scan_workers_before=n_scan,
-                    scan_workers_after=n_scan_after,
-                    detail_workers_before=n_detail,
-                    detail_workers_after=n_detail_after,
-                    error_rate=error_rate,
-                    baseline_error_rate=baseline_rate if baseline_rate > 0 else None,
-                    spike_factor=spike_factor,
-                    scan_queue_depth=r.llen(SCAN_QUEUE),
-                    detail_queue_depth=r.llen(REDIS_DETAIL_ADAPTIVE),
-                    notes=f"dynamic_floor={dynamic_floor} removed={removed}",
-                )
+            else:
+                logger.warning("manager_cmds: unrecognised command %r", cmd)
 
         except KeyboardInterrupt:
-            logger.info("fast_error_check_loop: stopping")
+            logger.info("manager_cmds_loop: stopping")
             break
         except Exception as exc:
-            logger.error("fast_error_check_loop: error: %s", exc, exc_info=True)
+            logger.error("manager_cmds_loop: error: %s", exc, exc_info=True)
+            time.sleep(5)
+
+
+
+def _ceiling_decay_loop() -> None:
+    """
+    Standalone learned-ceiling decay — runs every WORKER_SLOW_CHECK_INTERVAL_S (30 min).
+
+    Extracted from _slow_throughput_check_loop so it survives when that loop is
+    deleted during manager.py migration.  Logic is unchanged:
+
+    For each `worker:ceil:learned:{dc_key}` key, if 24h have passed since the last
+    error event (`worker:ceil:last_error:{dc_key}`), increment the ceiling by 1.
+    This probes upward toward the true safe maximum after a clean period.
+
+    Writes are guarded: if worker:ceil:last_error is missing or too recent, the key
+    is left alone.  Only moves UP (decay means relaxing the ceiling, not lowering it).
+    """
+    from db.api_health import record_scaling_event
+
+    r = get_redis()
+    logger.info("ceiling_decay_loop: started")
+
+    while True:
+        try:
+            time.sleep(WORKER_SLOW_CHECK_INTERVAL_S)
+
+            now = time.time()
+            cursor = 0
+            while True:
+                cursor, keys = r.scan(cursor, match="worker:ceil:learned:*", count=50)
+                for key in keys:
+                    dc_key   = key.split("worker:ceil:learned:", 1)[1] if isinstance(key, str) \
+                               else key.decode().split("worker:ceil:learned:", 1)[1]
+                    last_err = r.get(f"worker:ceil:last_error:{dc_key}")
+                    if last_err and (now - float(last_err)) > 86400:
+                        old_ceil = int(r.get(key) or WORKER_FLOOR)
+                        new_ceil = min(old_ceil + 1, MONITOR_MAX_WORKERS)
+                        r.set(key, new_ceil)
+                        logger.info(
+                            "ceiling_decay: ceil:learned relaxed for dc=%r %d → %d (24h clean)",
+                            dc_key, old_ceil, new_ceil,
+                        )
+                        record_scaling_event(
+                            "ceiling_learned",
+                            trigger_layer="ceiling_decay",
+                            dc_key=dc_key,
+                            learned_ceiling=new_ceil,
+                            notes=f"24h decay from {old_ceil}",
+                        )
+                if cursor == 0:
+                    break
+
+        except KeyboardInterrupt:
+            logger.info("ceiling_decay_loop: stopping")
+            break
+        except Exception as exc:
+            logger.error("ceiling_decay_loop: error: %s", exc, exc_info=True)
             time.sleep(60)
 
 
@@ -2602,8 +2615,7 @@ def _slow_throughput_check_loop() -> None:
     Phase 10 additions:
       - Checks worker:scaling_lock:{platform} before adding workers — prevents
         this loop from undoing a deliberate fast_error reduction.
-      - Learned ceiling decay: after 24h clean operation for a DC key, increments
-        the ceiling by 1 (probes upward toward true safe maximum).
+      - Learned ceiling decay: MOVED to standalone _ceiling_decay_loop() thread.
       - Emits record_scaling_event for every worker add/remove.
 
     Cascade logic (Section 9):
@@ -2675,35 +2687,6 @@ def _slow_throughput_check_loop() -> None:
                             )
             except Exception as exc:
                 logger.debug("slow_throughput: redis memory check failed: %s", exc)
-
-            # ── Phase 10: learned ceiling decay ───────────────────────────────
-            # For each known DC key, if 24h have passed since the last error
-            # event, increment the ceiling by 1 (probe upward toward true max).
-            now = time.time()
-            cursor = 0
-            while True:
-                cursor, keys = r.scan(cursor, match="worker:ceil:learned:*", count=50)
-                for key in keys:
-                    dc_key   = key.split("worker:ceil:learned:", 1)[1]
-                    last_err = r.get(f"worker:ceil:last_error:{dc_key}")
-                    if last_err and (now - float(last_err)) > 86400:
-                        old_ceil = int(r.get(key) or WORKER_FLOOR)
-                        new_ceil = min(old_ceil + 1, MONITOR_MAX_WORKERS)
-                        r.set(key, new_ceil)
-                        logger.info(
-                            "slow_throughput: ceil:learned relaxed for dc=%r "
-                            "%d → %d (24h clean)",
-                            dc_key, old_ceil, new_ceil,
-                        )
-                        record_scaling_event(
-                            "ceiling_learned",
-                            trigger_layer="slow_throughput",
-                            dc_key=dc_key,
-                            learned_ceiling=new_ceil,
-                            notes=f"24h decay from {old_ceil}",
-                        )
-                if cursor == 0:
-                    break
 
             # ── Phase 11: detail queue depth alert ────────────────────────────
             # Track how many consecutive slow-check cycles the queue has stayed
@@ -3024,13 +3007,16 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
                scan_pool     — listing scan workers
                detail_pool   — detail fetch workers
                fullscan_pool — fullscan workers (stream:fullscan consumers)
-        6. Starts six daemon threads:
+        6. Starts five daemon threads:
                adaptive_loop               — dispatches to stream:adaptive (two-layer)
                fullscan_loop               — dispatches to stream:fullscan (two-layer)
                pubsub_listener_loop        — handles pause/resume pub/sub
                _liveness_check_loop        — Layer 1: replace dead workers every 5s
-               _fast_error_check_loop      — Layer 2: error-triggered scaling every 5m
-               _slow_throughput_check_loop — Layer 3: throughput scaling every 30m
+               _ceiling_decay_loop         — relaxes learned ceilings after 24h clean (30m)
+               _manager_cmds_loop          — executes add/remove/deprioritize/outage commands from manager.py
+               _redis_watchdog_loop        — detects Redis restarts and rebuilds ZSETs
+               NOTE: _fast_error_check_loop removed — replaced by manager._check_error_spikes() (60s cycle)
+               NOTE: _slow_throughput_check_loop removed — replaced by workers/manager.py (Layer 0)
            NOTE: result_consumer_loop is retired — on_adaptive_complete() is called
            inline by scan_worker, and on_fullscan_complete() is handled in fullscan.py.
         7. On Ctrl+C: graceful shutdown → SIGKILL stragglers after 30s
@@ -3083,9 +3069,9 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
 
     # ── Spawn worker pools ────────────────────────────────────────────────────
     # Fullscan workers: floor at WORKER_FLOOR, cap at same ceiling as scan pool.
-    # Start fullscan workers at the floor; _slow_throughput_check_loop scales
-    # up when stream:fullscan has more pending messages than workers, and scales
-    # back down to the floor when the stream is idle.
+    # Start fullscan workers at the floor; manager.py Layer 0 scales
+    # up when delay exceeds DELAY_WARN threshold and scales back down
+    # when utilization drops below 50% for 5 consecutive cycles.
     fullscan_count = WORKER_FLOOR
 
     global _scan_pool, _detail_pool
@@ -3130,10 +3116,10 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
                          name="pubsub_listener",         daemon=True),
         threading.Thread(target=_liveness_check_loop,
                          name="liveness_check",          daemon=True),
-        threading.Thread(target=_fast_error_check_loop,
-                         name="fast_error_check",        daemon=True),
-        threading.Thread(target=_slow_throughput_check_loop,
-                         name="slow_throughput_check",   daemon=True),
+        threading.Thread(target=_ceiling_decay_loop,
+                         name="ceiling_decay",           daemon=True),
+        threading.Thread(target=_manager_cmds_loop,
+                         name="manager_cmds",            daemon=True),
         threading.Thread(target=_redis_watchdog_loop,
                          name="redis_watchdog",          daemon=True),
     ]
