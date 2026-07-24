@@ -62,11 +62,11 @@ SHADOW_MODE: bool = False
 MANAGER_CYCLE_S: int = 60
 
 # ── Bootstrap ceilings (used until 28 days of daily_peak data accumulates) ────
-# These match the current production fleet: 10 scan, 6 detail, 5 fullscan.
-# Layer 0 scales down within these ceilings naturally via util < 0.50 filter.
+# detail raised to 10: burst arrivals (single scan can drop 300+ jobs) require
+# more headroom to drain fast enough to stay below the 300s delay_warn threshold.
 BOOTSTRAP_CEIL: dict = {
     "scan":     10,
-    "detail":   6,
+    "detail":   10,
     "fullscan": 5,
 }
 BOOTSTRAP_DAYS_REQUIRED: int = 28
@@ -76,7 +76,7 @@ _DB_RESERVED: int = 3
 
 # ── Cold-start fallbacks for scaling_params (used until DB has real data) ──────
 _FALLBACK_PARAMS: dict = {
-    "detail":   {"fetch_p75": 1.5,   "delay_warn_s": 60},
+    "detail":   {"fetch_p75": 1.5,   "delay_warn_s": 300},   # 300s = ~400 jobs at 2 workers; 60s was too tight, fired Lever 1 on every normal burst
     "scan":     {"fetch_p75": 120.0, "delay_warn_s": 1800},
     "fullscan": {"fetch_p75": 300.0, "delay_warn_s": 7200},
 }
@@ -117,65 +117,65 @@ def _compute_scaling_params() -> dict:
 
     try:
         with get_conn() as conn:
-            with conn.cursor() as cur:
-                # detail: P75 across all api_health requests, last 30 days
-                cur.execute("""
-                    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
-                        ORDER BY total_ms / NULLIF(requests_made, 0)
-                    ) / 1000.0
-                    FROM api_health
-                    WHERE date > NOW() - INTERVAL '30 days'
-                      AND context = 'normal'
-                """)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    params["detail"]["fetch_p75"] = float(row[0])
+            cur = conn.cursor()
+            # detail: P75 across all api_health requests, last 30 days
+            cur.execute("""
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY total_ms / NULLIF(requests_made, 0)
+                ) / 1000.0
+                FROM api_health
+                WHERE date > NOW() - INTERVAL '30 days'
+                  AND context = 'normal'
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                params["detail"]["fetch_p75"] = float(row[0])
 
-                # scan: P75 of per-company avg_scan_duration_s
-                cur.execute("""
-                    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
-                        ORDER BY avg_scan_duration_s
-                    )
-                    FROM company_poll_stats
-                    WHERE avg_scan_duration_s IS NOT NULL
-                """)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    params["scan"]["fetch_p75"] = float(row[0])
+            # scan: P75 of per-company avg_scan_duration_s
+            cur.execute("""
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY avg_scan_duration_s
+                )
+                FROM company_poll_stats
+                WHERE avg_scan_duration_s IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                params["scan"]["fetch_p75"] = float(row[0])
 
-                # fullscan: P75 of per-company avg_fullscan_duration_s
-                cur.execute("""
-                    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
-                        ORDER BY avg_fullscan_duration_s
-                    )
-                    FROM company_poll_stats
-                    WHERE avg_fullscan_duration_s IS NOT NULL
-                """)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    params["fullscan"]["fetch_p75"] = float(row[0])
+            # fullscan: P75 of per-company avg_fullscan_duration_s
+            cur.execute("""
+                SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
+                    ORDER BY avg_fullscan_duration_s
+                )
+                FROM company_poll_stats
+                WHERE avg_fullscan_duration_s IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                params["fullscan"]["fetch_p75"] = float(row[0])
 
-                # scan DELAY_WARN_S: p10 of current_interval_s × 0.10
-                cur.execute("""
-                    SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (
-                        ORDER BY current_interval_s
-                    ) * 0.10
-                    FROM company_poll_stats
-                    WHERE current_interval_s IS NOT NULL
-                """)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    params["scan"]["delay_warn_s"] = max(300, int(row[0]))
+            # scan DELAY_WARN_S: p10 of current_interval_s × 0.10
+            cur.execute("""
+                SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (
+                    ORDER BY current_interval_s
+                ) * 0.10
+                FROM company_poll_stats
+                WHERE current_interval_s IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                params["scan"]["delay_warn_s"] = max(300, int(row[0]))
 
-                # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
-                cur.execute("""
-                    SELECT AVG(full_scan_interval_s) * 0.10
-                    FROM company_poll_stats
-                    WHERE full_scan_interval_s IS NOT NULL
-                """)
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    params["fullscan"]["delay_warn_s"] = max(600, int(row[0]))
+            # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
+            cur.execute("""
+                SELECT AVG(full_scan_interval_s) * 0.10
+                FROM company_poll_stats
+                WHERE full_scan_interval_s IS NOT NULL
+            """)
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                params["fullscan"]["delay_warn_s"] = max(600, int(row[0]))
 
         params["computed_at"] = datetime.now(timezone.utc).isoformat()
         logger.info(
@@ -761,10 +761,21 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     Also snapshots D (depth) and R (inflow rate) at the trigger moment.
     These must be captured BEFORE Lever 1 acts, because by cycle 3 the queue
     is already draining and R ≈ 0 — severely understating true demand.
+
+    Inflow guard: skip if the queue is already draining (depth falling and no
+    new inflow). URGENT scale-up is already handling it; halting inflow when
+    workers are winning is counterproductive.
     """
     if _get_lever1_active(r, pool):
         return  # idempotent
     inflow_rate = max(0.0, (depth - prev_depth) / MANAGER_CYCLE_S)
+    if inflow_rate == 0.0 and depth < prev_depth:
+        logger.debug(
+            "manager [%s]: Lever 1 skipped — queue draining "
+            "(depth %d→%d, inflow=0). URGENT workers handling it.",
+            pool, prev_depth, depth,
+        )
+        return
     pipe = r.pipeline()
     pipe.set(f"manager:lever1:{pool}:active", "1")
     pipe.set(f"manager:snapshot:{pool}:D", str(depth), ex=3600)

@@ -1825,7 +1825,7 @@ def _kill_ghost_workers(r) -> None:
                 ppid = int(ppid_line.split()[1])
                 if ppid != scheduler_pid:
                     ghosts.append(pid)
-            except (FileNotFoundError, PermissionError, StopIteration, ValueError, UnicodeDecodeError):
+            except (OSError, StopIteration, ValueError, UnicodeDecodeError):
                 continue
     except Exception as exc:
         logger.warning("watchdog: ghost worker scan failed: %s", exc)
