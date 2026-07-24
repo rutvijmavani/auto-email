@@ -156,7 +156,11 @@ def _check_pipeline_degraded():
 
         from datetime import date as _date_type
         try:
-            dates = [_date_type.fromisoformat(s["date"]) for s in recent]
+            dates = [
+                s["date"] if isinstance(s["date"], _date_type)
+                else _date_type.fromisoformat(s["date"])
+                for s in recent
+            ]
             for i in range(len(dates) - 1):
                 if (dates[i] - dates[i + 1]).days != 1:
                     logger.debug(

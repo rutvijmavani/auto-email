@@ -122,60 +122,60 @@ def _compute_scaling_params() -> dict:
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
                     ORDER BY total_ms / NULLIF(requests_made, 0)
-                ) / 1000.0
+                ) / 1000.0 AS value
                 FROM api_health
                 WHERE date > NOW() - INTERVAL '30 days'
                   AND context = 'normal'
             """)
             row = cur.fetchone()
-            if row and row[0] is not None:
-                params["detail"]["fetch_p75"] = float(row[0])
+            if row and row["value"] is not None:
+                params["detail"]["fetch_p75"] = float(row["value"])
 
             # scan: P75 of per-company avg_scan_duration_s
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
                     ORDER BY avg_scan_duration_s
-                )
+                ) AS value
                 FROM company_poll_stats
                 WHERE avg_scan_duration_s IS NOT NULL
             """)
             row = cur.fetchone()
-            if row and row[0] is not None:
-                params["scan"]["fetch_p75"] = float(row[0])
+            if row and row["value"] is not None:
+                params["scan"]["fetch_p75"] = float(row["value"])
 
             # fullscan: P75 of per-company avg_fullscan_duration_s
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (
                     ORDER BY avg_fullscan_duration_s
-                )
+                ) AS value
                 FROM company_poll_stats
                 WHERE avg_fullscan_duration_s IS NOT NULL
             """)
             row = cur.fetchone()
-            if row and row[0] is not None:
-                params["fullscan"]["fetch_p75"] = float(row[0])
+            if row and row["value"] is not None:
+                params["fullscan"]["fetch_p75"] = float(row["value"])
 
             # scan DELAY_WARN_S: p10 of current_interval_s × 0.10
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (
                     ORDER BY current_interval_s
-                ) * 0.10
+                ) * 0.10 AS value
                 FROM company_poll_stats
                 WHERE current_interval_s IS NOT NULL
             """)
             row = cur.fetchone()
-            if row and row[0] is not None:
-                params["scan"]["delay_warn_s"] = max(300, int(row[0]))
+            if row and row["value"] is not None:
+                params["scan"]["delay_warn_s"] = max(300, int(row["value"]))
 
             # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
             cur.execute("""
-                SELECT AVG(full_scan_interval_s) * 0.10
+                SELECT AVG(full_scan_interval_s) * 0.10 AS value
                 FROM company_poll_stats
                 WHERE full_scan_interval_s IS NOT NULL
             """)
             row = cur.fetchone()
-            if row and row[0] is not None:
-                params["fullscan"]["delay_warn_s"] = max(600, int(row[0]))
+            if row and row["value"] is not None:
+                params["fullscan"]["delay_warn_s"] = max(600, int(row["value"]))
 
         params["computed_at"] = datetime.now(timezone.utc).isoformat()
         logger.info(
