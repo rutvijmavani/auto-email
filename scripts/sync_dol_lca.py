@@ -238,10 +238,15 @@ def scrape_historical_quarters(soup: BeautifulSoup) -> dict[str, str]:
         year = int(m.group(1))
         if year not in BACKFILL_YEARS:
             continue
-        # Collect all .xlsx links in this row
+        # Collect all .xlsx links in this row — skip supplemental files
+        # (Appendix_A = wage data, Worksites = location data; neither has VISA_CLASS)
         for a in row.find_all("a", href=True):
             href = a["href"]
             if not href.lower().endswith(".xlsx"):
+                continue
+            href_lower = href.lower()
+            if "appendix" in href_lower or "worksite" in href_lower:
+                log.info("Skipping supplemental file: %s", href)
                 continue
             quarter = _extract_quarter(href) or _extract_quarter(a.get_text())
             if quarter:
