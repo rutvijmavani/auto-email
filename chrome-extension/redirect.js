@@ -59,7 +59,7 @@ fetch(GIST_URL + '?t=' + Date.now(), { signal: controller.signal })
   .then(r => r.json())
   .then(data => {
     const url = data.frontend_base;
-    if (url) {
+    if (url && isValidUrl(url)) {
       settle(() => openUrl(url));
     } else {
       settle(() => tryStorage('frontend_base not in Gist yet. Is the tunnel running on the server?'));

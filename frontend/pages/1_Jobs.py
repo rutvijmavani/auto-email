@@ -4,6 +4,7 @@ frontend/pages/1_Jobs.py — Live job listings from job_postings table.
 Replaces the weekly email digest with a filterable, searchable view.
 """
 
+import re
 import sys
 import os
 from datetime import date, timedelta
@@ -15,6 +16,22 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from frontend.db_utils import query as _query
 
 st.set_page_config(page_title="Jobs", page_icon="📋", layout="wide")
+
+
+def _fmt_desc(text: str) -> str:
+    """Convert scraped plain-text description to readable Markdown."""
+    if not text:
+        return text
+    # If the text is a flat blob (few/no newlines), inject breaks before
+    # section-like patterns ("What You'll Do:", "Basic Qualifications:", etc.)
+    if text.count("\n") < 3:
+        text = re.sub(r" ([A-Z][A-Za-z ,/&'\-]{2,60}:)\s", r"\n\n**\1** ", text)
+    # Double up newlines so Markdown renders paragraph breaks instead of spaces
+    text = re.sub(r"\n+", "\n\n", text)
+    # Bold any remaining standalone section headers (line is just "Header:")
+    text = re.sub(r"^([A-Z][^\n]{1,70}:)\s*$", r"**\1**", text, flags=re.MULTILINE)
+    return text.strip()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
@@ -212,7 +229,8 @@ if rows:
         desc = job.get("description")
         if isinstance(desc, str) and desc.strip():
             with st.expander("Job description", expanded=True):
-                st.markdown(desc[:4000] + ("…" if len(desc) > 4000 else ""))
+                truncated = desc[:4000]
+                st.markdown(_fmt_desc(truncated) + ("…" if len(desc) > 4000 else ""))
         else:
             st.info("Description not available (job may have expired).")
 

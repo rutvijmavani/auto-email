@@ -166,14 +166,16 @@ def _resolve_url(href: str) -> str | None:
 def _fetch_page() -> BeautifulSoup | None:
     log.info("Fetching DOL performance page …")
     session = _make_session()
-    _warm_session(session)
     try:
+        _warm_session(session)
         r = session.get(DOL_PERFORMANCE_URL, timeout=30)
         r.raise_for_status()
         return BeautifulSoup(r.text, "html.parser")
     except Exception as exc:
         log.error("Could not fetch DOL page: %s", exc)
         return None
+    finally:
+        session.close()
 
 
 def scrape_current_quarter(soup: BeautifulSoup) -> dict[str, str]:
@@ -266,8 +268,8 @@ def download(url: str, quarter: str) -> Path | None:
         return dest
 
     log.info("Downloading %s …", url)
+    session = _make_session()
     try:
-        session = _make_session()
         _warm_session(session)
         r = session.get(url, timeout=300, stream=True)
         r.raise_for_status()
@@ -282,6 +284,8 @@ def download(url: str, quarter: str) -> Path | None:
         if dest.exists():
             dest.unlink()
         return None
+    finally:
+        session.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
