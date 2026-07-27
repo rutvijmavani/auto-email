@@ -25,7 +25,7 @@ def _fmt_desc(text: str) -> str:
     # If the text is a flat blob (few/no newlines), inject breaks before
     # section-like patterns ("What You'll Do:", "Basic Qualifications:", etc.)
     if text.count("\n") < 3:
-        text = re.sub(r" ([A-Z][A-Za-z ,/&'\-]{2,60}:)\s", r"\n\n**\1** ", text)
+        text = re.sub(r"(?:^| )([A-Z][A-Za-z ,/&'\-]{2,60}:)\s", r"\n\n**\1** ", text)
     # Double up newlines so Markdown renders paragraph breaks instead of spaces
     text = re.sub(r"\n+", "\n\n", text)
     # Bold any remaining standalone section headers (line is just "Header:")
