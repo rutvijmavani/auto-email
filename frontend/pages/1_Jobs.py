@@ -80,9 +80,11 @@ def load_filter_options() -> dict:
     platforms = _query(
         "SELECT DISTINCT ats_platform FROM job_postings WHERE ats_platform IS NOT NULL ORDER BY ats_platform"
     )
+    total_companies = _query("SELECT COUNT(DISTINCT company) AS n FROM job_postings")
     return {
         "companies": companies["company"].tolist() if not companies.empty else [],
         "platforms": platforms["ats_platform"].tolist() if not platforms.empty else [],
+        "total_companies": int(total_companies["n"].iloc[0]) if not total_companies.empty else 0,
     }
 
 
@@ -143,11 +145,12 @@ df = load_jobs(
 week_ago  = date.today() - timedelta(days=7)
 this_week = df[pd.to_datetime(df["first_seen"], errors="coerce") >= pd.Timestamp(week_ago)] if not df.empty else df
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Total jobs",      len(df))
-m2.metric("Companies",       df["company"].nunique() if not df.empty else 0)
-m3.metric("Added this week", len(this_week))
-m4.metric("Avg skill score", f"{df['skill_score'].mean():.0f}" if not df.empty else "—")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Total jobs",          len(df))
+m2.metric("Companies in view",   df["company"].nunique() if not df.empty else 0)
+m3.metric("Companies monitored", opts["total_companies"])
+m4.metric("Added this week",     len(this_week))
+m5.metric("Avg skill score",     f"{df['skill_score'].mean():.0f}" if not df.empty else "—")
 
 st.divider()
 

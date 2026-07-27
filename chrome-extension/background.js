@@ -9,8 +9,9 @@ async function refreshApiUrl() {
   try {
     const r = await fetch(GIST_CONFIG_URL + '?t=' + Date.now());
     if (!r.ok) return;
-    const { api_base } = await r.json();
-    if (api_base) await chrome.storage.local.set({ api_base });
+    const { api_base, frontend_base } = await r.json();
+    if (api_base)      await chrome.storage.local.set({ api_base });
+    if (frontend_base) await chrome.storage.local.set({ frontend_base });
   } catch (_) {}
 }
 

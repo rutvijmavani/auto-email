@@ -90,11 +90,13 @@ _rollback_to_previous() {
         || echo "  [WARN] could not restart recruiter-manager"
     sudo systemctl restart email-processor \
         || echo "  [WARN] could not restart email-processor"
+    sudo systemctl restart streamlit-frontend \
+        || echo "  [WARN] could not restart streamlit-frontend"
 
     # Post-rollback verification
     sleep 3
     local _all_active=true
-    for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+    for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
         if systemctl is-active --quiet "$svc"; then
             echo "  [OK] $svc is active after rollback"
         else
@@ -192,7 +194,7 @@ fi
 # If a unit file changed in this commit and install-systemd.sh was not re-run,
 # install-pipeline-units would silently install the stale staged copy.
 _stale_units=0
-for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service"; do
+for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service" "streamlit-frontend.service"; do
     _src="$DEPLOY_DIR/systemd/$_unit"
     _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
     if [[ ! -f "$_staged" ]]; then
@@ -252,6 +254,11 @@ sudo systemctl restart email-processor || {
     _rollback_to_previous; exit 1
 }
 
+sudo systemctl restart streamlit-frontend || {
+    echo "  [ERROR] streamlit-frontend failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
+
 echo ""
 echo "  Waiting for services to come up..."
 sleep 5
@@ -260,7 +267,7 @@ sleep 5
 echo ""
 echo "► Service status:"
 _svc_fail=0
-for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
     if [[ "$status" == "active" ]]; then

@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Job Pipeline Dashboard</title>
+<style>
+  body { font-family: sans-serif; display: flex; align-items: center; justify-content: center;
+         height: 100vh; margin: 0; background: #0f0f0f; color: #ccc; flex-direction: column; gap: 14px; }
+  a { color: #4ea8ff; word-break: break-all; }
+  .spinner { width: 28px; height: 28px; border: 3px solid #333; border-top-color: #4ea8ff;
+             border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #url-box { display: none; text-align: center; }
+  #url-box p { margin: 0; font-size: 13px; color: #888; }
+  #open-btn { margin-top: 6px; padding: 8px 20px; background: #4ea8ff; color: #000;
+              border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+  #open-btn:hover { background: #78bcff; }
+  #msg { font-size: 14px; color: #888; text-align: center; max-width: 360px; line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="spinner" id="spinner"></div>
+<p id="msg">Fetching current dashboard URL…</p>
+<div id="url-box">
+  <p id="url-text"></p>
+  <button id="open-btn">Open Dashboard</button>
+</div>
+<script>
+const GIST_URL = 'https://gist.githubusercontent.com/rutvijmavani/4f400d820fd0b390c15dd7d6592d8053/raw/api-config.json';
+const FETCH_TIMEOUT_MS = 5000;
+
+function openUrl(url) {
+  document.getElementById('spinner').style.display = 'none';
+  document.getElementById('msg').style.display = 'none';
+  const box = document.getElementById('url-box');
+  box.style.display = 'block';
+  document.getElementById('url-text').innerHTML =
+    '<a href="' + url + '" target="_blank">' + url + '</a>';
+  document.getElementById('open-btn').onclick = () => window.open(url, '_blank');
+  chrome.storage.local.set({ frontend_base: url });
+  // Small delay so the link is visible before navigating
+  setTimeout(() => { window.location.href = url; }, 300);
+}
+
+function showError(msg) {
+  document.getElementById('spinner').style.display = 'none';
+  document.getElementById('msg').textContent = msg;
+}
+
+function tryStorage(fallbackMsg) {
+  chrome.storage.local.get('frontend_base', ({ frontend_base: cached }) => {
+    if (cached) {
+      openUrl(cached);
+    } else {
+      showError(fallbackMsg);
+    }
+  });
+}
+
+// Hard safety cutoff — if nothing resolves in 8s, try storage then show error
+const safetyTimer = setTimeout(() => {
+  tryStorage('Gist timed out. No cached URL found. Is the cloudflare-tunnel service running?');
+}, 8000);
+
+function done() { clearTimeout(safetyTimer); }
+
+// Fetch with 5s timeout
+const controller = new AbortController();
+const fetchTimer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+fetch(GIST_URL + '?t=' + Date.now(), { signal: controller.signal })
+  .then(r => { clearTimeout(fetchTimer); return r.json(); })
+  .then(data => {
+    done();
+    const url = data.frontend_base;
+    if (url) {
+      openUrl(url);
+    } else {
+      tryStorage('frontend_base not in Gist yet. Is the tunnel running on the server?');
+    }
+  })
+  .catch(() => {
+    clearTimeout(fetchTimer);
+    done();
+    tryStorage('Could not reach Gist. Using cached URL if available.');
+  });
+</script>
+</body>
+</html>
