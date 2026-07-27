@@ -94,7 +94,7 @@ def _warm_session(session) -> bool:
 
 # Only backfill these fiscal years from the historical table.
 # FY2026 comes from the current-quarter table automatically.
-BACKFILL_YEARS = {2025}
+BACKFILL_YEARS = {2024,2025}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
