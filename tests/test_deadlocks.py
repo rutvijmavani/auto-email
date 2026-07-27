@@ -176,7 +176,7 @@ class TestDeadlock1_DetailBorrowsFromScan(unittest.TestCase):
         _run(self.r, "detail", delay_s=warn + 300, n_workers=_CEIL,
              pool_sizes=pool_sizes, workers_targets=workers_targets)
         self.assertIsNone(self.r._store.get("manager:borrow:fullscan:detail"),
-                          "fullscan must not be touched when scan can lend")
+                          "fullscan has no lendable capacity (pool_size equals target)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +271,7 @@ class TestDeadlock4_FullscanDetailAllowed(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDeadlock5_BorrowPriority(unittest.TestCase):
-    """Both scan and fullscan have lendable workers; scan should be tried first."""
+    """Both scan and fullscan have lendable workers; Phase 1 takes from both."""
 
     def setUp(self):
         _reset_state("detail", "scan", "fullscan")
@@ -285,6 +285,10 @@ class TestDeadlock5_BorrowPriority(unittest.TestCase):
         scan_borrow = r._store.get("manager:borrow:scan:detail")
         self.assertIsNotNone(scan_borrow)
         self.assertEqual(int(scan_borrow), 3)   # all 3 lendable from scan taken
+        # Phase 1 continues to fullscan (2 lendable = 7 - max(5, WORKER_FLOOR))
+        fullscan_borrow = r._store.get("manager:borrow:fullscan:detail")
+        self.assertIsNotNone(fullscan_borrow)
+        self.assertEqual(int(fullscan_borrow), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

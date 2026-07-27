@@ -125,14 +125,21 @@ def _run_tunnel(port: str, gist_key: str, label: str) -> None:
 
 
 def main() -> None:
+    _stop = threading.Event()
+
+    def _run_and_signal(port: str, gist_key: str, label: str) -> None:
+        _run_tunnel(port, gist_key, label)
+        log.info('[%s] tunnel thread exiting — signalling stop', label)
+        _stop.set()
+
     api_thread = threading.Thread(
-        target=_run_tunnel,
+        target=_run_and_signal,
         args=(API_PORT, 'api_base', 'api'),
         daemon=True,
         name='tunnel-api',
     )
     frontend_thread = threading.Thread(
-        target=_run_tunnel,
+        target=_run_and_signal,
         args=(FRONTEND_PORT, 'frontend_base', 'frontend'),
         daemon=True,
         name='tunnel-frontend',
@@ -141,11 +148,9 @@ def main() -> None:
     api_thread.start()
     frontend_thread.start()
 
-    # Block until both tunnels exit (cloudflared crash → systemd restarts this service)
-    api_thread.join()
-    frontend_thread.join()
-
-    log.info('Both tunnels exited — stopping')
+    # Block until either tunnel exits; systemd Restart=always will relaunch both
+    _stop.wait()
+    log.info('A tunnel thread exited — stopping')
     sys.exit(1)
 
 

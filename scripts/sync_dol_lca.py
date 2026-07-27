@@ -100,9 +100,16 @@ def _extract_quarter(text: str) -> str | None:
     return None
 
 
-def _resolve_url(href: str) -> str:
-    """Resolve a potentially relative DOL href to an absolute URL."""
-    return href if href.startswith("http") else f"{DOL_BASE_URL}{href}"
+def _resolve_url(href: str) -> str | None:
+    """Resolve a relative DOL href to an absolute URL; reject non-DOL absolute hrefs."""
+    if not href.startswith("http"):
+        return f"{DOL_BASE_URL}{href}"
+    dol_host = "dol.gov"
+    from urllib.parse import urlparse
+    if dol_host not in urlparse(href).netloc:
+        log.warning("Rejected non-DOL URL in scrape result: %s", href)
+        return None
+    return href
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,8 +151,9 @@ def scrape_current_quarter(soup: BeautifulSoup) -> dict[str, str]:
                 quarter = _extract_quarter(a["href"]) or _extract_quarter(a.get_text())
                 if quarter:
                     url = _resolve_url(a["href"])
-                    log.info("Current quarter: %s → %s", quarter, url)
-                    return {quarter: url}
+                    if url:
+                        log.info("Current quarter: %s → %s", quarter, url)
+                        return {quarter: url}
 
     log.warning("LCA Programs row not found in current-quarter table")
     return {}
@@ -187,8 +195,9 @@ def scrape_historical_quarters(soup: BeautifulSoup) -> dict[str, str]:
             quarter = _extract_quarter(href) or _extract_quarter(a.get_text())
             if quarter:
                 url = _resolve_url(href)
-                found[quarter] = url
-                log.info("Historical: %s → %s", quarter, url)
+                if url:
+                    found[quarter] = url
+                    log.info("Historical: %s → %s", quarter, url)
 
     log.info("Found %d historical LCA files for years %s", len(found), BACKFILL_YEARS)
     return found
@@ -228,12 +237,18 @@ def download(url: str, quarter: str) -> Path | None:
 # Ingest
 # ─────────────────────────────────────────────────────────────────────────────
 
+_INGEST_TIMEOUT_S = 3600  # 1 hour; a quarterly file should process well within this
+
 def ingest(file_path: Path, quarter: str) -> bool:
     """Run process_dol_lca.py on a downloaded file. Returns True on success."""
     script = Path(__file__).parent / "process_dol_lca.py"
     cmd    = [sys.executable, str(script), "--file", str(file_path), "--quarter", quarter]
     log.info("Running ingestion for %s …", quarter)
-    result = subprocess.run(cmd, capture_output=False)
+    try:
+        result = subprocess.run(cmd, capture_output=False, timeout=_INGEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        log.error("Ingestion timed out after %ds for %s", _INGEST_TIMEOUT_S, quarter)
+        return False
     if result.returncode != 0:
         log.error("Ingestion failed for %s (exit %d)", quarter, result.returncode)
         return False

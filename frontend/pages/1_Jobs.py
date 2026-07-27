@@ -216,9 +216,10 @@ if rows:
         st.subheader(f"{job['title']}")
         st.caption(f"**{job['company']}**  ·  {job['location'] or 'Location not specified'}")
 
-        if job.get("description"):
+        desc = job.get("description")
+        if isinstance(desc, str) and desc.strip():
             with st.expander("Job description", expanded=True):
-                st.markdown(job["description"][:4000] + ("…" if len(str(job["description"])) > 4000 else ""))
+                st.markdown(desc[:4000] + ("…" if len(desc) > 4000 else ""))
         else:
             st.info("Description not available (job may have expired).")
 

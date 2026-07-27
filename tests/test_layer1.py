@@ -237,9 +237,8 @@ class TestMidnightRecomputeSwitchover(unittest.TestCase):
 
     def test_exactly_27_records_stays_in_bootstrap(self):
         """
-        27 pre-existing records + today (written by the function) = 28.
-        At 28 the formula kicks in.  With 27 pre-existing, after adding today
-        the total is 28 → formula mode.  Test 26 pre-existing → 27 total → bootstrap.
+        26 pre-existing records + today (written by _midnight_recompute) = 27 total.
+        27 < BOOTSTRAP_DAYS_REQUIRED (28) → still bootstrap mode.
         """
         r = _FakeRedis()
         _set_running(r, "detail", 5)

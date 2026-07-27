@@ -186,8 +186,8 @@ class TestMidnightRecomputeFormula(unittest.TestCase):
         data = {"manager:pool:scan:daily_peak:running": "15"}
         for i in range(BOOTSTRAP_DAYS_REQUIRED):
             date = f"2025-01-{i + 1:02d}"
-            # days 1-7 (most recent, stored reverse by sort) high, rest low
-            val = 15 if i < 7 else 5
+            # dates 22-28 are most recent (_midnight_recompute sorts descending) → high peaks
+            val = 15 if i >= BOOTSTRAP_DAYS_REQUIRED - 7 else 5
             data[f"manager:pool:scan:daily_peak:{date}"] = str(val)
         r = _make_redis(data)
         _midnight_recompute(r, ["scan"])
@@ -204,7 +204,7 @@ class TestMidnightRecomputeFormula(unittest.TestCase):
             date = f"2025-01-{i + 1:02d}"
             r._store[f"manager:pool:fullscan:daily_peak:{date}"] = "5"
 
-        _midnight_recompute(r, ["scan", "fullscan"])
+        _midnight_recompute(r, ["scan", "detail", "fullscan"])
 
         self.assertIsNotNone(r._store.get("manager:worker_ceil:scan"))
         self.assertIsNotNone(r._store.get("manager:worker_ceil:fullscan"))
@@ -232,16 +232,17 @@ class TestCombinedBudgetInvariant(unittest.TestCase):
             f"scan+detail BOOTSTRAP_CEIL sum={total} exceeds DB budget={_DB_BUDGET}",
         )
 
-    def test_monitor_max_workers_times_3_exceeds_budget_as_expected(self):
+    def test_monitor_max_workers_fits_within_db_budget(self):
         """
-        MONITOR_MAX_WORKERS (20) × 3 pools = 60 >> budget (22).
-        This documents that individual ceilings are each ≤ MONITOR_MAX_WORKERS,
-        NOT that their sum is — the constraint is enforced by design (pools
-        cannot all simultaneously reach their individual maxima).
+        MONITOR_MAX_WORKERS ≤ DB_POOL_MAXCONN - 3: a single pool at its maximum
+        cannot exhaust the DB connection budget on its own.
+        The sum of all pools CAN exceed the budget — that is intentional, since pools
+        cannot all simultaneously reach their individual maxima.
         """
-        individual_max = MONITOR_MAX_WORKERS
-        self.assertLessEqual(individual_max, DB_POOL_MAXCONN - 3 + individual_max,
-                             "each individual ceil fits within the budget with headroom")
+        self.assertLessEqual(
+            MONITOR_MAX_WORKERS, DB_POOL_MAXCONN - 3,
+            f"MONITOR_MAX_WORKERS={MONITOR_MAX_WORKERS} exceeds per-pool DB budget={DB_POOL_MAXCONN - 3}",
+        )
 
     def test_each_bootstrap_pool_below_individual_monitor_max(self):
         """Each BOOTSTRAP_CEIL[pool] ≤ MONITOR_MAX_WORKERS (formula upper bound)."""

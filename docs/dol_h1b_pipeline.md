@@ -114,18 +114,18 @@ CREATE TABLE dol_h1b_employers (
     last_updated        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_dol_employers_state        ON dol_h1b_employers (employer_state);
-CREATE INDEX idx_dol_employers_naics        ON dol_h1b_employers (naics_code);
-CREATE INDEX idx_dol_employers_approval     ON dol_h1b_employers (approval_rate DESC);
-CREATE INDEX idx_dol_employers_certified    ON dol_h1b_employers (total_certified DESC);
-CREATE INDEX idx_dol_employers_h1b_dep      ON dol_h1b_employers (h1b_dependent);
+CREATE INDEX idx_dol_emp_state     ON dol_h1b_employers (employer_state);
+CREATE INDEX idx_dol_emp_naics     ON dol_h1b_employers (naics_code);
+CREATE INDEX idx_dol_emp_approval  ON dol_h1b_employers (approval_rate DESC);
+CREATE INDEX idx_dol_emp_certified ON dol_h1b_employers (total_certified DESC);
+CREATE INDEX idx_dol_emp_h1b_dep   ON dol_h1b_employers (h1b_dependent);
 ```
 
 ### `dol_h1b_soc_breakdown` — certified counts per employer per SOC code
 
 ```sql
 CREATE TABLE dol_h1b_soc_breakdown (
-    employer_fein   TEXT NOT NULL REFERENCES dol_h1b_employers(employer_fein),
+    employer_fein   TEXT NOT NULL REFERENCES dol_h1b_employers(employer_fein) ON DELETE CASCADE,
     soc_code        TEXT NOT NULL,
     soc_title       TEXT,
     total_filed     INTEGER NOT NULL DEFAULT 0,
@@ -142,7 +142,7 @@ CREATE INDEX idx_dol_soc_certified ON dol_h1b_soc_breakdown (soc_code, total_cer
 
 ```sql
 CREATE TABLE dol_h1b_yearly (
-    employer_fein   TEXT NOT NULL REFERENCES dol_h1b_employers(employer_fein),
+    employer_fein   TEXT NOT NULL REFERENCES dol_h1b_employers(employer_fein) ON DELETE CASCADE,
     year            INTEGER NOT NULL,
     filed           INTEGER NOT NULL DEFAULT 0,
     certified       INTEGER NOT NULL DEFAULT 0,
@@ -152,7 +152,7 @@ CREATE TABLE dol_h1b_yearly (
     PRIMARY KEY (employer_fein, year)
 );
 
-CREATE INDEX idx_dol_yearly_fein ON dol_h1b_yearly (employer_fein, year);
+CREATE INDEX idx_dol_yearly_fein_year ON dol_h1b_yearly (employer_fein, year);
 ```
 
 ---

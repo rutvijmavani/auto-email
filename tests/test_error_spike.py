@@ -140,11 +140,6 @@ class TestAdjustConcurrencySpike(unittest.TestCase):
         """Spike flag is NOT written when error_rate < reduce threshold."""
         r = MagicMock()
         r.get.return_value = b"5"
-        # Below the reduce threshold AND below the increase threshold too
-        # → adjust_concurrency returns early with no flag writes
-        low_rate = CONCURRENCY_ERROR_RATE_REDUCE - 0.05
-        if low_rate < 0:
-            low_rate = 0.0
         from config import CONCURRENCY_ERROR_RATE_INCREASE
         # Use a rate that's in the stable band (no reduce, no increase)
         stable_rate = (CONCURRENCY_ERROR_RATE_REDUCE + CONCURRENCY_ERROR_RATE_INCREASE) / 2

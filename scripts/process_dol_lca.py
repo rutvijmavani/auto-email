@@ -177,6 +177,21 @@ def _str_or_none(val) -> str | None:
     return s if s else None
 
 
+def _merge_job_titles(new_titles: list, existing_json) -> list:
+    """Merge new quarter's title counts with existing DB counts; return top 15 sorted desc."""
+    combined: dict[str, int] = {}
+    if isinstance(existing_json, list):
+        for item in existing_json:
+            t = item.get("title", "") if isinstance(item, dict) else ""
+            if t:
+                combined[t] = combined.get(t, 0) + (item.get("count", 0) if isinstance(item, dict) else 0)
+    for item in new_titles:
+        t = item.get("title", "") if isinstance(item, dict) else ""
+        if t:
+            combined[t] = combined.get(t, 0) + (item.get("count", 0) if isinstance(item, dict) else 0)
+    return [{"title": t, "count": c} for t, c in sorted(combined.items(), key=lambda x: -x[1])[:15]]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Upsert
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,15 +201,17 @@ def upsert(aggregated: dict, quarter: str) -> None:
     try:
         # Check which FEINs already have this quarter processed
         feins = list(aggregated.keys())
-        existing = {}
+        existing        = {}
+        existing_titles = {}
         if feins:
             rows = conn.execute("""
-                SELECT employer_fein, quarters_processed
+                SELECT employer_fein, quarters_processed, top_job_titles
                 FROM dol_h1b_employers
                 WHERE employer_fein = ANY(%s)
             """, (feins,)).fetchall()
             for r in rows:
-                existing[r["employer_fein"]] = r["quarters_processed"] or []
+                existing[r["employer_fein"]]        = r["quarters_processed"] or []
+                existing_titles[r["employer_fein"]] = r["top_job_titles"]
 
         skipped = sum(1 for fein in feins if quarter in existing.get(fein, []))
         if skipped:
@@ -208,7 +225,8 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 continue
 
             e = data["employer"]
-            approval_rate = (e["total_certified"] / e["total_filed"]) if e["total_filed"] > 0 else None
+            approval_rate  = (e["total_certified"] / e["total_filed"]) if e["total_filed"] > 0 else None
+            merged_titles  = _merge_job_titles(e["top_job_titles"], existing_titles.get(fein))
 
             conn.execute("""
                 INSERT INTO dol_h1b_employers (
@@ -249,7 +267,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 e["naics_code"], e["h1b_dependent"], e["willful_violator"],
                 e["total_filed"], e["total_certified"], e["total_denied"], e["total_withdrawn"],
                 e["total_positions"], e["certified_positions"], approval_rate,
-                json.dumps(e["top_job_titles"]), quarter,
+                json.dumps(merged_titles), quarter,
             ))
             emp_count += 1
 

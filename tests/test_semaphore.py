@@ -194,19 +194,19 @@ class TestFullscanCeilingExceeded(unittest.TestCase):
         """CeilingExceeded → result["outcome"] == "ceiling_exceeded"."""
         try:
             result, _ = self._run_fullscan_ceiling()
-            self.assertEqual(result.get("outcome"), "ceiling_exceeded")
-        except Exception:
+        except (ImportError, ModuleNotFoundError, AttributeError):
             self.skipTest("fullscan mock setup too complex for this environment")
+        self.assertEqual(result.get("outcome"), "ceiling_exceeded")
 
     def test_rescheduled_on_fullscan_queue(self):
         """CeilingExceeded → r.zadd(REDIS_POLL_FULLSCAN, ...) called."""
         try:
             _, r = self._run_fullscan_ceiling()
-            zadd_calls = [c for c in r.zadd.call_args_list
-                          if REDIS_POLL_FULLSCAN in str(c) or "poll:fullscan" in str(c)]
-            self.assertGreaterEqual(len(zadd_calls), 1)
-        except Exception:
+        except (ImportError, ModuleNotFoundError, AttributeError):
             self.skipTest("fullscan mock setup too complex for this environment")
+        zadd_calls = [c for c in r.zadd.call_args_list
+                      if REDIS_POLL_FULLSCAN in str(c) or "poll:fullscan" in str(c)]
+        self.assertGreaterEqual(len(zadd_calls), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,26 +276,26 @@ class TestScanWorkerCeilingExceeded(unittest.TestCase):
         """CeilingExceeded → result["requeued"] == True."""
         try:
             result, _ = self._run_scan_ceiling()
-            self.assertTrue(result.get("requeued"), "result['requeued'] must be True")
-        except Exception:
+        except (ImportError, ModuleNotFoundError, AttributeError):
             self.skipTest("scan_worker mock setup too complex for this environment")
+        self.assertTrue(result.get("requeued"), "result['requeued'] must be True")
 
     def test_zadd_to_poll_adaptive(self):
         """CeilingExceeded → r.zadd('poll:adaptive', ...) called with +30s score."""
         try:
             _, r = self._run_scan_ceiling()
-            zadd_calls = [c for c in r.zadd.call_args_list if "poll:adaptive" in str(c)]
-            self.assertGreaterEqual(len(zadd_calls), 1)
-        except Exception:
+        except (ImportError, ModuleNotFoundError, AttributeError):
             self.skipTest("scan_worker mock setup too complex for this environment")
+        zadd_calls = [c for c in r.zadd.call_args_list if "poll:adaptive" in str(c)]
+        self.assertGreaterEqual(len(zadd_calls), 1)
 
     def test_no_xack_leaves_in_pel(self):
         """CeilingExceeded path must NOT call xack — message stays in PEL."""
         try:
             _, r = self._run_scan_ceiling()
-            r.xack.assert_not_called()
-        except Exception:
+        except (ImportError, ModuleNotFoundError, AttributeError):
             self.skipTest("scan_worker mock setup too complex for this environment")
+        r.xack.assert_not_called()
 
 
 if __name__ == "__main__":
