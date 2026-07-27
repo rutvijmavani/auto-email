@@ -1,9 +1,9 @@
 [Unit]
-Description=Cloudflare Tunnel — Job Pipeline API
+Description=Cloudflare Tunnel — Job Pipeline API + Streamlit Frontend
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target pipeline-api.service
+After=network-online.target pipeline-api.service streamlit-frontend.service
 Wants=network-online.target
-Requires=pipeline-api.service
+Requires=pipeline-api.service streamlit-frontend.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
 

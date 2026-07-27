@@ -235,11 +235,11 @@ class TestLever1Lifecycle(unittest.TestCase):
         D = self.r.get("manager:snapshot:scan:D")
         self.assertEqual(float(D), 50.0)  # still original
 
-    def test_inflow_rate_clamped_to_zero_when_depth_drops(self):
-        # depth dropped (prev > current) → inflow_rate must not be negative
+    def test_inflow_guard_skips_when_depth_drops(self):
+        # depth < prev_depth AND inflow_rate=0 → bail out entirely (no snapshot, no active key)
         mgr._fire_lever1(self.r, "scan", depth=30, prev_depth=60)
-        R = float(self.r.get("manager:snapshot:scan:R"))
-        self.assertGreaterEqual(R, 0.0)
+        self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
+        self.assertIsNone(self.r.get("manager:snapshot:scan:R"))
 
     def test_lift_lever1_clears_active_flag(self):
         mgr._fire_lever1(self.r, "scan", depth=50, prev_depth=30)
