@@ -48,19 +48,14 @@ DOL_WARM_URL        = "https://www.dol.gov/"
 
 DOWNLOAD_DIR = Path(os.environ.get("DOL_LCA_CACHE_DIR", "/home/opc/mail/data/dol_lca"))
 
-_HEADERS = {
-    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+# Fallback headers used only when curl_cffi is unavailable (plain requests.Session).
+# When curl_cffi is used, impersonate="chrome146" sets its own consistent headers
+# and TLS fingerprint — overriding them here would create a mismatch.
+_FALLBACK_HEADERS = {
+    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language":           "en-US,en;q=0.9",
     "Cache-Control":             "max-age=0",
-    "Priority":                  "u=0, i",
-    "Sec-Ch-Ua":                 '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
-    "Sec-Ch-Ua-Mobile":          "?0",
-    "Sec-Ch-Ua-Platform":        '"Windows"',
-    "Sec-Fetch-Dest":            "document",
-    "Sec-Fetch-Mode":            "navigate",
-    "Sec-Fetch-Site":            "none",
-    "Sec-Fetch-User":            "?1",
     "Upgrade-Insecure-Requests": "1",
 }
 
@@ -70,13 +65,14 @@ def _make_session():
     Build a curl_cffi Session with Chrome TLS fingerprint.
     curl_cffi impersonates Chrome at the TLS handshake level (JA3/JA4) —
     the same technique used in custom_career.py and adp.py to pass bot detection.
+    When impersonating, curl_cffi sets all headers internally; we do not override
+    them to avoid a fingerprint/header mismatch.
     """
     if _CURL_CFFI_AVAILABLE:
-        session = cffi_requests.Session(impersonate="chrome146")
-    else:
-        log.warning("curl_cffi not installed — falling back to requests (may get 403)")
-        session = cffi_requests.Session()
-    session.headers.update(_HEADERS)
+        return cffi_requests.Session(impersonate="chrome146")
+    log.warning("curl_cffi not installed — falling back to requests (may get 403)")
+    session = cffi_requests.Session()
+    session.headers.update(_FALLBACK_HEADERS)
     return session
 
 
@@ -424,16 +420,18 @@ def main_direct(url: str, quarter: str) -> None:
     local_file = download(url, quarter)
     if local_file is None:
         log.error("Download failed — exiting")
+        send_notification([], [quarter])
         sys.exit(1)
     if ingest(local_file, quarter):
         log.info("Ingested %s successfully", quarter)
         try:
             local_file.unlink()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Could not delete %s after ingestion: %s", local_file, exc)
         send_notification([quarter], [])
     else:
         log.error("Ingestion failed for %s", quarter)
+        send_notification([], [quarter])
         sys.exit(1)
 
 

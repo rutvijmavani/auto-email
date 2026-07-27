@@ -252,6 +252,9 @@ if [[ "$_START" == "--start" ]]; then
     systemctl start recruiter-watchdog
     echo "  Started recruiter-watchdog"
     sleep 3
+
+    systemctl start streamlit-frontend
+    echo "  Started streamlit-frontend"
 else
     echo "  Services NOT started (default — Redis AOF must be configured first)."
     echo "  To start immediately after install: sudo bash deploy/install-systemd.sh --start"
@@ -268,7 +271,7 @@ if [[ "$_START" != "--start" ]]; then
 else
     echo ""
     echo "► Service status:"
-    for svc in recruiter-scheduler recruiter-watchdog; do
+    for svc in recruiter-scheduler recruiter-watchdog streamlit-frontend; do
         status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
         pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
         echo "  $svc: $status (pid=$pid)"
