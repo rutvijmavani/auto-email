@@ -24,6 +24,7 @@ import sys
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -101,15 +102,20 @@ def _extract_quarter(text: str) -> str | None:
 
 
 def _resolve_url(href: str) -> str | None:
-    """Resolve a relative DOL href to an absolute URL; reject non-DOL absolute hrefs."""
-    if not href.startswith("http"):
-        return f"{DOL_BASE_URL}{href}"
-    dol_host = "dol.gov"
-    from urllib.parse import urlparse
-    if dol_host not in urlparse(href).netloc:
+    """Resolve a DOL href to an absolute HTTPS URL; reject non-DOL or non-HTTPS results."""
+    url    = urljoin(DOL_BASE_URL, href)
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        log.warning("Rejected non-HTTPS URL in scrape result: %s", href)
+        return None
+    netloc = parsed.netloc.lower()
+    if netloc != "dol.gov" and not netloc.endswith(".dol.gov"):
         log.warning("Rejected non-DOL URL in scrape result: %s", href)
         return None
-    return href
+    if parsed.username or parsed.password:
+        log.warning("Rejected URL with userinfo in scrape result: %s", href)
+        return None
+    return url
 
 
 # ─────────────────────────────────────────────────────────────────────────────

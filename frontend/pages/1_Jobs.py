@@ -12,23 +12,13 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from db.connection import get_conn
+from frontend.db_utils import query as _query
 
 st.set_page_config(page_title="Jobs", page_icon="📋", layout="wide")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _query(sql: str, params=None) -> pd.DataFrame:
-    """Execute SQL and return a DataFrame using our custom _Connection."""
-    conn = get_conn()
-    try:
-        cur = conn.execute(sql, params or ())
-        rows = cur.fetchall()
-        return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=120)

@@ -6,6 +6,7 @@ All filtering is SQL-based with indexed columns; no pandas post-filtering.
 """
 
 import json
+import logging
 import sys
 import os
 
@@ -15,21 +16,15 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
 from db.prospective import add_prospective_company
+from frontend.db_utils import query as _query
+
+log = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Discover", page_icon="🔎", layout="wide")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _query(sql: str, params=None) -> pd.DataFrame:
-    conn = get_conn()
-    try:
-        cur = conn.execute(sql, params or ())
-        rows = cur.fetchall()
-        return pd.DataFrame([dict(r) for r in rows]) if rows else pd.DataFrame()
-    finally:
-        conn.close()
 
 
 @st.cache_data(ttl=3600)
@@ -310,19 +305,23 @@ with col_chart:
         st.info("No yearly breakdown available.")
 
 with col_meta:
-    rate = emp["approval_rate"]
-    h1b  = emp["h1b_dependent"]
-    wv   = emp["willful_violator"]
+    rate     = emp["approval_rate"]
+    h1b      = emp["h1b_dependent"]
+    wv       = emp["willful_violator"]
+    quarters = emp["quarters_count"]
+
+    rate_str     = f"{rate * 100:.1f}%" if (rate is not None and not pd.isna(rate)) else "—"
+    quarters_str = "0" if (quarters is None or pd.isna(quarters)) else str(int(quarters))
 
     st.markdown("**Summary**")
     st.markdown(f"Filed: **{emp['total_filed']:,}**")
     st.markdown(f"Certified: **{emp['total_certified']:,}**")
     st.markdown(f"Denied: **{emp['total_denied']:,}**")
     st.markdown(f"Positions: **{emp['total_positions']:,}**")
-    st.markdown(f"Approval: **{f'{rate * 100:.1f}%' if rate is not None else '—'}**")
+    st.markdown(f"Approval: **{rate_str}**")
     st.markdown(f"H1B dependent: **{'Yes' if h1b is True else ('No' if h1b is False else '—')}**")
     st.markdown(f"Willful violator: **{'⚠️ Yes' if wv else 'No'}**")
-    st.markdown(f"Quarters: **{emp['quarters_count'] or 0}**")
+    st.markdown(f"Quarters: **{quarters_str}**")
 
     st.divider()
 
@@ -335,9 +334,11 @@ with col_meta:
                 inserted = add_prospective_company(name, priority=0)
                 if inserted:
                     st.success("Added to pipeline!")
+                    st.rerun()
                 else:
                     st.info("Already in pipeline.")
             except Exception as exc:
+                log.exception("Failed to add %r to pipeline", name)
                 st.error(f"Error: {exc}")
 
 # SOC breakdown + top job titles
@@ -370,15 +371,25 @@ with col_titles:
                 titles_raw = None
 
         if isinstance(titles_raw, dict):
-            for title, count in sorted(titles_raw.items(), key=lambda x: -(x[1] or 0))[:10]:
-                st.markdown(f"- {title} *({count:,})*")
+            for title, count in sorted(titles_raw.items(), key=lambda x: -(int(x[1]) if x[1] is not None else 0))[:10]:
+                try:
+                    c_int = int(count)
+                except (TypeError, ValueError):
+                    c_int = None
+                st.markdown(f"- {title} *({c_int:,})*" if c_int is not None else f"- {title}")
         elif isinstance(titles_raw, list):
             for item in titles_raw[:10]:
                 if isinstance(item, dict):
                     t = item.get("title", "—")
-                    c = item.get("count", "")
-                    st.markdown(f"- {t} *({c})*" if c else f"- {t}")
+                    c = item.get("count")
+                    try:
+                        c_int = int(c) if c is not None else None
+                    except (TypeError, ValueError):
+                        c_int = None
+                    st.markdown(f"- {t} *({c_int:,})*" if c_int is not None else f"- {t}")
                 else:
                     st.markdown(f"- {item}")
+        else:
+            st.info("No job title data available.")
     else:
         st.info("No job title data available.")
