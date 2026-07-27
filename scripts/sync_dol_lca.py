@@ -26,8 +26,14 @@ from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import requests
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as cffi_requests
+    _CURL_CFFI_AVAILABLE = True
+except ImportError:
+    import requests as cffi_requests  # type: ignore[no-redef]
+    _CURL_CFFI_AVAILABLE = False
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import EMAIL, APP_PASSWORD
@@ -38,18 +44,53 @@ log = get_logger(__name__)
 
 DOL_PERFORMANCE_URL = "https://www.dol.gov/agencies/eta/foreign-labor/performance"
 DOL_BASE_URL        = "https://www.dol.gov"
+DOL_WARM_URL        = "https://www.dol.gov/"
 
 DOWNLOAD_DIR = Path(os.environ.get("DOL_LCA_CACHE_DIR", "/home/opc/mail/data/dol_lca"))
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+# Fallback headers used only when curl_cffi is unavailable (plain requests.Session).
+# When curl_cffi is used, impersonate="chrome146" sets its own consistent headers
+# and TLS fingerprint — overriding them here would create a mismatch.
+_FALLBACK_HEADERS = {
+    "User-Agent":                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Cache-Control":             "max-age=0",
+    "Upgrade-Insecure-Requests": "1",
 }
+
+
+def _make_session():
+    """
+    Build a curl_cffi Session with Chrome TLS fingerprint.
+    curl_cffi impersonates Chrome at the TLS handshake level (JA3/JA4) —
+    the same technique used in custom_career.py and adp.py to pass bot detection.
+    When impersonating, curl_cffi sets all headers internally; we do not override
+    them to avoid a fingerprint/header mismatch.
+    """
+    if _CURL_CFFI_AVAILABLE:
+        return cffi_requests.Session(impersonate="chrome146")
+    log.warning("curl_cffi not installed — falling back to requests (may get 403)")
+    session = cffi_requests.Session()
+    session.headers.update(_FALLBACK_HEADERS)
+    return session
+
+
+def _warm_session(session) -> bool:
+    """
+    GET the DOL homepage so the server issues fresh session cookies (RT, nmstat, etc.)
+    into the in-memory session before the actual performance-page request.
+    Returns True if the warm succeeded, False on network error (caller continues anyway).
+    """
+    try:
+        r = session.get(DOL_WARM_URL, timeout=20)
+        log.info("DOL warm: %s → HTTP %s, cookies set: %s",
+                 DOL_WARM_URL, r.status_code,
+                 list(session.cookies.keys()))
+        return True
+    except Exception as exc:
+        log.warning("DOL session warm failed (continuing anyway): %s", exc)
+        return False
 
 # Only backfill these fiscal years from the historical table.
 # FY2026 comes from the current-quarter table automatically.
@@ -124,13 +165,17 @@ def _resolve_url(href: str) -> str | None:
 
 def _fetch_page() -> BeautifulSoup | None:
     log.info("Fetching DOL performance page …")
+    session = _make_session()
     try:
-        r = requests.get(DOL_PERFORMANCE_URL, headers=HEADERS, timeout=30)
+        _warm_session(session)
+        r = session.get(DOL_PERFORMANCE_URL, timeout=30)
         r.raise_for_status()
         return BeautifulSoup(r.text, "html.parser")
     except Exception as exc:
         log.error("Could not fetch DOL page: %s", exc)
         return None
+    finally:
+        session.close()
 
 
 def scrape_current_quarter(soup: BeautifulSoup) -> dict[str, str]:
@@ -223,8 +268,10 @@ def download(url: str, quarter: str) -> Path | None:
         return dest
 
     log.info("Downloading %s …", url)
+    session = _make_session()
     try:
-        r = requests.get(url, headers=HEADERS, timeout=300, stream=True)
+        _warm_session(session)
+        r = session.get(url, timeout=300, stream=True)
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -237,6 +284,8 @@ def download(url: str, quarter: str) -> Path | None:
         if dest.exists():
             dest.unlink()
         return None
+    finally:
+        session.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +418,40 @@ def main():
     send_notification(ingested, failed)
 
 
+def main_direct(url: str, quarter: str) -> None:
+    """Bypass mode: download a single known URL and ingest it directly."""
+    log.info("Direct mode: %s → %s", quarter, url)
+    local_file = download(url, quarter)
+    if local_file is None:
+        log.error("Download failed — exiting")
+        send_notification([], [quarter])
+        sys.exit(1)
+    if ingest(local_file, quarter):
+        log.info("Ingested %s successfully", quarter)
+        try:
+            local_file.unlink()
+        except Exception as exc:
+            log.warning("Could not delete %s after ingestion: %s", local_file, exc)
+        send_notification([quarter], [])
+    else:
+        log.error("Ingestion failed for %s", quarter)
+        send_notification([], [quarter])
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url",     help="Direct Excel URL (bypass page scrape)")
+    parser.add_argument("--quarter", help="Quarter ID, e.g. FY2025_Q4 (required with --url)")
+    args = parser.parse_args()
+
     init_logging("sync_dol_lca")
-    main()
+
+    if args.url:
+        if not args.quarter:
+            print("--quarter is required when using --url")
+            sys.exit(1)
+        main_direct(args.url, args.quarter)
+    else:
+        main()

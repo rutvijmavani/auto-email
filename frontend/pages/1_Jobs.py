@@ -4,6 +4,7 @@ frontend/pages/1_Jobs.py — Live job listings from job_postings table.
 Replaces the weekly email digest with a filterable, searchable view.
 """
 
+import re
 import sys
 import os
 from datetime import date, timedelta
@@ -15,6 +16,22 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from frontend.db_utils import query as _query
 
 st.set_page_config(page_title="Jobs", page_icon="📋", layout="wide")
+
+
+def _fmt_desc(text: str) -> str:
+    """Convert scraped plain-text description to readable Markdown."""
+    if not text:
+        return text
+    # If the text is a flat blob (few/no newlines), inject breaks before
+    # section-like patterns ("What You'll Do:", "Basic Qualifications:", etc.)
+    if text.count("\n") < 3:
+        text = re.sub(r"(?:^| )([A-Z][A-Za-z ,/&'\-]{2,60}:)\s", r"\n\n**\1** ", text)
+    # Double up newlines so Markdown renders paragraph breaks instead of spaces
+    text = re.sub(r"\n+", "\n\n", text)
+    # Bold any remaining standalone section headers (line is just "Header:")
+    text = re.sub(r"^([A-Z][^\n]{1,70}:)\s*$", r"**\1**", text, flags=re.MULTILINE)
+    return text.strip()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
@@ -80,9 +97,11 @@ def load_filter_options() -> dict:
     platforms = _query(
         "SELECT DISTINCT ats_platform FROM job_postings WHERE ats_platform IS NOT NULL ORDER BY ats_platform"
     )
+    total_companies = _query("SELECT COUNT(DISTINCT company) AS n FROM job_postings")
     return {
         "companies": companies["company"].tolist() if not companies.empty else [],
         "platforms": platforms["ats_platform"].tolist() if not platforms.empty else [],
+        "total_companies": int(total_companies["n"].iloc[0]) if not total_companies.empty else 0,
     }
 
 
@@ -143,11 +162,12 @@ df = load_jobs(
 week_ago  = date.today() - timedelta(days=7)
 this_week = df[pd.to_datetime(df["first_seen"], errors="coerce") >= pd.Timestamp(week_ago)] if not df.empty else df
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Total jobs",      len(df))
-m2.metric("Companies",       df["company"].nunique() if not df.empty else 0)
-m3.metric("Added this week", len(this_week))
-m4.metric("Avg skill score", f"{df['skill_score'].mean():.0f}" if not df.empty else "—")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Total jobs",          len(df))
+m2.metric("Companies in view",   df["company"].nunique() if not df.empty else 0)
+m3.metric("Companies monitored", opts["total_companies"])
+m4.metric("Added this week",     len(this_week))
+m5.metric("Avg skill score",     f"{df['skill_score'].mean():.0f}" if not df.empty else "—")
 
 st.divider()
 
@@ -209,7 +229,8 @@ if rows:
         desc = job.get("description")
         if isinstance(desc, str) and desc.strip():
             with st.expander("Job description", expanded=True):
-                st.markdown(desc[:4000] + ("…" if len(desc) > 4000 else ""))
+                truncated = desc[:4000]
+                st.markdown(_fmt_desc(truncated) + ("…" if len(desc) > 4000 else ""))
         else:
             st.info("Description not available (job may have expired).")
 

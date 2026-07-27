@@ -108,7 +108,7 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service; do
+for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service streamlit-frontend.service; do
     src="$DEPLOY_DIR/systemd/$unit"
     if [[ ! -f "$src" ]]; then
         echo "[ERROR] Unit file not found: $src"
@@ -145,6 +145,7 @@ ALLOWED_UNITS=(
     "recruiter-pipeline-alert@.service"
     "pipeline-api.service"
     "email-processor.service"
+    "streamlit-frontend.service"
 )
 for unit in "\${ALLOWED_UNITS[@]}"; do
     src="\$SRC_DIR/\$unit"
@@ -190,14 +191,17 @@ $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-schedul
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-manager
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed streamlit-frontend
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-manager
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart streamlit-frontend
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-manager
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active streamlit-frontend
 # Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
@@ -237,6 +241,7 @@ systemctl enable recruiter-scheduler
 systemctl enable recruiter-watchdog
 systemctl enable pipeline-api
 systemctl enable email-processor
+systemctl enable streamlit-frontend
 
 if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."
@@ -247,6 +252,9 @@ if [[ "$_START" == "--start" ]]; then
     systemctl start recruiter-watchdog
     echo "  Started recruiter-watchdog"
     sleep 3
+
+    systemctl start streamlit-frontend
+    echo "  Started streamlit-frontend"
 else
     echo "  Services NOT started (default — Redis AOF must be configured first)."
     echo "  To start immediately after install: sudo bash deploy/install-systemd.sh --start"
@@ -263,7 +271,7 @@ if [[ "$_START" != "--start" ]]; then
 else
     echo ""
     echo "► Service status:"
-    for svc in recruiter-scheduler recruiter-watchdog; do
+    for svc in recruiter-scheduler recruiter-watchdog streamlit-frontend; do
         status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
         pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
         echo "  $svc: $status (pid=$pid)"
