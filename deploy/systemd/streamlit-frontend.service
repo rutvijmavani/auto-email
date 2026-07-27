@@ -1,9 +1,8 @@
 [Unit]
-Description=Cloudflare Tunnel — Job Pipeline API + Streamlit Frontend
+Description=Job Pipeline Streamlit Frontend
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target pipeline-api.service streamlit-frontend.service
+After=network-online.target
 Wants=network-online.target
-Requires=pipeline-api.service streamlit-frontend.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
 
@@ -13,15 +12,25 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
-ExecStart=/home/opc/mail/venv/bin/python scripts/tunnel_manager.py
+ExecStart=/home/opc/mail/venv/bin/streamlit run frontend/Home.py \
+    --server.port 8501 \
+    --server.headless true \
+    --server.address 0.0.0.0 \
+    --server.enableCORS false
 Restart=always
 RestartSec=15s
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30s
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=no
+ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=cloudflare-tunnel
+SyslogIdentifier=streamlit-frontend
 
 [Install]
 WantedBy=multi-user.target

@@ -1238,6 +1238,116 @@ def init_db():
         WHERE email_status IS NOT NULL
     """)
 
+    # ── H1B sponsorship classification columns (2026-07-25) ──────────────────
+    # h1b_sponsor:    NULL=unchecked | TRUE=verified sponsor | FALSE=confirmed non-sponsor
+    # h1b_source:     'dol_lca' | 'manual' | 'negative_signal'
+    # h1b_confidence: 0.0–1.0 fuzzy-match quality from DOL name matching
+    for tbl in ("company_poll_stats", "prospective_companies"):
+        for col, defn in [
+            ("h1b_sponsor",    "BOOLEAN DEFAULT NULL"),
+            ("h1b_checked_at", "TIMESTAMPTZ DEFAULT NULL"),
+            ("h1b_source",     "TEXT DEFAULT NULL"),
+            ("h1b_confidence", "REAL DEFAULT NULL"),
+        ]:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} {defn}")
+
+    # ── DOL H-1B LCA discovery tables (2026-07-26) ───────────────────────────
+
+    # dol_h1b_employers: one row per employer FEIN.
+    # Aggregated across all processed quarterly files.
+    # approval_rate is recomputed on every upsert (total_certified / total_filed).
+    # top_job_titles is JSONB for display only — not used for SQL filtering.
+    # quarters_processed guards against double-counting a re-run file.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dol_h1b_employers (
+            employer_fein       TEXT PRIMARY KEY,
+            employer_name       TEXT NOT NULL,
+            employer_city       TEXT,
+            employer_state      TEXT,
+            naics_code          TEXT,
+            h1b_dependent       BOOLEAN,
+            willful_violator    BOOLEAN,
+
+            total_filed         INTEGER NOT NULL DEFAULT 0,
+            total_certified     INTEGER NOT NULL DEFAULT 0,
+            total_denied        INTEGER NOT NULL DEFAULT 0,
+            total_withdrawn     INTEGER NOT NULL DEFAULT 0,
+            total_positions     INTEGER NOT NULL DEFAULT 0,
+            certified_positions INTEGER NOT NULL DEFAULT 0,
+            approval_rate       REAL,
+
+            top_job_titles      JSONB,
+
+            quarters_processed  TEXT[]      NOT NULL DEFAULT '{}',
+            last_updated        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_state
+        ON dol_h1b_employers (employer_state)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_naics
+        ON dol_h1b_employers (naics_code)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_approval
+        ON dol_h1b_employers (approval_rate DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_certified
+        ON dol_h1b_employers (total_certified DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_h1b_dep
+        ON dol_h1b_employers (h1b_dependent)
+    """)
+
+    # dol_h1b_soc_breakdown: certified counts per employer per SOC code.
+    # Enables SQL filtering like "show employers with software role filings"
+    # without JSONB traversal.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dol_h1b_soc_breakdown (
+            employer_fein   TEXT    NOT NULL REFERENCES dol_h1b_employers(employer_fein) ON DELETE CASCADE,
+            soc_code        TEXT    NOT NULL,
+            soc_title       TEXT,
+            total_filed     INTEGER NOT NULL DEFAULT 0,
+            total_certified INTEGER NOT NULL DEFAULT 0,
+            total_positions INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (employer_fein, soc_code)
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_soc_code
+        ON dol_h1b_soc_breakdown (soc_code)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_soc_certified
+        ON dol_h1b_soc_breakdown (soc_code, total_certified DESC)
+    """)
+
+    # dol_h1b_yearly: year-over-year breakdown per employer.
+    # Year is derived from DECISION_DATE in the DOL file.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dol_h1b_yearly (
+            employer_fein   TEXT    NOT NULL REFERENCES dol_h1b_employers(employer_fein) ON DELETE CASCADE,
+            year            INTEGER NOT NULL,
+            filed           INTEGER NOT NULL DEFAULT 0,
+            certified       INTEGER NOT NULL DEFAULT 0,
+            denied          INTEGER NOT NULL DEFAULT 0,
+            withdrawn       INTEGER NOT NULL DEFAULT 0,
+            positions       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (employer_fein, year)
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_yearly_fein_year
+        ON dol_h1b_yearly (employer_fein, year)
+    """)
+
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
     _cleanup_closed_application_recruiters(c)
