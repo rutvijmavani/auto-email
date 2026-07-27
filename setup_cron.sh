@@ -389,6 +389,30 @@ echo "[CRON] enrichment finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CO
 exit $EXIT_CODE
 EOF
 
+# ── DOL LCA sync (monthly, 1st of month 6 AM) ─────────────────
+cat > "$PROJECT_DIR/run_sync_dol_lca.sh" << 'EOF'
+#!/bin/bash
+# run_sync_dol_lca.sh — Monthly DOL LCA sync: scrape, download, ingest
+# Runs at 6 AM on the 1st of every month (5 hours after the 1 AM pipeline chain).
+# Sends its own email notification — no pipeline.py involvement.
+PROJECT_DIR="/home/opc/mail"
+LOG_DIR="$PROJECT_DIR/logs"
+LOG_FILE="$LOG_DIR/sync_dol_lca_$(date +%Y-%m).log"
+
+cd "$PROJECT_DIR" || exit 1
+echo "" >> "$LOG_FILE"
+echo "══════════════════════════════════════════════" >> "$LOG_FILE"
+echo "[CRON] sync_dol_lca started at $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
+echo "══════════════════════════════════════════════" >> "$LOG_FILE"
+
+source venv/bin/activate
+python scripts/sync_dol_lca.py >> "$LOG_FILE" 2>&1
+EXIT_CODE=$?
+
+echo "[CRON] sync_dol_lca finished at $(date '+%Y-%m-%d %H:%M:%S') | exit=$EXIT_CODE" >> "$LOG_FILE"
+exit $EXIT_CODE
+EOF
+
 # ── Gmail watch renewal (daily 2 AM) ──────────────────────────
 cat > "$PROJECT_DIR/run_renew_watch.sh" << 'EOF'
 #!/bin/bash
@@ -450,7 +474,8 @@ chmod +x \
   "$PROJECT_DIR/run_weekly_summary.sh" \
   "$PROJECT_DIR/run_enrich.sh" \
   "$PROJECT_DIR/run_renew_watch.sh" \
-  "$PROJECT_DIR/run_verify_filled.sh"
+  "$PROJECT_DIR/run_verify_filled.sh" \
+  "$PROJECT_DIR/run_sync_dol_lca.sh"
 
 echo "[OK] All wrapper scripts created"
 
@@ -522,6 +547,15 @@ CRON_TZ=America/New_York
 # sync → backup → find-only → build-slugs → enrich → VACUUM → verify-filled
 # ─────────────────────────────────────────
 0 1 1 * * /home/opc/mail/run_monthly.sh
+
+# ─────────────────────────────────────────
+# DOL LCA SYNC — 1st of every month at 6 AM
+# Scrapes DOL page, downloads new quarterly Excel files, ingests into
+# dol_h1b_employers / dol_h1b_soc_breakdown / dol_h1b_yearly tables.
+# Sends its own email notification. Runs 5 hours after the monthly chain
+# so there is no overlap.
+# ─────────────────────────────────────────
+0 6 1 * * /home/opc/mail/run_sync_dol_lca.sh
 
 # ─────────────────────────────────────────
 # GMAIL WATCH RENEWAL — 2 AM daily
@@ -625,6 +659,7 @@ echo "  run_sync.sh            ← sync-forms + sync-prospective (9AM 12PM 3PM 6
 echo "  run_nightly.sh         ← sync→backup→find-only→verify-filled (Tue-Sun 1AM)"
 echo "  run_monday.sh          ← sync→backup→verify-only→find-only→verify-filled (Mon 1AM)"
 echo "  run_monthly.sh         ← sync→backup→find→slugs→enrich→VACUUM→verify-filled (1st 1AM)"
+echo "  run_sync_dol_lca.sh    ← DOL LCA quarterly scrape + ingest (1st 6AM)"
 echo "  run_outreach.sh        ← --outreach-only (Mon-Fri 9AM)"
 echo "  run_monitor.sh         ← --monitor-jobs (daily 7AM)"
 echo "  run_detect.sh          ← --detect-ats --batch (disabled — run manually)"
