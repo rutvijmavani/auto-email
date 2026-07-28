@@ -83,13 +83,36 @@ def _norm(name: str) -> str:
 # Load
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _detect_encoding(path: str) -> str:
+    """Sniff BOM to handle Tableau CSV exports (UTF-16 LE) and UTF-8-BOM files."""
+    with open(path, "rb") as f:
+        bom = f.read(4)
+    if bom[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return "utf-16"
+    if bom[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    return "utf-8"
+
+
+def _detect_sep(path: str, encoding: str) -> str:
+    """Sniff delimiter from the first line — Tableau TSVs are often saved as .csv."""
+    with open(path, encoding=encoding, errors="replace") as f:
+        first_line = f.readline()
+    tabs   = first_line.count("\t")
+    commas = first_line.count(",")
+    return "\t" if tabs > commas else ","
+
+
 def load_file(path: str) -> pd.DataFrame:
     log.info("Loading %s …", path)
     ext = os.path.splitext(path)[1].lower()
     if ext in (".xlsx", ".xls"):
         df = pd.read_excel(path, dtype=str)
     else:
-        df = pd.read_csv(path, dtype=str)
+        encoding = _detect_encoding(path)
+        sep      = _detect_sep(path, encoding)
+        log.info("Detected encoding=%s sep=%r", encoding, sep)
+        df = pd.read_csv(path, dtype=str, encoding=encoding, sep=sep)
 
     log.info("Raw shape: %d rows x %d columns", len(df), len(df.columns))
 
