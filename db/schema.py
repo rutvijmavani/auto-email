@@ -1402,6 +1402,8 @@ def init_db():
         )
     """)
 
+    c.execute("ALTER TABLE uscis_h1b_petitions ADD COLUMN IF NOT EXISTS employer_legal_norm TEXT NOT NULL DEFAULT ''")
+
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_petitions_year
         ON uscis_h1b_petitions (fiscal_year)
