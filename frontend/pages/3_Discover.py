@@ -144,34 +144,35 @@ def load_employer_soc(fein: str) -> pd.DataFrame:
 def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
     """
     Load USCIS H-1B petition rows for this employer, aggregated by fiscal year.
-    Join key: last 4 FEIN digits + normalized employer name (same transform as _norm()).
+    Join key: (employer_legal_norm = dol.employer_name_norm) OR (employer_name_norm = dol.trade_name_dba_norm),
+    constrained by last-4 FEIN. Handles both legal-name and brand-name USCIS entries.
     Returns one row per fiscal year; empty DataFrame if no match.
     """
     return _query("""
         SELECT
-            fiscal_year,
-            SUM(new_employment_approval)        AS new_employment_approval,
-            SUM(new_employment_denial)          AS new_employment_denial,
-            SUM(continuation_approval)          AS continuation_approval,
-            SUM(continuation_denial)            AS continuation_denial,
-            SUM(change_same_employer_approval)  AS change_same_employer_approval,
-            SUM(change_same_employer_denial)    AS change_same_employer_denial,
-            SUM(new_concurrent_approval)        AS new_concurrent_approval,
-            SUM(new_concurrent_denial)          AS new_concurrent_denial,
-            SUM(change_of_employer_approval)    AS change_of_employer_approval,
-            SUM(change_of_employer_denial)      AS change_of_employer_denial,
-            SUM(amended_approval)               AS amended_approval,
-            SUM(amended_denial)                 AS amended_denial
-        FROM uscis_h1b_petitions
-        WHERE tax_id = RIGHT(%s, 4)
-          AND employer_name_norm = TRIM(regexp_replace(
-                regexp_replace(
-                    regexp_replace(upper(%s), '&', ' AND ', 'g'),
-                    '[^A-Z0-9 ]', ' ', 'g'),
-                '\\s+', ' ', 'g'))
-        GROUP BY fiscal_year
-        ORDER BY fiscal_year
-    """, (fein, employer_name))
+            u.fiscal_year,
+            SUM(u.new_employment_approval)        AS new_employment_approval,
+            SUM(u.new_employment_denial)          AS new_employment_denial,
+            SUM(u.continuation_approval)          AS continuation_approval,
+            SUM(u.continuation_denial)            AS continuation_denial,
+            SUM(u.change_same_employer_approval)  AS change_same_employer_approval,
+            SUM(u.change_same_employer_denial)    AS change_same_employer_denial,
+            SUM(u.new_concurrent_approval)        AS new_concurrent_approval,
+            SUM(u.new_concurrent_denial)          AS new_concurrent_denial,
+            SUM(u.change_of_employer_approval)    AS change_of_employer_approval,
+            SUM(u.change_of_employer_denial)      AS change_of_employer_denial,
+            SUM(u.amended_approval)               AS amended_approval,
+            SUM(u.amended_denial)                 AS amended_denial
+        FROM uscis_h1b_petitions u
+        JOIN dol_h1b_employers d ON d.employer_fein = %s
+        WHERE u.tax_id = RIGHT(%s, 4)
+          AND (
+              u.employer_legal_norm = d.employer_name_norm
+           OR u.employer_name_norm  = d.trade_name_dba_norm
+          )
+        GROUP BY u.fiscal_year
+        ORDER BY u.fiscal_year
+    """, (fein, fein))
 
 
 def _pipeline_status(employer_name: str) -> str | None:

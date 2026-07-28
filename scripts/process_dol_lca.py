@@ -22,6 +22,7 @@ Design decisions (see docs/dol_h1b_pipeline.md):
 import argparse
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 
@@ -34,6 +35,43 @@ from logger import get_logger, init_logging
 log = get_logger(__name__)
 
 CERTIFIED_STATUSES = {"Certified", "Certified-Withdrawn"}
+
+_SPACED_LETTER_RE = re.compile(r"\b([A-Z])(?: ([A-Z]))+\b")
+_ABBREV_MAP = [
+    (re.compile(r"\bSVCS\b"),     "SERVICES"),
+    (re.compile(r"\bSRVCS\b"),    "SERVICES"),
+    (re.compile(r"\bTECHNOL\b"),  "TECHNOLOGIES"),
+    (re.compile(r"\bINTL\b"),     "INTERNATIONAL"),
+    (re.compile(r"\bMGMT\b"),     "MANAGEMENT"),
+    (re.compile(r"\bMGT\b"),      "MANAGEMENT"),
+    (re.compile(r"\bNATL\b"),     "NATIONAL"),
+    (re.compile(r"\bMFG\b"),      "MANUFACTURING"),
+    (re.compile(r"\bGRP\b"),      "GROUP"),
+    (re.compile(r"\bLTD\b"),      "LIMITED"),
+    (re.compile(r"\bPWC\b"),      "PRICEWATERHOUSECOOPERS"),
+]
+
+
+def _norm_name(name: str) -> str:
+    """Normalize a DOL employer name to the same form as USCIS employer_legal_norm.
+
+    Identical transform chain as process_uscis_h1b._legal_norm():
+      strip & and AND → strip punctuation → collapse whitespace →
+      collapse spaced letters (U S → US) → expand abbreviations (SVCS → SERVICES).
+    Applied to both employer_name and trade_name_dba so the USCIS join can use
+    stored columns instead of inline SQL normalization.
+    """
+    if not name or not name.strip():
+        return ""
+    name = name.upper()
+    name = re.sub(r"&", " ", name)
+    name = re.sub(r"\bAND\b", " ", name)
+    name = re.sub(r"[^A-Z0-9 ]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    name = _SPACED_LETTER_RE.sub(lambda m: m.group(0).replace(" ", ""), name)
+    for pat, repl in _ABBREV_MAP:
+        name = pat.sub(repl, name)
+    return re.sub(r"\s+", " ", name).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,8 +130,12 @@ def aggregate(df: pd.DataFrame) -> dict:
         employer_state = group.get("EMPLOYER_STATE", pd.Series()).iloc[-1] if "EMPLOYER_STATE" in group else None
         employer_city  = group.get("EMPLOYER_CITY",  pd.Series()).iloc[-1] if "EMPLOYER_CITY"  in group else None
         naics_code     = group.get("NAICS_CODE",     pd.Series()).iloc[-1] if "NAICS_CODE"     in group else None
+        trade_name_dba = _str_or_none(group["TRADE_NAME_DBA"].iloc[-1] if "TRADE_NAME_DBA" in group else None)
         h1b_dependent  = _parse_bool(group.get("H-1B_DEPENDENT",  pd.Series()).iloc[-1] if "H-1B_DEPENDENT"  in group else None)
         willful_viol   = _parse_bool(group.get("WILLFUL_VIOLATOR", pd.Series()).iloc[-1] if "WILLFUL_VIOLATOR" in group else None)
+
+        employer_name_norm  = _norm_name(employer_name)
+        trade_name_dba_norm = _norm_name(trade_name_dba) if trade_name_dba else None
 
         total_filed     = len(group)
         total_certified = int(group["_certified"].sum())
@@ -143,9 +185,12 @@ def aggregate(df: pd.DataFrame) -> dict:
             "employer": {
                 "employer_fein":       fein,
                 "employer_name":       employer_name,
+                "employer_name_norm":  employer_name_norm,
                 "employer_state":      _str_or_none(employer_state),
                 "employer_city":       _str_or_none(employer_city),
                 "naics_code":          _str_or_none(naics_code),
+                "trade_name_dba":      trade_name_dba,
+                "trade_name_dba_norm": trade_name_dba_norm,
                 "h1b_dependent":       h1b_dependent,
                 "willful_violator":    willful_viol,
                 "total_filed":         total_filed,
@@ -230,21 +275,26 @@ def upsert(aggregated: dict, quarter: str) -> None:
 
             conn.execute("""
                 INSERT INTO dol_h1b_employers (
-                    employer_fein, employer_name, employer_city, employer_state,
-                    naics_code, h1b_dependent, willful_violator,
+                    employer_fein, employer_name, employer_name_norm,
+                    employer_city, employer_state,
+                    naics_code, trade_name_dba, trade_name_dba_norm,
+                    h1b_dependent, willful_violator,
                     total_filed, total_certified, total_denied, total_withdrawn,
                     total_positions, certified_positions, approval_rate,
                     top_job_titles, quarters_processed, last_updated
                 ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
                     %s, ARRAY[%s]::TEXT[], NOW()
                 )
                 ON CONFLICT (employer_fein) DO UPDATE SET
                     employer_name       = EXCLUDED.employer_name,
+                    employer_name_norm  = EXCLUDED.employer_name_norm,
                     employer_city       = EXCLUDED.employer_city,
                     employer_state      = EXCLUDED.employer_state,
                     naics_code          = EXCLUDED.naics_code,
+                    trade_name_dba      = EXCLUDED.trade_name_dba,
+                    trade_name_dba_norm = EXCLUDED.trade_name_dba_norm,
                     h1b_dependent       = EXCLUDED.h1b_dependent,
                     willful_violator    = EXCLUDED.willful_violator,
                     total_filed         = dol_h1b_employers.total_filed         + EXCLUDED.total_filed,
@@ -263,8 +313,10 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     quarters_processed  = dol_h1b_employers.quarters_processed || EXCLUDED.quarters_processed,
                     last_updated        = NOW()
             """, (
-                fein, e["employer_name"], e["employer_city"], e["employer_state"],
-                e["naics_code"], e["h1b_dependent"], e["willful_violator"],
+                fein, e["employer_name"], e["employer_name_norm"],
+                e["employer_city"], e["employer_state"],
+                e["naics_code"], e["trade_name_dba"], e["trade_name_dba_norm"],
+                e["h1b_dependent"], e["willful_violator"],
                 e["total_filed"], e["total_certified"], e["total_denied"], e["total_withdrawn"],
                 e["total_positions"], e["certified_positions"], approval_rate,
                 json.dumps(merged_titles), quarter,
