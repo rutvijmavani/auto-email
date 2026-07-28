@@ -239,9 +239,9 @@ def populate_unmatched() -> None:
                  u.change_of_employer_approval  + u.amended_approval) AS total_approvals
             FROM uscis_h1b_petitions u
             LEFT JOIN dol_h1b_employers d
-              ON u.employer_name_norm = regexp_replace(
+              ON u.employer_name_norm = TRIM(regexp_replace(
                      regexp_replace(upper(d.employer_name), '[^A-Z0-9 ]', ' ', 'g'),
-                     '\\s+', ' ', 'g')
+                     '\\s+', ' ', 'g'))
              AND right(d.employer_fein, 4) = u.tax_id
             WHERE d.employer_fein IS NULL
             ORDER BY total_approvals DESC
