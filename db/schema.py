@@ -1351,8 +1351,8 @@ def init_db():
     # ── USCIS H-1B petition tables (2026-07-28) ──────────────────────────────
 
     # uscis_h1b_petitions: one row per (employer, tax_id, fiscal_year, naics, city, zip).
-    # Sourced from USCIS H-1B Employer Data Hub (FY2024–FY2026 downloaded via Tableau).
-    # employer_name_norm: punctuation replaced with space + uppercased — used to join
+    # Sourced from USCIS H-1B Employer Data Hub (FY2024-FY2026 downloaded via Tableau).
+    # employer_name_norm: punctuation replaced with space + uppercased -- used to join
     # against dol_h1b_employers via normalized name + last 4 FEIN.
     c.execute("""
         CREATE TABLE IF NOT EXISTS uscis_h1b_petitions (
@@ -1393,6 +1393,28 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_petitions_state
         ON uscis_h1b_petitions (state)
+    """)
+
+    # uscis_dol_unmatched: diagnostic table — USCIS rows with no DOL LCA match.
+    # Populated (TRUNCATE + INSERT) by process_uscis_h1b.py after every ingest.
+    # Ideally 0 rows; any row means the composite join key (norm_name + tax_id)
+    # failed for that employer. Sorted by total_approvals DESC for triage priority.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS uscis_dol_unmatched (
+            id                  BIGSERIAL PRIMARY KEY,
+            employer_name       TEXT    NOT NULL,
+            employer_name_norm  TEXT    NOT NULL,
+            tax_id              TEXT    NOT NULL,
+            fiscal_year         INTEGER NOT NULL,
+            state               TEXT,
+            total_approvals     INTEGER NOT NULL DEFAULT 0,
+            refreshed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uscis_unmatched_approvals
+        ON uscis_dol_unmatched (total_approvals DESC)
     """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────

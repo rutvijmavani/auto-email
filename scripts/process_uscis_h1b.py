@@ -6,7 +6,7 @@ each row into uscis_h1b_petitions.  One DB row per unique combination of
 (employer_name, tax_id, fiscal_year, naics_code, city, zip) — exactly the
 granularity published by USCIS.
 
-Source: USCIS H-1B Employer Data Hub (FY2024–FY2026).
+Source: USCIS H-1B Employer Data Hub (FY2024-FY2026).
   Data for these years is only available via the Tableau embed on:
   https://www.uscis.gov/tools/reports-and-studies/h-1b-employer-data-hub
   Download manually: "Crosstab View" → filter year → "Download to Excel" → CSV.
@@ -91,7 +91,7 @@ def load_file(path: str) -> pd.DataFrame:
     else:
         df = pd.read_csv(path, dtype=str)
 
-    log.info("Raw shape: %d rows × %d columns", len(df), len(df.columns))
+    log.info("Raw shape: %d rows x %d columns", len(df), len(df.columns))
 
     # Strip leading/trailing whitespace from column headers
     df.columns = [c.strip() for c in df.columns]
@@ -118,9 +118,23 @@ def load_file(path: str) -> pd.DataFrame:
     if dropped:
         log.warning("Dropped %d rows with blank employer_name or tax_id", dropped)
 
-    # Coerce integer columns (blank → 0)
+    # Coerce integer columns; blank petition counts default to 0
     for col in _INT_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    # Reject rows where fiscal_year resolved to 0 (was blank or non-numeric)
+    before = len(df)
+    df = df[df["fiscal_year"] > 0]
+    invalid_fy = before - len(df)
+    if invalid_fy:
+        log.warning("Dropped %d rows with invalid fiscal_year (blank or non-numeric)", invalid_fy)
+
+    # Reject rows with any negative petition count (data corruption indicator)
+    _count_cols = [c for c in _INT_COLS if c != "fiscal_year"]
+    neg_mask = (df[_count_cols] < 0).any(axis=1)
+    if neg_mask.any():
+        log.warning("Dropped %d rows with negative petition counts", int(neg_mask.sum()))
+        df = df[~neg_mask]
 
     # Derive normalized name
     df["employer_name_norm"] = df["employer_name"].apply(_norm)
@@ -138,9 +152,12 @@ def load_file(path: str) -> pd.DataFrame:
 def upsert(df: pd.DataFrame) -> None:
     conn = get_conn()
     try:
-        inserted = updated = 0
+        processed = 0
         for row in df.itertuples(index=False):
-            result = conn.execute("""
+            # naics_code, city, zip are part of the unique key — use empty string
+            # instead of NULL so PostgreSQL equality comparisons work on re-runs.
+            # (NULL != NULL in PG; two rows with NULL naics_code would not conflict.)
+            conn.execute("""
                 INSERT INTO uscis_h1b_petitions (
                     employer_name, employer_name_norm, tax_id, fiscal_year,
                     naics_code, city, state, zip,
@@ -177,8 +194,8 @@ def upsert(df: pd.DataFrame) -> None:
                     ingested_at                     = NOW()
             """, (
                 row.employer_name, row.employer_name_norm, row.tax_id, row.fiscal_year,
-                _str_or_none(row.naics_code), _str_or_none(row.city),
-                _str_or_none(row.state),      _str_or_none(row.zip),
+                _str_or_empty(row.naics_code), _str_or_empty(row.city),
+                _str_or_none(row.state),       _str_or_empty(row.zip),
                 row.new_employment_approval,       row.new_employment_denial,
                 row.continuation_approval,         row.continuation_denial,
                 row.change_same_employer_approval, row.change_same_employer_denial,
@@ -186,13 +203,55 @@ def upsert(df: pd.DataFrame) -> None:
                 row.change_of_employer_approval,   row.change_of_employer_denial,
                 row.amended_approval,              row.amended_denial,
             ))
-            if result.rowcount == 1:
-                inserted += 1
-            else:
-                updated += 1
+            processed += 1
 
         conn.commit()
-        log.info("Done: %d inserted, %d updated", inserted, updated)
+        log.info("Done: %d rows processed", processed)
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unmatched diagnostics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def populate_unmatched() -> None:
+    """
+    Refresh uscis_dol_unmatched with every USCIS petition row that has no
+    matching row in dol_h1b_employers (normalized name + last 4 FEIN join).
+    TRUNCATE + INSERT so the table always reflects the current DB state.
+    Ideally 0 rows — any row is a join key anomaly to investigate.
+    """
+    conn = get_conn()
+    try:
+        conn.execute("TRUNCATE TABLE uscis_dol_unmatched")
+        result = conn.execute("""
+            INSERT INTO uscis_dol_unmatched
+                (employer_name, employer_name_norm, tax_id, fiscal_year, state, total_approvals)
+            SELECT
+                u.employer_name,
+                u.employer_name_norm,
+                u.tax_id,
+                u.fiscal_year,
+                u.state,
+                (u.new_employment_approval + u.continuation_approval +
+                 u.change_same_employer_approval + u.new_concurrent_approval +
+                 u.change_of_employer_approval  + u.amended_approval) AS total_approvals
+            FROM uscis_h1b_petitions u
+            LEFT JOIN dol_h1b_employers d
+              ON u.employer_name_norm = regexp_replace(
+                     regexp_replace(upper(d.employer_name), '[^A-Z0-9 ]', ' ', 'g'),
+                     '\\s+', ' ', 'g')
+             AND right(d.employer_fein, 4) = u.tax_id
+            WHERE d.employer_fein IS NULL
+            ORDER BY total_approvals DESC
+        """)
+        count = result.rowcount
+        conn.commit()
+        if count == 0:
+            log.info("Unmatched check: 0 rows — composite key matched all USCIS employers")
+        else:
+            log.warning("Unmatched check: %d rows written to uscis_dol_unmatched — investigate join key", count)
     finally:
         conn.close()
 
@@ -202,6 +261,16 @@ def _str_or_none(val) -> str | None:
         return None
     s = str(val).strip()
     return s if s and s.lower() not in ("nan", "none") else None
+
+
+def _str_or_empty(val) -> str:
+    """Like _str_or_none but returns '' for missing/null values.
+    Used for unique-key columns (naics_code, city, zip) so NULL != NULL
+    in PostgreSQL does not prevent ON CONFLICT from matching on re-runs."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    return s if s and s.lower() not in ("nan", "none") else ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +288,7 @@ def main():
 
     df = load_file(args.file)
     upsert(df)
+    populate_unmatched()
 
 
 if __name__ == "__main__":
