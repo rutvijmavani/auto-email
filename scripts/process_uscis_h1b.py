@@ -75,8 +75,10 @@ _INT_COLS = [
 
 
 def _norm(name: str) -> str:
-    """Normalize employer name for DOL join: uppercase, punctuation → space, collapse whitespace."""
-    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", name.upper())).strip()
+    """Normalize employer name for DOL join: uppercase, & → AND, punctuation → space, collapse whitespace."""
+    name = name.upper()
+    name = re.sub(r"&", " AND ", name)  # USCIS spells "AND"; DOL LCA uses ampersand
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", name)).strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,7 +265,9 @@ def populate_unmatched() -> None:
             FROM uscis_h1b_petitions u
             LEFT JOIN dol_h1b_employers d
               ON u.employer_name_norm = TRIM(regexp_replace(
-                     regexp_replace(upper(d.employer_name), '[^A-Z0-9 ]', ' ', 'g'),
+                     regexp_replace(
+                         regexp_replace(upper(d.employer_name), '&', ' AND ', 'g'),
+                         '[^A-Z0-9 ]', ' ', 'g'),
                      '\\s+', ' ', 'g'))
              AND right(d.employer_fein, 4) = u.tax_id
             WHERE d.employer_fein IS NULL
@@ -302,8 +306,19 @@ def _str_or_empty(val) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Ingest a USCIS H-1B Employer Data Hub CSV/Excel file")
-    parser.add_argument("--file", required=True, help="Path to the downloaded CSV or Excel file")
+    parser.add_argument("--file", help="Path to the downloaded CSV or Excel file")
+    parser.add_argument(
+        "--refresh-unmatched", action="store_true",
+        help="Skip ingest — only rebuild uscis_dol_unmatched from current DB state",
+    )
     args = parser.parse_args()
+
+    if args.refresh_unmatched:
+        populate_unmatched()
+        return
+
+    if not args.file:
+        parser.error("--file is required unless --refresh-unmatched is set")
 
     if not os.path.exists(args.file):
         log.error("File not found: %s", args.file)

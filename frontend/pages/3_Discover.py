@@ -165,7 +165,9 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
         FROM uscis_h1b_petitions
         WHERE tax_id = RIGHT(%s, 4)
           AND employer_name_norm = TRIM(regexp_replace(
-                regexp_replace(upper(%s), '[^A-Z0-9 ]', ' ', 'g'),
+                regexp_replace(
+                    regexp_replace(upper(%s), '&', ' AND ', 'g'),
+                    '[^A-Z0-9 ]', ' ', 'g'),
                 '\\s+', ' ', 'g'))
         GROUP BY fiscal_year
         ORDER BY fiscal_year
