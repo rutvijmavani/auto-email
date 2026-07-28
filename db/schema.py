@@ -1258,13 +1258,19 @@ def init_db():
     # approval_rate is recomputed on every upsert (total_certified / total_filed).
     # top_job_titles is JSONB for display only — not used for SQL filtering.
     # quarters_processed guards against double-counting a re-run file.
+    # employer_name_norm:  normalized legal name — used for USCIS join (legal name match).
+    # trade_name_dba:      raw DBA/trade name from DOL LCA TRADE_NAME_DBA field.
+    # trade_name_dba_norm: normalized DBA name — used for USCIS join (brand name match).
     c.execute("""
         CREATE TABLE IF NOT EXISTS dol_h1b_employers (
             employer_fein       TEXT PRIMARY KEY,
             employer_name       TEXT NOT NULL,
+            employer_name_norm  TEXT,
             employer_city       TEXT,
             employer_state      TEXT,
             naics_code          TEXT,
+            trade_name_dba      TEXT,
+            trade_name_dba_norm TEXT,
             h1b_dependent       BOOLEAN,
             willful_violator    BOOLEAN,
 
@@ -1282,7 +1288,18 @@ def init_db():
             last_updated        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS employer_name_norm TEXT")
+    c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS trade_name_dba TEXT")
+    c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS trade_name_dba_norm TEXT")
 
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_name_norm
+        ON dol_h1b_employers (employer_name_norm)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_dol_emp_dba_norm
+        ON dol_h1b_employers (trade_name_dba_norm)
+    """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_dol_emp_state
         ON dol_h1b_employers (employer_state)
@@ -1352,13 +1369,16 @@ def init_db():
 
     # uscis_h1b_petitions: one row per (employer, tax_id, fiscal_year, naics, city, zip).
     # Sourced from USCIS H-1B Employer Data Hub (FY2024-FY2026 downloaded via Tableau).
-    # employer_name_norm: punctuation replaced with space + uppercased -- used to join
-    # against dol_h1b_employers via normalized name + last 4 FEIN.
+    # employer_name_norm:  full normalized name (uppercase, & → AND, punctuation → space).
+    # employer_legal_norm: same but D/B/A suffix stripped — used for DOL join.
+    #   "FIDELITY TECHNOLOGY GROUP LLC D B A FIDELITY INVESTMENTS" → "FIDELITY TECHNOLOGY GROUP LLC"
+    #   For non-DBA names employer_legal_norm == employer_name_norm.
     c.execute("""
         CREATE TABLE IF NOT EXISTS uscis_h1b_petitions (
             id                              BIGSERIAL PRIMARY KEY,
             employer_name                   TEXT    NOT NULL,
             employer_name_norm              TEXT    NOT NULL,
+            employer_legal_norm             TEXT    NOT NULL DEFAULT '',
             tax_id                          TEXT    NOT NULL,
             fiscal_year                     INTEGER NOT NULL,
             naics_code                      TEXT,
@@ -1389,6 +1409,10 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_petitions_norm_taxid
         ON uscis_h1b_petitions (employer_name_norm, tax_id)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uscis_petitions_legal_norm_taxid
+        ON uscis_h1b_petitions (employer_legal_norm, tax_id)
     """)
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_petitions_state

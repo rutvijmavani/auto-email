@@ -75,10 +75,59 @@ _INT_COLS = [
 
 
 def _norm(name: str) -> str:
-    """Normalize employer name for DOL join: uppercase, & → AND, punctuation → space, collapse whitespace."""
+    """Normalize employer name: uppercase, strip & and AND, punctuation → space, collapse whitespace."""
     name = name.upper()
-    name = re.sub(r"&", " AND ", name)  # USCIS spells "AND"; DOL LCA uses ampersand
+    name = re.sub(r"&", " ", name)
+    name = re.sub(r"\bAND\b", " ", name)
     return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", name)).strip()
+
+
+_SPACED_LETTER_RE = re.compile(r"\b([A-Z])(?: ([A-Z]))+\b")
+
+
+def _collapse_spaced_letters(name: str) -> str:
+    """Collapse sequences of space-separated single uppercase letters: 'U S' → 'US', 'L L C' → 'LLC'."""
+    return _SPACED_LETTER_RE.sub(lambda m: m.group(0).replace(" ", ""), name)
+
+
+_ABBREV_MAP = [
+    (re.compile(r"\bSVCS\b"),     "SERVICES"),
+    (re.compile(r"\bSRVCS\b"),    "SERVICES"),
+    (re.compile(r"\bTECHNOL\b"),  "TECHNOLOGIES"),
+    (re.compile(r"\bINTL\b"),     "INTERNATIONAL"),
+    (re.compile(r"\bMGMT\b"),     "MANAGEMENT"),
+    (re.compile(r"\bMGT\b"),      "MANAGEMENT"),
+    (re.compile(r"\bNATL\b"),     "NATIONAL"),
+    (re.compile(r"\bMFG\b"),      "MANUFACTURING"),
+    (re.compile(r"\bGRP\b"),      "GROUP"),
+    (re.compile(r"\bLTD\b"),      "LIMITED"),
+    (re.compile(r"\bPWC\b"),      "PRICEWATERHOUSECOOPERS"),
+]
+
+
+def _expand_abbrevs(name: str) -> str:
+    """Expand common H-1B abbreviations to canonical full-word forms."""
+    for pattern, replacement in _ABBREV_MAP:
+        name = pattern.sub(replacement, name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _legal_norm(name: str) -> str:
+    """Normalize for DOL join: strip DBA suffix, collapse spaced letters, expand abbreviations.
+
+    "FIDELITY TECHNOLOGY GROUP LLC D B A FIDELITY INVESTMENTS"
+        → "FIDELITY TECHNOLOGY GROUP LLC"
+    "TATA CONSULTANCY SVCS LTD" → "TATA CONSULTANCY SERVICES LIMITED"
+    "ERNST AND YOUNG U S LLP" → "ERNST YOUNG US LLP"
+    """
+    normed = _norm(name)
+    # Detect DBA before collapsing — _collapse_spaced_letters would turn 'D B A' → 'DBA'
+    dba_pos = normed.find(" D B A ")
+    if dba_pos != -1:
+        normed = normed[:dba_pos]
+    normed = _collapse_spaced_letters(normed)
+    normed = _expand_abbrevs(normed)
+    return normed.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,8 +192,11 @@ def load_file(path: str) -> pd.DataFrame:
     if dropped:
         log.warning("Dropped %d rows with blank employer_name or tax_id", dropped)
 
-    # Coerce integer columns; blank petition counts default to 0
+    # Coerce integer columns; blank petition counts default to 0.
+    # Strip thousands-separator commas first ("1,447" → "1447") — USCIS CSV uses
+    # comma formatting for large numbers which pd.to_numeric cannot parse as-is.
     for col in _INT_COLS:
+        df[col] = df[col].str.replace(",", "", regex=False)
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     # Reject rows where fiscal_year resolved to 0 (was blank or non-numeric)
@@ -161,8 +213,13 @@ def load_file(path: str) -> pd.DataFrame:
         log.warning("Dropped %d rows with negative petition counts", int(neg_mask.sum()))
         df = df[~neg_mask]
 
-    # Derive normalized name
-    df["employer_name_norm"] = df["employer_name"].apply(_norm)
+    # Derive normalized names.
+    # employer_name_norm:  full name after norm + collapse + expand (no DBA strip) — used for DBA brand match.
+    # employer_legal_norm: legal name only (DBA stripped) + collapse + expand — used for DOL legal name match.
+    df["employer_name_norm"]  = df["employer_name"].apply(
+        lambda n: _expand_abbrevs(_collapse_spaced_letters(_norm(n)))
+    )
+    df["employer_legal_norm"] = df["employer_name"].apply(_legal_norm)
 
     log.info("Loaded %d rows after filtering", len(df))
     years = sorted(df["fiscal_year"].unique())
@@ -184,7 +241,7 @@ def upsert(df: pd.DataFrame) -> None:
             # (NULL != NULL in PG; two rows with NULL naics_code would not conflict.)
             conn.execute("""
                 INSERT INTO uscis_h1b_petitions (
-                    employer_name, employer_name_norm, tax_id, fiscal_year,
+                    employer_name, employer_name_norm, employer_legal_norm, tax_id, fiscal_year,
                     naics_code, city, state, zip,
                     new_employment_approval,        new_employment_denial,
                     continuation_approval,          continuation_denial,
@@ -194,7 +251,7 @@ def upsert(df: pd.DataFrame) -> None:
                     amended_approval,               amended_denial,
                     ingested_at
                 ) VALUES (
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
@@ -204,6 +261,7 @@ def upsert(df: pd.DataFrame) -> None:
                 ON CONFLICT (employer_name, tax_id, fiscal_year, naics_code, city, zip)
                 DO UPDATE SET
                     employer_name_norm              = EXCLUDED.employer_name_norm,
+                    employer_legal_norm             = EXCLUDED.employer_legal_norm,
                     new_employment_approval         = EXCLUDED.new_employment_approval,
                     new_employment_denial           = EXCLUDED.new_employment_denial,
                     continuation_approval           = EXCLUDED.continuation_approval,
@@ -218,7 +276,7 @@ def upsert(df: pd.DataFrame) -> None:
                     amended_denial                  = EXCLUDED.amended_denial,
                     ingested_at                     = NOW()
             """, (
-                row.employer_name, row.employer_name_norm, row.tax_id, row.fiscal_year,
+                row.employer_name, row.employer_name_norm, row.employer_legal_norm, row.tax_id, row.fiscal_year,
                 _str_or_empty(row.naics_code), _str_or_empty(row.city),
                 _str_or_none(row.state),       _str_or_empty(row.zip),
                 row.new_employment_approval,       row.new_employment_denial,
@@ -264,11 +322,10 @@ def populate_unmatched() -> None:
                  u.change_of_employer_approval  + u.amended_approval) AS total_approvals
             FROM uscis_h1b_petitions u
             LEFT JOIN dol_h1b_employers d
-              ON u.employer_name_norm = TRIM(regexp_replace(
-                     regexp_replace(
-                         regexp_replace(upper(d.employer_name), '&', ' AND ', 'g'),
-                         '[^A-Z0-9 ]', ' ', 'g'),
-                     '\\s+', ' ', 'g'))
+              ON (
+                  u.employer_legal_norm = d.employer_name_norm
+               OR u.employer_name_norm  = d.trade_name_dba_norm
+              )
              AND right(d.employer_fein, 4) = u.tax_id
             WHERE d.employer_fein IS NULL
             ORDER BY total_approvals DESC
