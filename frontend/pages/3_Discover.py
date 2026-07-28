@@ -140,6 +140,38 @@ def load_employer_soc(fein: str) -> pd.DataFrame:
     )
 
 
+@st.cache_data(ttl=300)
+def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
+    """
+    Load USCIS H-1B petition rows for this employer, aggregated by fiscal year.
+    Join key: last 4 FEIN digits + normalized employer name (same transform as _norm()).
+    Returns one row per fiscal year; empty DataFrame if no match.
+    """
+    return _query("""
+        SELECT
+            fiscal_year,
+            SUM(new_employment_approval)        AS new_employment_approval,
+            SUM(new_employment_denial)          AS new_employment_denial,
+            SUM(continuation_approval)          AS continuation_approval,
+            SUM(continuation_denial)            AS continuation_denial,
+            SUM(change_same_employer_approval)  AS change_same_employer_approval,
+            SUM(change_same_employer_denial)    AS change_same_employer_denial,
+            SUM(new_concurrent_approval)        AS new_concurrent_approval,
+            SUM(new_concurrent_denial)          AS new_concurrent_denial,
+            SUM(change_of_employer_approval)    AS change_of_employer_approval,
+            SUM(change_of_employer_denial)      AS change_of_employer_denial,
+            SUM(amended_approval)               AS amended_approval,
+            SUM(amended_denial)                 AS amended_denial
+        FROM uscis_h1b_petitions
+        WHERE tax_id = RIGHT(%s, 4)
+          AND employer_name_norm = TRIM(regexp_replace(
+                regexp_replace(upper(%s), '[^A-Z0-9 ]', ' ', 'g'),
+                '\\s+', ' ', 'g'))
+        GROUP BY fiscal_year
+        ORDER BY fiscal_year
+    """, (fein, employer_name))
+
+
 def _pipeline_status(employer_name: str) -> str | None:
     """Return existing pipeline status string, or None if not in pipeline."""
     conn = get_conn()
@@ -393,3 +425,76 @@ with col_titles:
             st.info("No job title data available.")
     else:
         st.info("No job title data available.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USCIS petition panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.divider()
+st.markdown("#### USCIS H-1B Petitions (FY2024-FY2026)")
+
+uscis = load_uscis_petitions(fein, name)
+
+if uscis.empty:
+    st.info("No USCIS petition data found for this employer. Ingest FY2024-FY2026 files via `process_uscis_h1b.py` to populate.")
+else:
+    _approval_cols = [
+        "new_employment_approval", "continuation_approval",
+        "change_same_employer_approval", "new_concurrent_approval",
+        "change_of_employer_approval", "amended_approval",
+    ]
+    _denial_cols = [
+        "new_employment_denial", "continuation_denial",
+        "change_same_employer_denial", "new_concurrent_denial",
+        "change_of_employer_denial", "amended_denial",
+    ]
+
+    new_sponsorships = int((uscis["new_employment_approval"] + uscis["change_of_employer_approval"]).sum())
+    total_approvals  = int(uscis[_approval_cols].sum().sum())
+    total_denials    = int(uscis[_denial_cols].sum().sum())
+    total_petitions  = total_approvals + total_denials
+    uscis_rate       = f"{total_approvals / total_petitions * 100:.1f}%" if total_petitions > 0 else "—"
+
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric(
+        "New sponsorships",
+        f"{new_sponsorships:,}",
+        help="New Employment + Change of Employer approvals — workers actively brought in on H1B",
+    )
+    u2.metric("Total approvals", f"{total_approvals:,}")
+    u3.metric("Total petitions", f"{total_petitions:,}")
+    u4.metric("USCIS approval rate", uscis_rate)
+
+    # Stacked bar: group into 4 meaningful buckets per fiscal year
+    chart_data = uscis.set_index("fiscal_year").assign(
+        **{
+            "Active sponsorship":  lambda d: d["new_employment_approval"] + d["change_of_employer_approval"],
+            "Continuations":       lambda d: d["continuation_approval"],
+            "Other approvals":     lambda d: d["new_concurrent_approval"] + d["change_same_employer_approval"] + d["amended_approval"],
+            "Denials":             lambda d: d[_denial_cols].sum(axis=1),
+        }
+    )[["Active sponsorship", "Continuations", "Other approvals", "Denials"]]
+
+    st.bar_chart(chart_data, color=["#2196F3", "#4CAF50", "#9E9E9E", "#F44336"])
+    st.caption(
+        "Active sponsorship = New Employment + Change of Employer approvals  ·  "
+        "Continuations = renewals of existing H1B workers"
+    )
+
+    with st.expander("Full petition breakdown by year"):
+        breakdown = uscis.set_index("fiscal_year").rename(columns={
+            "new_employment_approval":       "New Emp ✓",
+            "new_employment_denial":         "New Emp ✗",
+            "continuation_approval":         "Continuation ✓",
+            "continuation_denial":           "Continuation ✗",
+            "change_same_employer_approval": "Same Emp Chg ✓",
+            "change_same_employer_denial":   "Same Emp Chg ✗",
+            "new_concurrent_approval":       "Concurrent ✓",
+            "new_concurrent_denial":         "Concurrent ✗",
+            "change_of_employer_approval":   "Chg Employer ✓",
+            "change_of_employer_denial":     "Chg Employer ✗",
+            "amended_approval":              "Amended ✓",
+            "amended_denial":                "Amended ✗",
+        })
+        st.dataframe(breakdown, use_container_width=True)
