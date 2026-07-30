@@ -99,7 +99,7 @@ def fetch_hackertarget(domain: str) -> list[str]:
             if parts:
                 subdomains.append(parts[0].strip().lower())
         return subdomains
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
         print(f"    [hackertarget] Error: {exc}")
         return []
 
@@ -274,7 +274,7 @@ def fetch_wayback(
                     urls.append(url)
         return urls
 
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
         print(f"    [wayback] Error for {url_pattern!r}: {exc}")
         return []
 
@@ -299,7 +299,10 @@ def enumerate_wayback(platforms: list[str]) -> dict[str, set[str]]:
                 else [(cfg.get("from_date"), None)]
             )
 
-            for from_date, to_date in chunks:
+            new_slugs: set[str] = set()
+            for i, (from_date, to_date) in enumerate(chunks):
+                if i > 0:
+                    time.sleep(1)  # polite delay between CDX chunk requests
                 label = f"{url_pattern}  [{from_date[:4] if from_date else 'all'}]"
                 print(f"    CDX: {label}")
                 t0 = time.time()
@@ -312,35 +315,34 @@ def enumerate_wayback(platforms: list[str]) -> dict[str, set[str]]:
                 elapsed = time.time() - t0
                 print(f"    got {len(urls):,} unique URLs in {elapsed:.1f}s")
 
-            new_slugs: set[str] = set()
-            for url in urls:
-                # Subdomain-based ATS: extract from hostname
-                if cfg.get("subdomain_re"):
-                    m = cfg["subdomain_re"].search(url)
-                    if not m:
-                        continue
-                    slug = cfg["slug_fn"](m)
-                else:
-                    # Path-based ATS: extract from URL path
-                    m = cfg["slug_re"].search(url)
-                    if not m:
-                        continue
-                    slug = m.group(1).lower().rstrip("/")
+                for url in urls:
+                    # Subdomain-based ATS: extract from hostname
+                    if cfg.get("subdomain_re"):
+                        m = cfg["subdomain_re"].search(url)
+                        if not m:
+                            continue
+                        slug = cfg["slug_fn"](m)
+                    else:
+                        # Path-based ATS: extract from URL path
+                        m = cfg["slug_re"].search(url)
+                        if not m:
+                            continue
+                        slug = m.group(1).lower().rstrip("/")
 
-                # Strip URL-encoding artifacts: "2fbloomberg" → "bloomberg" (2f = encoded /)
-                slug = re.sub(r"^[0-9a-f]{2}(?=[a-z])", "", slug)
-                # Strip numeric job-ID prefixes: "21941517-manulife" → "manulife"
-                slug = re.sub(r"^\d+[-_]", "", slug)
+                    # Strip URL-encoding artifacts: "2fbloomberg" → "bloomberg" (2f = encoded /)
+                    slug = re.sub(r"^[0-9a-f]{2}(?=[a-z])", "", slug)
+                    # Strip numeric job-ID prefixes: "21941517-manulife" → "manulife"
+                    slug = re.sub(r"^\d+[-_]", "", slug)
 
-                if (
-                    slug
-                    and slug not in _EXCLUDED
-                    and len(slug) >= 2
-                    and not slug.isdigit()
-                    and not slug.startswith(".")
-                    and re.match(r"^[a-z0-9][a-z0-9\-]*$", slug)
-                ):
-                    new_slugs.add(slug)
+                    if (
+                        slug
+                        and slug not in _EXCLUDED
+                        and len(slug) >= 2
+                        and not slug.isdigit()
+                        and not slug.startswith(".")
+                        and re.match(r"^[a-z0-9][a-z0-9\-]*$", slug)
+                    ):
+                        new_slugs.add(slug)
 
             added = new_slugs - slugs
             slugs.update(new_slugs)
@@ -397,7 +399,7 @@ def main():
         )
         platforms = [p for p in platforms if p in HACKERTARGET_PLATFORMS]
         if platforms:
-            print(f"\nSOURCE 1: hackertarget.com subdomain enumeration")
+            print("\nSOURCE 1: hackertarget.com subdomain enumeration")
             print(f"  Platforms: {platforms}")
             for platform, slugs in enumerate_hackertarget(platforms).items():
                 all_results[platform] = {
@@ -414,7 +416,7 @@ def main():
         )
         platforms = [p for p in platforms if p in WAYBACK_PLATFORMS]
         if platforms:
-            print(f"\nSOURCE 2: Wayback Machine CDX API")
+            print("\nSOURCE 2: Wayback Machine CDX API")
             print(f"  Platforms: {platforms}")
             for platform, slugs in enumerate_wayback(platforms).items():
                 if platform in all_results:

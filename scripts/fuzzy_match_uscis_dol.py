@@ -71,19 +71,34 @@ def _load_model() -> None:
     log.info("Model ready")
 
 
-def _run_with_timeout(fn, timeout: int = _INFERENCE_TIMEOUT):
-    """Run fn() in a forked child process; terminate it if timeout expires."""
-    def _worker(q, fn):
+def _child_infer(q: multiprocessing.Queue, prompt: str, model_path: str) -> None:
+    """Top-level (picklable) worker: loads model in child and runs one inference."""
+    try:
+        from llama_cpp import Llama  # type: ignore[import]
+        llm = Llama(model_path=model_path, n_ctx=4096, n_threads=2, verbose=False)
+        resp = llm.create_chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=120,
+            temperature=0,
+        )
         try:
-            q.put(("ok", fn()))
-        except Exception as exc:
-            try:
-                q.put(("err", exc))
-            except Exception:
-                q.put(("err", RuntimeError(str(exc))))
+            q.put(("ok", resp))
+        except Exception:
+            q.put(("ok", resp))
+    except Exception as exc:
+        try:
+            q.put(("err", RuntimeError(str(exc))))
+        except Exception:
+            pass
 
+
+def _run_with_timeout(prompt: str, timeout: int = _INFERENCE_TIMEOUT):
+    """
+    Run inference in a child process; terminate on timeout.
+    Uses a module-level target so the process is picklable under spawn/forkserver.
+    """
     q: multiprocessing.Queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=_worker, args=(q, fn))
+    p = multiprocessing.Process(target=_child_infer, args=(q, prompt, _MODEL_PATH))
     p.start()
     try:
         p.join(timeout)
@@ -225,11 +240,7 @@ def _ask_model(uscis_name: str, uscis_norm: str,
     )
 
     try:
-        resp = _run_with_timeout(lambda: _llm.create_chat_completion(  # type: ignore[union-attr]
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
-            temperature=0,
-        ))
+        resp = _run_with_timeout(prompt)
         text = _strip_think(resp["choices"][0]["message"]["content"])
         m = re.search(r"\{.*?\}", text, re.DOTALL)
         if not m:
@@ -247,9 +258,17 @@ def _ask_model(uscis_name: str, uscis_norm: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(limit: "int | None" = None, dry_run: bool = False) -> None:
-    _load_model()
-    conn = get_conn()
+    if not dry_run:
+        _load_model()
 
+    conn = get_conn()
+    try:
+        _run_body(conn, limit, dry_run)
+    finally:
+        conn.close()
+
+
+def _run_body(conn, limit: "int | None", dry_run: bool) -> None:
     unmatched = _fetch_unmatched(conn, limit)
     log.info("Processing %d unmatched USCIS entries", len(unmatched))
 
@@ -257,6 +276,8 @@ def run(limit: "int | None" = None, dry_run: bool = False) -> None:
 
     for row in unmatched:
         uscis_name      = row["employer_name"]
+        # Use COALESCE(NULLIF(employer_legal_norm,''), employer_name_norm) so the
+        # stored key matches the SQL join expression used by readers.
         uscis_norm      = row["employer_legal_norm"] or row["employer_name_norm"]
         tax_id          = row["tax_id"]
         total_approvals = row["total_approvals"]
@@ -338,8 +359,6 @@ def run(limit: "int | None" = None, dry_run: bool = False) -> None:
     )
     if not dry_run and (fuzzy_auto + llm_matched) > 0:
         log.info("Run: python scripts/process_uscis_h1b.py --refresh-unmatched")
-
-    conn.close()
 
 
 def main():

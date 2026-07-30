@@ -337,7 +337,7 @@ def populate_unmatched() -> None:
               )
              AND right(d.employer_fein, 4) = u.tax_id
             LEFT JOIN uscis_dol_fuzzy_map f
-              ON f.employer_legal_norm = u.employer_legal_norm
+              ON f.employer_legal_norm = COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
              AND f.tax_id             = u.tax_id
             WHERE d.employer_fein IS NULL
               AND f.dol_fein IS NULL

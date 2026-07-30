@@ -150,6 +150,9 @@ def aggregate(df: pd.DataFrame) -> dict:
 
         employer_name_norm  = _norm_name(employer_name, strip_dba=True)
         trade_name_dba_norm = _norm_name(trade_name_dba) if trade_name_dba else None
+        # NOTE: if _norm_name behavior changed (DBA strip, THE prefix, AKA, UNIV),
+        # existing dol_h1b_employers.employer_name_norm values are inconsistent.
+        # Re-run a full ingest (delete + re-process all quarterly files) to backfill.
 
         total_filed     = len(group)
         total_certified = int(group["_certified"].sum())

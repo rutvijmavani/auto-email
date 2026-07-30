@@ -20,8 +20,10 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import os
 import re
+import socket
 import sys
 import time
 from urllib.parse import urlparse
@@ -97,6 +99,41 @@ _HEADERS = {
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SSRF guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_public_url(url: str) -> bool:
+    """
+    Return True only when url resolves to a public routable address.
+    Rejects loopback, link-local, private RFC1918, and cloud-metadata ranges.
+    """
+    try:
+        parsed = urlparse(url)
+        host   = parsed.hostname
+        if not host:
+            return False
+        # Resolve all A/AAAA records; reject if ANY is non-public
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            addr = ipaddress.ip_address(info[4][0])
+            if (
+                addr.is_loopback
+                or addr.is_link_local
+                or addr.is_private
+                or addr.is_reserved
+                or addr.is_unspecified
+                or addr.is_multicast
+                # cloud metadata: 169.254.169.254 (covered by is_link_local on IPv4)
+                # explicitly block 100.64/10 (CGNAT shared) just in case
+                or (isinstance(addr, ipaddress.IPv4Address)
+                    and ipaddress.IPv4Address(addr) in ipaddress.IPv4Network("100.64.0.0/10"))
+            ):
+                return False
+        return True
+    except Exception:
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Name normalisation
@@ -161,7 +198,7 @@ def _wikidata_website(qid: str) -> str | None:
         if p856:
             snak = p856[0].get("mainsnak", {})
             url  = snak.get("datavalue", {}).get("value")
-            if url and url.startswith("http"):
+            if url and url.startswith("http") and _is_public_url(url):
                 return url.rstrip("/")
     except Exception as e:
         log.debug("Wikidata entity fetch error for %s: %s", qid, e)
@@ -299,14 +336,19 @@ def _url_is_reachable(url: str) -> bool:
 def _fetch_html(url: str) -> tuple[str | None, str]:
     """
     GET url; return (html_text, final_url).
-    Returns (None, url) on failure.
+    Returns (None, url) on failure or when the redirect destination is non-public.
     """
+    if not _is_public_url(url):
+        return None, url
     try:
         r = requests.get(url, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
                          allow_redirects=True)
         if r.status_code < 400:
+            if r.url != url and not _is_public_url(r.url):
+                log.debug("Redirect to non-public URL blocked: %s", r.url)
+                return None, url
             return r.text, r.url
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         log.debug("Fetch error %s: %s", url, e)
     return None, url
 
@@ -332,9 +374,14 @@ def discover_careers_url(website_url: str) -> tuple[str | None, str | None, str 
     Returns (careers_url, detected_platform, detected_slug).
     All may be None.
     """
+    if not _is_public_url(website_url):
+        log.warning("Skipping non-public URL: %s", website_url)
+        return None, None, None
+
     parsed = urlparse(website_url)
-    domain = parsed.netloc.lstrip("www.")
-    base   = f"{parsed.scheme}://{parsed.netloc}"
+    netloc = parsed.netloc
+    domain = netloc.removeprefix("www.")
+    base   = f"{parsed.scheme}://{netloc}"
 
     candidates: list[str] = []
 
@@ -483,9 +530,13 @@ def process_employer(emp: dict, conn, dry_run: bool, use_llm: bool,
         existing = get_discovery_row(fein, conn)
         if existing and existing.get("last_checked"):
             from datetime import datetime, timezone, timedelta
-            age = datetime.now(timezone.utc) - existing["last_checked"].replace(
-                tzinfo=timezone.utc
-            )
+            lc = existing["last_checked"]
+            # TIMESTAMPTZ from psycopg2 is tz-aware; naive timestamps get UTC attached
+            if lc.tzinfo is None:
+                lc = lc.replace(tzinfo=timezone.utc)
+            else:
+                lc = lc.astimezone(timezone.utc)
+            age = datetime.now(timezone.utc) - lc
             if age.days < _RECHECK_DAYS:
                 log.info("  Skipping — checked %d days ago", age.days)
                 return existing

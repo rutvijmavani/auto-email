@@ -169,7 +169,7 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
         FROM uscis_h1b_petitions u
         JOIN dol_h1b_employers d ON d.employer_fein = %s
         LEFT JOIN uscis_dol_fuzzy_map f
-          ON f.employer_legal_norm = u.employer_legal_norm
+          ON f.employer_legal_norm = COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
          AND f.tax_id              = u.tax_id
          AND f.dol_fein            = d.employer_fein
         WHERE u.tax_id = RIGHT(%s, 4)
@@ -235,11 +235,15 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
         canonical_source = "regex" if canonical_name != emp_name else None
 
     careers_url = detected_platform = detected_slug = None
+    probe_error = None
     if website_url:
         try:
-            careers_url, detected_platform, detected_slug = discover_careers_url(website_url)
-        except Exception:
-            pass
+            careers_url, detected_platform, detected_slug = discover_careers_url(
+                website_url
+            )
+        except Exception as e:
+            probe_error = str(e)
+            log.warning("Career-page probe failed for %r: %s", emp_name, e)
 
     data = {
         "employer_fein":     fein,
@@ -251,6 +255,11 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
         "detected_platform": detected_platform,
         "detected_slug":     detected_slug,
     }
+    # Surface probe errors in the UI without raising (result is still persisted as
+    # "ATS unknown" so a retry is possible and the row is not lost).
+    if probe_error:
+        import streamlit as _st
+        _st.warning(f"Careers probe failed: {probe_error}. Result saved as ATS unknown.")
     conn = get_conn()
     try:
         upsert_discovery(data, conn, dry_run=False)
@@ -644,7 +653,7 @@ else:
                             priority=1,
                             domain=website,
                         )
-                        # Mark is_monitored in h1b_ats_discovery
+                        # Mark is_monitored only after the pipeline insert succeeds
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
@@ -656,7 +665,7 @@ else:
                             conn.commit()
                         finally:
                             conn.close()
-                        st.cache_data.clear()
+                        load_ats_discovery.clear()
                         if inserted:
                             st.success("Added to pipeline!")
                         else:
@@ -684,7 +693,12 @@ else:
 
                 if st.button("Confirm and add to monitoring", key="confirm_ats", type="primary"):
                     try:
-                        # Update discovery row with confirmed ATS info
+                        # Insert into pipeline first; only mark is_monitored on success
+                        inserted = add_prospective_company(
+                            canonical if canonical != "—" else name,
+                            priority=1,
+                            domain=website,
+                        )
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
@@ -699,13 +713,7 @@ else:
                             conn.commit()
                         finally:
                             conn.close()
-
-                        inserted = add_prospective_company(
-                            canonical if canonical != "—" else name,
-                            priority=1,
-                            domain=website,
-                        )
-                        st.cache_data.clear()
+                        load_ats_discovery.clear()
                         if inserted:
                             st.success("Added to pipeline!")
                         else:
@@ -727,7 +735,7 @@ else:
         with st.spinner("Re-checking …"):
             try:
                 _run_inline_discovery(fein, name)
-                st.cache_data.clear()
+                load_ats_discovery.clear()
                 st.rerun()
             except Exception as exc:
                 log.exception("Re-run discovery failed for %r", name)
