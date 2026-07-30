@@ -7,6 +7,7 @@ All filtering is SQL-based with indexed columns; no pandas post-filtering.
 
 import json
 import logging
+import re
 import sys
 import os
 
@@ -17,6 +18,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from db.connection import get_conn
 from db.prospective import add_prospective_company
 from frontend.db_utils import query as _query
+
+_URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 
 log = logging.getLogger(__name__)
 
@@ -165,10 +168,15 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
             SUM(u.amended_denial)                 AS amended_denial
         FROM uscis_h1b_petitions u
         JOIN dol_h1b_employers d ON d.employer_fein = %s
+        LEFT JOIN uscis_dol_fuzzy_map f
+          ON f.employer_legal_norm = u.employer_legal_norm
+         AND f.tax_id              = u.tax_id
+         AND f.dol_fein            = d.employer_fein
         WHERE u.tax_id = RIGHT(%s, 4)
           AND (
               u.employer_legal_norm = d.employer_name_norm
            OR u.employer_name_norm  = d.trade_name_dba_norm
+           OR f.dol_fein IS NOT NULL
           )
         GROUP BY u.fiscal_year
         ORDER BY u.fiscal_year
@@ -179,7 +187,8 @@ def _pipeline_status(employer_name: str) -> str | None:
     """Return existing pipeline status string, or None if not in pipeline."""
     conn = get_conn()
     try:
-        cur = conn.execute(
+        cur = conn.cursor()
+        cur.execute(
             "SELECT status FROM prospective_companies WHERE company = %s",
             (employer_name.strip(),),
         )
@@ -187,6 +196,76 @@ def _pipeline_status(employer_name: str) -> str | None:
         return dict(row)["status"] if row else None
     finally:
         conn.close()
+
+
+@st.cache_data(ttl=120)
+def load_ats_discovery(fein: str) -> dict | None:
+    """Load ATS discovery row for a given employer FEIN."""
+    df = _query(
+        "SELECT * FROM h1b_ats_discovery WHERE employer_fein = %s", (fein,)
+    )
+    return df.to_dict("records")[0] if not df.empty else None
+
+
+def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
+    """
+    Run a quick inline ATS discovery from the UI.
+    Calls Wikidata + careers-page fingerprint without Qwen3.
+    Writes result to h1b_ats_discovery and returns the row.
+    """
+    import time
+    from scripts.discover_h1b_ats import (
+        enrich_wikidata, enrich_wikipedia, strip_legal_suffixes,
+        discover_careers_url, upsert_discovery,
+    )
+
+    wd = enrich_wikidata(emp_name)
+    time.sleep(0.4)
+    canonical_name   = wd["canonical_name"]
+    website_url      = wd["website_url"]
+    canonical_source = wd["source"]
+
+    if not canonical_name:
+        canonical_name   = enrich_wikipedia(emp_name)
+        canonical_source = "wikipedia" if canonical_name else None
+        time.sleep(0.3)
+
+    if not canonical_name:
+        canonical_name   = strip_legal_suffixes(emp_name)
+        canonical_source = "regex" if canonical_name != emp_name else None
+
+    careers_url = detected_platform = detected_slug = None
+    if website_url:
+        try:
+            careers_url, detected_platform, detected_slug = discover_careers_url(website_url)
+        except Exception:
+            pass
+
+    data = {
+        "employer_fein":     fein,
+        "employer_name":     emp_name,
+        "canonical_name":    canonical_name,
+        "canonical_source":  canonical_source,
+        "website_url":       website_url,
+        "careers_url":       careers_url,
+        "detected_platform": detected_platform,
+        "detected_slug":     detected_slug,
+    }
+    conn = get_conn()
+    try:
+        upsert_discovery(data, conn, dry_run=False)
+    finally:
+        conn.close()
+    return data
+
+
+def _match_ats_from_url(url: str) -> dict | None:
+    """Run patterns.py on a user-pasted URL. Returns {platform, slug} or None."""
+    try:
+        from jobs.ats.patterns import match_ats_pattern
+        return match_ats_pattern(url.strip())
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -501,3 +580,155 @@ else:
             "amended_denial":                "Amended ✗",
         })
         st.dataframe(breakdown, use_container_width=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ATS Discovery panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.divider()
+st.markdown("#### ATS Discovery")
+
+disc = load_ats_discovery(fein)
+
+if disc is None:
+    st.info("No discovery data yet for this employer.")
+    if st.button("Run ATS discovery", key="run_disc"):
+        with st.spinner("Querying Wikidata + probing careers page …"):
+            try:
+                disc = _run_inline_discovery(fein, name)
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                log.exception("Inline discovery failed for %r", name)
+                st.error(f"Discovery failed: {exc}")
+else:
+    # ── Info row ─────────────────────────────────────────────────────────────
+    d1, d2, d3 = st.columns(3)
+
+    canonical = disc.get("canonical_name") or "—"
+    d1.markdown(f"**Brand name**\n\n{canonical}")
+
+    website = disc.get("website_url")
+    if website:
+        d2.markdown(f"**Website**\n\n[{website}]({website})")
+    else:
+        d2.markdown("**Website**\n\n—")
+
+    careers = disc.get("careers_url")
+    if careers:
+        d3.markdown(f"**Careers page**\n\n[{careers}]({careers})")
+    else:
+        d3.markdown("**Careers page**\n\n—")
+
+    # ── ATS badge ────────────────────────────────────────────────────────────
+    platform = disc.get("detected_platform")
+    slug     = disc.get("detected_slug")
+    monitored = disc.get("is_monitored", False)
+
+    st.markdown("")  # spacing
+
+    if platform:
+        badge_col, action_col = st.columns([2, 3])
+        badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
+
+        with action_col:
+            pipeline_st = _pipeline_status(name)
+            if monitored or pipeline_st:
+                st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
+            else:
+                if st.button("Add to monitoring", key="add_mon", type="primary"):
+                    try:
+                        inserted = add_prospective_company(
+                            canonical if canonical != "—" else name,
+                            priority=1,
+                            domain=website,
+                        )
+                        # Mark is_monitored in h1b_ats_discovery
+                        conn = get_conn()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute(
+                                "UPDATE h1b_ats_discovery SET is_monitored = TRUE "
+                                "WHERE employer_fein = %s",
+                                (fein,),
+                            )
+                            conn.commit()
+                        finally:
+                            conn.close()
+                        st.cache_data.clear()
+                        if inserted:
+                            st.success("Added to pipeline!")
+                        else:
+                            st.info("Already in pipeline.")
+                        st.rerun()
+                    except Exception as exc:
+                        log.exception("Failed to add %r to pipeline", name)
+                        st.error(f"Error: {exc}")
+    else:
+        # No ATS detected — let user paste apply URL
+        st.warning("ATS not detected from careers page. If you find the apply URL, paste it below.")
+
+        paste_url = st.text_input(
+            "Apply / job listing URL",
+            placeholder="https://boards.greenhouse.io/stripe  or  https://stripe.wd1.myworkdayjobs.com/…",
+            key="paste_ats_url",
+        )
+
+        if paste_url:
+            matched = _match_ats_from_url(paste_url)
+            if matched:
+                p2 = matched["platform"]
+                s2 = matched.get("slug")
+                st.success(f"Detected: **{p2}**" + (f"  ·  slug: `{s2}`" if s2 else ""))
+
+                if st.button("Confirm and add to monitoring", key="confirm_ats", type="primary"):
+                    try:
+                        # Update discovery row with confirmed ATS info
+                        conn = get_conn()
+                        try:
+                            cur = conn.cursor()
+                            cur.execute("""
+                                UPDATE h1b_ats_discovery
+                                SET detected_platform = %s,
+                                    detected_slug     = %s,
+                                    careers_url       = COALESCE(careers_url, %s),
+                                    is_monitored      = TRUE
+                                WHERE employer_fein = %s
+                            """, (p2, s2, paste_url, fein))
+                            conn.commit()
+                        finally:
+                            conn.close()
+
+                        inserted = add_prospective_company(
+                            canonical if canonical != "—" else name,
+                            priority=1,
+                            domain=website,
+                        )
+                        st.cache_data.clear()
+                        if inserted:
+                            st.success("Added to pipeline!")
+                        else:
+                            st.info("Already in pipeline.")
+                        st.rerun()
+                    except Exception as exc:
+                        log.exception("Failed to confirm ATS for %r", name)
+                        st.error(f"Error: {exc}")
+            else:
+                st.error("Could not detect ATS from that URL. Check the URL and try again.")
+
+    # ── Re-run discovery ──────────────────────────────────────────────────────
+    checked = disc.get("last_checked")
+    if checked:
+        checked_str = str(checked)[:16].replace("T", " ")
+        st.caption(f"Last checked: {checked_str}")
+
+    if st.button("Re-run discovery", key="rerun_disc"):
+        with st.spinner("Re-checking …"):
+            try:
+                _run_inline_discovery(fein, name)
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as exc:
+                log.exception("Re-run discovery failed for %r", name)
+                st.error(f"Error: {exc}")

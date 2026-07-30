@@ -49,25 +49,39 @@ _ABBREV_MAP = [
     (re.compile(r"\bGRP\b"),      "GROUP"),
     (re.compile(r"\bLTD\b"),      "LIMITED"),
     (re.compile(r"\bPWC\b"),      "PRICEWATERHOUSECOOPERS"),
+    (re.compile(r"\bUNIV\b"),     "UNIVERSITY"),
 ]
 
 
-def _norm_name(name: str) -> str:
+def _norm_name(name: str, strip_dba: bool = False) -> str:
     """Normalize a DOL employer name to the same form as USCIS employer_legal_norm.
 
-    Identical transform chain as process_uscis_h1b._legal_norm():
-      strip & and AND → strip punctuation → collapse whitespace →
+    Transform chain (mirrors process_uscis_h1b._legal_norm() when strip_dba=True):
+      strip apostrophes → strip & and AND → strip punctuation → collapse whitespace →
+      strip leading THE → optionally strip DBA/AKA suffix →
       collapse spaced letters (U S → US) → expand abbreviations (SVCS → SERVICES).
-    Applied to both employer_name and trade_name_dba so the USCIS join can use
-    stored columns instead of inline SQL normalization.
+
+    strip_dba=True for employer_name (legal name, DBA suffix must be removed to match
+    USCIS employer_legal_norm). strip_dba=False for trade_name_dba (the DBA IS the brand name).
     """
     if not name or not name.strip():
         return ""
     name = name.upper()
+    name = re.sub(r"'", "", name)           # strip apostrophes: "Moody's" → "MOODYS"
     name = re.sub(r"&", " ", name)
     name = re.sub(r"\bAND\b", " ", name)
     name = re.sub(r"[^A-Z0-9 ]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
+    # Strip leading "THE " (DOL may include it; USCIS often drops it)
+    if name.startswith("THE "):
+        name = name[4:]
+    if strip_dba:
+        # Must detect DBA before collapsing — collapse turns ' D B A ' → 'DBA'
+        for marker in (" D B A ", " DBA ", " AKA "):
+            pos = name.find(marker)
+            if pos != -1:
+                name = name[:pos]
+                break
     name = _SPACED_LETTER_RE.sub(lambda m: m.group(0).replace(" ", ""), name)
     for pat, repl in _ABBREV_MAP:
         name = pat.sub(repl, name)
@@ -134,7 +148,7 @@ def aggregate(df: pd.DataFrame) -> dict:
         h1b_dependent  = _parse_bool(group.get("H-1B_DEPENDENT",  pd.Series()).iloc[-1] if "H-1B_DEPENDENT"  in group else None)
         willful_viol   = _parse_bool(group.get("WILLFUL_VIOLATOR", pd.Series()).iloc[-1] if "WILLFUL_VIOLATOR" in group else None)
 
-        employer_name_norm  = _norm_name(employer_name)
+        employer_name_norm  = _norm_name(employer_name, strip_dba=True)
         trade_name_dba_norm = _norm_name(trade_name_dba) if trade_name_dba else None
 
         total_filed     = len(group)

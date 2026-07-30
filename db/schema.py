@@ -1443,6 +1443,58 @@ def init_db():
         ON uscis_dol_unmatched (total_approvals DESC)
     """)
 
+    # uscis_dol_fuzzy_map: audit trail for fuzzy/LLM-derived USCIS → DOL matches.
+    # Populated by scripts/fuzzy_match_uscis_dol.py after every ingest.
+    # Each row = one USCIS employer (employer_legal_norm + tax_id) confirmed to map to a
+    # specific DOL FEIN by rapidfuzz pre-filter + Gemini LLM decision.
+    # Used as a fallback in populate_unmatched() and load_uscis_petitions().
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS uscis_dol_fuzzy_map (
+            id                   BIGSERIAL PRIMARY KEY,
+            employer_legal_norm  TEXT    NOT NULL,
+            tax_id               TEXT    NOT NULL,
+            dol_fein             TEXT    NOT NULL,
+            match_score          REAL,
+            match_stage          TEXT    NOT NULL DEFAULT 'llm',
+            created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (employer_legal_norm, tax_id)
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fuzzy_map_lookup
+        ON uscis_dol_fuzzy_map (employer_legal_norm, tax_id)
+    """)
+
+    # ── H-1B ATS discovery table (2026-07-30) ────────────────────────────────
+    # Populated by scripts/discover_h1b_ats.py.
+    # One row per FEIN — stores Wikidata/Wikipedia canonical enrichment result
+    # plus career-page ATS fingerprint.  Drives the Discover page UI section.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS h1b_ats_discovery (
+            id                BIGSERIAL PRIMARY KEY,
+            employer_fein     TEXT        NOT NULL UNIQUE,
+            employer_name     TEXT        NOT NULL,
+            canonical_name    TEXT,
+            canonical_source  TEXT,
+            website_url       TEXT,
+            careers_url       TEXT,
+            detected_platform TEXT,
+            detected_slug     TEXT,
+            is_monitored      BOOLEAN     NOT NULL DEFAULT FALSE,
+            last_checked      TIMESTAMPTZ,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_ats_disc_platform
+        ON h1b_ats_discovery (detected_platform)
+        WHERE detected_platform IS NOT NULL
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_ats_disc_monitored
+        ON h1b_ats_discovery (is_monitored)
+    """)
+
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
     _cleanup_closed_application_recruiters(c)
