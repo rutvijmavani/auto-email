@@ -509,3 +509,91 @@ Time cost:
 
 This means `--verify-only` can run as frequently as needed
 at zero cost to either quota.
+
+---
+
+## Wikidata / Wikipedia Rate Limiting
+
+`scripts/discover_h1b_ats.py` makes REST calls to Wikidata and Wikipedia.
+Both services publish a **20 requests-per-minute** guideline for bots with a
+proper `User-Agent`. The script enforces this with an in-process sliding-window
+rate limiter — the same design pattern used for Gemini RPM limiting in
+`db/quota.py`.
+
+### Design — `_RateLimiter`
+
+```python
+class _RateLimiter:
+    """Thread-safe sliding-window rate limiter."""
+
+    def __init__(self, rpm: int) -> None:
+        self._rpm    = rpm
+        self._window = deque()   # timestamps of recent calls
+        self._lock   = threading.Lock()
+
+    def acquire(self, api_name: str) -> None:
+        while True:
+            now = time.time()
+            with self._lock:
+                # evict timestamps older than 60 seconds
+                while self._window and self._window[0] < now - 60:
+                    self._window.popleft()
+                if len(self._window) < self._rpm:
+                    self._window.append(now)
+                    return
+            # window full — back off 3 s and retry
+            log.debug("%s RPM limit (%d/min) — waiting 3s", api_name, self._rpm)
+            time.sleep(3)
+```
+
+Two separate limiters exist so Wikidata and Wikipedia throttle independently:
+
+```python
+_wikidata_limiter  = _RateLimiter(rpm=20)  # used by _wikidata_search + _wikidata_website
+_wikipedia_limiter = _RateLimiter(rpm=20)  # used by enrich_wikipedia
+```
+
+### How it integrates with `_api_get`
+
+```python
+def _api_get(url, params, api_name, limiter):
+    limiter.acquire(api_name)          # blocks until a slot is available
+    r = requests.get(url, ...)
+    if r.status_code == 429:
+        wait = int(r.headers.get("Retry-After", 10))
+        time.sleep(wait)
+        limiter.acquire(api_name)      # re-acquire after sleeping
+        r = requests.get(url, ...)
+    r.raise_for_status()
+    return r
+```
+
+Key properties:
+- `acquire()` blocks the calling thread (no busy-spin — sleeps 3 s between checks)
+- Thread-safe: `deque` mutations happen inside `threading.Lock`
+- Sliding window: only calls within the last 60 seconds count against the cap
+- 429 path: honours `Retry-After` header, then re-acquires a fresh limiter slot before the retry
+- No fixed `time.sleep()` after every call — the limiter self-paces naturally
+
+### Compared to Gemini pattern (`db/quota.py`)
+
+| | Gemini (`quota.py`) | Wikidata/Wikipedia (`discover_h1b_ats.py`) |
+|---|---|---|
+| Storage | `defaultdict(list)` | `deque` (same sliding-window idea) |
+| Thread safety | Not locked (single-threaded Gemini use) | `threading.Lock` |
+| Interface | `within_rpm(model)` → bool; caller sleeps | `acquire()` → blocks until ready |
+| Per-key | Per model string | Per `_RateLimiter` instance |
+
+The `deque`+`Lock` approach is stricter and more correct for multi-call
+discovery runs where timing matters.
+
+### Quota summary
+
+| API | Limit | Limiter instance | Cost |
+|---|---|---|---|
+| Wikidata REST v1 | ~20 RPM (guideline) | `_wikidata_limiter` | Free |
+| Wikipedia Action API | ~20 RPM (guideline) | `_wikipedia_limiter` | Free |
+
+Both APIs are free with no daily cap. The RPM limit exists only to be a
+polite bot. A single `--top 100` run makes ~200 Wikidata calls (search +
+statements per employer) and runs in ~10 minutes under the 20 RPM limit.

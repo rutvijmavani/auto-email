@@ -1476,6 +1476,7 @@ def init_db():
             employer_name     TEXT        NOT NULL,
             canonical_name    TEXT,
             canonical_source  TEXT,
+            wikidata_qid      TEXT,
             website_url       TEXT,
             careers_url       TEXT,
             detected_platform TEXT,
@@ -1493,6 +1494,11 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_h1b_ats_disc_monitored
         ON h1b_ats_discovery (is_monitored)
+    """)
+    # Upgrade existing databases — safe no-op on fresh installs that already have the column
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS wikidata_qid TEXT
     """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
