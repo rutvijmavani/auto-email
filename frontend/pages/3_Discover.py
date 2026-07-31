@@ -623,7 +623,17 @@ else:
     d1, d2, d3 = st.columns(3)
 
     canonical = disc.get("canonical_name") or "—"
+    source    = disc.get("canonical_source") or ""
+    _SOURCE_LABELS = {
+        "wikidata":  "🌐 Wikidata",
+        "wikipedia": "📖 Wikipedia",
+        "qwen":      "🤖 Qwen3",
+        "regex":     "🔤 Regex strip",
+    }
+    source_label = _SOURCE_LABELS.get(source, source)
     d1.markdown(f"**Brand name**\n\n{canonical}")
+    if source_label:
+        d1.caption(f"Source: {source_label}")
 
     website = disc.get("website_url")
     if website:
@@ -636,6 +646,19 @@ else:
         d3.markdown(f"**Careers page**\n\n[{careers}]({careers})")
     else:
         d3.markdown("**Careers page**\n\n—")
+
+    # ── Wikidata detail row ───────────────────────────────────────────────────
+    if source == "wikidata":
+        with st.expander("🌐 Wikidata details", expanded=False):
+            wd_cols = st.columns(3)
+            wd_cols[0].markdown(f"**Entity label**\n\n{canonical}")
+            if website:
+                wd_cols[1].markdown(f"**Official site (P856)**\n\n[{website}]({website})")
+            else:
+                wd_cols[1].markdown("**Official site (P856)**\n\n—")
+            # Link to Wikidata search so user can inspect the entity directly
+            wd_search = f"https://www.wikidata.org/w/index.php?search={canonical.replace(' ', '+')}"
+            wd_cols[2].markdown(f"**Wikidata**\n\n[Search on Wikidata ↗]({wd_search})")
 
     # ── ATS badge ────────────────────────────────────────────────────────────
     platform = disc.get("detected_platform")

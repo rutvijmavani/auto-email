@@ -214,6 +214,64 @@ duplicate record instead of updating the existing one.
 
 ---
 
+## Companies Page — UI (`frontend/pages/2_Companies.py`)
+
+The Companies Streamlit page is the primary UI for browsing and managing the
+`prospective_companies` pipeline. It replaces manual CLI status queries.
+
+### Sidebar filters
+
+| Filter | Options |
+|---|---|
+| Name search | Free-text ILIKE |
+| Status | pending / scraped / converted / exhausted (multi-select, default: pending + scraped) |
+| ATS platform | Multi-select (populated from distinct values in DB) |
+| H-1B sponsors only | Toggle (requires `h1b_sponsor = TRUE`) |
+| Sort | Priority ↓ · Most jobs (30d) · Latest job ↓ · Added ↓ · Name A→Z |
+
+### Top metrics
+
+Four cards across the top: **Total companies**, **Active (pipeline)**, **ATS detected**, **Jobs this week**.
+
+### Company table columns
+
+`Company` · `Status` · `ATS` · `Slug` · `Jobs 7d` · `Jobs 30d` · `Last job` · `Empty days` · `Priority` · `H-1B`
+
+Status icons: 🟡 pending · 🟢 scraped · 🔵 converted · ⚫ exhausted
+
+### Detail panel (click any row)
+
+**Left (3/4 width):**
+- 90-day job posting trend bar chart
+- Last 15 job postings with clickable links
+
+**Right (1/4 width):**
+- Domain (linked), ATS platform + slug, H-1B badge, consecutive empty days, timestamps
+- **Change status** — dropdown + Save (writes `UPDATE prospective_companies SET status = ...`)
+- **Change priority** — number 0–10 + Save
+- **Discovery data** expander — shows Wikidata brand name, website, careers URL, detected ATS from `h1b_ats_discovery` if available
+- **Remove from pipeline** — two-step confirmation (DELETE from `prospective_companies`)
+
+### SQL behind the main query
+
+```sql
+SELECT
+    p.company, p.status, p.priority, p.ats_platform, p.ats_slug,
+    p.domain, p.consecutive_empty_days, p.last_checked_at, p.created_at,
+    p.h1b_sponsor,
+    COUNT(j.id) FILTER (WHERE j.first_seen >= NOW() - INTERVAL '30 days') AS jobs_30d,
+    COUNT(j.id) FILTER (WHERE j.first_seen >= NOW() - INTERVAL '7 days')  AS jobs_7d,
+    COUNT(j.id)                                                             AS jobs_total,
+    MAX(j.first_seen)                                                       AS last_job_seen
+FROM prospective_companies p
+LEFT JOIN job_postings j ON j.company = p.company
+[WHERE filters]
+GROUP BY p.id, ...
+ORDER BY [sort]
+```
+
+---
+
 ## Quota Distribution with Prospective
 
 ### Example — quiet day

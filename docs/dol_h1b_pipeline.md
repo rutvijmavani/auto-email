@@ -202,7 +202,117 @@ Sort options: total certified DESC, approval rate DESC, total positions DESC
 - Year-over-year chart (from `dol_h1b_yearly`)
 - SOC breakdown table (from `dol_h1b_soc_breakdown`)
 - Top job titles (from `top_job_titles` JSONB)
+- USCIS H-1B petition panel (FY2024–FY2026, from `uscis_h1b_petitions`)
+- **ATS Discovery panel** — shows brand name, website, careers page, ATS badge; inline "Run ATS discovery" button triggers Wikidata lookup + career-page fingerprint without leaving the page
+- **Wikidata detail expander** — visible when `canonical_source = 'wikidata'`; shows entity label, P856 website, and a direct Wikidata search link
 - "Add to pipeline" button → inserts into `prospective_companies`
+
+### Wikidata source badge
+
+The brand name field in the ATS Discovery panel carries a source caption:
+
+| Source | Label |
+|---|---|
+| `wikidata`  | 🌐 Wikidata |
+| `wikipedia` | 📖 Wikipedia |
+| `qwen`      | 🤖 Qwen3 |
+| `regex`     | 🔤 Regex strip |
+
+---
+
+## ATS Discovery — `scripts/discover_h1b_ats.py`
+
+For each top H-1B sponsor the script:
+1. Queries **Wikidata** for canonical brand name + official website (P856)
+2. Falls back to **Wikipedia** article title for canonical name
+3. Falls back to **Qwen3-8B** (optional `--llm` flag) for unusual names
+4. Falls back to **regex suffix-stripping** as last resort
+5. Probes common career URL paths on the discovered website
+6. Fingerprints ATS via HTML scanning (`jobs/ats/patterns.py`)
+7. Stores results in `h1b_ats_discovery`
+
+### Wikidata REST API v1
+
+The script uses the **Wikidata REST API v1** (not the legacy Action API):
+
+```
+Base URL: https://www.wikidata.org/w/rest.php/wikibase/v1
+
+Search:     GET /v1/search/items?q=<name>&language=en&limit=5
+Response:   { "results": [{ "id": "Q...", "display-label": {"value": "..."}, ... }] }
+
+Statements: GET /v1/entities/items/{qid}/statements?property=P856
+Response:   { "P856": [{ "rank": "normal"|"preferred"|"deprecated",
+                          "value": { "type": "value", "content": "https://..." } }] }
+```
+
+**Why REST v1 over Action API:**
+- Versioned and stable — breaking changes will have a migration path
+- Cleaner response structure (no nested `mainsnak.datavalue.value`)
+- `deprecated` rank is explicit — deprecated P856 entries are skipped automatically
+
+### P856 URL selection
+
+All P856 statements for an entity are collected, then:
+1. Filter out `rank = deprecated`
+2. Validate each URL via `_is_public_url()` (SSRF guard — rejects RFC1918, loopback, cloud-metadata)
+3. Prefer URLs whose hostname ends in `.com` (avoids returning `amazon.it` for Amazon)
+4. Among tied-preference URLs, return the shortest
+
+### Wikipedia lawsuit filtering
+
+When Wikidata returns no canonical name, Wikipedia is tried. The search fetches 3 candidates (`srlimit=3`) and skips:
+- Titles containing ` v. ` (legal cases — e.g. "Google LLC v. Oracle America, Inc.")
+- Titles ending in `(disambiguation)`
+
+### Rate limiting
+
+Both Wikidata and Wikipedia have dedicated sliding-window rate limiters:
+
+```python
+_wikidata_limiter  = _RateLimiter(rpm=20)
+_wikipedia_limiter = _RateLimiter(rpm=20)
+```
+
+See [quota-management.md](quota-management.md#wikidata--wikipedia-rate-limiting) for full design details.
+
+### `h1b_ats_discovery` table
+
+```sql
+CREATE TABLE h1b_ats_discovery (
+    employer_fein     TEXT PRIMARY KEY REFERENCES dol_h1b_employers(employer_fein),
+    employer_name     TEXT NOT NULL,
+    canonical_name    TEXT,           -- brand name from Wikidata / Wikipedia / regex
+    canonical_source  TEXT,           -- 'wikidata' | 'wikipedia' | 'qwen' | 'regex'
+    website_url       TEXT,           -- from Wikidata P856
+    careers_url       TEXT,           -- discovered career page URL
+    detected_platform TEXT,           -- ATS platform slug
+    detected_slug     TEXT,           -- company-specific ATS slug
+    is_monitored      BOOLEAN DEFAULT FALSE,
+    last_checked      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### CLI invocation
+
+```bash
+# Process top 100 sponsors (dry-run — no DB writes)
+python scripts/discover_h1b_ats.py --top 100 --dry-run
+
+# Process top 20 sponsors and write results
+python scripts/discover_h1b_ats.py --top 20
+
+# Single employer by FEIN
+python scripts/discover_h1b_ats.py --fein 123456789
+
+# With Qwen3-8B brand-name extraction fallback
+python scripts/discover_h1b_ats.py --top 100 --llm
+
+# Re-check even if checked recently
+python scripts/discover_h1b_ats.py --top 50 --force
+```
+
+Results are stored in `h1b_ats_discovery` and surfaced in the Discover page ATS Discovery panel. Companies with `detected_platform` set can be added directly to the monitoring pipeline via the "Add to monitoring" button.
 
 ---
 

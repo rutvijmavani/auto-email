@@ -25,7 +25,9 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
+from collections import deque
 from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -42,9 +44,9 @@ log = get_logger(__name__)
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-_WIKIDATA_SEARCH = "https://www.wikidata.org/w/api.php"
-_WIKIDATA_ENTITY = "https://www.wikidata.org/w/api.php"
-_WIKIPEDIA_API   = "https://en.wikipedia.org/w/api.php"
+# Wikidata REST API v1 (recommended over legacy Action API — versioned, cleaner structure)
+_WIKIDATA_REST  = "https://www.wikidata.org/w/rest.php/wikibase/v1"
+_WIKIPEDIA_API  = "https://en.wikipedia.org/w/api.php"
 
 _CAREER_PATHS = [
     "/careers",
@@ -71,9 +73,10 @@ _CAREER_SUBDOMAINS = [
     "https://work.{domain}",
 ]
 
-_HTTP_TIMEOUT   = 12
-_RECHECK_DAYS   = 7
-_MAX_REDIRECTS  = 10
+_HTTP_TIMEOUT       = 12
+_RECHECK_DAYS       = 7
+_MAX_REDIRECTS      = 10
+_RATE_LIMIT_BACKOFF = 10   # seconds to sleep on 429 before one retry
 
 _LEGAL_SUFFIXES = re.compile(
     r"\s*[,.]?\s*\b(?:LLC|L\.L\.C\.|INC\.?|CORP\.?|CORPORATION|"
@@ -157,61 +160,96 @@ def strip_legal_suffixes(name: str) -> str:
 # Wikidata
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wikidata_search(query: str) -> list[dict]:
-    """Return top Wikidata entity search results for query."""
+_API_HEADERS = {"User-Agent": "H1B-ATS-Discover/1.0 (research bot)"}
+
+
+class _RateLimiter:
+    """Thread-safe sliding-window rate limiter (same pattern as db/quota.py)."""
+
+    def __init__(self, rpm: int) -> None:
+        self._rpm  = rpm
+        self._window: deque = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, api_name: str) -> None:
+        while True:
+            now = time.time()
+            with self._lock:
+                while self._window and self._window[0] < now - 60:
+                    self._window.popleft()
+                if len(self._window) < self._rpm:
+                    self._window.append(now)
+                    return
+            log.debug("%s RPM limit (%d/min) — waiting 3s", api_name, self._rpm)
+            time.sleep(3)
+
+
+_wikidata_limiter  = _RateLimiter(rpm=20)
+_wikipedia_limiter = _RateLimiter(rpm=20)
+
+
+def _api_get(url: str, params: dict, api_name: str,
+             limiter: _RateLimiter) -> "requests.Response | None":
+    """GET with rate-limiter acquire and one Retry-After-aware retry on 429."""
+    limiter.acquire(api_name)
     try:
-        r = requests.get(
-            _WIKIDATA_SEARCH,
-            params={
-                "action":   "wbsearchentities",
-                "search":   query,
-                "language": "en",
-                "type":     "item",
-                "format":   "json",
-                "limit":    5,
-            },
-            headers={"User-Agent": "H1B-ATS-Discover/1.0 (research bot)"},
-            timeout=_HTTP_TIMEOUT,
-        )
+        r = requests.get(url, params=params, headers=_API_HEADERS,
+                         timeout=_HTTP_TIMEOUT)
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
+            log.debug("%s rate-limited — waiting %ds", api_name, wait)
+            time.sleep(wait)
+            limiter.acquire(api_name)
+            r = requests.get(url, params=params, headers=_API_HEADERS,
+                             timeout=_HTTP_TIMEOUT)
         r.raise_for_status()
-        return r.json().get("search", [])
-    except Exception as e:
-        log.debug("Wikidata search error for %r: %s", query, e)
-        return []
+        return r
+    except requests.exceptions.RequestException as e:
+        log.debug("%s error: %s", api_name, e)
+        return None
+
+
+def _wikidata_search(query: str) -> list[dict]:
+    """Return top Wikidata item search results using the REST API v1."""
+    r = _api_get(
+        f"{_WIKIDATA_REST}/search/items",
+        {"q": query, "language": "en", "limit": 5},
+        "Wikidata search",
+        _wikidata_limiter,
+    )
+    return r.json().get("results", []) if r else []
 
 
 def _wikidata_website(qid: str) -> str | None:
-    """Fetch official website (P856) for a Wikidata entity."""
-    try:
-        r = requests.get(
-            _WIKIDATA_ENTITY,
-            params={
-                "action":    "wbgetentities",
-                "ids":       qid,
-                "props":     "claims",
-                "languages": "en",
-                "format":    "json",
-            },
-            headers={"User-Agent": "H1B-ATS-Discover/1.0 (research bot)"},
-            timeout=_HTTP_TIMEOUT,
-        )
-        r.raise_for_status()
-        entity = r.json().get("entities", {}).get(qid, {})
-        claims = entity.get("claims", {})
-        p856   = claims.get("P856", [])
-        if p856:
-            snak = p856[0].get("mainsnak", {})
-            url  = snak.get("datavalue", {}).get("value")
-            if url and url.startswith("http") and _is_public_url(url):
-                return url.rstrip("/")
-    except Exception as e:
-        log.debug("Wikidata entity fetch error for %s: %s", qid, e)
-    return None
+    """Fetch P856 (official website) statements for a Wikidata item via REST API v1.
+    Skips deprecated statements. Prefers .com; falls back to shortest URL."""
+    r = _api_get(
+        f"{_WIKIDATA_REST}/entities/items/{qid}/statements",
+        {"property": "P856"},
+        "Wikidata statements",
+        _wikidata_limiter,
+    )
+    if not r:
+        return None
+    p856 = r.json().get("P856", [])
+    urls: list[str] = []
+    for stmt in p856:
+        if stmt.get("rank") == "deprecated":
+            continue
+        val = stmt.get("value", {})
+        if val.get("type") == "value":
+            content = val.get("content", "")
+            if isinstance(content, str) and content.startswith("http") and _is_public_url(content):
+                urls.append(content.rstrip("/"))
+    if not urls:
+        return None
+    com = [u for u in urls if (urlparse(u).hostname or "").endswith(".com")]
+    return min(com or urls, key=len)
 
 
 def enrich_wikidata(legal_name: str) -> dict:
     """
-    Search Wikidata for legal_name.
+    Search Wikidata for legal_name using the REST API.
     Returns dict with keys: canonical_name, website_url, qid (all may be None).
     Tries both the original name and the suffix-stripped version.
     """
@@ -226,7 +264,8 @@ def enrich_wikidata(legal_name: str) -> dict:
             continue
         hit = results[0]
         qid            = hit.get("id")
-        canonical_name = hit.get("label")
+        # REST API uses "display-label" key (hyphenated) for the label object
+        canonical_name = hit.get("display-label", {}).get("value")
         website_url    = _wikidata_website(qid) if qid else None
         if canonical_name or website_url:
             return {
@@ -235,7 +274,6 @@ def enrich_wikidata(legal_name: str) -> dict:
                 "qid":            qid,
                 "source":         "wikidata",
             }
-        time.sleep(0.2)
 
     return {"canonical_name": None, "website_url": None, "qid": None, "source": None}
 
@@ -248,30 +286,24 @@ def enrich_wikipedia(legal_name: str) -> str | None:
     """
     Search Wikipedia for legal_name; return article title as canonical name.
     Only used when Wikidata returns no canonical name.
+    Filters out legal case titles (contain " v. ") and disambiguation pages.
     """
     stripped = strip_legal_suffixes(legal_name)
     for query in [legal_name, stripped]:
-        try:
-            r = requests.get(
-                _WIKIPEDIA_API,
-                params={
-                    "action":       "query",
-                    "list":         "search",
-                    "srsearch":     query,
-                    "srlimit":      1,
-                    "srprop":       "snippet",
-                    "format":       "json",
-                },
-                headers={"User-Agent": "H1B-ATS-Discover/1.0 (research bot)"},
-                timeout=_HTTP_TIMEOUT,
-            )
-            r.raise_for_status()
-            hits = r.json().get("query", {}).get("search", [])
-            if hits:
-                return hits[0].get("title")
-        except Exception as e:
-            log.debug("Wikipedia search error for %r: %s", query, e)
-        time.sleep(0.2)
+        r = _api_get(_WIKIPEDIA_API, {
+            "action": "query", "list": "search",
+            "srsearch": query, "srlimit": 3,
+            "srprop": "snippet", "format": "json",
+        }, "Wikipedia search", _wikipedia_limiter)
+        if not r:
+            continue
+        hits = r.json().get("query", {}).get("search", [])
+        for hit in hits:
+            title = hit.get("title", "")
+            # Skip legal cases and disambiguation pages
+            if " v. " in title or title.endswith("(disambiguation)"):
+                continue
+            return title
     return None
 
 
