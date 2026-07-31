@@ -75,8 +75,9 @@ _INT_COLS = [
 
 
 def _norm(name: str) -> str:
-    """Normalize employer name: uppercase, strip & and AND, punctuation → space, collapse whitespace."""
+    """Normalize employer name: uppercase, strip apostrophes, strip & and AND, punctuation → space, collapse whitespace."""
     name = name.upper()
+    name = re.sub(r"'", "", name)           # strip apostrophes: "Moody's" → "MOODYS"
     name = re.sub(r"&", " ", name)
     name = re.sub(r"\bAND\b", " ", name)
     return re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", name)).strip()
@@ -102,6 +103,7 @@ _ABBREV_MAP = [
     (re.compile(r"\bGRP\b"),      "GROUP"),
     (re.compile(r"\bLTD\b"),      "LIMITED"),
     (re.compile(r"\bPWC\b"),      "PRICEWATERHOUSECOOPERS"),
+    (re.compile(r"\bUNIV\b"),     "UNIVERSITY"),
 ]
 
 
@@ -113,18 +115,25 @@ def _expand_abbrevs(name: str) -> str:
 
 
 def _legal_norm(name: str) -> str:
-    """Normalize for DOL join: strip DBA suffix, collapse spaced letters, expand abbreviations.
+    """Normalize for DOL join: strip DBA/AKA suffix, strip leading THE, collapse spaced letters, expand abbreviations.
 
-    "FIDELITY TECHNOLOGY GROUP LLC D B A FIDELITY INVESTMENTS"
-        → "FIDELITY TECHNOLOGY GROUP LLC"
-    "TATA CONSULTANCY SVCS LTD" → "TATA CONSULTANCY SERVICES LIMITED"
-    "ERNST AND YOUNG U S LLP" → "ERNST YOUNG US LLP"
+    "FIDELITY TECHNOLOGY GROUP LLC D B A FIDELITY INVESTMENTS" → "FIDELITY TECHNOLOGY GROUP LLC"
+    "ARTECH LLC DBA ARTECH INFORMATION SYSTEMS LLC"             → "ARTECH LLC"
+    "THE BOSTON CONSULTING GROUP"                               → "BOSTON CONSULTING GROUP"
+    "TATA CONSULTANCY SVCS LTD"                                 → "TATA CONSULTANCY SERVICES LIMITED"
+    "ERNST AND YOUNG U S LLP"                                   → "ERNST YOUNG US LLP"
     """
     normed = _norm(name)
-    # Detect DBA before collapsing — _collapse_spaced_letters would turn 'D B A' → 'DBA'
-    dba_pos = normed.find(" D B A ")
-    if dba_pos != -1:
-        normed = normed[:dba_pos]
+    # Strip leading "THE " so "THE KROGER CO" matches "KROGER CO" on DOL side
+    if normed.startswith("THE "):
+        normed = normed[4:]
+    # Detect DBA/AKA BEFORE collapsing — _collapse_spaced_letters turns ' D B A ' → 'DBA'
+    # Check both spaced form (' D B A ') and compact form (' DBA ', ' AKA ')
+    for marker in (" D B A ", " DBA ", " AKA "):
+        pos = normed.find(marker)
+        if pos != -1:
+            normed = normed[:pos]
+            break
     normed = _collapse_spaced_letters(normed)
     normed = _expand_abbrevs(normed)
     return normed.strip()
@@ -327,7 +336,11 @@ def populate_unmatched() -> None:
                OR u.employer_name_norm  = d.trade_name_dba_norm
               )
              AND right(d.employer_fein, 4) = u.tax_id
+            LEFT JOIN uscis_dol_fuzzy_map f
+              ON f.employer_legal_norm = COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
+             AND f.tax_id             = u.tax_id
             WHERE d.employer_fein IS NULL
+              AND f.dol_fein IS NULL
             ORDER BY total_approvals DESC
         """)
         count = result.rowcount
