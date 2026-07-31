@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -51,6 +52,7 @@ _WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 _WIKIPEDIA_API   = "https://en.wikipedia.org/w/api.php"
 
 _SPARQL_CHUNK_SIZE = 100   # max QIDs per SPARQL VALUES block
+_QID_RE = re.compile(r"^Q\d+$")  # valid Wikidata QID pattern
 
 _CAREER_PATHS = [
     "/careers",
@@ -299,21 +301,37 @@ def _sparql_batch_websites(qids: list[str]) -> dict[str, str | None]:
     if not qids:
         return {}
 
-    values = " ".join(f"wd:{qid}" for qid in qids)
+    valid_qids = [q for q in qids if _QID_RE.match(q)]
+    if not valid_qids:
+        log.debug("SPARQL P856 batch: no valid QIDs after filtering")
+        return {qid: None for qid in qids}
+
+    values = " ".join(f"wd:{qid}" for qid in valid_qids)
     sparql = (
         "SELECT ?item ?website WHERE { "
         f"VALUES ?item {{ {values} }} "
         "OPTIONAL { ?item wdt:P856 ?website. } "
         "}"
     )
+    _sparql_headers = {**_API_HEADERS, "Accept": "application/sparql-results+json"}
+    _sparql_params  = {"query": sparql, "format": "json"}
+
+    def _do_sparql_request() -> "requests.Response":
+        return requests.get(_WIKIDATA_SPARQL, params=_sparql_params,
+                            headers=_sparql_headers, timeout=60)
+
     _sparql_limiter.acquire("SPARQL P856 batch")
     try:
-        r = requests.get(
-            _WIKIDATA_SPARQL,
-            params={"query": sparql, "format": "json"},
-            headers={**_API_HEADERS, "Accept": "application/sparql-results+json"},
-            timeout=60,
-        )
+        r = _do_sparql_request()
+        if r.status_code == 429:
+            try:
+                wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
+            except (ValueError, TypeError):
+                wait = _RATE_LIMIT_BACKOFF
+            log.debug("SPARQL P856 batch rate-limited — waiting %ds", wait)
+            time.sleep(wait)
+            _sparql_limiter.acquire("SPARQL P856 batch retry")
+            r = _do_sparql_request()
         r.raise_for_status()
         bindings = r.json()["results"]["bindings"]
     except (requests.exceptions.RequestException, ValueError, KeyError) as e:
@@ -675,14 +693,19 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
 # Core processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _is_recently_checked(fein: str, conn, force: bool) -> dict | None:
-    """Return existing row if it was checked within _RECHECK_DAYS and force=False."""
+def _is_recently_checked(
+    fein: str, conn, force: bool, existing: dict | None = None
+) -> dict | None:
+    """
+    Return existing row if checked within _RECHECK_DAYS and force=False.
+    Pass existing when the row was already fetched to avoid a second DB read.
+    """
     if force:
         return None
-    existing = get_discovery_row(fein, conn)
+    if existing is None:
+        existing = get_discovery_row(fein, conn)
     if not (existing and existing.get("last_checked")):
         return None
-    from datetime import datetime, timezone
     lc = existing["last_checked"]
     if lc.tzinfo is None:
         lc = lc.replace(tzinfo=timezone.utc)
@@ -861,7 +884,8 @@ def main():
         # Phase 1: search all employers (REST API, 100 RPM) → collect QIDs
         log.info("Phase 1: Wikidata search for %d employers …", len(employers))
         search_map: dict[str, dict] = {}   # fein → {qid, canonical_name, canonical_source}
-        all_qids: list[str] = []
+        seen_qids: set[str] = set()         # deduplicates across employers
+        all_qids:  list[str] = []
 
         for i, emp in enumerate(employers, 1):
             fein = emp["employer_fein"]
@@ -869,8 +893,8 @@ def main():
 
             existing = get_discovery_row(fein, conn)
 
-            # Skip entirely if checked recently (existing behaviour)
-            if _is_recently_checked(fein, conn, args.force):
+            # Skip entirely if checked recently — pass existing to avoid a second DB read
+            if _is_recently_checked(fein, conn, args.force, existing=existing):
                 log.info("[%d/%d] skip (recent): %s", i, len(employers), name)
                 search_map[fein] = {"skip": True}
                 stats["skipped"] += 1
@@ -897,15 +921,17 @@ def main():
                 }
 
             search_map[fein] = entry
-            if entry.get("qid"):
-                all_qids.append(entry["qid"])
+            qid = entry.get("qid")
+            if qid and qid not in seen_qids:
+                seen_qids.add(qid)
+                all_qids.append(qid)
 
         # Phase 2: batch-fetch P856 via SPARQL (one query per 100 QIDs)
         log.info("Phase 2: SPARQL P856 batch for %d QIDs …", len(all_qids))
         website_map = _sparql_batch_websites_all(all_qids)  # {qid: url_or_None}
 
         # Merge website URLs back into search_map
-        for fein, entry in search_map.items():
+        for entry in search_map.values():
             if entry.get("skip"):
                 continue
             qid = entry.get("qid")
