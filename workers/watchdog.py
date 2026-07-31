@@ -167,11 +167,11 @@ ERR_DEATHS  = 5
 WATCHDOG_SNAPSHOT_KEY = "watchdog:queue_snapshot"
 WATCHDOG_SNAPSHOT_TTL = WATCHDOG_INTERVAL_S * 2   # expires if watchdog skips a cycle
 
-# Detail queue depth — absolute count is correct here: it is a throughput
-# metric, not a fleet-size metric.  500 backed-up jobs means the same lag
-# regardless of how many companies are registered.
-DETAIL_QUEUE_WARN  = 100
-DETAIL_QUEUE_ALERT = 500
+# Detail queue alerting — delay-based (matches manager.py Layer 0 trigger).
+# Primary source: manager:backpressure:threshold:{pool} (written every 60s cycle).
+# Fallback when manager is down: _DETAIL_DELAY_WARN_FALLBACK (same as
+# manager.py _FALLBACK_PARAMS["detail"]["delay_warn_s"]).
+_DETAIL_DELAY_WARN_FALLBACK = 300.0   # seconds
 
 PEL_WARN_AGE_MS         = 10 * 60 * 1000
 PEL_ALERT_AGE_MS        = 30 * 60 * 1000
@@ -792,6 +792,42 @@ def _worker_processed(r, worker_type: str) -> Optional[int]:
         return None
 
 
+def _detail_queue_delay_s(r, queue_key: str) -> float | None:
+    """Return age in seconds of the oldest item in a detail LIST queue.
+
+    Oldest item = index -1 (producers LPUSH to head; consumers pop from tail).
+    Returns None if the queue is empty or the payload cannot be parsed.
+    """
+    try:
+        raw = r.lindex(queue_key, -1)
+        if not raw:
+            return None
+        payload = json.loads(raw)
+        enqueued_at = payload.get("enqueued_at")
+        if not enqueued_at:
+            return None
+        enqueued_ts = datetime.fromisoformat(enqueued_at).timestamp()
+        return max(time.time() - enqueued_ts, 0.0)
+    except Exception:
+        return None
+
+
+def _backpressure_threshold(r, pool: str) -> float:
+    """Read manager-published delay_warn_s for a pool.
+
+    Manager writes manager:backpressure:threshold:{pool} on every 60s cycle
+    (TTL = 3× cycle).  Falls back to _DETAIL_DELAY_WARN_FALLBACK if the key
+    is absent (manager not running) or unparseable.
+    """
+    try:
+        val = r.get(f"manager:backpressure:threshold:{pool}")
+        if val:
+            return float(val)
+    except Exception:
+        pass
+    return _DETAIL_DELAY_WARN_FALLBACK
+
+
 def _zset_head(r, key: str):
     """(company_str, score_float) for the lowest-scored ZSET entry, or (None, None)."""
     try:
@@ -1203,6 +1239,8 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
 
     detail_adp_depth = r.llen(REDIS_DETAIL_ADAPTIVE)
     detail_fs_depth  = r.llen(REDIS_DETAIL_FULLSCAN)
+    detail_adp_delay = _detail_queue_delay_s(r, REDIS_DETAIL_ADAPTIVE)
+    detail_fs_delay  = _detail_queue_delay_s(r, REDIS_DETAIL_FULLSCAN)
 
     scan_proc        = _worker_processed(r, "scan_worker")
     fs_proc          = _worker_processed(r, "fullscan_worker")
@@ -1265,19 +1303,23 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             issues.append(Issue(Issue.OK, "queue:poll:fullscan",
                 f"baseline — {fs_total} scheduled  {fs_overdue} overdue"
                 + (" [lock active]" if fs_lock else "")))
-        for label, depth in [
-            ("queue:detail:adaptive", detail_adp_depth),
-            ("queue:detail:fullscan", detail_fs_depth),
+        delay_warn_s = _backpressure_threshold(r, "detail")
+        for label, depth, delay_s in [
+            ("queue:detail:adaptive", detail_adp_depth, detail_adp_delay),
+            ("queue:detail:fullscan", detail_fs_depth,  detail_fs_delay),
         ]:
-            if depth > DETAIL_QUEUE_ALERT:
-                issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} (baseline) — CRITICAL threshold exceeded",
-                    "python -m workers.detail_worker"))
-            elif depth > DETAIL_QUEUE_WARN:
-                issues.append(Issue(Issue.WARNING, label,
-                    f"depth={depth:,} (baseline) — elevated, delta tracking starts next cycle"))
-            else:
+            if depth == 0 or delay_s is None:
                 issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
+            elif delay_s > delay_warn_s:
+                issues.append(Issue(Issue.ERROR, label,
+                    f"depth={depth:,} delay={delay_s:.0f}s > threshold {delay_warn_s:.0f}s (baseline)",
+                    "python -m workers.detail_worker"))
+            elif delay_s > delay_warn_s * 0.75:
+                issues.append(Issue(Issue.WARNING, label,
+                    f"depth={depth:,} delay={delay_s:.0f}s (baseline, approaching threshold {delay_warn_s:.0f}s)"))
+            else:
+                issues.append(Issue(Issue.OK, label,
+                    f"depth={depth} delay={delay_s:.0f}s (baseline)"))
         _check_dlq_health(r, issues)
         _check_pel_health(r, issues)
         return issues
@@ -1395,50 +1437,49 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
         if detail_proc_delta is not None else ""
     )
 
-    for label, atype, depth, prev_depth in [
+    delay_warn_s = _backpressure_threshold(r, "detail")
+    for label, atype, depth, prev_depth, delay_s in [
         ("queue:detail:adaptive", "queue_detail_adaptive",
-         detail_adp_depth, prev_detail_adp),
+         detail_adp_depth, prev_detail_adp, detail_adp_delay),
         ("queue:detail:fullscan", "queue_detail_fullscan",
-         detail_fs_depth,  prev_detail_fs),
+         detail_fs_depth,  prev_detail_fs,  detail_fs_delay),
     ]:
-        delta   = depth - prev_depth
+        delta    = depth - prev_depth
         # Use only this queue's own depth delta to determine if it is draining.
         # The pool-wide detail_proc_delta is not queue-specific: workers processing
         # adaptive jobs would make a growing fullscan queue falsely appear as draining.
         draining = delta < 0
 
-        if depth == 0:
+        if depth == 0 or delay_s is None:
             issues.append(Issue(Issue.OK, label, f"depth=0 — idle{proc_note}"))
         elif draining:
-            # Queue is shrinking or worker confirmed processing
-            if depth > DETAIL_QUEUE_ALERT:
+            if delay_s > delay_warn_s:
                 issues.append(Issue(Issue.WARNING, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
-                    f"draining but critically elevated{proc_note}"))
-            elif depth > DETAIL_QUEUE_WARN:
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                    f"draining but delay critical (>{delay_warn_s:.0f}s){proc_note}"))
+            elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
-                    f"draining but elevated{proc_note}"))
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                    f"draining but delay elevated{proc_note}"))
             else:
                 issues.append(Issue(Issue.OK, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) draining{proc_note}"))
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) draining{proc_note}"))
         else:
-            # Not draining — stalled or growing
             direction = "growing" if delta > 0 else "stalled"
-            if depth > DETAIL_QUEUE_ALERT:
+            if delay_s > delay_warn_s:
                 issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
-                    f"{direction} at CRITICAL level{proc_note}",
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                    f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s){proc_note}",
                     "python -m workers.detail_worker",
                     alert_type=atype,
                 ))
-            elif depth > DETAIL_QUEUE_WARN:
+            elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
-                    f"{direction} at elevated level{proc_note}"))
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                    f"{direction}, delay approaching threshold{proc_note}"))
             else:
                 issues.append(Issue(Issue.OK, label,
-                    f"depth={depth:,} {_trend(delta)}({delta:+d}) — "
+                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
                     f"small backlog, {direction}{proc_note}"))
 
     # ── 9. PEL checks + DLQ depth ────────────────────────────────────────────

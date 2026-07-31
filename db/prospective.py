@@ -29,35 +29,46 @@ def submit_to_prospective_sheet(
     Column order matches the sheet exactly:
       Timestamp | Company Name | Job URL | Domain | Career Page URL |
       XML/Sitemap URL | Listing Curl | Detail Curl | Notes
+
+    Failures are logged and swallowed — callers must not depend on this
+    succeeding (the company is already in the DB at this point).
     """
+    import logging
     import gspread
     from google.oauth2.service_account import Credentials
 
-    creds  = Credentials.from_service_account_file(_CREDENTIALS_FILE, scopes=_SCOPES)
-    client = gspread.authorize(creds)
-    sheet  = client.open_by_key(_SHEET_ID)
+    _log = logging.getLogger(__name__)
     try:
-        ws = sheet.worksheet(_SHEET_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(_SHEET_NAME, rows=200, cols=9)
-        ws.update("A1:I1", [[
-            "Timestamp", "Company Name", "Job URL",
-            "Domain", "Career Page URL", "XML/Sitemap URL",
-            "Listing Curl", "Detail Curl", "Notes",
-        ]])
+        creds  = Credentials.from_service_account_file(_CREDENTIALS_FILE, scopes=_SCOPES)
+        client = gspread.authorize(creds)
+        # Set a finite read timeout so network hangs don't block indefinitely
+        if hasattr(client, "session") and hasattr(client.session, "timeout"):
+            client.session.timeout = (10, 30)
+        sheet = client.open_by_key(_SHEET_ID)
+        try:
+            ws = sheet.worksheet(_SHEET_NAME)
+        except gspread.WorksheetNotFound:
+            ws = sheet.add_worksheet(_SHEET_NAME, rows=200, cols=9)
+            ws.update("A1:I1", [[
+                "Timestamp", "Company Name", "Job URL",
+                "Domain", "Career Page URL", "XML/Sitemap URL",
+                "Listing Curl", "Detail Curl", "Notes",
+            ]])
 
-    row = [
-        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-        company,                                            # Company Name
-        job_url         or "",                              # Job URL
-        domain          or "",                              # Domain
-        career_page_url or "",                              # Career Page URL
-        "",                                                 # XML/Sitemap URL
-        "",                                                 # Listing Curl
-        "",                                                 # Detail Curl
-        notes,                                              # Notes
-    ]
-    ws.append_row(row, value_input_option="USER_ENTERED")
+        row = [
+            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            company,                                            # Company Name
+            job_url         or "",                              # Job URL
+            domain          or "",                              # Domain
+            career_page_url or "",                              # Career Page URL
+            "",                                                 # XML/Sitemap URL
+            "",                                                 # Listing Curl
+            "",                                                 # Detail Curl
+            notes,                                              # Notes
+        ]
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as exc:
+        _log.warning("submit_to_prospective_sheet failed for %r: %s", company, exc)
 
 
 def _normalize_company(name):

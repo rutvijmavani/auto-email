@@ -115,8 +115,12 @@ _KNOWN_ATS_DOMAINS = {
     "eightfold.ai", "phenompeople.com", "jobscore.com",
 }
 
-# Keywords in final redirect URL that indicate SSO / auth wall
+# Keywords in final redirect URL path+query that indicate SSO / auth wall
 _AUTH_KEYWORDS = ("login", "okta", "auth", "sso", "oauth", "saml", "signin")
+_AUTH_RE = re.compile(
+    r"\b(?:" + "|".join(_AUTH_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
 
 _LEGAL_SUFFIXES = re.compile(
     r"\s*[,.]?\s*\b(?:LLC|L\.L\.C\.|INC\.?|CORP\.?|CORPORATION|"
@@ -292,6 +296,11 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
     if not mids:
         return {}
 
+    _MID_RE = re.compile(r"^/m/[0-9a-z_]+$")
+    mids = [m for m in mids if _MID_RE.match(m)]
+    if not mids:
+        return {}
+
     values = " ".join(f'("{m}")' for m in mids)
     sparql = (
         "SELECT ?mid ?item ?jobs_url WHERE { "
@@ -350,10 +359,6 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
         out.update(_sparql_batch_p10311(chunk))
     return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Brave search — career page URL fallback
-# ─────────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Qwen3-8B — career URL disambiguation
@@ -427,32 +432,48 @@ def _company_tokens(name: str) -> set[str]:
     return tokens
 
 
+_AGGREGATOR_DOMAINS = frozenset({
+    "linkedin.com", "indeed.com", "glassdoor.com", "ziprecruiter.com",
+    "monster.com", "careerbuilder.com", "simplyhired.com", "dice.com",
+    "hired.com", "wellfound.com", "builtin.com",
+})
+
+
 def _is_plausible_career_url(url: str, company_tokens: set[str]) -> bool:
     """
     True if the URL is plausibly the company's own career page:
       a) company name token appears in the domain
       b) URL is on a known ATS domain
-      c) 'careers' or 'jobs' appears in domain or path
+      c) 'career' or 'jobs' appears in domain or path
+    Rejects job aggregators that would match (c) for any employer.
     """
+    root = _root_domain(url)
+    if root in _AGGREGATOR_DOMAINS:
+        return False
     parsed = urlparse(url)
     domain = (parsed.hostname or "").lower()
     path   = parsed.path.lower()
     return (
         any(tok in domain for tok in company_tokens)
-        or _root_domain(url) in _KNOWN_ATS_DOMAINS
-        or any(kw in domain + path for kw in ("careers", "jobs", "career"))
+        or root in _KNOWN_ATS_DOMAINS
+        or any(kw in domain + path for kw in ("career", "jobs"))
     )
 
 
 def _brave_load_quota() -> dict:
+    current_month = datetime.now().strftime("%Y-%m")
     try:
         with open(_BRAVE_QUOTA_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"calls": 0}
+        return {"calls": 0, "month": current_month}
+    if data.get("month") != current_month:
+        return {"calls": 0, "month": current_month}
+    return data
 
 
 def _brave_save_quota(data: dict) -> None:
+    data.setdefault("month", datetime.now().strftime("%Y-%m"))
     os.makedirs("data", exist_ok=True)
     with open(_BRAVE_QUOTA_FILE, "w") as f:
         json.dump(data, f)
@@ -588,8 +609,9 @@ def _is_homepage(final_url: str) -> bool:
 
 
 def _is_auth_redirect(final_url: str) -> bool:
-    url_lower = final_url.lower()
-    return any(kw in url_lower for kw in _AUTH_KEYWORDS)
+    parsed = urlparse(final_url)
+    path_query = parsed.path + ("?" + parsed.query if parsed.query else "")
+    return bool(_AUTH_RE.search(path_query))
 
 
 def discover_careers_url(
@@ -750,7 +772,7 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             kg_mid            = COALESCE(EXCLUDED.kg_mid,         h1b_ats_discovery.kg_mid),
             website_url       = EXCLUDED.website_url,
             jobs_url          = COALESCE(EXCLUDED.jobs_url,       h1b_ats_discovery.jobs_url),
-            careers_url       = EXCLUDED.careers_url,
+            careers_url       = COALESCE(EXCLUDED.careers_url,    h1b_ats_discovery.careers_url),
             detected_platform = EXCLUDED.detected_platform,
             detected_slug     = EXCLUDED.detected_slug,
             last_checked      = NOW()
@@ -845,7 +867,7 @@ def process_employer(
                 kg_mid           = kg.get("kg_mid")
                 canonical_name   = kg.get("name")
                 website_url      = kg.get("url")
-                canonical_source = "kg" if (canonical_name or website_url) else None
+                canonical_source = "kg_api" if (canonical_name or website_url) else None
             else:
                 canonical_name   = strip_legal_suffixes(name) or None
                 canonical_source = "regex" if canonical_name else None
@@ -871,6 +893,11 @@ def process_employer(
         # P10311 found — use it as the careers URL, no further probing needed
         careers_url = jobs_url
         log.info("  P10311 jobs URL: %s", jobs_url)
+        from jobs.ats.patterns import match_ats_pattern as _map
+        _hit = _map(jobs_url)
+        if _hit:
+            detected_platform = _hit["platform"]
+            detected_slug     = _hit.get("slug")
     elif website_url:
         # Phase 3: 19-pattern probe
         log.info("  Probing 19 career URL patterns on %s …", website_url)
@@ -1025,7 +1052,7 @@ def main():
                     entry = {
                         "kg_mid":          kg.get("kg_mid"),
                         "canonical_name":  kg.get("name"),
-                        "canonical_source": "kg" if (kg.get("name") or kg.get("url")) else None,
+                        "canonical_source": "kg_api" if (kg.get("name") or kg.get("url")) else None,
                         "website_url":     kg.get("url"),
                         "wikidata_qid":    None,
                     }

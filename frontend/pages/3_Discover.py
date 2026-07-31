@@ -232,14 +232,14 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     kg      = kg_search(emp_name)
     kg_mid  = None
     if kg:
-        canonical_name   = kg["name"]
-        website_url      = kg.get("url")
-        canonical_source = "kg_api"
-        kg_mid           = kg.get("kg_mid")
-    else:
-        canonical_name   = strip_legal_suffixes(emp_name)
-        canonical_source = "regex" if canonical_name != emp_name else None
-        website_url      = None
+        kg_mid         = kg.get("kg_mid")
+        canonical_name = kg.get("name") or None
+        website_url    = kg.get("url") or None
+        canonical_source = "kg_api" if (canonical_name or website_url) else None
+    if not kg or not canonical_name:
+        canonical_name   = strip_legal_suffixes(emp_name) or None
+        canonical_source = canonical_source or ("regex" if canonical_name != emp_name else None)
+        website_url      = website_url if kg else None
 
     # Phase 2: Wikidata P646 → P10311 (official jobs URL)
     wikidata_qid = jobs_url = None
@@ -253,6 +253,11 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     careers_url = jobs_url  # use Wikidata jobs URL if available
     detected_platform = detected_slug = None
     probe_error = None
+    if jobs_url:
+        _hit = _match_ats_from_url(jobs_url)
+        if _hit:
+            detected_platform = _hit["platform"]
+            detected_slug     = _hit.get("slug")
     if not careers_url and website_url:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(discover_careers_url, website_url)
@@ -661,23 +666,27 @@ else:
         st.markdown("**Careers page**")
         _ck = f"edit_careers_{fein}"
         if st.session_state.get(_ck):
-            new_val = st.text_input("", value=careers or "", key=f"input_careers_{fein}",
+            new_val = st.text_input("Career page URL", value=careers or "",
+                                    key=f"input_careers_{fein}",
                                     label_visibility="collapsed")
             s1, s2 = st.columns(2)
             if s1.button("Save", key=f"save_careers_{fein}", type="primary"):
                 _url_to_save = new_val.strip() or None
-                conn = get_conn()
-                try:
-                    conn.execute(
-                        "UPDATE h1b_ats_discovery SET careers_url = %s WHERE employer_fein = %s",
-                        (_url_to_save, fein),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                st.session_state.pop(_ck, None)
-                load_ats_discovery.clear()
-                st.rerun()
+                if _url_to_save and not _url_to_save.startswith(("http://", "https://")):
+                    st.error("URL must start with http:// or https://")
+                else:
+                    conn = get_conn()
+                    try:
+                        conn.execute(
+                            "UPDATE h1b_ats_discovery SET careers_url = %s WHERE employer_fein = %s",
+                            (_url_to_save, fein),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    st.session_state.pop(_ck, None)
+                    load_ats_discovery.clear()
+                    st.rerun()
             if s2.button("Cancel", key=f"cancel_careers_{fein}"):
                 st.session_state.pop(_ck, None)
                 st.rerun()
@@ -695,23 +704,27 @@ else:
         st.markdown("**Official jobs URL**")
         _jk = f"edit_jobs_{fein}"
         if st.session_state.get(_jk):
-            new_jval = st.text_input("", value=jobs_url or "", key=f"input_jobs_{fein}",
+            new_jval = st.text_input("Official jobs URL", value=jobs_url or "",
+                                     key=f"input_jobs_{fein}",
                                      label_visibility="collapsed")
             j1, j2 = st.columns(2)
             if j1.button("Save", key=f"save_jobs_{fein}", type="primary"):
                 _jurl_to_save = new_jval.strip() or None
-                conn = get_conn()
-                try:
-                    conn.execute(
-                        "UPDATE h1b_ats_discovery SET jobs_url = %s WHERE employer_fein = %s",
-                        (_jurl_to_save, fein),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
-                st.session_state.pop(_jk, None)
-                load_ats_discovery.clear()
-                st.rerun()
+                if _jurl_to_save and not _jurl_to_save.startswith(("http://", "https://")):
+                    st.error("URL must start with http:// or https://")
+                else:
+                    conn = get_conn()
+                    try:
+                        conn.execute(
+                            "UPDATE h1b_ats_discovery SET jobs_url = %s WHERE employer_fein = %s",
+                            (_jurl_to_save, fein),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    st.session_state.pop(_jk, None)
+                    load_ats_discovery.clear()
+                    st.rerun()
             if j2.button("Cancel", key=f"cancel_jobs_{fein}"):
                 st.session_state.pop(_jk, None)
                 st.rerun()
@@ -764,14 +777,18 @@ else:
                             priority=1,
                             domain=website,
                         )
-                        # Feed careers_url + jobs_url to the sheet so
-                        # prospective_form_sync.py can detect the ATS on next run.
-                        submit_to_prospective_sheet(
-                            company        = pipeline_name,
-                            career_page_url= disc.get("careers_url"),
-                            job_url        = disc.get("jobs_url"),
-                            domain         = website,
-                        )
+                        # Feed URLs to the sheet only for new inserts.
+                        if inserted:
+                            try:
+                                submit_to_prospective_sheet(
+                                    company        = pipeline_name,
+                                    career_page_url= disc.get("careers_url"),
+                                    job_url        = disc.get("jobs_url"),
+                                    domain         = website,
+                                )
+                            except Exception as _se:
+                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
+                                st.warning("ATS detection queuing failed — company was added to pipeline.")
                         # Mark is_monitored only after pipeline insert succeeds
                         conn = get_conn()
                         try:
@@ -819,14 +836,17 @@ else:
                             priority=1,
                             domain=website,
                         )
-                        # Feed the pasted job URL + existing careers_url to the sheet
-                        # so prospective_form_sync.py can detect ATS on next run.
-                        submit_to_prospective_sheet(
-                            company        = pipeline_name,
-                            career_page_url= disc.get("careers_url"),
-                            job_url        = paste_url,
-                            domain         = website,
-                        )
+                        if inserted:
+                            try:
+                                submit_to_prospective_sheet(
+                                    company        = pipeline_name,
+                                    career_page_url= disc.get("careers_url"),
+                                    job_url        = paste_url,
+                                    domain         = website,
+                                )
+                            except Exception as _se:
+                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
+                                st.warning("ATS detection queuing failed — company was added to pipeline.")
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
