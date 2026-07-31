@@ -166,7 +166,7 @@ def strip_legal_suffixes(name: str) -> str:
 # Wikidata
 # ─────────────────────────────────────────────────────────────────────────────
 
-_API_HEADERS = {"User-Agent": "H1B-ATS-Discover/1.0 (research bot)"}
+_API_HEADERS = {"User-Agent": "H1B-ATS-Discover/1.0 (research; server.unilog@gmail.com)"}
 
 
 class _RateLimiter:
@@ -190,7 +190,7 @@ class _RateLimiter:
             time.sleep(3)
 
 
-_wikidata_limiter  = _RateLimiter(rpm=100)  # anon REST limit is much higher; 20 was too conservative
+_wikidata_limiter  = _RateLimiter(rpm=40)   # proper UA allows much higher; conservative until confirmed
 _wikipedia_limiter = _RateLimiter(rpm=20)
 _sparql_limiter    = _RateLimiter(rpm=30)   # query.wikidata.org — separate pool, 60s timeout per query
 
