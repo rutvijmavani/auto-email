@@ -11,6 +11,7 @@ import logging
 import re
 import sys
 import os
+from urllib.parse import quote_plus
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +19,7 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
 from db.prospective import add_prospective_company
-from frontend.db_utils import query as _query
+from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 _INLINE_PROBE_TIMEOUT = 30  # seconds; caps career-page probe in inline discovery
@@ -624,12 +625,6 @@ else:
 
     canonical = disc.get("canonical_name") or "—"
     source    = disc.get("canonical_source") or ""
-    _SOURCE_LABELS = {
-        "wikidata":  "🌐 Wikidata",
-        "wikipedia": "📖 Wikipedia",
-        "qwen":      "🤖 Qwen3",
-        "regex":     "🔤 Regex strip",
-    }
     source_label = _SOURCE_LABELS.get(source, source)
     d1.markdown(f"**Brand name**\n\n{canonical}")
     if source_label:
@@ -657,7 +652,7 @@ else:
             else:
                 wd_cols[1].markdown("**Official site (P856)**\n\n—")
             # Link to Wikidata search so user can inspect the entity directly
-            wd_search = f"https://www.wikidata.org/w/index.php?search={canonical.replace(' ', '+')}"
+            wd_search = f"https://www.wikidata.org/w/index.php?search={quote_plus(canonical)}"
             wd_cols[2].markdown(f"**Wikidata**\n\n[Search on Wikidata ↗]({wd_search})")
 
     # ── ATS badge ────────────────────────────────────────────────────────────

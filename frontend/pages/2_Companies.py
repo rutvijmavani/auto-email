@@ -11,7 +11,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
-from frontend.db_utils import query as _query
+from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
 
 st.set_page_config(page_title="Companies", page_icon="🏢", layout="wide")
 
@@ -415,12 +415,6 @@ with col_right:
     # ── Discovery data (Wikidata) ─────────────────────────────────────────────
     disc = load_discovery(name)
     if disc:
-        _SOURCE_LABELS = {
-            "wikidata":  "🌐 Wikidata",
-            "wikipedia": "📖 Wikipedia",
-            "qwen":      "🤖 Qwen3",
-            "regex":     "🔤 Regex",
-        }
         src = disc.get("canonical_source") or ""
         with st.expander("Discovery data", expanded=False):
             if disc.get("canonical_name"):

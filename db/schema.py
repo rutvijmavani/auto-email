@@ -1071,6 +1071,11 @@ def init_db():
     # ── Misc index / constraint migrations ───────────────────────────────────
 
     c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS wikidata_qid TEXT
+    """)
+
+    c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
         ON prospective_companies(company)
     """)

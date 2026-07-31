@@ -45,8 +45,12 @@ log = get_logger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Wikidata REST API v1 (recommended over legacy Action API — versioned, cleaner structure)
-_WIKIDATA_REST  = "https://www.wikidata.org/w/rest.php/wikibase/v1"
-_WIKIPEDIA_API  = "https://en.wikipedia.org/w/api.php"
+_WIKIDATA_REST   = "https://www.wikidata.org/w/rest.php/wikibase/v1"
+# SPARQL endpoint — separate host, separate rate-limit pool from the REST API
+_WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
+_WIKIPEDIA_API   = "https://en.wikipedia.org/w/api.php"
+
+_SPARQL_CHUNK_SIZE = 100   # max QIDs per SPARQL VALUES block
 
 _CAREER_PATHS = [
     "/careers",
@@ -184,8 +188,9 @@ class _RateLimiter:
             time.sleep(3)
 
 
-_wikidata_limiter  = _RateLimiter(rpm=20)
+_wikidata_limiter  = _RateLimiter(rpm=100)  # anon REST limit is much higher; 20 was too conservative
 _wikipedia_limiter = _RateLimiter(rpm=20)
+_sparql_limiter    = _RateLimiter(rpm=30)   # query.wikidata.org — separate pool, 60s timeout per query
 
 
 def _api_get(url: str, params: dict, api_name: str,
@@ -196,7 +201,10 @@ def _api_get(url: str, params: dict, api_name: str,
         r = requests.get(url, params=params, headers=_API_HEADERS,
                          timeout=_HTTP_TIMEOUT)
         if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
+            try:
+                wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
+            except (ValueError, TypeError):
+                wait = _RATE_LIMIT_BACKOFF
             log.debug("%s rate-limited — waiting %ds", api_name, wait)
             time.sleep(wait)
             limiter.acquire(api_name)
@@ -217,7 +225,13 @@ def _wikidata_search(query: str) -> list[dict]:
         "Wikidata search",
         _wikidata_limiter,
     )
-    return r.json().get("results", []) if r else []
+    if not r:
+        return []
+    try:
+        return r.json().get("results", [])
+    except ValueError:
+        log.debug("Wikidata search: malformed JSON response")
+        return []
 
 
 def _wikidata_website(qid: str) -> str | None:
@@ -231,7 +245,11 @@ def _wikidata_website(qid: str) -> str | None:
     )
     if not r:
         return None
-    p856 = r.json().get("P856", [])
+    try:
+        p856 = r.json().get("P856", [])
+    except ValueError:
+        log.debug("Wikidata statements: malformed JSON response for %s", qid)
+        return None
     urls: list[str] = []
     for stmt in p856:
         if stmt.get("rank") == "deprecated":
@@ -245,6 +263,90 @@ def _wikidata_website(qid: str) -> str | None:
         return None
     com = [u for u in urls if (urlparse(u).hostname or "").endswith(".com")]
     return min(com or urls, key=len)
+
+
+def _wikidata_search_for_qid(legal_name: str) -> tuple[str | None, str | None]:
+    """
+    Search Wikidata for legal_name; return (qid, canonical_name) from first hit.
+    Does NOT fetch P856 — that is done later in a SPARQL batch.
+    Tries both the original name and the suffix-stripped version.
+    """
+    queries = [legal_name]
+    stripped = strip_legal_suffixes(legal_name)
+    if stripped and stripped != legal_name:
+        queries.append(stripped)
+    for query in queries:
+        results = _wikidata_search(query)
+        if not results:
+            continue
+        hit = results[0]
+        qid            = hit.get("id")
+        canonical_name = hit.get("display-label", {}).get("value")
+        if qid or canonical_name:
+            return qid, canonical_name
+    return None, None
+
+
+def _sparql_batch_websites(qids: list[str]) -> dict[str, str | None]:
+    """
+    Fetch P856 (official website) for up to _SPARQL_CHUNK_SIZE Wikidata QIDs in
+    one SPARQL query against query.wikidata.org (separate endpoint + rate-limit
+    pool from the REST API).
+
+    Returns {qid: best_url_or_None}. Applies the same .com-preference + shortest
+    fallback as _wikidata_website.
+    """
+    if not qids:
+        return {}
+
+    values = " ".join(f"wd:{qid}" for qid in qids)
+    sparql = (
+        "SELECT ?item ?website WHERE { "
+        f"VALUES ?item {{ {values} }} "
+        "OPTIONAL { ?item wdt:P856 ?website. } "
+        "}"
+    )
+    _sparql_limiter.acquire("SPARQL P856 batch")
+    try:
+        r = requests.get(
+            _WIKIDATA_SPARQL,
+            params={"query": sparql, "format": "json"},
+            headers={**_API_HEADERS, "Accept": "application/sparql-results+json"},
+            timeout=60,
+        )
+        r.raise_for_status()
+        bindings = r.json()["results"]["bindings"]
+    except (requests.exceptions.RequestException, ValueError, KeyError) as e:
+        log.debug("SPARQL P856 batch error: %s", e)
+        return {qid: None for qid in qids}
+
+    url_map: dict[str, list[str]] = {qid: [] for qid in qids}
+    for row in bindings:
+        qid = row["item"]["value"].split("/")[-1]
+        if "website" in row:
+            url = row["website"]["value"].rstrip("/")
+            if _is_public_url(url):
+                url_map.setdefault(qid, []).append(url)
+
+    out: dict[str, str | None] = {}
+    for qid, urls in url_map.items():
+        if not urls:
+            out[qid] = None
+        else:
+            com = [u for u in urls if (urlparse(u).hostname or "").endswith(".com")]
+            out[qid] = min(com or urls, key=len)
+    return out
+
+
+def _sparql_batch_websites_all(qids: list[str]) -> dict[str, str | None]:
+    """Chunk qids into _SPARQL_CHUNK_SIZE batches and merge results."""
+    out: dict[str, str | None] = {}
+    for i in range(0, len(qids), _SPARQL_CHUNK_SIZE):
+        chunk = qids[i : i + _SPARQL_CHUNK_SIZE]
+        log.info("SPARQL P856 batch %d–%d of %d …",
+                 i + 1, min(i + _SPARQL_CHUNK_SIZE, len(qids)), len(qids))
+        out.update(_sparql_batch_websites(chunk))
+    return out
 
 
 def enrich_wikidata(legal_name: str) -> dict:
@@ -289,7 +391,10 @@ def enrich_wikipedia(legal_name: str) -> str | None:
     Filters out legal case titles (contain " v. ") and disambiguation pages.
     """
     stripped = strip_legal_suffixes(legal_name)
-    for query in [legal_name, stripped]:
+    queries = [legal_name]
+    if stripped and stripped != legal_name:
+        queries.append(stripped)
+    for query in queries:
         r = _api_get(_WIKIPEDIA_API, {
             "action": "query", "list": "search",
             "srsearch": query, "srlimit": 3,
@@ -297,7 +402,11 @@ def enrich_wikipedia(legal_name: str) -> str | None:
         }, "Wikipedia search", _wikipedia_limiter)
         if not r:
             continue
-        hits = r.json().get("query", {}).get("search", [])
+        try:
+            hits = r.json().get("query", {}).get("search", [])
+        except ValueError:
+            log.debug("Wikipedia search: malformed JSON response for query %r", query)
+            continue
         for hit in hits:
             title = hit.get("title", "")
             # Skip legal cases and disambiguation pages
@@ -535,13 +644,14 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
     cur.execute("""
         INSERT INTO h1b_ats_discovery
             (employer_fein, employer_name, canonical_name, canonical_source,
-             website_url, careers_url, detected_platform, detected_slug,
-             last_checked)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+             wikidata_qid, website_url, careers_url, detected_platform,
+             detected_slug, last_checked)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (employer_fein) DO UPDATE SET
             employer_name    = EXCLUDED.employer_name,
             canonical_name   = EXCLUDED.canonical_name,
             canonical_source = EXCLUDED.canonical_source,
+            wikidata_qid     = COALESCE(EXCLUDED.wikidata_qid, h1b_ats_discovery.wikidata_qid),
             website_url      = EXCLUDED.website_url,
             careers_url      = EXCLUDED.careers_url,
             detected_platform= EXCLUDED.detected_platform,
@@ -552,6 +662,7 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data["employer_name"],
         data.get("canonical_name"),
         data.get("canonical_source"),
+        data.get("wikidata_qid"),
         data.get("website_url"),
         data.get("careers_url"),
         data.get("detected_platform"),
@@ -564,52 +675,78 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
 # Core processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def process_employer(emp: dict, conn, dry_run: bool, use_llm: bool,
-                     force: bool) -> dict:
+def _is_recently_checked(fein: str, conn, force: bool) -> dict | None:
+    """Return existing row if it was checked within _RECHECK_DAYS and force=False."""
+    if force:
+        return None
+    existing = get_discovery_row(fein, conn)
+    if not (existing and existing.get("last_checked")):
+        return None
+    from datetime import datetime, timezone
+    lc = existing["last_checked"]
+    if lc.tzinfo is None:
+        lc = lc.replace(tzinfo=timezone.utc)
+    else:
+        lc = lc.astimezone(timezone.utc)
+    if (datetime.now(timezone.utc) - lc).days < _RECHECK_DAYS:
+        return existing
+    return None
+
+
+def process_employer(
+    emp: dict,
+    conn,
+    dry_run: bool,
+    use_llm: bool,
+    force: bool,
+    prefetched: dict | None = None,
+) -> dict:
+    """
+    Enrich one employer and upsert into h1b_ats_discovery.
+
+    prefetched (batch mode only): dict with keys canonical_name, website_url,
+    canonical_source — skips Wikidata calls when provided. Wikipedia/LLM/regex
+    fallbacks still run when canonical_name is missing.
+    """
     fein  = emp["employer_fein"]
     name  = emp["employer_name"]
 
     log.info("── %s  %s", fein, name)
 
     # Skip if recently checked (unless forced)
-    if not force:
-        existing = get_discovery_row(fein, conn)
-        if existing and existing.get("last_checked"):
-            from datetime import datetime, timezone, timedelta
-            lc = existing["last_checked"]
-            # TIMESTAMPTZ from psycopg2 is tz-aware; naive timestamps get UTC attached
-            if lc.tzinfo is None:
-                lc = lc.replace(tzinfo=timezone.utc)
-            else:
-                lc = lc.astimezone(timezone.utc)
-            age = datetime.now(timezone.utc) - lc
-            if age.days < _RECHECK_DAYS:
-                log.info("  Skipping — checked %d days ago", age.days)
-                return existing
+    existing = _is_recently_checked(fein, conn, force)
+    if existing:
+        log.info("  Skipping — checked recently")
+        return existing
 
-    # Step 1: Wikidata
-    log.info("  Wikidata …")
-    wd = enrich_wikidata(name)
-    time.sleep(0.5)
+    if prefetched is not None:
+        # Batch mode: Wikidata search + P856 already resolved upstream
+        wikidata_qid     = prefetched.get("qid")
+        canonical_name   = prefetched.get("canonical_name")
+        website_url      = prefetched.get("website_url")
+        canonical_source = prefetched.get("canonical_source")
+    else:
+        # Single-employer mode (--fein): full inline Wikidata call
+        log.info("  Wikidata …")
+        wd = enrich_wikidata(name)
+        wikidata_qid     = wd["qid"]
+        canonical_name   = wd["canonical_name"]
+        website_url      = wd["website_url"]
+        canonical_source = wd["source"]
 
-    canonical_name   = wd["canonical_name"]
-    website_url      = wd["website_url"]
-    canonical_source = wd["source"]
-
-    # Step 2: Wikipedia fallback for canonical name
+    # Wikipedia fallback for canonical name
     if not canonical_name:
         log.info("  Wikipedia fallback …")
         canonical_name   = enrich_wikipedia(name)
         canonical_source = "wikipedia" if canonical_name else None
-        time.sleep(0.3)
 
-    # Step 3: Qwen3 fallback
+    # Qwen3 fallback
     if not canonical_name and use_llm:
         log.info("  Qwen3 fallback …")
         canonical_name   = llm_extract_brand(name)
         canonical_source = "qwen" if canonical_name else None
 
-    # Step 4: Regex suffix strip as last resort for canonical name
+    # Regex suffix strip as last resort
     if not canonical_name:
         canonical_name   = strip_legal_suffixes(name)
         canonical_source = "regex" if canonical_name != name else None
@@ -642,6 +779,7 @@ def process_employer(emp: dict, conn, dry_run: bool, use_llm: bool,
         "employer_name":    name,
         "canonical_name":   canonical_name,
         "canonical_source": canonical_source,
+        "wikidata_qid":     wikidata_qid,
         "website_url":      website_url,
         "careers_url":      careers_url,
         "detected_platform": detected_platform,
@@ -655,6 +793,17 @@ def process_employer(emp: dict, conn, dry_run: bool, use_llm: bool,
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _tally(stats: dict, result: dict, force: bool) -> None:
+    if result.get("last_checked") and not force:
+        stats["skipped"] += 1
+        return
+    stats["processed"] += 1
+    if result.get("website_url"):
+        stats["with_website"] += 1
+    if result.get("detected_platform"):
+        stats["with_ats"] += 1
+
 
 def main():
     init_logging("discover_h1b_ats")
@@ -695,25 +844,91 @@ def main():
 
     stats = {"processed": 0, "with_website": 0, "with_ats": 0, "skipped": 0}
 
-    for i, emp in enumerate(employers, 1):
-        log.info("[%d/%d]", i, len(employers))
-        result = process_employer(
-            emp, conn,
-            dry_run=args.dry_run,
-            use_llm=args.llm,
-            force=args.force,
-        )
-        if result.get("last_checked") and not args.force:
-            stats["skipped"] += 1
-            continue
-        stats["processed"] += 1
-        if result.get("website_url"):
-            stats["with_website"] += 1
-        if result.get("detected_platform"):
-            stats["with_ats"] += 1
+    if args.fein:
+        # ── Single-employer mode: inline Wikidata calls, no batching ─────────
+        for i, emp in enumerate(employers, 1):
+            log.info("[%d/%d]", i, len(employers))
+            result = process_employer(
+                emp, conn,
+                dry_run=args.dry_run,
+                use_llm=args.llm,
+                force=args.force,
+            )
+            _tally(stats, result, args.force)
+    else:
+        # ── Batch mode: two-phase Wikidata → SPARQL P856 → career probe ──────
+        #
+        # Phase 1: search all employers (REST API, 100 RPM) → collect QIDs
+        log.info("Phase 1: Wikidata search for %d employers …", len(employers))
+        search_map: dict[str, dict] = {}   # fein → {qid, canonical_name, canonical_source}
+        all_qids: list[str] = []
 
-        # Polite delay between employers
-        time.sleep(1.0)
+        for i, emp in enumerate(employers, 1):
+            fein = emp["employer_fein"]
+            name = emp["employer_name"]
+
+            existing = get_discovery_row(fein, conn)
+
+            # Skip entirely if checked recently (existing behaviour)
+            if _is_recently_checked(fein, conn, args.force):
+                log.info("[%d/%d] skip (recent): %s", i, len(employers), name)
+                search_map[fein] = {"skip": True}
+                stats["skipped"] += 1
+                continue
+
+            cached_qid = existing.get("wikidata_qid") if existing else None
+
+            if cached_qid and not args.force:
+                # QID already known — skip search entirely, go straight to SPARQL batch
+                log.info("[%d/%d] qid cached (%s): %s", i, len(employers), cached_qid, name)
+                entry = {
+                    "qid":            cached_qid,
+                    "canonical_name": existing.get("canonical_name"),
+                    "canonical_source": existing.get("canonical_source"),
+                }
+            else:
+                # New company or --force: run Wikidata search
+                log.info("[%d/%d search] %s", i, len(employers), name)
+                qid, canonical_name = _wikidata_search_for_qid(name)
+                entry = {
+                    "qid":            qid,
+                    "canonical_name": canonical_name,
+                    "canonical_source": "wikidata" if (qid or canonical_name) else None,
+                }
+
+            search_map[fein] = entry
+            if entry.get("qid"):
+                all_qids.append(entry["qid"])
+
+        # Phase 2: batch-fetch P856 via SPARQL (one query per 100 QIDs)
+        log.info("Phase 2: SPARQL P856 batch for %d QIDs …", len(all_qids))
+        website_map = _sparql_batch_websites_all(all_qids)  # {qid: url_or_None}
+
+        # Merge website URLs back into search_map
+        for fein, entry in search_map.items():
+            if entry.get("skip"):
+                continue
+            qid = entry.get("qid")
+            entry["website_url"] = website_map.get(qid) if qid else None
+
+        # Phase 3: career probe + upsert per employer
+        log.info("Phase 3: career probe for %d employers …", len(employers))
+        for i, emp in enumerate(employers, 1):
+            fein = emp["employer_fein"]
+            entry = search_map.get(fein, {})
+            if entry.get("skip"):
+                continue
+            log.info("[%d/%d career] %s  %s", i, len(employers),
+                     fein, emp["employer_name"])
+            result = process_employer(
+                emp, conn,
+                dry_run=args.dry_run,
+                use_llm=args.llm,
+                force=args.force,
+                prefetched=entry,
+            )
+            _tally(stats, result, args.force)
+            time.sleep(0.2)  # light delay between career probes only
 
     conn.close()
 

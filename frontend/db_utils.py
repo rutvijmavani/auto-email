@@ -11,6 +11,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from db.connection import get_conn
 
 
+SOURCE_LABELS: dict[str, str] = {
+    "wikidata":  "🌐 Wikidata",
+    "wikipedia": "📖 Wikipedia",
+    "qwen":      "🤖 Qwen3",
+    "regex":     "🔤 Regex strip",
+}
+
+
 def query(sql: str, params=None) -> pd.DataFrame:
     """Execute SQL and return a DataFrame. Returns an empty DataFrame on no results."""
     conn = get_conn()
