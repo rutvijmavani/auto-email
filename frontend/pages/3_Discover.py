@@ -229,17 +229,19 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     )
 
     # Phase 1: KG API → canonical name + website + Freebase MID
-    kg      = kg_search(emp_name)
-    kg_mid  = None
+    kg             = kg_search(emp_name)
+    kg_mid         = None
+    canonical_name = None
+    website_url    = None
+    canonical_source = None
     if kg:
         kg_mid         = kg.get("kg_mid")
         canonical_name = kg.get("name") or None
         website_url    = kg.get("url") or None
         canonical_source = "kg_api" if (canonical_name or website_url) else None
-    if not kg or not canonical_name:
+    if not canonical_name:
         canonical_name   = strip_legal_suffixes(emp_name) or None
         canonical_source = canonical_source or ("regex" if canonical_name != emp_name else None)
-        website_url      = website_url if kg else None
 
     # Phase 2: Wikidata P646 → P10311 (official jobs URL)
     wikidata_qid = jobs_url = None
@@ -661,84 +663,71 @@ else:
     careers  = disc.get("careers_url")
     jobs_url = disc.get("jobs_url")
 
-    # ── Careers page (editable) ───────────────────────────────────────────────
-    with d3:
-        st.markdown("**Careers page**")
-        _ck = f"edit_careers_{fein}"
-        if st.session_state.get(_ck):
-            new_val = st.text_input("Career page URL", value=careers or "",
-                                    key=f"input_careers_{fein}",
-                                    label_visibility="collapsed")
-            s1, s2 = st.columns(2)
-            if s1.button("Save", key=f"save_careers_{fein}", type="primary"):
-                _url_to_save = new_val.strip() or None
-                if _url_to_save and not _url_to_save.startswith(("http://", "https://")):
-                    st.error("URL must start with http:// or https://")
+    def _url_editor(
+        container, title: str, db_col: str, key_prefix: str,
+        current_val: str | None,
+        display_md: str | None = None,
+        caption: str | None = None,
+    ) -> None:
+        """Inline URL editor: show value + Edit button, or text input + Save/Cancel.
+
+        current_val  — the actual URL stored in the DB (used in the text input).
+        display_md   — optional markdown override for the read-only view; falls
+                       back to a link on current_val, then "—".
+        """
+        _sk = f"{key_prefix}_{fein}"
+        container.markdown(f"**{title}**")
+        if st.session_state.get(_sk):
+            new_val = container.text_input(
+                title, value=current_val or "",
+                key=f"input_{key_prefix}_{fein}",
+                label_visibility="collapsed",
+            )
+            c1, c2 = container.columns(2)
+            if c1.button("Save", key=f"save_{key_prefix}_{fein}", type="primary"):
+                _to_save = new_val.strip() or None
+                if _to_save and not _to_save.startswith(("http://", "https://")):
+                    container.error("URL must start with http:// or https://")
                 else:
                     conn = get_conn()
                     try:
                         conn.execute(
-                            "UPDATE h1b_ats_discovery SET careers_url = %s WHERE employer_fein = %s",
-                            (_url_to_save, fein),
+                            f"UPDATE h1b_ats_discovery SET {db_col} = %s WHERE employer_fein = %s",
+                            (_to_save, fein),
                         )
                         conn.commit()
                     finally:
                         conn.close()
-                    st.session_state.pop(_ck, None)
+                    st.session_state.pop(_sk, None)
                     load_ats_discovery.clear()
                     st.rerun()
-            if s2.button("Cancel", key=f"cancel_careers_{fein}"):
-                st.session_state.pop(_ck, None)
+            if c2.button("Cancel", key=f"cancel_{key_prefix}_{fein}"):
+                st.session_state.pop(_sk, None)
                 st.rerun()
         else:
-            if careers:
-                st.markdown(f"[{careers}]({careers})")
-            else:
-                st.markdown("—")
-            if st.button("Edit", key=f"edit_careers_btn_{fein}"):
-                st.session_state[_ck] = True
+            shown = display_md or (f"[{current_val}]({current_val})" if current_val else "—")
+            container.markdown(shown)
+            if caption:
+                container.caption(caption)
+            if container.button("Edit", key=f"edit_{key_prefix}_btn_{fein}"):
+                st.session_state[_sk] = True
                 st.rerun()
 
+    # ── Careers page (editable) ───────────────────────────────────────────────
+    _url_editor(d3, "Careers page", "careers_url", "edit_careers", careers)
+
     # ── Official jobs URL (editable) ──────────────────────────────────────────
-    with d4:
-        st.markdown("**Official jobs URL**")
-        _jk = f"edit_jobs_{fein}"
-        if st.session_state.get(_jk):
-            new_jval = st.text_input("Official jobs URL", value=jobs_url or "",
-                                     key=f"input_jobs_{fein}",
-                                     label_visibility="collapsed")
-            j1, j2 = st.columns(2)
-            if j1.button("Save", key=f"save_jobs_{fein}", type="primary"):
-                _jurl_to_save = new_jval.strip() or None
-                if _jurl_to_save and not _jurl_to_save.startswith(("http://", "https://")):
-                    st.error("URL must start with http:// or https://")
-                else:
-                    conn = get_conn()
-                    try:
-                        conn.execute(
-                            "UPDATE h1b_ats_discovery SET jobs_url = %s WHERE employer_fein = %s",
-                            (_jurl_to_save, fein),
-                        )
-                        conn.commit()
-                    finally:
-                        conn.close()
-                    st.session_state.pop(_jk, None)
-                    load_ats_discovery.clear()
-                    st.rerun()
-            if j2.button("Cancel", key=f"cancel_jobs_{fein}"):
-                st.session_state.pop(_jk, None)
-                st.rerun()
-        else:
-            if jobs_url and jobs_url != careers:
-                st.markdown(f"[{jobs_url}]({jobs_url})")
-                st.caption("Source: Wikidata P10311")
-            elif jobs_url:
-                st.markdown("*(same as careers page)*")
-            else:
-                st.markdown("—")
-            if st.button("Edit", key=f"edit_jobs_btn_{fein}"):
-                st.session_state[_jk] = True
-                st.rerun()
+    if jobs_url and jobs_url != careers:
+        _jobs_display_md = f"[{jobs_url}]({jobs_url})"
+        _jobs_caption    = "Source: Wikidata P10311"
+    elif jobs_url:
+        _jobs_display_md = "*(same as careers page)*"
+        _jobs_caption    = None
+    else:
+        _jobs_display_md = None
+        _jobs_caption    = None
+    _url_editor(d4, "Official jobs URL", "jobs_url", "edit_jobs",
+                jobs_url, display_md=_jobs_display_md, caption=_jobs_caption)
 
     # ── Wikidata detail row ───────────────────────────────────────────────────
     if source == "wikidata":
@@ -805,7 +794,7 @@ else:
                         if inserted:
                             st.success("Added to pipeline! Queued for ATS detection.")
                         else:
-                            st.info("Already in pipeline. Re-queued for ATS detection.")
+                            st.info("Already in pipeline.")
                         st.rerun()
                     except Exception as exc:
                         log.exception("Failed to add %r to pipeline", name)
@@ -865,7 +854,7 @@ else:
                         if inserted:
                             st.success("Added to pipeline! Queued for ATS detection.")
                         else:
-                            st.info("Already in pipeline. Re-queued for ATS detection.")
+                            st.info("Already in pipeline.")
                         st.rerun()
                     except Exception as exc:
                         log.exception("Failed to confirm ATS for %r", name)

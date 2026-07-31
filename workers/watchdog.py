@@ -822,7 +822,9 @@ def _backpressure_threshold(r, pool: str) -> float:
     try:
         val = r.get(f"manager:backpressure:threshold:{pool}")
         if val:
-            return float(val)
+            parsed = float(val)
+            if 0 < parsed < float("inf"):
+                return parsed
     except Exception:
         pass
     return _DETAIL_DELAY_WARN_FALLBACK
@@ -1450,8 +1452,10 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
         # adaptive jobs would make a growing fullscan queue falsely appear as draining.
         draining = delta < 0
 
-        if depth == 0 or delay_s is None:
+        if depth == 0:
             issues.append(Issue(Issue.OK, label, f"depth=0 — idle{proc_note}"))
+        elif delay_s is None:
+            issues.append(Issue(Issue.OK, label, f"depth={depth:,} — delay data unavailable{proc_note}"))
         elif draining:
             if delay_s > delay_warn_s:
                 issues.append(Issue(Issue.WARNING, label,
