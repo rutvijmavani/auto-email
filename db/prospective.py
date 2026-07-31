@@ -1,6 +1,63 @@
 # db/prospective.py — Prospective company DB operations
 
+import os
+from datetime import datetime
+
 from db.connection import get_conn
+
+_SHEET_ID         = os.environ.get("GOOGLE_SHEET_ID", "")
+_CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+_SHEET_NAME       = "Prospective"
+_SCOPES           = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def submit_to_prospective_sheet(
+    company: str,
+    career_page_url: str | None = None,
+    job_url: str | None = None,
+    domain: str | None = None,
+    notes: str = "via H1B Discover",
+) -> None:
+    """
+    Append one row to the 'Prospective' Google Sheet tab so that
+    prospective_form_sync.py picks it up on next run and runs full
+    ATS detection (career page fingerprint, job URL pattern match, etc.).
+
+    Column order matches the sheet exactly:
+      Timestamp | Company Name | Job URL | Domain | Career Page URL |
+      XML/Sitemap URL | Listing Curl | Detail Curl | Notes
+    """
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds  = Credentials.from_service_account_file(_CREDENTIALS_FILE, scopes=_SCOPES)
+    client = gspread.authorize(creds)
+    sheet  = client.open_by_key(_SHEET_ID)
+    try:
+        ws = sheet.worksheet(_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(_SHEET_NAME, rows=200, cols=9)
+        ws.update("A1:I1", [[
+            "Timestamp", "Company Name", "Job URL",
+            "Domain", "Career Page URL", "XML/Sitemap URL",
+            "Listing Curl", "Detail Curl", "Notes",
+        ]])
+
+    row = [
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+        company,                                            # Company Name
+        job_url         or "",                              # Job URL
+        domain          or "",                              # Domain
+        career_page_url or "",                              # Career Page URL
+        "",                                                 # XML/Sitemap URL
+        "",                                                 # Listing Curl
+        "",                                                 # Detail Curl
+        notes,                                              # Notes
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
 
 
 def _normalize_company(name):

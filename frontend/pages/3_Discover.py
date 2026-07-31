@@ -18,7 +18,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
-from db.prospective import add_prospective_company
+from db.prospective import add_prospective_company, submit_to_prospective_sheet
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
@@ -186,14 +186,20 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
     """, (fein, fein))
 
 
-def _pipeline_status(employer_name: str) -> str | None:
-    """Return existing pipeline status string, or None if not in pipeline."""
+def _pipeline_status(employer_name: str, canonical_name: str | None = None) -> str | None:
+    """Return existing pipeline status string, or None if not in pipeline.
+    Checks both the raw DOL name and canonical_name (added via ATS panel).
+    """
+    names = [employer_name.strip()]
+    if canonical_name and canonical_name not in ("—", employer_name.strip()):
+        names.append(canonical_name.strip())
     conn = get_conn()
     try:
         cur = conn.cursor()
+        placeholders = ", ".join(["%s"] * len(names))
         cur.execute(
-            "SELECT status FROM prospective_companies WHERE company = %s",
-            (employer_name.strip(),),
+            f"SELECT status FROM prospective_companies WHERE company IN ({placeholders})",
+            names,
         )
         row = cur.fetchone()
         return dict(row)["status"] if row else None
@@ -213,33 +219,41 @@ def load_ats_discovery(fein: str) -> dict | None:
 def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     """
     Run a quick inline ATS discovery from the UI.
-    Calls Wikidata + careers-page fingerprint without Qwen3.
+    KG API → Wikidata P10311 → career probe. No Qwen3/Brave.
     Writes result to h1b_ats_discovery and returns the row.
     """
     import time
     from scripts.discover_h1b_ats import (
-        enrich_wikidata, enrich_wikipedia, strip_legal_suffixes,
+        kg_search, _sparql_batch_p10311, strip_legal_suffixes,
         discover_careers_url, upsert_discovery,
     )
 
-    wd = enrich_wikidata(emp_name)
-    time.sleep(0.4)
-    canonical_name   = wd["canonical_name"]
-    website_url      = wd["website_url"]
-    canonical_source = wd["source"]
-
-    if not canonical_name:
-        canonical_name   = enrich_wikipedia(emp_name)
-        canonical_source = "wikipedia" if canonical_name else None
-        time.sleep(0.3)
-
-    if not canonical_name:
+    # Phase 1: KG API → canonical name + website + Freebase MID
+    kg      = kg_search(emp_name)
+    kg_mid  = None
+    if kg:
+        canonical_name   = kg["name"]
+        website_url      = kg.get("url")
+        canonical_source = "kg_api"
+        kg_mid           = kg.get("kg_mid")
+    else:
         canonical_name   = strip_legal_suffixes(emp_name)
         canonical_source = "regex" if canonical_name != emp_name else None
+        website_url      = None
 
-    careers_url = detected_platform = detected_slug = None
+    # Phase 2: Wikidata P646 → P10311 (official jobs URL)
+    wikidata_qid = jobs_url = None
+    if kg_mid:
+        sparql_result = _sparql_batch_p10311([kg_mid])
+        wd = sparql_result.get(kg_mid, {})
+        wikidata_qid = wd.get("qid")
+        jobs_url     = wd.get("jobs_url")
+
+    # Phase 3: career probe (skip if P10311 found)
+    careers_url = jobs_url  # use Wikidata jobs URL if available
+    detected_platform = detected_slug = None
     probe_error = None
-    if website_url:
+    if not careers_url and website_url:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(discover_careers_url, website_url)
             try:
@@ -258,13 +272,14 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
         "employer_name":     emp_name,
         "canonical_name":    canonical_name,
         "canonical_source":  canonical_source,
+        "wikidata_qid":      wikidata_qid,
+        "kg_mid":            kg_mid,
         "website_url":       website_url,
+        "jobs_url":          jobs_url,
         "careers_url":       careers_url,
         "detected_platform": detected_platform,
         "detected_slug":     detected_slug,
     }
-    # Surface probe errors in the UI without raising (result is still persisted as
-    # "ATS unknown" so a retry is possible and the row is not lost).
     if probe_error:
         import streamlit as _st
         _st.warning(f"Careers probe failed: {probe_error}. Result saved as ATS unknown.")
@@ -424,6 +439,9 @@ st.caption(
     f"  ·  NAICS: `{emp['naics_code'] or '—'}`"
 )
 
+disc = load_ats_discovery(fein)
+_canonical = (disc or {}).get("canonical_name") or None
+
 col_chart, col_meta = st.columns([3, 1])
 
 with col_chart:
@@ -456,13 +474,14 @@ with col_meta:
 
     st.divider()
 
-    existing_status = _pipeline_status(name)
+    existing_status = _pipeline_status(name, _canonical)
     if existing_status:
         st.success(f"In pipeline — {existing_status}")
     else:
+        pipeline_name = _canonical if _canonical and _canonical != "—" else name
         if st.button("➕ Add to pipeline", use_container_width=True, type="primary"):
             try:
-                inserted = add_prospective_company(name, priority=0)
+                inserted = add_prospective_company(pipeline_name, priority=0)
                 if inserted:
                     st.success("Added to pipeline!")
                     st.rerun()
@@ -606,12 +625,10 @@ else:
 st.divider()
 st.markdown("#### ATS Discovery")
 
-disc = load_ats_discovery(fein)
-
 if disc is None:
     st.info("No discovery data yet for this employer.")
     if st.button("Run ATS discovery", key="run_disc"):
-        with st.spinner("Querying Wikidata + probing careers page …"):
+        with st.spinner("Querying KG API + Wikidata + probing careers page …"):
             try:
                 disc = _run_inline_discovery(fein, name)
                 st.cache_data.clear()
@@ -621,7 +638,7 @@ if disc is None:
                 st.error(f"Discovery failed: {exc}")
 else:
     # ── Info row ─────────────────────────────────────────────────────────────
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
 
     canonical = disc.get("canonical_name") or "—"
     source    = disc.get("canonical_source") or ""
@@ -636,11 +653,79 @@ else:
     else:
         d2.markdown("**Website**\n\n—")
 
-    careers = disc.get("careers_url")
-    if careers:
-        d3.markdown(f"**Careers page**\n\n[{careers}]({careers})")
-    else:
-        d3.markdown("**Careers page**\n\n—")
+    careers  = disc.get("careers_url")
+    jobs_url = disc.get("jobs_url")
+
+    # ── Careers page (editable) ───────────────────────────────────────────────
+    with d3:
+        st.markdown("**Careers page**")
+        _ck = f"edit_careers_{fein}"
+        if st.session_state.get(_ck):
+            new_val = st.text_input("", value=careers or "", key=f"input_careers_{fein}",
+                                    label_visibility="collapsed")
+            s1, s2 = st.columns(2)
+            if s1.button("Save", key=f"save_careers_{fein}", type="primary"):
+                _url_to_save = new_val.strip() or None
+                conn = get_conn()
+                try:
+                    conn.execute(
+                        "UPDATE h1b_ats_discovery SET careers_url = %s WHERE employer_fein = %s",
+                        (_url_to_save, fein),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                st.session_state.pop(_ck, None)
+                load_ats_discovery.clear()
+                st.rerun()
+            if s2.button("Cancel", key=f"cancel_careers_{fein}"):
+                st.session_state.pop(_ck, None)
+                st.rerun()
+        else:
+            if careers:
+                st.markdown(f"[{careers}]({careers})")
+            else:
+                st.markdown("—")
+            if st.button("Edit", key=f"edit_careers_btn_{fein}"):
+                st.session_state[_ck] = True
+                st.rerun()
+
+    # ── Official jobs URL (editable) ──────────────────────────────────────────
+    with d4:
+        st.markdown("**Official jobs URL**")
+        _jk = f"edit_jobs_{fein}"
+        if st.session_state.get(_jk):
+            new_jval = st.text_input("", value=jobs_url or "", key=f"input_jobs_{fein}",
+                                     label_visibility="collapsed")
+            j1, j2 = st.columns(2)
+            if j1.button("Save", key=f"save_jobs_{fein}", type="primary"):
+                _jurl_to_save = new_jval.strip() or None
+                conn = get_conn()
+                try:
+                    conn.execute(
+                        "UPDATE h1b_ats_discovery SET jobs_url = %s WHERE employer_fein = %s",
+                        (_jurl_to_save, fein),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                st.session_state.pop(_jk, None)
+                load_ats_discovery.clear()
+                st.rerun()
+            if j2.button("Cancel", key=f"cancel_jobs_{fein}"):
+                st.session_state.pop(_jk, None)
+                st.rerun()
+        else:
+            if jobs_url and jobs_url != careers:
+                st.markdown(f"[{jobs_url}]({jobs_url})")
+                st.caption("Source: Wikidata P10311")
+            elif jobs_url:
+                st.markdown("*(same as careers page)*")
+            else:
+                st.markdown("—")
+            if st.button("Edit", key=f"edit_jobs_btn_{fein}"):
+                st.session_state[_jk] = True
+                st.rerun()
 
     # ── Wikidata detail row ───────────────────────────────────────────────────
     if source == "wikidata":
@@ -667,18 +752,27 @@ else:
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            pipeline_st = _pipeline_status(name)
+            pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None)
             if monitored or pipeline_st:
                 st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
             else:
                 if st.button("Add to monitoring", key="add_mon", type="primary"):
                     try:
+                        pipeline_name = canonical if canonical != "—" else name
                         inserted = add_prospective_company(
-                            canonical if canonical != "—" else name,
+                            pipeline_name,
                             priority=1,
                             domain=website,
                         )
-                        # Mark is_monitored only after the pipeline insert succeeds
+                        # Feed careers_url + jobs_url to the sheet so
+                        # prospective_form_sync.py can detect the ATS on next run.
+                        submit_to_prospective_sheet(
+                            company        = pipeline_name,
+                            career_page_url= disc.get("careers_url"),
+                            job_url        = disc.get("jobs_url"),
+                            domain         = website,
+                        )
+                        # Mark is_monitored only after pipeline insert succeeds
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
@@ -692,9 +786,9 @@ else:
                             conn.close()
                         load_ats_discovery.clear()
                         if inserted:
-                            st.success("Added to pipeline!")
+                            st.success("Added to pipeline! Queued for ATS detection.")
                         else:
-                            st.info("Already in pipeline.")
+                            st.info("Already in pipeline. Re-queued for ATS detection.")
                         st.rerun()
                     except Exception as exc:
                         log.exception("Failed to add %r to pipeline", name)
@@ -718,11 +812,20 @@ else:
 
                 if st.button("Confirm and add to monitoring", key="confirm_ats", type="primary"):
                     try:
+                        pipeline_name = canonical if canonical != "—" else name
                         # Insert into pipeline first; only mark is_monitored on success
                         inserted = add_prospective_company(
-                            canonical if canonical != "—" else name,
+                            pipeline_name,
                             priority=1,
                             domain=website,
+                        )
+                        # Feed the pasted job URL + existing careers_url to the sheet
+                        # so prospective_form_sync.py can detect ATS on next run.
+                        submit_to_prospective_sheet(
+                            company        = pipeline_name,
+                            career_page_url= disc.get("careers_url"),
+                            job_url        = paste_url,
+                            domain         = website,
                         )
                         conn = get_conn()
                         try:
@@ -740,9 +843,9 @@ else:
                             conn.close()
                         load_ats_discovery.clear()
                         if inserted:
-                            st.success("Added to pipeline!")
+                            st.success("Added to pipeline! Queued for ATS detection.")
                         else:
-                            st.info("Already in pipeline.")
+                            st.info("Already in pipeline. Re-queued for ATS detection.")
                         st.rerun()
                     except Exception as exc:
                         log.exception("Failed to confirm ATS for %r", name)

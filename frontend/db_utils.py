@@ -16,6 +16,7 @@ SOURCE_LABELS: dict[str, str] = {
     "wikipedia": "📖 Wikipedia",
     "qwen":      "🤖 Qwen3",
     "regex":     "🔤 Regex strip",
+    "kg_api":    "🔍 Google KG",
 }
 
 
