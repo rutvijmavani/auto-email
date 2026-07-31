@@ -26,7 +26,7 @@ import re
 import socket
 import sys
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -73,6 +73,7 @@ _CAREER_SUBDOMAINS = [
 
 _HTTP_TIMEOUT   = 12
 _RECHECK_DAYS   = 7
+_MAX_REDIRECTS  = 10
 
 _LEGAL_SUFFIXES = re.compile(
     r"\s*[,.]?\s*\b(?:LLC|L\.L\.C\.|INC\.?|CORP\.?|CORPORATION|"
@@ -107,9 +108,12 @@ def _is_public_url(url: str) -> bool:
     """
     Return True only when url resolves to a public routable address.
     Rejects loopback, link-local, private RFC1918, and cloud-metadata ranges.
+    Only http and https schemes are allowed.
     """
     try:
         parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
         host   = parsed.hostname
         if not host:
             return False
@@ -336,18 +340,28 @@ def _url_is_reachable(url: str) -> bool:
 def _fetch_html(url: str) -> tuple[str | None, str]:
     """
     GET url; return (html_text, final_url).
-    Returns (None, url) on failure or when the redirect destination is non-public.
+    Manually follows redirects so every intermediate hop is SSRF-validated.
+    Returns (None, url) on failure or when any hop resolves to a non-public address.
     """
     if not _is_public_url(url):
         return None, url
+    current = url
     try:
-        r = requests.get(url, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
-                         allow_redirects=True)
-        if r.status_code < 400:
-            if r.url != url and not _is_public_url(r.url):
-                log.debug("Redirect to non-public URL blocked: %s", r.url)
-                return None, url
-            return r.text, r.url
+        for _ in range(_MAX_REDIRECTS):
+            r = requests.get(current, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
+                             allow_redirects=False)
+            if r.is_redirect:
+                location = r.headers.get("Location", "")
+                next_url  = urljoin(current, location)
+                if not _is_public_url(next_url):
+                    log.debug("Redirect to non-public URL blocked: %s", next_url)
+                    return None, url
+                current = next_url
+                continue
+            if r.status_code < 400:
+                return r.text, current
+            return None, current
+        log.debug("Too many redirects for %s", url)
     except requests.exceptions.RequestException as e:
         log.debug("Fetch error %s: %s", url, e)
     return None, url

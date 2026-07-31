@@ -21,6 +21,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import queue
 import re
 import sys
 import time
@@ -81,10 +82,7 @@ def _child_infer(q: multiprocessing.Queue, prompt: str, model_path: str) -> None
             max_tokens=120,
             temperature=0,
         )
-        try:
-            q.put(("ok", resp))
-        except Exception:
-            q.put(("ok", resp))
+        q.put(("ok", resp))
     except Exception as exc:
         try:
             q.put(("err", RuntimeError(str(exc))))
@@ -106,12 +104,13 @@ def _run_with_timeout(prompt: str, timeout: int = _INFERENCE_TIMEOUT):
             p.terminate()
             p.join()
             raise RuntimeError(f"Inference timed out after {timeout}s")
-        if not q.empty():
-            kind, val = q.get_nowait()
+        try:
+            kind, val = q.get(timeout=2)
             if kind == "ok":
                 return val
             raise val
-        raise RuntimeError("Inference process exited without result")
+        except queue.Empty:
+            raise RuntimeError("Inference process exited without result")
     finally:
         q.close()
         q.join_thread()
@@ -258,9 +257,6 @@ def _ask_model(uscis_name: str, uscis_norm: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(limit: "int | None" = None, dry_run: bool = False) -> None:
-    if not dry_run:
-        _load_model()
-
     conn = get_conn()
     try:
         _run_body(conn, limit, dry_run)

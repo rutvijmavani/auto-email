@@ -5,6 +5,7 @@ Browse aggregated LCA disclosures to find companies worth adding to the pipeline
 All filtering is SQL-based with indexed columns; no pandas post-filtering.
 """
 
+import concurrent.futures
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ from db.prospective import add_prospective_company
 from frontend.db_utils import query as _query
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
+_INLINE_PROBE_TIMEOUT = 30  # seconds; caps career-page probe in inline discovery
 
 log = logging.getLogger(__name__)
 
@@ -237,13 +239,18 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     careers_url = detected_platform = detected_slug = None
     probe_error = None
     if website_url:
-        try:
-            careers_url, detected_platform, detected_slug = discover_careers_url(
-                website_url
-            )
-        except Exception as e:
-            probe_error = str(e)
-            log.warning("Career-page probe failed for %r: %s", emp_name, e)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(discover_careers_url, website_url)
+            try:
+                careers_url, detected_platform, detected_slug = future.result(
+                    timeout=_INLINE_PROBE_TIMEOUT
+                )
+            except concurrent.futures.TimeoutError:
+                probe_error = f"Career probe timed out after {_INLINE_PROBE_TIMEOUT}s"
+                log.warning("Career-page probe timed out for %r", emp_name)
+            except Exception as e:
+                probe_error = str(e)
+                log.warning("Career-page probe failed for %r: %s", emp_name, e)
 
     data = {
         "employer_fein":     fein,
