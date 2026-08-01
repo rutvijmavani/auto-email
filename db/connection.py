@@ -48,12 +48,14 @@ DAILY_LIMITS: dict = {
     "gemini-2.5-flash-lite": 20,
     "gemini-2.5-flash":      20,
     "gemma-4-31b-it":        1500,
+    "kg_api":                100_000,
 }
 
 RPM_LIMITS: dict = {
     "gemini-2.5-flash-lite": 10,
     "gemini-2.5-flash":       5,
     "gemma-4-31b-it":        15,
+    "kg_api":                600,
 }
 
 

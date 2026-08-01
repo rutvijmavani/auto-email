@@ -649,8 +649,9 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
                 fs_total=10, fs_overdue=2,
                 fs_head=("BigCorp", 1_699_980_000.0),
                 fs_lock=False, detail_adp=0, detail_fs=0,
+                detail_adp_delay_s=None, detail_fs_delay_s=None,
                 scan_proc=50, fs_proc=5, detail_proc=200,
-                xpending_total=0):
+                xpending_total=0, backpressure_threshold_s=300.0):
         """
         Build a Redis mock for check_queue_health().
         snap=None → no prior snapshot (baseline cycle).
@@ -718,11 +719,29 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             return 0
         r.llen.side_effect = _llen
 
-        # get — snapshot key + per-PID worker keys for _worker_processed
+        # lindex — oldest detail queue item for delay computation
+        def _lindex(key, idx):
+            from config import REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN
+            delay_s = None
+            if key == REDIS_DETAIL_ADAPTIVE:
+                delay_s = detail_adp_delay_s
+            elif key == REDIS_DETAIL_FULLSCAN:
+                delay_s = detail_fs_delay_s
+            if delay_s is None:
+                return None
+            enqueued_ts = now - delay_s
+            from datetime import datetime, timezone
+            enqueued_at = datetime.fromtimestamp(enqueued_ts, tz=timezone.utc).isoformat()
+            return json.dumps({"enqueued_at": enqueued_at, "company": "test"}).encode()
+        r.lindex.side_effect = _lindex
+
+        # get — snapshot key + per-PID worker keys + backpressure threshold
         def _get(key):
             key_s = key.decode() if isinstance(key, bytes) else key
             if key_s == WATCHDOG_SNAPSHOT_KEY:
                 return json.dumps(snap).encode() if snap else None
+            if key_s.startswith("manager:backpressure:threshold:"):
+                return str(backpressure_threshold_s).encode()
             # per-PID heartbeat keys returned by _scan above
             if "worker:alive:scan_worker:" in key_s:
                 return json.dumps({"pid": 1, "ts": now - 5, "processed": scan_proc}).encode()
@@ -868,30 +887,59 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
 
     def test_detail_queue_draining_ok(self):
-        """depth decreased since last cycle AND below DETAIL_QUEUE_WARN → draining → OK."""
+        """Depth decreased, delay well below threshold → draining → OK."""
         from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
             "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
-            "detail_adp_depth": 80, "detail_fs_depth": 0,  # was 80
+            "detail_adp_depth": 80, "detail_fs_depth": 0,
             "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
         }
-        issues, _ = self._run(snap=snap, detail_adp=60)  # now 60 < 80 < DETAIL_QUEUE_WARN(100) → OK
-        level = self._level(issues, "queue:detail:adaptive")
-        self.assertEqual(level, Issue.OK)
+        # delay=60s < threshold*0.75 (225s) → draining and delay fine → OK
+        issues, _ = self._run(snap=snap, detail_adp=60, detail_adp_delay_s=60.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
 
-    def test_detail_queue_stalled_at_alert_level_is_error(self):
-        """depth > DETAIL_QUEUE_ALERT and not draining → ERROR."""
-        from workers.watchdog import Issue, DETAIL_QUEUE_ALERT
-        depth = DETAIL_QUEUE_ALERT + 10
+    def test_detail_queue_stalled_delay_exceeds_threshold_is_error(self):
+        """Delay exceeds threshold and queue not draining → ERROR."""
+        from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
             "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
-            "detail_adp_depth": depth, "detail_fs_depth": 0,  # same depth
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
             "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
         }
-        issues, _ = self._run(snap=snap, detail_adp=depth, detail_proc=200)
+        # delay=400s > threshold=300s, depth unchanged (stalled) → ERROR
+        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0,
+                              backpressure_threshold_s=300.0, detail_proc=200)
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def test_detail_queue_non_default_threshold_delay_just_over_is_error(self):
+        """Non-default threshold: delay just above threshold → ERROR."""
+        from workers.watchdog import Issue
+        snap = {
+            "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
+            "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
+            "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+        }
+        # delay=151s > threshold=150s (non-default) → stalled and over threshold → ERROR
+        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=151.0,
+                              backpressure_threshold_s=150.0, detail_proc=200)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def test_detail_queue_non_default_threshold_delay_well_below_is_ok(self):
+        """Non-default threshold: delay well below threshold → OK."""
+        from workers.watchdog import Issue
+        snap = {
+            "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
+            "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
+            "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+        }
+        # delay=400s < threshold*0.75 (450s) with threshold=600 (non-default) → OK
+        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0,
+                              backpressure_threshold_s=600.0, detail_proc=200)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

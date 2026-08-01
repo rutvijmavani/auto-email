@@ -1500,6 +1500,14 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS wikidata_qid TEXT
     """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS kg_mid TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS jobs_url TEXT
+    """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
