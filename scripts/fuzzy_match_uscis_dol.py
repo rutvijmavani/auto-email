@@ -51,9 +51,7 @@ _FUZZY_DOMINANT_SCORE  = 80   # dominant-winner rule: best >= this AND gap >= _F
 _FUZZY_DOMINANT_GAP    = 25   # minimum gap between best and second score to auto-match
 _TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto threshold
 _LOAD_HEARTBEAT_S      = 5    # worker sends a heartbeat this often while loading the model
-_SILENCE_S             = 30   # seconds of silence (no heartbeat during load, no token during
-                               # inference) before treating the worker as genuinely stuck.
-                               # Not a total time limit — progress resets the clock each time.
+_POLL_S                = 5    # how often infer() polls res_q before checking proc.is_alive()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,13 +142,15 @@ class _Worker:
         log.info("Loading Qwen3-8B in worker (pid=%d) …", self._proc.pid)
         while True:
             try:
-                kind, val = self._res_q.get(timeout=_SILENCE_S)
+                kind, val = self._res_q.get(timeout=_POLL_S)
             except queue.Empty:
-                self._kill()
-                raise RuntimeError(
-                    f"Model load stalled — no heartbeat for {_SILENCE_S}s "
-                    "(disk I/O hung, OOM, or process crashed)"
-                )
+                if not self._proc.is_alive():
+                    self._kill()
+                    raise RuntimeError(
+                        "Worker process died during model load (OOM or crash)"
+                    )
+                log.debug("  … model still loading")
+                continue
             if kind == "loading":
                 log.debug("  … model still loading (heartbeat received)")
             elif kind == "ready":
@@ -169,28 +169,26 @@ class _Worker:
         """
         Send prompt, stream tokens back, return the full generated text.
 
-        No wall-clock timeout. Progress is tracked token-by-token: as long as
-        tokens keep arriving the model is working (even slowly). Only if no
-        token arrives for _SILENCE_S seconds is the model considered stuck,
-        at which point the worker is restarted and RuntimeError is raised.
-        Automatically starts (or restarts) the worker if it is not alive.
+        No wall-clock timeout. Polls res_q every _POLL_S seconds; on each miss
+        checks proc.is_alive(). A live-but-slow process (e.g. CPU-saturated VM)
+        keeps waiting indefinitely. Only a dead process (OOM/crash) triggers a
+        restart. Automatically starts the worker if not yet running.
         """
         self._ensure_started()
         self._req_q.put(prompt)
         text = ""
         while True:
             try:
-                kind, val = self._res_q.get(timeout=_SILENCE_S)
+                kind, val = self._res_q.get(timeout=_POLL_S)
             except queue.Empty:
-                log.warning(
-                    "No token generated for %ds — model appears stuck, restarting worker",
-                    _SILENCE_S,
-                )
-                self._kill()
-                self.start()
-                raise RuntimeError(f"Model stuck: token silence exceeded {_SILENCE_S}s")
+                if not self._proc.is_alive():
+                    log.warning("Worker process died during inference — restarting")
+                    self.start()
+                    raise RuntimeError("Worker died mid-inference (OOM or crash)")
+                # Process alive and computing — just slow under load; keep waiting
+                continue
             if kind == "token":
-                text += val          # model is alive; silence timer resets on next get()
+                text += val
             elif kind == "done":
                 return text
             elif kind == "err":
