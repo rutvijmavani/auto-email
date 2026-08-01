@@ -44,11 +44,13 @@ except ImportError:
 
 log = get_logger(__name__)
 
-_MODEL_PATH          = os.environ.get("EMAIL_PROCESSOR_MODEL_PATH", "")
-_FUZZY_THRESHOLD     = 40    # min score to include as a candidate at all
-_FUZZY_AUTO_THRESHOLD = 95   # score >= this → auto-match without LLM (match_stage='fuzzy')
-_TOP_N_CANDIDATES    = 3     # max candidates sent to LLM when score < auto threshold
-_INFERENCE_TIMEOUT   = 120   # seconds before treating inference as hung
+_MODEL_PATH            = os.environ.get("EMAIL_PROCESSOR_MODEL_PATH", "")
+_FUZZY_THRESHOLD       = 40   # min score to include as a candidate at all
+_FUZZY_AUTO_THRESHOLD  = 95   # score >= this → auto-match without LLM (match_stage='fuzzy')
+_FUZZY_DOMINANT_SCORE  = 80   # dominant-winner rule: best >= this AND gap >= _FUZZY_DOMINANT_GAP
+_FUZZY_DOMINANT_GAP    = 25   # minimum gap between best and second score to auto-match
+_TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto threshold
+_INFERENCE_TIMEOUT     = 300  # seconds before treating inference as hung (model load ~90s + inference)
 
 _llm: "Llama | None" = None
 
@@ -112,6 +114,9 @@ def _run_with_timeout(prompt: str, timeout: int = _INFERENCE_TIMEOUT):
         except queue.Empty:
             raise RuntimeError("Inference process exited without result")
     finally:
+        if p.is_alive():
+            p.terminate()
+            p.join()
         q.close()
         q.join_thread()
         p.close()
@@ -313,7 +318,22 @@ def _run_body(conn, limit: "int | None", dry_run: bool) -> None:
             fuzzy_auto += 1
             continue
 
-        # ── Ambiguous — send to Qwen3-8B for selection (score 40–94) ─────────
+        # ── Dominant-winner: clear #1 with large gap from #2 (no LLM needed) ─
+        second_score = top[1]["score"] if len(top) > 1 else 0
+        if best["score"] >= _FUZZY_DOMINANT_SCORE and (best["score"] - second_score) >= _FUZZY_DOMINANT_GAP:
+            log.info(
+                "fuzzy dominant-match: %r → FEIN %s | %s (score=%.0f, gap=%.0f, approvals=%d)",
+                uscis_name, best["employer_fein"], best["employer_name"],
+                best["score"], best["score"] - second_score, total_approvals,
+            )
+            if not dry_run:
+                _store_match(conn, uscis_norm, tax_id,
+                             best["employer_fein"], best["score"], stage="fuzzy_dominant")
+                conn.commit()
+            fuzzy_auto += 1
+            continue
+
+        # ── Ambiguous — send to Qwen3-8B for selection (score 40–94, gap < 25) ─
         log.info(
             "LLM select: %r  (approvals=%d, top_score=%.0f, sending %d candidates)",
             uscis_name, total_approvals, best["score"], len(top),
@@ -354,7 +374,7 @@ def _run_body(conn, limit: "int | None", dry_run: bool) -> None:
         fuzzy_auto, llm_matched, skipped, no_candidates, model_none, already,
     )
     if not dry_run and (fuzzy_auto + llm_matched) > 0:
-        log.info("Run: python scripts/process_uscis_h1b.py --refresh-unmatched")
+        log.info("Fuzzy pass complete — caller should refresh uscis_dol_unmatched")
 
 
 def main():
