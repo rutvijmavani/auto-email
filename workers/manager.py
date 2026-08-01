@@ -94,6 +94,22 @@ LEVER1_STABLE_REQUIRED   = 3      # consecutive stable cycles to lift Lever 1
 REINTRO_STABLE_REQUIRED   = 2      # consecutive stable cycles to end re-introduction
 REINTRO_DETAIL_BATCH_MAX  = 3      # max detail jobs pushed per scan/fullscan cycle during re-intro
 
+# ── Lever 1 max hold times (seconds) ──────────────────────────────────────────
+# For "scan" and "fullscan" pools, Lever 1 prevents scheduler dispatch, which
+# means the ZSET overdue count (and thus delay_s) GROWS under Lever 1 rather
+# than recovering — the normal stability condition can never be met.  A max
+# hold ensures Lever 1 auto-lifts after this duration even if delay_s hasn't
+# returned to stable.  If conditions still warrant it, the manager re-fires
+# within one cycle (60s) automatically.
+# "detail" has no limit: its queue drains naturally under Lever 1 (workers
+# pull from the list, inflow is halted, delay_s decreases organically).
+# fired_at is stored in Redis (not in-memory) so the age survives restarts.
+LEVER1_MAX_HOLD_S: dict = {
+    "scan":     300,   # 5 min
+    "fullscan": 600,   # 10 min
+    "detail":   None,  # no limit — recovers naturally
+}
+
 # ── Layer 2 in-memory state (survives individual cycle failures; Redis holds ───
 # persistent borrow/lever1/reintro state across manager restarts)
 _prev_depth:           dict = {"scan": 0, "detail": 0, "fullscan": 0}
@@ -778,6 +794,7 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
         return
     pipe = r.pipeline()
     pipe.set(f"manager:lever1:{pool}:active", "1")
+    pipe.set(f"manager:lever1:{pool}:fired_at", str(int(time.time())), ex=86400)
     pipe.set(f"manager:snapshot:{pool}:D", str(depth), ex=3600)
     pipe.set(f"manager:snapshot:{pool}:R", str(inflow_rate), ex=3600)
     pipe.execute()
@@ -788,10 +805,13 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     )
 
 
-def _lift_lever1(r, pool: str) -> None:
+def _lift_lever1(r, pool: str, reason: str = "stable") -> None:
     """Lift Lever 1 backpressure for pool."""
-    r.delete(f"manager:lever1:{pool}:active")
-    logger.info("manager [%s]: Lever 1 LIFTED — backpressure cleared", pool)
+    pipe = r.pipeline()
+    pipe.delete(f"manager:lever1:{pool}:active")
+    pipe.delete(f"manager:lever1:{pool}:fired_at")
+    pipe.execute()
+    logger.info("manager [%s]: Lever 1 LIFTED — reason=%s", pool, reason)
 
 
 def _get_effective_target(r, pool: str, workers_target: int) -> int:
@@ -1056,8 +1076,29 @@ def _check_layer2(
         else:
             _lever1_stable_cycles[pool] = 0
 
-        if _lever1_stable_cycles.get(pool, 0) >= LEVER1_STABLE_REQUIRED:
-            _lift_lever1(r, pool)
+        # Max-hold guard: for scan/fullscan pools, the ZSET delay_s GROWS under
+        # Lever 1 (dispatch is halted, companies pile up) so the normal stable
+        # condition may never be met.  Force-lift after LEVER1_MAX_HOLD_S so the
+        # scheduler can resume.  If conditions still warrant Lever 1, it re-fires
+        # within one cycle (60s) automatically.
+        max_hold = LEVER1_MAX_HOLD_S.get(pool)
+        force_lift = False
+        if max_hold is not None:
+            fired_at_raw = r.get(f"manager:lever1:{pool}:fired_at")
+            if fired_at_raw and (time.time() - float(fired_at_raw)) > max_hold:
+                force_lift = True
+                logger.warning(
+                    "manager [%s]: Lever 1 max hold (%ds) exceeded "
+                    "(fired_at=%s delay=%.0fs) — force lifting; "
+                    "will re-fire this cycle if conditions still warrant it",
+                    pool, max_hold, fired_at_raw.decode()
+                    if isinstance(fired_at_raw, bytes) else fired_at_raw,
+                    delay_s,
+                )
+
+        if force_lift or _lever1_stable_cycles.get(pool, 0) >= LEVER1_STABLE_REQUIRED:
+            lift_reason = "max_hold_expired" if force_lift else "stable"
+            _lift_lever1(r, pool, reason=lift_reason)
             _lever1_stable_cycles[pool] = 0
             lever1_active = False
 
@@ -1251,6 +1292,42 @@ def run_manager() -> None:
 
     # ── Load scaling params ────────────────────────────────────────────────────
     scaling_params = _load_scaling_params(r)
+
+    # ── Lever 1 startup re-evaluation ─────────────────────────────────────────
+    # A prior manager instance may have set Lever 1 and then restarted (e.g.,
+    # deploy rollback) before conditions recovered.  The new instance has no
+    # in-memory stable-cycle counter, so it will never lift a stale key on its
+    # own — the max-hold check above handles the long-term case, but on startup
+    # we can resolve it immediately by re-evaluating current conditions.
+    #
+    # If delay_s is already below delay_warn_s (conditions resolved while manager
+    # was down): clear Lever 1 immediately so dispatch resumes without waiting
+    # for LEVER1_STABLE_REQUIRED cycles.
+    # If conditions still warrant Lever 1: leave it active and reset fired_at to
+    # now so the max-hold clock starts fresh for this manager instance.
+    _startup_queue = _get_queue_metrics(r)
+    for _pool in pools:
+        if not _get_lever1_active(r, _pool):
+            continue
+        _sp      = scaling_params.get(_pool, _FALLBACK_PARAMS[_pool])
+        _warn    = _sp.get("delay_warn_s", _FALLBACK_PARAMS[_pool]["delay_warn_s"])
+        _delay   = _startup_queue.get(_pool, {}).get("delay_s", 0.0)
+        if _delay <= _warn:
+            _lift_lever1(r, _pool, reason="startup_conditions_resolved")
+            logger.warning(
+                "manager [%s]: startup: cleared stale Lever 1 from prior instance "
+                "(delay=%.0fs <= warn=%.0fs — conditions resolved)",
+                _pool, _delay, _warn,
+            )
+        else:
+            # Conditions still warrant Lever 1 — take ownership: reset fired_at
+            # so the max-hold clock starts from this instance's start time.
+            r.set(f"manager:lever1:{_pool}:fired_at", str(int(time.time())), ex=86400)
+            logger.warning(
+                "manager [%s]: startup: inherited active Lever 1 from prior instance "
+                "(delay=%.0fs > warn=%.0fs) — maintaining halt, max_hold reset",
+                _pool, _delay, _warn,
+            )
 
     # ── Bootstrap flag ─────────────────────────────────────────────────────────
     any_bootstrap = any(
