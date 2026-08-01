@@ -180,6 +180,18 @@ jobs:
             echo "  systemd daemon reloaded"
 
             echo "[7/8] Restarting services..."
+            # Pre-restart Redis cleanup so the new scheduler starts with a clean slate:
+            # 1. XACK any PEL entries from the current (about-to-die) scheduler — removes
+            #    them cleanly so they never become "stuck dead-consumer" entries after restart.
+            # 2. Clear inflight:scans ZSETs — accumulated entries from prior restarts cause
+            #    the ceiling check to block all dispatch (dispatched=0 stall) in the new scheduler.
+            _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+            if [ -n "$_pending_ids" ]; then
+              redis-cli XACK stream:adaptive scan-workers $_pending_ids > /dev/null || true
+              echo "  Pre-restart: ACKed PEL entries ($_pending_ids)"
+            fi
+            redis-cli --scan --pattern 'inflight:scans:*' 2>/dev/null | xargs -r redis-cli DEL > /dev/null || true
+            echo "  Pre-restart: cleared inflight:scans ZSETs"
             for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
@@ -205,10 +217,6 @@ jobs:
             trap - ERR
 
             echo "  Running health check to verify pipeline state..."
-            # Force-reclaim any PEL entries left by the old scheduler before health check.
-            # XAUTOCLAIM with 0ms min-idle claims everything immediately so the health
-            # check doesn't fail on a stale PEL from the just-restarted scheduler.
-            redis-cli XAUTOCLAIM stream:adaptive scan-workers "scheduler-$(hostname)-0" 0 0-0 > /dev/null || true
             sleep 70   # fullscan_worker writes heartbeat every 60s — wait at least that long
             source venv/bin/activate
             if ! python scripts/health_check.py; then
