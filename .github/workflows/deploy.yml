@@ -205,6 +205,10 @@ jobs:
             trap - ERR
 
             echo "  Running health check to verify pipeline state..."
+            # Force-reclaim any PEL entries left by the old scheduler before health check.
+            # XAUTOCLAIM with 0ms min-idle claims everything immediately so the health
+            # check doesn't fail on a stale PEL from the just-restarted scheduler.
+            redis-cli XAUTOCLAIM stream:adaptive scan-workers "scheduler-$(hostname)-0" 0 0-0 > /dev/null || true
             sleep 70   # fullscan_worker writes heartbeat every 60s — wait at least that long
             source venv/bin/activate
             if ! python scripts/health_check.py; then
