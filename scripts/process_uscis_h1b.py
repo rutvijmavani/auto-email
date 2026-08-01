@@ -13,7 +13,9 @@ Source: USCIS H-1B Employer Data Hub (FY2024-FY2026).
 
 Usage:
     python scripts/process_uscis_h1b.py --file ~/Downloads/H1B_FY2026.csv
-    python scripts/process_uscis_h1b.py --file ~/Downloads/H1B_FY2025.xlsx
+    python scripts/process_uscis_h1b.py --file ~/Downloads/H1B_FY2026.csv --skip-fuzzy
+    python scripts/process_uscis_h1b.py --file ~/Downloads/H1B_FY2025.xlsx --limit 500
+    python scripts/process_uscis_h1b.py --refresh-unmatched
 
 Design decisions:
   - employer_name_norm stored alongside raw name for DOL join:
@@ -381,6 +383,24 @@ def main():
         "--refresh-unmatched", action="store_true",
         help="Skip ingest — only rebuild uscis_dol_unmatched from current DB state",
     )
+    parser.add_argument(
+        "--skip-fuzzy", action="store_true",
+        help="Skip the fuzzy+LLM matching step after ingest (raw ingest only)",
+    )
+    def _positive_int(v: str) -> int:
+        i = int(v)
+        if i <= 0:
+            raise argparse.ArgumentTypeError(f"--limit must be a positive integer, got {v}")
+        return i
+
+    parser.add_argument(
+        "--limit", type=_positive_int, default=None,
+        help="Max unmatched rows to send through fuzzy+LLM (must be a positive integer)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Fuzzy step: print candidates without running inference or storing results",
+    )
     args = parser.parse_args()
 
     if args.refresh_unmatched:
@@ -397,6 +417,18 @@ def main():
     df = load_file(args.file)
     upsert(df)
     populate_unmatched()
+
+    if not args.skip_fuzzy:
+        _scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        import fuzzy_match_uscis_dol
+        log.info("Starting fuzzy+LLM matching pass …")
+        try:
+            fuzzy_match_uscis_dol.run(limit=args.limit, dry_run=args.dry_run)
+        finally:
+            log.info("Refreshing unmatched table after fuzzy pass …")
+            populate_unmatched()
 
 
 if __name__ == "__main__":

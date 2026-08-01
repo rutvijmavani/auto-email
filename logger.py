@@ -58,7 +58,10 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Commands whose logs accumulate for a full month.
 # These use YYYY-MM filenames and get LOG_RETENTION_MONTHLY_DAYS retention.
 # Everything else uses YYYY-MM-DD and gets LOG_RETENTION_DAILY_DAYS retention.
-_MONTHLY_COMMANDS = frozenset({"monthly", "enrich", "build_ats_slug_list", "sync_dol_lca"})
+_MONTHLY_COMMANDS = frozenset({
+    "monthly", "enrich", "build_ats_slug_list", "sync_dol_lca",
+    "process_uscis_h1b", "fuzzy_match_uscis_dol",
+})
 
 # Long-running processes that use TimedRotatingFileHandler (rotates at midnight)
 # instead of a dated filename so the file doesn't grow unbounded for weeks.
