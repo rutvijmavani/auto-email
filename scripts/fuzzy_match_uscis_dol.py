@@ -104,7 +104,6 @@ def _worker_main(req_q: multiprocessing.Queue, res_q: multiprocessing.Queue,
         try:
             for chunk in llm.create_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=120,
                 temperature=0,
                 stream=True,
             ):
