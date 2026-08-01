@@ -192,6 +192,13 @@ jobs:
             fi
             redis-cli --scan --pattern 'inflight:scans:*' 2>/dev/null | xargs -r redis-cli DEL > /dev/null || true
             echo "  Pre-restart: cleared inflight:scans ZSETs"
+            # 3. Clear any stale Lever 1 keys — a Lever 1 left over from a prior manager
+            #    instance (TTL -1, permanent) blocks all adaptive dispatch indefinitely.
+            #    The new manager's startup re-evaluation will re-fire Lever 1 within 60s
+            #    if conditions still warrant it.
+            redis-cli DEL manager:lever1:scan:active manager:lever1:scan:fired_at \
+                          manager:lever1:fullscan:active manager:lever1:fullscan:fired_at > /dev/null || true
+            echo "  Pre-restart: cleared stale Lever 1 keys"
             for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
