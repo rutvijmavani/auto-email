@@ -99,8 +99,11 @@ def _worker_main(req_q: multiprocessing.Queue, res_q: multiprocessing.Queue,
     while True:
         try:
             prompt = req_q.get()
-            if prompt is None:          # shutdown sentinel
-                break
+        except Exception:
+            break   # queue closed or pipe broken — terminate worker cleanly
+        if prompt is None:              # shutdown sentinel
+            break
+        try:
             for chunk in llm.create_chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=120,
@@ -126,11 +129,10 @@ class _Worker:
 
     def start(self) -> None:
         if not self._model_path:
-            log.error(
+            raise RuntimeError(
                 "EMAIL_PROCESSOR_MODEL_PATH is not set — "
                 "point it at the Qwen3-8B-Q4_K_M.gguf file"
             )
-            sys.exit(1)
         self._req_q = multiprocessing.Queue()
         self._res_q = multiprocessing.Queue()
         self._proc = multiprocessing.Process(
@@ -158,15 +160,22 @@ class _Worker:
                 self._kill()
                 raise RuntimeError(f"Worker startup error: {val}")
 
+    def _ensure_started(self) -> None:
+        """Start (or restart) the worker if it is not currently alive."""
+        if self._proc is None or not self._proc.is_alive():
+            self.start()
+
     def infer(self, prompt: str) -> str:
         """
         Send prompt, stream tokens back, return the full generated text.
 
         No wall-clock timeout. Progress is tracked token-by-token: as long as
         tokens keep arriving the model is working (even slowly). Only if no
-        token arrives for _TOKEN_SILENCE_S seconds is the model considered stuck,
+        token arrives for _SILENCE_S seconds is the model considered stuck,
         at which point the worker is restarted and RuntimeError is raised.
+        Automatically starts (or restarts) the worker if it is not alive.
         """
+        self._ensure_started()
         self._req_q.put(prompt)
         text = ""
         while True:
@@ -348,6 +357,12 @@ def _ask_model(worker: "_Worker", uscis_name: str, uscis_norm: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(limit: "int | None" = None, dry_run: bool = False) -> None:
+    if not dry_run and not _MODEL_PATH:
+        log.error(
+            "EMAIL_PROCESSOR_MODEL_PATH is not set — "
+            "point it at the Qwen3-8B-Q4_K_M.gguf file"
+        )
+        sys.exit(1)
     conn = get_conn()
     worker = _Worker(_MODEL_PATH)
     try:
@@ -360,10 +375,6 @@ def run(limit: "int | None" = None, dry_run: bool = False) -> None:
 def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> None:
     unmatched = _fetch_unmatched(conn, limit)
     log.info("Processing %d unmatched USCIS entries", len(unmatched))
-
-    # Only start the worker (load model) if there are rows that will need LLM.
-    # Fuzzy-only rows never touch the worker.
-    _worker_started = False
 
     fuzzy_auto = llm_matched = skipped = no_candidates = model_none = already = 0
 
@@ -436,10 +447,6 @@ def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> No
 
         if dry_run:
             continue
-
-        if not _worker_started:
-            worker.start()
-            _worker_started = True
 
         dol_fein = _ask_model(worker, uscis_name, uscis_norm, top)
 

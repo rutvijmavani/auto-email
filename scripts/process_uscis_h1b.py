@@ -387,9 +387,15 @@ def main():
         "--skip-fuzzy", action="store_true",
         help="Skip the fuzzy+LLM matching step after ingest (raw ingest only)",
     )
+    def _positive_int(v: str) -> int:
+        i = int(v)
+        if i <= 0:
+            raise argparse.ArgumentTypeError(f"--limit must be a positive integer, got {v}")
+        return i
+
     parser.add_argument(
-        "--limit", type=int, default=None,
-        help="Max unmatched rows to send through fuzzy+LLM (passed to fuzzy_match_uscis_dol)",
+        "--limit", type=_positive_int, default=None,
+        help="Max unmatched rows to send through fuzzy+LLM (must be a positive integer)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -418,9 +424,11 @@ def main():
             sys.path.insert(0, _scripts_dir)
         import fuzzy_match_uscis_dol
         log.info("Starting fuzzy+LLM matching pass …")
-        fuzzy_match_uscis_dol.run(limit=args.limit, dry_run=args.dry_run)
-        log.info("Refreshing unmatched table after fuzzy pass …")
-        populate_unmatched()
+        try:
+            fuzzy_match_uscis_dol.run(limit=args.limit, dry_run=args.dry_run)
+        finally:
+            log.info("Refreshing unmatched table after fuzzy pass …")
+            populate_unmatched()
 
 
 if __name__ == "__main__":
