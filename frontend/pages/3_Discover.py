@@ -675,6 +675,9 @@ else:
         display_md   — optional markdown override for the read-only view; falls
                        back to a link on current_val, then "—".
         """
+        _ALLOWED_COLS = frozenset({"careers_url", "jobs_url"})
+        if db_col not in _ALLOWED_COLS:
+            raise ValueError(f"_url_editor: forbidden column {db_col!r}")
         _sk = f"{key_prefix}_{fein}"
         container.markdown(f"**{title}**")
         if st.session_state.get(_sk):

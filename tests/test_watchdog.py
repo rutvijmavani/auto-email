@@ -913,8 +913,8 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
                               backpressure_threshold_s=300.0, detail_proc=200)
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
 
-    def test_detail_queue_stalled_delay_below_threshold_is_ok(self):
-        """Depth unchanged but delay well below threshold → OK (manager not yet triggered)."""
+    def test_detail_queue_non_default_threshold_delay_just_over_is_error(self):
+        """Non-default threshold: delay just above threshold → ERROR."""
         from workers.watchdog import Issue
         snap = {
             "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
@@ -922,9 +922,23 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             "detail_adp_depth": 200, "detail_fs_depth": 0,
             "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
         }
-        # delay=50s < threshold*0.75 (225s) → stalled but not alarming → OK
-        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=50.0,
-                              backpressure_threshold_s=300.0, detail_proc=200)
+        # delay=151s > threshold=150s (non-default) → stalled and over threshold → ERROR
+        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=151.0,
+                              backpressure_threshold_s=150.0, detail_proc=200)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def test_detail_queue_non_default_threshold_delay_well_below_is_ok(self):
+        """Non-default threshold: delay well below threshold → OK."""
+        from workers.watchdog import Issue
+        snap = {
+            "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
+            "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
+            "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+        }
+        # delay=400s < threshold*0.75 (450s) with threshold=600 (non-default) → OK
+        issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0,
+                              backpressure_threshold_s=600.0, detail_proc=200)
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
 
 

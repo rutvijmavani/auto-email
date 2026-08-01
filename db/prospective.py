@@ -1,7 +1,7 @@
 # db/prospective.py — Prospective company DB operations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from db.connection import get_conn
 
@@ -56,7 +56,7 @@ def submit_to_prospective_sheet(
             ]])
 
         row = [
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
             company,                                            # Company Name
             job_url         or "",                              # Job URL
             domain          or "",                              # Domain

@@ -603,9 +603,16 @@ def _find_ats_in_html(html: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _is_homepage(final_url: str) -> bool:
-    path = urlparse(final_url).path.rstrip("/")
-    return not path or path == ""
+def _is_homepage(final_url: str, company_host: str = "") -> bool:
+    parsed = urlparse(final_url)
+    path   = parsed.path.rstrip("/")
+    if path:
+        return False
+    # Root path is only a homepage when the host matches the company website.
+    # A careers subdomain (careers.amazon.com/) has a different host and is a
+    # legitimate careers page, not a homepage redirect.
+    final_host = (parsed.hostname or "").removeprefix("www.")
+    return not company_host or final_host == company_host
 
 
 def _is_auth_redirect(final_url: str) -> bool:
@@ -637,6 +644,7 @@ def discover_careers_url(
     domain        = netloc.removeprefix("www.")
     base          = f"{parsed.scheme}://{netloc}"
     company_root  = _root_domain(website_url)
+    company_host  = (parsed.hostname or "").removeprefix("www.")
 
     candidates: list[str] = []
     for tmpl in _CAREER_SUBDOMAINS:
@@ -650,7 +658,7 @@ def discover_careers_url(
             continue
 
         # Reject homepage redirects
-        if _is_homepage(final_url):
+        if _is_homepage(final_url, company_host):
             log.debug("  %s → homepage redirect, skipping", url)
             continue
 
