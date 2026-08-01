@@ -279,7 +279,7 @@ def claim_stale_work(r, stream_key: str, group: str,
         op_type:     "scan" | "fullscan" — controls which ZSET to use for backoff
     """
     from workers.scan_worker import _get_backoff_delay   # hoisted — used in dead-letter path
-    idle_ms = max((p95_ms or 0) * 3, 300_000)   # at least 5 min, scales with p95; guard against None
+    idle_ms = min(max((p95_ms or 0) * 3, 300_000), 600_000)   # 5–10 min; capped so deploy restarts don't leave PEL stuck for hours
 
     try:
         # XAUTOCLAIM: returns (next_start_id, [(msg_id, fields), ...], [deleted_ids])
