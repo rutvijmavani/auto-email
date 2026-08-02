@@ -295,6 +295,26 @@ ENRICH_WINDOW_HOURS = 18   # spread requests over this many hours
 ALERT_DEDUP_HOURS = 24     # don't re-send same alert within N hours
 
 # ─────────────────────────────────────────
+# LLM INFERENCE SERVER (llama-server)
+# ─────────────────────────────────────────
+LLM_BASE_URL          = os.getenv("LLM_BASE_URL", "")           # e.g. http://127.0.0.1:8080/v1
+LLM_MODEL             = os.getenv("LLM_MODEL", "qwen3")         # model name passed to API
+LLM_SERVER_BIN        = os.getenv("LLM_SERVER_BIN", "")         # path to llama-server binary
+LLM_MODEL_PATH        = os.getenv("LLM_MODEL_PATH", "")         # path to .gguf model file
+LLM_CTX_SIZE          = int(os.getenv("LLM_CTX_SIZE", "8192"))  # context window tokens
+LLM_POLL_S            = int(os.getenv("LLM_POLL_S", "5"))       # wrapper health-check interval
+LLM_STARTUP_TIMEOUT_S = int(os.getenv("LLM_STARTUP_TIMEOUT_S", "600"))  # max model load wait
+LLM_HEALTH_URL        = os.getenv("LLM_HEALTH_URL", "http://127.0.0.1:8080/health")
+
+# ─────────────────────────────────────────
+# H1B DISAMBIGUATION STREAM
+# ─────────────────────────────────────────
+H1B_DISAMBIG_STREAM   = os.getenv("H1B_DISAMBIG_STREAM", "llm:h1b:disambiguate")
+H1B_DISAMBIG_GROUP    = os.getenv("H1B_DISAMBIG_GROUP", "h1b-llm-workers")
+H1B_DISAMBIG_CONSUMER = os.getenv("H1B_DISAMBIG_CONSUMER", "h1b-llm-worker-1")
+H1B_DISAMBIG_BLOCK_MS = int(os.getenv("H1B_DISAMBIG_BLOCK_MS", "5000"))
+
+# ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING
 # ─────────────────────────────────────────
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379/0")

@@ -315,6 +315,37 @@ def run_health_check() -> int:
         _row("WARNING", "manager", f"heartbeat check failed: {_mgr_err}")
         warnings += 1
 
+    # ── h1b_llm_worker heartbeat ──────────────────────────────────────────────
+    try:
+        _h1b_keys = []
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:h1b_llm_worker:*", count=50)
+            _h1b_keys.extend(keys)
+            if cursor == 0:
+                break
+        if not _h1b_keys:
+            _row("WARNING", "h1b_llm_worker",
+                 "heartbeat key missing — worker not running (H1B LLM disambiguation paused)")
+            warnings += 1
+        else:
+            _h1b_raw = r.get(_h1b_keys[0])
+            _h1b_d   = json.loads(_h1b_raw) if _h1b_raw else {}
+            _h1b_age = now - float(_h1b_d.get("ts", now))
+            _h1b_dead_after = _HEARTBEAT_DEAD_AFTER.get("h1b_llm_worker", 120)
+            _h1b_status = (
+                f"pid={_h1b_d.get('pid','?')}  processed={_h1b_d.get('processed',0)}  "
+                f"heartbeat {_h1b_age:.0f}s ago"
+            )
+            if _h1b_age > _h1b_dead_after:
+                _row("WARNING", "h1b_llm_worker", _h1b_status + "  (STALE)")
+                warnings += 1
+            else:
+                _row("OK", "h1b_llm_worker", _h1b_status)
+    except Exception as _h1b_err:
+        _row("WARNING", "h1b_llm_worker", f"heartbeat check failed: {_h1b_err}")
+        warnings += 1
+
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")
     if health_raw is None:

@@ -108,7 +108,7 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service streamlit-frontend.service; do
+for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service streamlit-frontend.service llama-server.service h1b-llm-worker.service; do
     src="$DEPLOY_DIR/systemd/$unit"
     if [[ ! -f "$src" ]]; then
         echo "[ERROR] Unit file not found: $src"
@@ -146,6 +146,8 @@ ALLOWED_UNITS=(
     "pipeline-api.service"
     "email-processor.service"
     "streamlit-frontend.service"
+    "llama-server.service"
+    "h1b-llm-worker.service"
 )
 for unit in "\${ALLOWED_UNITS[@]}"; do
     src="\$SRC_DIR/\$unit"
@@ -192,16 +194,19 @@ $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdo
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-manager
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed streamlit-frontend
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed h1b-llm-worker
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-manager
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart streamlit-frontend
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart h1b-llm-worker
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active email-processor
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-manager
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active streamlit-frontend
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active h1b-llm-worker
 # Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
@@ -242,6 +247,8 @@ systemctl enable recruiter-watchdog
 systemctl enable pipeline-api
 systemctl enable email-processor
 systemctl enable streamlit-frontend
+systemctl enable llama-server
+systemctl enable h1b-llm-worker
 
 if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."

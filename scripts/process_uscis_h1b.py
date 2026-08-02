@@ -321,10 +321,12 @@ def populate_unmatched() -> None:
         conn.execute("TRUNCATE TABLE uscis_dol_unmatched")
         result = conn.execute("""
             INSERT INTO uscis_dol_unmatched
-                (employer_name, employer_name_norm, tax_id, fiscal_year, state, total_approvals)
+                (employer_name, employer_name_norm, employer_legal_norm,
+                 tax_id, fiscal_year, state, total_approvals)
             SELECT
                 u.employer_name,
                 u.employer_name_norm,
+                COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm),
                 u.tax_id,
                 u.fiscal_year,
                 u.state,

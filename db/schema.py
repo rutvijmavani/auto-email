@@ -1442,6 +1442,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_uscis_unmatched_approvals
         ON uscis_dol_unmatched (total_approvals DESC)
     """)
+    c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS employer_legal_norm TEXT")
+    c.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_uscis_unmatched_unique
+        ON uscis_dol_unmatched (employer_legal_norm, tax_id)
+        WHERE employer_legal_norm IS NOT NULL
+    """)
 
     # uscis_dol_fuzzy_map: audit trail for fuzzy/LLM-derived USCIS → DOL matches.
     # Populated by scripts/fuzzy_match_uscis_dol.py after every ingest.
@@ -1464,6 +1470,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_fuzzy_map_lookup
         ON uscis_dol_fuzzy_map (employer_legal_norm, tax_id)
     """)
+    c.execute("ALTER TABLE uscis_dol_fuzzy_map ADD COLUMN IF NOT EXISTS candidates_json JSONB")
 
     # ── H-1B ATS discovery table (2026-07-30) ────────────────────────────────
     # Populated by scripts/discover_h1b_ats.py.

@@ -1,5 +1,5 @@
 [Unit]
-Description=Gmail Email Status Processor (Qwen3-8B)
+Description=H1B employer disambiguation LLM worker (Qwen3 via llama-server)
 Documentation=https://github.com/rutvijmavani/auto-email
 After=network-online.target llama-server.service
 Wants=network-online.target
@@ -14,7 +14,7 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
-ExecStart=/home/opc/mail/venv/bin/python -m workers.email_processor
+ExecStart=/home/opc/mail/venv/bin/python -m workers.h1b_llm_worker
 Restart=always
 RestartSec=30s
 KillMode=mixed
@@ -28,7 +28,7 @@ ProtectHome=no
 ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=email-processor
+SyslogIdentifier=h1b-llm-worker
 
 [Install]
 WantedBy=multi-user.target

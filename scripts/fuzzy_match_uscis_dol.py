@@ -1,15 +1,16 @@
 """
-scripts/fuzzy_match_uscis_dol.py — Fuzzy + LLM matching for unresolved USCIS → DOL rows.
+scripts/fuzzy_match_uscis_dol.py — Fuzzy matching for unresolved USCIS → DOL rows.
 
 For each row in uscis_dol_unmatched, this script:
   1. Finds all DOL employers sharing the same last-4 FEIN (tax_id).
   2. Applies rapidfuzz token_set_ratio to rank candidates; keeps top 3 with score >= 40.
-  3. Sends the top candidates to Qwen3-8B for a selection decision — model picks the best
-     matching DOL FEIN from the candidates, or null if none match.
-  4. Stores confirmed matches in uscis_dol_fuzzy_map.
+  3. Auto-matches high-confidence cases (score >= 95 or dominant winner).
+  4. Pushes ambiguous cases to Redis stream llm:h1b:disambiguate for async LLM resolution
+     by workers/h1b_llm_worker.py.
 
-After running, re-run --refresh-unmatched to update the diagnostic table:
-    python scripts/process_uscis_h1b.py --refresh-unmatched
+Auto-matched rows are written atomically to uscis_dol_fuzzy_map and deleted from
+uscis_dol_unmatched in the same transaction.  Ambiguous rows stay in uscis_dol_unmatched
+until the LLM worker resolves them.
 
 Usage:
     python scripts/fuzzy_match_uscis_dol.py
@@ -19,16 +20,14 @@ Usage:
 
 import argparse
 import json
-import multiprocessing
 import os
-import queue
-import re
 import sys
-import threading
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from config import H1B_DISAMBIG_STREAM
 from db.connection import get_conn
 from logger import get_logger, init_logging
+from workers.redis_client import get_redis
 
 try:
     from rapidfuzz import fuzz as _fuzz
@@ -36,214 +35,13 @@ except ImportError:
     print("[ERROR] rapidfuzz is not installed. Run: pip install rapidfuzz")
     sys.exit(1)
 
-try:
-    from llama_cpp import Llama
-except ImportError:
-    print("[ERROR] llama-cpp-python is not installed. Run: pip install llama-cpp-python")
-    sys.exit(1)
-
 log = get_logger(__name__)
 
-_MODEL_PATH            = os.environ.get("EMAIL_PROCESSOR_MODEL_PATH", "")
 _FUZZY_THRESHOLD       = 40   # min score to include as a candidate at all
 _FUZZY_AUTO_THRESHOLD  = 95   # score >= this → auto-match without LLM (match_stage='fuzzy')
 _FUZZY_DOMINANT_SCORE  = 80   # dominant-winner rule: best >= this AND gap >= _FUZZY_DOMINANT_GAP
 _FUZZY_DOMINANT_GAP    = 25   # minimum gap between best and second score to auto-match
 _TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto threshold
-_LOAD_HEARTBEAT_S      = 5    # worker sends a heartbeat this often while loading the model
-_POLL_S                = 5    # how often infer() polls res_q before checking proc.is_alive()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Persistent worker process
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _worker_main(req_q: multiprocessing.Queue, res_q: multiprocessing.Queue,
-                 model_path: str) -> None:
-    """
-    Long-lived worker: load model once, serve prompts from req_q, stream tokens back.
-
-    Protocol (res_q messages):
-      ("loading", None)  — heartbeat sent every _LOAD_HEARTBEAT_S while model is loading;
-                           parent resets its silence timer on each so no arbitrary load timeout
-      ("ready", None)    — model loaded, ready for requests
-      ("token", str)     — one generated token; parent resets its silence timer on each
-      ("done", None)     — inference finished; parent assembles full text from tokens
-      ("err",  str)      — exception message
-    Sentinel None on req_q signals clean shutdown.
-    """
-    # llama_cpp model loading is a blocking call with no progress callback.
-    # A background thread sends heartbeats so the parent can distinguish
-    # "still loading" from "disk I/O hung / OOM / crashed".
-    _stop_hb = threading.Event()
-
-    def _heartbeat():
-        while not _stop_hb.wait(timeout=_LOAD_HEARTBEAT_S):
-            res_q.put(("loading", None))
-
-    hb = threading.Thread(target=_heartbeat, daemon=True)
-    hb.start()
-    try:
-        from llama_cpp import Llama  # type: ignore[import]
-        llm = Llama(model_path=model_path, n_ctx=4096, n_threads=2, verbose=False)
-        _stop_hb.set()
-        hb.join()
-        res_q.put(("ready", None))
-    except Exception as exc:
-        _stop_hb.set()
-        res_q.put(("err", str(exc)))
-        return
-
-    while True:
-        try:
-            prompt = req_q.get()
-        except Exception:
-            break   # queue closed or pipe broken — terminate worker cleanly
-        if prompt is None:              # shutdown sentinel
-            break
-        try:
-            for chunk in llm.create_chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-                stream=True,
-            ):
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    res_q.put(("token", delta))
-            res_q.put(("done", None))
-        except Exception as exc:
-            res_q.put(("err", str(exc)))
-
-
-class _Worker:
-    """Manages a persistent Qwen3-8B subprocess — load once, infer many times."""
-
-    def __init__(self, model_path: str) -> None:
-        self._model_path = model_path
-        self._req_q: "multiprocessing.Queue | None" = None
-        self._res_q: "multiprocessing.Queue | None" = None
-        self._proc: "multiprocessing.Process | None" = None
-
-    def start(self) -> None:
-        if not self._model_path:
-            raise RuntimeError(
-                "EMAIL_PROCESSOR_MODEL_PATH is not set — "
-                "point it at the Qwen3-8B-Q4_K_M.gguf file"
-            )
-        self._req_q = multiprocessing.Queue()
-        self._res_q = multiprocessing.Queue()
-        self._proc = multiprocessing.Process(
-            target=_worker_main,
-            args=(self._req_q, self._res_q, self._model_path),
-            daemon=True,
-        )
-        self._proc.start()
-        log.info("Loading Qwen3-8B in worker (pid=%d) …", self._proc.pid)
-        while True:
-            try:
-                kind, val = self._res_q.get(timeout=_POLL_S)
-            except queue.Empty:
-                if not self._proc.is_alive():
-                    self._kill()
-                    raise RuntimeError(
-                        "Worker process died during model load (OOM or crash)"
-                    )
-                log.debug("  … model still loading")
-                continue
-            if kind == "loading":
-                log.debug("  … model still loading (heartbeat received)")
-            elif kind == "ready":
-                log.info("Model ready (pid=%d)", self._proc.pid)
-                break
-            elif kind == "err":
-                self._kill()
-                raise RuntimeError(f"Worker startup error: {val}")
-
-    def _ensure_started(self) -> None:
-        """Start (or restart) the worker if it is not currently alive."""
-        if self._proc is None or not self._proc.is_alive():
-            self.start()
-
-    def infer(self, prompt: str) -> str:
-        """
-        Send prompt, stream tokens back, return the full generated text.
-
-        No wall-clock timeout. Polls res_q every _POLL_S seconds; on each miss
-        checks proc.is_alive(). A live-but-slow process (e.g. CPU-saturated VM)
-        keeps waiting indefinitely. Only a dead process (OOM/crash) triggers a
-        restart. Automatically starts the worker if not yet running.
-        """
-        self._ensure_started()
-        self._req_q.put(prompt)
-        text = ""
-        while True:
-            try:
-                kind, val = self._res_q.get(timeout=_POLL_S)
-            except queue.Empty:
-                if not self._proc.is_alive():
-                    log.warning("Worker process died during inference — restarting")
-                    self.start()
-                    raise RuntimeError("Worker died mid-inference (OOM or crash)")
-                # Process alive and computing — just slow under load; keep waiting
-                continue
-            if kind == "token":
-                text += val
-            elif kind == "done":
-                return text
-            elif kind == "err":
-                raise RuntimeError(val)
-
-    def stop(self) -> None:
-        try:
-            if self._proc and self._proc.is_alive():
-                self._req_q.put(None)   # graceful shutdown sentinel
-                self._proc.join(timeout=5)
-        finally:
-            self._kill()
-
-    def _kill(self) -> None:
-        if self._proc and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join()
-        for q in (self._req_q, self._res_q):
-            if q is not None:
-                try:
-                    q.close()
-                    q.join_thread()
-                except Exception:
-                    pass
-        self._proc = self._req_q = self._res_q = None
-
-
-def _strip_think(text: str) -> str:
-    """Remove Qwen3 <think>…</think> block so only the final answer remains."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt
-# ─────────────────────────────────────────────────────────────────────────────
-
-_MATCH_PROMPT = """/think
-I need to identify which DOL Labor Condition Application employer record corresponds to
-a USCIS H-1B petition employer. Both documents are filed by the same legal entity, so
-the names must refer to the same company — though formatting may differ.
-
-USCIS employer name: "{uscis_name}"
-USCIS normalized:    "{uscis_norm}"
-
-DOL candidates (same last-4 FEIN, ranked by name similarity):
-{candidates}
-
-Instructions:
-- Select the candidate that is the SAME legal entity as the USCIS employer.
-- Common aliases, DBA names, and abbreviations count as the same entity.
-- A subsidiary is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
-- A branch/campus is NOT the same as the national entity unless the names make it clear.
-- If NO candidate is the same legal entity, set "match" to null.
-
-Respond with ONLY a JSON object — no explanation, no markdown:
-{{"match": "<FEIN from candidates above, or null>"}}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,52 +99,51 @@ def _already_mapped(conn, employer_legal_norm: str, tax_id: str) -> bool:
     return row is not None
 
 
+def _clean_candidates(candidates: list[dict]) -> list[dict]:
+    """Strip internal normalization fields — keep human-readable keys for audit trail."""
+    return [
+        {"fein": c["employer_fein"], "name": c["employer_name"], "score": round(c["score"], 1)}
+        for c in candidates
+    ]
+
+
 def _store_match(conn, employer_legal_norm: str, tax_id: str,
-                 dol_fein: str, score: float, stage: str) -> None:
+                 dol_fein: str, score: float, stage: str,
+                 candidates: list[dict]) -> None:
+    """Write match to fuzzy_map and delete from unmatched — atomic in one transaction."""
     conn.execute("""
         INSERT INTO uscis_dol_fuzzy_map
-            (employer_legal_norm, tax_id, dol_fein, match_score, match_stage)
-        VALUES (%s, %s, %s, %s, %s)
+            (employer_legal_norm, tax_id, dol_fein, match_score, match_stage, candidates_json)
+        VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (employer_legal_norm, tax_id) DO UPDATE SET
-            dol_fein    = EXCLUDED.dol_fein,
-            match_score = EXCLUDED.match_score,
-            match_stage = EXCLUDED.match_stage,
-            created_at  = NOW()
-    """, (employer_legal_norm, tax_id, dol_fein, score, stage))
+            dol_fein        = EXCLUDED.dol_fein,
+            match_score     = EXCLUDED.match_score,
+            match_stage     = EXCLUDED.match_stage,
+            candidates_json = EXCLUDED.candidates_json,
+            created_at      = NOW()
+    """, (employer_legal_norm, tax_id, dol_fein, score, stage, json.dumps(candidates)))
+
+    conn.execute("""
+        DELETE FROM uscis_dol_unmatched
+        WHERE employer_legal_norm = %s AND tax_id = %s
+    """, (employer_legal_norm, tax_id))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM call
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _ask_model(worker: "_Worker", uscis_name: str, uscis_norm: str,
-               candidates: list[dict]) -> "str | None":
-    """
-    Ask Qwen3-8B (via persistent worker) to select the best-matching DOL FEIN.
-    Returns the FEIN string if a match is found, None otherwise.
-    """
-    cand_text = "\n".join(
-        f"  [{i+1}] FEIN={c['employer_fein']} | {c['employer_name']} "
-        f"(similarity score: {c['score']:.0f}/100)"
-        for i, c in enumerate(candidates)
+def _push_to_stream(r, uscis_norm: str, uscis_name: str,
+                    tax_id: str, candidates: list[dict]) -> None:
+    """Push ambiguous case to LLM disambiguation stream."""
+    r.xadd(
+        H1B_DISAMBIG_STREAM,
+        {
+            "employer_legal_norm": uscis_norm,
+            "uscis_name":          uscis_name,
+            "uscis_norm":          uscis_norm,
+            "tax_id":              tax_id,
+            "candidates":          json.dumps(candidates),
+        },
+        maxlen=1000,
+        approximate=True,
     )
-    prompt = _MATCH_PROMPT.format(
-        uscis_name=uscis_name,
-        uscis_norm=uscis_norm,
-        candidates=cand_text,
-    )
-
-    try:
-        text = _strip_think(worker.infer(prompt))
-        m = re.search(r"\{.*?\}", text, re.DOTALL)
-        if not m:
-            log.warning("Model returned no JSON for USCIS=%r — raw: %s", uscis_name, text[:200])
-            return None
-        data = json.loads(m.group())
-        return data.get("match") or None
-    except Exception as exc:
-        log.warning("Inference failed for USCIS=%r: %s", uscis_name, exc)
-        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,31 +151,22 @@ def _ask_model(worker: "_Worker", uscis_name: str, uscis_norm: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run(limit: "int | None" = None, dry_run: bool = False) -> None:
-    if not dry_run and not _MODEL_PATH:
-        log.error(
-            "EMAIL_PROCESSOR_MODEL_PATH is not set — "
-            "point it at the Qwen3-8B-Q4_K_M.gguf file"
-        )
-        sys.exit(1)
     conn = get_conn()
-    worker = _Worker(_MODEL_PATH)
+    r    = None if dry_run else get_redis()
     try:
-        _run_body(conn, limit, dry_run, worker)
+        _run_body(conn, r, limit, dry_run)
     finally:
         conn.close()
-        worker.stop()
 
 
-def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> None:
+def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
     unmatched = _fetch_unmatched(conn, limit)
     log.info("Processing %d unmatched USCIS entries", len(unmatched))
 
-    fuzzy_auto = llm_matched = skipped = no_candidates = model_none = already = 0
+    fuzzy_auto = queued = skipped = no_candidates = already = 0
 
     for row in unmatched:
         uscis_name      = row["employer_name"]
-        # Use COALESCE(NULLIF(employer_legal_norm,''), employer_name_norm) so the
-        # stored key matches the SQL join expression used by readers.
         uscis_norm      = row["employer_legal_norm"] or row["employer_name_norm"]
         tax_id          = row["tax_id"]
         total_approvals = row["total_approvals"]
@@ -402,7 +190,9 @@ def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> No
             )
             continue
 
-        best = top[0]
+        best         = top[0]
+        clean        = _clean_candidates(top)
+        second_score = top[1]["score"] if len(top) > 1 else 0
 
         # ── High-confidence fuzzy auto-match (score ≥ 95) ────────────────────
         if best["score"] >= _FUZZY_AUTO_THRESHOLD:
@@ -413,13 +203,12 @@ def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> No
             )
             if not dry_run:
                 _store_match(conn, uscis_norm, tax_id,
-                             best["employer_fein"], best["score"], stage="fuzzy")
+                             best["employer_fein"], best["score"], "fuzzy", clean)
                 conn.commit()
             fuzzy_auto += 1
             continue
 
-        # ── Dominant-winner: clear #1 with large gap from #2 (no LLM needed) ─
-        second_score = top[1]["score"] if len(top) > 1 else 0
+        # ── Dominant-winner: clear #1 with large gap from #2 ─────────────────
         if best["score"] >= _FUZZY_DOMINANT_SCORE and (best["score"] - second_score) >= _FUZZY_DOMINANT_GAP:
             log.info(
                 "fuzzy dominant-match: %r → FEIN %s | %s (score=%.0f, gap=%.0f, approvals=%d)",
@@ -428,58 +217,36 @@ def _run_body(conn, limit: "int | None", dry_run: bool, worker: "_Worker") -> No
             )
             if not dry_run:
                 _store_match(conn, uscis_norm, tax_id,
-                             best["employer_fein"], best["score"], stage="fuzzy_dominant")
+                             best["employer_fein"], best["score"], "fuzzy_dominant", clean)
                 conn.commit()
             fuzzy_auto += 1
             continue
 
-        # ── Ambiguous — send to Qwen3-8B for selection (score 40–94, gap < 25) ─
+        # ── Ambiguous — push to LLM worker stream ────────────────────────────
         log.info(
-            "LLM select: %r  (approvals=%d, top_score=%.0f, sending %d candidates)",
+            "queuing for LLM: %r  (approvals=%d, top_score=%.0f, %d candidates)",
             uscis_name, total_approvals, best["score"], len(top),
         )
         for c in top:
             log.info("  candidate: FEIN=%s | %s (score=%.0f)",
                      c["employer_fein"], c["employer_name"], c["score"])
 
-        if dry_run:
-            continue
-
-        dol_fein = _ask_model(worker, uscis_name, uscis_norm, top)
-
-        if dol_fein is None:
-            model_none += 1
-            log.debug("Model: no match for %r", uscis_name)
-            continue
-
-        # Validate the returned FEIN is one of the candidates (anti-hallucination)
-        valid_feins = {c["employer_fein"] for c in top}
-        if dol_fein not in valid_feins:
-            log.warning(
-                "Model returned FEIN %r not in candidates for %r — discarding",
-                dol_fein, uscis_name,
-            )
-            model_none += 1
-            continue
-
-        chosen_score = next(c["score"] for c in top if c["employer_fein"] == dol_fein)
-        _store_match(conn, uscis_norm, tax_id, dol_fein, chosen_score, stage="llm")
-        conn.commit()
-        llm_matched += 1
-        log.info("  → MATCHED to FEIN %s (score=%.0f)", dol_fein, chosen_score)
+        if not dry_run:
+            _push_to_stream(r, uscis_norm, uscis_name, tax_id, clean)
+            queued += 1
 
     log.info(
-        "Done: fuzzy_auto=%d  llm_matched=%d  skipped(below_threshold)=%d  "
-        "no_dol_candidates=%d  model_no_match=%d  already_mapped=%d",
-        fuzzy_auto, llm_matched, skipped, no_candidates, model_none, already,
+        "Done: fuzzy_auto=%d  queued_for_llm=%d  skipped(below_threshold)=%d  "
+        "no_dol_candidates=%d  already_mapped=%d",
+        fuzzy_auto, queued, skipped, no_candidates, already,
     )
-    if not dry_run and (fuzzy_auto + llm_matched) > 0:
-        log.info("Fuzzy pass complete — caller should refresh uscis_dol_unmatched")
+    if not dry_run and queued > 0:
+        log.info("%d ambiguous entries queued — h1b-llm-worker will resolve them asynchronously", queued)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fuzzy + Qwen3-8B match unresolved USCIS employers to DOL LCA records"
+        description="Fuzzy match unresolved USCIS employers to DOL LCA records"
     )
     parser.add_argument("--limit",   type=int, default=None,
                         help="Max unmatched rows to process")
