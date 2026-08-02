@@ -24,7 +24,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import H1B_DISAMBIG_STREAM
+from config import H1B_DISAMBIG_MAXLEN, H1B_DISAMBIG_STREAM
 from db.connection import get_conn
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -141,7 +141,7 @@ def _push_to_stream(r, uscis_norm: str, uscis_name: str,
             "tax_id":              tax_id,
             "candidates":          json.dumps(candidates),
         },
-        maxlen=1000,
+        maxlen=H1B_DISAMBIG_MAXLEN,
         approximate=True,
     )
 

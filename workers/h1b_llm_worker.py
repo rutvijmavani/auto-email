@@ -22,20 +22,20 @@ import os
 import re
 import sys
 
-import openai
-
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import (
     H1B_DISAMBIG_BLOCK_MS,
     H1B_DISAMBIG_CONSUMER,
+    H1B_DISAMBIG_DLQ_STREAM,
     H1B_DISAMBIG_GROUP,
+    H1B_DISAMBIG_MAX_DELIVERIES,
     H1B_DISAMBIG_STREAM,
     LLM_BASE_URL,
-    LLM_MODEL,
 )
 from db.connection import get_conn
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
+from workers.llm_client import call_llm as _call_llm_shared
 from workers.redis_client import get_redis
 
 log = get_logger(__name__)
@@ -67,18 +67,6 @@ Respond with ONLY a JSON object — no explanation, no markdown:
 {{"match": "<FEIN from candidates above, or null>"}}"""
 
 
-def _call_llm(prompt: str) -> str:
-    """Send prompt to llama-server. Raises on any connection or API error."""
-    client = openai.OpenAI(base_url=LLM_BASE_URL, api_key="none")
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    text = resp.choices[0].message.content or ""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-
 def _ask_model(uscis_name: str, uscis_norm: str,
                candidates: list[dict]) -> "str | None":
     """
@@ -94,7 +82,7 @@ def _ask_model(uscis_name: str, uscis_norm: str,
         uscis_norm=uscis_norm,
         candidates=cand_text,
     )
-    text = _call_llm(prompt)  # raises on connection error
+    text = _call_llm_shared(prompt)  # raises on connection error
     m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
         log.warning("Model returned no JSON for USCIS=%r — raw: %s", uscis_name, text[:200])
@@ -144,35 +132,64 @@ def _store_match(conn, employer_legal_norm: str, tax_id: str,
 # Job processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _decode(v) -> str:
-    return v.decode() if isinstance(v, bytes) else (v or "")
+def _delivery_count(r, msg_id: str) -> int:
+    """Return the delivery count from XPENDING for this message, or 0 on error."""
+    try:
+        entries = r.xpending_range(
+            H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP,
+            msg_id, msg_id, count=1,
+        )
+        return entries[0].get("times_delivered", 0) if entries else 0
+    except Exception:
+        return 0
 
 
-def _process_job(r, msg_id, fields) -> None:
-    employer_legal_norm = _decode(fields.get(b"employer_legal_norm") or fields.get("employer_legal_norm"))
-    uscis_name          = _decode(fields.get(b"uscis_name")          or fields.get("uscis_name"))
-    uscis_norm          = _decode(fields.get(b"uscis_norm")          or fields.get("uscis_norm"))
-    tax_id              = _decode(fields.get(b"tax_id")              or fields.get("tax_id"))
-    candidates_raw      = _decode(fields.get(b"candidates")          or fields.get("candidates"))
+def _move_to_dlq(r, msg_id: str, fields: dict) -> None:
+    """Publish a message to the DLQ stream and XACK it from the main stream."""
+    try:
+        r.xadd(H1B_DISAMBIG_DLQ_STREAM, fields, maxlen=10000, approximate=True)
+    except Exception as exc:
+        log.error("DLQ publish failed for msg_id=%s: %s", msg_id, exc)
+    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+
+
+def _process_job(r, msg_id, fields) -> bool:
+    """Process one LLM disambiguation job.  Returns True if the message was XACKed."""
+    # decode_responses=True means all values are already str — no bytes handling needed
+    employer_legal_norm = fields.get("employer_legal_norm") or ""
+    uscis_name          = fields.get("uscis_name") or ""
+    uscis_norm          = fields.get("uscis_norm") or ""
+    tax_id              = fields.get("tax_id") or ""
+    candidates_raw      = fields.get("candidates") or ""
 
     try:
         candidates = json.loads(candidates_raw) if candidates_raw else []
     except json.JSONDecodeError:
         log.warning("malformed candidates in msg_id=%s — discarding", msg_id)
         r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
-        return
+        return True
 
     if not employer_legal_norm or not tax_id or not candidates:
         log.warning("incomplete job msg_id=%s — discarding", msg_id)
         r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
-        return
+        return True
+
+    # DLQ guard: move messages that have failed too many times so they don't block the queue
+    deliveries = _delivery_count(r, msg_id)
+    if deliveries >= H1B_DISAMBIG_MAX_DELIVERIES:
+        log.error(
+            "msg_id=%s exceeded max deliveries (%d/%d) — moving %r to DLQ",
+            msg_id, deliveries, H1B_DISAMBIG_MAX_DELIVERIES, uscis_name,
+        )
+        _move_to_dlq(r, msg_id, fields)
+        return True
 
     conn = get_conn()
     try:
         if _already_mapped(conn, employer_legal_norm, tax_id):
             log.info("already mapped %r — skipping msg_id=%s", uscis_name, msg_id)
             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
-            return
+            return True
 
         log.info("LLM select: %r (tax_id=%s, %d candidates)", uscis_name, tax_id, len(candidates))
 
@@ -180,28 +197,29 @@ def _process_job(r, msg_id, fields) -> None:
             dol_fein = _ask_model(uscis_name, uscis_norm, candidates)
         except Exception as exc:
             log.error("LLM unavailable for %r: %s — leaving in PEL", uscis_name, exc)
-            return  # no XACK — stays in PEL, reclaimed on next startup
+            return False  # no XACK — stays in PEL, reclaimed on next startup
 
         if dol_fein is None:
             log.debug("no match for %r", uscis_name)
             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
-            return
+            return True
 
         valid_feins = {c["fein"] for c in candidates}
         if dol_fein not in valid_feins:
             log.warning("hallucinated FEIN %r for %r — discarding", dol_fein, uscis_name)
             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
-            return
+            return True
 
         chosen_score = next(c["score"] for c in candidates if c["fein"] == dol_fein)
         _store_match(conn, employer_legal_norm, tax_id, dol_fein, chosen_score, "llm", candidates)
         conn.commit()
         r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
         log.info("matched %r → FEIN %s (score=%.0f)", uscis_name, dol_fein, chosen_score)
+        return True
 
     except Exception as exc:
         log.error("unexpected error processing %r msg_id=%s: %s", uscis_name, msg_id, exc, exc_info=True)
-        # no XACK — stays in PEL
+        return False  # no XACK — stays in PEL
     finally:
         conn.close()
 
@@ -231,13 +249,16 @@ def run_worker(once: bool = False) -> None:
 
     # Drain PEL from any previous crash before processing new messages
     pending_drained = False
-    stream_id       = "0"
 
     hb_count = {"n": 0}
     hb = Heartbeat(r, "h1b_llm_worker", lambda: hb_count["n"], interval_s=30).start()
 
     log.info("h1b-llm-worker started — stream=%s group=%s consumer=%s",
              H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, H1B_DISAMBIG_CONSUMER)
+
+    # PEL entries that failed in this session (LLM error) — skip them until next restart.
+    # This prevents the PEL drain loop from busy-spinning on a persistently unavailable LLM.
+    skipped_pel_ids: set = set()
 
     try:
         while True:
@@ -253,6 +274,23 @@ def run_worker(once: bool = False) -> None:
                     if once:
                         break
                     continue
+
+                for _stream, entries in messages:
+                    for msg_id, fields in entries:
+                        if msg_id in skipped_pel_ids:
+                            # We've cycled back to a message that failed this session —
+                            # all remaining PEL entries are ones we already attempted.
+                            pending_drained = True
+                            log.debug(
+                                "PEL drain complete — %d entry(s) left in PEL "
+                                "(LLM unavailable; will retry on next startup)",
+                                len(skipped_pel_ids),
+                            )
+                            break
+                        was_acked = _process_job(r, msg_id, fields)
+                        hb_count["n"] += 1
+                        if not was_acked:
+                            skipped_pel_ids.add(msg_id)
             else:
                 # Read new messages
                 messages = r.xreadgroup(
@@ -261,15 +299,15 @@ def run_worker(once: bool = False) -> None:
                     block=H1B_DISAMBIG_BLOCK_MS,
                 )
 
-            if not messages:
-                if once:
-                    break
-                continue
+                if not messages:
+                    if once:
+                        break
+                    continue
 
-            for _stream, entries in messages:
-                for msg_id, fields in entries:
-                    _process_job(r, msg_id, fields)
-                    hb_count["n"] += 1
+                for _stream, entries in messages:
+                    for msg_id, fields in entries:
+                        _process_job(r, msg_id, fields)
+                        hb_count["n"] += 1
 
             if once:
                 break

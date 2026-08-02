@@ -101,6 +101,7 @@ jobs:
               else
                 echo "[WARN] Skipping pip install and unit sync — code state unknown"
               fi
+              # llama-server and h1b-llm-worker excluded — see [7/8] comment above
               for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
@@ -180,6 +181,12 @@ jobs:
             echo "  systemd daemon reloaded"
 
             echo "[7/8] Restarting services..."
+            # llama-server and h1b-llm-worker are intentionally excluded from this loop:
+            #   llama-server: model load takes minutes; TimeoutStartSec=infinity; systemd
+            #                 restarts it on failure; h1b-llm-worker depends on it via Requires=.
+            #   h1b-llm-worker: runs only during H1B batch jobs (quarterly/yearly); systemd
+            #                   starts it automatically when llama-server becomes active.
+            # Both are covered by the stale-unit check in step [6/8] and by watchdog monitoring.
             # Pre-restart Redis cleanup so the new scheduler starts with a clean slate:
             # 1. XACK any PEL entries from the current (about-to-die) scheduler — removes
             #    them cleanly so they never become "stuck dead-consumer" entries after restart.

@@ -131,6 +131,7 @@ _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
 _UNIT_MANAGER         = "recruiter-manager"
 _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
+_UNIT_LLAMA_SERVER    = "llama-server"
 
 
 # ─────────────────────────────────────────
@@ -151,7 +152,7 @@ HEARTBEAT_DEAD_AFTER = {
     "scan_worker":     45,
     "detail_worker":   45,
     "fullscan_worker":    1900,   # scans can legitimately take 30 min
-    "h1b_llm_worker":      120,   # interval=30s → TTL=90s; 4× gives safe dead-after
+    "h1b_llm_worker":       60,   # interval=30s → TTL=90s; 60s < TTL so STALE branch is reachable
 }
 
 # Consecutive rapid-death thresholds for worker pool health.
@@ -280,6 +281,12 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "description": f"Restarted {_UNIT_H1B_LLM_WORKER} via systemd (service was inactive/failed)",
                 "foreground":  True,
             },
+            f"systemd_{_UNIT_LLAMA_SERVER}": {
+                "cmd_args":    _systemd_restart_cmd(_UNIT_LLAMA_SERVER),
+                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
+                "description": f"Restarted {_UNIT_LLAMA_SERVER} via systemd (service was inactive/failed)",
+                "foreground":  True,
+            },
             # Queue empty → rebuild.  Queue stall → restart workers (rebuild
             # won't help if the queue has entries but workers aren't draining it).
             "queue_poll_adaptive_empty": {
@@ -372,6 +379,8 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/h1b_llm_worker.log",
                 "description": "Restarted h1b_llm_worker process (subprocess fallback)",
             },
+            # llama-server is not a Python module — subprocess fallback is not applicable
+            # (managed exclusively by systemd with TimeoutStartSec=infinity for model load)
             # Detail queues — depth growing/stalled at CRITICAL level.
             "queue_detail_adaptive": {
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.detail_worker"],
@@ -769,9 +778,20 @@ def check_worker_heartbeats(r) -> list:
         issues.append(Issue(Issue.WARNING, "worker:pool_health",
             f"Could not parse scheduler:health: {exc}"))
 
-    # ── 3. h1b_llm_worker heartbeat ──────────────────────────────────────────
-    # Standalone process outside the scheduler pool — scan for its heartbeat key.
-    _h1b_dead_after = HEARTBEAT_DEAD_AFTER["h1b_llm_worker"]
+    return issues
+
+
+def check_h1b_llm_worker_heartbeat(r) -> list:
+    """
+    Check h1b_llm_worker liveness via its heartbeat key.
+
+    Called from _run_all_checks() independently of check_worker_heartbeats() so
+    it always runs — even when the scheduler is completely down (which causes an
+    early return inside check_worker_heartbeats before it could reach this logic).
+    """
+    issues  = []
+    now     = time.time()
+    dead_after = HEARTBEAT_DEAD_AFTER["h1b_llm_worker"]
     try:
         h1b_keys = []
         cursor = 0
@@ -797,7 +817,7 @@ def check_worker_heartbeats(r) -> list:
                 f"pid={d.get('pid','?')}  processed={d.get('processed',0)}  "
                 f"heartbeat {age_s:.0f}s ago"
             )
-            if age_s > _h1b_dead_after:
+            if age_s > dead_after:
                 issues.append(Issue(
                     Issue.WARNING,
                     "worker:h1b_llm_worker",
@@ -810,7 +830,6 @@ def check_worker_heartbeats(r) -> list:
     except Exception as _h1b_err:
         issues.append(Issue(Issue.WARNING, "worker:h1b_llm_worker",
             f"heartbeat check failed: {_h1b_err}"))
-
     return issues
 
 
@@ -1714,6 +1733,7 @@ def check_systemd_services() -> list:
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_MANAGER,       True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker; systemd Requires=llama-server handles dep
+        (_UNIT_LLAMA_SERVER,   True),  # inference server; h1b-llm-worker and email-processor depend on it
     ]:
         try:
             result = subprocess.run(
@@ -1775,6 +1795,7 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     # can miss during the heartbeat TTL grace period after a crash.
     issues.extend(check_systemd_services())
     issues.extend(check_worker_heartbeats(r))
+    issues.extend(check_h1b_llm_worker_heartbeat(r))
     issues.extend(check_queue_health(r, persist_snapshot=persist_snapshot))
     issues.extend(check_bloom_health(r))
     issues.extend(check_coverage(r))

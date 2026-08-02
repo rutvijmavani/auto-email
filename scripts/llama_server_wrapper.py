@@ -44,8 +44,14 @@ def _sd_notify(msg: str) -> None:
     path = os.environ.get("NOTIFY_SOCKET", "")
     if not path:
         return
-    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
-        s.sendto(msg.encode(), path)
+    # Linux abstract-namespace sockets are indicated by a leading "@"; convert to NUL prefix
+    if path.startswith("@"):
+        path = "\0" + path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(msg.encode(), path)
+    except OSError as exc:
+        log.warning("sd_notify failed (NOTIFY_SOCKET=%r): %s", os.environ.get("NOTIFY_SOCKET"), exc)
 
 
 def _health() -> str:
@@ -96,7 +102,11 @@ def main() -> None:
             log.error("llama-server did not become ready within %ds — killing",
                       LLM_STARTUP_TIMEOUT_S)
             proc.terminate()
-            proc.wait()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             sys.exit(1)
 
         status = _health()
@@ -119,7 +129,11 @@ def main() -> None:
         if _health() != "ok":
             log.error("llama-server health check failed post-startup — killing")
             proc.terminate()
-            proc.wait()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             sys.exit(1)
 
 

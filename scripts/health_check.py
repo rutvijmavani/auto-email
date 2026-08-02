@@ -332,7 +332,7 @@ def run_health_check() -> int:
             _h1b_raw = r.get(_h1b_keys[0])
             _h1b_d   = json.loads(_h1b_raw) if _h1b_raw else {}
             _h1b_age = now - float(_h1b_d.get("ts", now))
-            _h1b_dead_after = _HEARTBEAT_DEAD_AFTER.get("h1b_llm_worker", 120)
+            _h1b_dead_after = _HEARTBEAT_DEAD_AFTER.get("h1b_llm_worker", 60)
             _h1b_status = (
                 f"pid={_h1b_d.get('pid','?')}  processed={_h1b_d.get('processed',0)}  "
                 f"heartbeat {_h1b_age:.0f}s ago"

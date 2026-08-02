@@ -38,9 +38,8 @@ import time
 from datetime import datetime, timezone
 
 import google.auth.exceptions
-import openai
 from google.auth.transport.requests import Request
-from config import LLM_BASE_URL, LLM_MODEL
+from config import LLM_BASE_URL
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -103,16 +102,7 @@ return removed
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
-def _call_llm(prompt: str) -> str:
-    """Send prompt to llama-server, return full response text with <think> stripped."""
-    client = openai.OpenAI(base_url=LLM_BASE_URL, api_key="none")
-    resp = client.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    text = resp.choices[0].message.content or ""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+from workers.llm_client import call_llm as _call_llm
 
 
 # ── Gmail helpers ──────────────────────────────────────────────────────────────

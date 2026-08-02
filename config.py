@@ -305,14 +305,19 @@ LLM_CTX_SIZE          = int(os.getenv("LLM_CTX_SIZE", "8192"))  # context window
 LLM_POLL_S            = int(os.getenv("LLM_POLL_S", "5"))       # wrapper health-check interval
 LLM_STARTUP_TIMEOUT_S = int(os.getenv("LLM_STARTUP_TIMEOUT_S", "600"))  # max model load wait
 LLM_HEALTH_URL        = os.getenv("LLM_HEALTH_URL", "http://127.0.0.1:8080/health")
+LLM_REQUEST_TIMEOUT   = int(os.getenv("LLM_REQUEST_TIMEOUT", "60"))   # HTTP timeout for inference calls
+LLM_MAX_TOKENS        = int(os.getenv("LLM_MAX_TOKENS", "512"))        # cap output length
 
 # ─────────────────────────────────────────
 # H1B DISAMBIGUATION STREAM
 # ─────────────────────────────────────────
-H1B_DISAMBIG_STREAM   = os.getenv("H1B_DISAMBIG_STREAM", "llm:h1b:disambiguate")
-H1B_DISAMBIG_GROUP    = os.getenv("H1B_DISAMBIG_GROUP", "h1b-llm-workers")
-H1B_DISAMBIG_CONSUMER = os.getenv("H1B_DISAMBIG_CONSUMER", "h1b-llm-worker-1")
-H1B_DISAMBIG_BLOCK_MS = int(os.getenv("H1B_DISAMBIG_BLOCK_MS", "5000"))
+H1B_DISAMBIG_STREAM        = os.getenv("H1B_DISAMBIG_STREAM", "llm:h1b:disambiguate")
+H1B_DISAMBIG_GROUP         = os.getenv("H1B_DISAMBIG_GROUP", "h1b-llm-workers")
+H1B_DISAMBIG_CONSUMER      = os.getenv("H1B_DISAMBIG_CONSUMER", "h1b-llm-worker-1")
+H1B_DISAMBIG_BLOCK_MS      = int(os.getenv("H1B_DISAMBIG_BLOCK_MS", "5000"))
+H1B_DISAMBIG_MAXLEN        = int(os.getenv("H1B_DISAMBIG_MAXLEN", "50000"))  # max stream length
+H1B_DISAMBIG_MAX_DELIVERIES = int(os.getenv("H1B_DISAMBIG_MAX_DELIVERIES", "5"))  # DLQ after N failures
+H1B_DISAMBIG_DLQ_STREAM    = os.getenv("H1B_DISAMBIG_DLQ_STREAM", "llm:h1b:dlq")
 
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING

@@ -1444,7 +1444,7 @@ def init_db():
     """)
     c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS employer_legal_norm TEXT")
     c.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_uscis_unmatched_unique
+        CREATE INDEX IF NOT EXISTS idx_uscis_unmatched_employer
         ON uscis_dol_unmatched (employer_legal_norm, tax_id)
         WHERE employer_legal_norm IS NOT NULL
     """)
