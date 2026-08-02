@@ -15,6 +15,7 @@ Usage (via systemd — see deploy/systemd/llama-server.service):
 """
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -87,6 +88,18 @@ def main() -> None:
 
     log.info("Starting llama-server: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd)
+
+    def _on_sigterm(signum, frame):
+        log.info("SIGTERM received — forwarding to llama-server (pid %d)", proc.pid)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     # ── Phase 1: wait for model to load ──────────────────────────────────────
     log.info("Waiting for model to load (poll every %ds, timeout %ds)",

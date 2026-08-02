@@ -149,7 +149,8 @@ def _move_to_dlq(r, msg_id: str, fields: dict) -> None:
     try:
         r.xadd(H1B_DISAMBIG_DLQ_STREAM, fields, maxlen=10000, approximate=True)
     except Exception as exc:
-        log.error("DLQ publish failed for msg_id=%s: %s", msg_id, exc)
+        log.error("DLQ publish failed for msg_id=%s — leaving in PEL for recovery: %s", msg_id, exc)
+        return
     r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
 
 
@@ -249,6 +250,7 @@ def run_worker(once: bool = False) -> None:
 
     # Drain PEL from any previous crash before processing new messages
     pending_drained = False
+    pel_cursor = "0-0"
 
     hb_count = {"n": 0}
     hb = Heartbeat(r, "h1b_llm_worker", lambda: hb_count["n"], interval_s=30).start()
@@ -256,41 +258,49 @@ def run_worker(once: bool = False) -> None:
     log.info("h1b-llm-worker started — stream=%s group=%s consumer=%s",
              H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, H1B_DISAMBIG_CONSUMER)
 
-    # PEL entries that failed in this session (LLM error) — skip them until next restart.
-    # This prevents the PEL drain loop from busy-spinning on a persistently unavailable LLM.
+    # PEL entries that failed this session (LLM error) — left in PEL, skipped via cursor.
+    # XAUTOCLAIM advances past failed entries so later PEL entries are still attempted.
     skipped_pel_ids: set = set()
 
     try:
         while True:
             if not pending_drained:
-                # Read PEL entries for this consumer (id="0")
-                messages = r.xreadgroup(
-                    H1B_DISAMBIG_GROUP, H1B_DISAMBIG_CONSUMER,
-                    {H1B_DISAMBIG_STREAM: "0"}, count=1,
+                # XAUTOCLAIM with cursor advances past failed entries, unlike XREADGROUP "0"
+                # which always re-delivers the oldest pending entry.  min_idle_time=0 means
+                # re-deliver immediately; we are already the owner of these entries.
+                new_cursor, entries, _ = r.xautoclaim(
+                    H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, H1B_DISAMBIG_CONSUMER,
+                    min_idle_time=0, start=pel_cursor, count=1,
                 )
-                if not messages or not messages[0][1]:
+                if not entries:
                     pending_drained = True
-                    log.debug("PEL drained — switching to new messages")
+                    log.debug("PEL drained — switching to new messages (%d entries skipped)",
+                              len(skipped_pel_ids))
                     if once:
                         break
                     continue
 
-                for _stream, entries in messages:
-                    for msg_id, fields in entries:
-                        if msg_id in skipped_pel_ids:
-                            # We've cycled back to a message that failed this session —
-                            # all remaining PEL entries are ones we already attempted.
-                            pending_drained = True
-                            log.debug(
-                                "PEL drain complete — %d entry(s) left in PEL "
-                                "(LLM unavailable; will retry on next startup)",
-                                len(skipped_pel_ids),
-                            )
-                            break
-                        was_acked = _process_job(r, msg_id, fields)
-                        hb_count["n"] += 1
-                        if not was_acked:
-                            skipped_pel_ids.add(msg_id)
+                msg_id, fields = entries[0]
+                if msg_id in skipped_pel_ids:
+                    # Already failed this session; advance cursor past it and keep draining.
+                    pel_cursor = new_cursor
+                    if new_cursor == "0-0":
+                        pending_drained = True
+                        log.debug(
+                            "PEL drain complete — %d entry(s) left in PEL "
+                            "(LLM unavailable; will retry on next startup)",
+                            len(skipped_pel_ids),
+                        )
+                    continue
+
+                was_acked = _process_job(r, msg_id, fields)
+                hb_count["n"] += 1
+                if not was_acked:
+                    skipped_pel_ids.add(msg_id)
+                pel_cursor = new_cursor
+                if new_cursor == "0-0":
+                    pending_drained = True
+                    log.debug("PEL drained — switching to new messages")
             else:
                 # Read new messages
                 messages = r.xreadgroup(

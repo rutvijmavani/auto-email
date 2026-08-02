@@ -37,4 +37,6 @@ def call_llm(prompt: str, *, max_tokens: int = LLM_MAX_TOKENS) -> str:
         max_tokens=max_tokens,
     )
     text = resp.choices[0].message.content or ""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*$", "", text, flags=re.DOTALL)
+    return text.strip()

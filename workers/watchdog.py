@@ -810,23 +810,41 @@ def check_h1b_llm_worker_heartbeat(r) -> list:
                 alert_type=f"systemd_{_UNIT_H1B_LLM_WORKER}",
             ))
         else:
-            raw = r.get(h1b_keys[0])
-            d   = json.loads(raw) if raw else {}
-            age_s = now - float(d.get("ts", now))
-            detail = (
-                f"pid={d.get('pid','?')}  processed={d.get('processed',0)}  "
-                f"heartbeat {age_s:.0f}s ago"
-            )
-            if age_s > dead_after:
+            best_d: dict = {}
+            for key in h1b_keys:
+                raw = r.get(key)
+                if not raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except Exception:
+                    continue
+                if float(d.get("ts", 0)) > float(best_d.get("ts", 0)):
+                    best_d = d
+            if not best_d:
                 issues.append(Issue(
                     Issue.WARNING,
                     "worker:h1b_llm_worker",
-                    f"{detail}  (STALE — process may be hung)",
+                    "h1b_llm_worker heartbeat keys present but all unreadable",
                     f"sudo {_SYSTEMCTL} restart {_UNIT_H1B_LLM_WORKER}",
                     alert_type=f"systemd_{_UNIT_H1B_LLM_WORKER}",
                 ))
             else:
-                issues.append(Issue(Issue.OK, "worker:h1b_llm_worker", detail))
+                age_s = now - float(best_d.get("ts", now))
+                detail = (
+                    f"pid={best_d.get('pid','?')}  processed={best_d.get('processed',0)}  "
+                    f"heartbeat {age_s:.0f}s ago"
+                )
+                if age_s > dead_after:
+                    issues.append(Issue(
+                        Issue.WARNING,
+                        "worker:h1b_llm_worker",
+                        f"{detail}  (STALE — process may be hung)",
+                        f"sudo {_SYSTEMCTL} restart {_UNIT_H1B_LLM_WORKER}",
+                        alert_type=f"systemd_{_UNIT_H1B_LLM_WORKER}",
+                    ))
+                else:
+                    issues.append(Issue(Issue.OK, "worker:h1b_llm_worker", detail))
     except Exception as _h1b_err:
         issues.append(Issue(Issue.WARNING, "worker:h1b_llm_worker",
             f"heartbeat check failed: {_h1b_err}"))
