@@ -2,8 +2,7 @@
 Description=Gmail Email Status Processor (Qwen3-8B)
 Documentation=https://github.com/rutvijmavani/auto-email
 After=network-online.target llama-server.service
-Wants=network-online.target
-Requires=llama-server.service
+Wants=network-online.target llama-server.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
 OnFailure=recruiter-pipeline-alert@%p.service
