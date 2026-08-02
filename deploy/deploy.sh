@@ -180,38 +180,19 @@ fi
 # Run this before restart so the updated definitions are always active.
 echo ""
 echo "► Syncing systemd unit files..."
-# NOTE: install-pipeline-units reads from the root-owned staging directory
-# (/usr/local/share/mail-pipeline/systemd/).  If you changed a .service file
-# in this commit, you MUST re-stage it first:
-#   sudo bash deploy/install-systemd.sh
-# (one-time per structural unit change; deploy.sh does not auto-restage)
-if [[ ! -x /usr/local/bin/install-pipeline-units ]]; then
-    echo "[ERROR] /usr/local/bin/install-pipeline-units not found."
-    echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
-    _rollback_to_previous; exit 1
-fi
-# Guard: verify staging is current before installing — same check as deploy.yml.
-# If a unit file changed in this commit and install-systemd.sh was not re-run,
-# install-pipeline-units would silently install the stale staged copy.
-_stale_units=0
-for _unit in "recruiter-scheduler.service" "recruiter-watchdog.service" "recruiter-pipeline-alert@.service" "pipeline-api.service" "streamlit-frontend.service"; do
-    _src="$DEPLOY_DIR/systemd/$_unit"
-    _staged="/usr/local/share/mail-pipeline/systemd/$_unit"
-    if [[ ! -f "$_staged" ]]; then
-        echo "[ERROR] Staging file missing: $_staged — run: sudo bash deploy/install-systemd.sh"
-        _stale_units=1
-    elif ! diff -q "$_src" "$_staged" > /dev/null 2>&1; then
-        echo "[ERROR] Staged unit out of date: $_unit (deploy/systemd/ vs staging)"
-        echo "        Run: sudo bash deploy/install-systemd.sh"
-        _stale_units=1
+for _wrapper in /usr/local/bin/install-pipeline-units /usr/local/bin/sync-pipeline-staging; do
+    if [[ ! -x "$_wrapper" ]]; then
+        echo "[ERROR] $_wrapper not found."
+        echo "        Run 'sudo bash deploy/install-systemd.sh' once to provision it."
+        _rollback_to_previous; exit 1
     fi
 done
-if [[ "$_stale_units" -eq 1 ]]; then
-    echo "[ERROR] Systemd unit staging is stale — rolling back"
+sudo /usr/local/bin/sync-pipeline-staging || {
+    echo "  [ERROR] Staging sync failed — rolling back"
     _rollback_to_previous; exit 1
-fi
+}
 sudo /usr/local/bin/install-pipeline-units || {
-    echo "  [ERROR] Unit sync failed — rolling back"
+    echo "  [ERROR] Unit install failed — rolling back"
     _rollback_to_previous; exit 1
 }
 echo "  systemd unit files installed"

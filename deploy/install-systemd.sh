@@ -108,14 +108,10 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for unit in recruiter-scheduler.service recruiter-watchdog.service "recruiter-pipeline-alert@.service" pipeline-api.service email-processor.service streamlit-frontend.service llama-server.service h1b-llm-worker.service; do
-    src="$DEPLOY_DIR/systemd/$unit"
-    if [[ ! -f "$src" ]]; then
-        echo "[ERROR] Unit file not found: $src"
-        echo "        Ensure deploy/systemd/$unit exists before running this script."
-        exit 1
-    fi
-    cp "$src" "$UNIT_STAGING_DIR/$unit"
+for _unit_src in "$DEPLOY_DIR"/systemd/*.service; do
+    unit="$(basename "$_unit_src")"
+    [[ "$unit" == "cloudflare-tunnel.service" ]] && continue
+    cp "$_unit_src" "$UNIT_STAGING_DIR/$unit"
     chown root:root "$UNIT_STAGING_DIR/$unit"
     chmod 644 "$UNIT_STAGING_DIR/$unit"
     echo "  Staged: $UNIT_STAGING_DIR/$unit"
@@ -133,33 +129,53 @@ UNIT_INSTALL_BIN="/usr/local/bin/install-pipeline-units"
 cat > "$UNIT_INSTALL_BIN" << WRAPPER_EOF
 #!/bin/bash
 # Root-owned unit installer — reads from root-owned staging dir.
-# Do NOT grant NOPASSWD tee on /etc/systemd/system/ — use this wrapper instead.
+# Auto-installs all .service files present in staging (cloudflare-tunnel excluded).
 set -euo pipefail
 SERVICE_USER="${SERVICE_USER}"
 PROJECT_DIR="${PROJECT_DIR}"
 SRC_DIR="/usr/local/share/mail-pipeline/systemd"
 DST_DIR="/etc/systemd/system"
-ALLOWED_UNITS=(
-    "recruiter-scheduler.service"
-    "recruiter-watchdog.service"
-    "recruiter-pipeline-alert@.service"
-    "pipeline-api.service"
-    "email-processor.service"
-    "streamlit-frontend.service"
-    "llama-server.service"
-    "h1b-llm-worker.service"
-)
-for unit in "\${ALLOWED_UNITS[@]}"; do
-    src="\$SRC_DIR/\$unit"
-    [[ -f "\$src" ]] || continue
+for src in "\$SRC_DIR"/*.service; do
+    unit="\$(basename "\$src")"
+    [[ "\$unit" == "cloudflare-tunnel.service" ]] && continue
     sed "s|User=opc|User=\$SERVICE_USER|g; s|Group=opc|Group=\$SERVICE_USER|g; s|/home/opc/mail|\$PROJECT_DIR|g" \
         "\$src" > "\$DST_DIR/\$unit"
     echo "  Installed: \$DST_DIR/\$unit"
+    if [[ "\$unit" != *@* ]]; then
+        systemctl enable "\${unit%.service}" || true
+    fi
 done
 WRAPPER_EOF
 chmod 755 "$UNIT_INSTALL_BIN"
 chown root:root "$UNIT_INSTALL_BIN"
 echo "  Wrapper installed: $UNIT_INSTALL_BIN"
+
+echo ""
+echo "► Creating staging-sync wrapper..."
+UNIT_SYNC_BIN="/usr/local/bin/sync-pipeline-staging"
+cat > "$UNIT_SYNC_BIN" << WRAPPER_EOF
+#!/bin/bash
+# Root-owned staging sync — copies unit files from project tree into staging dir.
+# Called by deploy.yml at step [6/8] so new unit files land in staging automatically.
+set -euo pipefail
+PROJECT_DIR="${PROJECT_DIR}"
+SRC_DIR="\$PROJECT_DIR/deploy/systemd"
+STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
+mkdir -p "\$STAGING_DIR"
+for src in "\$SRC_DIR"/*.service; do
+    unit="\$(basename "\$src")"
+    [[ "\$unit" == "cloudflare-tunnel.service" ]] && continue
+    cp "\$src" "\$STAGING_DIR/\$unit"
+    chown root:root "\$STAGING_DIR/\$unit"
+    chmod 644 "\$STAGING_DIR/\$unit"
+    echo "  Synced: \$STAGING_DIR/\$unit"
+done
+chown root:root "\$STAGING_DIR"
+chmod 755 "\$STAGING_DIR"
+WRAPPER_EOF
+chmod 755 "$UNIT_SYNC_BIN"
+chown root:root "$UNIT_SYNC_BIN"
+echo "  Sync wrapper installed: $UNIT_SYNC_BIN"
 
 # ── Add sudoers rule so watchdog can restart the scheduler ───────────────────
 # The watchdog needs to run: sudo systemctl restart recruiter-scheduler
@@ -188,30 +204,20 @@ cat > "$_SUDOERS_TMP" << EOF
 # Allow opc user to restart/query pipeline services without password.
 # Required by workers/watchdog.py self-healing and deploy workflow.
 # Path = $(which systemctl) → resolved to $SYSTEMCTL_BIN
-# Watchdog commands:
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-scheduler
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-watchdog
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed email-processor
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed recruiter-manager
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed streamlit-frontend
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed h1b-llm-worker
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed llama-server
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-scheduler
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-watchdog
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart email-processor
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart recruiter-manager
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart streamlit-frontend
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart h1b-llm-worker
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart llama-server
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-scheduler
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-watchdog
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active email-processor
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active recruiter-manager
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active streamlit-frontend
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active h1b-llm-worker
-$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active llama-server
-# Deploy-time unit sync — uses root-owned wrapper (not tee) to prevent stdin injection:
+# Per-service entries auto-generated from staged unit files:
+EOF
+for _unit_file in "$UNIT_STAGING_DIR"/*.service; do
+    _svc="$(basename "$_unit_file" .service)"
+    cat >> "$_SUDOERS_TMP" << EOF
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reset-failed $_svc
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart $_svc
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN is-active $_svc
+EOF
+done
+cat >> "$_SUDOERS_TMP" << EOF
+# Deploy-time unit sync — root-owned wrappers (not tee) prevent stdin injection:
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
+$SERVICE_USER ALL=(root) NOPASSWD: $UNIT_SYNC_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
 EOF
 chmod 440 "$_SUDOERS_TMP"
@@ -245,13 +251,12 @@ echo ""
 echo "► Enabling services (daemon-reload + enable)..."
 systemctl daemon-reload
 
-systemctl enable recruiter-scheduler
-systemctl enable recruiter-watchdog
-systemctl enable pipeline-api
-systemctl enable email-processor
-systemctl enable streamlit-frontend
-systemctl enable llama-server
-systemctl enable h1b-llm-worker
+for _unit_file in "$UNIT_STAGING_DIR"/*.service; do
+    _unit="$(basename "$_unit_file")"
+    [[ "$_unit" == "cloudflare-tunnel.service" ]] && continue
+    [[ "$_unit" == *@* ]] && continue  # skip template units — enabled per-instance
+    systemctl enable "${_unit%.service}"
+done
 
 if [[ "$_START" == "--start" ]]; then
     echo "► Starting services..."
