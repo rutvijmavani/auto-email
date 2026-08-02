@@ -64,6 +64,7 @@ Every WATCHDOG_INTERVAL_S (5 min):
 
 import html as _html_lib
 import json
+import math
 import os
 import shutil
 import smtplib
@@ -811,21 +812,31 @@ def check_h1b_llm_worker_heartbeat(r) -> list:
             ))
         else:
             best_d: dict = {}
+            invalid_keys = 0
             for key in h1b_keys:
                 raw = r.get(key)
                 if not raw:
+                    invalid_keys += 1
                     continue
                 try:
                     d = json.loads(raw)
-                except Exception:
+                    if not isinstance(d, dict):
+                        raise TypeError(f"expected dict, got {type(d).__name__}")
+                    ts = float(d["ts"])
+                    if not math.isfinite(ts):
+                        raise ValueError(f"non-finite ts: {ts}")
+                    if ts > float(best_d.get("ts", 0)):
+                        best_d = d
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError) as exc:
+                    log.debug("h1b_llm_worker: skipping malformed heartbeat key %s: %s", key, exc)
+                    invalid_keys += 1
                     continue
-                if float(d.get("ts", 0)) > float(best_d.get("ts", 0)):
-                    best_d = d
             if not best_d:
                 issues.append(Issue(
                     Issue.WARNING,
                     "worker:h1b_llm_worker",
-                    "h1b_llm_worker heartbeat keys present but all unreadable",
+                    f"h1b_llm_worker heartbeat keys present but all unreadable "
+                    f"({invalid_keys}/{len(h1b_keys)} invalid)",
                     f"sudo {_SYSTEMCTL} restart {_UNIT_H1B_LLM_WORKER}",
                     alert_type=f"systemd_{_UNIT_H1B_LLM_WORKER}",
                 ))
