@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -98,6 +99,16 @@ def _update_gist(key: str, url: str) -> None:
             log.error('Gist update error: %s', exc)
 
 
+def _is_dns_error(exc: requests.exceptions.ConnectionError) -> bool:
+    """Return True if the exception chain contains a socket.gaierror (DNS failure)."""
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, socket.gaierror):
+            return True
+        cause = cause.__cause__ or cause.__context__
+    return False
+
+
 def _health_monitor(url: str, proc: subprocess.Popen, label: str,
                     interval: int = 300, max_failures: int = 3) -> None:
     """
@@ -114,14 +125,7 @@ def _health_monitor(url: str, proc: subprocess.Popen, label: str,
                 log.info('[%s] health check recovered', label)
             failures = 0
         except requests.exceptions.ConnectionError as exc:
-            msg = str(exc).lower()
-            is_dns = any(s in msg for s in (
-                'name or service not known',
-                'nodename nor servname',
-                'name resolution',
-                'nxdomain',
-            ))
-            if is_dns:
+            if _is_dns_error(exc):
                 failures += 1
                 log.warning('[%s] DNS lookup failed (%d/%d): %s', label, failures, max_failures, exc)
                 if failures >= max_failures:
@@ -132,7 +136,7 @@ def _health_monitor(url: str, proc: subprocess.Popen, label: str,
                 # DNS resolved but connection refused/reset — local service issue, not the tunnel
                 log.debug('[%s] connection error (not DNS, not restarting): %s', label, exc)
                 failures = 0
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             log.debug('[%s] health check non-fatal error: %s', label, exc)
             failures = 0
         time.sleep(interval)
