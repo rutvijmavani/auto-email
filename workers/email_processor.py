@@ -12,9 +12,9 @@ Pub/Sub notification, calls history.list to find new message IDs, then for each:
   6. Updates applications.email_status + ats_company + ats_title, or writes to
      unmatched_emails when no application can be identified.
 
-Model: Qwen3-8B-Q4_K_M.gguf via llama-cpp-python. Loaded once at startup (~2 min),
-stays in memory forever. Single worker — email volume (~5-10/day) does not justify
-parallelism, and concurrent Qwen inference on a 2-core VM is slower than sequential.
+Model: Qwen3 via shared llama-server (HTTP, OpenAI-compatible API at LLM_BASE_URL).
+Single worker — email volume (~5-10/day) does not justify parallelism, and concurrent
+Qwen inference on a 2-core VM is slower than sequential.
 
 At-least-once delivery (same pattern as detail_worker):
   LMOVE queue:email:push → queue:email:push:inflight:{worker_id}   (atomic)
@@ -30,7 +30,6 @@ Usage:
 
 import base64
 import json
-import multiprocessing
 import os
 import re
 import socket
@@ -40,10 +39,10 @@ from datetime import datetime, timezone
 
 import google.auth.exceptions
 from google.auth.transport.requests import Request
+from config import LLM_BASE_URL
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from llama_cpp import Llama
 from rapidfuzz import fuzz
 
 from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ
@@ -62,12 +61,10 @@ _INFLIGHT_KEY: str = ""
 
 _CLIENT_ID     = os.environ.get("GMAIL_CLIENT_ID", "")
 _CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
-_MODEL_PATH    = os.environ.get("EMAIL_PROCESSOR_MODEL_PATH", "")
 
-_MAX_ATTEMPTS     = 3           # total attempts before DLQ (1 original + 2 retries)
-_RETRY_DELAYS     = [30, 300]   # seconds to wait before attempt 2 and 3
-_DLQ_MAX_ENTRIES  = 200
-_INFERENCE_TIMEOUT = 120        # seconds before treating an inference call as hung
+_MAX_ATTEMPTS    = 3            # total attempts before DLQ (1 original + 2 retries)
+_RETRY_DELAYS    = [30, 300]    # seconds to wait before attempt 2 and 3
+_DLQ_MAX_ENTRIES = 200
 
 # ATS email sender domain → platform name used for Layer 1 filtering
 _SENDER_TO_PLATFORM = {
@@ -103,65 +100,9 @@ if removed > 0 then redis.call('RPUSH', KEYS[2], ARGV[1]) end
 return removed
 """
 
-llm: "Llama | None" = None
-
-
 # ── Model ─────────────────────────────────────────────────────────────────────
 
-def _load_model() -> None:
-    global llm
-    if llm is not None:
-        return
-    if not _MODEL_PATH:
-        raise RuntimeError(
-            "EMAIL_PROCESSOR_MODEL_PATH is not set — "
-            "point it at the Qwen3-8B-Q4_K_M.gguf file"
-        )
-    logger.info("loading Qwen3-8B from %s ...", _MODEL_PATH)
-    llm = Llama(
-        model_path=_MODEL_PATH,
-        n_ctx=4096,
-        n_threads=2,
-        verbose=False,
-    )
-    logger.info("model ready")
-
-
-def _run_with_timeout(fn, timeout: int = _INFERENCE_TIMEOUT):
-    """Run fn() in a forked child process; terminate it if timeout expires."""
-    def _worker(q, fn):
-        try:
-            q.put(("ok", fn()))
-        except Exception as exc:
-            try:
-                q.put(("err", exc))
-            except Exception:
-                q.put(("err", RuntimeError(str(exc))))
-
-    q: multiprocessing.Queue = multiprocessing.Queue()
-    p = multiprocessing.Process(target=_worker, args=(q, fn))
-    p.start()
-    try:
-        p.join(timeout)
-        if p.is_alive():
-            p.terminate()
-            p.join()
-            raise RuntimeError(f"inference timed out after {timeout}s")
-        if not q.empty():
-            kind, val = q.get_nowait()
-            if kind == "ok":
-                return val
-            raise val
-        raise RuntimeError("inference process exited without result")
-    finally:
-        q.close()
-        q.join_thread()
-        p.close()
-
-
-def _strip_think(text: str) -> str:
-    """Remove Qwen3 <think>…</think> block so only the final answer remains."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+from workers.llm_client import call_llm as _call_llm
 
 
 # ── Gmail helpers ──────────────────────────────────────────────────────────────
@@ -255,12 +196,7 @@ Output JSON: {{"application_id": <one of the IDs listed above>}}"""
 def _gate(subject: str, sender: str) -> str:
     """Call 1: classify subject+sender. Returns 'yes', 'no', or 'not_sure'."""
     prompt = _GATE_PROMPT.format(sender=sender, subject=subject)
-    resp = _run_with_timeout(lambda: llm.create_chat_completion(  # type: ignore[union-attr]
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=10,
-        temperature=0,
-    ))
-    raw = _strip_think(resp["choices"][0]["message"]["content"]).lower()
+    raw = _call_llm(prompt).lower()
     for token in ("yes", "not_sure", "no"):
         if token in raw:
             return token
@@ -270,12 +206,7 @@ def _gate(subject: str, sender: str) -> str:
 def _extract(body: str) -> dict:
     """Call 2: extract company, title, status from full email body."""
     prompt = _EXTRACT_PROMPT.format(body=_truncate_body(body))
-    resp = _run_with_timeout(lambda: llm.create_chat_completion(  # type: ignore[union-attr]
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=200,
-        temperature=0,
-    ))
-    text = _strip_think(resp["choices"][0]["message"]["content"])
+    text = _call_llm(prompt)
     m = re.search(r"\{[^}]+\}", text, re.DOTALL)
     if not m:
         return {}
@@ -302,12 +233,7 @@ def _disambiguate(extracted: dict, candidates: list) -> "int | None":
         status=extracted.get("status") or "unknown",
         candidates=lines,
     )
-    resp = _run_with_timeout(lambda: llm.create_chat_completion(  # type: ignore[union-attr]
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=400,
-        temperature=0,
-    ))
-    text = _strip_think(resp["choices"][0]["message"]["content"])
+    text = _call_llm(prompt)
     m = re.search(r"\{[^}]+\}", text, re.DOTALL)
     if not m:
         return None
@@ -714,17 +640,19 @@ def _process_notification(raw_str: str, r) -> str:
 
 def run_worker(once: bool = False) -> None:
     global _INFLIGHT_KEY
+    if not LLM_BASE_URL:
+        logger.error(
+            "LLM_BASE_URL is not set — start llama-server and set LLM_BASE_URL in .env "
+            "(e.g. http://localhost:8080/v1)"
+        )
+        raise RuntimeError("LLM_BASE_URL not configured")
     _INFLIGHT_KEY = f"queue:email:push:inflight:{WORKER_ID}"
 
     r = get_redis()
     _recover_stuck_jobs(r)
 
-    # Start heartbeat daemon BEFORE model loading so the worker is visible to
-    # the watchdog during the ~2-minute model-load phase.
     _hw = {"count": 0}
     _hb = Heartbeat(r, "email_processor", lambda: _hw["count"], interval_s=30).start()
-
-    _load_model()
 
     logger.info(
         "email-processor started worker_id=%s inflight=%s",

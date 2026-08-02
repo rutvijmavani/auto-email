@@ -1,0 +1,37 @@
+[Unit]
+Description=llama.cpp HTTP inference server (shared model for all pipeline workers)
+Documentation=https://github.com/ggerganov/llama.cpp
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=3
+StartLimitIntervalSec=600s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/python scripts/llama_server_wrapper.py
+Restart=always
+RestartSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+TimeoutStartSec=infinity
+OOMScoreAdj=-500
+LimitNOFILE=4096
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindPaths=/home/opc/mail /home/opc/models /home/opc/llama.cpp
+PrivateTmp=true
+ReadWritePaths=/home/opc/mail /home/opc/models /home/opc/llama.cpp
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llama-server
+
+[Install]
+WantedBy=multi-user.target

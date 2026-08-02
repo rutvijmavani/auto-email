@@ -321,16 +321,19 @@ def populate_unmatched() -> None:
         conn.execute("TRUNCATE TABLE uscis_dol_unmatched")
         result = conn.execute("""
             INSERT INTO uscis_dol_unmatched
-                (employer_name, employer_name_norm, tax_id, fiscal_year, state, total_approvals)
+                (employer_name, employer_name_norm, employer_legal_norm,
+                 tax_id, fiscal_year, state, total_approvals)
             SELECT
-                u.employer_name,
-                u.employer_name_norm,
+                MAX(u.employer_name)      AS employer_name,
+                MAX(u.employer_name_norm) AS employer_name_norm,
+                COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
+                                          AS employer_legal_norm,
                 u.tax_id,
-                u.fiscal_year,
-                u.state,
-                (u.new_employment_approval + u.continuation_approval +
-                 u.change_same_employer_approval + u.new_concurrent_approval +
-                 u.change_of_employer_approval  + u.amended_approval) AS total_approvals
+                MAX(u.fiscal_year)        AS fiscal_year,
+                MAX(u.state)              AS state,
+                SUM(u.new_employment_approval + u.continuation_approval +
+                    u.change_same_employer_approval + u.new_concurrent_approval +
+                    u.change_of_employer_approval  + u.amended_approval) AS total_approvals
             FROM uscis_h1b_petitions u
             LEFT JOIN dol_h1b_employers d
               ON (
@@ -343,6 +346,7 @@ def populate_unmatched() -> None:
              AND f.tax_id             = u.tax_id
             WHERE d.employer_fein IS NULL
               AND f.dol_fein IS NULL
+            GROUP BY COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm), u.tax_id
             ORDER BY total_approvals DESC
         """)
         count = result.rowcount
