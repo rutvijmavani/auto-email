@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import html
 import ipaddress
 import json
 import os
@@ -68,6 +69,7 @@ def _is_maintenance(r) -> bool:
 
 _KG_ENDPOINT     = "https://kgsearch.googleapis.com/v1/entities:search"
 _KG_API_KEY      = os.environ.get("KG_API_KEY", "")
+_KG_MAX_RETRIES  = 3   # max words to drop when a thin /g/ entity is returned
 
 _WIKIDATA_SPARQL = "https://query.wikidata.org/sparql"
 
@@ -231,11 +233,20 @@ _sparql_limiter = _RateLimiter(rpm=30)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def kg_search(legal_name: str) -> dict | None:
-    """
-    Search KG API for legal_name with types=Organization filter.
-    Returns {name, url, kg_mid} or None.
-    kg_mid is the Freebase MID stripped of 'kg:' prefix (e.g. '/m/0mgkg').
-    Uses can_call / increment_usage for daily + RPM tracking.
+    """Search KG API for legal_name with progressive fallback for thin shell entities.
+
+    Returns {name, url, kg_mid} or None.  kg_mid is the Freebase MID stripped of
+    the 'kg:' prefix (e.g. '/m/0mgkg').
+
+    USCIS uses legal subsidiary names ("WAL-MART ASSOCIATES INC") that resolve to
+    thin /g/ Google-minted entities with no website data.  When that happens, the
+    last word of the query is dropped and KG is retried (up to _KG_MAX_RETRIES
+    times) until a richer /m/ entity (the brand) is found.
+
+        "WAL-MART ASSOCIATES" → /g/ thin → retry
+        "WAL-MART"            → /m/ Walmart with url ✓
+
+    No keyword lists — the /g/ MID prefix is the only trigger.
     """
     if not _KG_API_KEY:
         log.warning("KG_API_KEY not set — skipping KG search for %r", legal_name)
@@ -252,50 +263,76 @@ def kg_search(legal_name: str) -> dict | None:
             log.warning("KG API daily limit (100k) reached")
             return None
 
-    query = strip_legal_suffixes(legal_name) or legal_name
-    try:
-        resp = requests.get(
-            _KG_ENDPOINT,
-            params={
-                "query":     query,
-                "key":       _KG_API_KEY,
-                "types":     "Organization",
-                "limit":     1,
-                "languages": "en",
-                "indent":    "False",
-            },
-            headers=_API_HEADERS,
-            timeout=_HTTP_TIMEOUT,
+    base_query = strip_legal_suffixes(legal_name) or legal_name
+    tokens     = base_query.split()
+    last_result: dict | None = None
+
+    for attempt in range(min(_KG_MAX_RETRIES + 1, len(tokens))):
+        query = " ".join(tokens[:len(tokens) - attempt])
+
+        if attempt > 0 and not can_call("kg_api"):
+            log.debug("KG API quota exhausted mid-retry for %r", legal_name)
+            break
+
+        try:
+            resp = requests.get(
+                _KG_ENDPOINT,
+                params={
+                    "query":     query,
+                    "key":       _KG_API_KEY,
+                    "types":     "Organization",
+                    "limit":     1,
+                    "languages": "en",
+                    "indent":    "False",
+                },
+                headers=_API_HEADERS,
+                timeout=_HTTP_TIMEOUT,
+            )
+            increment_usage("kg_api")
+
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
+                log.debug("KG API rate-limited — waiting %ds", wait)
+                time.sleep(wait)
+                return last_result
+
+            resp.raise_for_status()
+            items = resp.json().get("itemListElement", [])
+
+            if not items:
+                log.debug("KG API: no results for %r (attempt %d)", query, attempt)
+                continue  # shorter query might still match
+
+            result  = items[0].get("result", {})
+            raw_id  = result.get("@id", "")
+            kg_mid  = raw_id.removeprefix("kg:") or None
+            name    = html.unescape(result.get("name") or "") or None
+            raw_url = result.get("url") or None
+            url     = raw_url if raw_url and _is_public_url(raw_url) else None
+
+            last_result = {"name": name, "url": url, "kg_mid": kg_mid}
+
+            if kg_mid and kg_mid.startswith("/g/"):
+                log.debug(
+                    "KG: thin shell entity %r (mid=%r) for %r — retrying without last word",
+                    name, kg_mid, query,
+                )
+                continue  # drop last word and retry
+
+            # /m/ entity or no MID — accept as the brand entity
+            log.debug("KG hit: %r → name=%r url=%r mid=%r", query, name, url, kg_mid)
+            return last_result
+
+        except requests.exceptions.RequestException as e:
+            log.debug("KG API error for %r: %s", legal_name, e)
+            return last_result
+
+    if last_result:
+        log.debug(
+            "KG: retries exhausted for %r — using best result: name=%r mid=%r",
+            legal_name, last_result.get("name"), last_result.get("kg_mid"),
         )
-        increment_usage("kg_api")
-
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
-            log.debug("KG API rate-limited — waiting %ds", wait)
-            time.sleep(wait)
-            return None
-
-        resp.raise_for_status()
-        items = resp.json().get("itemListElement", [])
-        if not items:
-            log.debug("KG API: no results for %r", query)
-            return None
-
-        result = items[0].get("result", {})
-        raw_id = result.get("@id", "")               # "kg:/m/0mgkg"
-        kg_mid = raw_id.removeprefix("kg:") or None   # "/m/0mgkg"
-        name   = result.get("name") or None
-        url    = result.get("url") or None
-
-        if url and not _is_public_url(url):
-            url = None
-
-        log.debug("KG hit: %r → name=%r url=%r mid=%r", query, name, url, kg_mid)
-        return {"name": name, "url": url, "kg_mid": kg_mid}
-
-    except requests.exceptions.RequestException as e:
-        log.debug("KG API error for %r: %s", legal_name, e)
-        return None
+    return last_result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,10 +341,10 @@ def kg_search(legal_name: str) -> dict | None:
 
 def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
     """
-    Batch-fetch Wikidata QID + P10311 (official jobs URL) for a list of
-    Freebase MIDs using a single SPARQL VALUES query.
+    Batch-fetch Wikidata QID + P10311 (official jobs URL) + P856 (official website)
+    for a list of Freebase MIDs using a single SPARQL VALUES query.
 
-    Returns {mid: {"qid": str|None, "jobs_url": str|None}}.
+    Returns {mid: {"qid": str|None, "jobs_url": str|None, "website": str|None}}.
     """
     if not mids:
         return {}
@@ -319,10 +356,11 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
 
     values = " ".join(f'("{m}")' for m in mids)
     sparql = (
-        "SELECT ?mid ?item ?jobs_url WHERE { "
+        "SELECT ?mid ?item ?jobs_url ?website WHERE { "
         f"VALUES (?mid) {{ {values} }} "
         "?item wdt:P646 ?mid . "
         "OPTIONAL { ?item wdt:P10311 ?jobs_url } "
+        "OPTIONAL { ?item wdt:P856 ?website } "
         "}"
     )
     headers = {**_API_HEADERS, "Accept": "application/sparql-results+json"}
@@ -333,32 +371,35 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
             _WIKIDATA_SPARQL, params=params, headers=headers, timeout=60
         )
 
-    _sparql_limiter.acquire("SPARQL P646+P10311 batch")
+    _sparql_limiter.acquire("SPARQL P646+P10311+P856 batch")
     try:
         r = _do_request()
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
             log.debug("SPARQL rate-limited — waiting %ds", wait)
             time.sleep(wait)
-            _sparql_limiter.acquire("SPARQL P646+P10311 retry")
+            _sparql_limiter.acquire("SPARQL P646+P10311+P856 retry")
             r = _do_request()
         r.raise_for_status()
         bindings = r.json()["results"]["bindings"]
     except (requests.exceptions.RequestException, ValueError, KeyError) as e:
-        log.debug("SPARQL P646+P10311 batch error: %s", e)
-        return {m: {"qid": None, "jobs_url": None} for m in mids}
+        log.debug("SPARQL P646+P10311+P856 batch error: %s", e)
+        return {m: {"qid": None, "jobs_url": None, "website": None} for m in mids}
 
-    out: dict[str, dict] = {m: {"qid": None, "jobs_url": None} for m in mids}
+    out: dict[str, dict] = {m: {"qid": None, "jobs_url": None, "website": None} for m in mids}
     for row in bindings:
         mid      = row.get("mid", {}).get("value")
         item_uri = row.get("item", {}).get("value", "")
         qid      = item_uri.split("/")[-1] if item_uri else None
         jobs_url = row.get("jobs_url", {}).get("value") or None
+        website  = row.get("website", {}).get("value") or None
         if mid and mid in out:
             if qid:
                 out[mid]["qid"] = qid
             if jobs_url and _is_public_url(jobs_url):
                 out[mid]["jobs_url"] = jobs_url
+            if website and _is_public_url(website):
+                out[mid]["website"] = website
 
     return out
 
@@ -369,7 +410,7 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
     for i in range(0, len(mids), _SPARQL_CHUNK_SIZE):
         chunk = mids[i: i + _SPARQL_CHUNK_SIZE]
         log.info(
-            "SPARQL P646+P10311 batch %d–%d of %d …",
+            "SPARQL P646+P10311+P856 batch %d–%d of %d …",
             i + 1, min(i + _SPARQL_CHUNK_SIZE, len(mids)), len(mids),
         )
         out.update(_sparql_batch_p10311(chunk))
@@ -742,6 +783,12 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
                   u.employer_legal_norm = d.employer_name_norm
                OR u.employer_name_norm  = d.trade_name_dba_norm
               )
+        LEFT JOIN h1b_ats_discovery h ON h.employer_fein = d.employer_fein
+        WHERE (
+            h.employer_fein IS NULL
+            OR h.last_checked IS NULL
+            OR h.last_checked < NOW() - INTERVAL '7 days'
+        )
         GROUP BY d.employer_fein, d.employer_name, d.total_certified
         ORDER BY total_approvals DESC NULLS LAST
         LIMIT %s
@@ -845,6 +892,7 @@ def process_employer(
     dry_run: bool,
     force: bool,
     prefetched: dict | None = None,
+    skip_brave: bool = True,
 ) -> dict:
     """
     Enrich one employer through the full pipeline and upsert into h1b_ats_discovery.
@@ -898,11 +946,13 @@ def process_employer(
                 website_url      = None
 
         if kg_mid:
-            log.info("  SPARQL P10311 for MID %s …", kg_mid)
+            log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
             sparql_res   = _sparql_batch_p10311([kg_mid])
             entry        = sparql_res.get(kg_mid, {})
             wikidata_qid = entry.get("qid")
             jobs_url     = entry.get("jobs_url")
+            if website_url is None:
+                website_url = entry.get("website") or None
 
     log.info(
         "  canonical=%r source=%s website=%s jobs_url=%s",
@@ -932,8 +982,8 @@ def process_employer(
         except Exception as e:
             log.warning("  Career probe failed: %s", e)
 
-        # Phase 4: Brave search fallback
-        if not careers_url:
+        # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
+        if not careers_url and not skip_brave:
             search_name = canonical_name or strip_legal_suffixes(name) or name
             log.info("  Brave search fallback for %r …", search_name)
             brave_url = brave_career_search(search_name, website_url=website_url)
@@ -975,6 +1025,89 @@ def process_employer(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Brave pass — separate monthly sweep for companies with website but no careers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_brave_candidates(limit: int, conn) -> list[dict]:
+    """Companies enriched by KG+probe but still missing a careers URL."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT employer_fein, employer_name, website_url, canonical_name
+        FROM h1b_ats_discovery
+        WHERE last_checked IS NOT NULL
+          AND brave_checked_at IS NULL
+          AND careers_url IS NULL
+          AND website_url IS NOT NULL
+        ORDER BY last_checked ASC
+        LIMIT %s
+    """, (limit,))
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _brave_upsert(fein: str, careers_url: "str | None",
+                  platform: "str | None", slug: "str | None", conn) -> None:
+    """Mark brave_checked_at and persist any career URL found."""
+    conn.cursor().execute("""
+        UPDATE h1b_ats_discovery
+        SET brave_checked_at  = NOW(),
+            careers_url       = COALESCE(%s, careers_url),
+            detected_platform = COALESCE(%s, detected_platform),
+            detected_slug     = COALESCE(%s, detected_slug)
+        WHERE employer_fein = %s
+    """, (careers_url, platform, slug, fein))
+    conn.commit()
+
+
+def _run_brave_pass(conn, r, args) -> None:
+    """--brave-pass: run Brave search on KG-enriched companies with no careers URL."""
+    from jobs.ats.patterns import match_ats_pattern as _map
+
+    candidates = _load_brave_candidates(args.top, conn)
+    log.info("Brave pass: %d candidates (website known, careers missing)", len(candidates))
+
+    for i, row in enumerate(candidates, 1):
+        while _is_maintenance(r):
+            log.info("Maintenance window active — pausing for 30s")
+            time.sleep(30)
+
+        fein         = row["employer_fein"]
+        name         = row["employer_name"]
+        website_url  = row["website_url"]
+        search_name  = row.get("canonical_name") or strip_legal_suffixes(name) or name
+
+        log.info("[%d/%d brave] %s  %s", i, len(candidates), fein, name)
+
+        careers_url = platform = slug = None
+
+        if not args.dry_run:
+            brave_url = brave_career_search(search_name, website_url=website_url)
+            if brave_url:
+                careers_url = brave_url
+                hit = _map(brave_url)
+                if hit:
+                    platform = hit["platform"]
+                    slug     = hit.get("slug")
+                else:
+                    try:
+                        html_content, _ = _fetch_html(brave_url)
+                        if html_content:
+                            platform, slug = _find_ats_in_html(html_content)
+                    except Exception as e:
+                        log.warning("  HTML fingerprint failed: %s", e)
+                log.info("  Brave → %s  platform=%s", careers_url, platform)
+            else:
+                log.info("  Brave found nothing — marking as attempted")
+
+            _brave_upsert(fein, careers_url, platform, slug, conn)
+        else:
+            log.info("  [DRY-RUN] would Brave-search %r on %s", search_name, website_url)
+
+        time.sleep(0.2)
+
+    log.info("Brave pass done. %d candidates processed.", len(candidates))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1005,8 +1138,10 @@ def main():
                         help="Print results without writing to DB")
     parser.add_argument("--force",   action="store_true",
                         help="Re-check even if recently checked")
-    parser.add_argument("--llm",     action="store_true",
+    parser.add_argument("--llm",        action="store_true",
                         help="Load Qwen3-8B for Brave result disambiguation")
+    parser.add_argument("--brave-pass", action="store_true",
+                        help="Run Brave search only on companies already enriched by KG+probe")
     args = parser.parse_args()
 
     if args.llm:
@@ -1019,6 +1154,11 @@ def main():
 
     init_db()
     conn = get_conn()
+
+    if args.brave_pass:
+        _run_brave_pass(conn, r, args)
+        conn.close()
+        return
 
     if args.fein:
         row = load_by_fein(args.fein, conn)
@@ -1045,6 +1185,7 @@ def main():
             log.info("[%d/%d]", i, len(employers))
             result = process_employer(
                 emp, conn, dry_run=args.dry_run, force=args.force,
+                skip_brave=False,
             )
             _tally(stats, result, args.force)
     else:
@@ -1114,8 +1255,10 @@ def main():
             mid = entry.get("kg_mid")
             if mid:
                 sp = sparql_map.get(mid, {})
-                entry["wikidata_qid"] = sp.get("qid")
-                entry["jobs_url"]     = sp.get("jobs_url")
+                entry["wikidata_qid"]    = sp.get("qid")
+                entry["jobs_url"]        = sp.get("jobs_url")
+                if not entry.get("website_url"):
+                    entry["website_url"] = sp.get("website") or None
             else:
                 entry["jobs_url"] = None
 

@@ -288,7 +288,7 @@ def run_worker(once: bool = False) -> None:
                 # re-deliver immediately; we are already the owner of these entries.
                 new_cursor, entries, _ = r.xautoclaim(
                     H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, H1B_DISAMBIG_CONSUMER,
-                    min_idle_time=0, start=pel_cursor, count=1,
+                    min_idle_time=0, start_id=pel_cursor, count=1,
                 )
                 if not entries:
                     pending_drained = True

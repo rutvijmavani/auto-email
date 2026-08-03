@@ -154,6 +154,7 @@ HEARTBEAT_DEAD_AFTER = {
     "detail_worker":   45,
     "fullscan_worker":    1900,   # scans can legitimately take 30 min
     "h1b_llm_worker":       60,   # interval=30s → TTL=90s; 60s < TTL so STALE branch is reachable
+    "email_processor":      60,   # interval=30s → same reasoning as h1b_llm_worker
 }
 
 # Consecutive rapid-death thresholds for worker pool health.

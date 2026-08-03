@@ -9,8 +9,9 @@ The pipeline manages three quotas:
 | CareerShift profile views | 50 new contacts/day | Daily | ✅ Yes — each user has their own 50/day limit |
 | Gemini AI calls (email content) | 40 calls/day (20 per model) | Daily | ✅ Yes — each user has their own Gemini API key |
 | Gemini AI calls (ATS detection) | Shared pool | Daily | ❌ No — shared across all users |
+| Google KG API (H-1B discovery) | 100,000 calls/day | Daily | ❌ No — shared |
 | Serper API credits | 2500 total (one-time) | Never | ❌ No — shared |
-| Brave Search API calls | 1000/month (hard stop: 950) | Monthly | ❌ No — shared |
+| Brave Search API calls | 1000/month (hard stop: 950) | Monthly | ❌ No — shared (build_ats_slug_list + discover_h1b_ats) |
 | AWS Athena queries | ~$0.00024/query | Pay-per-use | ❌ No — shared |
 
 All quotas are tracked locally in the database and synced with real values at runtime.
@@ -380,17 +381,16 @@ Serper API credits: 2450/2500 remaining
 > Replaced with Brave Search API (free tier: 1,000 queries/month).
 > Sign up: https://api.search.brave.com/
 
-### How it works
+### Where Brave is used
 
-Brave Search API fills gaps for ATS platforms that Common Crawl does not index well:
+Brave is used in **two scripts**:
 
-| Platform | Reason CC misses it |
-|---|---|
-| Lever | Migrated to JS rendering after CC-MAIN-2025-47 |
-| Oracle HCM | Very sparse CC coverage |
-| iCIMS | JS-heavy job boards |
+| Script | Purpose | When |
+|---|---|---|
+| `build_ats_slug_list.py` | Discover new ATS slugs (Lever/Oracle/iCIMS) via CC gaps | Monthly |
+| `discover_h1b_ats.py --brave-pass` | Career page fallback for H-1B sponsors with website but no ATS pattern | Monthly |
 
-Brave is used exclusively in `build_ats_slug_list.py` — not during daily job monitoring.
+Both scripts share the same `data/brave_quota.json` counter and the same 950-call monthly cap.
 
 ### Quota tracking
 
@@ -400,29 +400,47 @@ Hard stop:        950 calls (50 call safety buffer)
 Resets:          1st of each month (auto-detected by month change)
 Stored in:       data/brave_quota.json
 Increments:      only on HTTP 200 success
-Checked:         before every page request
+Checked:         before every call
 ```
 
 ### Monthly budget breakdown
 
 ```text
-Lever:     3 queries × 20 pages = 60 calls
-Oracle:    2 queries × 20 pages = 40 calls
-iCIMS:     2 queries × 20 pages = 40 calls
-─────────────────────────────────────────
-Total per run:                   140 calls
-Monthly runs:          1 (normal refresh)
-Safety buffer:                    50 calls
-─────────────────────────────────────────
-Monthly usage:    ~140/1000 (14% of limit)
-Well within free tier ✓
+build_ats_slug_list.py:
+  Lever:     3 queries × 20 pages = 60 calls
+  Oracle:    2 queries × 20 pages = 40 calls
+  iCIMS:     2 queries × 20 pages = 40 calls
+  ─────────────────────────────────────────
+  Subtotal:                        140 calls
+
+discover_h1b_ats.py --brave-pass:
+  Only companies with website_url + no careers_url (pass 1 probe found nothing)
+  Typical: 100–300 calls/month depending on dataset size
+  ─────────────────────────────────────────
+  Subtotal:                    ~100–300 calls
+
+Safety buffer:                      50 calls
+─────────────────────────────────────────────
+Total safe budget: 950 calls/month
 ```
+
+### Two-pass design — KG and Brave never contend
+
+`discover_h1b_ats.py` separates enrichment into two independent passes so KG quota (100k/day) and Brave quota (950/month) never block each other:
+
+- **Pass 1 (default `--top N`):** Google KG + SPARQL + 19-pattern probe. No Brave calls. Runs daily. Sets `last_checked`.
+- **Pass 2 (`--brave-pass`):** Brave only, targeting companies where Pass 1 completed but found no careers URL. Runs monthly. Sets `brave_checked_at`.
+
+This means a day's KG run of 900 companies costs 0 Brave calls, leaving the full 950/month for the targeted monthly sweep.
 
 ### Checking Brave quota
 
 ```bash
+cat data/brave_quota.json
+# {"month": "2026-08", "calls": 11}
+
 python build_ats_slug_list.py --test
-# Shows: [BRAVE] Quota: 140/950 used (2026-03), 810 remaining
+# Shows: [BRAVE] Quota: 140/950 used (2026-08), 810 remaining
 ```
 
 ---
@@ -512,88 +530,63 @@ at zero cost to either quota.
 
 ---
 
-## Wikidata / Wikipedia Rate Limiting
+## Google KG + SPARQL Rate Limiting
 
-`scripts/discover_h1b_ats.py` makes REST calls to Wikidata and Wikipedia.
-Both services publish a **20 requests-per-minute** guideline for bots with a
-proper `User-Agent`. The script enforces this with an in-process sliding-window
-rate limiter — the same design pattern used for Gemini RPM limiting in
-`db/quota.py`.
+`scripts/discover_h1b_ats.py` uses two external APIs for company enrichment.
 
-### Design — `_RateLimiter`
+### Google Knowledge Graph API
+
+```text
+Daily limit:   100,000 calls
+RPM limit:     600 RPM (enforced via db/quota.py can_call/increment_usage)
+Cost:          Free (Google Cloud project quota)
+Tracked in:    db/quota.py ("kg_api" key)
+```
+
+Progressive retry means up to 4 calls per company (original query + 3 word-drops on `/g/` MID). Worst case: 25,000 companies/day. In practice most companies resolve in 1–2 calls.
+
+### Wikidata SPARQL (P646+P10311+P856 batch)
+
+```text
+Rate limit:    30 RPM client-side (enforced via _sparql_limiter = _RateLimiter(rpm=30))
+Cost:          Free
+Endpoint:      https://query.wikidata.org/sparql
+Batch size:    100 MIDs per query (_SPARQL_CHUNK_SIZE=100)
+```
+
+One SPARQL query fetches QID + jobs URL (P10311) + official website (P856) for up to 100 companies simultaneously. A `--top 900` run needs ≤9 SPARQL queries total — negligible.
+
+### `_RateLimiter` design
+
+Both `_sparql_limiter` and any future in-process rate limiters use the same pattern:
 
 ```python
 class _RateLimiter:
     """Thread-safe sliding-window rate limiter."""
-
     def __init__(self, rpm: int) -> None:
         self._rpm    = rpm
-        self._window = deque()   # timestamps of recent calls
+        self._window = deque()
         self._lock   = threading.Lock()
 
     def acquire(self, api_name: str) -> None:
         while True:
             now = time.time()
             with self._lock:
-                # evict timestamps older than 60 seconds
                 while self._window and self._window[0] < now - 60:
                     self._window.popleft()
                 if len(self._window) < self._rpm:
                     self._window.append(now)
                     return
-            # window full — back off 3 s and retry
-            log.debug("%s RPM limit (%d/min) — waiting 3s", api_name, self._rpm)
+            log.debug("%s RPM limit — waiting 3s", api_name)
             time.sleep(3)
 ```
 
-Two separate limiters exist so Wikidata and Wikipedia throttle independently:
-
-```python
-_wikidata_limiter  = _RateLimiter(rpm=20)  # used by _wikidata_search + _wikidata_website
-_wikipedia_limiter = _RateLimiter(rpm=20)  # used by enrich_wikipedia
-```
-
-### How it integrates with `_api_get`
-
-```python
-def _api_get(url, params, api_name, limiter):
-    limiter.acquire(api_name)          # blocks until a slot is available
-    r = requests.get(url, ...)
-    if r.status_code == 429:
-        wait = int(r.headers.get("Retry-After", 10))
-        time.sleep(wait)
-        limiter.acquire(api_name)      # re-acquire after sleeping
-        r = requests.get(url, ...)
-    r.raise_for_status()
-    return r
-```
-
-Key properties:
-- `acquire()` blocks the calling thread (no busy-spin — sleeps 3 s between checks)
-- Thread-safe: `deque` mutations happen inside `threading.Lock`
-- Sliding window: only calls within the last 60 seconds count against the cap
-- 429 path: honours `Retry-After` header, then re-acquires a fresh limiter slot before the retry
-- No fixed `time.sleep()` after every call — the limiter self-paces naturally
-
-### Compared to Gemini pattern (`db/quota.py`)
-
-| | Gemini (`quota.py`) | Wikidata/Wikipedia (`discover_h1b_ats.py`) |
-|---|---|---|
-| Storage | `defaultdict(list)` | `deque` (same sliding-window idea) |
-| Thread safety | Not locked (single-threaded Gemini use) | `threading.Lock` |
-| Interface | `within_rpm(model)` → bool; caller sleeps | `acquire()` → blocks until ready |
-| Per-key | Per model string | Per `_RateLimiter` instance |
-
-The `deque`+`Lock` approach is stricter and more correct for multi-call
-discovery runs where timing matters.
+Key properties: sliding 60s window, thread-safe, blocks caller (no busy-spin), honours `Retry-After` on 429.
 
 ### Quota summary
 
-| API | Limit | Limiter instance | Cost |
+| API | Daily limit | Monthly limit | Cost |
 |---|---|---|---|
-| Wikidata REST v1 | ~20 RPM (guideline) | `_wikidata_limiter` | Free |
-| Wikipedia Action API | ~20 RPM (guideline) | `_wikipedia_limiter` | Free |
-
-Both APIs are free with no daily cap. The RPM limit exists only to be a
-polite bot. A single `--top 100` run makes ~200 Wikidata calls (search +
-statements per employer) and runs in ~10 minutes under the 20 RPM limit.
+| Google KG API | 100,000 calls | — | Free (GCP quota) |
+| Wikidata SPARQL | No hard cap | No hard cap | Free |
+| Brave Search | — | 950 calls | Free tier |
