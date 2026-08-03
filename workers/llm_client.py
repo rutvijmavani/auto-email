@@ -29,8 +29,9 @@ def _get_client() -> openai.OpenAI:
 
 
 def _poll_until_free() -> None:
-    """Poll /slots until no slot is processing or server is unreachable."""
-    while True:
+    """Poll /slots until no slot is processing, deadline expires, or server is unreachable."""
+    deadline = time.monotonic() + LLM_REQUEST_TIMEOUT
+    while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(LLM_SLOTS_URL, timeout=5) as resp:
                 slots = json.loads(resp.read())
@@ -50,22 +51,26 @@ def call_llm(prompt: str, *, max_tokens: int = LLM_MAX_TOKENS) -> str:
     the caller can safely retry without competing with the in-flight request.
     Raises on any connection or API error — callers decide retry vs discard.
     """
+    stream = None
     try:
         tokens: list[str] = []
-        with _get_client().chat.completions.create(
+        stream = _get_client().chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=max_tokens,
             stream=True,
-        ) as stream:
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if delta:
-                    tokens.append(delta)
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content if chunk.choices else None
+            if delta:
+                tokens.append(delta)
     except Exception:
         _poll_until_free()
         raise
+    finally:
+        if stream is not None:
+            stream.response.close()
 
     text = "".join(tokens)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
