@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from config import (
@@ -31,6 +32,7 @@ from config import (
     H1B_DISAMBIG_MAX_DELIVERIES,
     H1B_DISAMBIG_STREAM,
     LLM_BASE_URL,
+    REDIS_DB_MAINTENANCE,
 )
 from db.connection import get_conn
 from logger import get_logger, init_logging
@@ -39,6 +41,18 @@ from workers.llm_client import call_llm as _call_llm_shared
 from workers.redis_client import get_redis
 
 log = get_logger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Maintenance window
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_maintenance(r) -> bool:
+    try:
+        return bool(r.exists(REDIS_DB_MAINTENANCE))
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,6 +278,10 @@ def run_worker(once: bool = False) -> None:
 
     try:
         while True:
+            while _is_maintenance(r):
+                log.info("Maintenance window active — pausing for 30s")
+                time.sleep(30)
+
             if not pending_drained:
                 # XAUTOCLAIM with cursor advances past failed entries, unlike XREADGROUP "0"
                 # which always re-delivers the oldest pending entry.  min_idle_time=0 means

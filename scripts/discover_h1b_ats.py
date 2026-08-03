@@ -39,12 +39,28 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import requests
 
+from config import REDIS_DB_MAINTENANCE
 from db.connection import get_conn
 from db.quota import can_call, increment_usage, within_rpm
 from db.schema import init_db
 from logger import get_logger, init_logging
+from workers.redis_client import get_redis
 
 log = get_logger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Maintenance window
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_maintenance(r) -> bool:
+    if r is None:
+        return False
+    try:
+        return bool(r.exists(REDIS_DB_MAINTENANCE))
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
@@ -996,6 +1012,11 @@ def main():
     if args.llm:
         _load_llm()
 
+    try:
+        r = get_redis()
+    except Exception:
+        r = None
+
     init_db()
     conn = get_conn()
 
@@ -1018,6 +1039,9 @@ def main():
     if args.fein:
         # Single-employer: inline KG + SPARQL, no batching
         for i, emp in enumerate(employers, 1):
+            while _is_maintenance(r):
+                log.info("Maintenance window active — pausing for 30s")
+                time.sleep(30)
             log.info("[%d/%d]", i, len(employers))
             result = process_employer(
                 emp, conn, dry_run=args.dry_run, force=args.force,
@@ -1102,6 +1126,9 @@ def main():
             entry = kg_map.get(fein, {})
             if entry.get("skip"):
                 continue
+            while _is_maintenance(r):
+                log.info("Maintenance window active — pausing for 30s")
+                time.sleep(30)
             log.info("[%d/%d career] %s  %s", i, len(employers), fein, emp["employer_name"])
             result = process_employer(
                 emp, conn,

@@ -45,7 +45,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from rapidfuzz import fuzz
 
-from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ
+from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ, REDIS_DB_MAINTENANCE
 from db.connection import get_conn
 from db.gmail_tokens import get_token_by_email, update_history_id
 from logger import get_logger, init_logging
@@ -55,6 +55,14 @@ from workers.redis_client import get_redis
 logger = get_logger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _is_maintenance(r) -> bool:
+    try:
+        return bool(r.exists(REDIS_DB_MAINTENANCE))
+    except Exception as exc:
+        logger.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        return False
 
 # set in run_worker() after forking so WORKER_ID uses the real child PID
 _INFLIGHT_KEY: str = ""
@@ -660,6 +668,9 @@ def run_worker(once: bool = False) -> None:
     )
 
     while True:
+        while _is_maintenance(r):
+            logger.info("Maintenance window active — pausing for 30s")
+            time.sleep(30)
 
         # LMOVE: atomically pop from source tail → push to inflight head
         # Producers lpush (left); we consume from right → FIFO order

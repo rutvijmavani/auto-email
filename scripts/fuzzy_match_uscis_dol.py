@@ -22,9 +22,10 @@ import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import H1B_DISAMBIG_MAXLEN, H1B_DISAMBIG_STREAM
+from config import H1B_DISAMBIG_MAXLEN, H1B_DISAMBIG_STREAM, REDIS_DB_MAINTENANCE
 from db.connection import get_conn
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -45,6 +46,29 @@ _TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto thr
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Maintenance window
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_maintenance(r) -> bool:
+    if r is None:
+        return False
+    try:
+        return bool(r.exists(REDIS_DB_MAINTENANCE))
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        return False
+
+
+def _ensure_schema(conn) -> None:
+    """Add queued_for_llm column if not yet present (idempotent)."""
+    conn.execute("""
+        ALTER TABLE uscis_dol_unmatched
+        ADD COLUMN IF NOT EXISTS queued_for_llm BOOLEAN DEFAULT FALSE
+    """)
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DB helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -62,6 +86,7 @@ def _fetch_unmatched(conn, limit: "int | None") -> list[dict]:
         JOIN uscis_h1b_petitions p
           ON p.employer_name = n.employer_name
          AND p.tax_id        = n.tax_id
+        WHERE n.queued_for_llm IS NOT TRUE
         ORDER BY n.total_approvals DESC
     """
     if limit:
@@ -129,9 +154,27 @@ def _store_match(conn, employer_legal_norm: str, tax_id: str,
     """, (employer_legal_norm, tax_id))
 
 
-def _push_to_stream(r, uscis_norm: str, uscis_name: str,
+def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
                     tax_id: str, candidates: list[dict]) -> None:
-    """Push ambiguous case to LLM disambiguation stream."""
+    """Atomically claim the unmatched row, then publish to the LLM stream.
+
+    The UPDATE uses RETURNING id with an IS NOT TRUE guard so the claim is
+    idempotent: if the row was already queued (e.g. script restarted mid-run),
+    RETURNING returns nothing and we skip the XADD — no duplicate stream entry.
+    If XADD fails after commit, the row stays claimed; populate_unmatched resets
+    the table on the next ingest, making the orphan retryable.
+    """
+    row = conn.execute("""
+        UPDATE uscis_dol_unmatched
+        SET queued_for_llm = TRUE
+        WHERE employer_name = %s AND tax_id = %s
+          AND queued_for_llm IS NOT TRUE
+        RETURNING id
+    """, (uscis_name, tax_id)).fetchone()
+    conn.commit()
+    if row is None:
+        log.debug("Row already claimed for LLM (employer_name=%s, tax_id=%s) — skipping XADD", uscis_name, tax_id)
+        return
     r.xadd(
         H1B_DISAMBIG_STREAM,
         {
@@ -154,6 +197,8 @@ def run(limit: "int | None" = None, dry_run: bool = False) -> None:
     conn = get_conn()
     r    = None if dry_run else get_redis()
     try:
+        if not dry_run:
+            _ensure_schema(conn)
         _run_body(conn, r, limit, dry_run)
     finally:
         conn.close()
@@ -166,6 +211,10 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
     fuzzy_auto = queued = skipped = no_candidates = already = 0
 
     for row in unmatched:
+        while _is_maintenance(r):
+            log.info("Maintenance window active — pausing for 30s")
+            time.sleep(30)
+
         uscis_name      = row["employer_name"]
         uscis_norm      = row["employer_legal_norm"] or row["employer_name_norm"]
         tax_id          = row["tax_id"]
@@ -232,7 +281,7 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
                      c["employer_fein"], c["employer_name"], c["score"])
 
         if not dry_run:
-            _push_to_stream(r, uscis_norm, uscis_name, tax_id, clean)
+            _push_to_stream(r, conn, uscis_norm, uscis_name, tax_id, clean)
             queued += 1
 
     log.info(

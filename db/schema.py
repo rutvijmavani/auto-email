@@ -1434,7 +1434,8 @@ def init_db():
             fiscal_year         INTEGER NOT NULL,
             state               TEXT,
             total_approvals     INTEGER NOT NULL DEFAULT 0,
-            refreshed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            refreshed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            queued_for_llm      BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
 
@@ -1443,6 +1444,8 @@ def init_db():
         ON uscis_dol_unmatched (total_approvals DESC)
     """)
     c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS employer_legal_norm TEXT")
+    c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+    c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS queued_for_llm BOOLEAN NOT NULL DEFAULT FALSE")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_unmatched_employer
         ON uscis_dol_unmatched (employer_legal_norm, tax_id)
