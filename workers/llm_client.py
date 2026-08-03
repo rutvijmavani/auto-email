@@ -12,7 +12,7 @@ import urllib.request
 
 import openai
 
-from config import LLM_BASE_URL, LLM_MAX_TOKENS, LLM_MODEL, LLM_REQUEST_TIMEOUT, LLM_SLOTS_URL
+from config import LLM_BASE_URL, LLM_MODEL, LLM_REQUEST_TIMEOUT, LLM_SLOTS_URL
 
 _client: "openai.OpenAI | None" = None
 
@@ -42,7 +42,7 @@ def _poll_until_free() -> None:
         time.sleep(1)
 
 
-def call_llm(prompt: str, *, max_tokens: int = LLM_MAX_TOKENS) -> str:
+def call_llm(prompt: str) -> str:
     """
     Send prompt to llama-server via streaming; return response with <think> stripped.
     Streaming keeps the HTTP connection alive during long /think inference so the
@@ -58,7 +58,6 @@ def call_llm(prompt: str, *, max_tokens: int = LLM_MAX_TOKENS) -> str:
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=max_tokens,
             stream=True,
         )
         for chunk in stream:

@@ -307,7 +307,6 @@ LLM_STARTUP_TIMEOUT_S = int(os.getenv("LLM_STARTUP_TIMEOUT_S", "600"))  # max mo
 LLM_HEALTH_URL        = os.getenv("LLM_HEALTH_URL", "http://127.0.0.1:8080/health")
 LLM_SLOTS_URL         = os.getenv("LLM_SLOTS_URL",  LLM_HEALTH_URL.replace("/health", "/slots"))
 LLM_REQUEST_TIMEOUT   = int(os.getenv("LLM_REQUEST_TIMEOUT", "60"))   # HTTP timeout for inference calls
-LLM_MAX_TOKENS        = int(os.getenv("LLM_MAX_TOKENS", "512"))        # cap output length
 
 # ─────────────────────────────────────────
 # H1B DISAMBIGUATION STREAM
