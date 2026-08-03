@@ -102,7 +102,7 @@ jobs:
                 echo "[WARN] Skipping pip install and unit sync — code state unknown"
               fi
               # llama-server and h1b-llm-worker excluded — see [7/8] comment above
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
             }
@@ -115,7 +115,7 @@ jobs:
               _rollback_to_sha "$PREVIOUS_SHA"
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
@@ -162,7 +162,8 @@ jobs:
             #                 restarts it on failure; h1b-llm-worker depends on it via Requires=.
             #   h1b-llm-worker: runs only during H1B batch jobs (quarterly/yearly); systemd
             #                   starts it automatically when llama-server becomes active.
-            # Both are covered by the stale-unit check in step [6/8] and by watchdog monitoring.
+            # cloudflare-tunnel excluded: restarting it invalidates tunnel URLs on every deploy.
+            # Both llama-server and h1b-llm-worker are covered by step [6/8] unit sync and watchdog.
             # Pre-restart Redis cleanup so the new scheduler starts with a clean slate:
             # 1. XACK any PEL entries from the current (about-to-die) scheduler — removes
             #    them cleanly so they never become "stuck dead-consumer" entries after restart.
@@ -182,7 +183,7 @@ jobs:
             redis-cli DEL manager:lever1:scan:active manager:lever1:scan:fired_at \
                           manager:lever1:fullscan:active manager:lever1:fullscan:fired_at > /dev/null || true
             echo "  Pre-restart: cleared stale Lever 1 keys"
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
                 false  # trigger ERR trap → _early_rollback runs
@@ -192,7 +193,7 @@ jobs:
 
             echo "[8/8] Verifying services are active..."
             sleep 3   # brief settle: systemctl restart returns once the process starts, not fully active
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
               if ! systemctl is-active --quiet "$svc"; then
                 echo "[ERROR] $svc failed to start after restart:"
                 journalctl -u "$svc" -n 30 --no-pager || true
@@ -215,7 +216,7 @@ jobs:
 
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
