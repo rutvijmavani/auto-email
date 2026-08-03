@@ -1434,7 +1434,8 @@ def init_db():
             fiscal_year         INTEGER NOT NULL,
             state               TEXT,
             total_approvals     INTEGER NOT NULL DEFAULT 0,
-            refreshed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            refreshed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            queued_for_llm      BOOLEAN NOT NULL DEFAULT FALSE
         )
     """)
 

@@ -50,7 +50,8 @@ log = get_logger(__name__)
 def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
-    except Exception:
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
 
 

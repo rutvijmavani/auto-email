@@ -54,7 +54,8 @@ def _is_maintenance(r) -> bool:
         return False
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
-    except Exception:
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
 
 
@@ -155,7 +156,19 @@ def _store_match(conn, employer_legal_norm: str, tax_id: str,
 
 def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
                     tax_id: str, candidates: list[dict]) -> None:
-    """Push ambiguous case to LLM stream and mark queued_for_llm to prevent re-queuing."""
+    """Mark DB row as queued first, then publish to Redis stream.
+
+    Order matters: commit the claim before publishing so that on crash-between-
+    the-two, the row stays marked and fuzzy_match won't re-queue it on resume.
+    If the XADD fails after commit, the row is orphaned until populate_unmatched
+    resets the table on the next ingest.
+    """
+    conn.execute("""
+        UPDATE uscis_dol_unmatched
+        SET queued_for_llm = TRUE
+        WHERE employer_name = %s AND tax_id = %s
+    """, (uscis_name, tax_id))
+    conn.commit()
     r.xadd(
         H1B_DISAMBIG_STREAM,
         {
@@ -168,12 +181,6 @@ def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
         maxlen=H1B_DISAMBIG_MAXLEN,
         approximate=True,
     )
-    conn.execute("""
-        UPDATE uscis_dol_unmatched
-        SET queued_for_llm = TRUE
-        WHERE employer_legal_norm = %s AND tax_id = %s
-    """, (uscis_norm, tax_id))
-    conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

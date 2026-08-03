@@ -60,7 +60,8 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
 
 # set in run_worker() after forking so WORKER_ID uses the real child PID
