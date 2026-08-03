@@ -245,11 +245,19 @@ sudo systemctl restart streamlit-frontend || {
 
 # h1b-llm-worker: reset-failed first — StartLimitBurst may have been hit if
 # the worker crash-looped before deploy.  Non-critical batch worker; a restart
-# failure here does not trigger a rollback.
+# failure here does not trigger a rollback.  Guard against starting the worker
+# when llama-server is inactive — systemd Requires= would pull it in and block
+# the deploy on model load (TimeoutStartSec=infinity).
 sudo systemctl reset-failed h1b-llm-worker 2>/dev/null || true
-sudo systemctl restart h1b-llm-worker \
-    || echo "  [WARN] h1b-llm-worker failed to restart — non-critical, check manually"
-echo "  Restarted: h1b-llm-worker"
+if systemctl is-active --quiet llama-server; then
+    if sudo systemctl restart h1b-llm-worker; then
+        echo "  Restarted: h1b-llm-worker"
+    else
+        echo "  [WARN] h1b-llm-worker failed to restart — non-critical, check manually"
+    fi
+else
+    echo "  [WARN] h1b-llm-worker not restarted — llama-server inactive (model not loaded)"
+fi
 
 echo ""
 echo "  Waiting for services to come up..."
@@ -270,7 +278,8 @@ for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager
     fi
 done
 # h1b-llm-worker: batch worker — warn only, does not block deployment
-_h1b_status=$(systemctl is-active "h1b-llm-worker" 2>/dev/null || echo "unknown")
+_h1b_status=$(systemctl is-active "h1b-llm-worker" 2>/dev/null)
+_h1b_status=${_h1b_status:-unknown}
 _h1b_pid=$(systemctl show -p MainPID --value "h1b-llm-worker" 2>/dev/null || echo "?")
 if [[ "$_h1b_status" == "active" ]]; then
     echo "  ✓ h1b-llm-worker: $_h1b_status (pid=$_h1b_pid)"

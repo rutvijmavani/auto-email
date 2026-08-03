@@ -490,7 +490,7 @@ def run_health_check() -> int:
         else:
             _row("OK", "email:push", _email_msg)
 
-        _h1b_lag = _h1b_pel = 0
+        _h1b_lag = _h1b_pel = None
         try:
             for _grp in (r.xinfo_groups(H1B_DISAMBIG_STREAM) or []):
                 if (isinstance(_grp, dict) and
@@ -499,11 +499,16 @@ def run_health_check() -> int:
                     _h1b_pel = int(_grp.get("pending") or 0)
                     break
         except Exception:
-            pass  # stream may not exist yet; lag/pel stay 0
-        _h1b_idle = _h1b_lag == 0 and _h1b_pel == 0
-        _h1b_msg  = (f"lag={_h1b_lag}  pel={_h1b_pel}" +
-                     (" — idle" if _h1b_idle else ""))
-        _row("OK", "llm:h1b:disambiguate", _h1b_msg)
+            pass  # stream may not exist yet
+        if _h1b_lag is None or _h1b_pel is None:
+            _row("WARNING", "llm:h1b:disambiguate",
+                 "metrics unavailable — stream or consumer group not found yet")
+            warnings += 1
+        else:
+            _h1b_idle = _h1b_lag == 0 and _h1b_pel == 0
+            _h1b_msg  = (f"lag={_h1b_lag}  pel={_h1b_pel}" +
+                         (" — idle" if _h1b_idle else ""))
+            _row("OK", "llm:h1b:disambiguate", _h1b_msg)
     except Exception as _qdepth_err:
         _row("WARNING", "queue depths", f"Could not read ancillary queue depths: {_qdepth_err}")
         warnings += 1
