@@ -92,6 +92,9 @@ _rollback_to_previous() {
         || echo "  [WARN] could not restart email-processor"
     sudo systemctl restart streamlit-frontend \
         || echo "  [WARN] could not restart streamlit-frontend"
+    sudo systemctl reset-failed h1b-llm-worker 2>/dev/null || true
+    sudo systemctl restart h1b-llm-worker \
+        || echo "  [WARN] could not restart h1b-llm-worker"
 
     # Post-rollback verification
     sleep 3
@@ -240,6 +243,14 @@ sudo systemctl restart streamlit-frontend || {
     _rollback_to_previous; exit 1
 }
 
+# h1b-llm-worker: reset-failed first — StartLimitBurst may have been hit if
+# the worker crash-looped before deploy.  Non-critical batch worker; a restart
+# failure here does not trigger a rollback.
+sudo systemctl reset-failed h1b-llm-worker 2>/dev/null || true
+sudo systemctl restart h1b-llm-worker \
+    || echo "  [WARN] h1b-llm-worker failed to restart — non-critical, check manually"
+echo "  Restarted: h1b-llm-worker"
+
 echo ""
 echo "  Waiting for services to come up..."
 sleep 5
@@ -258,6 +269,14 @@ for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager
         _svc_fail=1
     fi
 done
+# h1b-llm-worker: batch worker — warn only, does not block deployment
+_h1b_status=$(systemctl is-active "h1b-llm-worker" 2>/dev/null || echo "unknown")
+_h1b_pid=$(systemctl show -p MainPID --value "h1b-llm-worker" 2>/dev/null || echo "?")
+if [[ "$_h1b_status" == "active" ]]; then
+    echo "  ✓ h1b-llm-worker: $_h1b_status (pid=$_h1b_pid)"
+else
+    echo "  ! h1b-llm-worker: $_h1b_status  ← WARN (batch worker — non-critical)"
+fi
 if [[ $_svc_fail -ne 0 ]]; then
     echo ""
     echo "  [ERROR] One or more services failed to start"

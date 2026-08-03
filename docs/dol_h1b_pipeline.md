@@ -273,7 +273,7 @@ KG can process ~25,000 companies/day. Brave is spent once a month on the small r
 
 USCIS uses legal subsidiary names (e.g. `ORACLE AMERICA, INC.`) that KG maps to thin Google-minted `/g/` entities with no website or description. The parent brand entity (Oracle, Walmart) has a `/m/` Freebase legacy MID with full data. The `/g/` prefix is a reliable structural signal — no keyword lists needed.
 
-```
+```text
 ORACLE AMERICA, INC.  → /g/ → retry "ORACLE AMERICA" → /g/ → retry "ORACLE" → /m/ oracle.com ✓
 WAL-MART ASSOCIATES   → /g/ → retry "WAL-MART" → /m/ walmart.com ✓
 ```
@@ -284,8 +284,9 @@ WAL-MART ASSOCIATES   → /g/ → retry "WAL-MART" → /m/ walmart.com ✓
 
 ```sql
 CREATE TABLE h1b_ats_discovery (
-    employer_fein     TEXT PRIMARY KEY REFERENCES dol_h1b_employers(employer_fein),
-    employer_name     TEXT NOT NULL,
+    id                BIGSERIAL PRIMARY KEY,
+    employer_fein     TEXT        NOT NULL UNIQUE,
+    employer_name     TEXT        NOT NULL,
     canonical_name    TEXT,           -- brand name from KG / regex
     canonical_source  TEXT,           -- 'kg_api' | 'regex'
     wikidata_qid      TEXT,           -- Wikidata QID from SPARQL P646 join
@@ -295,7 +296,7 @@ CREATE TABLE h1b_ats_discovery (
     careers_url       TEXT,           -- discovered career page URL
     detected_platform TEXT,           -- ATS platform slug
     detected_slug     TEXT,           -- company-specific ATS slug
-    is_monitored      BOOLEAN DEFAULT FALSE,
+    is_monitored      BOOLEAN     NOT NULL DEFAULT FALSE,
     last_checked      TIMESTAMPTZ,    -- set after KG+probe pass completes
     brave_checked_at  TIMESTAMPTZ,    -- set after Brave pass runs (NULL = not yet tried)
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()

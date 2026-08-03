@@ -844,8 +844,8 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             website_url       = COALESCE(EXCLUDED.website_url,    h1b_ats_discovery.website_url),
             jobs_url          = COALESCE(EXCLUDED.jobs_url,       h1b_ats_discovery.jobs_url),
             careers_url       = COALESCE(EXCLUDED.careers_url,    h1b_ats_discovery.careers_url),
-            detected_platform = EXCLUDED.detected_platform,
-            detected_slug     = EXCLUDED.detected_slug,
+            detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
+            detected_slug     = COALESCE(EXCLUDED.detected_slug,     h1b_ats_discovery.detected_slug),
             last_checked      = NOW()
     """, (
         data["employer_fein"],
@@ -1080,6 +1080,12 @@ def _run_brave_pass(conn, r, args) -> None:
         careers_url = platform = slug = None
 
         if not args.dry_run:
+            # Check quota before calling — exhaustion must not stamp brave_checked_at
+            if _brave_load_quota().get("calls", 0) >= _BRAVE_QUOTA_LIMIT:
+                log.warning("Brave monthly quota exhausted — stopping brave pass at %d/%d",
+                            i - 1, len(candidates))
+                break
+
             brave_url = brave_career_search(search_name, website_url=website_url)
             if brave_url:
                 careers_url = brave_url

@@ -363,18 +363,24 @@ def run_health_check() -> int:
             warnings += 1
         else:
             _ep_raw = r.get(_ep_keys[0])
-            _ep_d   = json.loads(_ep_raw) if _ep_raw else {}
-            _ep_age = now - float(_ep_d.get("ts", now))
-            _ep_dead_after = _HEARTBEAT_DEAD_AFTER.get("email_processor", 60)
-            _ep_status = (
-                f"pid={_ep_d.get('pid','?')}  processed={_ep_d.get('processed',0)}  "
-                f"heartbeat {_ep_age:.0f}s ago"
-            )
-            if _ep_age > _ep_dead_after:
-                _row("WARNING", "email_processor", _ep_status + "  (STALE)")
+            _ep_d   = json.loads(_ep_raw) if _ep_raw else None
+            _ep_ts  = _ep_d.get("ts") if isinstance(_ep_d, dict) else None
+            if _ep_ts is None:
+                _row("WARNING", "email_processor",
+                     "heartbeat key present but payload missing or has no ts — DEATH")
                 warnings += 1
             else:
-                _row("OK", "email_processor", _ep_status)
+                _ep_age = now - float(_ep_ts)
+                _ep_dead_after = _HEARTBEAT_DEAD_AFTER.get("email_processor", 60)
+                _ep_status = (
+                    f"pid={_ep_d.get('pid','?')}  processed={_ep_d.get('processed',0)}  "
+                    f"heartbeat {_ep_age:.0f}s ago"
+                )
+                if _ep_age > _ep_dead_after:
+                    _row("WARNING", "email_processor", _ep_status + "  (STALE)")
+                    warnings += 1
+                else:
+                    _row("OK", "email_processor", _ep_status)
     except Exception as _ep_err:
         _row("WARNING", "email_processor", f"heartbeat check failed: {_ep_err}")
         warnings += 1
@@ -484,8 +490,19 @@ def run_health_check() -> int:
         else:
             _row("OK", "email:push", _email_msg)
 
-        _h1b_depth = int(r.xlen(H1B_DISAMBIG_STREAM) or 0)
-        _h1b_msg   = f"depth={_h1b_depth}" + (" — idle" if _h1b_depth == 0 else "")
+        _h1b_lag = _h1b_pel = 0
+        try:
+            for _grp in (r.xinfo_groups(H1B_DISAMBIG_STREAM) or []):
+                if (isinstance(_grp, dict) and
+                        _grp.get("name") in ("h1b-llm-workers", b"h1b-llm-workers")):
+                    _h1b_lag = int(_grp.get("lag") or 0)
+                    _h1b_pel = int(_grp.get("pending") or 0)
+                    break
+        except Exception:
+            pass  # stream may not exist yet; lag/pel stay 0
+        _h1b_idle = _h1b_lag == 0 and _h1b_pel == 0
+        _h1b_msg  = (f"lag={_h1b_lag}  pel={_h1b_pel}" +
+                     (" — idle" if _h1b_idle else ""))
         _row("OK", "llm:h1b:disambiguate", _h1b_msg)
     except Exception as _qdepth_err:
         _row("WARNING", "queue depths", f"Could not read ancillary queue depths: {_qdepth_err}")
