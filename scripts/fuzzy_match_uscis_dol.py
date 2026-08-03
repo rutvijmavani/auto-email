@@ -156,19 +156,25 @@ def _store_match(conn, employer_legal_norm: str, tax_id: str,
 
 def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
                     tax_id: str, candidates: list[dict]) -> None:
-    """Mark DB row as queued first, then publish to Redis stream.
+    """Atomically claim the unmatched row, then publish to the LLM stream.
 
-    Order matters: commit the claim before publishing so that on crash-between-
-    the-two, the row stays marked and fuzzy_match won't re-queue it on resume.
-    If the XADD fails after commit, the row is orphaned until populate_unmatched
-    resets the table on the next ingest.
+    The UPDATE uses RETURNING id with an IS NOT TRUE guard so the claim is
+    idempotent: if the row was already queued (e.g. script restarted mid-run),
+    RETURNING returns nothing and we skip the XADD — no duplicate stream entry.
+    If XADD fails after commit, the row stays claimed; populate_unmatched resets
+    the table on the next ingest, making the orphan retryable.
     """
-    conn.execute("""
+    row = conn.execute("""
         UPDATE uscis_dol_unmatched
         SET queued_for_llm = TRUE
         WHERE employer_name = %s AND tax_id = %s
-    """, (uscis_name, tax_id))
+          AND queued_for_llm IS NOT TRUE
+        RETURNING id
+    """, (uscis_name, tax_id)).fetchone()
     conn.commit()
+    if row is None:
+        log.debug("Row already claimed for LLM (employer_name=%s, tax_id=%s) — skipping XADD", uscis_name, tax_id)
+        return
     r.xadd(
         H1B_DISAMBIG_STREAM,
         {
