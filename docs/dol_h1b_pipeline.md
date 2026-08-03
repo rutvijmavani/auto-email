@@ -222,94 +222,109 @@ The brand name field in the ATS Discovery panel carries a source caption:
 
 ## ATS Discovery — `scripts/discover_h1b_ats.py`
 
-For each top H-1B sponsor the script:
-1. Queries **Wikidata** for canonical brand name + official website (P856)
-2. Falls back to **Wikipedia** article title for canonical name
-3. Falls back to **Qwen3-8B** (optional `--llm` flag) for unusual names
-4. Falls back to **regex suffix-stripping** as last resort
-5. Probes common career URL paths on the discovered website
-6. Fingerprints ATS via HTML scanning (`jobs/ats/patterns.py`)
-7. Stores results in `h1b_ats_discovery`
+### Two-pass architecture
 
-### Wikidata REST API v1
+The script separates KG enrichment (daily, high-quota) from Brave search (monthly, low-quota) into two independent passes so neither blocks the other.
 
-The script uses the **Wikidata REST API v1** (not the legacy Action API):
+**Pass 1 — KG + probe (default, run daily)**
 
-```
-Base URL: https://www.wikidata.org/w/rest.php/wikibase/v1
+For each un-enriched top H-1B sponsor:
+1. **Google Knowledge Graph API** → canonical brand name + `website_url` + `kg_mid` (Freebase MID)
+   - Progressive `/g/` retry: if KG returns a thin Google-minted shell entity (USCIS legal subsidiary), drops the last word of the query and retries — up to 3 times — until a `/m/` Freebase brand entity is found
+   - Example: `WAL-MART ASSOCIATES, INC.` → `/g/` → retry `WAL-MART` → `/m/` Walmart, `walmart.com`
+2. **SPARQL P646+P10311+P856 batch** (Wikidata) → `wikidata_qid` + `jobs_url` + P856 `website` fallback
+   - If `jobs_url` (P10311) found → used directly as `careers_url`, probe skipped
+   - If KG returned no `website_url` → P856 fills it (covers Accenture, Google, Meta, AWS)
+3. **19-pattern career URL probe** on `website_url` → `careers_url`, `detected_platform`, `detected_slug`
+4. **HTML fingerprint** (`_find_ats_in_html`) on any found career page
 
-Search:     GET /v1/search/items?q=<name>&language=en&limit=5
-Response:   { "results": [{ "id": "Q...", "display-label": {"value": "..."}, ... }] }
+Pass 1 never calls Brave. `last_checked` is set after each employer regardless of whether a careers URL was found.
 
-Statements: GET /v1/entities/items/{qid}/statements?property=P856
-Response:   { "P856": [{ "rank": "normal"|"preferred"|"deprecated",
-                          "value": { "type": "value", "content": "https://..." } }] }
-```
+**Pass 2 — Brave search (`--brave-pass`, run monthly)**
 
-**Why REST v1 over Action API:**
-- Versioned and stable — breaking changes will have a migration path
-- Cleaner response structure (no nested `mainsnak.datavalue.value`)
-- `deprecated` rank is explicit — deprecated P856 entries are skipped automatically
+Targets only companies that Pass 1 fully enriched but could not find a careers URL:
 
-### P856 URL selection
-
-All P856 statements for an entity are collected, then:
-1. Filter out `rank = deprecated`
-2. Validate each URL via `_is_public_url()` (SSRF guard — rejects RFC1918, loopback, cloud-metadata)
-3. Prefer URLs whose hostname ends in `.com` (avoids returning `amazon.it` for Amazon)
-4. Among tied-preference URLs, return the shortest
-
-### Wikipedia lawsuit filtering
-
-When Wikidata returns no canonical name, Wikipedia is tried. The search fetches 3 candidates (`srlimit=3`) and skips:
-- Titles containing ` v. ` (legal cases — e.g. "Google LLC v. Oracle America, Inc.")
-- Titles ending in `(disambiguation)`
-
-### Rate limiting
-
-Both Wikidata and Wikipedia have dedicated sliding-window rate limiters:
-
-```python
-_wikidata_limiter  = _RateLimiter(rpm=20)
-_wikipedia_limiter = _RateLimiter(rpm=20)
+```sql
+SELECT FROM h1b_ats_discovery
+WHERE last_checked IS NOT NULL      -- Pass 1 complete
+  AND brave_checked_at IS NULL      -- Brave not yet tried
+  AND careers_url IS NULL           -- probe found nothing
+  AND website_url IS NOT NULL       -- we have a website to search against
 ```
 
-See [quota-management.md](quota-management.md#wikidata--wikipedia-rate-limiting) for full design details.
+Runs Brave search + ATS fingerprint on each. Sets `brave_checked_at = NOW()` regardless of whether a URL was found — prevents infinite retries.
+
+**Why separate?**
+
+| | KG API | Brave API |
+|---|---|---|
+| Daily limit | 100,000 | N/A |
+| Monthly limit | N/A | 950 (free tier) |
+| Resets | Daily | Monthly |
+| Role | Primary enrichment | Fallback only |
+
+KG can process ~25,000 companies/day. Brave is spent once a month on the small residual set (companies with a website but no detectable ATS pattern). The quotas never contend.
+
+**Multi-day progress:** `load_top_sponsors` filters out recently-checked companies in SQL (`WHERE last_checked IS NULL OR last_checked < NOW() - 7 days`), so `--top N` always means "next N un-enriched companies". Large batches (`--top 900`) automatically resume where they left off on subsequent days.
+
+---
+
+### `/g/` vs `/m/` KG MIDs
+
+USCIS uses legal subsidiary names (e.g. `ORACLE AMERICA, INC.`) that KG maps to thin Google-minted `/g/` entities with no website or description. The parent brand entity (Oracle, Walmart) has a `/m/` Freebase legacy MID with full data. The `/g/` prefix is a reliable structural signal — no keyword lists needed.
+
+```text
+ORACLE AMERICA, INC.  → /g/ → retry "ORACLE AMERICA" → /g/ → retry "ORACLE" → /m/ oracle.com ✓
+WAL-MART ASSOCIATES   → /g/ → retry "WAL-MART" → /m/ walmart.com ✓
+```
+
+---
 
 ### `h1b_ats_discovery` table
 
 ```sql
 CREATE TABLE h1b_ats_discovery (
-    employer_fein     TEXT PRIMARY KEY REFERENCES dol_h1b_employers(employer_fein),
-    employer_name     TEXT NOT NULL,
-    canonical_name    TEXT,           -- brand name from Wikidata / Wikipedia / regex
-    canonical_source  TEXT,           -- 'wikidata' | 'wikipedia' | 'qwen' | 'regex'
-    website_url       TEXT,           -- from Wikidata P856
+    id                BIGSERIAL PRIMARY KEY,
+    employer_fein     TEXT        NOT NULL UNIQUE,
+    employer_name     TEXT        NOT NULL,
+    canonical_name    TEXT,           -- brand name from KG / regex
+    canonical_source  TEXT,           -- 'kg_api' | 'regex'
+    wikidata_qid      TEXT,           -- Wikidata QID from SPARQL P646 join
+    kg_mid            TEXT,           -- Freebase MID from KG API (/m/... or /g/...)
+    website_url       TEXT,           -- from KG url field or Wikidata P856
+    jobs_url          TEXT,           -- Wikidata P10311 official jobs URL
     careers_url       TEXT,           -- discovered career page URL
     detected_platform TEXT,           -- ATS platform slug
     detected_slug     TEXT,           -- company-specific ATS slug
-    is_monitored      BOOLEAN DEFAULT FALSE,
-    last_checked      TIMESTAMPTZ DEFAULT NOW()
+    is_monitored      BOOLEAN     NOT NULL DEFAULT FALSE,
+    last_checked      TIMESTAMPTZ,    -- set after KG+probe pass completes
+    brave_checked_at  TIMESTAMPTZ,    -- set after Brave pass runs (NULL = not yet tried)
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
+
+---
 
 ### CLI invocation
 
 ```bash
-# Process top 100 sponsors (dry-run — no DB writes)
-python scripts/discover_h1b_ats.py --top 100 --dry-run
+# Pass 1 — KG+probe for next 900 un-enriched companies (run daily)
+python scripts/discover_h1b_ats.py --top 900
 
-# Process top 20 sponsors and write results
-python scripts/discover_h1b_ats.py --top 20
+# Pass 1 — dry-run (no DB writes)
+python scripts/discover_h1b_ats.py --top 20 --dry-run
 
-# Single employer by FEIN
+# Pass 2 — Brave sweep for companies with website but no careers URL (run monthly)
+python scripts/discover_h1b_ats.py --brave-pass --top 950
+
+# Single employer by FEIN — full pipeline including Brave (debug/manual)
 python scripts/discover_h1b_ats.py --fein 123456789
-
-# With Qwen3-8B brand-name extraction fallback
-python scripts/discover_h1b_ats.py --top 100 --llm
 
 # Re-check even if checked recently
 python scripts/discover_h1b_ats.py --top 50 --force
+
+# With Qwen3-8B for Brave result disambiguation
+python scripts/discover_h1b_ats.py --brave-pass --top 950 --llm
 ```
 
 Results are stored in `h1b_ats_discovery` and surfaced in the Discover page ATS Discovery panel. Companies with `detected_platform` set can be added directly to the monitoring pipeline via the "Add to monitoring" button.

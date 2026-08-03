@@ -1493,6 +1493,7 @@ def init_db():
             detected_slug     TEXT,
             is_monitored      BOOLEAN     NOT NULL DEFAULT FALSE,
             last_checked      TIMESTAMPTZ,
+            brave_checked_at  TIMESTAMPTZ,
             created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
@@ -1517,6 +1518,10 @@ def init_db():
     c.execute("""
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS jobs_url TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS brave_checked_at TIMESTAMPTZ
     """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────

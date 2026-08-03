@@ -16,11 +16,13 @@ Usage:
 What is checked:
   ─ Infrastructure  : Redis (reachable, version, memory, last RDB save)
                       PostgreSQL (reachable, job count)
-  ─ Worker liveness : scheduler, scan_worker, detail_worker, fullscan_worker
+  ─ Worker liveness : scheduler, scan_worker, detail_worker, fullscan_worker,
+                      h1b_llm_worker, email_processor
                       via worker:alive:{type} heartbeat keys
   ─ Queue health    : poll:adaptive (ZSET), poll:fullscan (ZSET)
                       queue:detail:adaptive (LIST), queue:detail:fullscan (LIST)
                       stream:adaptive PEL, stream:fullscan PEL
+                      queue:email:push (LIST depth), llm:h1b:disambiguate (stream depth)
   ─ Bloom filters   : bloom:fullscan:* key count
   ─ Coverage        : companies not scanned in last 26h
   ─ Stuck jobs      : pending_detail records > 1h old
@@ -346,6 +348,43 @@ def run_health_check() -> int:
         _row("WARNING", "h1b_llm_worker", f"heartbeat check failed: {_h1b_err}")
         warnings += 1
 
+    # ── email_processor heartbeat ─────────────────────────────────────────────
+    try:
+        _ep_keys = []
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:email_processor:*", count=50)
+            _ep_keys.extend(keys)
+            if cursor == 0:
+                break
+        if not _ep_keys:
+            _row("WARNING", "email_processor",
+                 "heartbeat key missing — worker not running (email classification paused)")
+            warnings += 1
+        else:
+            _ep_raw = r.get(_ep_keys[0])
+            _ep_d   = json.loads(_ep_raw) if _ep_raw else None
+            _ep_ts  = _ep_d.get("ts") if isinstance(_ep_d, dict) else None
+            if _ep_ts is None:
+                _row("WARNING", "email_processor",
+                     "heartbeat key present but payload missing or has no ts — DEATH")
+                warnings += 1
+            else:
+                _ep_age = now - float(_ep_ts)
+                _ep_dead_after = _HEARTBEAT_DEAD_AFTER.get("email_processor", 60)
+                _ep_status = (
+                    f"pid={_ep_d.get('pid','?')}  processed={_ep_d.get('processed',0)}  "
+                    f"heartbeat {_ep_age:.0f}s ago"
+                )
+                if _ep_age > _ep_dead_after:
+                    _row("WARNING", "email_processor", _ep_status + "  (STALE)")
+                    warnings += 1
+                else:
+                    _row("OK", "email_processor", _ep_status)
+    except Exception as _ep_err:
+        _row("WARNING", "email_processor", f"heartbeat check failed: {_ep_err}")
+        warnings += 1
+
     # ── Worker pools — from scheduler:health + per-PID keys ──────────────────
     health_raw = r.get("scheduler:health")
     if health_raw is None:
@@ -438,6 +477,40 @@ def run_health_check() -> int:
     except Exception as _exc:
         # Fallback to static counts if the watchdog module is unavailable
         _row("WARNING", "queue health", f"Could not run watchdog checks: {_exc}")
+        warnings += 1
+
+    # ── Ancillary queue depths (not velocity-tracked, just depth) ─────────────
+    try:
+        from config import REDIS_EMAIL_PUSH, H1B_DISAMBIG_STREAM
+        _email_depth = int(r.llen(REDIS_EMAIL_PUSH) or 0)
+        _email_msg   = f"depth={_email_depth}" + (" — idle" if _email_depth == 0 else "")
+        if _email_depth > 50:
+            _row("WARNING", "email:push", f"{_email_msg}  (backlog building — is email-processor running?)")
+            warnings += 1
+        else:
+            _row("OK", "email:push", _email_msg)
+
+        _h1b_lag = _h1b_pel = None
+        try:
+            for _grp in (r.xinfo_groups(H1B_DISAMBIG_STREAM) or []):
+                if (isinstance(_grp, dict) and
+                        _grp.get("name") in ("h1b-llm-workers", b"h1b-llm-workers")):
+                    _h1b_lag = int(_grp.get("lag") or 0)
+                    _h1b_pel = int(_grp.get("pending") or 0)
+                    break
+        except Exception:
+            pass  # stream may not exist yet
+        if _h1b_lag is None or _h1b_pel is None:
+            _row("WARNING", "llm:h1b:disambiguate",
+                 "metrics unavailable — stream or consumer group not found yet")
+            warnings += 1
+        else:
+            _h1b_idle = _h1b_lag == 0 and _h1b_pel == 0
+            _h1b_msg  = (f"lag={_h1b_lag}  pel={_h1b_pel}" +
+                         (" — idle" if _h1b_idle else ""))
+            _row("OK", "llm:h1b:disambiguate", _h1b_msg)
+    except Exception as _qdepth_err:
+        _row("WARNING", "queue depths", f"Could not read ancillary queue depths: {_qdepth_err}")
         warnings += 1
 
     # ── BLOOM FILTERS ─────────────────────────────────────────────────────────
