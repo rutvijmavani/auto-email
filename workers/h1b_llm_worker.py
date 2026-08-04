@@ -125,14 +125,13 @@ _gemini_limiter: "DualRateLimiter | None" = None
 def _get_gemini_model():
     global _gemini_model, _gemini_limiter
     if _gemini_model is None:
-        import google.generativeai as genai
+        from google import genai
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "GOOGLE_API_KEY not set — required when H1B_LLM_PROVIDER=gemini"
             )
-        genai.configure(api_key=api_key)
-        _gemini_model = genai.GenerativeModel(H1B_LLM_GEMINI_MODEL)
+        _gemini_model = genai.Client(api_key=api_key)
         _gemini_limiter = DualRateLimiter(rpm=H1B_LLM_GEMINI_RPM, tpm=H1B_LLM_GEMINI_TPM)
         log.info("Gemini provider initialised — model=%s rpm=%d tpm=%d",
                  H1B_LLM_GEMINI_MODEL, H1B_LLM_GEMINI_RPM, H1B_LLM_GEMINI_TPM)
@@ -142,17 +141,19 @@ def _get_gemini_model():
 def _ask_gemini(uscis_name: str, uscis_norm: str,
                 candidates: list[dict], cand_text: str) -> "str | None":
     """Call Gemini API. Raises on API errors — caller leaves message in PEL."""
-    import google.generativeai as genai
-    model, limiter = _get_gemini_model()
+    from google.genai import types
+    client, limiter = _get_gemini_model()
     prompt = _MATCH_PROMPT_GEMINI.format(
         uscis_name=uscis_name,
         uscis_norm=uscis_norm,
         candidates=cand_text,
     )
-    limiter.wait()
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(temperature=0),
+    estimated = len(prompt) // 4 + 50
+    limiter.wait(estimated_tokens=estimated)
+    response = client.models.generate_content(
+        model=H1B_LLM_GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0),
     )
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
     limiter.record(tokens)
@@ -352,8 +353,8 @@ def _ensure_group(r) -> None:
 
 
 def run_worker(once: bool = False) -> None:
-    if not LLM_BASE_URL:
-        log.error("LLM_BASE_URL not set — start llama-server and set LLM_BASE_URL in .env")
+    if H1B_LLM_PROVIDER == "local" and not LLM_BASE_URL:
+        log.error("LLM_BASE_URL not set — required when H1B_LLM_PROVIDER=local")
         raise RuntimeError("LLM_BASE_URL not configured")
 
     r = get_redis()

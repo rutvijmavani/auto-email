@@ -46,19 +46,27 @@ def _prune_tpm(model: str, now: float) -> None:
         log.popleft()
 
 
-def within_tpm(model: str) -> bool:
-    """Return True if model is within TPM limit using 60s sliding window."""
+def within_tpm(model: str, estimated_tokens: int = 0) -> bool:
+    """Return True if model is within TPM limit using 60s sliding window.
+
+    estimated_tokens: prompt-length estimate (chars // 4 + output buffer) so the
+    check accounts for the upcoming request from the very first call.
+    """
     limit = TPM_LIMITS.get(model)
     if not limit:
         return True
     now = time.time()
     _prune_tpm(model, now)
     tokens_used = sum(t for _, t in _tpm_token_log[model])
-    return tokens_used < limit
+    return tokens_used + estimated_tokens < limit
 
 
-def tpm_wait_seconds(model: str) -> float:
-    """Return seconds to wait until TPM window has headroom. 0 if already clear."""
+def tpm_wait_seconds(model: str, estimated_tokens: int = 0) -> float:
+    """Return seconds to wait until TPM window has headroom. 0 if already clear.
+
+    estimated_tokens: prompt-length estimate (chars // 4 + output buffer) so the
+    check accounts for the upcoming request from the very first call.
+    """
     limit = TPM_LIMITS.get(model)
     if not limit:
         return 0.0
@@ -66,7 +74,7 @@ def tpm_wait_seconds(model: str) -> float:
     _prune_tpm(model, now)
     log = _tpm_token_log[model]
     tokens_used = sum(t for _, t in log)
-    if tokens_used < limit or not log:
+    if tokens_used + estimated_tokens < limit or not log:
         return 0.0
     return max(0.0, 60.0 - (now - log[0][0]) + 0.1)
 

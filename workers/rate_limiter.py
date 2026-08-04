@@ -27,8 +27,13 @@ class DualRateLimiter:
             self._token_log.popleft()
         return now
 
-    def wait(self) -> None:
-        """Block until both RPM and TPM have headroom for one more request."""
+    def wait(self, estimated_tokens: int = 0) -> None:
+        """Block until both RPM and TPM have headroom for one more request.
+
+        estimated_tokens: prompt length estimate (chars // 4 + output buffer) so
+        the admission check accounts for the upcoming request from the very first
+        call, not after actual usage accumulates.
+        """
         while True:
             now = self._prune()
 
@@ -39,7 +44,9 @@ class DualRateLimiter:
                     continue
 
             tokens_used = sum(t for _, t in self._token_log)
-            if tokens_used >= self._tpm:
+            if tokens_used + estimated_tokens >= self._tpm:
+                if not self._token_log:
+                    break  # no history yet — nothing to wait on
                 sleep_s = 60.0 - (now - self._token_log[0][0]) + 0.05
                 if sleep_s > 0:
                     time.sleep(sleep_s)

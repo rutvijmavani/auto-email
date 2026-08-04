@@ -102,12 +102,13 @@ def _call_model(prompt, cache_key, company, job_title, user_id: int = 1):
                 print(f"{model} still unavailable after wait — trying next model.")
                 continue
 
-        # TPM check — wait exactly until the oldest tokens exit the 60s window
-        wait_s = tpm_wait_seconds(model)
+        # TPM check — estimate prompt tokens (chars/4) + generous output buffer
+        estimated_tokens = len(prompt) // 4 + 500
+        wait_s = tpm_wait_seconds(model, estimated_tokens=estimated_tokens)
         if wait_s > 0:
             print(f"{model} TPM limit hit — waiting {wait_s:.1f}s...")
             time.sleep(wait_s)
-            if not within_tpm(model):
+            if not within_tpm(model, estimated_tokens=estimated_tokens):
                 print(f"{model} still over TPM after wait — trying next model.")
                 continue
 
