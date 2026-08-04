@@ -6,6 +6,14 @@ This file is a thin wrapper so ai_full_personalizer.py imports stay clean.
 """
 
 from db.db import can_call, increment_usage, all_models_exhausted
-from db.quota import within_rpm
+from db.quota import within_rpm, within_tpm, tpm_wait_seconds, record_tpm
 
-__all__ = ["can_call", "increment_usage", "all_models_exhausted", "within_rpm"]
+__all__ = [
+    "all_models_exhausted",
+    "can_call",
+    "increment_usage",
+    "record_tpm",
+    "tpm_wait_seconds",
+    "within_rpm",
+    "within_tpm",
+]

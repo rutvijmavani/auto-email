@@ -7,8 +7,10 @@ import hashlib
 import re
 from google import genai
 from dotenv import load_dotenv
-from db.quota_manager import can_call, increment_usage, all_models_exhausted
-from db.quota import within_rpm
+from db.quota_manager import (
+    can_call, increment_usage, all_models_exhausted,
+    within_rpm, within_tpm, tpm_wait_seconds, record_tpm,
+)
 from db.db import get_ai_cache, save_ai_cache
 import time
 
@@ -92,14 +94,22 @@ def _call_model(prompt, cache_key, company, job_title, user_id: int = 1):
         return {}
 
     for model in [PRIMARY_MODEL, FALLBACK_MODEL]:
-        # Check RPM first — a soft RPM limit shouldn't trigger an immediate skip.
-        # can_call() includes RPM internally, so checking it first would exit
-        # without the 60-second retry window when only RPM is the issue.
+        # RPM check
         if not within_rpm(model):
             print(f"{model} RPM limit hit — waiting 60s...")
             time.sleep(60)
             if not within_rpm(model):
                 print(f"{model} still unavailable after wait — trying next model.")
+                continue
+
+        # TPM check — estimate prompt tokens (chars/4) + generous output buffer
+        estimated_tokens = len(prompt) // 4 + 500
+        wait_s = tpm_wait_seconds(model, estimated_tokens=estimated_tokens)
+        if wait_s > 0:
+            print(f"{model} TPM limit hit — waiting {wait_s:.1f}s...")
+            time.sleep(wait_s)
+            if not within_tpm(model, estimated_tokens=estimated_tokens):
+                print(f"{model} still over TPM after wait — trying next model.")
                 continue
 
         if not can_call(model, user_id=user_id):
@@ -112,6 +122,8 @@ def _call_model(prompt, cache_key, company, job_title, user_id: int = 1):
                 contents=prompt
             )
 
+            tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
+            record_tpm(model, tokens)
             increment_usage(model, user_id=user_id)
 
             text = response.text.strip()

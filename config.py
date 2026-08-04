@@ -319,6 +319,12 @@ H1B_DISAMBIG_MAXLEN        = int(os.getenv("H1B_DISAMBIG_MAXLEN", "50000"))  # m
 H1B_DISAMBIG_MAX_DELIVERIES = int(os.getenv("H1B_DISAMBIG_MAX_DELIVERIES", "5"))  # DLQ after N failures
 H1B_DISAMBIG_DLQ_STREAM    = os.getenv("H1B_DISAMBIG_DLQ_STREAM", "llm:h1b:dlq")
 
+# LLM provider for H1B disambiguation: "gemini" (Google AI API) or "local" (llama-server/Qwen3)
+H1B_LLM_PROVIDER           = os.getenv("H1B_LLM_PROVIDER", "gemini")
+H1B_LLM_GEMINI_MODEL       = os.getenv("H1B_LLM_GEMINI_MODEL", "gemma-4-31b-it")
+H1B_LLM_GEMINI_RPM         = int(os.getenv("H1B_LLM_GEMINI_RPM", "30"))
+H1B_LLM_GEMINI_TPM         = int(os.getenv("H1B_LLM_GEMINI_TPM", "16000"))
+
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING
 # ─────────────────────────────────────────

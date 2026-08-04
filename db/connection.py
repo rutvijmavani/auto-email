@@ -58,6 +58,12 @@ RPM_LIMITS: dict = {
     "kg_api":                600,
 }
 
+TPM_LIMITS: dict = {
+    "gemini-2.5-flash-lite": 250_000,
+    "gemini-2.5-flash":      250_000,
+    "gemma-4-31b-it":         16_000,
+}
+
 
 # ─────────────────────────────────────────
 # CONNECTION POOL
