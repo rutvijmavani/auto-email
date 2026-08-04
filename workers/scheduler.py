@@ -183,6 +183,7 @@ _death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
 _WORKER_STABLE_AFTER_S: int  = 60  # seconds
 _SCHEDULER_HEALTH_KEY   = "scheduler:health"
 _SCHEDULER_HEALTH_TTL   = 600      # 10 min — expires naturally if scheduler dies
+_SCHEDULER_STARTUP_HB_TTL = 180    # startup grace: survives init_db()+rebuild_redis() before loop takes over
 
 # ── Phase 10 — per-company DC key cache ──────────────────────────────────────
 # Populated lazily in _get_dc_key_for_company().  Avoids a DB query on every
@@ -1207,19 +1208,21 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
     )
 
 
-def _write_scheduler_heartbeat(r, loop: str, dispatched: int) -> None:
+def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30) -> None:
     """Write per-loop liveness key so a hung loop is detected independently.
 
     Key: worker:alive:scheduler:{loop}  (e.g. :adaptive or :fullscan)
     Watchdog checks both keys; if either goes stale the loop is flagged dead
     even while the other loop keeps the process alive.
+    ttl defaults to 30s (loop rewrites every 1s tick); pass _SCHEDULER_STARTUP_HB_TTL
+    for the initial write before the loop starts.
     """
     try:
         r.set(f"worker:alive:scheduler:{loop}", json.dumps({
             "pid":        os.getpid(),
             "ts":         time.time(),
             "dispatched": dispatched,
-        }), ex=30)
+        }), ex=ttl)
     except Exception as _hb_err:
         logger.debug("scheduler: %s_loop heartbeat write failed: %s", loop, _hb_err)
 
@@ -3029,6 +3032,16 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
 
     from workers.startup import validate_startup
     validate_startup("scheduler", check_redis=True, check_db=True, check_config=True)
+
+    # Write startup heartbeats immediately after Redis is confirmed reachable so
+    # the deploy health check (runs ~70s after service restart) sees the scheduler
+    # as alive even while init_db() / rebuild_redis() are still running.
+    # Same pattern as manager.py (_MANAGER_HB_TTL=180).  The loop's 1s-tick
+    # writes take over once adaptive_loop / fullscan_loop start.
+    _r_startup = get_redis()
+    _write_scheduler_heartbeat(_r_startup, "adaptive", 0, ttl=_SCHEDULER_STARTUP_HB_TTL)
+    _write_scheduler_heartbeat(_r_startup, "fullscan", 0, ttl=_SCHEDULER_STARTUP_HB_TTL)
+    logger.info("scheduler: startup heartbeats written (ttl=%ds)", _SCHEDULER_STARTUP_HB_TTL)
 
     init_db()
 
