@@ -353,6 +353,7 @@ REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintena
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume
 REDIS_CRONCHAIN_ALIVE  = "cronchain:alive"         # STRING TTL=300 — cron chain heartbeat
 REDIS_DB_MAINTENANCE   = "db:maintenance"          # STRING no-TTL — maintenance flag
+REDIS_GEMINI_LOCK      = "gemini:discover_ats:active"  # STRING TTL=8h — set while discover_h1b_ats.py runs; email_processor yields
 REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currently being full-scanned
                                                    # score = scan start Unix timestamp
                                                    # written at scan start, removed on completion/error

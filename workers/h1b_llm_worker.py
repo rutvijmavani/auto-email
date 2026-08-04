@@ -37,7 +37,7 @@ from config import (
     REDIS_DB_MAINTENANCE,
 )
 from db.connection import get_conn
-from db.quota_manager import can_call, increment_usage, within_tpm, tpm_wait_seconds, record_tpm
+from db.quota_manager import can_call, increment_usage, within_rpm, within_tpm, tpm_wait_seconds, record_tpm
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
 from workers.llm_client import call_llm as _call_llm_shared   # local/Qwen3 path — kept, used when H1B_LLM_PROVIDER=local
@@ -144,9 +144,11 @@ def _ask_gemini(uscis_name: str, uscis_norm: str,
         candidates=cand_text,
     )
 
-    # RPD + RPM: wait until daily limit and per-minute slot are both available
+    # RPD + RPM: distinguish daily exhaustion from per-minute throttle
     while not can_call(H1B_LLM_GEMINI_MODEL, use_case="h1b_disambig"):
-        log.debug("h1b quota: RPD/RPM limit reached — sleeping 5s")
+        if within_rpm(H1B_LLM_GEMINI_MODEL):
+            raise RuntimeError("h1b_disambig daily quota exhausted — leaving in PEL")
+        log.debug("h1b quota: RPM limit reached — sleeping 5s")
         time.sleep(5)
 
     # TPM: wait until token budget has headroom
@@ -162,9 +164,9 @@ def _ask_gemini(uscis_name: str, uscis_norm: str,
     )
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
     increment_usage(H1B_LLM_GEMINI_MODEL, use_case="h1b_disambig")
-    record_tpm(H1B_LLM_GEMINI_MODEL, tokens)
+    record_tpm(H1B_LLM_GEMINI_MODEL, tokens or estimated)
     log.debug("Gemini response tokens=%d", tokens)
-    return response.text.strip()
+    return (response.text or "").strip()
 
 
 def _ask_local(uscis_name: str, uscis_norm: str,

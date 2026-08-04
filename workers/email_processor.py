@@ -45,7 +45,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from rapidfuzz import fuzz
 
-from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ, REDIS_DB_MAINTENANCE
+from config import REDIS_EMAIL_PUSH, REDIS_EMAIL_DLQ, REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK
 from db.connection import get_conn
 from db.gmail_tokens import get_token_by_email, update_history_id
 from logger import get_logger, init_logging
@@ -63,6 +63,13 @@ def _is_maintenance(r) -> bool:
     except Exception as exc:
         logger.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
+
+
+def _is_ats_discover_active(r) -> bool:
+    try:
+        return bool(r.exists(REDIS_GEMINI_LOCK))
+    except Exception:
+        return False  # fail-open: if Redis is down, don't block email processing
 
 # set in run_worker() after forking so WORKER_ID uses the real child PID
 _INFLIGHT_KEY: str = ""
@@ -677,6 +684,10 @@ def run_worker(once: bool = False) -> None:
     while True:
         while _is_maintenance(r):
             logger.info("Maintenance window active — pausing for 30s")
+            time.sleep(30)
+
+        while _is_ats_discover_active(r):
+            logger.info("ATS discover batch active — pausing email processing for 30s")
             time.sleep(30)
 
         # LMOVE: atomically pop from source tail → push to inflight head

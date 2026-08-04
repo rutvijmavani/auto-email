@@ -30,7 +30,7 @@ from config import (
     LLM_REQUEST_TIMEOUT,
     LLM_SLOTS_URL,
 )
-from db.quota_manager import can_call, increment_usage, tpm_wait_seconds, record_tpm
+from db.quota_manager import can_call, increment_usage, within_rpm, tpm_wait_seconds, record_tpm
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -121,9 +121,11 @@ def _call_gemini(prompt: str) -> str:
     clean = _QWEN_PREFIX.sub("", prompt)
     client = _get_gemini_client()
 
-    # RPD + RPM: wait until daily limit and per-minute slot are both available
+    # RPD + RPM: distinguish daily exhaustion from per-minute throttle
     while not can_call(EMAIL_LLM_GEMINI_MODEL, use_case="email_classif"):
-        logger.debug("email quota: RPD/RPM limit reached — sleeping 5s")
+        if within_rpm(EMAIL_LLM_GEMINI_MODEL):
+            raise RuntimeError("email_classif daily quota exhausted — requeueing job")
+        logger.debug("email quota: RPM limit reached — sleeping 5s")
         time.sleep(5)
 
     # TPM: wait until token budget has headroom
@@ -139,7 +141,7 @@ def _call_gemini(prompt: str) -> str:
     )
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
     increment_usage(EMAIL_LLM_GEMINI_MODEL, use_case="email_classif")
-    record_tpm(EMAIL_LLM_GEMINI_MODEL, tokens)
+    record_tpm(EMAIL_LLM_GEMINI_MODEL, tokens or estimated)
     logger.debug("Gemini email response tokens=%d", tokens)
 
     return (response.text or "").strip()
