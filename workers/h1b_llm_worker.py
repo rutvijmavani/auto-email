@@ -206,6 +206,8 @@ def _process_job(r, msg_id, fields) -> bool:
             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
             return True
 
+        conn.commit()  # release SELECT's transaction before LLM inference (2-3 min)
+
         log.info("LLM select: %r (tax_id=%s, %d candidates)", uscis_name, tax_id, len(candidates))
 
         try:
