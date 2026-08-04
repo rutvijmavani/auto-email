@@ -54,7 +54,20 @@ class DualRateLimiter:
 
             break
 
+    def reserve(self) -> None:
+        """Consume one RPM slot immediately (before the request fires).
+
+        Call this right before the API call so failed requests still count
+        against the rate limit and retries cannot exceed GEMMA_RPM.
+        """
+        self._req_times.append(time.monotonic())
+
+    def record_tokens(self, tokens: int) -> None:
+        """Record actual token usage (TPM) after receiving the response."""
+        self._token_log.append((time.monotonic(), tokens))
+
     def record(self, tokens: int) -> None:
+        """Convenience: reserve() + record_tokens() in one call."""
         now = time.monotonic()
         self._req_times.append(now)
         self._token_log.append((now, tokens))

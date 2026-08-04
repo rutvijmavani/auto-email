@@ -92,12 +92,28 @@ def _init_gemma() -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def _valid_candidates(candidates: object) -> bool:
+    """Return True if candidates is a non-empty list of dicts with required keys."""
+    if not isinstance(candidates, list) or not candidates:
+        return False
+    return all(
+        isinstance(c, dict)
+        and isinstance(c.get("fein"), str)
+        and isinstance(c.get("name"), str)
+        and isinstance(c.get("score"), (int, float))
+        for c in candidates
+    )
+
+
 def _ask_gemma(client: genai.Client, limiter: DualRateLimiter,
                uscis_name: str, uscis_norm: str,
                candidates: list[dict]) -> tuple["str | None", int]:
     """
     Call Gemma and return (matched_fein_or_None, total_tokens).
-    Raises on API errors — caller decides whether to XACK or leave in PEL.
+
+    Raises on API errors or unparseable responses — caller leaves message in PEL
+    for retry.  Only returns (None, tokens) when the model explicitly selects
+    null (no match found), which is a valid permanent decision.
     """
     cand_text = "\n".join(
         f"  [{i+1}] FEIN={c['fein']} | {c['name']} (similarity score: {c['score']:.0f}/100)"
@@ -111,6 +127,7 @@ def _ask_gemma(client: genai.Client, limiter: DualRateLimiter,
 
     estimated = len(prompt) // 4 + 50
     limiter.wait(estimated_tokens=estimated)
+    limiter.reserve()  # consume RPM slot before request so failures still count
 
     response = client.models.generate_content(
         model=GEMMA_MODEL,
@@ -119,20 +136,28 @@ def _ask_gemma(client: genai.Client, limiter: DualRateLimiter,
     )
 
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
-    limiter.record(tokens)
+    limiter.record_tokens(tokens)
 
     text = response.text.strip()
     m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
-        log.warning("Gemma returned no JSON for %r — raw: %s", uscis_name, text[:200])
-        return None, tokens
+        raise ValueError(f"no JSON in response for {uscis_name!r}: {text[:200]}")
 
     try:
-        result = json.loads(m.group()).get("match")
-        return result or None, tokens
+        parsed = json.loads(m.group())
     except json.JSONDecodeError as exc:
-        log.warning("JSON parse failed for %r: %s", uscis_name, exc)
-        return None, tokens
+        raise ValueError(f"JSON parse failed for {uscis_name!r}: {exc}") from exc
+
+    match_val = parsed.get("match")
+    if match_val is not None and not isinstance(match_val, str):
+        raise ValueError(
+            f"unexpected match type {type(match_val).__name__!r} for {uscis_name!r}"
+        )
+    if isinstance(match_val, str) and not match_val:
+        raise ValueError(f"empty match string for {uscis_name!r}")
+
+    # None means model explicitly selected null — valid no-match decision
+    return match_val or None, tokens
 
 
 # ── DB helpers (same logic as h1b_llm_worker) ────────────────────────────────
@@ -199,10 +224,12 @@ def run_batch(dry_run: bool = False) -> None:
         processed = matched = skipped = errors = consecutive_errors = 0
         pel_drained = False
         pel_cursor = "0-0"
+        xread_cursor = "0-0"  # only used in dry-run mode (xread is non-destructive)
+        stop_batch = False
 
         while True:
-            # ── PEL drain first ──────────────────────────────────────────────────
-            if not pel_drained:
+            # ── PEL drain — skipped in dry-run (would modify consumer group state) ──
+            if not dry_run and not pel_drained:
                 result = r.xautoclaim(
                     H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, GEMMA_CONSUMER,
                     min_idle_time=0, start_id=pel_cursor, count=1,
@@ -215,15 +242,21 @@ def run_batch(dry_run: bool = False) -> None:
                 pel_cursor = next_cursor
             else:
                 # ── New messages ─────────────────────────────────────────────────
-                result = r.xreadgroup(
-                    H1B_DISAMBIG_GROUP, GEMMA_CONSUMER,
-                    {H1B_DISAMBIG_STREAM: ">"}, count=1, block=5000,
-                )
+                if dry_run:
+                    # xread does not claim messages or modify consumer group state
+                    result = r.xread({H1B_DISAMBIG_STREAM: xread_cursor}, count=1, block=5000)
+                else:
+                    result = r.xreadgroup(
+                        H1B_DISAMBIG_GROUP, GEMMA_CONSUMER,
+                        {H1B_DISAMBIG_STREAM: ">"}, count=1, block=5000,
+                    )
                 if not result:
                     log.info("queue empty — batch complete. processed=%d matched=%d skipped=%d errors=%d",
                              processed, matched, skipped, errors)
                     break
                 messages = result[0][1]
+                if dry_run:
+                    xread_cursor = messages[-1][0]  # advance past last seen message
 
             for msg_id, fields in messages:
                 employer_legal_norm = fields.get("employer_legal_norm") or ""
@@ -235,33 +268,46 @@ def run_batch(dry_run: bool = False) -> None:
                 try:
                     candidates = json.loads(candidates_raw) if candidates_raw else []
                 except json.JSONDecodeError:
-                    log.warning("malformed candidates msg_id=%s — discarding", msg_id)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    log.warning("malformed candidates JSON msg_id=%s — discarding", msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                     processed += 1
                     continue
 
-                if not employer_legal_norm or not tax_id or not candidates:
+                if not _valid_candidates(candidates):
+                    log.warning("candidates schema invalid msg_id=%s — discarding", msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    processed += 1
+                    continue
+
+                if not employer_legal_norm or not tax_id:
                     log.warning("incomplete job msg_id=%s — discarding", msg_id)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                     processed += 1
                     continue
 
-                # DLQ guard
+                # DLQ guard — XACK only after xadd succeeds; leave in PEL on failure
                 deliveries = _delivery_count(r, msg_id)
                 if deliveries >= H1B_DISAMBIG_MAX_DELIVERIES:
                     log.error("msg_id=%s exceeded max deliveries — moving to DLQ", msg_id)
-                    try:
-                        r.xadd(H1B_DISAMBIG_DLQ_STREAM, fields, maxlen=10000, approximate=True)
-                    except Exception as exc:
-                        log.error("DLQ publish failed: %s", exc)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    if not dry_run:
+                        try:
+                            r.xadd(H1B_DISAMBIG_DLQ_STREAM, fields, maxlen=10000, approximate=True)
+                            r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                        except Exception as exc:
+                            log.error("DLQ publish failed for msg_id=%s — leaving in PEL: %s",
+                                      msg_id, exc)
+                            continue  # no XACK — stays in PEL for manual recovery
                     processed += 1
                     continue
 
                 # Idempotency
                 if _already_mapped(conn, employer_legal_norm, tax_id):
                     log.info("already mapped %r — skipping msg_id=%s", uscis_name, msg_id)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                     conn.commit()
                     skipped += 1
                     processed += 1
@@ -279,12 +325,13 @@ def run_batch(dry_run: bool = False) -> None:
                     )
                     consecutive_errors = 0
                 except Exception as exc:
-                    log.error("Gemma API error for %r: %s — leaving in PEL", uscis_name, exc)
+                    log.error("Gemma error for %r: %s — leaving in PEL", uscis_name, exc)
                     errors += 1
                     consecutive_errors += 1
                     if consecutive_errors >= _GEMMA_MAX_CONSECUTIVE_ERRORS:
                         log.error("too many consecutive errors (%d) — stopping batch",
                                   consecutive_errors)
+                        stop_batch = True
                         break
                     backoff = min(2 ** consecutive_errors, 60)
                     log.info("backing off %ds before next attempt", backoff)
@@ -294,14 +341,16 @@ def run_batch(dry_run: bool = False) -> None:
                 if dol_fein and not re.match(r"^\d{2}-\d{7}$", dol_fein):
                     log.warning("hallucinated FEIN %r for %r — discarding (tokens=%d)",
                                 dol_fein, uscis_name, tokens)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                     processed += 1
                     continue
 
                 if dol_fein and dol_fein not in candidate_feins:
                     log.warning("FEIN %r not in candidates for %r — discarding (tokens=%d)",
                                 dol_fein, uscis_name, tokens)
-                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                    if not dry_run:
+                        r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                     processed += 1
                     continue
 
@@ -318,12 +367,16 @@ def run_batch(dry_run: bool = False) -> None:
                 else:
                     log.info("no match for %r (tokens=%d)", uscis_name, tokens)
 
-                r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
+                if not dry_run:
+                    r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                 processed += 1
 
                 if processed % 100 == 0:
                     log.info("progress: processed=%d matched=%d skipped=%d errors=%d [%s]",
                              processed, matched, skipped, errors, limiter.status())
+
+            if stop_batch:
+                break
 
     finally:
         conn.close()
