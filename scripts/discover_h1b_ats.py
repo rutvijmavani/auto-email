@@ -1237,16 +1237,16 @@ def main():
     except Exception:
         r = None
 
-    if r:
-        r.set(REDIS_GEMINI_LOCK, "1", ex=8 * 3600)
-        log.info("Gemini lock set (TTL=8h) — email_processor will pause during this run")
+    if r and not args.dry_run:
+        r.set(REDIS_GEMINI_LOCK, "1", ex=3600)
+        log.info("Gemini lock set (TTL=1h, renews per employer) — email_processor will pause during this run")
+    conn = None
     try:
         init_db()
         conn = get_conn()
 
         if args.brave_pass:
             _run_brave_pass(conn, r, args)
-            conn.close()
             return
 
         if args.fein:
@@ -1268,6 +1268,8 @@ def main():
         if args.fein:
             # Single-employer: inline KG + SPARQL, no batching
             for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
                 while _is_maintenance(r):
                     log.info("Maintenance window active — pausing for 30s")
                     time.sleep(30)
@@ -1285,6 +1287,8 @@ def main():
             seen_mids: set[str]     = set()
 
             for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
                 fein = emp["employer_fein"]
                 name = emp["employer_name"]
 
@@ -1354,6 +1358,8 @@ def main():
             # ── Phase 3: career probe + upsert ───────────────────────────────────
             log.info("Phase 3: career probe for %d employers …", len(employers))
             for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
                 fein  = emp["employer_fein"]
                 entry = kg_map.get(fein, {})
                 if entry.get("skip"):
@@ -1371,20 +1377,20 @@ def main():
                 _tally(stats, result, args.force)
                 time.sleep(0.2)
 
-        conn.close()
-
         log.info(
             "Done. processed=%d skipped=%d with_website=%d with_jobs_url=%d with_ats=%d",
             stats["processed"], stats["skipped"],
             stats["with_website"], stats["with_jobs_url"], stats["with_ats"],
         )
     finally:
-        if r:
+        if conn:
+            conn.close()
+        if r and not args.dry_run:
             try:
                 r.delete(REDIS_GEMINI_LOCK)
                 log.info("Gemini lock cleared — email_processor resuming")
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed to clear Gemini lock: %s", exc)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,7 @@ from db.connection import get_conn
 from db.gmail_tokens import get_token_by_email, update_history_id
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
+import redis.exceptions
 from workers.redis_client import get_redis
 
 logger = get_logger(__name__)
@@ -68,8 +69,9 @@ def _is_maintenance(r) -> bool:
 def _is_ats_discover_active(r) -> bool:
     try:
         return bool(r.exists(REDIS_GEMINI_LOCK))
-    except Exception:
-        return False  # fail-open: if Redis is down, don't block email processing
+    except redis.exceptions.RedisError as exc:
+        logger.warning("Redis ATS discover check failed (%s) — assuming not active", exc)
+        return False
 
 # set in run_worker() after forking so WORKER_ID uses the real child PID
 _INFLIGHT_KEY: str = ""
@@ -686,9 +688,10 @@ def run_worker(once: bool = False) -> None:
             logger.info("Maintenance window active — pausing for 30s")
             time.sleep(30)
 
-        while _is_ats_discover_active(r):
-            logger.info("ATS discover batch active — pausing email processing for 30s")
-            time.sleep(30)
+        if not once:
+            while _is_ats_discover_active(r):
+                logger.info("ATS discover batch active — pausing email processing for 30s")
+                time.sleep(30)
 
         # LMOVE: atomically pop from source tail → push to inflight head
         # Producers lpush (left); we consume from right → FIFO order
