@@ -32,17 +32,15 @@ from config import (
     H1B_DISAMBIG_MAX_DELIVERIES,
     H1B_DISAMBIG_STREAM,
     H1B_LLM_GEMINI_MODEL,
-    H1B_LLM_GEMINI_RPM,
-    H1B_LLM_GEMINI_TPM,
     H1B_LLM_PROVIDER,
     LLM_BASE_URL,
     REDIS_DB_MAINTENANCE,
 )
 from db.connection import get_conn
+from db.quota_manager import can_call, increment_usage, within_tpm, tpm_wait_seconds, record_tpm
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
 from workers.llm_client import call_llm as _call_llm_shared   # local/Qwen3 path — kept, used when H1B_LLM_PROVIDER=local
-from workers.rate_limiter import DualRateLimiter
 from workers.redis_client import get_redis
 
 log = get_logger(__name__)
@@ -118,47 +116,54 @@ _MATCH_PROMPT = _MATCH_PROMPT_LOCAL
 # LLM — Gemini provider (used when H1B_LLM_PROVIDER=gemini)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_gemini_model = None
-_gemini_limiter: "DualRateLimiter | None" = None
+_gemini_client = None
 
 
-def _get_gemini_model():
-    global _gemini_model, _gemini_limiter
-    if _gemini_model is None:
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
         from google import genai
         api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError(
                 "GOOGLE_API_KEY not set — required when H1B_LLM_PROVIDER=gemini"
             )
-        _gemini_model = genai.Client(api_key=api_key)
-        _gemini_limiter = DualRateLimiter(rpm=H1B_LLM_GEMINI_RPM, tpm=H1B_LLM_GEMINI_TPM)
-        log.info("Gemini provider initialised — model=%s rpm=%d tpm=%d",
-                 H1B_LLM_GEMINI_MODEL, H1B_LLM_GEMINI_RPM, H1B_LLM_GEMINI_TPM)
-    return _gemini_model, _gemini_limiter
+        _gemini_client = genai.Client(api_key=api_key)
+        log.info("Gemini provider initialised — model=%s", H1B_LLM_GEMINI_MODEL)
+    return _gemini_client
 
 
 def _ask_gemini(uscis_name: str, uscis_norm: str,
                 candidates: list[dict], cand_text: str) -> "str | None":
-    """Call Gemini API. Raises on API errors — caller leaves message in PEL."""
+    """Call Gemini API with RPD+RPM+TPM quota guards. Raises on API errors — caller leaves in PEL."""
     from google.genai import types
-    client, limiter = _get_gemini_model()
+    client = _get_gemini_client()
     prompt = _MATCH_PROMPT_GEMINI.format(
         uscis_name=uscis_name,
         uscis_norm=uscis_norm,
         candidates=cand_text,
     )
+
+    # RPD + RPM: wait until daily limit and per-minute slot are both available
+    while not can_call(H1B_LLM_GEMINI_MODEL, use_case="h1b_disambig"):
+        log.debug("h1b quota: RPD/RPM limit reached — sleeping 5s")
+        time.sleep(5)
+
+    # TPM: wait until token budget has headroom
     estimated = len(prompt) // 4 + 50
-    limiter.wait(estimated_tokens=estimated)
-    limiter.reserve()  # consume RPM slot before request so failures still count
+    wait_s = tpm_wait_seconds(H1B_LLM_GEMINI_MODEL, estimated_tokens=estimated)
+    if wait_s > 0:
+        time.sleep(wait_s)
+
     response = client.models.generate_content(
         model=H1B_LLM_GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0),
     )
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
-    limiter.record_tokens(tokens)
-    log.debug("Gemini response tokens=%d [%s]", tokens, limiter.status())
+    increment_usage(H1B_LLM_GEMINI_MODEL, use_case="h1b_disambig")
+    record_tpm(H1B_LLM_GEMINI_MODEL, tokens)
+    log.debug("Gemini response tokens=%d", tokens)
     return response.text.strip()
 
 

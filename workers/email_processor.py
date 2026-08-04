@@ -5,16 +5,16 @@ Reads from queue:email:push (written by api.py /email-push webhook). For each
 Pub/Sub notification, calls history.list to find new message IDs, then for each:
 
   1. Fetches subject + sender metadata (no body, cheap API call)
-  2. Runs Qwen3-8B gate  (subject+sender → yes/no/not_sure, ~5-6s warm)
+  2. Runs gate LLM  (subject+sender → yes/no/not_sure)
   3. Fetches full body only if gate passes (yes or not_sure)
-  4. Runs Qwen3-8B extraction  (body → {company, title, status} JSON, ~25-30s)
-  5. 4-layer matching funnel: ATS domain filter → fuzzy match → Qwen3-8B disambiguation
+  4. Runs extraction LLM  (body → {company, title, status} JSON)
+  5. 4-layer matching funnel: ATS domain filter → fuzzy match → LLM disambiguation
   6. Updates applications.email_status + ats_company + ats_title, or writes to
      unmatched_emails when no application can be identified.
 
-Model: Qwen3 via shared llama-server (HTTP, OpenAI-compatible API at LLM_BASE_URL).
-Single worker — email volume (~5-10/day) does not justify parallelism, and concurrent
-Qwen inference on a 2-core VM is slower than sequential.
+Model: configured via EMAIL_LLM_PROVIDER in config.py ("gemini" default → gemma-4-27b-it
+via Google AI API; "local" → llama-server at LLM_BASE_URL). Single worker — email
+volume (~5-10/day) does not justify parallelism.
 
 At-least-once delivery (same pattern as detail_worker):
   LMOVE queue:email:push → queue:email:push:inflight:{worker_id}   (atomic)
@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 
 import google.auth.exceptions
 from google.auth.transport.requests import Request
-from config import LLM_BASE_URL
+from config import EMAIL_LLM_PROVIDER, LLM_BASE_URL
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -648,7 +648,7 @@ def _process_notification(raw_str: str, r) -> str:
 
 def run_worker(once: bool = False) -> None:
     global _INFLIGHT_KEY
-    if not LLM_BASE_URL:
+    if EMAIL_LLM_PROVIDER == "local" and not LLM_BASE_URL:
         logger.error(
             "LLM_BASE_URL is not set — start llama-server and set LLM_BASE_URL in .env "
             "(e.g. http://localhost:8080/v1)"

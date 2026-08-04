@@ -19,7 +19,7 @@ Usage:
     python scripts/discover_h1b_ats.py --top 20 --dry-run
     python scripts/discover_h1b_ats.py --fein 123456789
     python scripts/discover_h1b_ats.py --top 20 --force
-    python scripts/discover_h1b_ats.py --top 20 --llm   # load Qwen3 for Brave disambiguation
+    python scripts/discover_h1b_ats.py --top 20   # Gemini used automatically for Brave disambiguation
 """
 
 import argparse
@@ -40,9 +40,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import requests
 
-from config import REDIS_DB_MAINTENANCE
+from config import DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER, REDIS_DB_MAINTENANCE
 from db.connection import get_conn
-from db.quota import can_call, increment_usage, within_rpm
+from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -418,8 +418,10 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Qwen3-8B — career URL disambiguation
+# Career URL disambiguation — Gemini (default) or local Qwen3-8B
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Local (Qwen3-8B via llama_cpp) ────────────────────────────────────────────
 
 _llm = None
 _STRIP_THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -447,10 +449,6 @@ def _qwen_pick_career_url(
     company_name: str,
     website_url: str | None,
 ) -> str | None:
-    """
-    Ask Qwen3-8B to pick the official career page from a short candidate list.
-    Returns the chosen URL or None if LLM unavailable / fails.
-    """
     if _llm is None or not candidates:
         return None
     numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(candidates))
@@ -472,6 +470,84 @@ def _qwen_pick_career_url(
     except Exception as e:
         log.debug("Qwen3 career URL pick failed: %s", e)
     return None
+
+
+# ── Gemini backend ─────────────────────────────────────────────────────────────
+
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY not set — required when DISCOVER_ATS_LLM_PROVIDER=gemini"
+            )
+        _gemini_client = genai.Client(api_key=api_key)
+        log.info("Gemini provider initialised — model=%s", DISCOVER_ATS_GEMINI_MODEL)
+    return _gemini_client
+
+
+def _gemini_pick_career_url(
+    candidates: list[str],
+    company_name: str,
+    website_url: str | None,
+) -> str | None:
+    if not candidates:
+        return None
+    numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(candidates))
+    website_hint = f" (official website: {website_url})" if website_url else ""
+    prompt = (
+        f"Company: {company_name}{website_hint}\n\n"
+        f"Candidate career page URLs:\n{numbered}\n\n"
+        "Which number is the official career page for this company? "
+        "Reply with ONLY the number."
+    )
+    while not can_call(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig"):
+        log.debug("ats_disambig quota: RPD/RPM limit reached — sleeping 5s")
+        time.sleep(5)
+
+    estimated = len(prompt) // 4 + 50
+    wait_s = tpm_wait_seconds(DISCOVER_ATS_GEMINI_MODEL, estimated_tokens=estimated)
+    if wait_s > 0:
+        time.sleep(wait_s)
+
+    try:
+        from google.genai import types
+        response = _get_gemini_client().models.generate_content(
+            model=DISCOVER_ATS_GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0),
+        )
+        tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
+        increment_usage(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig")
+        record_tpm(DISCOVER_ATS_GEMINI_MODEL, tokens)
+        text = (response.text or "").strip()
+        idx  = int(text) - 1
+        if 0 <= idx < len(candidates):
+            log.debug("Gemini picked candidate %d: %s", idx + 1, candidates[idx])
+            return candidates[idx]
+    except Exception as e:
+        log.debug("Gemini career URL pick failed: %s", e)
+    return None
+
+
+# ── Public interface ───────────────────────────────────────────────────────────
+
+def _pick_career_url(
+    candidates: list[str],
+    company_name: str,
+    website_url: str | None,
+) -> str | None:
+    """Pick the best career URL from candidates using the configured LLM provider."""
+    if DISCOVER_ATS_LLM_PROVIDER == "gemini":
+        return _gemini_pick_career_url(candidates, company_name, website_url)
+    # local path — lazy-load Qwen3 on first call
+    _load_llm()
+    return _qwen_pick_career_url(candidates, company_name, website_url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -601,13 +677,13 @@ def brave_career_search(
             log.debug("Brave: single candidate → %s", candidates[0])
             return candidates[0]
 
-        # Multiple candidates — ask Qwen3 to pick
-        chosen = _qwen_pick_career_url(candidates[:3], company_name, website_url)
+        # Multiple candidates — ask LLM to pick
+        chosen = _pick_career_url(candidates[:3], company_name, website_url)
         if chosen:
             return chosen
 
-        # Qwen3 unavailable — return first plausible result
-        log.debug("Brave: Qwen3 unavailable, using first candidate: %s", candidates[0])
+        # LLM unavailable — return first plausible result
+        log.debug("Brave: LLM unavailable, using first candidate: %s", candidates[0])
         return candidates[0]
 
     except requests.exceptions.RequestException as e:
@@ -1144,14 +1220,9 @@ def main():
                         help="Print results without writing to DB")
     parser.add_argument("--force",   action="store_true",
                         help="Re-check even if recently checked")
-    parser.add_argument("--llm",        action="store_true",
-                        help="Load Qwen3-8B for Brave result disambiguation")
     parser.add_argument("--brave-pass", action="store_true",
                         help="Run Brave search only on companies already enriched by KG+probe")
     args = parser.parse_args()
-
-    if args.llm:
-        _load_llm()
 
     try:
         r = get_redis()

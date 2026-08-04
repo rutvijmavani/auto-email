@@ -1,9 +1,8 @@
 [Unit]
-Description=H1B employer disambiguation LLM worker (Qwen3 via llama-server)
+Description=H1B employer disambiguation LLM worker (Gemini API)
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target llama-server.service
+After=network-online.target
 Wants=network-online.target
-Requires=llama-server.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
 OnFailure=recruiter-pipeline-alert@%p.service

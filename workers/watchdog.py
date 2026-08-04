@@ -132,7 +132,6 @@ _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
 _UNIT_MANAGER         = "recruiter-manager"
 _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
-_UNIT_LLAMA_SERVER    = "llama-server"
 
 
 # ─────────────────────────────────────────
@@ -1762,8 +1761,7 @@ def check_systemd_services() -> list:
         (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_MANAGER,       True),    # standalone daemon; healable via reset-failed + restart
-        (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker; systemd Requires=llama-server handles dep
-        (_UNIT_LLAMA_SERVER,   True),  # inference server; h1b-llm-worker and email-processor depend on it
+        (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker (Gemini API — no llama-server dependency)
     ]:
         try:
             result = subprocess.run(

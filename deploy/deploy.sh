@@ -245,18 +245,12 @@ sudo systemctl restart streamlit-frontend || {
 
 # h1b-llm-worker: reset-failed first — StartLimitBurst may have been hit if
 # the worker crash-looped before deploy.  Non-critical batch worker; a restart
-# failure here does not trigger a rollback.  Guard against starting the worker
-# when llama-server is inactive — systemd Requires= would pull it in and block
-# the deploy on model load (TimeoutStartSec=infinity).
+# failure here does not trigger a rollback.
 sudo systemctl reset-failed h1b-llm-worker 2>/dev/null || true
-if systemctl is-active --quiet llama-server; then
-    if sudo systemctl restart h1b-llm-worker; then
-        echo "  Restarted: h1b-llm-worker"
-    else
-        echo "  [WARN] h1b-llm-worker failed to restart — non-critical, check manually"
-    fi
+if sudo systemctl restart h1b-llm-worker; then
+    echo "  Restarted: h1b-llm-worker"
 else
-    echo "  [WARN] h1b-llm-worker not restarted — llama-server inactive (model not loaded)"
+    echo "  [WARN] h1b-llm-worker failed to restart — non-critical, check manually"
 fi
 
 echo ""
