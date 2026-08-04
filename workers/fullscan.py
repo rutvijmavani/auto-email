@@ -92,6 +92,7 @@ import copy
 import json
 import os
 import socket
+import redis.exceptions
 import sys
 import time
 from datetime import datetime, timezone
@@ -1626,6 +1627,9 @@ def run_worker(once: bool = False, skip_lock: bool = False,
             print("\n[fullscan] Shutting down.")
             break
 
+        except redis.exceptions.TimeoutError:
+            logger.warning("fullscan: Redis socket timeout (system load?) — retrying")
+            continue
         except Exception as exc:
             logger.error(
                 "fullscan: unexpected loop error: %s", exc, exc_info=True,

@@ -150,13 +150,14 @@ def _ask_gemini(uscis_name: str, uscis_norm: str,
     )
     estimated = len(prompt) // 4 + 50
     limiter.wait(estimated_tokens=estimated)
+    limiter.reserve()  # consume RPM slot before request so failures still count
     response = client.models.generate_content(
         model=H1B_LLM_GEMINI_MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(temperature=0),
     )
     tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
-    limiter.record(tokens)
+    limiter.record_tokens(tokens)
     log.debug("Gemini response tokens=%d [%s]", tokens, limiter.status())
     return response.text.strip()
 

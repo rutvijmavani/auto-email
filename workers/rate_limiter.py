@@ -44,9 +44,7 @@ class DualRateLimiter:
                     continue
 
             tokens_used = sum(t for _, t in self._token_log)
-            if tokens_used + estimated_tokens >= self._tpm:
-                if not self._token_log:
-                    break  # no history yet — nothing to wait on
+            if self._token_log and tokens_used + estimated_tokens >= self._tpm:
                 sleep_s = 60.0 - (now - self._token_log[0][0]) + 0.05
                 if sleep_s > 0:
                     time.sleep(sleep_s)

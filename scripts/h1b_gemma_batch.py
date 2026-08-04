@@ -48,10 +48,15 @@ log = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-GEMMA_MODEL       = os.getenv("GEMMA_MODEL", "gemma-4-31b-it")
-GEMMA_RPM         = int(os.getenv("GEMMA_RPM", "30"))
-GEMMA_TPM         = int(os.getenv("GEMMA_TPM", "16000"))
-GEMMA_CONSUMER    = os.getenv("GEMMA_CONSUMER", "h1b-gemma-batch-1")
+GEMMA_MODEL            = os.getenv("GEMMA_MODEL", "gemma-4-31b-it")
+GEMMA_RPM              = int(os.getenv("GEMMA_RPM", "30"))
+GEMMA_TPM              = int(os.getenv("GEMMA_TPM", "16000"))
+GEMMA_CONSUMER         = os.getenv("GEMMA_CONSUMER", "h1b-gemma-batch-1")
+# min_idle_time for xautoclaim PEL drain — must exceed max expected
+# generate_content + rate-limit wait duration so in-flight messages from
+# another consumer (or same consumer on a slow run) are not reclaimed.
+# Default 120s covers 60s rate-limit sleep + ~60s API timeout headroom.
+GEMMA_PEL_MIN_IDLE_MS  = int(os.getenv("GEMMA_PEL_MIN_IDLE_MS", "120000"))
 
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
@@ -148,7 +153,14 @@ def _ask_gemma(client: genai.Client, limiter: DualRateLimiter,
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON parse failed for {uscis_name!r}: {exc}") from exc
 
-    match_val = parsed.get("match")
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"expected JSON object, got {type(parsed).__name__!r} for {uscis_name!r}"
+        )
+    if "match" not in parsed:
+        raise ValueError(f"'match' key missing from response for {uscis_name!r}")
+
+    match_val = parsed["match"]  # key confirmed present above
     if match_val is not None and not isinstance(match_val, str):
         raise ValueError(
             f"unexpected match type {type(match_val).__name__!r} for {uscis_name!r}"
@@ -156,7 +168,7 @@ def _ask_gemma(client: genai.Client, limiter: DualRateLimiter,
     if isinstance(match_val, str) and not match_val:
         raise ValueError(f"empty match string for {uscis_name!r}")
 
-    # None means model explicitly selected null — valid no-match decision
+    # None means model explicitly selected null — valid permanent no-match decision
     return match_val or None, tokens
 
 
@@ -232,7 +244,7 @@ def run_batch(dry_run: bool = False) -> None:
             if not dry_run and not pel_drained:
                 result = r.xautoclaim(
                     H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, GEMMA_CONSUMER,
-                    min_idle_time=0, start_id=pel_cursor, count=1,
+                    min_idle_time=GEMMA_PEL_MIN_IDLE_MS, start_id=pel_cursor, count=1,
                 )
                 next_cursor, messages = result[0], result[1]
                 if not messages:
@@ -294,7 +306,9 @@ def run_batch(dry_run: bool = False) -> None:
                     log.error("msg_id=%s exceeded max deliveries — moving to DLQ", msg_id)
                     if not dry_run:
                         try:
-                            r.xadd(H1B_DISAMBIG_DLQ_STREAM, fields, maxlen=10000, approximate=True)
+                            r.xadd(H1B_DISAMBIG_DLQ_STREAM,
+                                   {**fields, "source_msg_id": msg_id},
+                                   maxlen=10000, approximate=True)
                             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
                         except Exception as exc:
                             log.error("DLQ publish failed for msg_id=%s — leaving in PEL: %s",

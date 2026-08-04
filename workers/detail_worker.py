@@ -61,6 +61,7 @@ queue:detail:adaptive always takes priority over queue:detail:fullscan.
 
 import json
 import os
+import redis.exceptions
 import socket
 import sys
 import time
@@ -1339,6 +1340,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             print("\n[detail_worker] Shutting down.")
             break
 
+        except redis.exceptions.TimeoutError:
+            logger.warning("detail_worker: Redis socket timeout (system load?) — retrying")
+            continue
         except Exception as exc:
             logger.error(
                 "detail_worker: unexpected loop error: %s", exc, exc_info=True,

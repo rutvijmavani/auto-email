@@ -26,6 +26,7 @@ Pub/Sub:
 import ctypes
 import json
 import logging
+import redis.exceptions
 import math
 import multiprocessing
 import os
@@ -2548,6 +2549,9 @@ def _manager_cmds_loop() -> None:
         except KeyboardInterrupt:
             logger.info("manager_cmds_loop: stopping")
             break
+        except redis.exceptions.TimeoutError:
+            logger.warning("manager_cmds_loop: Redis socket timeout (system load?) — retrying")
+            continue
         except Exception as exc:
             logger.error("manager_cmds_loop: error: %s", exc, exc_info=True)
             time.sleep(5)

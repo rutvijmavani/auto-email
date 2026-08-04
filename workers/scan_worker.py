@@ -85,6 +85,7 @@ import json
 import copy
 import os
 import socket
+import redis.exceptions
 import sys
 import time
 from datetime import datetime, timezone
@@ -1043,6 +1044,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             print("\n[scan_worker] Shutting down.")
             break
 
+        except redis.exceptions.TimeoutError:
+            logger.warning("scan_worker: Redis socket timeout (system load?) — retrying")
+            continue
         except Exception as exc:
             logger.error(
                 "scan_worker: unexpected loop error: %s", exc, exc_info=True,
