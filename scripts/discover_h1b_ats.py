@@ -507,7 +507,11 @@ def _gemini_pick_career_url(
         "Reply with ONLY the number."
     )
     while not can_call(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig"):
-        log.debug("ats_disambig quota: RPD/RPM limit reached — sleeping 5s")
+        if within_rpm(DISCOVER_ATS_GEMINI_MODEL):
+            # RPM is fine → daily quota exhausted; spinning won't help
+            log.debug("ats_disambig: daily quota exhausted — skipping disambiguation")
+            return None
+        log.debug("ats_disambig: RPM limit reached — sleeping 5s")
         time.sleep(5)
 
     estimated = len(prompt) // 4 + 50
@@ -526,7 +530,11 @@ def _gemini_pick_career_url(
         increment_usage(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig")
         record_tpm(DISCOVER_ATS_GEMINI_MODEL, tokens)
         text = (response.text or "").strip()
-        idx  = int(text) - 1
+        m = re.search(r'\d+', text)
+        if not m:
+            log.debug("Gemini returned non-numeric response: %r", text)
+            return None
+        idx = int(m.group()) - 1
         if 0 <= idx < len(candidates):
             log.debug("Gemini picked candidate %d: %s", idx + 1, candidates[idx])
             return candidates[idx]

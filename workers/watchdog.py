@@ -282,12 +282,6 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "description": f"Restarted {_UNIT_H1B_LLM_WORKER} via systemd (service was inactive/failed)",
                 "foreground":  True,
             },
-            f"systemd_{_UNIT_LLAMA_SERVER}": {
-                "cmd_args":    _systemd_restart_cmd(_UNIT_LLAMA_SERVER),
-                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
-                "description": f"Restarted {_UNIT_LLAMA_SERVER} via systemd (service was inactive/failed)",
-                "foreground":  True,
-            },
             # Queue empty → rebuild.  Queue stall → restart workers (rebuild
             # won't help if the queue has entries but workers aren't draining it).
             "queue_poll_adaptive_empty": {

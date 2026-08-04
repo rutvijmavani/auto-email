@@ -12,7 +12,7 @@ Pub/Sub notification, calls history.list to find new message IDs, then for each:
   6. Updates applications.email_status + ats_company + ats_title, or writes to
      unmatched_emails when no application can be identified.
 
-Model: configured via EMAIL_LLM_PROVIDER in config.py ("gemini" default → gemma-4-27b-it
+Model: configured via EMAIL_LLM_PROVIDER in config.py ("gemini" default → gemma-4-26b-it
 via Google AI API; "local" → llama-server at LLM_BASE_URL). Single worker — email
 volume (~5-10/day) does not justify parallelism.
 
@@ -648,6 +648,13 @@ def _process_notification(raw_str: str, r) -> str:
 
 def run_worker(once: bool = False) -> None:
     global _INFLIGHT_KEY
+    _VALID_PROVIDERS = {"gemini", "local"}
+    if EMAIL_LLM_PROVIDER not in _VALID_PROVIDERS:
+        raise RuntimeError(
+            f"EMAIL_LLM_PROVIDER must be 'gemini' or 'local', got {EMAIL_LLM_PROVIDER!r}"
+        )
+    if EMAIL_LLM_PROVIDER == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
+        raise RuntimeError("GOOGLE_API_KEY not set — required when EMAIL_LLM_PROVIDER=gemini")
     if EMAIL_LLM_PROVIDER == "local" and not LLM_BASE_URL:
         logger.error(
             "LLM_BASE_URL is not set — start llama-server and set LLM_BASE_URL in .env "

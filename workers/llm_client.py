@@ -154,4 +154,6 @@ def call_llm(prompt: str) -> str:
     """
     if EMAIL_LLM_PROVIDER == "gemini":
         return _call_gemini(prompt)
-    return _call_local(prompt)
+    if EMAIL_LLM_PROVIDER == "local":
+        return _call_local(prompt)
+    raise RuntimeError(f"Unsupported EMAIL_LLM_PROVIDER: {EMAIL_LLM_PROVIDER!r}")
