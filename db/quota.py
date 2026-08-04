@@ -1,9 +1,10 @@
 # db/quota.py — CareerShift and Gemini quota helpers
 
 import time
+from collections import defaultdict, deque
 from datetime import datetime
-from db.connection import get_conn, DAILY_LIMITS, RPM_LIMITS
-from collections import defaultdict
+
+from db.connection import DAILY_LIMITS, RPM_LIMITS, TPM_LIMITS, get_conn
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -14,24 +15,65 @@ logger = get_logger(__name__)
 # ─────────────────────────────────────────
 
 # { model: [timestamp, ...] } — resets on process restart (fine for 60s windows)
-_rpm_timestamps = defaultdict(list)
+_rpm_timestamps: defaultdict[str, list] = defaultdict(list)
+
+# { model: deque[(timestamp, tokens)] } — sliding window for TPM
+_tpm_token_log: defaultdict[str, deque] = defaultdict(deque)
 
 
-def within_rpm(model):
+def within_rpm(model: str) -> bool:
     """Return True if model is within RPM limit using 60s sliding window."""
     limit = RPM_LIMITS.get(model)
     if not limit:
         return True
     now = time.time()
-    _rpm_timestamps[model] = [
-        t for t in _rpm_timestamps[model] if t > now - 60
-    ]
+    _rpm_timestamps[model] = [t for t in _rpm_timestamps[model] if t > now - 60]
     return len(_rpm_timestamps[model]) < limit
 
 
-def _record_rpm(model):
+def _record_rpm(model: str) -> None:
     """Record a call timestamp for RPM tracking."""
     _rpm_timestamps[model].append(time.time())
+
+
+# ─────────────────────────────────────────
+# TPM TRACKING (in-memory sliding window)
+# ─────────────────────────────────────────
+
+def _prune_tpm(model: str, now: float) -> None:
+    log = _tpm_token_log[model]
+    while log and log[0][0] <= now - 60:
+        log.popleft()
+
+
+def within_tpm(model: str) -> bool:
+    """Return True if model is within TPM limit using 60s sliding window."""
+    limit = TPM_LIMITS.get(model)
+    if not limit:
+        return True
+    now = time.time()
+    _prune_tpm(model, now)
+    tokens_used = sum(t for _, t in _tpm_token_log[model])
+    return tokens_used < limit
+
+
+def tpm_wait_seconds(model: str) -> float:
+    """Return seconds to wait until TPM window has headroom. 0 if already clear."""
+    limit = TPM_LIMITS.get(model)
+    if not limit:
+        return 0.0
+    now = time.time()
+    _prune_tpm(model, now)
+    log = _tpm_token_log[model]
+    tokens_used = sum(t for _, t in log)
+    if tokens_used < limit or not log:
+        return 0.0
+    return max(0.0, 60.0 - (now - log[0][0]) + 0.1)
+
+
+def record_tpm(model: str, tokens: int) -> None:
+    """Record actual token usage for TPM sliding window."""
+    _tpm_token_log[model].append((time.time(), tokens))
 
 
 

@@ -31,13 +31,18 @@ from config import (
     H1B_DISAMBIG_GROUP,
     H1B_DISAMBIG_MAX_DELIVERIES,
     H1B_DISAMBIG_STREAM,
+    H1B_LLM_GEMINI_MODEL,
+    H1B_LLM_GEMINI_RPM,
+    H1B_LLM_GEMINI_TPM,
+    H1B_LLM_PROVIDER,
     LLM_BASE_URL,
     REDIS_DB_MAINTENANCE,
 )
 from db.connection import get_conn
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
-from workers.llm_client import call_llm as _call_llm_shared
+from workers.llm_client import call_llm as _call_llm_shared   # local/Qwen3 path — kept, used when H1B_LLM_PROVIDER=local
+from workers.rate_limiter import DualRateLimiter
 from workers.redis_client import get_redis
 
 log = get_logger(__name__)
@@ -56,10 +61,12 @@ def _is_maintenance(r) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM
+# LLM — prompts
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MATCH_PROMPT = """/think
+# Local/Qwen3 prompt — /think prefix triggers chain-of-thought reasoning in Qwen3.
+# Used when H1B_LLM_PROVIDER=local.
+_MATCH_PROMPT_LOCAL = """/think
 I need to identify which DOL Labor Condition Application employer record corresponds to
 a USCIS H-1B petition employer. Both documents are filed by the same legal entity, so
 the names must refer to the same company — though formatting may differ.
@@ -80,23 +87,111 @@ Instructions:
 Respond with ONLY a JSON object — no explanation, no markdown:
 {{"match": "<FEIN from candidates above, or null>"}}"""
 
+# Gemini prompt — same content, no /think (Qwen3-specific prefix not understood by Gemini).
+# Used when H1B_LLM_PROVIDER=gemini.
+_MATCH_PROMPT_GEMINI = """\
+I need to identify which DOL Labor Condition Application employer record corresponds to
+a USCIS H-1B petition employer. Both documents are filed by the same legal entity, so
+the names must refer to the same company — though formatting may differ.
+
+USCIS employer name: "{uscis_name}"
+USCIS normalized:    "{uscis_norm}"
+
+DOL candidates (same last-4 FEIN, ranked by name similarity):
+{candidates}
+
+Instructions:
+- Select the candidate that is the SAME legal entity as the USCIS employer.
+- Common aliases, DBA names, and abbreviations count as the same entity.
+- A subsidiary is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
+- A branch/campus is NOT the same as the national entity unless the names make it clear.
+- If NO candidate is the same legal entity, set "match" to null.
+
+Respond with ONLY a JSON object — no explanation, no markdown:
+{{"match": "<FEIN from candidates above, or null>"}}"""
+
+# Keep backward-compat alias so any external code referencing _MATCH_PROMPT still works.
+_MATCH_PROMPT = _MATCH_PROMPT_LOCAL
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM — Gemini provider (used when H1B_LLM_PROVIDER=gemini)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_gemini_model = None
+_gemini_limiter: "DualRateLimiter | None" = None
+
+
+def _get_gemini_model():
+    global _gemini_model, _gemini_limiter
+    if _gemini_model is None:
+        import google.generativeai as genai
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY not set — required when H1B_LLM_PROVIDER=gemini"
+            )
+        genai.configure(api_key=api_key)
+        _gemini_model = genai.GenerativeModel(H1B_LLM_GEMINI_MODEL)
+        _gemini_limiter = DualRateLimiter(rpm=H1B_LLM_GEMINI_RPM, tpm=H1B_LLM_GEMINI_TPM)
+        log.info("Gemini provider initialised — model=%s rpm=%d tpm=%d",
+                 H1B_LLM_GEMINI_MODEL, H1B_LLM_GEMINI_RPM, H1B_LLM_GEMINI_TPM)
+    return _gemini_model, _gemini_limiter
+
+
+def _ask_gemini(uscis_name: str, uscis_norm: str,
+                candidates: list[dict], cand_text: str) -> "str | None":
+    """Call Gemini API. Raises on API errors — caller leaves message in PEL."""
+    import google.generativeai as genai
+    model, limiter = _get_gemini_model()
+    prompt = _MATCH_PROMPT_GEMINI.format(
+        uscis_name=uscis_name,
+        uscis_norm=uscis_norm,
+        candidates=cand_text,
+    )
+    limiter.wait()
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(temperature=0),
+    )
+    tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
+    limiter.record(tokens)
+    log.debug("Gemini response tokens=%d [%s]", tokens, limiter.status())
+    return response.text.strip()
+
+
+def _ask_local(uscis_name: str, uscis_norm: str,
+               candidates: list[dict], cand_text: str) -> str:
+    """Call local llama-server (Qwen3). Raises on connection error — caller leaves in PEL."""
+    prompt = _MATCH_PROMPT_LOCAL.format(
+        uscis_name=uscis_name,
+        uscis_norm=uscis_norm,
+        candidates=cand_text,
+    )
+    return _call_llm_shared(prompt)
+
 
 def _ask_model(uscis_name: str, uscis_norm: str,
                candidates: list[dict]) -> "str | None":
     """
-    Ask LLM to pick the best-matching FEIN. Returns FEIN string or None (no match).
+    Ask configured LLM to pick the best-matching FEIN.
+    Returns FEIN string or None (no match).
     Raises on LLM connection/API errors — caller decides whether to ACK or leave in PEL.
+
+    Provider is selected via H1B_LLM_PROVIDER env var (config.py):
+      "gemini" — Google AI API (Gemma 4 31B by default).  Default.
+      "local"  — local llama-server / Qwen3-8B.
     """
     cand_text = "\n".join(
         f"  [{i+1}] FEIN={c['fein']} | {c['name']} (similarity score: {c['score']:.0f}/100)"
         for i, c in enumerate(candidates)
     )
-    prompt = _MATCH_PROMPT.format(
-        uscis_name=uscis_name,
-        uscis_norm=uscis_norm,
-        candidates=cand_text,
-    )
-    text = _call_llm_shared(prompt)  # raises on connection error
+
+    if H1B_LLM_PROVIDER == "local":
+        text = _ask_local(uscis_name, uscis_norm, candidates, cand_text)
+    else:
+        text = _ask_gemini(uscis_name, uscis_norm, candidates, cand_text)
+
     m = re.search(r"\{.*?\}", text, re.DOTALL)
     if not m:
         log.warning("Model returned no JSON for USCIS=%r — raw: %s", uscis_name, text[:200])
