@@ -1629,6 +1629,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
 
         except redis.exceptions.TimeoutError:
             logger.warning("fullscan: Redis socket timeout (system load?) — retrying")
+            if once:
+                break
             continue
         except Exception as exc:
             logger.error(

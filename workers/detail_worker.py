@@ -1342,6 +1342,8 @@ def run_worker(once: bool = False, shutdown_event=None,
 
         except redis.exceptions.TimeoutError:
             logger.warning("detail_worker: Redis socket timeout (system load?) — retrying")
+            if once:
+                break
             continue
         except Exception as exc:
             logger.error(
