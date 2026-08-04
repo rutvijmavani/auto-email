@@ -429,9 +429,11 @@ class TestAIPersonalizer(unittest.TestCase):
                 with patch("outreach.ai_full_personalizer.can_call",
                            side_effect=lambda m, **kw: m == "gemini-2.5-flash"):
                     with patch("outreach.ai_full_personalizer.increment_usage"):
-                        result = _call_model("prompt", "newkey123", "Google", "SWE")
-                        # Should have used fallback model
-                        self.assertNotEqual(result, {})
+                        with patch("outreach.ai_full_personalizer.tpm_wait_seconds", return_value=0.0):
+                            with patch("outreach.ai_full_personalizer.record_tpm"):
+                                result = _call_model("prompt", "newkey123", "Google", "SWE")
+                                # Should have used fallback model
+                                self.assertNotEqual(result, {})
 
     def test_successful_generation_saves_to_cache(self):
         from outreach.ai_full_personalizer import _call_model
@@ -445,11 +447,13 @@ class TestAIPersonalizer(unittest.TestCase):
             with patch("outreach.ai_full_personalizer._get_client", return_value=mock_client):
                 with patch("outreach.ai_full_personalizer.can_call", return_value=True):
                     with patch("outreach.ai_full_personalizer.increment_usage"):
-                        import hashlib
-                        key = hashlib.sha256("test-save-cache".encode()).hexdigest()
-                        result = _call_model("prompt", key, "Google", "SWE")
-                        cached = db_module.get_ai_cache(key)
-                        self.assertIsNotNone(cached)
+                        with patch("outreach.ai_full_personalizer.tpm_wait_seconds", return_value=0.0):
+                            with patch("outreach.ai_full_personalizer.record_tpm"):
+                                import hashlib
+                                key = hashlib.sha256("test-save-cache".encode()).hexdigest()
+                                result = _call_model("prompt", key, "Google", "SWE")
+                                cached = db_module.get_ai_cache(key)
+                                self.assertIsNotNone(cached)
 
     def test_invalid_json_response_tries_next_model(self):
         from outreach.ai_full_personalizer import _call_model
@@ -462,9 +466,11 @@ class TestAIPersonalizer(unittest.TestCase):
             with patch("outreach.ai_full_personalizer._get_client", return_value=mock_client):
                 with patch("outreach.ai_full_personalizer.can_call", return_value=True):
                     with patch("outreach.ai_full_personalizer.increment_usage"):
-                        result = _call_model("prompt", "badkey", "Google", "SWE")
-                        # Both models failed → empty dict
-                        self.assertEqual(result, {})
+                        with patch("outreach.ai_full_personalizer.tpm_wait_seconds", return_value=0.0):
+                            with patch("outreach.ai_full_personalizer.record_tpm"):
+                                result = _call_model("prompt", "badkey", "Google", "SWE")
+                                # Both models failed → empty dict
+                                self.assertEqual(result, {})
 
 
 if __name__ == "__main__":

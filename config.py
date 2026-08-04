@@ -320,10 +320,19 @@ H1B_DISAMBIG_MAX_DELIVERIES = int(os.getenv("H1B_DISAMBIG_MAX_DELIVERIES", "5"))
 H1B_DISAMBIG_DLQ_STREAM    = os.getenv("H1B_DISAMBIG_DLQ_STREAM", "llm:h1b:dlq")
 
 # LLM provider for H1B disambiguation: "gemini" (Google AI API) or "local" (llama-server/Qwen3)
+# RPM / TPM / RPD limits live in db/connection.py (shared with ai_full_personalizer)
 H1B_LLM_PROVIDER           = os.getenv("H1B_LLM_PROVIDER", "gemini")
 H1B_LLM_GEMINI_MODEL       = os.getenv("H1B_LLM_GEMINI_MODEL", "gemma-4-31b-it")
-H1B_LLM_GEMINI_RPM         = int(os.getenv("H1B_LLM_GEMINI_RPM", "30"))
-H1B_LLM_GEMINI_TPM         = int(os.getenv("H1B_LLM_GEMINI_TPM", "16000"))
+
+# LLM provider for email classification: "gemini" (Google AI API) or "local" (llama-server/Qwen3)
+# RPM / TPM / RPD limits live in db/connection.py (shared with ai_full_personalizer)
+EMAIL_LLM_PROVIDER         = os.getenv("EMAIL_LLM_PROVIDER", "gemini")
+EMAIL_LLM_GEMINI_MODEL     = os.getenv("EMAIL_LLM_GEMINI_MODEL", "gemma-4-26b-it")
+
+# LLM provider for ATS career-URL disambiguation in discover_h1b_ats.py
+# RPM / TPM / RPD limits live in db/connection.py
+DISCOVER_ATS_LLM_PROVIDER  = os.getenv("DISCOVER_ATS_LLM_PROVIDER", "gemini")
+DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b-it")
 
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING
@@ -344,6 +353,7 @@ REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintena
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume
 REDIS_CRONCHAIN_ALIVE  = "cronchain:alive"         # STRING TTL=300 — cron chain heartbeat
 REDIS_DB_MAINTENANCE   = "db:maintenance"          # STRING no-TTL — maintenance flag
+REDIS_GEMINI_LOCK      = "gemini:discover_ats:active"  # STRING TTL=8h — set while discover_h1b_ats.py runs; email_processor yields
 REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currently being full-scanned
                                                    # score = scan start Unix timestamp
                                                    # written at scan start, removed on completion/error

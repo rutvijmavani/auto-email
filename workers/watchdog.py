@@ -132,7 +132,6 @@ _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
 _UNIT_MANAGER         = "recruiter-manager"
 _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
-_UNIT_LLAMA_SERVER    = "llama-server"
 
 
 # ─────────────────────────────────────────
@@ -281,12 +280,6 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    _systemd_restart_cmd(_UNIT_H1B_LLM_WORKER),
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_H1B_LLM_WORKER} via systemd (service was inactive/failed)",
-                "foreground":  True,
-            },
-            f"systemd_{_UNIT_LLAMA_SERVER}": {
-                "cmd_args":    _systemd_restart_cmd(_UNIT_LLAMA_SERVER),
-                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
-                "description": f"Restarted {_UNIT_LLAMA_SERVER} via systemd (service was inactive/failed)",
                 "foreground":  True,
             },
             # Queue empty → rebuild.  Queue stall → restart workers (rebuild
@@ -1762,8 +1755,7 @@ def check_systemd_services() -> list:
         (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_MANAGER,       True),    # standalone daemon; healable via reset-failed + restart
-        (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker; systemd Requires=llama-server handles dep
-        (_UNIT_LLAMA_SERVER,   True),  # inference server; h1b-llm-worker and email-processor depend on it
+        (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker (Gemini API — no llama-server dependency)
     ]:
         try:
             result = subprocess.run(

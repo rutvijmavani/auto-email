@@ -47,14 +47,16 @@ DB_FILE: str = DATABASE_URL
 DAILY_LIMITS: dict = {
     "gemini-2.5-flash-lite": 20,
     "gemini-2.5-flash":      20,
-    "gemma-4-31b-it":        1500,
+    "gemma-4-31b-it":        14_400,
+    "gemma-4-26b-it":        14_400,
     "kg_api":                100_000,
 }
 
 RPM_LIMITS: dict = {
     "gemini-2.5-flash-lite": 10,
     "gemini-2.5-flash":       5,
-    "gemma-4-31b-it":        15,
+    "gemma-4-31b-it":        30,
+    "gemma-4-26b-it":        30,
     "kg_api":                600,
 }
 
@@ -62,6 +64,7 @@ TPM_LIMITS: dict = {
     "gemini-2.5-flash-lite": 250_000,
     "gemini-2.5-flash":      250_000,
     "gemma-4-31b-it":         16_000,
+    "gemma-4-26b-it":         16_000,
 }
 
 

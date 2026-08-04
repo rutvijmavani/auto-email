@@ -19,7 +19,7 @@ Usage:
     python scripts/discover_h1b_ats.py --top 20 --dry-run
     python scripts/discover_h1b_ats.py --fein 123456789
     python scripts/discover_h1b_ats.py --top 20 --force
-    python scripts/discover_h1b_ats.py --top 20 --llm   # load Qwen3 for Brave disambiguation
+    python scripts/discover_h1b_ats.py --top 20   # Gemini used automatically for Brave disambiguation
 """
 
 import argparse
@@ -40,9 +40,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import requests
 
-from config import REDIS_DB_MAINTENANCE
+from config import DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER, REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK
 from db.connection import get_conn
-from db.quota import can_call, increment_usage, within_rpm
+from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -418,8 +418,10 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Qwen3-8B — career URL disambiguation
+# Career URL disambiguation — Gemini (default) or local Qwen3-8B
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Local (Qwen3-8B via llama_cpp) ────────────────────────────────────────────
 
 _llm = None
 _STRIP_THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -447,10 +449,6 @@ def _qwen_pick_career_url(
     company_name: str,
     website_url: str | None,
 ) -> str | None:
-    """
-    Ask Qwen3-8B to pick the official career page from a short candidate list.
-    Returns the chosen URL or None if LLM unavailable / fails.
-    """
     if _llm is None or not candidates:
         return None
     numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(candidates))
@@ -472,6 +470,92 @@ def _qwen_pick_career_url(
     except Exception as e:
         log.debug("Qwen3 career URL pick failed: %s", e)
     return None
+
+
+# ── Gemini backend ─────────────────────────────────────────────────────────────
+
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai
+        api_key = os.environ.get("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY not set — required when DISCOVER_ATS_LLM_PROVIDER=gemini"
+            )
+        _gemini_client = genai.Client(api_key=api_key)
+        log.info("Gemini provider initialised — model=%s", DISCOVER_ATS_GEMINI_MODEL)
+    return _gemini_client
+
+
+def _gemini_pick_career_url(
+    candidates: list[str],
+    company_name: str,
+    website_url: str | None,
+) -> str | None:
+    if not candidates:
+        return None
+    numbered = "\n".join(f"{i+1}. {u}" for i, u in enumerate(candidates))
+    website_hint = f" (official website: {website_url})" if website_url else ""
+    prompt = (
+        f"Company: {company_name}{website_hint}\n\n"
+        f"Candidate career page URLs:\n{numbered}\n\n"
+        "Which number is the official career page for this company? "
+        "Reply with ONLY the number."
+    )
+    while not can_call(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig"):
+        if within_rpm(DISCOVER_ATS_GEMINI_MODEL):
+            # RPM is fine → daily quota exhausted; spinning won't help
+            log.debug("ats_disambig: daily quota exhausted — skipping disambiguation")
+            return None
+        log.debug("ats_disambig: RPM limit reached — sleeping 5s")
+        time.sleep(5)
+
+    estimated = len(prompt) // 4 + 50
+    wait_s = tpm_wait_seconds(DISCOVER_ATS_GEMINI_MODEL, estimated_tokens=estimated)
+    if wait_s > 0:
+        time.sleep(wait_s)
+
+    try:
+        from google.genai import types
+        response = _get_gemini_client().models.generate_content(
+            model=DISCOVER_ATS_GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0),
+        )
+        tokens = getattr(response.usage_metadata, "total_token_count", 0) or 0
+        increment_usage(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig")
+        record_tpm(DISCOVER_ATS_GEMINI_MODEL, tokens or estimated)
+        text = (response.text or "").strip()
+        m = re.search(r'\d+', text)
+        if not m:
+            log.debug("Gemini returned non-numeric response: %r", text)
+            return None
+        idx = int(m.group()) - 1
+        if 0 <= idx < len(candidates):
+            log.debug("Gemini picked candidate %d: %s", idx + 1, candidates[idx])
+            return candidates[idx]
+    except Exception as e:
+        log.debug("Gemini career URL pick failed: %s", e)
+    return None
+
+
+# ── Public interface ───────────────────────────────────────────────────────────
+
+def _pick_career_url(
+    candidates: list[str],
+    company_name: str,
+    website_url: str | None,
+) -> str | None:
+    """Pick the best career URL from candidates using the configured LLM provider."""
+    if DISCOVER_ATS_LLM_PROVIDER == "gemini":
+        return _gemini_pick_career_url(candidates, company_name, website_url)
+    # local path — lazy-load Qwen3 on first call
+    _load_llm()
+    return _qwen_pick_career_url(candidates, company_name, website_url)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -601,13 +685,13 @@ def brave_career_search(
             log.debug("Brave: single candidate → %s", candidates[0])
             return candidates[0]
 
-        # Multiple candidates — ask Qwen3 to pick
-        chosen = _qwen_pick_career_url(candidates[:3], company_name, website_url)
+        # Multiple candidates — ask LLM to pick
+        chosen = _pick_career_url(candidates[:3], company_name, website_url)
         if chosen:
             return chosen
 
-        # Qwen3 unavailable — return first plausible result
-        log.debug("Brave: Qwen3 unavailable, using first candidate: %s", candidates[0])
+        # LLM unavailable — return first plausible result
+        log.debug("Brave: LLM unavailable, using first candidate: %s", candidates[0])
         return candidates[0]
 
     except requests.exceptions.RequestException as e:
@@ -1144,157 +1228,169 @@ def main():
                         help="Print results without writing to DB")
     parser.add_argument("--force",   action="store_true",
                         help="Re-check even if recently checked")
-    parser.add_argument("--llm",        action="store_true",
-                        help="Load Qwen3-8B for Brave result disambiguation")
     parser.add_argument("--brave-pass", action="store_true",
                         help="Run Brave search only on companies already enriched by KG+probe")
     args = parser.parse_args()
-
-    if args.llm:
-        _load_llm()
 
     try:
         r = get_redis()
     except Exception:
         r = None
 
-    init_db()
-    conn = get_conn()
+    if r and not args.dry_run:
+        r.set(REDIS_GEMINI_LOCK, "1", ex=3600)
+        log.info("Gemini lock set (TTL=1h, renews per employer) — email_processor will pause during this run")
+    conn = None
+    try:
+        init_db()
+        conn = get_conn()
 
-    if args.brave_pass:
-        _run_brave_pass(conn, r, args)
-        conn.close()
-        return
+        if args.brave_pass:
+            _run_brave_pass(conn, r, args)
+            return
 
-    if args.fein:
-        row = load_by_fein(args.fein, conn)
-        if not row:
-            log.error("FEIN %s not found in dol_h1b_employers", args.fein)
-            sys.exit(1)
-        employers = [row]
-    else:
-        log.info("Loading top %d H-1B sponsors …", args.top)
-        employers = load_top_sponsors(args.top, conn)
-        log.info("Loaded %d employers", len(employers))
+        if args.fein:
+            row = load_by_fein(args.fein, conn)
+            if not row:
+                log.error("FEIN %s not found in dol_h1b_employers", args.fein)
+                sys.exit(1)
+            employers = [row]
+        else:
+            log.info("Loading top %d H-1B sponsors …", args.top)
+            employers = load_top_sponsors(args.top, conn)
+            log.info("Loaded %d employers", len(employers))
 
-    stats = {
-        "processed": 0, "skipped": 0,
-        "with_website": 0, "with_jobs_url": 0, "with_ats": 0,
-    }
+        stats = {
+            "processed": 0, "skipped": 0,
+            "with_website": 0, "with_jobs_url": 0, "with_ats": 0,
+        }
 
-    if args.fein:
-        # Single-employer: inline KG + SPARQL, no batching
-        for i, emp in enumerate(employers, 1):
-            while _is_maintenance(r):
-                log.info("Maintenance window active — pausing for 30s")
-                time.sleep(30)
-            log.info("[%d/%d]", i, len(employers))
-            result = process_employer(
-                emp, conn, dry_run=args.dry_run, force=args.force,
-                skip_brave=False,
-            )
-            _tally(stats, result, args.force)
-    else:
-        # ── Phase 1: KG API for all employers → collect kg_mids ──────────────
-        log.info("Phase 1: KG API for %d employers …", len(employers))
-        kg_map: dict[str, dict] = {}   # fein → {kg_mid, canonical_name, website_url, ...}
-        all_mids: list[str]     = []
-        seen_mids: set[str]     = set()
+        if args.fein:
+            # Single-employer: inline KG + SPARQL, no batching
+            for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
+                while _is_maintenance(r):
+                    log.info("Maintenance window active — pausing for 30s")
+                    time.sleep(30)
+                log.info("[%d/%d]", i, len(employers))
+                result = process_employer(
+                    emp, conn, dry_run=args.dry_run, force=args.force,
+                    skip_brave=False,
+                )
+                _tally(stats, result, args.force)
+        else:
+            # ── Phase 1: KG API for all employers → collect kg_mids ──────────────
+            log.info("Phase 1: KG API for %d employers …", len(employers))
+            kg_map: dict[str, dict] = {}   # fein → {kg_mid, canonical_name, website_url, ...}
+            all_mids: list[str]     = []
+            seen_mids: set[str]     = set()
 
-        for i, emp in enumerate(employers, 1):
-            fein = emp["employer_fein"]
-            name = emp["employer_name"]
+            for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
+                fein = emp["employer_fein"]
+                name = emp["employer_name"]
 
-            existing = get_discovery_row(fein, conn)
+                existing = get_discovery_row(fein, conn)
 
-            if _is_recently_checked(fein, conn, args.force, existing=existing):
-                log.info("[%d/%d] skip (recent): %s", i, len(employers), name)
-                kg_map[fein] = {"skip": True}
-                stats["skipped"] += 1
-                continue
+                if _is_recently_checked(fein, conn, args.force, existing=existing):
+                    log.info("[%d/%d] skip (recent): %s", i, len(employers), name)
+                    kg_map[fein] = {"skip": True}
+                    stats["skipped"] += 1
+                    continue
 
-            cached_mid = existing.get("kg_mid") if existing else None
+                cached_mid = existing.get("kg_mid") if existing else None
 
-            if cached_mid and not args.force:
-                log.info("[%d/%d] KG MID cached (%s): %s", i, len(employers), cached_mid, name)
-                entry = {
-                    "kg_mid":          cached_mid,
-                    "canonical_name":  existing.get("canonical_name"),
-                    "canonical_source": existing.get("canonical_source"),
-                    "website_url":     existing.get("website_url"),
-                    "wikidata_qid":    existing.get("wikidata_qid"),
-                }
-            else:
-                log.info("[%d/%d KG] %s", i, len(employers), name)
-                kg = kg_search(name)
-                if kg:
+                if cached_mid and not args.force:
+                    log.info("[%d/%d] KG MID cached (%s): %s", i, len(employers), cached_mid, name)
                     entry = {
-                        "kg_mid":          kg.get("kg_mid"),
-                        "canonical_name":  kg.get("name"),
-                        "canonical_source": "kg_api" if (kg.get("name") or kg.get("url")) else None,
-                        "website_url":     kg.get("url"),
-                        "wikidata_qid":    None,
+                        "kg_mid":          cached_mid,
+                        "canonical_name":  existing.get("canonical_name"),
+                        "canonical_source": existing.get("canonical_source"),
+                        "website_url":     existing.get("website_url"),
+                        "wikidata_qid":    existing.get("wikidata_qid"),
                     }
                 else:
-                    stripped = strip_legal_suffixes(name)
-                    entry = {
-                        "kg_mid":          None,
-                        "canonical_name":  stripped or None,
-                        "canonical_source": "regex" if stripped else None,
-                        "website_url":     None,
-                        "wikidata_qid":    None,
-                    }
+                    log.info("[%d/%d KG] %s", i, len(employers), name)
+                    kg = kg_search(name)
+                    if kg:
+                        entry = {
+                            "kg_mid":          kg.get("kg_mid"),
+                            "canonical_name":  kg.get("name"),
+                            "canonical_source": "kg_api" if (kg.get("name") or kg.get("url")) else None,
+                            "website_url":     kg.get("url"),
+                            "wikidata_qid":    None,
+                        }
+                    else:
+                        stripped = strip_legal_suffixes(name)
+                        entry = {
+                            "kg_mid":          None,
+                            "canonical_name":  stripped or None,
+                            "canonical_source": "regex" if stripped else None,
+                            "website_url":     None,
+                            "wikidata_qid":    None,
+                        }
 
-            kg_map[fein] = entry
-            mid = entry.get("kg_mid")
-            if mid and mid not in seen_mids:
-                seen_mids.add(mid)
-                all_mids.append(mid)
+                kg_map[fein] = entry
+                mid = entry.get("kg_mid")
+                if mid and mid not in seen_mids:
+                    seen_mids.add(mid)
+                    all_mids.append(mid)
 
-        # ── Phase 2: SPARQL P646+P10311 batch for all MIDs ───────────────────
-        log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
-        sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
+            # ── Phase 2: SPARQL P646+P10311 batch for all MIDs ───────────────────
+            log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
+            sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
 
-        for entry in kg_map.values():
-            if entry.get("skip"):
-                continue
-            mid = entry.get("kg_mid")
-            if mid:
-                sp = sparql_map.get(mid, {})
-                entry["wikidata_qid"]    = sp.get("qid")
-                entry["jobs_url"]        = sp.get("jobs_url")
-                if not entry.get("website_url"):
-                    entry["website_url"] = sp.get("website") or None
-            else:
-                entry["jobs_url"] = None
+            for entry in kg_map.values():
+                if entry.get("skip"):
+                    continue
+                mid = entry.get("kg_mid")
+                if mid:
+                    sp = sparql_map.get(mid, {})
+                    entry["wikidata_qid"]    = sp.get("qid")
+                    entry["jobs_url"]        = sp.get("jobs_url")
+                    if not entry.get("website_url"):
+                        entry["website_url"] = sp.get("website") or None
+                else:
+                    entry["jobs_url"] = None
 
-        # ── Phase 3: career probe + upsert ───────────────────────────────────
-        log.info("Phase 3: career probe for %d employers …", len(employers))
-        for i, emp in enumerate(employers, 1):
-            fein  = emp["employer_fein"]
-            entry = kg_map.get(fein, {})
-            if entry.get("skip"):
-                continue
-            while _is_maintenance(r):
-                log.info("Maintenance window active — pausing for 30s")
-                time.sleep(30)
-            log.info("[%d/%d career] %s  %s", i, len(employers), fein, emp["employer_name"])
-            result = process_employer(
-                emp, conn,
-                dry_run=args.dry_run,
-                force=args.force,
-                prefetched=entry,
-            )
-            _tally(stats, result, args.force)
-            time.sleep(0.2)
+            # ── Phase 3: career probe + upsert ───────────────────────────────────
+            log.info("Phase 3: career probe for %d employers …", len(employers))
+            for i, emp in enumerate(employers, 1):
+                if r and not args.dry_run:
+                    r.expire(REDIS_GEMINI_LOCK, 3600)
+                fein  = emp["employer_fein"]
+                entry = kg_map.get(fein, {})
+                if entry.get("skip"):
+                    continue
+                while _is_maintenance(r):
+                    log.info("Maintenance window active — pausing for 30s")
+                    time.sleep(30)
+                log.info("[%d/%d career] %s  %s", i, len(employers), fein, emp["employer_name"])
+                result = process_employer(
+                    emp, conn,
+                    dry_run=args.dry_run,
+                    force=args.force,
+                    prefetched=entry,
+                )
+                _tally(stats, result, args.force)
+                time.sleep(0.2)
 
-    conn.close()
-
-    log.info(
-        "Done. processed=%d skipped=%d with_website=%d with_jobs_url=%d with_ats=%d",
-        stats["processed"], stats["skipped"],
-        stats["with_website"], stats["with_jobs_url"], stats["with_ats"],
-    )
+        log.info(
+            "Done. processed=%d skipped=%d with_website=%d with_jobs_url=%d with_ats=%d",
+            stats["processed"], stats["skipped"],
+            stats["with_website"], stats["with_jobs_url"], stats["with_ats"],
+        )
+    finally:
+        if conn:
+            conn.close()
+        if r and not args.dry_run:
+            try:
+                r.delete(REDIS_GEMINI_LOCK)
+                log.info("Gemini lock cleared — email_processor resuming")
+            except Exception as exc:
+                log.warning("Failed to clear Gemini lock: %s", exc)
 
 
 if __name__ == "__main__":
