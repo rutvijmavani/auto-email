@@ -118,7 +118,7 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
         strategy = "legacy"
     else:
         print(f"  Strategy: {strategy}")
-        print(f"  Cookies after warm: {[c.name for c in session.cookies]}")
+        print(f"  Cookies after warm: {list(session.cookies.keys())}")
 
     # ── Step 3: Fetch jobs page with warmed session ───────────────────────────
     print(f"\n[3/4] Fetching {jobs_url}...")
