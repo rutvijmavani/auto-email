@@ -117,7 +117,21 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False, warm_url: str
         strategy = "legacy"
     else:
         print(f"  Strategy: {strategy}")
+        all_cf = [c for c in session.cookies if c.name == "cf_clearance"]
         print(f"  Cookies after warm: {list(session.cookies.keys())}")
+        for i, c in enumerate(all_cf):
+            print(f"  cf_clearance[{i}]: domain={c.domain} path={c.path} value={c.value[:60]}...")
+
+    # If two cf_clearance cookies exist, keep only the newest (last set by server)
+    all_cf = [c for c in session.cookies if c.name == "cf_clearance"]
+    if len(all_cf) >= 2 and all_cf[0].value != all_cf[-1].value:
+        print(f"\n  Two DIFFERENT cf_clearance values — dropping old, keeping fresh one")
+        old_val = all_cf[0].value
+        for c in list(session.cookies):
+            if c.name == "cf_clearance" and c.value == old_val:
+                session.cookies.clear(c.domain, c.path, c.name)
+    elif len(all_cf) >= 2:
+        print(f"\n  Two cf_clearance values but SAME — warm-up did not issue a new token")
 
     # ── Step 3: Fetch jobs page with warmed session ───────────────────────────
     print(f"\n[3/4] Fetching {jobs_url}...")
