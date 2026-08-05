@@ -23,8 +23,22 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+try:
+    from curl_cffi.requests import Session as _Session
+    _IMPERSONATE = "chrome146"
+    _USE_CURL_CFFI = True
+except ImportError:
+    from requests import Session as _Session
+    _IMPERSONATE = None
+    _USE_CURL_CFFI = False
 
 GLASSDOOR_BASE = "https://www.glassdoor.com"
+
+
+def _make_session():
+    if _USE_CURL_CFFI:
+        return _Session(impersonate=_IMPERSONATE)
+    return _Session()
 
 
 def _jobs_page_url(employer_id: str) -> str:
@@ -74,49 +88,36 @@ def _extract_apply_url(html_text: str) -> tuple[str | None, bool | None]:
 
 def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
     from jobs.curl_parser import curl_to_slug_info
-    from jobs.ats.custom_career import _warm_session, _build_legacy_session
 
     # ── Step 1: Parse curl ────────────────────────────────────────────────────
     print(f"\n[1/4] Parsing curl...")
     slug_info = curl_to_slug_info(curl_string, career_page_url=GLASSDOOR_BASE)
     print(f"  Original URL : {slug_info['url']}")
-    print(f"  Career page  : {slug_info.get('career_page_url')}")
+    print(f"  curl_cffi    : {'yes (Chrome impersonation)' if _USE_CURL_CFFI else 'NO — pip install curl_cffi'}")
     print(f"  Headers      : {len(slug_info.get('headers', {}))} headers")
 
-    # Override URL to target company jobs page
     jobs_url = _jobs_page_url(employer_id)
-    slug_info["url"] = jobs_url
-    slug_info["method"] = "GET"
-    slug_info["params"] = None
-    slug_info["body"] = None
     print(f"  Target URL   : {jobs_url}")
 
     if dry_run:
         print("\n[DRY RUN] Stopping before network requests.")
         return
 
-    # ── Step 2: Warm session ──────────────────────────────────────────────────
+    # ── Step 2: Warm session on glassdoor.com ─────────────────────────────────
     print(f"\n[2/4] Warming session on {GLASSDOOR_BASE}...")
-    try:
-        session, strategy = _warm_session(slug_info, "glassdoor")
-    except Exception as e:
-        print(f"  Warm failed ({e}) — using legacy session")
-        session = None
-
-    if session is None:
-        print("  Falling back to legacy session (stored cookies)")
-        session = _build_legacy_session(slug_info)
-        strategy = "legacy"
-    else:
-        print(f"  Strategy: {strategy}")
-
-    # ── Step 3: Fetch jobs page ───────────────────────────────────────────────
-    print(f"\n[3/4] Fetching {jobs_url}...")
+    session = _make_session()
     raw_headers = slug_info.get("headers", {})
     skip = {"cookie", "content-length", "host", "connection",
             "transfer-encoding", "accept-encoding"}
     extra = {k: v for k, v in raw_headers.items() if k.lower() not in skip}
+    try:
+        warm_resp = session.get(GLASSDOOR_BASE, headers=extra, timeout=20, allow_redirects=True)
+        print(f"  Warm-up HTTP {warm_resp.status_code}  ({len(warm_resp.content):,} bytes)")
+    except Exception as e:
+        print(f"  Warm-up failed: {e} — continuing anyway")
 
+    # ── Step 3: Fetch jobs page ───────────────────────────────────────────────
+    print(f"\n[3/4] Fetching {jobs_url}...")
     try:
         resp = session.get(jobs_url, headers=extra, timeout=30, allow_redirects=True)
         print(f"  HTTP {resp.status_code}  ({len(resp.content):,} bytes)")
@@ -125,8 +126,7 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
         return
 
     if resp.status_code != 200:
-        print(f"  [ERROR] Non-200 response — cookies may be expired")
-        print(f"  Re-capture a fresh Glassdoor curl and retry.")
+        print(f"  [ERROR] Non-200 response (status={resp.status_code})")
         return
 
     # ── Step 4: Parse __next_f for applyUrl ──────────────────────────────────
@@ -162,13 +162,21 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
 
 def main():
     ap = argparse.ArgumentParser(description="POC: Glassdoor → ATS apply URL")
-    ap.add_argument("--curl", required=True, help="Raw curl command from DevTools")
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--curl", help="Raw curl command from DevTools (inline)")
+    group.add_argument("--curl-file", help="Path to file containing raw curl command")
     ap.add_argument("--employer-id", required=True, help="Glassdoor employer ID (e.g. 13461)")
     ap.add_argument("--dry-run", action="store_true", help="Parse only, no network requests")
     args = ap.parse_args()
 
+    if args.curl_file:
+        with open(args.curl_file, "r", encoding="utf-8") as f:
+            curl_string = f.read()
+    else:
+        curl_string = args.curl
+
     run(
-        curl_string=args.curl,
+        curl_string=curl_string,
         employer_id=args.employer_id,
         dry_run=args.dry_run,
     )
