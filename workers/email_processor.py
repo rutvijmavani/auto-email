@@ -662,8 +662,8 @@ def run_worker(once: bool = False) -> None:
         raise RuntimeError(
             f"EMAIL_LLM_PROVIDER must be 'gemini' or 'local', got {EMAIL_LLM_PROVIDER!r}"
         )
-    if EMAIL_LLM_PROVIDER == "gemini" and not os.environ.get("GOOGLE_API_KEY"):
-        raise RuntimeError("GOOGLE_API_KEY not set — required when EMAIL_LLM_PROVIDER=gemini")
+    if EMAIL_LLM_PROVIDER == "gemini" and not (os.environ.get("GEMINI_API_KEY_USER_1") or os.environ.get("GOOGLE_API_KEY")):
+        raise RuntimeError("GEMINI_API_KEY_USER_1 (or GOOGLE_API_KEY) not set — required when EMAIL_LLM_PROVIDER=gemini")
     if EMAIL_LLM_PROVIDER == "local" and not LLM_BASE_URL:
         logger.error(
             "LLM_BASE_URL is not set — start llama-server and set LLM_BASE_URL in .env "
