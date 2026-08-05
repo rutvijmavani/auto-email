@@ -89,35 +89,43 @@ def _extract_apply_url(html_text: str) -> tuple[str | None, bool | None]:
 def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
     from jobs.curl_parser import curl_to_slug_info
 
-    # ── Step 1: Parse curl ────────────────────────────────────────────────────
+    # ── Step 1: Parse curl — warm directly on the jobs listing page ──────────
     print(f"\n[1/4] Parsing curl...")
-    slug_info = curl_to_slug_info(curl_string, career_page_url=GLASSDOOR_BASE)
-    print(f"  Original URL : {slug_info['url']}")
-    print(f"  curl_cffi    : {'yes (Chrome impersonation)' if _USE_CURL_CFFI else 'NO — pip install curl_cffi'}")
-    print(f"  Headers      : {len(slug_info.get('headers', {}))} headers")
-
     jobs_url = _jobs_page_url(employer_id)
-    print(f"  Target URL   : {jobs_url}")
+    # career_page_url = jobs listing page itself (not homepage)
+    # _warm_session will visit it, pick up CF cookies from that response,
+    # then we replay the same URL with those fresh cookies.
+    slug_info = curl_to_slug_info(curl_string, career_page_url=jobs_url)
+    print(f"  Warm target  : {jobs_url}")
+    print(f"  cf_clearance : {'present' if 'cf_clearance' in slug_info.get('_fallback_cookies', {}) else 'MISSING'}")
+    print(f"  Headers      : {len(slug_info.get('headers', {}))} headers")
 
     if dry_run:
         print("\n[DRY RUN] Stopping before network requests.")
         return
 
-    # ── Step 2: Warm session on glassdoor.com ─────────────────────────────────
-    print(f"\n[2/4] Warming session on {GLASSDOOR_BASE}...")
-    session = _make_session()
+    # ── Step 2: Warm session on the jobs listing page directly ────────────────
+    print(f"\n[2/4] Warming session on {jobs_url}...")
+    from jobs.ats.custom_career import _warm_session, _build_legacy_session
+    slug_info["url"] = jobs_url
+    slug_info["method"] = "GET"
+    slug_info["params"] = None
+    slug_info["body"] = None
+    session, strategy = _warm_session(slug_info, "glassdoor")
+    if session is None:
+        print("  Warm returned None (5xx) — falling back to legacy session")
+        session = _build_legacy_session(slug_info)
+        strategy = "legacy"
+    else:
+        print(f"  Strategy: {strategy}")
+        print(f"  Cookies after warm: {[c.name for c in session.cookies]}")
+
+    # ── Step 3: Fetch jobs page with warmed session ───────────────────────────
+    print(f"\n[3/4] Fetching {jobs_url}...")
     raw_headers = slug_info.get("headers", {})
     skip = {"cookie", "content-length", "host", "connection",
             "transfer-encoding", "accept-encoding"}
     extra = {k: v for k, v in raw_headers.items() if k.lower() not in skip}
-    try:
-        warm_resp = session.get(GLASSDOOR_BASE, headers=extra, timeout=20, allow_redirects=True)
-        print(f"  Warm-up HTTP {warm_resp.status_code}  ({len(warm_resp.content):,} bytes)")
-    except Exception as e:
-        print(f"  Warm-up failed: {e} — continuing anyway")
-
-    # ── Step 3: Fetch jobs page ───────────────────────────────────────────────
-    print(f"\n[3/4] Fetching {jobs_url}...")
     try:
         resp = session.get(jobs_url, headers=extra, timeout=30, allow_redirects=True)
         print(f"  HTTP {resp.status_code}  ({len(resp.content):,} bytes)")
@@ -126,7 +134,7 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
         return
 
     if resp.status_code != 200:
-        print(f"  [ERROR] Non-200 response (status={resp.status_code})")
+        print(f"  [BLOCKED] {resp.status_code} — CF is hard-blocking this IP/path")
         return
 
     # ── Step 4: Parse __next_f for applyUrl ──────────────────────────────────
