@@ -1527,6 +1527,14 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS brave_checked_at TIMESTAMPTZ
     """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS glassdoor_id TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS crunchbase_id TEXT
+    """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)

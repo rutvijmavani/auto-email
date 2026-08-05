@@ -745,6 +745,18 @@ else:
             wd_search = f"https://www.wikidata.org/w/index.php?search={quote_plus(canonical)}"
             wd_cols[2].markdown(f"**Wikidata**\n\n[Search on Wikidata ↗]({wd_search})")
 
+    # ── Glassdoor + Crunchbase links ─────────────────────────────────────────
+    glassdoor_id  = disc.get("glassdoor_id")
+    crunchbase_id = disc.get("crunchbase_id")
+    if glassdoor_id or crunchbase_id:
+        ext_cols = st.columns(2)
+        if glassdoor_id:
+            gd_url = f"https://www.glassdoor.com/Overview/Working-at-EI_IE{glassdoor_id}.htm"
+            ext_cols[0].markdown(f"**Glassdoor**\n\n[View on Glassdoor ↗]({gd_url})")
+        if crunchbase_id:
+            cb_url = f"https://www.crunchbase.com/organization/{crunchbase_id}"
+            ext_cols[1].markdown(f"**Crunchbase**\n\n[View on Crunchbase ↗]({cb_url})")
+
     # ── ATS badge ────────────────────────────────────────────────────────────
     platform = disc.get("detected_platform")
     slug     = disc.get("detected_slug")
