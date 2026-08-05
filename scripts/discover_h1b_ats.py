@@ -481,10 +481,10 @@ def _get_gemini_client():
     global _gemini_client
     if _gemini_client is None:
         from google import genai
-        api_key = os.environ.get("GOOGLE_API_KEY")
+        api_key = os.environ.get("GEMINI_API_KEY_USER_1") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "GOOGLE_API_KEY not set — required when DISCOVER_ATS_LLM_PROVIDER=gemini"
+                "GEMINI_API_KEY_USER_1 (or GOOGLE_API_KEY) not set — required when DISCOVER_ATS_LLM_PROVIDER=gemini"
             )
         _gemini_client = genai.Client(api_key=api_key)
         log.info("Gemini provider initialised — model=%s", DISCOVER_ATS_GEMINI_MODEL)
