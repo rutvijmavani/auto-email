@@ -86,17 +86,16 @@ def _extract_apply_url(html_text: str) -> tuple[str | None, bool | None]:
     return None, None
 
 
-def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
+def run(curl_string: str, employer_id: str, dry_run: bool = False, warm_url: str = None) -> None:
     from jobs.curl_parser import curl_to_slug_info
 
-    # ── Step 1: Parse curl — warm directly on the jobs listing page ──────────
+    # ── Step 1: Parse curl ────────────────────────────────────────────────────
     print(f"\n[1/4] Parsing curl...")
     jobs_url = _jobs_page_url(employer_id)
-    # career_page_url = jobs listing page itself (not homepage)
-    # _warm_session will visit it, pick up CF cookies from that response,
-    # then we replay the same URL with those fresh cookies.
-    slug_info = curl_to_slug_info(curl_string, career_page_url=jobs_url)
-    print(f"  Warm target  : {jobs_url}")
+    warm_url = warm_url or jobs_url
+    slug_info = curl_to_slug_info(curl_string, career_page_url=warm_url)
+    print(f"  Warm target  : {warm_url}")
+    print(f"  Jobs URL     : {jobs_url}")
     print(f"  cf_clearance : {'present' if 'cf_clearance' in slug_info.get('_fallback_cookies', {}) else 'MISSING'}")
     print(f"  Headers      : {len(slug_info.get('headers', {}))} headers")
 
@@ -105,7 +104,7 @@ def run(curl_string: str, employer_id: str, dry_run: bool = False) -> None:
         return
 
     # ── Step 2: Warm session on the jobs listing page directly ────────────────
-    print(f"\n[2/4] Warming session on {jobs_url}...")
+    print(f"\n[2/4] Warming session on {warm_url}...")
     from jobs.ats.custom_career import _warm_session, _build_legacy_session
     slug_info["url"] = jobs_url
     slug_info["method"] = "GET"
@@ -175,6 +174,7 @@ def main():
     group.add_argument("--curl-file", help="Path to file containing raw curl command")
     ap.add_argument("--employer-id", required=True, help="Glassdoor employer ID (e.g. 13461)")
     ap.add_argument("--dry-run", action="store_true", help="Parse only, no network requests")
+    ap.add_argument("--warm-url", help="URL to warm session on (default: jobs listing page)")
     args = ap.parse_args()
 
     if args.curl_file:
@@ -187,6 +187,7 @@ def main():
         curl_string=curl_string,
         employer_id=args.employer_id,
         dry_run=args.dry_run,
+        warm_url=args.warm_url,
     )
 
 
