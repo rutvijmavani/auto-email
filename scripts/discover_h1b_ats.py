@@ -356,11 +356,13 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
 
     values = " ".join(f'("{m}")' for m in mids)
     sparql = (
-        "SELECT ?mid ?item ?jobs_url ?website WHERE { "
+        "SELECT ?mid ?item ?jobs_url ?website ?glassdoor_id ?crunchbase_id WHERE { "
         f"VALUES (?mid) {{ {values} }} "
         "?item wdt:P646 ?mid . "
         "OPTIONAL { ?item wdt:P10311 ?jobs_url } "
         "OPTIONAL { ?item wdt:P856 ?website } "
+        "OPTIONAL { ?item wdt:P2267 ?glassdoor_id } "
+        "OPTIONAL { ?item wdt:P2088 ?crunchbase_id } "
         "}"
     )
     headers = {**_API_HEADERS, "Accept": "application/sparql-results+json"}
@@ -384,15 +386,17 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
         bindings = r.json()["results"]["bindings"]
     except (requests.exceptions.RequestException, ValueError, KeyError) as e:
         log.debug("SPARQL P646+P10311+P856 batch error: %s", e)
-        return {m: {"qid": None, "jobs_url": None, "website": None} for m in mids}
+        return {m: {"qid": None, "jobs_url": None, "website": None, "glassdoor_id": None, "crunchbase_id": None} for m in mids}
 
-    out: dict[str, dict] = {m: {"qid": None, "jobs_url": None, "website": None} for m in mids}
+    out: dict[str, dict] = {m: {"qid": None, "jobs_url": None, "website": None, "glassdoor_id": None, "crunchbase_id": None} for m in mids}
     for row in bindings:
-        mid      = row.get("mid", {}).get("value")
-        item_uri = row.get("item", {}).get("value", "")
-        qid      = item_uri.split("/")[-1] if item_uri else None
-        jobs_url = row.get("jobs_url", {}).get("value") or None
-        website  = row.get("website", {}).get("value") or None
+        mid           = row.get("mid", {}).get("value")
+        item_uri      = row.get("item", {}).get("value", "")
+        qid           = item_uri.split("/")[-1] if item_uri else None
+        jobs_url      = row.get("jobs_url", {}).get("value") or None
+        website       = row.get("website", {}).get("value") or None
+        glassdoor_id  = row.get("glassdoor_id", {}).get("value") or None
+        crunchbase_id = row.get("crunchbase_id", {}).get("value") or None
         if mid and mid in out:
             if qid:
                 out[mid]["qid"] = qid
@@ -400,6 +404,10 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
                 out[mid]["jobs_url"] = jobs_url
             if website and _is_public_url(website):
                 out[mid]["website"] = website
+            if glassdoor_id:
+                out[mid]["glassdoor_id"] = glassdoor_id
+            if crunchbase_id:
+                out[mid]["crunchbase_id"] = crunchbase_id
 
     return out
 
@@ -917,19 +925,22 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         INSERT INTO h1b_ats_discovery
             (employer_fein, employer_name, canonical_name, canonical_source,
              wikidata_qid, kg_mid, website_url, jobs_url,
-             careers_url, detected_platform, detected_slug, last_checked)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+             careers_url, detected_platform, detected_slug,
+             glassdoor_id, crunchbase_id, last_checked)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (employer_fein) DO UPDATE SET
             employer_name     = EXCLUDED.employer_name,
             canonical_name    = EXCLUDED.canonical_name,
             canonical_source  = EXCLUDED.canonical_source,
-            wikidata_qid      = COALESCE(EXCLUDED.wikidata_qid,  h1b_ats_discovery.wikidata_qid),
-            kg_mid            = COALESCE(EXCLUDED.kg_mid,         h1b_ats_discovery.kg_mid),
-            website_url       = COALESCE(EXCLUDED.website_url,    h1b_ats_discovery.website_url),
-            jobs_url          = COALESCE(EXCLUDED.jobs_url,       h1b_ats_discovery.jobs_url),
-            careers_url       = COALESCE(EXCLUDED.careers_url,    h1b_ats_discovery.careers_url),
+            wikidata_qid      = COALESCE(EXCLUDED.wikidata_qid,    h1b_ats_discovery.wikidata_qid),
+            kg_mid            = COALESCE(EXCLUDED.kg_mid,           h1b_ats_discovery.kg_mid),
+            website_url       = COALESCE(EXCLUDED.website_url,      h1b_ats_discovery.website_url),
+            jobs_url          = COALESCE(EXCLUDED.jobs_url,         h1b_ats_discovery.jobs_url),
+            careers_url       = COALESCE(EXCLUDED.careers_url,      h1b_ats_discovery.careers_url),
             detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
-            detected_slug     = COALESCE(EXCLUDED.detected_slug,     h1b_ats_discovery.detected_slug),
+            detected_slug     = COALESCE(EXCLUDED.detected_slug,    h1b_ats_discovery.detected_slug),
+            glassdoor_id      = COALESCE(EXCLUDED.glassdoor_id,     h1b_ats_discovery.glassdoor_id),
+            crunchbase_id     = COALESCE(EXCLUDED.crunchbase_id,    h1b_ats_discovery.crunchbase_id),
             last_checked      = NOW()
     """, (
         data["employer_fein"],
@@ -943,6 +954,8 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data.get("careers_url"),
         data.get("detected_platform"),
         data.get("detected_slug"),
+        data.get("glassdoor_id"),
+        data.get("crunchbase_id"),
     ))
     conn.commit()
 
@@ -1001,11 +1014,15 @@ def process_employer(
         kg_mid           = prefetched.get("kg_mid")
         wikidata_qid     = prefetched.get("wikidata_qid")
         jobs_url         = prefetched.get("jobs_url")
+        glassdoor_id     = prefetched.get("glassdoor_id")
+        crunchbase_id    = prefetched.get("crunchbase_id")
     else:
         # Single-employer mode: inline KG + SPARQL calls
         kg_mid           = None
         wikidata_qid     = None
         jobs_url         = None
+        glassdoor_id     = None
+        crunchbase_id    = None
 
         existing_row = get_discovery_row(fein, conn)
         cached_mid   = existing_row.get("kg_mid") if existing_row else None
@@ -1033,8 +1050,10 @@ def process_employer(
             log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
             sparql_res   = _sparql_batch_p10311([kg_mid])
             entry        = sparql_res.get(kg_mid, {})
-            wikidata_qid = entry.get("qid")
-            jobs_url     = entry.get("jobs_url")
+            wikidata_qid  = entry.get("qid")
+            jobs_url      = entry.get("jobs_url")
+            glassdoor_id  = entry.get("glassdoor_id")
+            crunchbase_id = entry.get("crunchbase_id")
             if website_url is None:
                 website_url = entry.get("website") or None
 
@@ -1102,6 +1121,8 @@ def process_employer(
         "careers_url":      careers_url,
         "detected_platform": detected_platform,
         "detected_slug":    detected_slug,
+        "glassdoor_id":     glassdoor_id,
+        "crunchbase_id":    crunchbase_id,
     }
 
     upsert_discovery(result, conn, dry_run=dry_run)
@@ -1350,6 +1371,8 @@ def main():
                     sp = sparql_map.get(mid, {})
                     entry["wikidata_qid"]    = sp.get("qid")
                     entry["jobs_url"]        = sp.get("jobs_url")
+                    entry["glassdoor_id"]    = sp.get("glassdoor_id")
+                    entry["crunchbase_id"]   = sp.get("crunchbase_id")
                     if not entry.get("website_url"):
                         entry["website_url"] = sp.get("website") or None
                 else:
