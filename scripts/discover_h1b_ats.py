@@ -14,12 +14,16 @@ For each top H-1B sponsor this script:
      careers|jobs keyword) → Qwen3-8B picks best when multiple survive.
   5. Fetches career page HTML → fingerprints embedded ATS.
 
-Usage:
-    python scripts/discover_h1b_ats.py --top 20
+Two-pass architecture (Brave quota = 950/month):
+  Pass 1 — KG + SPARQL + probe, no Brave (run freely, KG is 100k/day):
+    python scripts/discover_h1b_ats.py --top 900
+  Pass 2 — Brave only, for companies Pass 1 couldn't resolve:
+    python scripts/discover_h1b_ats.py --brave-pass --top 950
+
+Other usage:
     python scripts/discover_h1b_ats.py --top 20 --dry-run
-    python scripts/discover_h1b_ats.py --fein 123456789
-    python scripts/discover_h1b_ats.py --top 20 --force
-    python scripts/discover_h1b_ats.py --top 20   # Gemini used automatically for Brave disambiguation
+    python scripts/discover_h1b_ats.py --fein 123456789   # single company by FEIN (includes Brave)
+    python scripts/discover_h1b_ats.py --top 20 --force   # re-process already-checked companies
 """
 
 import argparse
@@ -35,6 +39,8 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
+
+from rapidfuzz.fuzz import token_set_ratio
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -328,6 +334,14 @@ def kg_search(legal_name: str) -> dict | None:
             return last_result
 
     if last_result:
+        result_name = last_result.get("name") or ""
+        if result_name and token_set_ratio(base_query, result_name) < 70:
+            log.debug(
+                "KG: retries exhausted — %r too dissimilar from %r (score=%d), returning None",
+                result_name, base_query,
+                token_set_ratio(base_query, result_name),
+            )
+            return None
         log.debug(
             "KG: retries exhausted for %r — using best result: name=%r mid=%r",
             legal_name, last_result.get("name"), last_result.get("kg_mid"),
@@ -770,6 +784,51 @@ def _is_auth_redirect(final_url: str) -> bool:
     return bool(_AUTH_RE.search(path_query))
 
 
+_CDN_DOMAINS = frozenset({
+    "cloudfront.net", "fastly.net", "akamai.net", "akamaized.net",
+    "edgecastcdn.net", "stackpathcdn.com", "azureedge.net",
+    "amazonaws.com", "azurewebsites.net", "firebaseapp.com",
+})
+
+
+def _resolve_website_redirect(url: str) -> str:
+    """
+    Fetch the company root URL and follow redirects to detect rebrands/domain changes.
+
+    Cases:
+      - Redirect fails / times out         → return original unchanged
+      - Redirect → CDN or generic host     → return original (don't trust it)
+      - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
+      - Redirect → different root domain   → return resolved (genuine rebrand)
+    """
+    try:
+        parsed   = urlparse(url)
+        root_url = f"{parsed.scheme}://{parsed.netloc}/"
+        r = requests.get(root_url, timeout=8, allow_redirects=True,
+                         headers=_API_HEADERS)
+        final_url = r.url.rstrip("/")
+    except Exception as exc:
+        log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
+        return url
+
+    final_root = _root_domain(final_url)
+    orig_root  = _root_domain(url)
+
+    if not final_root or final_root in _CDN_DOMAINS:
+        log.debug("_resolve_website_redirect: CDN/generic redirect (%s) — keeping original", final_root)
+        return url
+
+    final_parsed = urlparse(final_url)
+    resolved_base = f"{final_parsed.scheme}://{final_parsed.netloc}"
+
+    if final_root == orig_root:
+        log.debug("_resolve_website_redirect: same root domain (%s→%s), using resolved base", url, resolved_base)
+    else:
+        log.info("_resolve_website_redirect: domain changed %s → %s", orig_root, final_root)
+
+    return resolved_base
+
+
 def discover_careers_url(
     website_url: str,
 ) -> tuple[str | None, str | None, str | None]:
@@ -817,13 +876,6 @@ def discover_careers_url(
             continue
 
         final_root = _root_domain(final_url)
-
-        # Reject unrelated domain (not company domain and not a known ATS)
-        if final_root != company_root and final_root not in _KNOWN_ATS_DOMAINS:
-            log.debug(
-                "  %s → unrelated domain (%s), skipping", url, final_root
-            )
-            continue
 
         # If redirect landed directly on an ATS domain, try URL-level match first
         if final_root in _KNOWN_ATS_DOMAINS:
@@ -1077,6 +1129,7 @@ def process_employer(
             detected_slug     = _hit.get("slug")
     elif website_url:
         # Phase 3: 19-pattern probe
+        website_url = _resolve_website_redirect(website_url)
         log.info("  Probing 19 career URL patterns on %s …", website_url)
         try:
             careers_url, detected_platform, detected_slug = discover_careers_url(
