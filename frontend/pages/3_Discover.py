@@ -229,7 +229,7 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     )
 
     # Phase 1: KG API → canonical name + website + Freebase MID
-    kg             = kg_search(emp_name)
+    kg, _all_candidates = kg_search(emp_name)
     kg_mid         = None
     canonical_name = None
     website_url    = None
@@ -903,3 +903,117 @@ else:
             except Exception as exc:
                 log.exception("Re-run discovery failed for %r", name)
                 st.error(f"Error: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KG Quality Events panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.divider()
+
+
+@st.cache_data(ttl=60)
+def _load_quality_events() -> pd.DataFrame:
+    return _query(
+        """
+        SELECT fein, legal_name, event_type, kg_score,
+               selected_name, selected_kg_mid, all_candidates, resolved, created_at
+        FROM   h1b_ats_quality_events
+        ORDER  BY resolved ASC, created_at DESC
+        """
+    )
+
+
+def _resolve_quality_event(fein: str, careers_url: str | None, selected_kg_mid: str | None) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE h1b_ats_quality_events
+               SET resolved     = TRUE,
+                   resolved_url = :url,
+                   resolved_at  = NOW()
+             WHERE fein = :fein
+            """,
+            {"fein": fein, "url": careers_url},
+        )
+        if careers_url and selected_kg_mid:
+            # Backfill the resolved URL into h1b_ats_discovery if the row exists
+            conn.execute(
+                """
+                UPDATE h1b_ats_discovery
+                   SET careers_url  = :url,
+                       last_checked = NOW()
+                 WHERE employer_fein = :fein
+                   AND (careers_url IS NULL OR careers_url != :url)
+                """,
+                {"fein": fein, "url": careers_url},
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+unresolved_count = 0
+try:
+    qe_df = _load_quality_events()
+    unresolved_count = int((~qe_df["resolved"]).sum()) if not qe_df.empty else 0
+except Exception:
+    qe_df = pd.DataFrame()
+
+label = f"KG Quality Review ({unresolved_count} pending)" if unresolved_count else "KG Quality Review"
+with st.expander(label, expanded=unresolved_count > 0):
+    if qe_df.empty:
+        st.info("No quality events — all KG resolutions are high-confidence.")
+    else:
+        tab_pending, tab_resolved = st.tabs(["Pending", "Resolved"])
+
+        pending = qe_df[~qe_df["resolved"]]
+        resolved = qe_df[qe_df["resolved"]]
+
+        with tab_pending:
+            if pending.empty:
+                st.success("Nothing to review.")
+            else:
+                for _, row in pending.iterrows():
+                    ev_fein    = row["fein"]
+                    ev_name    = row["legal_name"]
+                    ev_type    = row["event_type"]
+                    ev_score   = row["kg_score"]
+                    ev_sel     = row["selected_name"]
+                    ev_mid     = row["selected_kg_mid"]
+                    try:
+                        candidates = json.loads(row["all_candidates"]) if row["all_candidates"] else []
+                    except Exception:
+                        candidates = []
+
+                    badge = "🔴 no match" if ev_type == "no_kg_match" else f"🟡 score={ev_score}"
+                    with st.expander(f"{badge}  {ev_name}  ({ev_fein})", expanded=False):
+                        if ev_sel:
+                            st.caption(f"Algorithm selected: **{ev_sel}** (mid={ev_mid}, score={ev_score})")
+                        else:
+                            st.caption("KG returned no match.")
+
+                        if candidates:
+                            st.write("**All KG candidates seen:**")
+                            for c in candidates:
+                                st.write(f"- {c.get('name')} — score={c.get('score')}  `{c.get('kg_mid')}`")
+
+                        st.write("**Resolve:**")
+                        manual_url = st.text_input(
+                            "Careers URL (leave blank to mark as unresolvable)",
+                            key=f"qe_url_{ev_fein}",
+                            placeholder="https://careers.example.com",
+                        )
+                        if st.button("Mark resolved", key=f"qe_resolve_{ev_fein}"):
+                            _resolve_quality_event(ev_fein, manual_url or None, ev_mid)
+                            _load_quality_events.clear()
+                            st.rerun()
+
+        with tab_resolved:
+            if resolved.empty:
+                st.info("No resolved events yet.")
+            else:
+                for _, row in resolved.iterrows():
+                    resolved_url = row.get("resolved_url") or "—"
+                    st.write(f"✅ **{row['legal_name']}** ({row['fein']}) → `{resolved_url}`")
