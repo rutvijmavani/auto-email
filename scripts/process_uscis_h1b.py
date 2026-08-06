@@ -313,48 +313,102 @@ def populate_unmatched() -> None:
     """
     Refresh uscis_dol_unmatched with every USCIS petition row that has no
     matching row in dol_h1b_employers (normalized name + last 4 FEIN join).
-    TRUNCATE + INSERT so the table always reflects the current DB state.
-    Ideally 0 rows — any row is a join key anomaly to investigate.
+
+    Uses a temp-table diff rather than TRUNCATE+INSERT so that queued_for_llm
+    is preserved on rows the LLM already processed and rejected.  TRUNCATE would
+    reset that flag, causing the same rows to be re-queued on the next fuzzy pass.
+
+    Steps:
+      1. Build the new unmatched set into a temp table.
+      2. Delete rows from uscis_dol_unmatched that are now matched (not in new set).
+      3. Insert genuinely new rows (not seen before) — get queued_for_llm = FALSE.
+      4. Update mutable stats (approvals, refreshed_at) for existing rows without
+         touching queued_for_llm.
+    """
+    _UNMATCHED_SELECT = """
+        SELECT
+            MAX(u.employer_name)      AS employer_name,
+            MAX(u.employer_name_norm) AS employer_name_norm,
+            COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
+                                      AS employer_legal_norm,
+            u.tax_id,
+            MAX(u.fiscal_year)        AS fiscal_year,
+            MAX(u.state)              AS state,
+            SUM(u.new_employment_approval + u.continuation_approval +
+                u.change_same_employer_approval + u.new_concurrent_approval +
+                u.change_of_employer_approval  + u.amended_approval) AS total_approvals
+        FROM uscis_h1b_petitions u
+        LEFT JOIN dol_h1b_employers d
+          ON (
+              u.employer_legal_norm = d.employer_name_norm
+           OR u.employer_name_norm  = d.trade_name_dba_norm
+          )
+         AND right(d.employer_fein, 4) = u.tax_id
+        LEFT JOIN uscis_dol_fuzzy_map f
+          ON f.employer_legal_norm = COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
+         AND f.tax_id             = u.tax_id
+        WHERE d.employer_fein IS NULL
+          AND f.dol_fein IS NULL
+        GROUP BY COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm), u.tax_id
     """
     conn = get_conn()
     try:
-        conn.execute("TRUNCATE TABLE uscis_dol_unmatched")
-        result = conn.execute("""
+        # Step 1: materialise the new unmatched set
+        conn.execute(f"CREATE TEMP TABLE _new_unmatched AS {_UNMATCHED_SELECT}")
+
+        # Step 2: drop rows that are now matched (no longer in the new set)
+        deleted = conn.execute("""
+            DELETE FROM uscis_dol_unmatched u
+            WHERE NOT EXISTS (
+                SELECT 1 FROM _new_unmatched n
+                WHERE n.employer_legal_norm = u.employer_legal_norm
+                  AND n.tax_id              = u.tax_id
+            )
+        """).rowcount
+
+        # Step 3: insert truly new rows — queued_for_llm defaults to FALSE
+        inserted = conn.execute("""
             INSERT INTO uscis_dol_unmatched
                 (employer_name, employer_name_norm, employer_legal_norm,
                  tax_id, fiscal_year, state, total_approvals)
-            SELECT
-                MAX(u.employer_name)      AS employer_name,
-                MAX(u.employer_name_norm) AS employer_name_norm,
-                COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
-                                          AS employer_legal_norm,
-                u.tax_id,
-                MAX(u.fiscal_year)        AS fiscal_year,
-                MAX(u.state)              AS state,
-                SUM(u.new_employment_approval + u.continuation_approval +
-                    u.change_same_employer_approval + u.new_concurrent_approval +
-                    u.change_of_employer_approval  + u.amended_approval) AS total_approvals
-            FROM uscis_h1b_petitions u
-            LEFT JOIN dol_h1b_employers d
-              ON (
-                  u.employer_legal_norm = d.employer_name_norm
-               OR u.employer_name_norm  = d.trade_name_dba_norm
-              )
-             AND right(d.employer_fein, 4) = u.tax_id
-            LEFT JOIN uscis_dol_fuzzy_map f
-              ON f.employer_legal_norm = COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm)
-             AND f.tax_id             = u.tax_id
-            WHERE d.employer_fein IS NULL
-              AND f.dol_fein IS NULL
-            GROUP BY COALESCE(NULLIF(u.employer_legal_norm, ''), u.employer_name_norm), u.tax_id
-            ORDER BY total_approvals DESC
+            SELECT n.employer_name, n.employer_name_norm, n.employer_legal_norm,
+                   n.tax_id, n.fiscal_year, n.state, n.total_approvals
+            FROM _new_unmatched n
+            WHERE NOT EXISTS (
+                SELECT 1 FROM uscis_dol_unmatched u
+                WHERE u.employer_legal_norm = n.employer_legal_norm
+                  AND u.tax_id              = n.tax_id
+            )
+        """).rowcount
+
+        # Step 4: refresh mutable stats for rows that already exist (preserves queued_for_llm)
+        conn.execute("""
+            UPDATE uscis_dol_unmatched u
+            SET employer_name      = n.employer_name,
+                employer_name_norm = n.employer_name_norm,
+                fiscal_year        = n.fiscal_year,
+                state              = n.state,
+                total_approvals    = n.total_approvals,
+                refreshed_at       = NOW()
+            FROM _new_unmatched n
+            WHERE u.employer_legal_norm = n.employer_legal_norm
+              AND u.tax_id              = n.tax_id
         """)
-        count = result.rowcount
+
+        conn.execute("DROP TABLE _new_unmatched")
         conn.commit()
-        if count == 0:
+
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS n FROM uscis_dol_unmatched"
+        ).fetchone()["n"]
+
+        if remaining == 0:
             log.info("Unmatched check: 0 rows — composite key matched all USCIS employers")
         else:
-            log.warning("Unmatched check: %d rows written to uscis_dol_unmatched — investigate join key", count)
+            log.warning(
+                "Unmatched: %d rows total (+%d new, -%d matched) — investigate join key",
+                remaining, inserted, deleted,
+            )
     finally:
         conn.close()
 

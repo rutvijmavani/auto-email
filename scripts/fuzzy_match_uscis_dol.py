@@ -161,8 +161,9 @@ def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
     The UPDATE uses RETURNING id with an IS NOT TRUE guard so the claim is
     idempotent: if the row was already queued (e.g. script restarted mid-run),
     RETURNING returns nothing and we skip the XADD — no duplicate stream entry.
-    If XADD fails after commit, the row stays claimed; populate_unmatched resets
-    the table on the next ingest, making the orphan retryable.
+    If XADD fails after commit, the row stays claimed (queued_for_llm=TRUE).
+    populate_unmatched preserves that flag, so the orphan is skipped on the next
+    fuzzy pass rather than re-queued — acceptable since the stream entry is lost.
     """
     row = conn.execute("""
         UPDATE uscis_dol_unmatched
@@ -293,6 +294,73 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
         log.info("%d ambiguous entries queued — h1b-llm-worker will resolve them asynchronously", queued)
 
 
+def _sample_candidates(limit: int, include_queued: bool) -> None:
+    """
+    Print candidates for unmatched rows — regardless of queued_for_llm status.
+    Used to diagnose why the LLM rejected rows or why rows were never sent.
+    """
+    conn = get_conn()
+    try:
+        queued_filter = "" if include_queued else "WHERE n.queued_for_llm IS NOT TRUE"
+        sql = f"""
+            SELECT
+                n.employer_name,
+                n.employer_legal_norm,
+                n.tax_id,
+                n.total_approvals,
+                n.queued_for_llm
+            FROM uscis_dol_unmatched n
+            {queued_filter}
+            ORDER BY n.total_approvals DESC
+            LIMIT {int(limit)}
+        """
+        rows = conn.execute(sql).fetchall()
+        if not rows:
+            print("No unmatched rows found.")
+            return
+
+        print(f"\n{'='*70}")
+        print(f"Sampling {len(rows)} unmatched rows (include_queued={include_queued})")
+        print(f"{'='*70}\n")
+
+        for row in rows:
+            row = dict(row)
+            uscis_norm = row["employer_legal_norm"] or row["employer_name"]
+            tax_id     = row["tax_id"]
+            queued     = row["queued_for_llm"]
+
+            candidates = _fetch_dol_candidates(conn, tax_id)
+            top        = _score_candidates(uscis_norm, candidates) if candidates else []
+
+            status = "LLM-processed (no match)" if queued else "never sent"
+            best_score = top[0]["score"] if top else 0
+            print(f"[{status}] {row['employer_name']!r}  tax_id={tax_id}  approvals={row['total_approvals']}")
+            print(f"  norm: {uscis_norm!r}")
+
+            if not candidates:
+                print("  NO DOL FEIN CANDIDATES — tax_id collision gap")
+            elif not top:
+                dol_scores = sorted(
+                    [_fuzz.token_set_ratio(uscis_norm, c["employer_name_norm"]) for c in candidates],
+                    reverse=True,
+                )
+                print(f"  {len(candidates)} DOL records share this tax_id — all score < {_FUZZY_THRESHOLD}")
+                print(f"  best raw scores: {dol_scores[:5]}")
+            else:
+                if best_score >= _FUZZY_AUTO_THRESHOLD:
+                    verdict = "→ would auto-match (score ≥ 95)"
+                elif best_score >= _FUZZY_DOMINANT_SCORE and len(top) >= 2 and (top[0]["score"] - top[1]["score"]) >= _FUZZY_DOMINANT_GAP:
+                    verdict = "→ would dominant-match"
+                else:
+                    verdict = "→ would queue for LLM"
+                print(f"  {verdict}")
+                for c in top:
+                    print(f"    FEIN={c['employer_fein']}  score={c['score']:.0f}  name={c['employer_name']!r}")
+            print()
+    finally:
+        conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Fuzzy match unresolved USCIS employers to DOL LCA records"
@@ -301,7 +369,16 @@ def main():
                         help="Max unmatched rows to process")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print candidates without running inference or storing results")
+    parser.add_argument("--sample",  type=int, default=None, metavar="N",
+                        help="Diagnostic: print candidates for top N unmatched rows and exit")
+    parser.add_argument("--sample-all", action="store_true",
+                        help="With --sample: include rows already sent to LLM (queued_for_llm=TRUE)")
     args = parser.parse_args()
+
+    if args.sample:
+        _sample_candidates(args.sample, include_queued=args.sample_all)
+        return
+
     run(limit=args.limit, dry_run=args.dry_run)
 
 
