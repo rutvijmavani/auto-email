@@ -337,7 +337,7 @@ def kg_search(legal_name: str) -> dict | None:
                 # /m/ entity (or no MID) — check name overlap before accepting
                 found_m   = True
                 candidate = {"name": name, "url": url, "kg_mid": kg_mid}
-                score     = token_set_ratio(base_query, name or "") if name else 0
+                score     = token_set_ratio(base_query.lower(), (name or "").lower()) if name else 0
                 if score >= _KG_MIN_OVERLAP:
                     log.debug(
                         "KG hit: %r → name=%r url=%r mid=%r score=%d",
@@ -361,11 +361,11 @@ def kg_search(legal_name: str) -> dict | None:
 
     if last_result:
         result_name = last_result.get("name") or ""
-        if result_name and token_set_ratio(base_query, result_name) < 70:
+        if result_name and token_set_ratio(base_query.lower(), result_name.lower()) < 70:
             log.debug(
                 "KG: retries exhausted — %r too dissimilar from %r (score=%d), returning None",
                 result_name, base_query,
-                token_set_ratio(base_query, result_name),
+                token_set_ratio(base_query.lower(), result_name.lower()),
             )
             return None
         log.debug(
