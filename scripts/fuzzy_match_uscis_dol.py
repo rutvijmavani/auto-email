@@ -14,8 +14,9 @@ until the LLM worker resolves them.
 
 Usage:
     python scripts/fuzzy_match_uscis_dol.py
-    python scripts/fuzzy_match_uscis_dol.py --limit 500   # process at most N unmatched rows
-    python scripts/fuzzy_match_uscis_dol.py --dry-run     # print candidates without storing
+    python scripts/fuzzy_match_uscis_dol.py --limit 500             # process at most N unmatched rows
+    python scripts/fuzzy_match_uscis_dol.py --dry-run               # print candidates without storing
+    python scripts/fuzzy_match_uscis_dol.py --reset-after-dol-sync  # re-evaluate LLM-rejected rows after new DOL quarters
 """
 
 import argparse
@@ -194,12 +195,31 @@ def _push_to_stream(r, conn, uscis_norm: str, uscis_name: str,
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run(limit: "int | None" = None, dry_run: bool = False) -> None:
+def _reset_llm_flags(conn) -> None:
+    """Reset queued_for_llm to NULL for all LLM-rejected rows.
+
+    Use after ingesting new DOL quarters — new DOL records may make previously
+    rejected rows resolvable, but they are skipped because queued_for_llm=TRUE.
+    Resetting forces them back through fuzzy scoring with fresh DOL candidates.
+    """
+    n = conn.execute("""
+        UPDATE uscis_dol_unmatched
+        SET queued_for_llm = NULL
+        WHERE queued_for_llm = TRUE
+    """).rowcount
+    conn.commit()
+    log.info("reset_llm_flags: %d rows cleared — will be re-evaluated with fresh DOL data", n)
+
+
+def run(limit: "int | None" = None, dry_run: bool = False,
+        reset_after_dol_sync: bool = False) -> None:
     conn = get_conn()
     r    = None if dry_run else get_redis()
     try:
         if not dry_run:
             _ensure_schema(conn)
+        if reset_after_dol_sync and not dry_run:
+            _reset_llm_flags(conn)
         _run_body(conn, r, limit, dry_run)
     finally:
         conn.close()
@@ -420,6 +440,9 @@ def main():
                         help="With --sample: include rows already sent to LLM (queued_for_llm=TRUE)")
     parser.add_argument("--backfill-candidates", action="store_true",
                         help="Populate candidates_json for all queued_for_llm=TRUE rows that lack it")
+    parser.add_argument("--reset-after-dol-sync", action="store_true",
+                        help="Clear queued_for_llm flags before running so LLM-rejected rows are "
+                             "re-evaluated with fresh DOL data. Use after ingesting new DOL quarters.")
     args = parser.parse_args()
 
     if args.backfill_candidates:
@@ -430,7 +453,8 @@ def main():
         _sample_candidates(args.sample, include_queued=args.sample_all)
         return
 
-    run(limit=args.limit, dry_run=args.dry_run)
+    run(limit=args.limit, dry_run=args.dry_run,
+        reset_after_dol_sync=args.reset_after_dol_sync)
 
 
 if __name__ == "__main__":

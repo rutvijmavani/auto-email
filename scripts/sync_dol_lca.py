@@ -366,6 +366,32 @@ def send_notification(ingested: list[str], failed: list[str]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Post-ingest helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reset_llm_flags() -> None:
+    """Clear queued_for_llm on all LLM-rejected unmatched rows.
+
+    Called automatically after new DOL quarters are ingested so that previously
+    rejected rows are re-evaluated against the fresh DOL candidates on the next
+    fuzzy match run.  No-ops gracefully if the table doesn't exist yet.
+    """
+    conn = get_conn()
+    try:
+        n = conn.execute("""
+            UPDATE uscis_dol_unmatched
+            SET queued_for_llm = NULL
+            WHERE queued_for_llm = TRUE
+        """).rowcount
+        conn.commit()
+        log.info("reset_llm_flags: %d rows cleared for re-evaluation", n)
+    except Exception as exc:
+        log.warning("reset_llm_flags skipped: %s", exc)
+    finally:
+        conn.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -420,6 +446,9 @@ def main():
 
     log.info("Done. Ingested: %s | Failed: %s", ingested or "none", failed or "none")
 
+    if ingested:
+        _reset_llm_flags()
+
     send_notification(ingested, failed)
 
 
@@ -437,6 +466,7 @@ def main_direct(url: str, quarter: str) -> None:
             local_file.unlink()
         except Exception as exc:
             log.warning("Could not delete %s after ingestion: %s", local_file, exc)
+        _reset_llm_flags()
         send_notification([quarter], [])
     else:
         log.error("Ingestion failed for %s", quarter)
