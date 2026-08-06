@@ -78,12 +78,13 @@ DOL candidates (same last-4 FEIN, ranked by name similarity):
 Instructions:
 - Select the candidate that is the SAME legal entity as the USCIS employer.
 - Common aliases, DBA names, and abbreviations count as the same entity.
-- A subsidiary is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
-- A branch/campus is NOT the same as the national entity unless the names make it clear.
-- If NO candidate is the same legal entity, set "match" to null.
+- A subsidiary or distinct legal entity is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
+- University systems and research foundations often file under a campus name in DOL but the umbrella entity name in USCIS — treat these as the same entity if the core institution name matches (e.g. "Research Foundation for SUNY" ≈ "Research Foundation for SUNY Upstate Medical University").
+- If NO candidate is the same legal entity, respond with null (not the string "null").
 
-Respond with ONLY a JSON object — no explanation, no markdown:
-{{"match": "<FEIN from candidates above, or null>"}}"""
+Respond with ONLY valid JSON — no explanation, no markdown. Examples:
+  Match found:    {{"match": "12-3456789"}}
+  No match found: {{"match": null}}"""
 
 # Gemini prompt — same content, no /think (Qwen3-specific prefix not understood by Gemini).
 # Used when H1B_LLM_PROVIDER=gemini.
@@ -101,12 +102,13 @@ DOL candidates (same last-4 FEIN, ranked by name similarity):
 Instructions:
 - Select the candidate that is the SAME legal entity as the USCIS employer.
 - Common aliases, DBA names, and abbreviations count as the same entity.
-- A subsidiary is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
-- A branch/campus is NOT the same as the national entity unless the names make it clear.
-- If NO candidate is the same legal entity, set "match" to null.
+- A subsidiary or distinct legal entity is NOT the same as its parent (e.g. "Amazon Web Services" ≠ "Amazon.com").
+- University systems and research foundations often file under a campus name in DOL but the umbrella entity name in USCIS — treat these as the same entity if the core institution name matches (e.g. "Research Foundation for SUNY" ≈ "Research Foundation for SUNY Upstate Medical University").
+- If NO candidate is the same legal entity, respond with null (not the string "null").
 
-Respond with ONLY a JSON object — no explanation, no markdown:
-{{"match": "<FEIN from candidates above, or null>"}}"""
+Respond with ONLY valid JSON — no explanation, no markdown. Examples:
+  Match found:    {{"match": "12-3456789"}}
+  No match found: {{"match": null}}"""
 
 # Keep backward-compat alias so any external code referencing _MATCH_PROMPT still works.
 _MATCH_PROMPT = _MATCH_PROMPT_LOCAL
@@ -206,7 +208,11 @@ def _ask_model(uscis_name: str, uscis_norm: str,
         log.warning("Model returned no JSON for USCIS=%r — raw: %s", uscis_name, text[:200])
         return None
     try:
-        return json.loads(m.group()).get("match") or None
+        val = json.loads(m.group()).get("match")
+        # Treat JSON null AND the string "null" (common LLM formatting mistake) as no-match
+        if val is None or str(val).strip().lower() == "null":
+            return None
+        return val or None
     except json.JSONDecodeError as exc:
         log.warning("JSON parse failed for USCIS=%r: %s", uscis_name, exc)
         return None
@@ -312,7 +318,8 @@ def _process_job(r, msg_id, fields) -> bool:
 
         conn.commit()  # release SELECT's transaction before LLM inference (2-3 min)
 
-        log.info("LLM select: %r (tax_id=%s, %d candidates)", uscis_name, tax_id, len(candidates))
+        cand_summary = ", ".join(f"{c['name']} ({c['score']:.0f})" for c in candidates)
+        log.info("LLM select: %r (tax_id=%s) candidates: [%s]", uscis_name, tax_id, cand_summary)
 
         try:
             dol_fein = _ask_model(uscis_name, uscis_norm, candidates)
@@ -322,6 +329,17 @@ def _process_job(r, msg_id, fields) -> bool:
 
         if dol_fein is None:
             log.debug("no match for %r", uscis_name)
+            # Persist candidates so the no-match decision is auditable from the DB.
+            try:
+                conn.execute("""
+                    UPDATE uscis_dol_unmatched
+                    SET candidates_json = %s
+                    WHERE employer_legal_norm = %s AND tax_id = %s
+                """, (json.dumps(candidates), employer_legal_norm, tax_id))
+                conn.commit()
+            except Exception as exc:
+                log.warning("Could not save candidates_json for no-match %r: %s", uscis_name, exc)
+                conn.rollback()
             r.xack(H1B_DISAMBIG_STREAM, H1B_DISAMBIG_GROUP, msg_id)
             return True
 
