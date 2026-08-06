@@ -250,14 +250,18 @@ def kg_search(legal_name: str) -> dict | None:
     the 'kg:' prefix (e.g. '/m/0mgkg').
 
     Strategy:
+    - Punctuation (except hyphens) is stripped from base_query before tokenising so
+      trailing commas ("Salesforce,") don't pollute shorter-query attempts.
     - Fetch _KG_FETCH_LIMIT candidates per query.  /g/ shells are always skipped.
-    - Score each /m/ candidate: token_set_ratio(base_query.lower(), name.lower()).
+    - Within each attempt, iterate candidates in KG relevance order.  Stop at the
+      first /m/ candidate that scores ≥ _KG_MIN_OVERLAP (30) — KG's ranking is more
+      reliable than cross-candidate score comparison.  Candidates below 30 are checked
+      in order until one passes or the list is exhausted.
     - Score ≥ _KG_HIGH_CONFIDENCE (90) → return immediately, no need to retry.
-    - Otherwise track (best_candidate, best_score) and continue to a shorter query
-      (drop last word), even when /m/ candidates were found.  This lets a shorter
-      query surface the correct brand entity when the full query returns a
-      plausible-but-wrong result — e.g. "Oracle America, Inc" → OFS(68) at attempt 0,
-      but bare "Oracle" → Oracle Corporation(100) at attempt 2.
+    - 30 ≤ score < 90 → update global best if higher, then always continue to a
+      shorter query (drop last word).  This lets a shorter query surface the correct
+      brand entity — e.g. "Oracle America Inc" → OFS(68) at attempt 0, bare "Oracle"
+      → Oracle Corporation(100) at attempt 2.
     - After _KG_MAX_RETRIES, return best_candidate if best_score ≥ _KG_MIN_OVERLAP,
       else None.
     """
@@ -277,6 +281,7 @@ def kg_search(legal_name: str) -> dict | None:
             return None
 
     base_query = strip_legal_suffixes(legal_name) or legal_name
+    base_query = re.sub(r'[^\w\s-]', '', base_query).strip()
     tokens     = base_query.split()
     best_candidate: dict | None = None
     best_score: int = -1
@@ -341,18 +346,23 @@ def kg_search(legal_name: str) -> dict | None:
                     )
                     return candidate
 
-                if score > best_score:
-                    best_score     = score
-                    best_candidate = candidate
+                if score >= _KG_MIN_OVERLAP:
+                    # First /m/ candidate above threshold — trust KG's relevance order,
+                    # stop checking remaining candidates in this attempt.
                     log.debug(
-                        "KG: /m/ candidate %r (mid=%r score=%d) — new best, trying shorter query",
+                        "KG: /m/ candidate %r (mid=%r score=%d) — first above threshold%s",
                         name, kg_mid, score,
+                        ", new best" if score > best_score else f", not better than best ({best_score})",
                     )
-                else:
-                    log.debug(
-                        "KG: /m/ candidate %r (mid=%r score=%d) — not better than best (%d)",
-                        name, kg_mid, score, best_score,
-                    )
+                    if score > best_score:
+                        best_score     = score
+                        best_candidate = candidate
+                    break
+
+                log.debug(
+                    "KG: /m/ candidate %r (mid=%r score=%d) — below threshold, checking next",
+                    name, kg_mid, score,
+                )
 
             if not found_m:
                 log.debug("KG: all /g/ results for %r — retrying without last word", query)
