@@ -197,6 +197,7 @@ def main() -> None:
     )
 
     api_thread.start()
+    time.sleep(10)  # stagger so both threads don't write the Gist simultaneously
     frontend_thread.start()
 
     # Block until either tunnel exits; systemd Restart=always will relaunch both
