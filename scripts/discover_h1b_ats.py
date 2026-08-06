@@ -428,8 +428,8 @@ def upsert_quality_event(
         INSERT INTO h1b_ats_quality_events
             (fein, legal_name, event_type, kg_score, selected_name, selected_kg_mid, all_candidates)
         VALUES
-            (:fein, :legal_name, :event_type, :kg_score,
-             :selected_name, :selected_kg_mid, :all_candidates::jsonb)
+            (%(fein)s, %(legal_name)s, %(event_type)s, %(kg_score)s,
+             %(selected_name)s, %(selected_kg_mid)s, %(all_candidates)s::jsonb)
         ON CONFLICT (fein) DO UPDATE SET
             legal_name      = EXCLUDED.legal_name,
             event_type      = EXCLUDED.event_type,
