@@ -238,20 +238,22 @@ _sparql_limiter = _RateLimiter(rpm=30)
 # Google Knowledge Graph API
 # ─────────────────────────────────────────────────────────────────────────────
 
-_KG_FETCH_LIMIT     = 3   # candidates fetched per query
-_KG_MIN_OVERLAP     = 30  # minimum score to accept at retry exhaustion
-_KG_HIGH_CONFIDENCE = 90  # return immediately — no point trying shorter queries
+_KG_FETCH_LIMIT      = 3   # candidates fetched per query
+_KG_MIN_OVERLAP      = 30  # minimum score to accept at retry exhaustion
+_KG_HIGH_CONFIDENCE  = 90  # return immediately — no point trying shorter queries
+_KG_QUALITY_THRESHOLD = 60  # flag for human review when selected score < this
 
 
-def kg_search(legal_name: str) -> dict | None:
+def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
     """Search KG API for legal_name with progressive word-stripping and best-match selection.
 
-    Returns {name, url, kg_mid} or None.  kg_mid is the Freebase MID stripped of
-    the 'kg:' prefix (e.g. '/m/0mgkg').
+    Returns (selected, all_candidates) where:
+      selected       — {name, url, kg_mid, _score} or None
+      all_candidates — every /m/ entity seen across all attempts, deduplicated by
+                       kg_mid (max score kept), sorted by score descending.
+                       Used by the quality-events audit trail.
 
     Strategy:
-    - Punctuation (except hyphens) is stripped from base_query before tokenising so
-      trailing commas ("Salesforce,") don't pollute shorter-query attempts.
     - Fetch _KG_FETCH_LIMIT candidates per query.  /g/ shells are always skipped.
     - Within each attempt, iterate candidates in KG relevance order.  Stop at the
       first /m/ candidate that scores ≥ _KG_MIN_OVERLAP (30) — KG's ranking is more
@@ -267,7 +269,7 @@ def kg_search(legal_name: str) -> dict | None:
     """
     if not _KG_API_KEY:
         log.warning("KG_API_KEY not set — skipping KG search for %r", legal_name)
-        return None
+        return None, []
 
     if not can_call("kg_api"):
         if not within_rpm("kg_api"):
@@ -275,16 +277,16 @@ def kg_search(legal_name: str) -> dict | None:
             time.sleep(60)
             if not can_call("kg_api"):
                 log.warning("KG API still unavailable after wait — skipping")
-                return None
+                return None, []
         else:
             log.warning("KG API daily limit (100k) reached")
-            return None
+            return None, []
 
     base_query = strip_legal_suffixes(legal_name) or legal_name
-    base_query = re.sub(r'[^\w\s-]', '', base_query).strip()
     tokens     = base_query.split()
     best_candidate: dict | None = None
     best_score: int = -1
+    all_seen:   dict[str, dict] = {}  # kg_mid → {name, kg_mid, score} — audit trail
 
     for attempt in range(min(_KG_MAX_RETRIES + 1, len(tokens))):
         query = " ".join(tokens[:len(tokens) - attempt])
@@ -336,15 +338,20 @@ def kg_search(legal_name: str) -> dict | None:
                     continue
 
                 found_m   = True
-                candidate = {"name": name, "url": url, "kg_mid": kg_mid}
                 score     = token_set_ratio(base_query.lower(), (name or "").lower()) if name else 0
+                candidate = {"name": name, "url": url, "kg_mid": kg_mid, "_score": score}
+
+                # Track every /m/ entity seen for the audit trail (dedup by kg_mid, max score)
+                if kg_mid and (kg_mid not in all_seen or score > all_seen[kg_mid]["score"]):
+                    all_seen[kg_mid] = {"name": name, "kg_mid": kg_mid, "score": score}
 
                 if score >= _KG_HIGH_CONFIDENCE:
                     log.debug(
                         "KG hit: %r → name=%r url=%r mid=%r score=%d",
                         query, name, url, kg_mid, score,
                     )
-                    return candidate
+                    all_candidates = sorted(all_seen.values(), key=lambda x: x["score"], reverse=True)
+                    return candidate, all_candidates
 
                 if score >= _KG_MIN_OVERLAP:
                     # First /m/ candidate above threshold — trust KG's relevance order,
@@ -376,18 +383,73 @@ def kg_search(legal_name: str) -> dict | None:
             log.debug("KG API error for %r: %s", legal_name, e)
             break
 
+    all_candidates = sorted(all_seen.values(), key=lambda x: x["score"], reverse=True)
+
     if best_candidate and best_score >= _KG_MIN_OVERLAP:
         log.debug(
             "KG: retries exhausted for %r — best result: name=%r mid=%r score=%d",
             legal_name, best_candidate.get("name"), best_candidate.get("kg_mid"), best_score,
         )
-        return best_candidate
+        return best_candidate, all_candidates
 
     log.debug(
         "KG: no confident match for %r — best score=%d, returning None",
         legal_name, best_score,
     )
-    return None
+    return None, all_candidates
+
+
+def upsert_quality_event(
+    conn,
+    fein:           str,
+    legal_name:     str,
+    event_type:     str,
+    selected:       dict | None,
+    all_candidates: list[dict],
+    dry_run:        bool = False,
+) -> None:
+    """Write a KG quality event for human review.
+
+    event_type: 'no_kg_match' | 'low_confidence'
+    ON CONFLICT (fein): update only when the existing row is not yet resolved —
+    resolved rows represent a human override and must not be clobbered.
+    """
+    if dry_run:
+        log.info(
+            "[DRY-RUN] quality event fein=%s type=%s selected=%r score=%s candidates=%d",
+            fein, event_type,
+            selected.get("name") if selected else None,
+            selected.get("_score") if selected else None,
+            len(all_candidates),
+        )
+        return
+    conn.execute(
+        """
+        INSERT INTO h1b_ats_quality_events
+            (fein, legal_name, event_type, kg_score, selected_name, selected_kg_mid, all_candidates)
+        VALUES
+            (:fein, :legal_name, :event_type, :kg_score,
+             :selected_name, :selected_kg_mid, :all_candidates::jsonb)
+        ON CONFLICT (fein) DO UPDATE SET
+            legal_name      = EXCLUDED.legal_name,
+            event_type      = EXCLUDED.event_type,
+            kg_score        = EXCLUDED.kg_score,
+            selected_name   = EXCLUDED.selected_name,
+            selected_kg_mid = EXCLUDED.selected_kg_mid,
+            all_candidates  = EXCLUDED.all_candidates,
+            created_at      = NOW()
+        WHERE NOT h1b_ats_quality_events.resolved
+        """,
+        {
+            "fein":            fein,
+            "legal_name":      legal_name,
+            "event_type":      event_type,
+            "kg_score":        selected.get("_score") if selected else None,
+            "selected_name":   selected.get("name")   if selected else None,
+            "selected_kg_mid": selected.get("kg_mid") if selected else None,
+            "all_candidates":  json.dumps(all_candidates),
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1136,16 +1198,19 @@ def process_employer(
             canonical_source = existing_row.get("canonical_source")
         else:
             log.info("  KG API …")
-            kg = kg_search(name)
+            kg, all_candidates = kg_search(name)
             if kg:
                 kg_mid           = kg.get("kg_mid")
                 canonical_name   = kg.get("name")
                 website_url      = kg.get("url")
                 canonical_source = "kg_api" if (canonical_name or website_url) else None
+                if (kg.get("_score") or 0) < _KG_QUALITY_THRESHOLD:
+                    upsert_quality_event(conn, fein, name, "low_confidence", kg, all_candidates, dry_run)
             else:
                 canonical_name   = strip_legal_suffixes(name) or None
                 canonical_source = "regex" if canonical_name else None
                 website_url      = None
+                upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, dry_run)
 
         if kg_mid:
             log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
@@ -1436,7 +1501,7 @@ def main():
                     }
                 else:
                     log.info("[%d/%d KG] %s", i, len(employers), name)
-                    kg = kg_search(name)
+                    kg, all_candidates = kg_search(name)
                     if kg:
                         entry = {
                             "kg_mid":          kg.get("kg_mid"),
@@ -1445,6 +1510,8 @@ def main():
                             "website_url":     kg.get("url"),
                             "wikidata_qid":    None,
                         }
+                        if (kg.get("_score") or 0) < _KG_QUALITY_THRESHOLD:
+                            upsert_quality_event(conn, fein, name, "low_confidence", kg, all_candidates, args.dry_run)
                     else:
                         stripped = strip_legal_suffixes(name)
                         entry = {
@@ -1454,6 +1521,7 @@ def main():
                             "website_url":     None,
                             "wikidata_qid":    None,
                         }
+                        upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, args.dry_run)
 
                 kg_map[fein] = entry
                 mid = entry.get("kg_mid")

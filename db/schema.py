@@ -1541,6 +1541,25 @@ def init_db():
         ADD COLUMN IF NOT EXISTS sample_apply_url TEXT
     """)
 
+    # ── KG quality events — low-confidence / no-match companies for review ────
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS h1b_ats_quality_events (
+            id              BIGSERIAL    PRIMARY KEY,
+            fein            TEXT         NOT NULL,
+            legal_name      TEXT         NOT NULL,
+            event_type      TEXT         NOT NULL,
+            kg_score        INTEGER,
+            selected_name   TEXT,
+            selected_kg_mid TEXT,
+            all_candidates  JSONB        NOT NULL DEFAULT '[]',
+            resolved        BOOLEAN      NOT NULL DEFAULT FALSE,
+            resolved_url    TEXT,
+            resolved_at     TIMESTAMPTZ,
+            created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            CONSTRAINT uq_quality_event_fein UNIQUE (fein)
+        )
+    """)
+
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
     _cleanup_closed_application_recruiters(c)
