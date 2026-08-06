@@ -1536,6 +1536,10 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS crunchbase_id TEXT
     """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS sample_apply_url TEXT
+    """)
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)
