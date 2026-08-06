@@ -238,31 +238,28 @@ _sparql_limiter = _RateLimiter(rpm=30)
 # Google Knowledge Graph API
 # ─────────────────────────────────────────────────────────────────────────────
 
-_KG_FETCH_LIMIT   = 3   # fetch multiple candidates per query so we can compare
-_KG_MIN_OVERLAP   = 30  # token_set_ratio threshold — rejects totally unrelated entities
-                         # (IBM→0% for "Salesforce") while allowing brand contractions
-                         # (Walmart→~54% for "WAL-MART ASSOCIATES")
+_KG_FETCH_LIMIT     = 3   # candidates fetched per query
+_KG_MIN_OVERLAP     = 30  # minimum score to accept at retry exhaustion
+_KG_HIGH_CONFIDENCE = 90  # return immediately — no point trying shorter queries
 
 
 def kg_search(legal_name: str) -> dict | None:
-    """Search KG API for legal_name with progressive fallback for thin shell entities.
+    """Search KG API for legal_name with progressive word-stripping and best-match selection.
 
     Returns {name, url, kg_mid} or None.  kg_mid is the Freebase MID stripped of
     the 'kg:' prefix (e.g. '/m/0mgkg').
 
-    Fetches up to _KG_FETCH_LIMIT results per query so we can compare candidates:
-    - /g/ entities (thin Google-minted shells) are skipped.
-    - Among /m/ entities, we pick the first one whose name overlaps sufficiently
-      with base_query (token_set_ratio ≥ _KG_MIN_OVERLAP).  This prevents a
-      mis-ranked result (e.g. IBM returned for "Salesforce") from being accepted
-      when the correct entity is also in the result set.
-    - If no /m/ entity passes the overlap check, the last word is dropped and
-      KG is retried (up to _KG_MAX_RETRIES times).
-    - At retry exhaustion, a final 70-point guard rejects any remaining bad result.
-
-        "WAL-MART ASSOCIATES" → /g/ thin → retry
-        "WAL-MART"            → /m/ Walmart (score ~54%) ≥ 30 → accepted ✓
-        "Salesforce, Inc"     → [IBM(0%), Salesforce(100%)] → IBM skipped, Salesforce ✓
+    Strategy:
+    - Fetch _KG_FETCH_LIMIT candidates per query.  /g/ shells are always skipped.
+    - Score each /m/ candidate: token_set_ratio(base_query.lower(), name.lower()).
+    - Score ≥ _KG_HIGH_CONFIDENCE (90) → return immediately, no need to retry.
+    - Otherwise track (best_candidate, best_score) and continue to a shorter query
+      (drop last word), even when /m/ candidates were found.  This lets a shorter
+      query surface the correct brand entity when the full query returns a
+      plausible-but-wrong result — e.g. "Oracle America, Inc" → OFS(68) at attempt 0,
+      but bare "Oracle" → Oracle Corporation(100) at attempt 2.
+    - After _KG_MAX_RETRIES, return best_candidate if best_score ≥ _KG_MIN_OVERLAP,
+      else None.
     """
     if not _KG_API_KEY:
         log.warning("KG_API_KEY not set — skipping KG search for %r", legal_name)
@@ -281,7 +278,8 @@ def kg_search(legal_name: str) -> dict | None:
 
     base_query = strip_legal_suffixes(legal_name) or legal_name
     tokens     = base_query.split()
-    last_result: dict | None = None
+    best_candidate: dict | None = None
+    best_score: int = -1
 
     for attempt in range(min(_KG_MAX_RETRIES + 1, len(tokens))):
         query = " ".join(tokens[:len(tokens) - attempt])
@@ -310,17 +308,15 @@ def kg_search(legal_name: str) -> dict | None:
                 wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
                 log.debug("KG API rate-limited — waiting %ds", wait)
                 time.sleep(wait)
-                return last_result
+                break
 
             resp.raise_for_status()
             items = resp.json().get("itemListElement", [])
 
             if not items:
                 log.debug("KG API: no results for %r (attempt %d)", query, attempt)
-                continue  # shorter query might still match
+                continue
 
-            # Iterate candidates in Google's relevance order; pick first /m/ with
-            # sufficient name overlap — skips /g/ shells and mis-ranked /m/ results.
             found_m = False
             for item in items:
                 result  = item.get("result", {})
@@ -334,45 +330,54 @@ def kg_search(legal_name: str) -> dict | None:
                     log.debug("KG: /g/ thin shell %r (mid=%r) skipped", name, kg_mid)
                     continue
 
-                # /m/ entity (or no MID) — check name overlap before accepting
                 found_m   = True
                 candidate = {"name": name, "url": url, "kg_mid": kg_mid}
                 score     = token_set_ratio(base_query.lower(), (name or "").lower()) if name else 0
-                if score >= _KG_MIN_OVERLAP:
+
+                if score >= _KG_HIGH_CONFIDENCE:
                     log.debug(
                         "KG hit: %r → name=%r url=%r mid=%r score=%d",
                         query, name, url, kg_mid, score,
                     )
                     return candidate
-                log.debug(
-                    "KG: /m/ candidate %r (mid=%r score=%d) below threshold — checking next",
-                    name, kg_mid, score,
-                )
-                if last_result is None:
-                    last_result = candidate  # keep as fallback for exhaustion
+
+                if score > best_score:
+                    best_score     = score
+                    best_candidate = candidate
+                    log.debug(
+                        "KG: /m/ candidate %r (mid=%r score=%d) — new best, trying shorter query",
+                        name, kg_mid, score,
+                    )
+                else:
+                    log.debug(
+                        "KG: /m/ candidate %r (mid=%r score=%d) — not better than best (%d)",
+                        name, kg_mid, score, best_score,
+                    )
 
             if not found_m:
-                # All candidates were /g/ shells — retry with shorter query
                 log.debug("KG: all /g/ results for %r — retrying without last word", query)
+            else:
+                log.debug(
+                    "KG: best so far score=%d for %r — trying shorter query",
+                    best_score, query,
+                )
 
         except requests.exceptions.RequestException as e:
             log.debug("KG API error for %r: %s", legal_name, e)
-            return last_result
+            break
 
-    if last_result:
-        result_name = last_result.get("name") or ""
-        if result_name and token_set_ratio(base_query.lower(), result_name.lower()) < 70:
-            log.debug(
-                "KG: retries exhausted — %r too dissimilar from %r (score=%d), returning None",
-                result_name, base_query,
-                token_set_ratio(base_query.lower(), result_name.lower()),
-            )
-            return None
+    if best_candidate and best_score >= _KG_MIN_OVERLAP:
         log.debug(
-            "KG: retries exhausted for %r — using best result: name=%r mid=%r",
-            legal_name, last_result.get("name"), last_result.get("kg_mid"),
+            "KG: retries exhausted for %r — best result: name=%r mid=%r score=%d",
+            legal_name, best_candidate.get("name"), best_candidate.get("kg_mid"), best_score,
         )
-    return last_result
+        return best_candidate
+
+    log.debug(
+        "KG: no confident match for %r — best score=%d, returning None",
+        legal_name, best_score,
+    )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
