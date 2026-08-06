@@ -238,21 +238,31 @@ _sparql_limiter = _RateLimiter(rpm=30)
 # Google Knowledge Graph API
 # ─────────────────────────────────────────────────────────────────────────────
 
+_KG_FETCH_LIMIT   = 3   # fetch multiple candidates per query so we can compare
+_KG_MIN_OVERLAP   = 30  # token_set_ratio threshold — rejects totally unrelated entities
+                         # (IBM→0% for "Salesforce") while allowing brand contractions
+                         # (Walmart→~54% for "WAL-MART ASSOCIATES")
+
+
 def kg_search(legal_name: str) -> dict | None:
     """Search KG API for legal_name with progressive fallback for thin shell entities.
 
     Returns {name, url, kg_mid} or None.  kg_mid is the Freebase MID stripped of
     the 'kg:' prefix (e.g. '/m/0mgkg').
 
-    USCIS uses legal subsidiary names ("WAL-MART ASSOCIATES INC") that resolve to
-    thin /g/ Google-minted entities with no website data.  When that happens, the
-    last word of the query is dropped and KG is retried (up to _KG_MAX_RETRIES
-    times) until a richer /m/ entity (the brand) is found.
+    Fetches up to _KG_FETCH_LIMIT results per query so we can compare candidates:
+    - /g/ entities (thin Google-minted shells) are skipped.
+    - Among /m/ entities, we pick the first one whose name overlaps sufficiently
+      with base_query (token_set_ratio ≥ _KG_MIN_OVERLAP).  This prevents a
+      mis-ranked result (e.g. IBM returned for "Salesforce") from being accepted
+      when the correct entity is also in the result set.
+    - If no /m/ entity passes the overlap check, the last word is dropped and
+      KG is retried (up to _KG_MAX_RETRIES times).
+    - At retry exhaustion, a final 70-point guard rejects any remaining bad result.
 
         "WAL-MART ASSOCIATES" → /g/ thin → retry
-        "WAL-MART"            → /m/ Walmart with url ✓
-
-    No keyword lists — the /g/ MID prefix is the only trigger.
+        "WAL-MART"            → /m/ Walmart (score ~54%) ≥ 30 → accepted ✓
+        "Salesforce, Inc"     → [IBM(0%), Salesforce(100%)] → IBM skipped, Salesforce ✓
     """
     if not _KG_API_KEY:
         log.warning("KG_API_KEY not set — skipping KG search for %r", legal_name)
@@ -287,7 +297,7 @@ def kg_search(legal_name: str) -> dict | None:
                     "query":     query,
                     "key":       _KG_API_KEY,
                     "types":     "Organization",
-                    "limit":     1,
+                    "limit":     _KG_FETCH_LIMIT,
                     "languages": "en",
                     "indent":    "False",
                 },
@@ -309,25 +319,41 @@ def kg_search(legal_name: str) -> dict | None:
                 log.debug("KG API: no results for %r (attempt %d)", query, attempt)
                 continue  # shorter query might still match
 
-            result  = items[0].get("result", {})
-            raw_id  = result.get("@id", "")
-            kg_mid  = raw_id.removeprefix("kg:") or None
-            name    = html.unescape(result.get("name") or "") or None
-            raw_url = result.get("url") or None
-            url     = raw_url if raw_url and _is_public_url(raw_url) else None
+            # Iterate candidates in Google's relevance order; pick first /m/ with
+            # sufficient name overlap — skips /g/ shells and mis-ranked /m/ results.
+            found_m = False
+            for item in items:
+                result  = item.get("result", {})
+                raw_id  = result.get("@id", "")
+                kg_mid  = raw_id.removeprefix("kg:") or None
+                name    = html.unescape(result.get("name") or "") or None
+                raw_url = result.get("url") or None
+                url     = raw_url if raw_url and _is_public_url(raw_url) else None
 
-            last_result = {"name": name, "url": url, "kg_mid": kg_mid}
+                if kg_mid and kg_mid.startswith("/g/"):
+                    log.debug("KG: /g/ thin shell %r (mid=%r) skipped", name, kg_mid)
+                    continue
 
-            if kg_mid and kg_mid.startswith("/g/"):
+                # /m/ entity (or no MID) — check name overlap before accepting
+                found_m   = True
+                candidate = {"name": name, "url": url, "kg_mid": kg_mid}
+                score     = token_set_ratio(base_query, name or "") if name else 0
+                if score >= _KG_MIN_OVERLAP:
+                    log.debug(
+                        "KG hit: %r → name=%r url=%r mid=%r score=%d",
+                        query, name, url, kg_mid, score,
+                    )
+                    return candidate
                 log.debug(
-                    "KG: thin shell entity %r (mid=%r) for %r — retrying without last word",
-                    name, kg_mid, query,
+                    "KG: /m/ candidate %r (mid=%r score=%d) below threshold — checking next",
+                    name, kg_mid, score,
                 )
-                continue  # drop last word and retry
+                if last_result is None:
+                    last_result = candidate  # keep as fallback for exhaustion
 
-            # /m/ entity or no MID — accept as the brand entity
-            log.debug("KG hit: %r → name=%r url=%r mid=%r", query, name, url, kg_mid)
-            return last_result
+            if not found_m:
+                # All candidates were /g/ shells — retry with shorter query
+                log.debug("KG: all /g/ results for %r — retrying without last word", query)
 
         except requests.exceptions.RequestException as e:
             log.debug("KG API error for %r: %s", legal_name, e)
@@ -819,7 +845,15 @@ def _resolve_website_redirect(url: str) -> str:
         return url
 
     final_parsed = urlparse(final_url)
-    resolved_base = f"{final_parsed.scheme}://{final_parsed.netloc}"
+    # Strip redundant default ports (:443 on https, :80 on http)
+    host = final_parsed.hostname or ""
+    port = final_parsed.port
+    if port and not (
+        (final_parsed.scheme == "https" and port == 443) or
+        (final_parsed.scheme == "http"  and port == 80)
+    ):
+        host = f"{host}:{port}"
+    resolved_base = f"{final_parsed.scheme}://{host}"
 
     if final_root == orig_root:
         log.debug("_resolve_website_redirect: same root domain (%s→%s), using resolved base", url, resolved_base)
