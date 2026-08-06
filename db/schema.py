@@ -1446,6 +1446,7 @@ def init_db():
     c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS employer_legal_norm TEXT")
     c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS refreshed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
     c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS queued_for_llm BOOLEAN NOT NULL DEFAULT FALSE")
+    c.execute("ALTER TABLE uscis_dol_unmatched ADD COLUMN IF NOT EXISTS candidates_json JSONB")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_uscis_unmatched_employer
         ON uscis_dol_unmatched (employer_legal_norm, tax_id)

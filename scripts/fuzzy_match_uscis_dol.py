@@ -294,6 +294,51 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
         log.info("%d ambiguous entries queued — h1b-llm-worker will resolve them asynchronously", queued)
 
 
+def _backfill_candidates() -> None:
+    """
+    Populate candidates_json for all uscis_dol_unmatched rows where the LLM
+    already processed the row (queued_for_llm=TRUE) but candidates_json is NULL.
+    Re-derives candidates from dol_h1b_employers using the same fuzzy scoring
+    the fuzzy script used at queue time — candidates are stable as long as the
+    DOL data hasn't changed.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT employer_name, employer_legal_norm, employer_name_norm, tax_id
+            FROM uscis_dol_unmatched
+            WHERE queued_for_llm = TRUE AND candidates_json IS NULL
+            ORDER BY total_approvals DESC
+        """).fetchall()
+
+        if not rows:
+            print("Nothing to backfill — all queued rows already have candidates_json.")
+            return
+
+        print(f"Backfilling candidates_json for {len(rows)} no-match rows…")
+        updated = 0
+        for row in rows:
+            row = dict(row)
+            uscis_norm = row["employer_legal_norm"] or row["employer_name_norm"]
+            tax_id     = row["tax_id"]
+
+            raw        = _fetch_dol_candidates(conn, tax_id)
+            top        = _score_candidates(uscis_norm, raw) if raw else []
+            clean      = _clean_candidates(top) if top else []
+
+            conn.execute("""
+                UPDATE uscis_dol_unmatched
+                SET candidates_json = %s
+                WHERE employer_legal_norm = %s AND tax_id = %s
+            """, (json.dumps(clean), row["employer_legal_norm"], tax_id))
+            updated += 1
+
+        conn.commit()
+        print(f"Done — {updated} rows backfilled.")
+    finally:
+        conn.close()
+
+
 def _sample_candidates(limit: int, include_queued: bool) -> None:
     """
     Print candidates for unmatched rows — regardless of queued_for_llm status.
@@ -373,7 +418,13 @@ def main():
                         help="Diagnostic: print candidates for top N unmatched rows and exit")
     parser.add_argument("--sample-all", action="store_true",
                         help="With --sample: include rows already sent to LLM (queued_for_llm=TRUE)")
+    parser.add_argument("--backfill-candidates", action="store_true",
+                        help="Populate candidates_json for all queued_for_llm=TRUE rows that lack it")
     args = parser.parse_args()
+
+    if args.backfill_candidates:
+        _backfill_candidates()
+        return
 
     if args.sample:
         _sample_candidates(args.sample, include_queued=args.sample_all)
