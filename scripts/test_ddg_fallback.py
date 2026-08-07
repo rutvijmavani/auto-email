@@ -188,8 +188,8 @@ def main():
     cur  = conn.cursor()
     query = """
         SELECT d.employer_fein, d.employer_name, h.canonical_name, h.kg_mid
-        FROM   h1b_sponsors d
-        LEFT JOIN h1b_ats_discovery h ON h.employer_fein = d.employer_fein
+        FROM   dol_h1b_employers d
+        JOIN   h1b_ats_discovery h ON h.employer_fein = d.employer_fein
         WHERE  h.last_checked IS NOT NULL
           AND  h.website_url  IS NULL
         ORDER BY d.employer_name
