@@ -184,9 +184,7 @@ def main():
 
     init_logging()
 
-    conn = get_conn()
-    cur  = conn.cursor()
-    query = """
+    sql = """
         SELECT d.employer_fein, d.employer_name, h.canonical_name, h.kg_mid
         FROM   dol_h1b_employers d
         JOIN   h1b_ats_discovery h ON h.employer_fein = d.employer_fein
@@ -195,10 +193,9 @@ def main():
         ORDER BY d.employer_name
     """
     if args.limit:
-        query += f" LIMIT {args.limit}"
-    cur.execute(query)
-    rows = cur.fetchall()
-    cur.close()
+        sql += f" LIMIT {args.limit}"
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
 
     if not rows:
         print("No companies without website found — nothing to test.")
