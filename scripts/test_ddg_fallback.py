@@ -211,7 +211,11 @@ def main():
     session = requests.Session()
     session.headers["User-Agent"] = "Mozilla/5.0 (compatible; h1b-pipeline-test/1.0)"
 
-    for i, (fein, legal_name, canonical_name, kg_mid) in enumerate(rows, 1):
+    for i, row in enumerate(rows, 1):
+        fein           = row["employer_fein"]
+        legal_name     = row["employer_name"]
+        canonical_name = row["canonical_name"]
+        kg_mid         = row["kg_mid"]
         query_str = canonical_name or legal_name
 
         # ── DDG ──────────────────────────────────────────────────────────
