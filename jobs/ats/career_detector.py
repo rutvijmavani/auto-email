@@ -670,8 +670,10 @@ def detect(start_url, session=None, visited=None, _best=None, _referer=None, _ma
     if not html:
         return _best[0]
 
-    # Track final URL (post-redirect) — prevents re-crawling pages reached via different paths
-    if final_url in visited:
+    # Track final URL (post-redirect) — prevents re-crawling pages reached via different paths.
+    # Only check when there was an actual redirect (final_url != start_url) — start_url is
+    # already in visited, so checking final_url == start_url would always return early.
+    if final_url != start_url and final_url in visited:
         return _best[0]
     visited.add(final_url)
     logger.debug("[detector] page=%d url=%s", len(visited), final_url)
