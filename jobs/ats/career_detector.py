@@ -644,11 +644,17 @@ def find_next_pages(html, current_url, visited=None):
 # Single-page processor — fetch one URL, scan, return next candidates
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_page(url, session, visited, hits, best, referer=None):
+def _process_page(url, session, visited, hits, best, referer=None,
+                  seen_ext_domains=None, company_root=None):
     """
     Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
     Records hits into shared dicts. Returns scored next-page candidates.
     Does NOT recurse — BFS queue in detect_company drives traversal.
+
+    seen_ext_domains / company_root enable external-signal novelty pruning:
+    if a page introduces no new external hostnames AND a complete ATS hit
+    already exists, its candidates are dropped — the page is structurally
+    identical to pages already processed and cannot reveal a new ATS.
     """
     _url_ext = url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in url else ""
     if _url_ext in {"jpg", "jpeg", "png", "gif", "svg", "webp", "ico",
@@ -707,6 +713,26 @@ def _process_page(url, session, visited, hits, best, referer=None):
         logger.debug("[detector] API probe page=%d path=%s", len(visited), path)
         _handle(scan(resp), "API")
 
+    # ── External signal novelty ──────────────────────────────────────────────
+    # Enqueue candidates only if this page introduces new external hostnames
+    # OR no complete ATS hit exists yet.
+    #
+    # "New external hostname" = any host outside company_root not seen before
+    # on any prior page.  Locale variants (ar-es/careers, au-en/careers) and
+    # culture pages reference the same CDN + ATS hosts as the pages already
+    # visited → zero new hosts → candidates dropped, cascade stopped.
+    #
+    # Multi-ATS is preserved: a page pointing to nomuracampus.tal.net (never
+    # seen) always passes — it's a genuinely new external integration point.
+    if seen_ext_domains is not None and company_root:
+        page_ext = _extract_external_domains(html, company_root)
+        new_ext  = page_ext - seen_ext_domains
+        seen_ext_domains.update(page_ext)
+        if not new_ext and hits:
+            logger.debug("[detector] ext-novelty: no new ext domains + hit exists"
+                         " — pruning candidates from %s", final_url)
+            return []
+
     candidates = find_next_pages(html, final_url, visited)
     logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
     return [(c, final_url) for c in candidates]
@@ -721,6 +747,35 @@ _PAGINATION_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _PAGE_PATH_RE = re.compile(r'/page/\d+(?:/|$)', re.IGNORECASE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# External signal novelty — only keep exploring from pages that introduce new
+# external domain references (the dynamic signal for a new ATS integration)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EXT_URL_RE = re.compile(
+    r'(?:src|href|action|data-src)=["\']https?://([^/"\'#\s>]+)',
+    re.IGNORECASE,
+)
+
+
+def _extract_external_domains(html, company_root):
+    """
+    Return all external hostnames referenced in html that don't belong to
+    company_root (e.g. 'accenture.com').
+
+    These are the integration points where a career site connects to outside
+    systems — ATS platforms, CDN, analytics, etc.  When a page introduces
+    zero new hostnames compared to everything seen so far, it is structurally
+    identical to pages already processed and cannot reveal a new ATS.
+    """
+    external = set()
+    for host in _EXT_URL_RE.findall(html):
+        parts    = host.split('.')
+        host_root = '.'.join(parts[-2:]) if len(parts) >= 2 else host
+        if host_root != company_root:
+            external.add(host)
+    return external
 
 
 def _url_template(url):
@@ -839,7 +894,9 @@ def detect_company(company_domain, session=None):
     if session is None:
         session = _make_session()
 
+    company_root       = '.'.join(domain.split('.')[-2:])  # e.g. 'accenture.com'
     visited            = set()  # prevents re-fetching any URL
+    seen_ext_domains   = set()  # external hostnames seen across all pages
     hits               = {}     # (platform, slug) → {platform, slug, source_url}
     best               = [None] # fallback partial
     pagination_roots   = {}     # listing root → paginated pages seen
@@ -862,7 +919,10 @@ def detect_company(company_domain, session=None):
         url, referer = queue.popleft()
         if url in visited:
             continue
-        next_candidates = _process_page(url, session, visited, hits, best, referer)
+        next_candidates = _process_page(
+            url, session, visited, hits, best, referer,
+            seen_ext_domains=seen_ext_domains, company_root=company_root,
+        )
         filtered = _filter_listing_candidates(
             next_candidates, pagination_roots, sampled_patterns, confirmed_patterns
         )
