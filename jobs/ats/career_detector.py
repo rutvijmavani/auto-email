@@ -35,6 +35,44 @@ except ImportError:
     import requests as _requests
     _CURL_AVAILABLE = False
 
+try:
+    import requests as _requests_plain
+    from config import CF_WORKER_URL as _CF_WORKER_URL, CF_WORKER_SECRET as _CF_WORKER_SECRET
+except Exception:
+    _requests_plain = None
+    _CF_WORKER_URL = ""
+    _CF_WORKER_SECRET = ""
+
+
+def _fetch_via_worker(url: str) -> tuple[str, str] | None:
+    """Proxy a URL fetch through the Cloudflare probe Worker.
+
+    Used as fallback when career site IP-blocks the OCI/local IP (429/403).
+    Returns (html_text, final_url) or None.
+    """
+    if not _CF_WORKER_URL or not _CF_WORKER_SECRET or not _requests_plain:
+        return None
+    try:
+        resp = _requests_plain.post(
+            _CF_WORKER_URL,
+            json={"url": url, "max_bytes": 131072},
+            headers={"Authorization": f"Bearer {_CF_WORKER_SECRET}"},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("error") or (data.get("status") or 0) >= 400:
+            logger.debug("[detector] CF Worker: %s → error=%s status=%s",
+                         url, data.get("error"), data.get("status"))
+            return None
+        body = data.get("body") or ""
+        final_url = data.get("final_url") or url
+        logger.debug("[detector] CF Worker: %s → %s (status=%s)",
+                     url, final_url, data.get("status"))
+        return body, final_url
+    except Exception as exc:
+        logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
+        return None
+
 def _make_session():
     if _CURL_AVAILABLE:
         return _CurlSession(impersonate="chrome124")
@@ -410,6 +448,11 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         resp = _get(url)
         if resp.status_code == 200:
             return resp.text, resp.url
+        logger.debug("[detector] %s → HTTP %s", url, resp.status_code)
+        if resp.status_code in (429, 403):
+            result = _fetch_via_worker(url)
+            if result:
+                return result
         return None, url
     except Exception as e:
         # SSL fallback to HTTP
@@ -421,6 +464,10 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             except Exception:
                 pass
         logger.debug("[detector] fetch error %s: %s", url, e)
+        # Network-level failure — try CF Worker (handles IP blocks, DNS fails)
+        result = _fetch_via_worker(url)
+        if result:
+            return result
         return None, url
 
 
