@@ -630,12 +630,6 @@ def find_next_pages(html, current_url, visited=None):
             if phrase in anchor:
                 score += pts
 
-        # Bonus for external brand-family domains — cross-domain career portals
-        # (nomuraholdings.com from nomura.com) are more likely to be the actual
-        # job portal than internal brochure subpages with identical URL scores.
-        if parsed.netloc != base_domain:
-            score += 3
-
         if score >= 2:
             scored[absolute] = max(scored.get(absolute, 0), score)
 
@@ -643,81 +637,51 @@ def find_next_pages(html, current_url, visited=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main detect loop
+# Single-page processor — fetch one URL, scan, return next candidates
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect(start_url, session=None, visited=None, _hits=None, _best=None, _referer=None, _max_pages=None):
+def _process_page(url, session, visited, hits, best, referer=None):
     """
-    Crawl start_url and accumulate every ATS platform found into _hits.
-
-    Terminators:
-      - len(visited) >= _max_pages  (page budget exhausted)
-      - find_next_pages returns empty  (no more scored candidates)
-
-    A complete hit (slug != "") is recorded but never stops the crawl — we
-    exhaust all possibilities so multi-ATS companies (e.g. Nomura: TALapply
-    for campus + SuccessFactors for experienced) are fully discovered.
-
-    slug == ""  → partial hit; stored in _best as fallback, crawl continues.
-
-    _hits / _best / _referer / _max_pages are internal — do not pass from outside.
+    Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
+    Records hits into shared dicts. Returns scored next-page candidates.
+    Does NOT recurse — BFS queue in detect_company drives traversal.
     """
-    if session is None:
-        session = _make_session()
-    if visited is None:
-        visited = set()
-    if _hits is None:
-        _hits = {}   # (platform, slug) → {platform, slug, source_url}
-    if _best is None:
-        _best = [None]
-    if _max_pages is None:
-        _max_pages = _MAX_PAGES
-
-    if start_url in visited:
-        return
-    if len(visited) >= _max_pages:
-        return
-
-    # Skip binary resources before fetching — catches redirect destinations too
-    _url_ext = start_url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in start_url else ""
+    _url_ext = url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in url else ""
     if _url_ext in {"jpg", "jpeg", "png", "gif", "svg", "webp", "ico",
                     "pdf", "zip", "mp4", "mp3", "woff", "woff2"}:
-        return
+        return []
 
-    visited.add(start_url)
+    if url in visited:
+        return []
+    visited.add(url)
 
-    html, final_url = _fetch(start_url, session, referer=_referer)
+    html, final_url = _fetch(url, session, referer=referer)
     if not html:
-        return
+        return []
 
-    # Track final URL (post-redirect) — prevents re-crawling the same page
-    # reached via different paths. Guard: only check when a redirect actually
-    # occurred (final_url != start_url) — start_url is already in visited.
-    if final_url != start_url and final_url in visited:
-        return
+    if final_url != url and final_url in visited:
+        return []
     visited.add(final_url)
     logger.debug("[detector] page=%d url=%s", len(visited), final_url)
 
     def _handle(result, source_label):
-        """Record a scan result. Complete hits go into _hits; partials into _best."""
         if not result:
             return
         if result["slug"]:
             key = (result["platform"], result["slug"])
-            if key not in _hits:
-                _hits[key] = {**result, "source_url": final_url}
+            if key not in hits:
+                hits[key] = {**result, "source_url": final_url}
                 logger.info("[detector] HIT (%s) page=%d platform=%s slug=%s url=%s",
                             source_label, len(visited), result["platform"], result["slug"], final_url)
-        elif _best[0] is None:
+        elif best[0] is None:
             logger.debug("[detector] PARTIAL (%s) page=%d platform=%s — continuing for slug",
                          source_label, len(visited), result["platform"])
-            _best[0] = result
+            best[0] = result
 
     # 1. Scan raw HTML
     _handle(scan(html), "HTML")
 
-    # 2. Scan JS bundles — fetch with script headers + Referer = page that loaded them
-    #    Also extract API endpoint paths from bundle source for step 2b.
+    # 2. Scan JS bundles
     api_paths = []
     for src in _script_srcs(html, final_url):
         bundle, _ = _fetch(src, session, referer=final_url, is_script=True)
@@ -726,9 +690,7 @@ def detect(start_url, session=None, visited=None, _hits=None, _best=None, _refer
         _handle(scan(bundle), "JS bundle")
         api_paths.extend(_extract_api_paths(bundle))
 
-    # 2b. Probe API endpoints discovered in bundles.
-    #     Session already holds cookies from the page visit — same auth as the JS uses.
-    #     This surfaces ATS config that SPAs fetch at runtime without us running any JS.
+    # 2b. Probe API endpoints discovered in bundles
     seen_api = set()
     for path in api_paths:
         if path in seen_api:
@@ -741,20 +703,23 @@ def detect(start_url, session=None, visited=None, _hits=None, _best=None, _refer
         logger.debug("[detector] API probe page=%d path=%s", len(visited), path)
         _handle(scan(resp), "API")
 
-    # 3. Navigate deeper — recurse into ALL scored candidates, no early exit on hit
     candidates = find_next_pages(html, final_url, visited)
     logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
-    for next_url in candidates:
-        detect(next_url, session, visited, _hits, _best, _referer=final_url, _max_pages=_max_pages)
+    # Return (next_url, referer) pairs for the BFS queue
+    return [(c, final_url) for c in candidates]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BFS driver — breadth-first so sibling branches share the page budget
+# ─────────────────────────────────────────────────────────────────────────────
 
 def detect_company(company_domain, session=None):
     """
     Detect all ATS platforms for a company given only its domain.
 
-    Probes all standard career paths then career subdomains. A shared visited
-    set, _hits dict, and _best partial are threaded through every probe so we
-    never re-crawl and always collect every platform encountered.
+    Uses BFS so all candidates at depth N are explored before any at depth N+1.
+    This guarantees siblings (e.g. nomura.com early-careers AND nomuraholdings.com)
+    share the page budget rather than one branch consuming it all via DFS.
 
     Args:
         company_domain: e.g. "stripe.com" (no https://)
@@ -763,28 +728,34 @@ def detect_company(company_domain, session=None):
     Returns:
         List of {"platform": ..., "slug": ..., "source_url": ...}
         — one entry per unique (platform, slug) pair found across the full crawl.
-        — slug may be "" if the platform was detected but the tenant URL was not found.
+        — slug="" if platform detected but tenant URL not found (partial).
         — empty list if nothing found.
     """
+    from collections import deque
+
     domain = company_domain.lower().strip()
     domain = re.sub(r'^https?://', '', domain).rstrip('/')
     if session is None:
         session = _make_session()
 
-    visited = set()   # shared — prevents re-crawling the same pages across probes
-    hits    = {}      # (platform, slug) → result — accumulates every unique ATS found
-    best    = [None]  # fallback partial (platform known, slug not found)
+    visited = set()
+    hits    = {}      # (platform, slug) → {platform, slug, source_url}
+    best    = [None]  # fallback partial
 
-    # 1. Standard paths on main domain
+    # Seed the BFS queue: (url, referer)
+    queue = deque()
     for path in CAREER_PATHS:
-        url = f"https://{domain}{path}"
-        detect(url, session, visited=visited, _hits=hits, _best=best)
-
-    # 2. Career subdomains
+        queue.append((f"https://{domain}{path}", None))
     root = domain.split(".")[-2] + "." + domain.split(".")[-1]
     for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-        url = f"https://{subdomain}.{root}"
-        detect(url, session, visited=visited, _hits=hits, _best=best)
+        queue.append((f"https://{subdomain}.{root}", None))
+
+    while queue and len(visited) < _MAX_PAGES:
+        url, referer = queue.popleft()
+        if url in visited:
+            continue
+        next_candidates = _process_page(url, session, visited, hits, best, referer)
+        queue.extend(next_candidates)
 
     if hits:
         logger.info("[detector] DONE domain=%s found=%d platform(s): %s",
