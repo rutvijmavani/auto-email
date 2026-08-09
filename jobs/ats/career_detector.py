@@ -212,20 +212,20 @@ def _extract_workday(text):
 
 
 def _extract_greenhouse(text):
-    # Script src / iframe src embed pattern
-    m = re.search(
-        r'(?:boards|job-boards)\.greenhouse\.io/(?:embed/job_board(?:/js)?[^"\'<>\s]*[?&]for=|)([a-zA-Z0-9_-]+)',
-        text, re.IGNORECASE,
-    )
-    if m:
-        slug = m.group(1).split("&")[0].split("?")[0]
-        return {"platform": "greenhouse", "slug": slug}
-    # __NEXT_DATA__ / JSON blob with greenhouseId
-    m = re.search(r'"greenhouseId"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    # Pattern 1: for= query param — most reliable, covers both embed variants:
+    #   job-boards.greenhouse.io/embed/job_app?for=<slug>   (more common)
+    #   job-boards.greenhouse.io/embed/job_board?for=<slug>
+    m = re.search(r'greenhouse\.io[^"\'<>\s]*[?&]for=([^&"\'<>\s]+)', text, re.IGNORECASE)
     if m:
         return {"platform": "greenhouse", "slug": m.group(1)}
-    # Generic greenhouse.io URL with for= param anywhere in text
-    m = re.search(r'greenhouse\.io[^"\'<>\s]*[?&]for=([^&"\'<>\s]+)', text, re.IGNORECASE)
+    # Pattern 2: path-based boards URL — boards.greenhouse.io/<slug>/jobs
+    m = re.search(r'boards\.greenhouse\.io/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m:
+        slug = m.group(1)
+        if slug.lower() not in ("embed", "js"):  # guard against misparse
+            return {"platform": "greenhouse", "slug": slug}
+    # Pattern 3: __NEXT_DATA__ / JSON blob with greenhouseId
+    m = re.search(r'"greenhouseId"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
     if m:
         return {"platform": "greenhouse", "slug": m.group(1)}
     return None
@@ -593,6 +593,12 @@ def find_next_pages(html, current_url, visited=None):
 
         absolute = urljoin(current_url, href)
         parsed   = urlparse(absolute)
+
+        # Belt-and-suspenders: filter image/media/doc files by parsed path extension
+        _path_ext = parsed.path.rsplit(".", 1)[-1].lower() if "." in parsed.path else ""
+        if _path_ext in {"jpg", "jpeg", "png", "gif", "svg", "webp", "ico",
+                         "pdf", "zip", "mp4", "mp3", "woff", "woff2"}:
+            continue
 
         # Allow same domain OR brand-family domain
         if parsed.netloc != base_domain and brand not in parsed.netloc:
