@@ -124,12 +124,16 @@ try:
         FETCH_TIMEOUT as _FETCH_TIMEOUT,
         CAREER_DETECTOR_MAX_JS_BUNDLES as _MAX_JS_BUNDLES,
         CAREER_DETECTOR_MAX_API_PROBES as _MAX_API_PROBES,
+        CAREER_DETECTOR_LISTING_PAGES as _N_LISTING_PAGES,
+        CAREER_DETECTOR_DETAIL_SAMPLE as _M_DETAIL_SAMPLE,
     )
 except Exception:
-    _MAX_PAGES      = 25
-    _FETCH_TIMEOUT  = 15
-    _MAX_JS_BUNDLES = 15
-    _MAX_API_PROBES = 10
+    _MAX_PAGES        = 25
+    _FETCH_TIMEOUT    = 15
+    _MAX_JS_BUNDLES   = 15
+    _MAX_API_PROBES   = 10
+    _N_LISTING_PAGES  = 2   # paginated listing pages to process before stopping pagination
+    _M_DETAIL_SAMPLE  = 3   # job detail pages to sample per URL template before stopping
 
 FETCH_TIMEOUT  = _FETCH_TIMEOUT
 MAX_JS_BUNDLES = _MAX_JS_BUNDLES
@@ -705,8 +709,105 @@ def _process_page(url, session, visited, hits, best, referer=None):
 
     candidates = find_next_pages(html, final_url, visited)
     logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
-    # Return (next_url, referer) pairs for the BFS queue
     return [(c, final_url) for c in candidates]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Listing-page sampling — prevent crawling 250 identical job detail pages
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PAGINATION_PARAM_RE = re.compile(
+    r'[?&](page|p|pg|offset|start|from)=\d+',
+    re.IGNORECASE,
+)
+_PAGE_PATH_RE = re.compile(r'/page/\d+(?:/|$)', re.IGNORECASE)
+
+
+def _url_template(url):
+    """
+    Normalise variable path segments so structurally identical job-listing URLs
+    share a template string.
+
+      /careers/listing/ai-engineer/8044460  →  .../careers/listing/{slug}/{id}
+      /job/12345                             →  .../job/{id}
+      /careers/americas/                     →  .../careers/americas/   (unchanged)
+    """
+    parsed = urlparse(url)
+    parts  = [p for p in parsed.path.split('/') if p]
+    out    = []
+    for part in parts:
+        if re.match(r'^\d+$', part):
+            out.append('{id}')
+        elif len(part) > 20 and part.count('-') >= 2:
+            out.append('{slug}')
+        else:
+            out.append(part)
+    return parsed.netloc + '/' + '/'.join(out)
+
+
+def _pagination_root(url):
+    """Strip page/offset params so paginated URLs collapse to their listing root."""
+    cleaned = _PAGINATION_PARAM_RE.sub('', url)
+    cleaned = _PAGE_PATH_RE.sub('/', cleaned)
+    return re.sub(r'[?&]+$', '', cleaned).rstrip('/')
+
+
+def _filter_listing_candidates(candidates, pagination_roots, sampled_patterns, confirmed_patterns):
+    """
+    Gate BFS candidates to prevent runaway crawling of paginated job listings.
+
+    Three candidate types:
+      1. Pagination links (?page=N, /page/N) — follow at most _N_LISTING_PAGES per root.
+      2. Job detail links  — URL template appears 3+ times in one batch (cluster signal).
+                            Sample at most _M_DETAIL_SAMPLE per template across all batches.
+                            Once sampled, add to confirmed_patterns and drop all further matches.
+      3. Everything else   — navigation, subdomains, regional sections — always pass through.
+
+    Termination does NOT require a slug hit first. Pattern confirmation (same URL structure
+    repeated across enough pages) is sufficient — if we've seen 3 sample detail pages and
+    found nothing, the remaining 247 will almost certainly yield nothing either.
+    """
+    from collections import Counter
+
+    # Detect which templates appear ≥ 3 times in this batch → job listing cluster
+    template_counts = Counter(_url_template(url) for url, _ in candidates)
+    batch_job_templates = {t for t, c in template_counts.items() if c >= 3}
+
+    filtered = []
+    for url, referer in candidates:
+        # ── Pagination link ──────────────────────────────────────────────────
+        if _PAGINATION_PARAM_RE.search(url) or _PAGE_PATH_RE.search(url):
+            root = _pagination_root(url)
+            seen = pagination_roots.get(root, 0)
+            if seen >= _N_LISTING_PAGES:
+                logger.debug("[detector] listing-cap: dropping pagination %s (root seen %d×)", url, seen)
+                continue
+            pagination_roots[root] = seen + 1
+            filtered.append((url, referer))
+            continue
+
+        # ── Job detail link ──────────────────────────────────────────────────
+        template = _url_template(url)
+        is_job = (
+            template in batch_job_templates
+            or template in sampled_patterns
+            or template in confirmed_patterns
+        )
+        if is_job:
+            if template in confirmed_patterns:
+                logger.debug("[detector] listing-cap: dropping confirmed-pattern %s", url)
+                continue
+            count = sampled_patterns.get(template, 0)
+            if count >= _M_DETAIL_SAMPLE:
+                confirmed_patterns.add(template)
+                logger.debug("[detector] listing-cap: pattern confirmed %s — dropping %s", template, url)
+                continue
+            sampled_patterns[template] = count + 1
+
+        # ── Navigation / everything else ─────────────────────────────────────
+        filtered.append((url, referer))
+
+    return filtered
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,9 +839,12 @@ def detect_company(company_domain, session=None):
     if session is None:
         session = _make_session()
 
-    visited = set()
-    hits    = {}      # (platform, slug) → {platform, slug, source_url}
-    best    = [None]  # fallback partial
+    visited            = set()  # prevents re-fetching any URL
+    hits               = {}     # (platform, slug) → {platform, slug, source_url}
+    best               = [None] # fallback partial
+    pagination_roots   = {}     # listing root → paginated pages seen
+    sampled_patterns   = {}     # url template  → detail pages sampled
+    confirmed_patterns = set()  # templates fully sampled — drop all further matches
 
     # Seed the BFS queue: (url, referer)
     queue = deque()
@@ -750,12 +854,19 @@ def detect_company(company_domain, session=None):
     for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
         queue.append((f"https://{subdomain}.{root}", None))
 
-    while queue and len(visited) < _MAX_PAGES:
+    # No page budget — BFS runs until the queue is empty (natural leaf termination).
+    # _filter_listing_candidates caps paginated job listings so we don't crawl 250
+    # identical job detail pages; all other branches (regions, subdomains, nav) are
+    # followed completely. visited dedup prevents cycles.
+    while queue:
         url, referer = queue.popleft()
         if url in visited:
             continue
         next_candidates = _process_page(url, session, visited, hits, best, referer)
-        queue.extend(next_candidates)
+        filtered = _filter_listing_candidates(
+            next_candidates, pagination_roots, sampled_patterns, confirmed_patterns
+        )
+        queue.extend(filtered)
 
     if hits:
         logger.info("[detector] DONE domain=%s found=%d platform(s): %s",
