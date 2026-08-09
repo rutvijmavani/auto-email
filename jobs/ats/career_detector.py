@@ -670,6 +670,13 @@ def detect(start_url, session=None, visited=None, _best=None, _referer=None, _ma
     if len(visited) >= _max_pages:
         logger.debug("[detector] page budget exhausted (%d pages)", len(visited))
         return _best[0]
+
+    # Skip non-HTML resources before fetching — catches redirect destinations too
+    _url_ext = start_url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in start_url else ""
+    if _url_ext in {"jpg", "jpeg", "png", "gif", "svg", "webp", "ico",
+                    "pdf", "zip", "mp4", "mp3", "woff", "woff2"}:
+        return _best[0]
+
     visited.add(start_url)
 
     html, final_url = _fetch(start_url, session, referer=_referer)

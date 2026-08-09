@@ -7,7 +7,7 @@ TESTS = [
     ("accenture.com",   "workday"),
     ("stripe.com",      "greenhouse"),
     ("spotify.com",     "lever"),
-    ("agco.com",        "successfactors"),
+    ("nomura.com",      "successfactors"),
     ("ashbyhq.com",     "ashby"),
     ("notion.so",       "greenhouse"),
     ("figma.com",       "greenhouse"),
