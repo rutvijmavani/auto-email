@@ -118,10 +118,22 @@ _API_HEADERS = {
     "Sec-Ch-Ua-Platform": '"Windows"',
 }
 
-FETCH_TIMEOUT  = 15
-MAX_DEPTH      = 3       # career → listing → JD → apply
-MAX_JS_BUNDLES = 15      # increased — SPAs can have many relevant bundles
-MAX_API_PROBES = 10      # max API endpoint paths to try per page
+try:
+    from config import (
+        CAREER_DETECTOR_MAX_PAGES as _MAX_PAGES,
+        FETCH_TIMEOUT as _FETCH_TIMEOUT,
+        CAREER_DETECTOR_MAX_JS_BUNDLES as _MAX_JS_BUNDLES,
+        CAREER_DETECTOR_MAX_API_PROBES as _MAX_API_PROBES,
+    )
+except Exception:
+    _MAX_PAGES      = 25
+    _FETCH_TIMEOUT  = 15
+    _MAX_JS_BUNDLES = 15
+    _MAX_API_PROBES = 10
+
+FETCH_TIMEOUT  = _FETCH_TIMEOUT
+MAX_JS_BUNDLES = _MAX_JS_BUNDLES
+MAX_API_PROBES = _MAX_API_PROBES
 
 # JS bundle URLs containing these strings are analytics/infra — skip them
 # NOTE: do NOT add "chunk" here — webpack app bundles are named *.chunk.js
@@ -529,7 +541,8 @@ _ANCHOR_SCORES = {
 
 _SKIP_HREF = re.compile(
     r'^(?:#|mailto:|tel:|javascript:)|'
-    r'(?:facebook|twitter|linkedin|instagram|youtube|tiktok)\.com',
+    r'(?:facebook|twitter|linkedin|instagram|youtube|tiktok)\.com|'
+    r'\.(?:jpg|jpeg|png|gif|svg|webp|ico|pdf|zip|mp4|mp3|woff2?)(?:[?#]|$)',
     re.IGNORECASE,
 )
 
@@ -619,30 +632,37 @@ def find_next_pages(html, current_url, visited=None):
 # Main detect loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect(start_url, session=None, depth=0, visited=None, _best=None, _referer=None):
+def detect(start_url, session=None, visited=None, _best=None, _referer=None, _max_pages=None):
     """
     Detect ATS for a single URL. Behaves like a real Chrome browser:
       - Carries cookies automatically (session jar)
       - Sends Referer on every navigation
       - Sends correct Sec-Fetch-* headers per request type
 
+    Crawl terminates when:
+      - ATS found (complete hit)
+      - No more scored candidates (signal died naturally)
+      - len(visited) >= _max_pages (safety budget from config, not a depth limit)
+
     slug != ""  → complete hit, return immediately
     slug == ""  → partial (platform found, no tenant slug yet); keep navigating
     None        → no ATS found in this branch
 
-    _best / _referer are internal — do not pass from outside.
+    _best / _referer / _max_pages are internal — do not pass from outside.
     """
-    if depth > MAX_DEPTH:
-        return _best[0] if _best else None
-
     if session is None:
         session = _make_session()
     if visited is None:
         visited = set()
     if _best is None:
         _best = [None]
+    if _max_pages is None:
+        _max_pages = _MAX_PAGES
 
     if start_url in visited:
+        return _best[0]
+    if len(visited) >= _max_pages:
+        logger.debug("[detector] page budget exhausted (%d pages)", len(visited))
         return _best[0]
     visited.add(start_url)
 
@@ -650,19 +670,22 @@ def detect(start_url, session=None, depth=0, visited=None, _best=None, _referer=
     if not html:
         return _best[0]
 
+    # Track final URL (post-redirect) — prevents re-crawling pages reached via different paths
+    if final_url in visited:
+        return _best[0]
     visited.add(final_url)
-    logger.debug("[detector] depth=%d url=%s", depth, final_url)
+    logger.debug("[detector] page=%d url=%s", len(visited), final_url)
 
     def _handle(result, source_label):
         if not result:
             return None
         if result["slug"]:
-            logger.info("[detector] HIT (%s) depth=%d platform=%s slug=%s url=%s",
-                        source_label, depth, result["platform"], result["slug"], final_url)
+            logger.info("[detector] HIT (%s) page=%d platform=%s slug=%s url=%s",
+                        source_label, len(visited), result["platform"], result["slug"], final_url)
             return result
         if _best[0] is None:
-            logger.debug("[detector] PARTIAL (%s) depth=%d platform=%s — continuing for slug",
-                         source_label, depth, result["platform"])
+            logger.debug("[detector] PARTIAL (%s) page=%d platform=%s — continuing for slug",
+                         source_label, len(visited), result["platform"])
             _best[0] = result
         return None
 
@@ -695,20 +718,20 @@ def detect(start_url, session=None, depth=0, visited=None, _best=None, _referer=
         resp, _ = _fetch(api_url, session, referer=final_url, is_api=True)
         if not resp:
             continue
-        logger.debug("[detector] API probe depth=%d path=%s", depth, path)
+        logger.debug("[detector] API probe page=%d path=%s", len(visited), path)
         hit = _handle(scan(resp), "API")
         if hit:
             return hit
 
     # 3. Navigate deeper — pass current page as Referer to each child, just like Chrome
     candidates = find_next_pages(html, final_url, visited)
-    logger.debug("[detector] candidates depth=%d: %s", depth, candidates[:5])
+    logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
     for next_url in candidates:
-        result = detect(next_url, session, depth + 1, visited, _best, _referer=final_url)
+        result = detect(next_url, session, visited, _best, _referer=final_url, _max_pages=_max_pages)
         if result and result["slug"]:
             return result
 
-    logger.debug("[detector] MISS depth=%d url=%s", depth, final_url)
+    logger.debug("[detector] MISS page=%d url=%s", len(visited), final_url)
     return _best[0]
 
 
@@ -742,7 +765,7 @@ def detect_company(company_domain, session=None):
     # 1. Standard paths on main domain
     for path in CAREER_PATHS:
         url = f"https://{domain}{path}"
-        result = detect(url, session, depth=0, visited=visited, _best=best)
+        result = detect(url, session, visited=visited, _best=best)
         if result and result["slug"]:  # complete hit
             return result
 
@@ -750,7 +773,7 @@ def detect_company(company_domain, session=None):
     root = domain.split(".")[-2] + "." + domain.split(".")[-1]
     for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
         url = f"https://{subdomain}.{root}"
-        result = detect(url, session, depth=0, visited=visited, _best=best)
+        result = detect(url, session, visited=visited, _best=best)
         if result and result["slug"]:
             return result
 
