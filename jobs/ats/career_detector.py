@@ -1,0 +1,710 @@
+# jobs/ats/career_detector.py — Universal ATS detector
+#
+# Algorithm (same logic at every page level):
+#
+#   for each level (career → listing → JD → apply):
+#       page_text = fetch(url)
+#       result = scan(page_text)          ← full raw-text keyword search
+#       if result: return result
+#
+#       for src in script_srcs(page_text):
+#           result = scan(fetch(src))     ← JS bundle scan (catches Lever/Spotify)
+#           if result: return result
+#
+#       next_url = find_next_page(page_text, current_url)   ← scoring-based
+#
+# No BeautifulSoup. No Playwright. Pure requests + re.
+
+import re
+import json
+import logging
+from html import unescape as _html_unescape
+from urllib.parse import urljoin, urlparse
+
+from jobs.career_page import CAREER_PATHS
+
+logger = logging.getLogger(__name__)
+
+# ─── Chrome impersonation ─────────────────────────────────────────────────────
+# curl_cffi matches Chrome's TLS fingerprint (JA3) + HTTP/2 — urllib3 is
+# fingerprinted immediately by Cloudflare/Akamai even with a Chrome UA.
+try:
+    from curl_cffi.requests import Session as _CurlSession
+    _CURL_AVAILABLE = True
+except ImportError:
+    import requests as _requests
+    _CURL_AVAILABLE = False
+
+def _make_session():
+    if _CURL_AVAILABLE:
+        return _CurlSession(impersonate="chrome124")
+    return _requests.Session()
+
+# Headers for HTML page navigation — mirrors what Chrome sends on a user click
+_NAV_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;"
+        "q=0.8,application/signed-exchange;v=b3;q=0.7"
+    ),
+    "Accept-Language":           "en-US,en;q=0.9",
+    "Cache-Control":             "max-age=0",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest":            "document",
+    "Sec-Fetch-Mode":            "navigate",
+    "Sec-Fetch-User":            "?1",
+    "Sec-Ch-Ua":                 '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":          "?0",
+    "Sec-Ch-Ua-Platform":        '"Windows"',
+}
+
+# Headers for <script src> bundle fetches
+_SCRIPT_HEADERS = {
+    "Accept":            "*/*",
+    "Accept-Language":   "en-US,en;q=0.9",
+    "Sec-Fetch-Dest":    "script",
+    "Sec-Fetch-Mode":    "no-cors",
+    "Sec-Ch-Ua":         '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":  "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+# Headers for XHR/fetch API calls made by JS — same-origin CORS requests
+_API_HEADERS = {
+    "Accept":            "application/json, text/plain, */*",
+    "Accept-Language":   "en-US,en;q=0.9",
+    "Sec-Fetch-Dest":    "empty",
+    "Sec-Fetch-Mode":    "cors",
+    "Sec-Ch-Ua":         '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile":  "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+FETCH_TIMEOUT  = 15
+MAX_DEPTH      = 3       # career → listing → JD → apply
+MAX_JS_BUNDLES = 15      # increased — SPAs can have many relevant bundles
+MAX_API_PROBES = 10      # max API endpoint paths to try per page
+
+# JS bundle URLs containing these strings are analytics/infra — skip them
+# NOTE: do NOT add "chunk" here — webpack app bundles are named *.chunk.js
+# and those ARE the files where ATS strings live
+_BUNDLE_SKIP = (
+    "analytics", "tracking", "gtm", "google-tag", "fonts",
+    "recaptcha", "zendesk", "intercom", "hotjar", "segment",
+    "sentry", "datadog", "polyfill",
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API endpoint discovery — static analysis of JS bundles
+#
+# SPAs call internal APIs to load ATS config at runtime. The endpoint URL is a
+# string constant in the bundle. We find it, call it with the session (which
+# already has cookies from the page visit), and scan the JSON response — exactly
+# what the JS would have done, without executing any JS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Match string literals that look like internal API paths
+_API_PATH_RE = re.compile(
+    r'''["'`](\/(?:api|v\d+)\/[a-zA-Z0-9_./?=&%-]{3,100})["'`]''',
+    re.IGNORECASE,
+)
+
+# Only probe paths that mention career/job concepts — avoids noise
+_API_CAREER_KW = frozenset((
+    "career", "job", "jobs", "recruit", "apply", "hire",
+    "talent", "requisition", "ats", "position", "opening",
+))
+
+
+def _extract_api_paths(bundle_text):
+    """
+    Find candidate API endpoint paths in a JS bundle by looking for string
+    literals under /api/ or /v{N}/ that contain career-related keywords.
+    Returns deduplicated list capped at MAX_API_PROBES.
+    """
+    seen = set()
+    results = []
+    for m in _API_PATH_RE.finditer(bundle_text):
+        path = m.group(1)
+        if path in seen:
+            continue
+        seen.add(path)
+        if any(kw in path.lower() for kw in _API_CAREER_KW):
+            results.append(path)
+            if len(results) >= MAX_API_PROBES:
+                break
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extractor functions — called after keyword match confirms the platform
+# Each takes raw text, returns {"platform": ..., "slug": ...} or None
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_workday(text):
+    m = re.search(
+        r'([a-z0-9-]+)\.(wd\d+)\.myworkdayjobs\.com/([a-zA-Z0-9_%-][a-zA-Z0-9_%-]*)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        slug = json.dumps({"slug": m.group(1), "wd": m.group(2), "path": m.group(3)})
+        return {"platform": "workday", "slug": slug}
+    # alternate myworkdaysite.com domain
+    m = re.search(
+        r'(wd\d+)\.myworkdaysite\.com/recruiting/([a-z0-9-]+)/([a-zA-Z0-9_%-]*)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        slug = json.dumps({"slug": m.group(2), "wd": m.group(1), "path": m.group(3)})
+        return {"platform": "workday", "slug": slug}
+    return None
+
+
+def _extract_greenhouse(text):
+    # Script src / iframe src embed pattern
+    m = re.search(
+        r'(?:boards|job-boards)\.greenhouse\.io/(?:embed/job_board(?:/js)?[^"\'<>\s]*[?&]for=|)([a-zA-Z0-9_-]+)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        slug = m.group(1).split("&")[0].split("?")[0]
+        return {"platform": "greenhouse", "slug": slug}
+    # __NEXT_DATA__ / JSON blob with greenhouseId
+    m = re.search(r'"greenhouseId"\s*:\s*"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        return {"platform": "greenhouse", "slug": m.group(1)}
+    # Generic greenhouse.io URL with for= param anywhere in text
+    m = re.search(r'greenhouse\.io[^"\'<>\s]*[?&]for=([^&"\'<>\s]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "greenhouse", "slug": m.group(1)}
+    return None
+
+
+def _extract_successfactors(text):
+    # j2w.init({ssoCompanyId: ..., ssoUrl: ...}) — canonical fingerprint
+    m_slug = re.search(r'["\']?ssoCompanyId["\']?\s*:\s*["\']([^"\']+)["\']', text, re.IGNORECASE)
+    m_url  = re.search(
+        r'["\']?ssoUrl["\']?\s*:\s*["\']https?://career(\d+)\.successfactors\.(com|eu)["\']',
+        text, re.IGNORECASE,
+    )
+    if m_slug and m_url:
+        slug = json.dumps({"slug": m_slug.group(1), "dc": m_url.group(1), "region": m_url.group(2)})
+        return {"platform": "successfactors", "slug": slug}
+    # Hosted SF URL: career{N}.successfactors.com/careers?company={slug}
+    m = re.search(
+        r'career(\d+)\.successfactors\.(com|eu)/careers?\?[^"\'<>\s]*company=([^&"\'<>\s]+)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        # Filter out staging slugs
+        slug_val = m.group(3)
+        if any(x in slug_val.upper() for x in ("UAT", "SUAT", "DEV", "STG", "TEST")):
+            return None
+        slug = json.dumps({"slug": slug_val, "dc": m.group(1), "region": m.group(2)})
+        return {"platform": "successfactors", "slug": slug}
+    return None
+
+
+def _extract_lever(text):
+    m = re.search(r'(?:jobs|hire)\.lever\.co/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "lever", "slug": m.group(1)}
+    return None
+
+
+def _extract_smartrecruiters(text):
+    m = re.search(r'jobs\.smartrecruiters\.com/([a-zA-Z0-9_-]+)/', text, re.IGNORECASE)
+    if m:
+        return {"platform": "smartrecruiters", "slug": m.group(1)}
+    # careers.smartrecruiters.com/{slug}
+    m = re.search(r'careers\.smartrecruiters\.com/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "smartrecruiters", "slug": m.group(1)}
+    return None
+
+
+def _extract_eightfold(text):
+    m = re.search(r'https?://([a-z0-9][a-z0-9-]*)\.eightfold\.ai/', text, re.IGNORECASE)
+    if m:
+        slug = json.dumps({"slug": m.group(1), "domain": ""})
+        return {"platform": "eightfold", "slug": slug}
+    return None
+
+
+def _extract_ashby(text):
+    m = re.search(r'jobs\.ashbyhq\.com/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "ashby", "slug": m.group(1)}
+    return None
+
+
+def _extract_taleo(text):
+    m = re.search(r'([a-z0-9-]+)\.taleo\.net', text, re.IGNORECASE)
+    if m:
+        return {"platform": "taleo", "slug": m.group(1)}
+    return None
+
+
+def _extract_phenom(text):
+    # CDN domain: cdn.phenompeople.com or {slug}.phenompeople.com
+    m = re.search(r'([a-z0-9-]+)\.phenompeople\.com', text, re.IGNORECASE)
+    if m and m.group(1) != "cdn":
+        return {"platform": "phenom", "slug": m.group(1)}
+    # cdn presence alone confirms Phenom — slug comes from patterns.py at fetch time
+    return {"platform": "phenom", "slug": ""}
+
+
+def _extract_talentbrew(text):
+    # TalentBrew tenant auto-detected from sitemap at fetch time
+    m = re.search(r'([a-z0-9-]+)\.talentbrew\.com', text, re.IGNORECASE)
+    if m:
+        return {"platform": "talentbrew", "slug": m.group(1)}
+    return {"platform": "talentbrew", "slug": ""}
+
+
+def _extract_oracle_hcm(text):
+    # Primary: {tenant}.fa.{region}.oraclecloud.com/hcmUI/.../sites/{site}
+    m = re.search(
+        r'([a-z0-9-]+)\.fa\.([a-z0-9-]+)\.oraclecloud\.com/hcmUI/[^"\'<>\s]*sites/([a-zA-Z0-9_-]+)',
+        text, re.IGNORECASE,
+    )
+    if m:
+        slug = json.dumps({"slug": m.group(1), "region": m.group(2), "site": m.group(3)})
+        return {"platform": "oracle_hcm", "slug": slug}
+    # JS fingerprint: {tenant}.fa.{region}.oraclecloud.com/hcmUI/ (no /sites/)
+    m = re.search(
+        r'([a-z0-9-]+)\.fa\.([a-z0-9-]+)\.oraclecloud\.com/hcmUI/',
+        text, re.IGNORECASE,
+    )
+    if m:
+        slug = json.dumps({"slug": m.group(1), "region": m.group(2), "site": ""})
+        return {"platform": "oracle_hcm", "slug": slug}
+    return None
+
+
+def _extract_avature(text):
+    # Hosted Avature tenant
+    m = re.search(r'([a-z0-9-]+)\.avature\.net/([a-zA-Z0-9_/-]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "avature", "slug": m.group(1)}
+    # Custom career page with avatureReferrerQueryParam key — confirms Avature but no slug yet
+    return {"platform": "avature", "slug": ""}
+
+
+def _extract_icims(text):
+    m = re.search(r'([a-z0-9-]+)\.icims\.com', text, re.IGNORECASE)
+    if m:
+        return {"platform": "icims", "slug": m.group(1)}
+    # jibecdn.com is iCIMS Jibe product
+    m = re.search(r'([a-z0-9-]+)\.jibecdn\.com', text, re.IGNORECASE)
+    if m:
+        return {"platform": "icims", "slug": m.group(1)}
+    return {"platform": "icims", "slug": ""}
+
+
+def _extract_jobvite(text):
+    m = re.search(r'jobs\.jobvite\.com/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m:
+        return {"platform": "jobvite", "slug": m.group(1)}
+    return {"platform": "jobvite", "slug": ""}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Keyword → extractor table
+# Adding a new ATS = one line here + one extract_* function above
+# ─────────────────────────────────────────────────────────────────────────────
+
+ATS_KEYWORDS = {
+    "myworkdayjobs":             _extract_workday,
+    "myworkdaysite":             _extract_workday,
+    "greenhouse":                _extract_greenhouse,
+    "successfactors":            _extract_successfactors,
+    "j2w.init":                  _extract_successfactors,
+    "lever.co":                  _extract_lever,
+    "smartrecruiters":           _extract_smartrecruiters,
+    "eightfold.ai":              _extract_eightfold,
+    "ashbyhq":                   _extract_ashby,
+    "taleo.net":                 _extract_taleo,
+    "phenompeople":              _extract_phenom,
+    "talentbrew":                _extract_talentbrew,
+    "oraclecloud.com/hcmUI":     _extract_oracle_hcm,
+    "avature.net":               _extract_avature,
+    "avatureReferrerQueryParam": _extract_avature,
+    "icims.com":                 _extract_icims,
+    "jibecdn.com":               _extract_icims,
+    "jobvite.com":               _extract_jobvite,
+}
+
+# Eightfold is treated as tentative — many companies embed it as a widget
+# without being Eightfold customers. Never return it if a harder ATS is found.
+_TENTATIVE_PLATFORMS = {"eightfold"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core scan — runs on any raw string (HTML or JS bundle)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scan(text):
+    """
+    Scan raw text for any ATS keyword. Returns first non-tentative match,
+    or tentative match if nothing harder found.
+    """
+    tentative = None
+    for keyword, extractor in ATS_KEYWORDS.items():
+        if keyword in text:
+            result = extractor(text)
+            if result:
+                if result["platform"] in _TENTATIVE_PLATFORMS:
+                    if tentative is None:
+                        tentative = result
+                else:
+                    return result
+    return tentative
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP fetch — full Chrome impersonation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sec_fetch_site(target_url, referer_url):
+    """Compute Sec-Fetch-Site exactly as Chrome does."""
+    if not referer_url:
+        return "none"
+    tp = urlparse(target_url)
+    rp = urlparse(referer_url)
+    if tp.netloc == rp.netloc:
+        return "same-origin"
+    t_root = ".".join(tp.netloc.split(".")[-2:])
+    r_root = ".".join(rp.netloc.split(".")[-2:])
+    if t_root == r_root:
+        return "same-site"
+    return "cross-site"
+
+
+def _fetch(url, session, referer=None, is_script=False, is_api=False):
+    """
+    Fetch url with full Chrome headers. Cookie jar is managed by the session
+    automatically — same as a real browser maintaining state across pages.
+
+    Args:
+        referer:   URL of the page that linked here (sent as Referer header)
+        is_script: True when fetching a JS bundle (<script src>)
+        is_api:    True when replicating an XHR/fetch API call from JS
+    """
+    if is_api:
+        base_headers = _API_HEADERS
+    elif is_script:
+        base_headers = _SCRIPT_HEADERS
+    else:
+        base_headers = _NAV_HEADERS
+    headers = dict(base_headers)
+    headers["Sec-Fetch-Site"] = _sec_fetch_site(url, referer)
+    if referer:
+        headers["Referer"] = referer
+
+    def _get(target):
+        return session.get(target, headers=headers, timeout=FETCH_TIMEOUT, allow_redirects=True)
+
+    try:
+        resp = _get(url)
+        if resp.status_code == 200:
+            return resp.text, resp.url
+        return None, url
+    except Exception as e:
+        # SSL fallback to HTTP
+        if "ssl" in str(e).lower() or "SSL" in type(e).__name__:
+            try:
+                resp = _get(url.replace("https://", "http://", 1))
+                if resp.status_code == 200:
+                    return resp.text, resp.url
+            except Exception:
+                pass
+        logger.debug("[detector] fetch error %s: %s", url, e)
+        return None, url
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Script src extraction — only fetches relevant bundles
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _script_srcs(html, base_url):
+    """
+    Extract <script src="..."> URLs from raw HTML.
+    Skips analytics/tracking bundles. Prioritises bundles with career/job in
+    the name (most likely to contain ATS config), then same-domain bundles,
+    then CDN bundles. Capped at MAX_JS_BUNDLES.
+    """
+    base_domain = urlparse(base_url).netloc
+    root = ".".join(base_domain.split(".")[-2:])
+
+    priority = []   # career/job-named bundles first
+    same_dom  = []  # same domain / same-root CDN
+    external  = []  # fully external CDN
+
+    for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.IGNORECASE):
+        src = m.group(1).strip()
+        if src.startswith("data:") or src.startswith("#"):
+            continue
+        src_lower = src.lower()
+        if any(skip in src_lower for skip in _BUNDLE_SKIP):
+            continue
+        absolute = urljoin(base_url, src)
+        parsed   = urlparse(absolute)
+
+        if any(kw in src_lower for kw in ("career", "job", "recruit", "apply", "hire")):
+            priority.append(absolute)
+        elif root in parsed.netloc:
+            same_dom.append(absolute)
+        else:
+            external.append(absolute)
+
+    return (priority + same_dom + external)[:MAX_JS_BUNDLES]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring-based next-page navigation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_URL_SCORES = {
+    "job": 3, "jobs": 3, "career": 3, "careers": 3,
+    "position": 2, "positions": 2, "opening": 2, "openings": 2,
+    "hiring": 2, "role": 1, "roles": 1, "work": 1,
+}
+
+_ANCHOR_SCORES = {
+    "view jobs": 5, "see jobs": 5, "explore jobs": 5, "find jobs": 5,
+    "open positions": 5, "job openings": 5, "search jobs": 4,
+    "browse jobs": 4, "view openings": 4, "apply now": 4,
+    "all jobs": 3, "careers": 3, "opportunities": 2, "join us": 2,
+    "explore roles": 3, "see openings": 4, "view roles": 3,
+}
+
+_SKIP_HREF = re.compile(
+    r'^(?:#|mailto:|tel:|javascript:)|'
+    r'(?:facebook|twitter|linkedin|instagram|youtube|tiktok)\.com',
+    re.IGNORECASE,
+)
+
+# Path segments that indicate non-job content — never contain ATS signals
+_PATH_DENYLIST = re.compile(
+    r'/(?:blog|tech-blog|news|press|events|life-at|life|perks|benefits|'
+    r'values|diversity|inclusion|awards|media|podcast|video|gallery|'
+    r'photos|story|stories|leadership|board|culture|privacy|legal|terms|'
+    r'accessibility|sitemap|contact|support|faq|help|'
+    r'state-specific|disclosure|language|application-language)(?:/|$)',
+    re.IGNORECASE,
+)
+
+# Already-tried top-level paths — don't cycle back to them
+_TOP_LEVEL_PATHS = frozenset({
+    "", "/", "/careers", "/careers/", "/jobs", "/jobs/",
+    "/about/careers", "/company/careers", "/en/careers",
+    "/us/careers", "/join-us", "/work-with-us", "/opportunities",
+})
+
+
+def find_next_pages(html, current_url, visited=None):
+    """
+    Score every <a href> in raw HTML and return ALL candidates with score >= 2,
+    sorted highest first. Caller tries each in order until one resolves.
+
+    Domain rule: allow same domain OR any domain that contains the brand keyword
+    (e.g. wayfair.com → aboutwayfair.com, spotify.com → lifeatspotify.com).
+    """
+    parsed_base = urlparse(current_url)
+    base_domain = parsed_base.netloc
+    base_parts  = base_domain.split(".")
+    brand       = base_parts[-2] if len(base_parts) >= 2 else base_domain
+
+    pairs = re.findall(
+        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html, re.IGNORECASE | re.DOTALL,
+    )
+
+    scored = {}  # url → score (dedup by url, keep highest)
+
+    for raw_href, raw_anchor in pairs:
+        href   = _html_unescape(raw_href.strip())
+        anchor = re.sub(r'<[^>]+>', '', raw_anchor).strip().lower()
+
+        if _SKIP_HREF.search(href):
+            continue
+
+        absolute = urljoin(current_url, href)
+        parsed   = urlparse(absolute)
+
+        # Allow same domain OR brand-family domain
+        if parsed.netloc != base_domain and brand not in parsed.netloc:
+            continue
+
+        # Skip already-visited URLs
+        if visited and absolute in visited:
+            continue
+
+        path = parsed.path.rstrip("/")
+
+        # Skip content pages (blog, news, culture) — they never have ATS signals
+        if _PATH_DENYLIST.search(path):
+            continue
+        if path in _TOP_LEVEL_PATHS:
+            continue
+
+        # Score URL path + domain tokens
+        score = 0
+        path_lower = (parsed.netloc + path).lower()
+        for token, pts in _URL_SCORES.items():
+            if token in path_lower:
+                score += pts
+
+        # Score anchor text
+        for phrase, pts in _ANCHOR_SCORES.items():
+            if phrase in anchor:
+                score += pts
+
+        if score >= 2:
+            scored[absolute] = max(scored.get(absolute, 0), score)
+
+    return sorted(scored, key=scored.get, reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main detect loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect(start_url, session=None, depth=0, visited=None, _best=None, _referer=None):
+    """
+    Detect ATS for a single URL. Behaves like a real Chrome browser:
+      - Carries cookies automatically (session jar)
+      - Sends Referer on every navigation
+      - Sends correct Sec-Fetch-* headers per request type
+
+    slug != ""  → complete hit, return immediately
+    slug == ""  → partial (platform found, no tenant slug yet); keep navigating
+    None        → no ATS found in this branch
+
+    _best / _referer are internal — do not pass from outside.
+    """
+    if depth > MAX_DEPTH:
+        return _best[0] if _best else None
+
+    if session is None:
+        session = _make_session()
+    if visited is None:
+        visited = set()
+    if _best is None:
+        _best = [None]
+
+    if start_url in visited:
+        return _best[0]
+    visited.add(start_url)
+
+    html, final_url = _fetch(start_url, session, referer=_referer)
+    if not html:
+        return _best[0]
+
+    visited.add(final_url)
+    logger.debug("[detector] depth=%d url=%s", depth, final_url)
+
+    def _handle(result, source_label):
+        if not result:
+            return None
+        if result["slug"]:
+            logger.info("[detector] HIT (%s) depth=%d platform=%s slug=%s url=%s",
+                        source_label, depth, result["platform"], result["slug"], final_url)
+            return result
+        if _best[0] is None:
+            logger.debug("[detector] PARTIAL (%s) depth=%d platform=%s — continuing for slug",
+                         source_label, depth, result["platform"])
+            _best[0] = result
+        return None
+
+    # 1. Scan raw HTML
+    hit = _handle(scan(html), "HTML")
+    if hit:
+        return hit
+
+    # 2. Scan JS bundles — fetch with script headers + Referer = page that loaded them
+    #    Also extract API endpoint paths from bundle source for step 2b.
+    api_paths = []
+    for src in _script_srcs(html, final_url):
+        bundle, _ = _fetch(src, session, referer=final_url, is_script=True)
+        if not bundle:
+            continue
+        hit = _handle(scan(bundle), "JS bundle")
+        if hit:
+            return hit
+        api_paths.extend(_extract_api_paths(bundle))
+
+    # 2b. Probe API endpoints discovered in bundles.
+    #     Session already holds cookies from the page visit — same auth as the JS uses.
+    #     This surfaces ATS config that SPAs fetch at runtime without us running any JS.
+    seen_api = set()
+    for path in api_paths:
+        if path in seen_api:
+            continue
+        seen_api.add(path)
+        api_url = urljoin(final_url, path)
+        resp, _ = _fetch(api_url, session, referer=final_url, is_api=True)
+        if not resp:
+            continue
+        logger.debug("[detector] API probe depth=%d path=%s", depth, path)
+        hit = _handle(scan(resp), "API")
+        if hit:
+            return hit
+
+    # 3. Navigate deeper — pass current page as Referer to each child, just like Chrome
+    candidates = find_next_pages(html, final_url, visited)
+    logger.debug("[detector] candidates depth=%d: %s", depth, candidates[:5])
+    for next_url in candidates:
+        result = detect(next_url, session, depth + 1, visited, _best, _referer=final_url)
+        if result and result["slug"]:
+            return result
+
+    logger.debug("[detector] MISS depth=%d url=%s", depth, final_url)
+    return _best[0]
+
+
+def detect_company(company_domain, session=None):
+    """
+    Detect ATS for a company given only its domain.
+
+    Probes in order:
+      1. Standard career paths on the main domain (e.g. stripe.com/jobs)
+      2. Career subdomains (careers.stripe.com, jobs.stripe.com)
+
+    A shared visited set and _best partial are threaded through all probes so
+    we never re-crawl the same pages and always upgrade toward a complete slug.
+
+    Args:
+        company_domain: e.g. "stripe.com" (no https://)
+        session:        requests.Session (created if not provided)
+
+    Returns:
+        {"platform": ..., "slug": ...}  or  None
+        (slug may be "" if the platform was detected but the tenant URL was not found)
+    """
+    domain = company_domain.lower().strip()
+    domain = re.sub(r'^https?://', '', domain).rstrip('/')
+    if session is None:
+        session = _make_session()
+
+    visited  = set()   # shared — prevents re-crawling the same pages across probes
+    best     = [None]  # shared partial — upgraded by any probe that finds a better result
+
+    # 1. Standard paths on main domain
+    for path in CAREER_PATHS:
+        url = f"https://{domain}{path}"
+        result = detect(url, session, depth=0, visited=visited, _best=best)
+        if result and result["slug"]:  # complete hit
+            return result
+
+    # 2. Career subdomains
+    root = domain.split(".")[-2] + "." + domain.split(".")[-1]
+    for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
+        url = f"https://{subdomain}.{root}"
+        result = detect(url, session, depth=0, visited=visited, _best=best)
+        if result and result["slug"]:
+            return result
+
+    return best[0]  # best partial found (slug=""), or None if nothing at all

@@ -147,6 +147,9 @@ def aggregate(df: pd.DataFrame) -> dict:
         trade_name_dba = _str_or_none(group["TRADE_NAME_DBA"].iloc[-1] if "TRADE_NAME_DBA" in group else None)
         h1b_dependent  = _parse_bool(group.get("H-1B_DEPENDENT",  pd.Series()).iloc[-1] if "H-1B_DEPENDENT"  in group else None)
         willful_viol   = _parse_bool(group.get("WILLFUL_VIOLATOR", pd.Series()).iloc[-1] if "WILLFUL_VIOLATOR" in group else None)
+        poc_email_domain = _extract_email_domain(
+            group["EMPLOYER_POC_EMAIL"].dropna().iloc[-1] if "EMPLOYER_POC_EMAIL" in group.columns and group["EMPLOYER_POC_EMAIL"].notna().any() else None
+        )
 
         employer_name_norm  = _norm_name(employer_name, strip_dba=True)
         trade_name_dba_norm = _norm_name(trade_name_dba) if trade_name_dba else None
@@ -210,6 +213,7 @@ def aggregate(df: pd.DataFrame) -> dict:
                 "trade_name_dba_norm": trade_name_dba_norm,
                 "h1b_dependent":       h1b_dependent,
                 "willful_violator":    willful_viol,
+                "poc_email_domain":    poc_email_domain,
                 "total_filed":         total_filed,
                 "total_certified":     total_certified,
                 "total_denied":        total_denied,
@@ -224,6 +228,16 @@ def aggregate(df: pd.DataFrame) -> dict:
 
     log.info("Aggregated %d unique employers (FEINs)", len(results))
     return results
+
+
+def _extract_email_domain(raw) -> str | None:
+    if not raw or (isinstance(raw, float) and pd.isna(raw)):
+        return None
+    email = str(raw).strip()
+    if "@" not in email:
+        return None
+    domain = email.split("@")[-1].strip()
+    return domain if domain else None
 
 
 def _parse_bool(val) -> bool | None:
@@ -298,11 +312,11 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     h1b_dependent, willful_violator,
                     total_filed, total_certified, total_denied, total_withdrawn,
                     total_positions, certified_positions, approval_rate,
-                    top_job_titles, quarters_processed, last_updated
+                    top_job_titles, quarters_processed, poc_email_domain, last_updated
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
-                    %s, ARRAY[%s]::TEXT[], NOW()
+                    %s, ARRAY[%s]::TEXT[], %s, NOW()
                 )
                 ON CONFLICT (employer_fein) DO UPDATE SET
                     employer_name       = EXCLUDED.employer_name,
@@ -328,6 +342,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     END,
                     top_job_titles      = EXCLUDED.top_job_titles,
                     quarters_processed  = dol_h1b_employers.quarters_processed || EXCLUDED.quarters_processed,
+                    poc_email_domain    = COALESCE(EXCLUDED.poc_email_domain, dol_h1b_employers.poc_email_domain),
                     last_updated        = NOW()
             """, (
                 fein, e["employer_name"], e["employer_name_norm"],
@@ -336,7 +351,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 e["h1b_dependent"], e["willful_violator"],
                 e["total_filed"], e["total_certified"], e["total_denied"], e["total_withdrawn"],
                 e["total_positions"], e["certified_positions"], approval_rate,
-                json.dumps(merged_titles), quarter,
+                json.dumps(merged_titles), quarter, e["poc_email_domain"],
             ))
             emp_count += 1
 

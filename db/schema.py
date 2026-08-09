@@ -1291,6 +1291,7 @@ def init_db():
     c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS employer_name_norm TEXT")
     c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS trade_name_dba TEXT")
     c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS trade_name_dba_norm TEXT")
+    c.execute("ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS poc_email_domain TEXT")
 
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_dol_emp_name_norm

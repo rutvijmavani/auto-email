@@ -40,6 +40,7 @@ TIMEOUT = 10
 CAREER_PATHS = [
     "/careers",
     "/careers/",
+    "/careers/jobs",
     "/jobs",
     "/jobs/",
     "/about/careers",

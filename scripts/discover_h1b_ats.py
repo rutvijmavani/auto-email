@@ -40,13 +40,18 @@ from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-from rapidfuzz.fuzz import token_set_ratio
+from rapidfuzz import process as fuzz_process, utils as fuzz_utils
+from rapidfuzz.fuzz import ratio as fuzz_ratio, WRatio
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import requests
 
-from config import DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER, REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK
+from config import (
+    CF_WORKER_SECRET, CF_WORKER_URL,
+    DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
+    REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
+)
 from db.connection import get_conn
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
@@ -243,6 +248,105 @@ _KG_MIN_OVERLAP      = 30  # minimum score to accept at retry exhaustion
 _KG_HIGH_CONFIDENCE  = 90  # return immediately — no point trying shorter queries
 _KG_QUALITY_THRESHOLD = 60  # flag for human review when selected score < this
 
+_KG_SIG_STOP = frozenset({
+    # abbreviated entity type markers
+    "inc", "llc", "ltd", "corp", "lp", "plc", "pvt", "co", "na", "llp",
+    # full entity type markers
+    "corporation", "incorporated", "limited", "company", "partnership",
+    # connectors
+    "the", "a", "an", "and", "of", "for", "in", "de", "los", "las",
+})
+
+
+def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
+    """Return True if EVERY significant token of the KG entity name has a
+    plausible match somewhere in the legal name.
+
+    No stripping — both names are tokenized raw and noise words (inc, llc,
+    corporation, etc.) are removed via _KG_SIG_STOP.  Descriptive words like
+    'Technologies', 'Enterprises', 'Solutions' are preserved so that
+    'Fourth Technologies' ≠ 'Fourth Enterprises'.
+
+    Match per token: prefix match OR fuzz.ratio ≥ 65.
+
+    Rejects:
+      'SQUAD SOFTWARE'    → 'San Diego Padres'       (san  ∉ squad/software)
+      'Cruise LLC'        → 'Carnival Cruise Line'   (carnival ∉ cruise)
+      'FOURTH ENTERPRISES'→ 'Fourth Technologies'    (technologies ∉ fourth/enterprises)
+
+    Accepts:
+      'WAL-MART ASSOCIATES' → 'Walmart'   (walmart.startswith('wal'))
+      'HCL AMERICA'         → 'HCLTech'  (hcltech.startswith('hcl'))
+      'ORACLE AMERICA'      → 'Oracle Corporation'  (oracle ✓, corporation filtered)
+    """
+    def _sig(s: str) -> list[str]:
+        return [t for t in re.findall(r'\w+', (s or "").lower())
+                if t not in _KG_SIG_STOP and len(t) > 1]
+
+    q_toks = _sig(legal_name)
+    e_toks = _sig(entity_name)
+
+    if not q_toks or not e_toks:
+        return True  # can't check — don't reject
+
+    for et in e_toks:
+        matched = any(
+            et.startswith(qt) or qt.startswith(et) or fuzz_ratio(et, qt) >= 65
+            for qt in q_toks
+        )
+        if not matched:
+            return False
+
+    return True
+
+
+def _coverage_weighted_score(legal_name: str, entity_name: str | None) -> float:
+    """Coverage-weighted match score between legal_name and entity_name.
+
+    Score = best_raw × max(legal_coverage, entity_coverage), where:
+      best_raw      = highest WRatio between any entity prefix and any legal prefix
+      legal_cov     = tokens in winning legal prefix  / total legal sig tokens
+      entity_cov    = tokens in winning entity prefix / total entity sig tokens
+
+    This rewards matches where the entity explains a meaningful portion of the
+    legal name, while protecting short distinctive brands (Amazon, Google) via
+    entity_coverage — if the entire entity name is matched, coverage is 100%
+    regardless of how long the legal name is.
+
+    Examples:
+      "AMAZON.COM SERVICES LLC" → "Amazon"                 100 (entity_cov=1/1)
+      "COGNIZANT TECH SOLUTIONS US" → "Cognizant Tech"     100 (entity_cov=2/2)
+      "SQUAD SOFTWARE INC" → "San Diego Padres"             ~20 → below threshold
+    """
+    def _sig(s: str) -> list[str]:
+        return [t for t in re.findall(r'\w+', (s or "").lower())
+                if t not in _KG_SIG_STOP and len(t) > 1]
+
+    legal_toks  = _sig(legal_name)
+    # Strip legal suffixes from KG entity name so "Oracle Corporation" → ["oracle"]
+    entity_toks = _sig(strip_legal_suffixes(entity_name or "")) or _sig(entity_name)
+
+    if not legal_toks or not entity_toks:
+        return 0.0
+
+    legal_pfx  = [" ".join(legal_toks[:i])  for i in range(1, len(legal_toks)  + 1)]
+    entity_pfx = [" ".join(entity_toks[:i]) for i in range(1, len(entity_toks) + 1)]
+
+    best = 0.0
+    for ei, ep in enumerate(entity_pfx):
+        m = fuzz_process.extractOne(ep, legal_pfx, scorer=WRatio,
+                                    processor=fuzz_utils.default_process)
+        if not m:
+            continue
+        raw, li = m[1], m[2]
+        legal_cov  = (li + 1) / len(legal_toks)
+        entity_cov = (ei + 1) / len(entity_toks)
+        weighted   = raw * max(legal_cov, entity_cov)
+        if weighted > best:
+            best = weighted
+
+    return best
+
 
 def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
     """Search KG API for legal_name with progressive word-stripping and best-match selection.
@@ -337,8 +441,22 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                     log.debug("KG: /g/ thin shell %r (mid=%r) skipped", name, kg_mid)
                     continue
 
+                # Gate 1: entity's leading token must plausibly match the legal name.
+                # Rejects "San Diego Padres" for "SQUAD SOFTWARE", "Carnival Cruise Line"
+                # for "Cruise LLC", etc.  Lead-gate failures are treated like /g/ shells —
+                # found_m stays False so the retry loop tries a shorter query.
+                if not _entity_lead_in_query(legal_name, name):
+                    log.debug(
+                        "KG: /m/ candidate %r (mid=%r) — lead mismatch vs %r, skipping",
+                        name, kg_mid, legal_name,
+                    )
+                    continue
+
                 found_m   = True
-                score     = token_set_ratio(base_query.lower(), (name or "").lower()) if name else 0
+                # Gate 3: coverage-weighted score — rewards matches where the entity
+                # explains a meaningful portion of the legal name, and protects
+                # short distinctive brands via entity_coverage.
+                score     = _coverage_weighted_score(legal_name, name)
                 candidate = {"name": name, "url": url, "kg_mid": kg_mid, "_score": score}
 
                 # Track every /m/ entity seen for the audit trail (dedup by kg_mid, max score)
@@ -372,7 +490,7 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                 )
 
             if not found_m:
-                log.debug("KG: all /g/ results for %r — retrying without last word", query)
+                log.debug("KG: no usable /m/ results for %r (all /g/ or lead-rejected) — retrying without last word", query)
             else:
                 log.debug(
                     "KG: best so far score=%d for %r — trying shorter query",
@@ -856,7 +974,38 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
         log.debug("Too many redirects for %s", url)
     except requests.exceptions.RequestException as e:
         log.debug("Fetch error %s: %s", url, e)
+        result = _fetch_via_worker(url)
+        if result:
+            return result
     return None, url
+
+
+def _fetch_via_worker(url: str) -> tuple[str, str] | None:
+    """Proxy a URL fetch through the Cloudflare probe Worker.
+
+    Used as fallback when the direct fetch times out or is connection-refused
+    (OCI datacenter IP blocked). Returns (html_text, final_url) or None.
+    """
+    if not CF_WORKER_URL or not CF_WORKER_SECRET:
+        return None
+    try:
+        resp = requests.post(
+            CF_WORKER_URL,
+            json={"url": url, "max_bytes": 65536},
+            headers={"Authorization": f"Bearer {CF_WORKER_SECRET}"},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("error") or (data.get("status") or 0) >= 400:
+            log.debug("CF Worker: %s → error=%s status=%s", url, data.get("error"), data.get("status"))
+            return None
+        final_url = data.get("final_url") or url
+        body      = data.get("body") or ""
+        log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
+        return body, final_url
+    except Exception as exc:
+        log.debug("CF Worker request failed for %s: %s", url, exc)
+        return None
 
 
 def _find_ats_in_html(html: str) -> tuple[str | None, str | None]:
@@ -904,14 +1053,23 @@ def _resolve_website_redirect(url: str) -> str:
       - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
       - Redirect → different root domain   → return resolved (genuine rebrand)
     """
+    parsed   = urlparse(url)
+    root_url = f"{parsed.scheme}://{parsed.netloc}/"
+    final_url = None
+
     try:
-        parsed   = urlparse(url)
-        root_url = f"{parsed.scheme}://{parsed.netloc}/"
         r = requests.get(root_url, timeout=8, allow_redirects=True,
                          headers=_API_HEADERS)
         final_url = r.url.rstrip("/")
     except Exception as exc:
         log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
+        result = _fetch_via_worker(root_url)
+        if result:
+            _, worker_final = result
+            final_url = worker_final.rstrip("/")
+            log.debug("_resolve_website_redirect: CF Worker resolved %s → %s", url, final_url)
+
+    if final_url is None:
         return url
 
     final_root = _root_domain(final_url)
@@ -1020,6 +1178,7 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
         SELECT
             d.employer_fein,
             d.employer_name,
+            d.poc_email_domain,
             COALESCE(
                 SUM(
                     u.new_employment_approval +
@@ -1044,7 +1203,7 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
             OR h.last_checked IS NULL
             OR h.last_checked < NOW() - INTERVAL '7 days'
         )
-        GROUP BY d.employer_fein, d.employer_name, d.total_certified
+        GROUP BY d.employer_fein, d.employer_name, d.poc_email_domain, d.total_certified
         ORDER BY total_approvals DESC NULLS LAST
         LIMIT %s
     """, (limit,))
@@ -1222,6 +1381,10 @@ def process_employer(
             crunchbase_id = entry.get("crunchbase_id")
             if website_url is None:
                 website_url = entry.get("website") or None
+
+    if website_url is None and emp.get("poc_email_domain"):
+        website_url = "https://" + emp["poc_email_domain"]
+        log.debug("POC email domain fallback: %s → %s", emp.get("employer_name"), website_url)
 
     log.info(
         "  canonical=%r source=%s website=%s jobs_url=%s",

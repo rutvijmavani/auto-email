@@ -334,6 +334,9 @@ EMAIL_LLM_GEMINI_MODEL     = os.getenv("EMAIL_LLM_GEMINI_MODEL", "gemma-4-26b-it
 DISCOVER_ATS_LLM_PROVIDER  = os.getenv("DISCOVER_ATS_LLM_PROVIDER", "gemini")
 DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b-it")
 
+CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
+CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
+
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING
 # ─────────────────────────────────────────
