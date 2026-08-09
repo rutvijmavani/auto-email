@@ -600,8 +600,10 @@ def find_next_pages(html, current_url, visited=None):
                          "pdf", "zip", "mp4", "mp3", "woff", "woff2"}:
             continue
 
-        # Allow same domain OR brand-family domain
-        if parsed.netloc != base_domain and brand not in parsed.netloc:
+        # Allow same domain OR brand-family domain (bidirectional).
+        # e.g. nomura.com ↔ nomuraholdings.com: "nomura" appears in both.
+        target_brand = parsed.netloc.split(".")[-2] if "." in parsed.netloc else parsed.netloc
+        if parsed.netloc != base_domain and brand not in parsed.netloc and target_brand not in base_domain:
             continue
 
         # Skip already-visited URLs
@@ -627,6 +629,12 @@ def find_next_pages(html, current_url, visited=None):
         for phrase, pts in _ANCHOR_SCORES.items():
             if phrase in anchor:
                 score += pts
+
+        # Bonus for external brand-family domains — cross-domain career portals
+        # (nomuraholdings.com from nomura.com) are more likely to be the actual
+        # job portal than internal brochure subpages with identical URL scores.
+        if parsed.netloc != base_domain:
+            score += 3
 
         if score >= 2:
             scored[absolute] = max(scored.get(absolute, 0), score)
@@ -668,8 +676,6 @@ def detect(start_url, session=None, visited=None, _hits=None, _best=None, _refer
     if start_url in visited:
         return
     if len(visited) >= _max_pages:
-        if len(visited) == _max_pages:  # log only on first hit, not every unwind
-            logger.debug("[detector] page budget exhausted (%d pages)", len(visited))
         return
 
     # Skip binary resources before fetching — catches redirect destinations too
