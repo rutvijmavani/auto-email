@@ -668,7 +668,8 @@ def detect(start_url, session=None, visited=None, _hits=None, _best=None, _refer
     if start_url in visited:
         return
     if len(visited) >= _max_pages:
-        logger.debug("[detector] page budget exhausted (%d pages)", len(visited))
+        if len(visited) == _max_pages:  # log only on first hit, not every unwind
+            logger.debug("[detector] page budget exhausted (%d pages)", len(visited))
         return
 
     # Skip binary resources before fetching — catches redirect destinations too
