@@ -122,6 +122,7 @@ try:
     from config import (
         CAREER_DETECTOR_MAX_PAGES as _MAX_PAGES,
         FETCH_TIMEOUT as _FETCH_TIMEOUT,
+        CONNECT_TIMEOUT as _CONNECT_TIMEOUT,
         CAREER_DETECTOR_MAX_JS_BUNDLES as _MAX_JS_BUNDLES,
         CAREER_DETECTOR_MAX_API_PROBES as _MAX_API_PROBES,
         CAREER_DETECTOR_LISTING_PAGES as _N_LISTING_PAGES,
@@ -130,12 +131,14 @@ try:
 except Exception:
     _MAX_PAGES        = 25
     _FETCH_TIMEOUT    = 15
+    _CONNECT_TIMEOUT  = 5
     _MAX_JS_BUNDLES   = 15
     _MAX_API_PROBES   = 10
     _N_LISTING_PAGES  = 2   # paginated listing pages to process before stopping pagination
     _M_DETAIL_SAMPLE  = 3   # job detail pages to sample per URL template before stopping
 
-FETCH_TIMEOUT  = _FETCH_TIMEOUT
+FETCH_TIMEOUT   = _FETCH_TIMEOUT
+CONNECT_TIMEOUT = _CONNECT_TIMEOUT
 MAX_JS_BUNDLES = _MAX_JS_BUNDLES
 MAX_API_PROBES = _MAX_API_PROBES
 
@@ -467,7 +470,7 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         headers["Referer"] = referer
 
     def _get(target):
-        return session.get(target, headers=headers, timeout=FETCH_TIMEOUT, allow_redirects=True)
+        return session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=True)
 
     try:
         resp = _get(url)

@@ -339,6 +339,7 @@ CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler s
 
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))
+CONNECT_TIMEOUT                = int(os.getenv("CAREER_DETECTOR_CONNECT_TIMEOUT",   "5"))
 CAREER_DETECTOR_MAX_PAGES      = int(os.getenv("CAREER_DETECTOR_MAX_PAGES",        "25"))
 CAREER_DETECTOR_MAX_JS_BUNDLES = int(os.getenv("CAREER_DETECTOR_MAX_JS_BUNDLES",   "15"))
 CAREER_DETECTOR_MAX_API_PROBES = int(os.getenv("CAREER_DETECTOR_MAX_API_PROBES",   "10"))
