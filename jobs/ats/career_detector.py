@@ -300,6 +300,14 @@ def _extract_taleo(text):
     return None
 
 
+def _extract_tal(text):
+    # Taleo Business Edition / TALapply — uses .tal.net subdomains
+    m = re.search(r'([a-z0-9-]+)\.tal\.net', text, re.IGNORECASE)
+    if m:
+        return {"platform": "taleo", "slug": m.group(1)}
+    return None
+
+
 def _extract_phenom(text):
     # CDN domain: cdn.phenompeople.com or {slug}.phenompeople.com
     m = re.search(r'([a-z0-9-]+)\.phenompeople\.com', text, re.IGNORECASE)
@@ -380,6 +388,7 @@ ATS_KEYWORDS = {
     "eightfold.ai":              _extract_eightfold,
     "ashbyhq":                   _extract_ashby,
     "taleo.net":                 _extract_taleo,
+    "tal.net":                   _extract_tal,
     "phenompeople":              _extract_phenom,
     "talentbrew":                _extract_talentbrew,
     "oraclecloud.com/hcmUI":     _extract_oracle_hcm,
