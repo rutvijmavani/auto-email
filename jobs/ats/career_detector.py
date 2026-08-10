@@ -357,6 +357,21 @@ def _extract_avature(text):
     return {"platform": "avature", "slug": ""}
 
 
+def _extract_avature_portal(text):
+    # Custom-domain Avature via avature.portal.* meta tags (e.g. L'Oreal, Lenovo)
+    # Reconstruct {"base": "https://careers.loreal.com", "path": "en_US/content"}
+    lang  = re.search(r'avature\.portal\.lang["\'][^>]+content=["\']([^"\']+)["\']',    text, re.IGNORECASE)
+    upath = re.search(r'avature\.portal\.urlPath["\'][^>]+content=["\']([^"\']+)["\']', text, re.IGNORECASE)
+    canon = re.search(r'rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']',           text, re.IGNORECASE)
+    if not canon:
+        canon = re.search(r'href=["\']([^"\']+)["\'][^>]+rel=["\']canonical["\']',      text, re.IGNORECASE)
+    if lang and upath and canon:
+        parsed = urlparse(canon.group(1))
+        slug = json.dumps({"base": f"{parsed.scheme}://{parsed.netloc}", "path": f"{lang.group(1)}/{upath.group(1)}"})
+        return {"platform": "avature", "slug": slug}
+    return {"platform": "avature", "slug": ""}
+
+
 def _extract_icims(text):
     m = re.search(r'([a-z0-9-]+)\.icims\.com', text, re.IGNORECASE)
     if m:
@@ -397,6 +412,7 @@ ATS_KEYWORDS = {
     "oraclecloud.com/hcmUI":     _extract_oracle_hcm,
     "avature.net":               _extract_avature,
     "avatureReferrerQueryParam": _extract_avature,
+    "avature.portal":            _extract_avature_portal,
     "icims.com":                 _extract_icims,
     "jibecdn.com":               _extract_icims,
     "jobvite.com":               _extract_jobvite,
