@@ -644,17 +644,17 @@ def find_next_pages(html, current_url, visited=None):
 # Single-page processor — fetch one URL, scan, return next candidates
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_page(url, session, visited, hits, best, referer=None,
-                  seen_ext_domains=None, company_root=None):
+def _process_page(url, session, visited, hits, best, referer=None, company_root=None):
     """
     Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
     Records hits into shared dicts. Returns scored next-page candidates.
     Does NOT recurse — BFS queue in detect_company drives traversal.
 
-    seen_ext_domains / company_root enable external-signal novelty pruning:
-    if a page introduces no new external hostnames AND a complete ATS hit
-    already exists, its candidates are dropped — the page is structurally
-    identical to pages already processed and cannot reveal a new ATS.
+    Leaf conditions (return [] immediately):
+      Rule 1  — new complete ATS hit found → children share the same ATS, useless.
+      Signal 1 — page is not company territory:
+                   neither company brand in page domain
+                   nor company root domain referenced anywhere in page HTML.
     """
     _url_ext = url.rsplit(".", 1)[-1].lower().split("?")[0] if "." in url else ""
     if _url_ext in {"jpg", "jpeg", "png", "gif", "svg", "webp", "ico",
@@ -688,19 +688,44 @@ def _process_page(url, session, visited, hits, best, referer=None,
                          source_label, len(visited), result["platform"])
             best[0] = result
 
-    # 1. Scan raw HTML
+    # Always scan raw HTML — catches ATS slug even on external pages
+    hits_before = len(hits)
     _handle(scan(html), "HTML")
 
-    # 2. Scan JS bundles
+    # Rule 1: new complete ATS hit in HTML → leaf
+    if len(hits) > hits_before:
+        logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
+        return []
+
+    # ── Signal 1: company territory check ────────────────────────────────────
+    # Company territory = brand name appears in the page's domain
+    #                  OR company root domain is referenced anywhere in the HTML.
+    # Both signals are derived from the email/company domain (e.g. "nomura.com"):
+    #   brand      = "nomura"   — first segment, appears in brand-family domains
+    #   company_root = "nomura.com" — full root, appears in cross-links and hrefs
+    # Neither uses the legal entity name which never matches website content.
+    if company_root:
+        company_brand = company_root.split('.')[0]
+        page_netloc   = urlparse(final_url).netloc.lower()
+        in_domain     = company_brand in page_netloc
+        in_html       = company_root in html.lower()
+        if not in_domain and not in_html:
+            logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
+            return []
+
+    # Company territory confirmed — full scan: JS bundles + API probes
     api_paths = []
     for src in _script_srcs(html, final_url):
         bundle, _ = _fetch(src, session, referer=final_url, is_script=True)
         if not bundle:
             continue
+        hits_before_js = len(hits)
         _handle(scan(bundle), "JS bundle")
+        if len(hits) > hits_before_js:
+            logger.debug("[detector] rule1 (JS): new hit — leaf %s", final_url)
+            return []
         api_paths.extend(_extract_api_paths(bundle))
 
-    # 2b. Probe API endpoints discovered in bundles
     seen_api = set()
     for path in api_paths:
         if path in seen_api:
@@ -711,28 +736,13 @@ def _process_page(url, session, visited, hits, best, referer=None,
         if not resp:
             continue
         logger.debug("[detector] API probe page=%d path=%s", len(visited), path)
+        hits_before_api = len(hits)
         _handle(scan(resp), "API")
-
-    # ── External signal novelty ──────────────────────────────────────────────
-    # Enqueue candidates only if this page introduces new external hostnames
-    # OR no complete ATS hit exists yet.
-    #
-    # "New external hostname" = any host outside company_root not seen before
-    # on any prior page.  Locale variants (ar-es/careers, au-en/careers) and
-    # culture pages reference the same CDN + ATS hosts as the pages already
-    # visited → zero new hosts → candidates dropped, cascade stopped.
-    #
-    # Multi-ATS is preserved: a page pointing to nomuracampus.tal.net (never
-    # seen) always passes — it's a genuinely new external integration point.
-    if seen_ext_domains is not None and company_root:
-        page_ext = _extract_external_domains(html, company_root)
-        new_ext  = page_ext - seen_ext_domains
-        seen_ext_domains.update(page_ext)
-        if not new_ext and hits:
-            logger.debug("[detector] ext-novelty: no new ext domains + hit exists"
-                         " — pruning candidates from %s", final_url)
+        if len(hits) > hits_before_api:
+            logger.debug("[detector] rule1 (API): new hit — leaf %s", final_url)
             return []
 
+    # Company territory, no hit yet → follow links
     candidates = find_next_pages(html, final_url, visited)
     logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
     return [(c, final_url) for c in candidates]
@@ -747,35 +757,6 @@ _PAGINATION_PARAM_RE = re.compile(
     re.IGNORECASE,
 )
 _PAGE_PATH_RE = re.compile(r'/page/\d+(?:/|$)', re.IGNORECASE)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# External signal novelty — only keep exploring from pages that introduce new
-# external domain references (the dynamic signal for a new ATS integration)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_EXT_URL_RE = re.compile(
-    r'(?:src|href|action|data-src)=["\']https?://([^/"\'#\s>]+)',
-    re.IGNORECASE,
-)
-
-
-def _extract_external_domains(html, company_root):
-    """
-    Return all external hostnames referenced in html that don't belong to
-    company_root (e.g. 'accenture.com').
-
-    These are the integration points where a career site connects to outside
-    systems — ATS platforms, CDN, analytics, etc.  When a page introduces
-    zero new hostnames compared to everything seen so far, it is structurally
-    identical to pages already processed and cannot reveal a new ATS.
-    """
-    external = set()
-    for host in _EXT_URL_RE.findall(html):
-        parts    = host.split('.')
-        host_root = '.'.join(parts[-2:]) if len(parts) >= 2 else host
-        if host_root != company_root:
-            external.add(host)
-    return external
 
 
 def _url_template(url):
@@ -896,7 +877,6 @@ def detect_company(company_domain, session=None):
 
     company_root       = '.'.join(domain.split('.')[-2:])  # e.g. 'accenture.com'
     visited            = set()  # prevents re-fetching any URL
-    seen_ext_domains   = set()  # external hostnames seen across all pages
     hits               = {}     # (platform, slug) → {platform, slug, source_url}
     best               = [None] # fallback partial
     pagination_roots   = {}     # listing root → paginated pages seen
@@ -911,17 +891,17 @@ def detect_company(company_domain, session=None):
     for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
         queue.append((f"https://{subdomain}.{root}", None))
 
-    # No page budget — BFS runs until the queue is empty (natural leaf termination).
-    # _filter_listing_candidates caps paginated job listings so we don't crawl 250
-    # identical job detail pages; all other branches (regions, subdomains, nav) are
-    # followed completely. visited dedup prevents cycles.
+    # BFS until queue drains. Two leaf conditions bound the crawl:
+    #   Rule 1  — page yields a new ATS hit → don't enqueue its children
+    #   Signal 1 — page not in company territory → scan only, no children
+    # _filter_listing_candidates additionally caps job-listing clusters.
     while queue:
         url, referer = queue.popleft()
         if url in visited:
             continue
         next_candidates = _process_page(
             url, session, visited, hits, best, referer,
-            seen_ext_domains=seen_ext_domains, company_root=company_root,
+            company_root=company_root,
         )
         filtered = _filter_listing_candidates(
             next_candidates, pagination_roots, sampled_patterns, confirmed_patterns
