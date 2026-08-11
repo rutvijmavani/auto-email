@@ -132,12 +132,13 @@ def rebuild_poll_queues() -> dict:
 
     Four-way categorisation based on CYCLE_START_HOUR (default 7 AM):
 
-    UNREGISTERED companies (in prospective_companies but no row in company_poll_stats)
-        → Never been scanned by the new scheduler (e.g. fresh deployment or
-          newly added company).  Treated identically to NEW: added to
-          poll:fullscan only, spread across a dynamic startup window.
-          on_fullscan_complete() writes their first company_poll_stats row
-          and bootstraps them into poll:adaptive afterwards.
+    UNREGISTERED companies (monitorable but no row in company_poll_stats)
+        → Never been scanned by the new scheduler (e.g. fresh deployment,
+          newly added company, or newly approved company_ats entry).
+          Treated identically to NEW: added to poll:fullscan only, spread
+          across a dynamic startup window.  on_fullscan_complete() writes
+          their first company_poll_stats row and bootstraps them into
+          poll:adaptive afterwards.
 
     NEW companies (row in company_poll_stats; last_poll_at IS NULL AND last_full_scan_at IS NULL)
         → poll:fullscan only, spread across a dynamic startup window.
@@ -228,7 +229,7 @@ def rebuild_poll_queues() -> dict:
     if unregistered:
         new_companies.extend(unregistered)
         logger.info(
-            "rebuild: %d unregistered companies found in prospective_companies "
+            "rebuild: %d unregistered companies found "
             "(not yet in company_poll_stats) → merged into NEW bucket",
             len(unregistered),
         )

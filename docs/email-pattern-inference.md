@@ -44,11 +44,26 @@ KG was the only source of truth for website/domain. Complex name-matching logic 
 
 ### New flow (LCA email-first)
 ```
+DOL LCA + USCIS join → rank by H1B approval count → priority score
+                                ↓
 LCA emails → domain counting per FEIN → probe domain → follow redirect → website URL
                                                                         ↓
                                                               career probe (19 patterns, CF Worker)
+                                                              → fein_domain_map.careers_url
                                                                         ↓
-                                                                  ATS detection
+                                              (processed in priority order — top H1B sponsors first)
+                                                                        ↓
+                                                          career_page.py  ← gun: fast, BeautifulSoup
+                                                              HIT → company_ats (source="career_page", is_monitored=FALSE)
+                                                              MISS ↓
+                                                          career_detector.py  ← rifle: BFS, JS bundles
+                                                              HIT → company_ats (source="career_detector", is_monitored=FALSE)
+                                                              MISS → "undetected" queue (frontend)
+                                                                        ↓
+                                                          manual review → set is_monitored=TRUE → job monitor picks up
+                                                                        ↓
+                                                          recruiter scraping (LCA email patterns + CareerShift)
+                                                              → same priority order as ATS detection
 ```
 KG/Wikidata is now a secondary enrichment layer, not the domain source of truth.
 
@@ -264,6 +279,7 @@ Feeds directly into the discovery pipeline: `assigned_domain` → probe → `web
 | `lca_case_number` | TEXT | unique LCA case identifier |
 | `lca_quarter` | TEXT | which file (`FY2026_Q2`) |
 | `decision_date` | DATE | freshness signal — how old is this contact? |
+| `middle_name` | TEXT | from LCA `EMPLOYER_POC_MIDDLE_NAME` — dedicated field, required for `{mn}`/`{mi}`/`{mn[:N]}` pattern tokens |
 | `is_generic` | BOOLEAN | `true` if `hr@`, `immigration@` etc. — no pattern derivable |
 
 **Note on email as PK**: if the same person files under two subsidiary FEINs, PK keeps the most recent filing. Fine — for pattern building we only need the email+name pair once. If the same HR alias (`hr@company.com`) appears across 100 filings, stored once, last filing wins.
@@ -306,6 +322,49 @@ infosys.com — Deepa Nair:
   deepan@infosys.com        (5%,  53 records on file)
 ```
 No arbitrary cap in the data layer. Return everything above the threshold. UI can collapse low-probability ones if needed — that's a frontend concern. Always surface info, let user decide.
+
+---
+
+---
+
+## Columns Added to Existing Tables
+
+### `dol_h1b_soc_breakdown` — wage aggregates
+
+Wages are normalized to **annual equivalent** at ingest time:
+`Hour × 2080 | Week × 52 | Bi-Weekly × 26 | Month × 12 | Year × 1`
+
+NULL wages are excluded from aggregation. `wage_count` tracks how many filings contributed data.
+
+| column | type | purpose |
+|---|---|---|
+| `wage_from_min` | REAL | minimum annual `WAGE_RATE_OF_PAY_FROM` across filings for this employer+SOC |
+| `wage_from_max` | REAL | maximum annual `WAGE_RATE_OF_PAY_FROM` |
+| `wage_from_sum` | REAL | sum for avg: `wage_from_sum / wage_count` |
+| `wage_to_min` | REAL | minimum annual `WAGE_RATE_OF_PAY_TO` |
+| `wage_to_max` | REAL | maximum annual `WAGE_RATE_OF_PAY_TO` |
+| `wage_to_sum` | REAL | sum for avg: `wage_to_sum / wage_count` |
+| `wage_count` | INT | filings with non-NULL wage data for this employer+SOC |
+
+Enables all three query patterns without extra tables:
+- **Per company avg wage**: `SUM(wage_from_sum) / SUM(wage_count)` across all SOC rows for a FEIN
+- **Per SOC per company**: direct row read
+- **Per SOC across all companies**: aggregate on `soc_code` across entire table
+
+---
+
+### `dol_h1b_employers` — wage rollup
+
+Computed from `dol_h1b_soc_breakdown` at upsert time. Fast single-company lookup without aggregation.
+
+| column | type | purpose |
+|---|---|---|
+| `wage_from_min` | REAL | company-wide minimum annual offered wage (from side) |
+| `wage_from_max` | REAL | company-wide maximum annual offered wage (from side) |
+| `wage_from_avg` | REAL | company-wide average annual offered wage (from side) |
+| `wage_to_min` | REAL | company-wide minimum annual offered wage (to side) |
+| `wage_to_max` | REAL | company-wide maximum annual offered wage (to side) |
+| `wage_to_avg` | REAL | company-wide average annual offered wage (to side) |
 
 ---
 
@@ -371,11 +430,11 @@ None — all design decisions locked in. See "What IS Decided" below.
 - CareerShift stays as primary verified source; pattern inference is the scale/free path
 - LCA email domain already added to `dol_h1b_employers.poc_email_domain` as website fallback (existing change) — this feature builds on top of that
 - KG/Wikidata role narrowed: canonical name + Glassdoor/Crunchbase IDs + P10311 fallback only
-- **Storage**: 3-table design — `fein_domain_map`, `lca_contacts`, `email_patterns` (see above)
+- **Storage**: 3-table design — `fein_domain_map`, `lca_contacts`, `email_patterns` (see above); plus wage aggregates added to `dol_h1b_soc_breakdown` and rollup columns to `dol_h1b_employers` (see "Columns Added to Existing Tables")
 - `low_confidence` uses confidence ratio only (`< 0.70`); no `total_emails < N` condition
 - `total_unique_personal` exposed as raw count; no `low_sample` boolean flag — user decides reliability
 - Generated emails: stateless for now, not stored; Table 4 `generated_contacts` designed and deferred (see above)
-- Middle name: `EMPLOYER_POC_MIDDLE_NAME` is a dedicated LCA column — no parsing needed; closes `cameron.t.villa`-style open question
+- Middle name: `EMPLOYER_POC_MIDDLE_NAME` is a dedicated LCA column — stored as `middle_name` in `lca_contacts`; no parsing needed; closes `cameron.t.villa`-style open question
 - Digit handling: `{d}` token can appear anywhere in the local part (not just trailing); detect by replacing digit sequences with `{d}` placeholder and retrying match
 - Pattern storage threshold: probability floor of 5% (count / total_unique_personal) — no hard count threshold; naturally handles both small companies (1/1 = 100% → store) and large noisy ones (1/8000 = 0.01% → drop)
 - Multi-pattern output: return ALL patterns ≥ 5% sorted by probability descending, no cap — UI handles collapse if needed

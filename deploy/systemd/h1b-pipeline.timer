@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily H1B ATS Discovery Pipeline
+Requires=h1b-pipeline.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

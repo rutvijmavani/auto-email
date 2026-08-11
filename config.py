@@ -195,6 +195,8 @@ TARGET_SKILLS = [
 # Freshness
 JOB_MONITOR_DAYS_FRESH        = 3    # days to consider a job fresh
 JOB_MONITOR_REDETECT_DAYS     = 14   # re-detect ATS after X consecutive empty days
+DISCOVER_BATCH_SIZE           = int(os.getenv("DISCOVER_BATCH_SIZE", "100"))  # companies per daily pipeline run
+DISCOVER_REDETECT_EMPTY_DAYS  = int(os.getenv("DISCOVER_REDETECT_EMPTY_DAYS", "30"))  # step 3.5: re-discover after N empty days
 JOB_MONITOR_PDF_RETENTION     = 30   # days to keep PDF digest files
 JOB_MONITOR_MAX_JOBS          = 0    # 0 = no cap (show ALL matching jobs)
 JOB_MONITOR_API_TIMEOUT       = 10   # seconds per API request

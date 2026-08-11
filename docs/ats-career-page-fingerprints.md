@@ -759,42 +759,50 @@ Group 1 = slug
 
 ### Avature
 
-**Keyword identifier:** `avature`
+**Keyword identifiers:** `avature.net` / `avatureReferrerQueryParam` / `avature.portal`
 
 **Known URL variants:**
 ```
-https://{company}.avature.net/{slug}                      ← custom subdomain job board
-https://careers.{company}.com/...                         ← custom career page backed by Avature
+https://{company}.avature.net/{slug}                      ← hosted tenant (subdomain)
+https://careers.{company}.com/...                         ← custom domain, meta-tag configured
 ```
 - Avature is often configured with a fully custom career page UI — the Avature tenant URL only appears on the job detail or apply page.
+- Custom domains (L'Oreal, Lenovo) expose `avature.portal.*` meta tags instead of any `avature.net` URL.
 
-**Extraction regex:**
+**Slug structure (our pipeline):**
+```json
+{"base": "https://careers.loreal.com", "path": "en_US/content"}
 ```
-([a-z0-9-]+)\.avature\.net/([^/?&#\s"'<>]+)
-```
-Group 1 = company subdomain, Group 2 = path/slug
+- Hosted: `{"base": "https://{company}.avature.net", "path": "careers"}`
+- Custom domain: `{"base": "https://{careers-domain}", "path": "{lang}/{urlPath}"}` — reconstructed from meta tags
 
 **Fingerprint locations:**
 
-| type | what to look for | page level |
-|---|---|---|
-| JSON blob (`<script type="application/json">`) | `"avatureReferrerQueryParam"` key | career page (custom UI) |
-| `<a href>` | `*.avature.net/...` link | listing or JD page |
-| `<script src>` | `*.avature.net/...` JS file | listing or JD page |
+| type | keyword | what to look for | page level |
+|---|---|---|---|
+| JSON blob (`<script type="application/json">`) | `avatureReferrerQueryParam` | `"avatureReferrerQueryParam"` key | career page (Wayfair-style custom UI) |
+| `<a href>` / `<script src>` | `avature.net` | `*.avature.net/...` link or JS file | listing or JD page |
+| `<meta>` tags | `avature.portal` | `avature.portal.lang` + `avature.portal.urlPath` | career page (L'Oreal, Lenovo) |
+
+**Extraction:**
+- `avature.net` keyword → regex `([a-z0-9-]+)\.avature\.net/([a-zA-Z0-9_/-]+)` → hosted slug
+- `avatureReferrerQueryParam` keyword → confirms Avature, slug="" (need to go deeper to JD/apply page)
+- `avature.portal` keyword → read `avature.portal.lang` + `avature.portal.urlPath` meta tags + canonical URL → reconstruct `{"base": ..., "path": "lang/urlPath"}`
 
 **Confirmed examples:**
 
-| company | fingerprint found at | notes |
-|---|---|---|
-| Wayfair (`wayfair.com/careers/jobs`) | Career page — `<script type="application/json" id="wfAppData">` contains `"avatureReferrerQueryParam":"&source="` | Fully custom career UI on top of Avature; no Avature URL on career/listing page — only the referrer param key reveals the ATS. Avature tenant URL appears on JD or apply page. |
+| company | fingerprint found at | keyword triggered | notes |
+|---|---|---|---|
+| Wayfair (`wayfair.com/careers/jobs`) | Career page `<script type="application/json" id="wfAppData">` | `avatureReferrerQueryParam` | Fully custom UI; no Avature URL visible. Tenant URL appears at JD/apply page only. |
+| L'Oreal (`careers.loreal.com`) | Career page `<meta>` tags | `avature.portal` | `avature.portal.lang=en_US`, `avature.portal.urlPath=content` + canonical → `{"base": "https://careers.loreal.com", "path": "en_US/content"}` |
+| Lenovo | Career page `<meta>` tags | `avature.portal` | Same pattern as L'Oreal |
 
 **Notes:**
-- Wayfair built a fully custom job search UI (`careers_job_search_results` React component). The JSON data blob embedded server-side in `<script type="application/json" id="wfAppData">` contains `"avatureReferrerQueryParam"` alongside `"greenhouseReferrerQueryParam"` — Wayfair previously used Greenhouse and now uses Avature.
-- Scan `<script type="application/json">` text content, not just href/src attributes.
-- The `avature` keyword alone may not appear in this JSON — the key is the full string `avatureReferrerQueryParam`. Add `avatureReferrerQueryParam` as a secondary keyword to scan.
-- Actual Avature tenant URL (with slug) only appears at the job detail or apply page level.
+- Three distinct keywords, three distinct extractors — each does one thing.
+- `avature.portal` pattern is fully implemented in `career_detector.py:_extract_avature_portal()`.
+- Canonical URL (`<link rel="canonical">`) is used to derive the base domain for custom-domain companies.
 
-**Status: 1/3 confirmed — need Avature tenant URL from JD/apply page**
+**Status: ✅ 3 keywords implemented and confirmed**
 
 ---
 
@@ -849,7 +857,7 @@ Single keyword `icims` covers both. Document together.
 | talentbrew + jibe | 5+4 | `talentbrew` / `icims` | Charles Schwab (`schwabjobs.com`) | ✅ talentbrew documented (1 example, needs tenant IDs) |
 | eightfold | 3 | `eightfold` | Lam Research | ✅ documented (1 example, need 2 more) |
 | lever | 3 | `lever` | Spotify | ⚠️ HTML scan fails — JS bundle scan required |
-| avature | 2 | `avature` / `avatureReferrerQueryParam` | Wayfair (career page JSON blob), EA (`jobs.ea.com`) | ✅ documented (1 example, need Avature tenant URL from JD/apply page) |
+| avature | 2 | `avature.net` / `avatureReferrerQueryParam` / `avature.portal` | Wayfair, L'Oreal, Lenovo | ✅ LOCKED IN (3 keywords, 3 extractors) |
 | ashby | 2 | `ashbyhq` | Depth First, Snowflake | ✅ documented (1 example, need 2 more) |
 | taleo | 1 | `taleo` | Cognizant | ✅ documented (1 example, need 2 more) |
 | jobvite | 1 | `jobvite` | Nutanix (`nutanix.com`) | ⬜ |

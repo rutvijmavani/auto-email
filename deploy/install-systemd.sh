@@ -108,7 +108,8 @@ echo ""
 echo "► Staging unit templates to root-owned location..."
 UNIT_STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "$UNIT_STAGING_DIR"
-for _unit_src in "$DEPLOY_DIR"/systemd/*.service; do
+for _unit_src in "$DEPLOY_DIR"/systemd/*.service "$DEPLOY_DIR"/systemd/*.timer; do
+    [[ -f "$_unit_src" ]] || continue
     unit="$(basename "$_unit_src")"
     [[ "$unit" == "cloudflare-tunnel.service" ]] && continue
     cp "$_unit_src" "$UNIT_STAGING_DIR/$unit"
@@ -129,20 +130,26 @@ UNIT_INSTALL_BIN="/usr/local/bin/install-pipeline-units"
 cat > "$UNIT_INSTALL_BIN" << WRAPPER_EOF
 #!/bin/bash
 # Root-owned unit installer — reads from root-owned staging dir.
-# Auto-installs all .service files present in staging (cloudflare-tunnel excluded).
+# Auto-installs all .service and .timer files (cloudflare-tunnel excluded).
 set -euo pipefail
 SERVICE_USER="${SERVICE_USER}"
 PROJECT_DIR="${PROJECT_DIR}"
 SRC_DIR="/usr/local/share/mail-pipeline/systemd"
 DST_DIR="/etc/systemd/system"
-for src in "\$SRC_DIR"/*.service; do
+for src in "\$SRC_DIR"/*.service "\$SRC_DIR"/*.timer; do
+    [[ -f "\$src" ]] || continue
     unit="\$(basename "\$src")"
     [[ "\$unit" == "cloudflare-tunnel.service" ]] && continue
     sed "s|User=opc|User=\$SERVICE_USER|g; s|Group=opc|Group=\$SERVICE_USER|g; s|/home/opc/mail|\$PROJECT_DIR|g" \
         "\$src" > "\$DST_DIR/\$unit"
     echo "  Installed: \$DST_DIR/\$unit"
     if [[ "\$unit" != *@* ]]; then
-        systemctl enable "\${unit%.service}" || true
+        ext="\${unit##*.}"
+        if [[ "\$ext" == "timer" ]]; then
+            systemctl enable "\$unit" || true
+        else
+            systemctl enable "\${unit%.service}" || true
+        fi
     fi
 done
 WRAPPER_EOF

@@ -229,14 +229,19 @@ def _cleanup_unmatched_emails(c):
 
 def _cleanup_seen_job_ids(c):
     """
-    Remove seen_job_ids entries for companies no longer in prospective_companies.
+    Remove seen_job_ids entries for companies no longer monitored.
     Keeps the table lean as companies are removed.
     Also prune entries not polled in 90 days (dormant cleanup).
+    company_ats entries use 'ca:{id}' keys — excluded from deletion while
+    is_monitored=TRUE.
     """
     c.execute("""
         DELETE FROM seen_job_ids
         WHERE company NOT IN (
             SELECT company FROM prospective_companies
+        )
+        AND company NOT IN (
+            SELECT 'ca:' || id::text FROM company_ats WHERE is_monitored = TRUE
         )
     """)
     cutoff = (datetime.now() - timedelta(days=90)).isoformat()
@@ -1560,6 +1565,157 @@ def init_db():
             CONSTRAINT uq_quality_event_fein UNIQUE (fein)
         )
     """)
+
+    # ── LCA email inference tables (2026-08-10) ──────────────────────────────
+
+    # fein_domain_map: one row per FEIN — domain frequency map + probed website/careers URL.
+    # Populated by process_dol_lca.py during ingest.
+    # assigned_domain is the LCA email-first source of truth for domain resolution;
+    # replaces KG/Wikidata P856 as the primary website_url source.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS fein_domain_map (
+            employer_fein   TEXT        PRIMARY KEY REFERENCES dol_h1b_employers(employer_fein) ON DELETE CASCADE,
+            domain_counts   JSONB       NOT NULL DEFAULT '{}',
+            total_emails    INTEGER     NOT NULL DEFAULT 0,
+            assigned_domain TEXT,
+            confidence      REAL,
+            low_confidence  BOOLEAN     NOT NULL DEFAULT FALSE,
+            website_url     TEXT,
+            careers_url     TEXT,
+            updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fein_domain_assigned
+        ON fein_domain_map (assigned_domain)
+        WHERE assigned_domain IS NOT NULL
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fein_domain_low_conf
+        ON fein_domain_map (low_confidence)
+    """)
+
+    # lca_contacts: one row per unique POC email — deduplicated across all quarterly files.
+    # email is PK — same HR contact across 50 filings = 1 row (last filing wins).
+    # is_generic=TRUE for hr@, immigration@ etc. — no pattern derivable, still useful as direct contact.
+    # middle_name stored for {mn}/{mi}/{mn[:N]} pattern tokens — dedicated LCA column, no parsing needed.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS lca_contacts (
+            email           TEXT        PRIMARY KEY,
+            domain          TEXT        NOT NULL,
+            first_name      TEXT,
+            middle_name     TEXT,
+            last_name       TEXT,
+            job_title       TEXT,
+            employer_fein   TEXT        REFERENCES dol_h1b_employers(employer_fein) ON DELETE SET NULL,
+            employer_name   TEXT,
+            lca_case_number TEXT,
+            lca_quarter     TEXT,
+            decision_date   DATE,
+            is_generic      BOOLEAN     NOT NULL DEFAULT FALSE
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_lca_contacts_domain
+        ON lca_contacts (domain)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_lca_contacts_fein
+        ON lca_contacts (employer_fein)
+        WHERE employer_fein IS NOT NULL
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_lca_contacts_generic
+        ON lca_contacts (is_generic)
+    """)
+
+    # email_patterns: one row per domain — JSONB patterns array built by build_email_patterns.py.
+    # patterns = [{pattern_id, count, probability, example_local, last_seen, has_digit}]
+    # Only patterns with probability >= 5% are stored (count/total_unique_personal).
+    # total_unique_personal: unique non-generic emails used — exposed as raw count (no low_sample flag).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS email_patterns (
+            domain                  TEXT        PRIMARY KEY,
+            patterns                JSONB       NOT NULL DEFAULT '[]',
+            total_unique_personal   INTEGER     NOT NULL DEFAULT 0,
+            updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    # company_ats: ATS detection results from the H1B discovery pipeline.
+    # UNIQUE(domain, platform) — enables multi-ATS per company (e.g. Nomura: SF + Taleo rows).
+    # is_monitored=FALSE by default — requires manual review before job monitor picks it up.
+    # source tracks which detector found it: "career_page" | "career_detector" | "manual".
+    # priority is derived from USCIS approval count — top H1B sponsors processed first.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS company_ats (
+            id                      BIGSERIAL   PRIMARY KEY,
+            employer_fein           TEXT        REFERENCES dol_h1b_employers(employer_fein) ON DELETE SET NULL,
+            domain                  TEXT        NOT NULL,
+            company_name            TEXT,
+            platform                TEXT        NOT NULL,
+            slug                    TEXT        NOT NULL,
+            source                  TEXT        NOT NULL,
+            is_monitored            BOOLEAN     NOT NULL DEFAULT FALSE,
+            status                  TEXT        NOT NULL DEFAULT 'pending',
+            priority                INTEGER     NOT NULL DEFAULT 0,
+            detected_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reviewed_at             TIMESTAMPTZ,
+            scraped_at              TIMESTAMPTZ,
+            converted_at            TIMESTAMPTZ,
+            first_scanned_at        TIMESTAMPTZ,
+            last_checked_at         TIMESTAMPTZ,
+            consecutive_empty_days  INTEGER     NOT NULL DEFAULT 0,
+            UNIQUE (domain, platform)
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_ats_monitored
+        ON company_ats (is_monitored)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_ats_platform
+        ON company_ats (platform)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_ats_priority
+        ON company_ats (priority DESC)
+        WHERE is_monitored = FALSE
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_ats_fein
+        ON company_ats (employer_fein)
+        WHERE employer_fein IS NOT NULL
+    """)
+
+    # ── Wage aggregates on existing tables (2026-08-10) ───────────────────────
+    # Wages normalized to annual equivalent at ingest time:
+    #   Hour × 2080 | Week × 52 | Bi-Weekly × 26 | Month × 12 | Year × 1
+    # wage_count = filings with non-NULL wage data (NULL wages excluded from aggregation).
+    # wage_*_sum / wage_count = avg wage. LEAST/GREATEST used in upsert for running min/max.
+
+    for col, typ in [
+        ("wage_from_min", "REAL"),
+        ("wage_from_max", "REAL"),
+        ("wage_from_sum", "REAL"),
+        ("wage_to_min",   "REAL"),
+        ("wage_to_max",   "REAL"),
+        ("wage_to_sum",   "REAL"),
+        ("wage_count",    "INTEGER"),
+    ]:
+        c.execute(f"ALTER TABLE dol_h1b_soc_breakdown ADD COLUMN IF NOT EXISTS {col} {typ}")
+
+    # Rollup columns on dol_h1b_employers — computed from soc_breakdown at upsert time.
+    # Fast single-company wage lookup without aggregating soc_breakdown.
+    for col, typ in [
+        ("wage_from_min", "REAL"),
+        ("wage_from_max", "REAL"),
+        ("wage_from_avg", "REAL"),
+        ("wage_to_min",   "REAL"),
+        ("wage_to_max",   "REAL"),
+        ("wage_to_avg",   "REAL"),
+    ]:
+        c.execute(f"ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS {col} {typ}")
 
     # ── Cleanup pass ─────────────────────────────────────────────────────────
     _cleanup_auto_close_applications(c)

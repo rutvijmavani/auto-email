@@ -821,6 +821,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         _release_dc("company-not-found")
         return result
 
+    display_name = company_row.get("company_name") or company
+
     platform = company_row.get("ats_platform", "unknown")
     slug     = company_row.get("ats_slug")
 
@@ -1139,7 +1141,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # Layer 4: DB check — source of truth for new/known decision.
                 try:
                     detail_payload = _build_detail_payload(
-                        company, platform, job, slug_info,
+                        display_name, platform, job, slug_info,
                     )
                 except ValueError:
                     logger.error(
@@ -1151,7 +1153,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                     )
                 else:
                     if save_pending_detail(
-                        company, platform, job, found_by="tier2_fullscan",
+                        display_name, platform, job, found_by="tier2_fullscan",
                         detail_payload=detail_payload,
                     ):
                         # Layer 2 Lever 1: skip push when detail backpressure active.

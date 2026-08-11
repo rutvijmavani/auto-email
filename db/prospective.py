@@ -129,16 +129,42 @@ def add_prospective_company(company, priority=0, domain=None):
 
 def get_pending_prospective(limit=None):
     """
-    Return prospective companies with status = 'pending' (not yet scraped).
-    Ordered by priority DESC, then created_at ASC (higher priority first,
-    earlier added first within same priority).
+    Return companies pending recruiter scraping from both prospective_companies
+    and company_ats (is_monitored=TRUE, status='pending', company_name NOT NULL).
+
+    Each row includes:
+      company    — actual company name passed to CareerShift search
+      update_key — identifier for mark_prospective_scraped/exhausted calls;
+                   equals company for prospective_companies rows,
+                   'ca:{id}' for company_ats rows
+      priority   — ordering weight
+      domain     — full domain hint for scraper email validation (may be None)
     """
     conn = get_conn()
     c = conn.cursor()
     query = """
-        SELECT id, company, priority
+        SELECT
+            company     AS update_key,
+            company,
+            priority,
+            domain,
+            created_at
         FROM prospective_companies
         WHERE status = 'pending'
+
+        UNION ALL
+
+        SELECT
+            'ca:' || id::text AS update_key,
+            company_name      AS company,
+            priority,
+            domain,
+            detected_at       AS created_at
+        FROM company_ats
+        WHERE is_monitored = TRUE
+          AND status = 'pending'
+          AND company_name IS NOT NULL
+
         ORDER BY priority DESC, created_at ASC
     """
     if limit:
@@ -172,9 +198,25 @@ def get_prospective_companies(status=None):
     return rows
 
 
-def mark_prospective_scraped(company):
-    """Mark prospective company as scraped — recruiters found."""
-    company = _normalize_company(company)
+def mark_prospective_scraped(company_key):
+    """
+    Mark company as scraped — recruiters found.
+    company_key is 'ca:{id}' for company_ats rows, company name otherwise.
+    """
+    if company_key.startswith("ca:"):
+        id_ = int(company_key[3:])
+        conn = get_conn()
+        try:
+            conn.execute("""
+                UPDATE company_ats
+                SET status = 'scraped', scraped_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND status = 'pending'
+            """, (id_,))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    company = _normalize_company(company_key)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -186,9 +228,25 @@ def mark_prospective_scraped(company):
     conn.close()
 
 
-def mark_prospective_exhausted(company):
-    """Mark prospective company as exhausted — no recruiters found."""
-    company = _normalize_company(company)
+def mark_prospective_exhausted(company_key):
+    """
+    Mark company as exhausted — no recruiters found.
+    company_key is 'ca:{id}' for company_ats rows, company name otherwise.
+    """
+    if company_key.startswith("ca:"):
+        id_ = int(company_key[3:])
+        conn = get_conn()
+        try:
+            conn.execute("""
+                UPDATE company_ats
+                SET status = 'exhausted', scraped_at = CURRENT_TIMESTAMP
+                WHERE id = %s AND status = 'pending'
+            """, (id_,))
+            conn.commit()
+        finally:
+            conn.close()
+        return
+    company = _normalize_company(company_key)
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
@@ -264,11 +322,25 @@ def get_prospective_company(company):
     conn.close()
     return dict(row) if row else None
 
-def get_domain_for_prospective(company):
-    """Return the domain root for a prospective company, or '' if not set.
-    e.g. 'lucidmotors.com' → 'lucidmotors', 'snap.com' → 'snap'
+def get_domain_for_prospective(company_key):
     """
-    company = _normalize_company(company)
+    Return the domain root for a company, or '' if not set.
+    e.g. 'lucidmotors.com' → 'lucidmotors', 'snap.com' → 'snap'
+    company_key is 'ca:{id}' for company_ats rows, company name otherwise.
+    """
+    if company_key.startswith("ca:"):
+        id_ = int(company_key[3:])
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT domain FROM company_ats WHERE id = %s", (id_,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row and row["domain"]:
+            return row["domain"].split(".")[0]
+        return ""
+    company = _normalize_company(company_key)
     conn = get_conn()
     c = conn.cursor()
     c.execute(

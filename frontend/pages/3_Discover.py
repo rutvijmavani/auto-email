@@ -216,6 +216,16 @@ def load_ats_discovery(fein: str) -> dict | None:
     return df.to_dict("records")[0] if not df.empty else None
 
 
+@st.cache_data(ttl=60)
+def load_company_ats_entries(fein: str) -> list[dict]:
+    """Load all company_ats rows for a given employer FEIN, ordered by priority."""
+    df = _query(
+        "SELECT * FROM company_ats WHERE employer_fein = %s ORDER BY priority DESC",
+        (fein,),
+    )
+    return df.to_dict("records") if not df.empty else []
+
+
 def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     """
     Run a quick inline ATS discovery from the UI.
@@ -438,6 +448,16 @@ emp  = df.iloc[sel_rows[0]]
 fein = emp["employer_fein"]
 name = emp["employer_name"]
 
+# Purge editor session state from the previous company so stale widget
+# values don't bleed into this render cycle.
+if st.session_state.get("_last_fein") != fein:
+    _stale_prefixes = ("edit_careers_", "edit_jobs_", "edit_apply_",
+                       "input_edit_", "save_edit_", "cancel_edit_")
+    for _k in list(st.session_state.keys()):
+        if any(_k.startswith(_p) for _p in _stale_prefixes):
+            del st.session_state[_k]
+    st.session_state["_last_fein"] = fein
+
 st.divider()
 st.subheader(name)
 st.caption(
@@ -634,7 +654,7 @@ st.markdown("#### ATS Discovery")
 
 if disc is None:
     st.info("No discovery data yet for this employer.")
-    if st.button("Run ATS discovery", key="run_disc"):
+    if st.button("Run ATS discovery", key=f"run_disc_{fein}"):
         with st.spinner("Querying KG API + Wikidata + probing careers page …"):
             try:
                 disc = _run_inline_discovery(fein, name)
@@ -784,7 +804,7 @@ else:
             if monitored or pipeline_st:
                 st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
             else:
-                if st.button("Add to monitoring", key="add_mon", type="primary"):
+                if st.button("Add to monitoring", key=f"add_mon_{fein}", type="primary"):
                     try:
                         pipeline_name = canonical if canonical != "—" else name
                         inserted = add_prospective_company(
@@ -832,7 +852,7 @@ else:
         paste_url = st.text_input(
             "Apply / job listing URL",
             placeholder="https://boards.greenhouse.io/stripe  or  https://stripe.wd1.myworkdayjobs.com/…",
-            key="paste_ats_url",
+            key=f"paste_ats_url_{fein}",
         )
 
         if paste_url:
@@ -842,7 +862,7 @@ else:
                 s2 = matched.get("slug")
                 st.success(f"Detected: **{p2}**" + (f"  ·  slug: `{s2}`" if s2 else ""))
 
-                if st.button("Confirm and add to monitoring", key="confirm_ats", type="primary"):
+                if st.button("Confirm and add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
                     try:
                         pipeline_name = canonical if canonical != "—" else name
                         # Insert into pipeline first; only mark is_monitored on success
@@ -894,7 +914,7 @@ else:
         checked_str = str(checked)[:16].replace("T", " ")
         st.caption(f"Last checked: {checked_str}")
 
-    if st.button("Re-run discovery", key="rerun_disc"):
+    if st.button("Re-run discovery", key=f"rerun_disc_{fein}"):
         with st.spinner("Re-checking …"):
             try:
                 _run_inline_discovery(fein, name)
@@ -903,6 +923,64 @@ else:
             except Exception as exc:
                 log.exception("Re-run discovery failed for %r", name)
                 st.error(f"Error: {exc}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# company_ats review panel — flip is_monitored after manual review
+# ─────────────────────────────────────────────────────────────────────────────
+
+ca_entries = load_company_ats_entries(fein)
+if ca_entries:
+    st.divider()
+    st.markdown("#### Detected ATS entries (pending review)")
+    st.caption(
+        "These entries were discovered by the H-1B ATS pipeline. "
+        "Toggle **Monitor** to start job tracking once you've confirmed the slug is correct."
+    )
+    for ca in ca_entries:
+        ca_id       = ca["id"]
+        ca_platform = ca.get("platform", "unknown")
+        ca_slug     = ca.get("slug", "")
+        ca_domain   = ca.get("domain", "")
+        ca_monitored = bool(ca.get("is_monitored"))
+        ca_status   = ca.get("status", "pending")
+        ca_source   = ca.get("source", "")
+
+        badge = "🟢 Monitored" if ca_monitored else "⚪ Pending review"
+        with st.expander(
+            f"{badge}  ·  {ca_platform}  ·  `{ca_slug}`  ·  {ca_domain}",
+            expanded=not ca_monitored,
+        ):
+            info_cols = st.columns(3)
+            info_cols[0].markdown(f"**Platform**\n\n{ca_platform}")
+            info_cols[1].markdown(f"**Slug**\n\n`{ca_slug}`")
+            info_cols[2].markdown(f"**Domain**\n\n{ca_domain}")
+
+            meta_cols = st.columns(3)
+            meta_cols[0].markdown(f"**Source**\n\n{ca_source}")
+            meta_cols[1].markdown(f"**Status**\n\n{ca_status}")
+            meta_cols[2].markdown(f"**Priority**\n\n{ca.get('priority', 0):,}")
+
+            st.markdown("")
+            btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
+            btn_type  = "secondary" if ca_monitored else "primary"
+            if st.button(btn_label, key=f"ca_toggle_{ca_id}", type=btn_type):
+                new_val = not ca_monitored
+                try:
+                    conn = get_conn()
+                    try:
+                        conn.execute(
+                            "UPDATE company_ats SET is_monitored = %s, reviewed_at = NOW() "
+                            "WHERE id = %s",
+                            (new_val, ca_id),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    load_company_ats_entries.clear()
+                    st.rerun()
+                except Exception as exc:
+                    log.exception("Failed to toggle is_monitored for company_ats id=%s", ca_id)
+                    st.error(f"Error: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

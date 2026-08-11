@@ -1,0 +1,26 @@
+[Unit]
+Description=H1B ATS Discovery Pipeline (daily batch)
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target postgresql.service
+Wants=network-online.target
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=oneshot
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/python scripts/h1b_pipeline.py
+TimeoutStartSec=7200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=no
+ReadWritePaths=/home/opc/mail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=h1b-pipeline
+
+[Install]
+WantedBy=multi-user.target

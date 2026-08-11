@@ -155,7 +155,25 @@ def mark_first_scan_complete(company):
 
     Idempotent — only sets first_scanned_at when it is NULL so calling it
     multiple times (e.g. after update_company_check already set it) is safe.
+
+    company_ats entries use the 'ca:{id}' key prefix — routed to company_ats.
     """
+    if company.startswith("ca:"):
+        id_ = int(company[3:])
+        conn = get_conn()
+        try:
+            conn.execute("""
+                UPDATE company_ats
+                SET first_scanned_at = CASE
+                        WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                        ELSE first_scanned_at
+                    END
+                WHERE id = %s
+            """, (id_,))
+            conn.commit()
+        finally:
+            conn.close()
+        return
     conn = get_conn()
     try:
         conn.execute("""
@@ -181,7 +199,41 @@ def update_company_check(company, found_jobs):
 
     Combining first_scanned_at into this call ensures it is set even when the
     company returns 0 jobs on its first scan (early-return path in _process_company).
+
+    company_ats entries use the 'ca:{id}' key prefix — routed to company_ats.
     """
+    if company.startswith("ca:"):
+        id_ = int(company[3:])
+        conn = get_conn()
+        try:
+            if found_jobs:
+                conn.execute("""
+                    UPDATE company_ats
+                    SET first_scanned_at = CASE
+                            WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                            ELSE first_scanned_at
+                        END,
+                        last_checked_at        = CURRENT_TIMESTAMP,
+                        consecutive_empty_days = 0
+                    WHERE id = %s
+                """, (id_,))
+            else:
+                conn.execute("""
+                    UPDATE company_ats
+                    SET first_scanned_at = CASE
+                            WHEN first_scanned_at IS NULL THEN CURRENT_TIMESTAMP
+                            ELSE first_scanned_at
+                        END,
+                        last_checked_at        = CURRENT_TIMESTAMP,
+                        consecutive_empty_days = COALESCE(
+                            consecutive_empty_days, 0
+                        ) + 1
+                    WHERE id = %s
+                """, (id_,))
+            conn.commit()
+        finally:
+            conn.close()
+        return
     conn = get_conn()
     try:
         if found_jobs:
@@ -214,7 +266,11 @@ def update_company_check(company, found_jobs):
 
 
 def get_all_monitored_companies():
-    """Return all companies from prospective_companies table."""
+    """
+    Return all monitored companies from both prospective_companies and
+    company_ats (is_monitored=TRUE). company_ats rows use 'ca:{id}' as the
+    company key so callers can route write-backs to the correct table.
+    """
     conn = get_conn()
     try:
         rows = conn.execute("""
@@ -223,6 +279,21 @@ def get_all_monitored_companies():
                    last_checked_at, consecutive_empty_days,
                    domain
             FROM prospective_companies
+
+            UNION ALL
+
+            SELECT
+                'ca:' || id::text          AS company,
+                platform                   AS ats_platform,
+                slug                       AS ats_slug,
+                NULL                       AS ats_detected_at,
+                first_scanned_at,
+                last_checked_at,
+                consecutive_empty_days,
+                domain
+            FROM company_ats
+            WHERE is_monitored = TRUE
+
             ORDER BY company ASC
         """).fetchall()
         return [dict(r) for r in rows]
@@ -232,27 +303,23 @@ def get_all_monitored_companies():
 
 def get_monitorable_companies():
     """
-    Return companies ready for daily job monitoring.
+    Return companies ready for daily job monitoring from both
+    prospective_companies and company_ats (is_monitored=TRUE).
 
-    Includes:
-      - All standard detected platforms (greenhouse, lever, ashby etc.)
+    prospective_companies rules:
+      - Standard detected platforms (greenhouse, lever, ashby, etc.)
       - custom WITH valid ats_slug containing a 'url' field
-        (curl has been captured and parsed successfully)
-      - manual overrides (any platform with _manual flag)
+      - Excludes: unknown, unsupported, NULL slug, custom without URL
 
-    Excludes:
-      - unknown (ATS never detected)
-      - custom WITHOUT valid ats_slug (needs curl capture)
-      - unsupported (out of scope platforms)
-      - NULL slug (detection incomplete)
+    company_ats rules:
+      - is_monitored = TRUE
+      - platform not unknown/unsupported, slug present
+      - Returned with 'ca:{id}' as company key for write-back routing
     """
     conn = get_conn()
     try:
         # json_extract_text() is a safe PL/pgSQL helper defined in init_db()
         # that returns NULL for non-JSON input (catches cast exceptions).
-        # Using it here avoids the "invalid input syntax for type json" error
-        # that occurs when PostgreSQL eagerly evaluates ats_slug::json for
-        # non-custom rows whose ats_slug is a plain string (e.g. "amazon").
         rows = conn.execute("""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
@@ -262,15 +329,29 @@ def get_monitorable_companies():
               AND ats_platform NOT IN ('unknown', 'unsupported')
               AND ats_slug IS NOT NULL
               AND (
-                  -- Standard platforms: include as long as slug present
                   ats_platform != 'custom'
                   OR
-                  -- Custom: only include when slug has a captured URL.
-                  -- json_extract_text() safely returns NULL for non-JSON input.
                   (ats_platform = 'custom'
                    AND json_extract_text(ats_slug, '$.url') IS NOT NULL
                    AND json_extract_text(ats_slug, '$.url') <> '')
               )
+
+            UNION ALL
+
+            SELECT
+                'ca:' || id::text          AS company,
+                platform                   AS ats_platform,
+                slug                       AS ats_slug,
+                NULL                       AS ats_detected_at,
+                first_scanned_at,
+                last_checked_at,
+                consecutive_empty_days
+            FROM company_ats
+            WHERE is_monitored = TRUE
+              AND platform IS NOT NULL
+              AND platform NOT IN ('unknown', 'unsupported')
+              AND slug IS NOT NULL
+
             ORDER BY company ASC
         """).fetchall()
         return [dict(r) for r in rows]
@@ -592,11 +673,34 @@ def get_tracked_urls_for_company(company):
 
 def get_company_row(company: str) -> "dict | None":
     """
-    Fetch a single company row by name for the scan worker.
+    Fetch a single company row by key for the scan worker.
     Returns the same shape as get_monitorable_companies() rows,
     plus domain (used by re-detection logging in _process_company).
-    Returns None if company not found.
+
+    company_ats entries use the 'ca:{id}' prefix — routed to company_ats.
+    Returns None if company not found in either table.
     """
+    if company.startswith("ca:"):
+        id_ = int(company[3:])
+        conn = get_conn()
+        try:
+            row = conn.execute("""
+                SELECT
+                    'ca:' || id::text          AS company,
+                    platform                   AS ats_platform,
+                    slug                       AS ats_slug,
+                    NULL                       AS ats_detected_at,
+                    first_scanned_at,
+                    last_checked_at,
+                    consecutive_empty_days,
+                    domain,
+                    company_name
+                FROM company_ats
+                WHERE id = %s
+            """, (id_,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
     conn = get_conn()
     try:
         row = conn.execute("""
