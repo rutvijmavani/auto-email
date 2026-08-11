@@ -4,6 +4,10 @@ export default {
       return new Response("Method Not Allowed", { status: 405 });
     }
 
+    // Reject all requests when secret is not configured
+    if (!env.PROBE_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
     const auth = request.headers.get("Authorization") || "";
     if (auth !== `Bearer ${env.PROBE_SECRET}`) {
       return new Response("Unauthorized", { status: 401 });
@@ -17,7 +21,10 @@ export default {
     }
 
     const targetUrl = body.url;
-    const maxBytes  = body.max_bytes || 65536;
+    const rawBytes  = body.max_bytes;
+    const maxBytes  = (Number.isFinite(rawBytes) && rawBytes > 0)
+      ? Math.min(rawBytes, 2 * 1024 * 1024)   // cap at 2 MB
+      : 65536;
 
     if (!targetUrl || typeof targetUrl !== "string") {
       return Response.json({ error: "Missing url" }, { status: 400 });
@@ -44,8 +51,22 @@ export default {
         redirect: "follow",
       });
 
-      const buf  = await resp.arrayBuffer();
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf.slice(0, maxBytes));
+      // Read incrementally up to maxBytes — avoids buffering huge responses
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (received < maxBytes) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const slice = value.slice(0, maxBytes - received);
+        chunks.push(slice);
+        received += slice.byteLength;
+      }
+      reader.cancel().catch(() => {});
+      const buf = new Uint8Array(received);
+      let pos = 0;
+      for (const c of chunks) { buf.set(c, pos); pos += c.byteLength; }
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
 
       return Response.json({
         status:    resp.status,

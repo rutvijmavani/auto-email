@@ -364,10 +364,20 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             _conn = None
             try:
                 _conn = _get_conn()
-                _conn.execute(
-                    "UPDATE prospective_companies SET ats_slug = ? WHERE company = ?",
-                    (json.dumps(slug_info), company),
-                )
+                if company.startswith("ca:"):
+                    try:
+                        _ca_id = int(company[3:])
+                    except ValueError:
+                        raise ValueError(f"malformed ca: key: {company!r}")
+                    _conn.execute(
+                        "UPDATE company_ats SET slug = %s WHERE id = %s",
+                        (json.dumps(slug_info), _ca_id),
+                    )
+                else:
+                    _conn.execute(
+                        "UPDATE prospective_companies SET ats_slug = %s WHERE company = %s",
+                        (json.dumps(slug_info), company),
+                    )
                 _conn.commit()
                 logger.info(
                     "scan_worker [%s]: persisted updated slug_info for %r "

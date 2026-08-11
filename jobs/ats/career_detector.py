@@ -73,6 +73,15 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
         return None
 
+_MULTI_LABEL_SLDS = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "gen", "ne", "me"}
+
+def _host_root(hostname: str) -> str:
+    """Return the registrable domain, handling multi-label TLDs like .co.uk."""
+    parts = hostname.split(".")
+    if len(parts) >= 3 and parts[-2] in _MULTI_LABEL_SLDS:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+
 def _make_session():
     if _CURL_AVAILABLE:
         return _CurlSession(impersonate="chrome124")
@@ -429,10 +438,11 @@ _TENTATIVE_PLATFORMS = {"eightfold"}
 
 def scan(text):
     """
-    Scan raw text for any ATS keyword. Returns first non-tentative match,
-    or tentative match if nothing harder found.
+    Scan raw text for any ATS keyword. Returns first non-tentative match with
+    a non-empty slug, then a non-tentative partial (empty slug), then a tentative.
     """
     tentative = None
+    partial   = None  # non-tentative platform detected but slug is empty
     for keyword, extractor in ATS_KEYWORDS.items():
         if keyword in text:
             result = extractor(text)
@@ -440,9 +450,11 @@ def scan(text):
                 if result["platform"] in _TENTATIVE_PLATFORMS:
                     if tentative is None:
                         tentative = result
-                else:
+                elif result.get("slug"):
                     return result
-    return tentative
+                elif partial is None:
+                    partial = result
+    return partial or tentative
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -903,7 +915,7 @@ def detect_company(company_domain, session=None):
     if session is None:
         session = _make_session()
 
-    company_root       = '.'.join(domain.split('.')[-2:])  # e.g. 'accenture.com'
+    company_root       = _host_root(domain)  # e.g. 'accenture.com' or 'amazon.co.uk'
     visited            = set()  # prevents re-fetching any URL
     hits               = {}     # (platform, slug) → {platform, slug, source_url}
     best               = [None] # fallback partial
@@ -915,15 +927,18 @@ def detect_company(company_domain, session=None):
     queue = deque()
     for path in CAREER_PATHS:
         queue.append((f"https://{domain}{path}", None))
-    root = domain.split(".")[-2] + "." + domain.split(".")[-1]
-    for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-        queue.append((f"https://{subdomain}.{root}", None))
+    root = _host_root(domain)
+    if len(domain.split(".")) > 1:
+        for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
+            queue.append((f"https://{subdomain}.{root}", None))
 
     # BFS until queue drains. Two leaf conditions bound the crawl:
     #   Rule 1  — page yields a new ATS hit → don't enqueue its children
     #   Signal 1 — page not in company territory → scan only, no children
     # _filter_listing_candidates additionally caps job-listing clusters.
     while queue:
+        if len(visited) >= _MAX_PAGES:
+            break
         url, referer = queue.popleft()
         if url in visited:
             continue

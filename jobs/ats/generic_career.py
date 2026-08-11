@@ -53,9 +53,9 @@ LOCATION_HINTS = {"location", "joblocation", "job_location", "city",
                   "citystate", "office", "site", "locationname", "fulllocation"}
 ID_HINTS       = {"id", "jobid", "job_id", "requisitionid", "reqid",
                   "req_id", "referenceid", "externalid", "postingid",
-                  "uniqueid", "slug", "req_id"}
+                  "uniqueid", "slug"}
 URL_HINTS      = {"url", "joburl", "job_url", "applyurl", "apply_url",
-                  "detailurl", "link", "href", "absoluteurl", "applyurl"}
+                  "detailurl", "link", "href", "absoluteurl"}
 DATE_HINTS     = {"posteddate", "posted_date", "postedat", "posted_at",
                   "postingdate", "dateposted", "date_posted", "createdat",
                   "created_at", "publishedat", "published_at", "postedts"}

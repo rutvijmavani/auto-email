@@ -199,9 +199,11 @@ def aggregate(df: pd.DataFrame) -> dict:
         trade_name_dba = _str_or_none(group["TRADE_NAME_DBA"].iloc[-1] if "TRADE_NAME_DBA" in group else None)
         h1b_dependent  = _parse_bool(group.get("H-1B_DEPENDENT",  pd.Series()).iloc[-1] if "H-1B_DEPENDENT"  in group else None)
         willful_viol   = _parse_bool(group.get("WILLFUL_VIOLATOR", pd.Series()).iloc[-1] if "WILLFUL_VIOLATOR" in group else None)
-        poc_email_domain = _extract_email_domain(
-            group["EMPLOYER_POC_EMAIL"].dropna().iloc[-1] if "EMPLOYER_POC_EMAIL" in group.columns and group["EMPLOYER_POC_EMAIL"].notna().any() else None
-        )
+        if "EMPLOYER_POC_EMAIL" in group.columns and group["EMPLOYER_POC_EMAIL"].notna().any():
+            _poc_by_date = group[group["EMPLOYER_POC_EMAIL"].notna()].sort_values("_dec_date", ascending=False, na_position="last")
+            poc_email_domain = _extract_email_domain(_poc_by_date["EMPLOYER_POC_EMAIL"].iloc[0])
+        else:
+            poc_email_domain = None
 
         employer_name_norm  = _norm_name(employer_name, strip_dba=True)
         trade_name_dba_norm = _norm_name(trade_name_dba) if trade_name_dba else None
@@ -537,8 +539,8 @@ def upsert(aggregated: dict, quarter: str) -> None:
                         total_filed, total_certified, total_positions,
                         wage_from_min, wage_from_max, wage_from_sum,
                         wage_to_min,   wage_to_max,   wage_to_sum,
-                        wage_count
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        wage_count, wage_to_count
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (employer_fein, soc_code) DO UPDATE SET
                         soc_title       = EXCLUDED.soc_title,
                         total_filed     = dol_h1b_soc_breakdown.total_filed     + EXCLUDED.total_filed,
@@ -550,13 +552,14 @@ def upsert(aggregated: dict, quarter: str) -> None:
                         wage_to_min     = LEAST(dol_h1b_soc_breakdown.wage_to_min, EXCLUDED.wage_to_min),
                         wage_to_max     = GREATEST(dol_h1b_soc_breakdown.wage_to_max, EXCLUDED.wage_to_max),
                         wage_to_sum     = COALESCE(dol_h1b_soc_breakdown.wage_to_sum, 0) + COALESCE(EXCLUDED.wage_to_sum, 0),
-                        wage_count      = COALESCE(dol_h1b_soc_breakdown.wage_count, 0) + COALESCE(EXCLUDED.wage_count, 0)
+                        wage_count      = COALESCE(dol_h1b_soc_breakdown.wage_count, 0)    + COALESCE(EXCLUDED.wage_count, 0),
+                        wage_to_count   = COALESCE(dol_h1b_soc_breakdown.wage_to_count, 0) + COALESCE(EXCLUDED.wage_to_count, 0)
                 """, (
                     fein, soc_code, s["soc_title"],
                     s["total_filed"], s["total_certified"], s["total_positions"],
                     s["wage_from_min"], s["wage_from_max"], s["wage_from_sum"],
                     s["wage_to_min"],   s["wage_to_max"],   s["wage_to_sum"],
-                    s["wage_count"],
+                    s["wage_count"],    s["wage_to_count"],
                 ))
                 soc_count += 1
 
@@ -610,8 +613,36 @@ def upsert(aggregated: dict, quarter: str) -> None:
                             )
                             ORDER BY value::int DESC LIMIT 1
                         ),
-                        confidence      = EXCLUDED.confidence,
-                        low_confidence  = EXCLUDED.low_confidence,
+                        confidence      = (
+                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)
+                            FROM jsonb_each_text(
+                                (
+                                    SELECT jsonb_object_agg(
+                                        key,
+                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
+                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
+                                    )
+                                    FROM jsonb_object_keys(
+                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                    ) AS key
+                                )
+                            )
+                        ),
+                        low_confidence  = (
+                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0) < 0.70
+                            FROM jsonb_each_text(
+                                (
+                                    SELECT jsonb_object_agg(
+                                        key,
+                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
+                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
+                                    )
+                                    FROM jsonb_object_keys(
+                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                    ) AS key
+                                )
+                            )
+                        ),
                         updated_at      = NOW()
                 """, (
                     fein,
@@ -641,6 +672,9 @@ def upsert(aggregated: dict, quarter: str) -> None:
                         lca_quarter     = EXCLUDED.lca_quarter,
                         decision_date   = EXCLUDED.decision_date,
                         is_generic      = EXCLUDED.is_generic
+                    WHERE EXCLUDED.decision_date IS NOT NULL
+                      AND (lca_contacts.decision_date IS NULL
+                           OR EXCLUDED.decision_date > lca_contacts.decision_date)
                 """, (
                     poc["email"], poc["domain"],
                     poc["first_name"], poc["middle_name"], poc["last_name"],

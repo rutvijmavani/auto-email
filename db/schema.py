@@ -1695,13 +1695,14 @@ def init_db():
     # wage_*_sum / wage_count = avg wage. LEAST/GREATEST used in upsert for running min/max.
 
     for col, typ in [
-        ("wage_from_min", "REAL"),
-        ("wage_from_max", "REAL"),
-        ("wage_from_sum", "REAL"),
-        ("wage_to_min",   "REAL"),
-        ("wage_to_max",   "REAL"),
-        ("wage_to_sum",   "REAL"),
-        ("wage_count",    "INTEGER"),
+        ("wage_from_min",  "REAL"),
+        ("wage_from_max",  "REAL"),
+        ("wage_from_sum",  "REAL"),
+        ("wage_to_min",    "REAL"),
+        ("wage_to_max",    "REAL"),
+        ("wage_to_sum",    "REAL"),
+        ("wage_count",     "INTEGER"),
+        ("wage_to_count",  "INTEGER"),
     ]:
         c.execute(f"ALTER TABLE dol_h1b_soc_breakdown ADD COLUMN IF NOT EXISTS {col} {typ}")
 

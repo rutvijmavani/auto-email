@@ -987,6 +987,11 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
                     return None, url
                 current = next_url
                 continue
+            if r.status_code in (403, 429):
+                result = _fetch_via_worker(current)
+                if result:
+                    return result
+                return None, current
             if r.status_code < 400:
                 return r.text, current
             return None, current
@@ -1592,9 +1597,12 @@ def process_employer(
             from jobs.ats.career_detector import detect_company
             _cd_results = detect_company(_cd_domain)
             if _cd_results:
-                _best = _cd_results[0]
+                # Prefer a result with a non-empty slug; fall back to partial detection
+                _best = next((r for r in _cd_results if r.get("slug")), _cd_results[0])
                 detected_platform = _best["platform"]
-                detected_slug     = _best.get("slug")
+                _best_slug = _best.get("slug") or ""
+                if _best_slug:
+                    detected_slug = _best_slug
                 if not careers_url:
                     careers_url = _best.get("source_url")
                 log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
@@ -1859,7 +1867,7 @@ def main():
                         "kg_mid":          cached_mid,
                         "canonical_name":  existing.get("canonical_name"),
                         "canonical_source": existing.get("canonical_source"),
-                        "kg_url":          existing.get("website_url"),
+                        "kg_url":          existing.get("kg_url"),
                         "wikidata_qid":    existing.get("wikidata_qid"),
                         "_all_candidates": [],
                     }
@@ -1899,11 +1907,12 @@ def main():
             log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
             sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
 
+            _fein_to_emp = {e["employer_fein"]: e for e in employers}
             for fein, entry in kg_map.items():
                 if entry.get("skip"):
                     continue
                 mid = entry.get("kg_mid")
-                emp_row = next((e for e in employers if e["employer_fein"] == fein), {})
+                emp_row = _fein_to_emp.get(fein, {})
                 assigned_domain = emp_row.get("assigned_domain")
 
                 if mid:

@@ -94,7 +94,7 @@ def _stale_feins() -> list[str]:
               AND employer_fein IS NOT NULL
               AND consecutive_empty_days >= %s
         """, (DISCOVER_REDETECT_EMPTY_DAYS,))
-        return [row[0] for row in cur.fetchall()]
+        return [row["employer_fein"] for row in cur.fetchall()]
     finally:
         conn.close()
 
