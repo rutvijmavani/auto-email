@@ -1,0 +1,7 @@
+name            = "h1b-probe-worker"
+main            = "index.js"
+compatibility_date = "2024-09-23"
+
+# Deploy: wrangler deploy
+# Set secret: wrangler secret put PROBE_SECRET
+# Then add CF_WORKER_URL and CF_WORKER_SECRET to .env on OCI

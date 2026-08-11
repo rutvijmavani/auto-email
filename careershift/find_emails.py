@@ -442,14 +442,21 @@ def run():
                                                 user_id)
                                     break
 
-                                company   = prospect["company"]
-                                max_extra = min(3, current_remaining)
+                                company    = prospect["company"]
+                                update_key = prospect.get("update_key", company)
+                                max_extra  = min(3, current_remaining)
 
                                 logger.info("Prospective scrape user_id=%d: %r (max_extra=%d)",
                                             user_id, company, max_extra)
                                 print(f"\n[INFO] Prospective: {company} (max {max_extra})")
 
-                                prospective_domain = get_domain_for_prospective(company)
+                                # Use domain from row when present (company_ats rows include it);
+                                # fall back to DB lookup for prospective_companies rows.
+                                raw_domain = prospect.get("domain")
+                                prospective_domain = (
+                                    raw_domain.split(".")[0] if raw_domain
+                                    else get_domain_for_prospective(update_key)
+                                )
                                 contacts = scrape_company(page, company, max_extra, prospective_domain,
                                                           user_id=user_id)
 
@@ -459,14 +466,14 @@ def run():
                                 elif not contacts:
                                     logger.info("Prospective %r — no contacts found, exhausting", company)
                                     print(f"   [INFO] Exhausting prospective {company}")
-                                    mark_prospective_exhausted(company)
+                                    mark_prospective_exhausted(update_key)
                                     all_prospective_stats["exhausted"] += 1
                                 else:
                                     logger.info("Prospective %r — found %d contact(s), saving",
                                                 company, len(contacts))
                                     saved = _save_prospective_contacts(contacts, company, user_id=user_id)
                                     if saved:
-                                        mark_prospective_scraped(company)
+                                        mark_prospective_scraped(update_key)
                                         all_prospective_stats["scraped"] += 1
                                         logger.info("Prospective %r — marked scraped", company)
                                     else:

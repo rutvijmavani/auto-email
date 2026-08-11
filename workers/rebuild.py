@@ -132,12 +132,13 @@ def rebuild_poll_queues() -> dict:
 
     Four-way categorisation based on CYCLE_START_HOUR (default 7 AM):
 
-    UNREGISTERED companies (in prospective_companies but no row in company_poll_stats)
-        → Never been scanned by the new scheduler (e.g. fresh deployment or
-          newly added company).  Treated identically to NEW: added to
-          poll:fullscan only, spread across a dynamic startup window.
-          on_fullscan_complete() writes their first company_poll_stats row
-          and bootstraps them into poll:adaptive afterwards.
+    UNREGISTERED companies (monitorable but no row in company_poll_stats)
+        → Never been scanned by the new scheduler (e.g. fresh deployment,
+          newly added company, or newly approved company_ats entry).
+          Treated identically to NEW: added to poll:fullscan only, spread
+          across a dynamic startup window.  on_fullscan_complete() writes
+          their first company_poll_stats row and bootstraps them into
+          poll:adaptive afterwards.
 
     NEW companies (row in company_poll_stats; last_poll_at IS NULL AND last_full_scan_at IS NULL)
         → poll:fullscan only, spread across a dynamic startup window.
@@ -186,12 +187,26 @@ def rebuild_poll_queues() -> dict:
     finally:
         conn.close()
 
+    # Fetch monitorable set first so stale poll_stats rows (companies that have
+    # been removed from monitoring) are excluded from the ZSET rebuild.
+    try:
+        monitorable     = get_monitorable_companies()
+        monitorable_set = {c["company"] for c in monitorable}
+    except Exception as exc:
+        logger.warning("rebuild: could not fetch monitorable companies: %s", exc)
+        monitorable     = []
+        monitorable_set = None  # unknown — skip filter to avoid dropping valid entries
+
     # ── Categorise ────────────────────────────────────────────────────────────
     new_companies:     list = []   # never polled AND never full-scanned
     stale_companies:   list = []   # have history; schedule from a previous cycle
     current_companies: list = []   # have history; schedule within current cycle
 
     for row in rows:
+        # Drop companies no longer in monitoring (is_monitored flipped off, etc.)
+        if monitorable_set is not None and row["company"] not in monitorable_set:
+            continue
+
         never_polled   = row["last_poll_at"]     is None
         never_fullscan = row["last_full_scan_at"] is None
 
@@ -214,21 +229,16 @@ def rebuild_poll_queues() -> dict:
     # yet (fresh deployment, or newly added company).  Merge into new_companies
     # so they get the same fullscan-first treatment and spread window.
     known = {row["company"] for row in rows}
-    try:
-        monitorable = get_monitorable_companies()
-        unregistered = [
-            {"company": c["company"]}
-            for c in monitorable
-            if c["company"] not in known
-        ]
-    except Exception as exc:
-        logger.warning("rebuild: could not fetch monitorable companies: %s", exc)
-        unregistered = []
+    unregistered = [
+        {"company": c["company"]}
+        for c in monitorable
+        if c["company"] not in known
+    ]
 
     if unregistered:
         new_companies.extend(unregistered)
         logger.info(
-            "rebuild: %d unregistered companies found in prospective_companies "
+            "rebuild: %d unregistered companies found "
             "(not yet in company_poll_stats) → merged into NEW bucket",
             len(unregistered),
         )

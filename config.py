@@ -195,6 +195,8 @@ TARGET_SKILLS = [
 # Freshness
 JOB_MONITOR_DAYS_FRESH        = 3    # days to consider a job fresh
 JOB_MONITOR_REDETECT_DAYS     = 14   # re-detect ATS after X consecutive empty days
+DISCOVER_BATCH_SIZE           = int(os.getenv("DISCOVER_BATCH_SIZE", "100"))  # companies per daily pipeline run
+DISCOVER_REDETECT_EMPTY_DAYS  = int(os.getenv("DISCOVER_REDETECT_EMPTY_DAYS", "30"))  # step 3.5: re-discover after N empty days
 JOB_MONITOR_PDF_RETENTION     = 30   # days to keep PDF digest files
 JOB_MONITOR_MAX_JOBS          = 0    # 0 = no cap (show ALL matching jobs)
 JOB_MONITOR_API_TIMEOUT       = 10   # seconds per API request
@@ -333,6 +335,18 @@ EMAIL_LLM_GEMINI_MODEL     = os.getenv("EMAIL_LLM_GEMINI_MODEL", "gemma-4-26b-it
 # RPM / TPM / RPD limits live in db/connection.py
 DISCOVER_ATS_LLM_PROVIDER  = os.getenv("DISCOVER_ATS_LLM_PROVIDER", "gemini")
 DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b-it")
+
+CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
+CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
+
+# career_detector.py tuning — all adjustable via env vars, no hardcoded values
+FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))
+CONNECT_TIMEOUT                = int(os.getenv("CAREER_DETECTOR_CONNECT_TIMEOUT",   "5"))
+CAREER_DETECTOR_MAX_PAGES      = int(os.getenv("CAREER_DETECTOR_MAX_PAGES",        "25"))
+CAREER_DETECTOR_MAX_JS_BUNDLES = int(os.getenv("CAREER_DETECTOR_MAX_JS_BUNDLES",   "15"))
+CAREER_DETECTOR_MAX_API_PROBES = int(os.getenv("CAREER_DETECTOR_MAX_API_PROBES",   "10"))
+CAREER_DETECTOR_LISTING_PAGES  = int(os.getenv("CAREER_DETECTOR_LISTING_PAGES",     "2"))
+CAREER_DETECTOR_DETAIL_SAMPLE  = int(os.getenv("CAREER_DETECTOR_DETAIL_SAMPLE",     "3"))
 
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING

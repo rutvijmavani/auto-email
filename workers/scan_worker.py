@@ -263,6 +263,11 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             )
             return result
 
+        # display_name is the real company name written to job_postings.company.
+        # For ca:{id} routing keys the row now carries company_name from company_ats;
+        # for prospective_companies rows company_name is absent, fall back to company.
+        display_name = company_row.get("company_name") or company
+
         platform = company_row.get("ats_platform", "unknown")
         slug     = company_row.get("ats_slug")
 
@@ -359,10 +364,20 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             _conn = None
             try:
                 _conn = _get_conn()
-                _conn.execute(
-                    "UPDATE prospective_companies SET ats_slug = ? WHERE company = ?",
-                    (json.dumps(slug_info), company),
-                )
+                if company.startswith("ca:"):
+                    try:
+                        _ca_id = int(company[3:])
+                    except ValueError:
+                        raise ValueError(f"malformed ca: key: {company!r}")
+                    _conn.execute(
+                        "UPDATE company_ats SET slug = %s WHERE id = %s",
+                        (json.dumps(slug_info), _ca_id),
+                    )
+                else:
+                    _conn.execute(
+                        "UPDATE prospective_companies SET ats_slug = %s WHERE company = %s",
+                        (json.dumps(slug_info), company),
+                    )
                 _conn.commit()
                 logger.info(
                     "scan_worker [%s]: persisted updated slug_info for %r "
@@ -427,6 +442,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 slug_info=slug_info,
                 config=config,
                 request_id=request_id,
+                display_name=display_name,
             )
             if _fetch_complete:
                 mark_first_scan_complete(company)
@@ -506,7 +522,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             # records (a job inserted but never queued can never be re-queued).
             try:
                 detail_payload = _build_detail_payload(
-                    company, platform, job, slug_info,
+                    display_name, platform, job, slug_info,
                     request_id=request_id,
                     found_by="tier1_adaptive",
                 )
@@ -519,7 +535,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                     exc_info=True,
                 )
             else:
-                if save_pending_detail(company, platform, job,
+                if save_pending_detail(display_name, platform, job,
                                        detail_payload=detail_payload):
                     if _lever1_detail_active:
                         adaptive_skipped += 1
@@ -627,6 +643,7 @@ def _handle_first_scan(
     slug_info=None,
     config: dict = None,
     request_id: str = "",
+    display_name: str = "",
 ) -> int:
     """
     Bootstrap a company's first scan with fresh/stale split.
@@ -667,7 +684,7 @@ def _handle_first_scan(
             if title_passed:
                 try:
                     detail_payload = _build_detail_payload(
-                        company, platform, job, slug_info,
+                        display_name, platform, job, slug_info,
                         request_id=request_id,
                         found_by="first_scan_fresh",
                     )
@@ -681,7 +698,7 @@ def _handle_first_scan(
                     )
                 else:
                     if save_pending_detail(
-                        company, platform, job, found_by="first_scan_fresh",
+                        display_name, platform, job, found_by="first_scan_fresh",
                         detail_payload=detail_payload,
                     ):
                         r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
@@ -693,11 +710,11 @@ def _handle_first_scan(
             else:
                 # Filtered by title → treat as pre-existing
                 preexisting_ids.append(job_id)
-                save_pre_existing_listing(company, platform, job)
+                save_pre_existing_listing(display_name, platform, job)
         else:
             # ── Stale job: mark pre-existing immediately ──────────────────────
             preexisting_ids.append(job_id)
-            save_pre_existing_listing(company, platform, job)
+            save_pre_existing_listing(display_name, platform, job)
 
     # Bulk SADD all processed IDs to adaptive_seen (saves DB lookups today)
     if preexisting_ids:

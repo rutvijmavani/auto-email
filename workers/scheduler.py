@@ -1737,11 +1737,18 @@ def _get_dc_key_for_company(company: str) -> str:
         import json as _json
         conn = get_conn()
         try:
-            row = conn.execute("""
-                SELECT ats_platform, ats_slug
-                FROM prospective_companies
-                WHERE company = %s
-            """, (company,)).fetchone()
+            if company.startswith("ca:"):
+                id_ = int(company[3:])
+                row = conn.execute("""
+                    SELECT platform AS ats_platform, slug AS ats_slug
+                    FROM company_ats WHERE id = %s
+                """, (id_,)).fetchone()
+            else:
+                row = conn.execute("""
+                    SELECT ats_platform, ats_slug
+                    FROM prospective_companies
+                    WHERE company = %s
+                """, (company,)).fetchone()
         finally:
             conn.close()
 
@@ -2323,13 +2330,19 @@ def _deprioritise_platform(r, platform: str) -> int:
     """
     conn = get_conn()
     try:
-        rows = conn.execute("""
+        pc_rows = conn.execute("""
             SELECT company FROM prospective_companies
             WHERE ats_platform = %s
+        """, (platform,)).fetchall()
+        ca_rows = conn.execute("""
+            SELECT 'ca:' || id::text AS company
+            FROM company_ats
+            WHERE platform = %s AND is_monitored = TRUE
         """, (platform,)).fetchall()
     finally:
         conn.close()
 
+    rows = list(pc_rows) + list(ca_rows)
     if not rows:
         return 0
 

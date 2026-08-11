@@ -291,6 +291,48 @@ custom   → KNOWN_CUSTOM_ATS list (Amazon/Apple/Google etc.)
 
 ---
 
+### `company_ats`
+ATS detection results for companies discovered via the H1B pipeline (DOL + USCIS). One row per `(domain, platform)` pair — a company using two ATS platforms (e.g. Nomura: SF + Taleo) gets two rows. This is the new-system counterpart to `prospective_companies` (legacy). Both tables are read by the job monitor and workers; the system runs both in parallel.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | INTEGER PK | Auto-incremented |
+| `employer_fein` | TEXT | FK → `dol_h1b_employers` — used for USCIS join and priority ranking |
+| `domain` | TEXT NOT NULL | FK → `fein_domain_map.assigned_domain` |
+| `company_name` | TEXT | Best available name: canonical (KG/Wikidata) > USCIS `employer_legal_norm` > DOL `employer_name` |
+| `platform` | TEXT NOT NULL | ATS platform: `workday` / `greenhouse` / `avature` / etc. |
+| `slug` | TEXT NOT NULL | JSON or string slug (same format as `prospective_companies.ats_slug`) |
+| `source` | TEXT NOT NULL | `career_page` / `career_detector` / `manual` — which detector found it |
+| `is_monitored` | BOOLEAN DEFAULT FALSE | Explicit monitoring on/off — must be set `TRUE` before job monitor picks it up |
+| `status` | TEXT DEFAULT `pending` | Recruiter pipeline state: `pending` / `scraped` / `exhausted` / `converted` — mirrors `prospective_companies.status` lifecycle |
+| `priority` | INTEGER DEFAULT 0 | Derived from USCIS H1B approval count — higher priority companies get ATS detection and recruiter scraping first |
+| `detected_at` | TIMESTAMP DEFAULT NOW | When ATS was detected |
+| `reviewed_at` | TIMESTAMP | When manually reviewed (NULL until reviewed) |
+| `scraped_at` | TIMESTAMP | When CareerShift / LCA recruiter scrape completed |
+| `converted_at` | TIMESTAMP | When converted to active application |
+| `first_scanned_at` | TIMESTAMP | When first job monitor scan completed |
+| `last_checked_at` | TIMESTAMP | When last checked by job monitor |
+| `consecutive_empty_days` | INTEGER DEFAULT 0 | Days with 0 jobs returned — triggers re-detection at threshold |
+
+**UNIQUE constraint:** `(domain, platform)` — enables multi-ATS per company. One company can have multiple rows (one per platform).
+
+**Source values:**
+- `career_page` — found by `career_page.py` (BeautifulSoup URL scan, lightweight)
+- `career_detector` — found by `career_detector.py` (BFS crawler + JS bundles, heavier — runs only on misses from `career_page`)
+- `manual` — entered manually via frontend review UI
+
+**Company name resolution order:** canonical KG/Wikidata name (clean, display-ready) → USCIS `employer_legal_norm` (DBA-stripped) → DOL `employer_name` (messy legal fallback). Store whatever is available — never block on canonical.
+
+**Priority ranking:** derived from USCIS H1B approval count at time of insert. High-volume H1B sponsors get ATS detection AND recruiter scraping first — both pipelines share the same priority queue.
+
+**Dual-system job monitor:** job monitor reads from both `prospective_companies` (legacy) and `company_ats` (new) via UNION. No migration of existing data required. As confidence grows, `prospective_companies` data can be migrated to `company_ats` at any time.
+
+**Undetected queue:** domains in `fein_domain_map` with a non-null `careers_url` but no matching `company_ats` row — surfaced in the frontend for manual verification and pattern discovery.
+
+**Retention:** Permanent — never auto-deleted.
+
+---
+
 ### `job_postings`
 Job postings discovered by `--monitor-jobs`. Only new postings appear in daily PDF digest.
 
@@ -766,11 +808,17 @@ applications (1) ←→ outreach (many)
 applications (1) ←→ ai_cache (1)
 applications (1) ←→ jobs (1)
 
-prospective_companies (1)
+prospective_companies (1)  ← legacy system
     → job monitoring (daily --monitor-jobs)
     → recruiter scraping (--find-only leftover quota)
     → recruiters stored at company level (recruiters table only)
     → converted to applications (--add) → top recruiters linked then
+
+company_ats (many per domain) ← new system (H1B pipeline)
+    → job monitoring (same --monitor-jobs, UNION with prospective_companies)
+    → recruiter scraping (LCA email patterns + CareerShift, priority-ordered by USCIS approvals)
+    → is_monitored=TRUE required before job monitor picks up
+    → UNIQUE(domain, platform) enables multi-ATS per company
 
 job_postings (many) ← --monitor-jobs
     → PDF digest (daily 7 AM email) → mark_postings_digested()

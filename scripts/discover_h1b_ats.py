@@ -40,13 +40,18 @@ from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-from rapidfuzz.fuzz import token_set_ratio
+from rapidfuzz import process as fuzz_process, utils as fuzz_utils
+from rapidfuzz.fuzz import ratio as fuzz_ratio, WRatio
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import requests
 
-from config import DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER, REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK
+from config import (
+    CF_WORKER_SECRET, CF_WORKER_URL,
+    DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
+    REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
+)
 from db.connection import get_conn
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
@@ -208,6 +213,25 @@ def _root_domain(url: str) -> str:
     return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
+def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain: str) -> bool:
+    """
+    Verify a KG entity against the LCA email-derived assigned_domain.
+
+    Verification URL priority:
+      1. KG entity URL (already fetched, primary)
+      2. SPARQL P856 — fallback only when KG has no URL; same underlying
+         data source so if KG has no URL, P856 probably won't either, but we try.
+
+    Returns True only when a verification URL exists AND its root domain
+    matches assigned_domain exactly.  No URL = False. Mismatch = False.
+    """
+    verification_url = kg_url or sparql_p856
+    if not verification_url:
+        return False
+    host = (urlparse(verification_url).hostname or "").removeprefix("www.")
+    return host == assigned_domain or host.endswith("." + assigned_domain)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SPARQL rate limiter (shared, thread-safe sliding window)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,6 +266,105 @@ _KG_FETCH_LIMIT      = 3   # candidates fetched per query
 _KG_MIN_OVERLAP      = 30  # minimum score to accept at retry exhaustion
 _KG_HIGH_CONFIDENCE  = 90  # return immediately — no point trying shorter queries
 _KG_QUALITY_THRESHOLD = 60  # flag for human review when selected score < this
+
+_KG_SIG_STOP = frozenset({
+    # abbreviated entity type markers
+    "inc", "llc", "ltd", "corp", "lp", "plc", "pvt", "co", "na", "llp",
+    # full entity type markers
+    "corporation", "incorporated", "limited", "company", "partnership",
+    # connectors
+    "the", "a", "an", "and", "of", "for", "in", "de", "los", "las",
+})
+
+
+def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
+    """Return True if EVERY significant token of the KG entity name has a
+    plausible match somewhere in the legal name.
+
+    No stripping — both names are tokenized raw and noise words (inc, llc,
+    corporation, etc.) are removed via _KG_SIG_STOP.  Descriptive words like
+    'Technologies', 'Enterprises', 'Solutions' are preserved so that
+    'Fourth Technologies' ≠ 'Fourth Enterprises'.
+
+    Match per token: prefix match OR fuzz.ratio ≥ 65.
+
+    Rejects:
+      'SQUAD SOFTWARE'    → 'San Diego Padres'       (san  ∉ squad/software)
+      'Cruise LLC'        → 'Carnival Cruise Line'   (carnival ∉ cruise)
+      'FOURTH ENTERPRISES'→ 'Fourth Technologies'    (technologies ∉ fourth/enterprises)
+
+    Accepts:
+      'WAL-MART ASSOCIATES' → 'Walmart'   (walmart.startswith('wal'))
+      'HCL AMERICA'         → 'HCLTech'  (hcltech.startswith('hcl'))
+      'ORACLE AMERICA'      → 'Oracle Corporation'  (oracle ✓, corporation filtered)
+    """
+    def _sig(s: str) -> list[str]:
+        return [t for t in re.findall(r'\w+', (s or "").lower())
+                if t not in _KG_SIG_STOP and len(t) > 1]
+
+    q_toks = _sig(legal_name)
+    e_toks = _sig(entity_name)
+
+    if not q_toks or not e_toks:
+        return True  # can't check — don't reject
+
+    for et in e_toks:
+        matched = any(
+            et.startswith(qt) or qt.startswith(et) or fuzz_ratio(et, qt) >= 65
+            for qt in q_toks
+        )
+        if not matched:
+            return False
+
+    return True
+
+
+def _coverage_weighted_score(legal_name: str, entity_name: str | None) -> float:
+    """Coverage-weighted match score between legal_name and entity_name.
+
+    Score = best_raw x max(legal_coverage, entity_coverage), where:
+      best_raw      = highest WRatio between any entity prefix and any legal prefix
+      legal_cov     = tokens in winning legal prefix  / total legal sig tokens
+      entity_cov    = tokens in winning entity prefix / total entity sig tokens
+
+    This rewards matches where the entity explains a meaningful portion of the
+    legal name, while protecting short distinctive brands (Amazon, Google) via
+    entity_coverage — if the entire entity name is matched, coverage is 100%
+    regardless of how long the legal name is.
+
+    Examples:
+      "AMAZON.COM SERVICES LLC" → "Amazon"                 100 (entity_cov=1/1)
+      "COGNIZANT TECH SOLUTIONS US" → "Cognizant Tech"     100 (entity_cov=2/2)
+      "SQUAD SOFTWARE INC" → "San Diego Padres"             ~20 → below threshold
+    """
+    def _sig(s: str) -> list[str]:
+        return [t for t in re.findall(r'\w+', (s or "").lower())
+                if t not in _KG_SIG_STOP and len(t) > 1]
+
+    legal_toks  = _sig(legal_name)
+    # Strip legal suffixes from KG entity name so "Oracle Corporation" → ["oracle"]
+    entity_toks = _sig(strip_legal_suffixes(entity_name or "")) or _sig(entity_name)
+
+    if not legal_toks or not entity_toks:
+        return 0.0
+
+    legal_pfx  = [" ".join(legal_toks[:i])  for i in range(1, len(legal_toks)  + 1)]
+    entity_pfx = [" ".join(entity_toks[:i]) for i in range(1, len(entity_toks) + 1)]
+
+    best = 0.0
+    for ei, ep in enumerate(entity_pfx):
+        m = fuzz_process.extractOne(ep, legal_pfx, scorer=WRatio,
+                                    processor=fuzz_utils.default_process)
+        if not m:
+            continue
+        raw, li = m[1], m[2]
+        legal_cov  = (li + 1) / len(legal_toks)
+        entity_cov = (ei + 1) / len(entity_toks)
+        weighted   = raw * max(legal_cov, entity_cov)
+        if weighted > best:
+            best = weighted
+
+    return best
 
 
 def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
@@ -337,8 +460,22 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                     log.debug("KG: /g/ thin shell %r (mid=%r) skipped", name, kg_mid)
                     continue
 
+                # Gate 1: entity's leading token must plausibly match the legal name.
+                # Rejects "San Diego Padres" for "SQUAD SOFTWARE", "Carnival Cruise Line"
+                # for "Cruise LLC", etc.  Lead-gate failures are treated like /g/ shells —
+                # found_m stays False so the retry loop tries a shorter query.
+                if not _entity_lead_in_query(legal_name, name):
+                    log.debug(
+                        "KG: /m/ candidate %r (mid=%r) — lead mismatch vs %r, skipping",
+                        name, kg_mid, legal_name,
+                    )
+                    continue
+
                 found_m   = True
-                score     = token_set_ratio(base_query.lower(), (name or "").lower()) if name else 0
+                # Gate 3: coverage-weighted score — rewards matches where the entity
+                # explains a meaningful portion of the legal name, and protects
+                # short distinctive brands via entity_coverage.
+                score     = _coverage_weighted_score(legal_name, name)
                 candidate = {"name": name, "url": url, "kg_mid": kg_mid, "_score": score}
 
                 # Track every /m/ entity seen for the audit trail (dedup by kg_mid, max score)
@@ -372,7 +509,7 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                 )
 
             if not found_m:
-                log.debug("KG: all /g/ results for %r — retrying without last word", query)
+                log.debug("KG: no usable /m/ results for %r (all /g/ or lead-rejected) — retrying without last word", query)
             else:
                 log.debug(
                     "KG: best so far score=%d for %r — trying shorter query",
@@ -850,13 +987,49 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
                     return None, url
                 current = next_url
                 continue
+            if r.status_code in (403, 429):
+                result = _fetch_via_worker(current)
+                if result:
+                    return result
+                return None, current
             if r.status_code < 400:
                 return r.text, current
             return None, current
         log.debug("Too many redirects for %s", url)
     except requests.exceptions.RequestException as e:
         log.debug("Fetch error %s: %s", url, e)
+        result = _fetch_via_worker(url)
+        if result:
+            return result
     return None, url
+
+
+def _fetch_via_worker(url: str) -> tuple[str, str] | None:
+    """Proxy a URL fetch through the Cloudflare probe Worker.
+
+    Used as fallback when the direct fetch times out or is connection-refused
+    (OCI datacenter IP blocked). Returns (html_text, final_url) or None.
+    """
+    if not CF_WORKER_URL or not CF_WORKER_SECRET:
+        return None
+    try:
+        resp = requests.post(
+            CF_WORKER_URL,
+            json={"url": url, "max_bytes": 65536},
+            headers={"Authorization": f"Bearer {CF_WORKER_SECRET}"},
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("error") or (data.get("status") or 0) >= 400:
+            log.debug("CF Worker: %s → error=%s status=%s", url, data.get("error"), data.get("status"))
+            return None
+        final_url = data.get("final_url") or url
+        body      = data.get("body") or ""
+        log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
+        return body, final_url
+    except Exception as exc:
+        log.debug("CF Worker request failed for %s: %s", url, exc)
+        return None
 
 
 def _find_ats_in_html(html: str) -> tuple[str | None, str | None]:
@@ -904,14 +1077,25 @@ def _resolve_website_redirect(url: str) -> str:
       - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
       - Redirect → different root domain   → return resolved (genuine rebrand)
     """
+    if not _is_public_url(url):
+        return url
+    parsed   = urlparse(url)
+    root_url = f"{parsed.scheme}://{parsed.netloc}/"
+    final_url = None
+
     try:
-        parsed   = urlparse(url)
-        root_url = f"{parsed.scheme}://{parsed.netloc}/"
         r = requests.get(root_url, timeout=8, allow_redirects=True,
                          headers=_API_HEADERS)
         final_url = r.url.rstrip("/")
     except Exception as exc:
         log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
+        result = _fetch_via_worker(root_url)
+        if result:
+            _, worker_final = result
+            final_url = worker_final.rstrip("/")
+            log.debug("_resolve_website_redirect: CF Worker resolved %s → %s", url, final_url)
+
+    if final_url is None:
         return url
 
     final_root = _root_domain(final_url)
@@ -1020,6 +1204,8 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
         SELECT
             d.employer_fein,
             d.employer_name,
+            d.poc_email_domain,
+            fdm.assigned_domain,
             COALESCE(
                 SUM(
                     u.new_employment_approval +
@@ -1039,12 +1225,29 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
                OR u.employer_name_norm  = d.trade_name_dba_norm
               )
         LEFT JOIN h1b_ats_discovery h ON h.employer_fein = d.employer_fein
+        LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = d.employer_fein
         WHERE (
             h.employer_fein IS NULL
             OR h.last_checked IS NULL
             OR h.last_checked < NOW() - INTERVAL '7 days'
         )
-        GROUP BY d.employer_fein, d.employer_name, d.total_certified
+        AND (
+            fdm.assigned_domain IS NULL
+            OR (
+                fdm.assigned_domain NOT IN (
+                    SELECT domain FROM prospective_companies
+                    WHERE domain IS NOT NULL
+                      AND ats_platform IS NOT NULL
+                      AND ats_platform NOT IN ('unknown', 'unsupported')
+                )
+                AND fdm.assigned_domain NOT IN (
+                    SELECT domain FROM company_ats
+                    WHERE is_monitored = TRUE
+                )
+            )
+        )
+        GROUP BY d.employer_fein, d.employer_name, d.poc_email_domain,
+                 fdm.assigned_domain, d.total_certified
         ORDER BY total_approvals DESC NULLS LAST
         LIMIT %s
     """, (limit,))
@@ -1053,11 +1256,13 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
 
 def load_by_fein(fein: str, conn) -> dict | None:
     cur = conn.cursor()
-    cur.execute(
-        "SELECT employer_fein, employer_name FROM dol_h1b_employers "
-        "WHERE employer_fein = %s",
-        (fein,),
-    )
+    cur.execute("""
+        SELECT d.employer_fein, d.employer_name, d.poc_email_domain,
+               fdm.assigned_domain
+        FROM dol_h1b_employers d
+        LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = d.employer_fein
+        WHERE d.employer_fein = %s
+    """, (fein,))
     row = cur.fetchone()
     return dict(row) if row else None
 
@@ -1120,6 +1325,70 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data.get("glassdoor_id"),
         data.get("crunchbase_id"),
     ))
+    conn.commit()
+
+
+def _upsert_company_ats(
+    conn,
+    fein: "str | None",
+    domain: str,
+    company_name: str,
+    platform: str,
+    slug: str,
+    priority: int = 0,
+) -> None:
+    """
+    Write a confirmed ATS detection to company_ats for manual review.
+
+    is_monitored stays FALSE — a human must flip it before job monitor picks it up.
+    ON CONFLICT (domain, platform): update slug + priority but never touch is_monitored
+    or status, so a previously reviewed entry is not reset.
+
+    Skips the write if this domain+platform is already actively monitored in
+    prospective_companies (ats_platform not null/unknown/unsupported) or in
+    company_ats (is_monitored=TRUE) — prevents duplicate monitoring.
+    """
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT 1 FROM prospective_companies
+        WHERE domain = %s
+          AND ats_platform = %s
+          AND ats_platform NOT IN ('unknown', 'unsupported')
+        LIMIT 1
+    """, (domain, platform))
+    if cur.fetchone():
+        log.debug(
+            "_upsert_company_ats: %s/%s already in prospective_companies — skipping",
+            domain, platform,
+        )
+        return
+
+    cur.execute("""
+        SELECT 1 FROM company_ats
+        WHERE domain = %s AND platform = %s AND is_monitored = TRUE
+        LIMIT 1
+    """, (domain, platform))
+    if cur.fetchone():
+        log.debug(
+            "_upsert_company_ats: %s/%s already monitored in company_ats — skipping",
+            domain, platform,
+        )
+        return
+
+    cur.execute("""
+        INSERT INTO company_ats
+            (employer_fein, domain, company_name, platform, slug, source, priority)
+        VALUES (%s, %s, %s, %s, %s, 'career_detector', %s)
+        ON CONFLICT (domain, platform) DO UPDATE SET
+            employer_fein = COALESCE(company_ats.employer_fein, EXCLUDED.employer_fein),
+            company_name  = COALESCE(company_ats.company_name,  EXCLUDED.company_name),
+            slug          = CASE
+                                WHEN company_ats.reviewed_at IS NOT NULL THEN company_ats.slug
+                                ELSE EXCLUDED.slug
+                            END,
+            priority      = GREATEST(company_ats.priority, EXCLUDED.priority)
+    """, (fein, domain, company_name, platform, slug, priority))
     conn.commit()
 
 
@@ -1190,11 +1459,14 @@ def process_employer(
         existing_row = get_discovery_row(fein, conn)
         cached_mid   = existing_row.get("kg_mid") if existing_row else None
 
+        assigned_domain = emp.get("assigned_domain")
+        all_candidates  = []
+        kg_url          = None
+
         if cached_mid and not force:
             log.info("  KG MID cached: %s", cached_mid)
-            kg_mid         = cached_mid
-            canonical_name = existing_row.get("canonical_name")
-            website_url    = existing_row.get("website_url")
+            kg_mid           = cached_mid
+            canonical_name   = existing_row.get("canonical_name")
             canonical_source = existing_row.get("canonical_source")
         else:
             log.info("  KG API …")
@@ -1202,26 +1474,59 @@ def process_employer(
             if kg:
                 kg_mid           = kg.get("kg_mid")
                 canonical_name   = kg.get("name")
-                website_url      = kg.get("url")
-                canonical_source = "kg_api" if (canonical_name or website_url) else None
+                kg_url           = kg.get("url")
+                canonical_source = "kg_api" if canonical_name else None
                 if (kg.get("_score") or 0) < _KG_QUALITY_THRESHOLD:
                     upsert_quality_event(conn, fein, name, "low_confidence", kg, all_candidates, dry_run)
             else:
-                canonical_name   = strip_legal_suffixes(name) or None
+                kg_mid         = None
+                canonical_name = strip_legal_suffixes(name) or None
                 canonical_source = "regex" if canonical_name else None
-                website_url      = None
+                kg_url         = None
                 upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, dry_run)
 
         if kg_mid:
             log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
-            sparql_res   = _sparql_batch_p10311([kg_mid])
-            entry        = sparql_res.get(kg_mid, {})
-            wikidata_qid  = entry.get("qid")
-            jobs_url      = entry.get("jobs_url")
-            glassdoor_id  = entry.get("glassdoor_id")
-            crunchbase_id = entry.get("crunchbase_id")
-            if website_url is None:
-                website_url = entry.get("website") or None
+            sparql_res    = _sparql_batch_p10311([kg_mid])
+            entry         = sparql_res.get(kg_mid, {})
+            sparql_p856   = entry.get("website") or None
+            sparql_jobs   = entry.get("jobs_url") or None
+            sparql_qid    = entry.get("qid")
+            sparql_gd     = entry.get("glassdoor_id")
+            sparql_cb     = entry.get("crunchbase_id")
+
+            # Domain gate — verify KG entity against LCA email-derived domain.
+            # kg_url is primary verification source; sparql_p856 is fallback.
+            # No verifiable URL OR domain mismatch → discard entire KG entry.
+            if assigned_domain and not _kg_domain_gate(kg_url, sparql_p856, assigned_domain):
+                log.warning(
+                    "  KG domain mismatch: kg_url=%r p856=%r assigned=%r — discarding KG entry",
+                    kg_url, sparql_p856, assigned_domain,
+                )
+                upsert_quality_event(conn, fein, name, "kg_domain_mismatch",
+                                     {"name": canonical_name, "kg_mid": kg_mid, "_score": 0},
+                                     all_candidates if not (cached_mid and not force) else [],
+                                     dry_run)
+                kg_mid = wikidata_qid = jobs_url = glassdoor_id = crunchbase_id = None
+                canonical_name   = strip_legal_suffixes(name) or None
+                canonical_source = "regex" if canonical_name else None
+            else:
+                wikidata_qid  = sparql_qid
+                jobs_url      = sparql_jobs
+                glassdoor_id  = sparql_gd
+                crunchbase_id = sparql_cb
+        else:
+            jobs_url = glassdoor_id = crunchbase_id = wikidata_qid = None
+
+        # website_url: always from assigned_domain (LCA email-first).
+        # Fall back to poc_email_domain only if fein_domain_map not yet populated.
+        if assigned_domain:
+            website_url = "https://" + assigned_domain
+        elif emp.get("poc_email_domain"):
+            website_url = "https://" + emp["poc_email_domain"]
+            log.debug("  poc_email_domain fallback (fein_domain_map not yet populated): %s", website_url)
+        else:
+            website_url = None
 
     log.info(
         "  canonical=%r source=%s website=%s jobs_url=%s",
@@ -1268,6 +1573,42 @@ def process_employer(
                 except Exception as e:
                     log.warning("  HTML fingerprint failed: %s", e)
 
+    # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
+    # Runs when platform still unknown, whether jobs_url or website_url was found.
+    if not detected_platform and website_url:
+        _cp_domain = _root_domain(website_url)
+        _cp_name   = canonical_name or name
+        log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
+        try:
+            from jobs.career_page import detect_via_career_page
+            _cp_result = detect_via_career_page(_cp_name, _cp_domain)
+            if _cp_result:
+                detected_platform = _cp_result["platform"]
+                detected_slug     = _cp_result.get("slug")
+                log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+        except Exception as e:
+            log.warning("  Phase 6 (career_page) failed: %s", e)
+
+    # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
+    if not detected_platform and website_url:
+        _cd_domain = _root_domain(website_url)
+        log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
+        try:
+            from jobs.ats.career_detector import detect_company
+            _cd_results = detect_company(_cd_domain)
+            if _cd_results:
+                # Prefer a result with a non-empty slug; fall back to partial detection
+                _best = next((r for r in _cd_results if r.get("slug")), _cd_results[0])
+                detected_platform = _best["platform"]
+                _best_slug = _best.get("slug") or ""
+                if _best_slug:
+                    detected_slug = _best_slug
+                if not careers_url:
+                    careers_url = _best.get("source_url")
+                log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
+        except Exception as e:
+            log.warning("  Phase 7 (career_detector) failed: %s", e)
+
     if careers_url:
         log.info(
             "  careers=%s  platform=%s  slug=%s",
@@ -1293,6 +1634,21 @@ def process_employer(
     }
 
     upsert_discovery(result, conn, dry_run=dry_run)
+
+    if not dry_run and detected_platform and detected_slug and result.get("website_url"):
+        domain = _root_domain(result["website_url"])
+        if domain:
+            _upsert_company_ats(
+                conn,
+                fein=fein,
+                domain=domain,
+                company_name=canonical_name or name,
+                platform=detected_platform,
+                slug=detected_slug,
+                priority=int(emp.get("total_approvals") or 0),
+            )
+            log.info("  → company_ats upserted: %s / %s / %s", domain, detected_platform, detected_slug)
+
     return result
 
 
@@ -1304,13 +1660,34 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
     """Companies enriched by KG+probe but still missing a careers URL."""
     cur = conn.cursor()
     cur.execute("""
-        SELECT employer_fein, employer_name, website_url, canonical_name
-        FROM h1b_ats_discovery
-        WHERE last_checked IS NOT NULL
-          AND brave_checked_at IS NULL
-          AND careers_url IS NULL
-          AND website_url IS NOT NULL
-        ORDER BY last_checked ASC
+        SELECT h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
+               COALESCE(
+                   SUM(
+                       u.new_employment_approval +
+                       u.continuation_approval +
+                       u.change_same_employer_approval +
+                       u.new_concurrent_approval +
+                       u.change_of_employer_approval +
+                       u.amended_approval
+                   ),
+                   d.total_certified,
+                   0
+               ) AS total_approvals
+        FROM h1b_ats_discovery h
+        LEFT JOIN dol_h1b_employers d ON d.employer_fein = h.employer_fein
+        LEFT JOIN uscis_h1b_petitions u
+               ON u.tax_id = RIGHT(h.employer_fein, 4)
+              AND (
+                  u.employer_legal_norm = d.employer_name_norm
+               OR u.employer_name_norm  = d.trade_name_dba_norm
+              )
+        WHERE h.last_checked IS NOT NULL
+          AND h.brave_checked_at IS NULL
+          AND h.careers_url IS NULL
+          AND h.website_url IS NOT NULL
+        GROUP BY h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
+                 d.total_certified
+        ORDER BY h.last_checked ASC
         LIMIT %s
     """, (limit,))
     return [dict(r) for r in cur.fetchall()]
@@ -1377,6 +1754,19 @@ def _run_brave_pass(conn, r, args) -> None:
                 log.info("  Brave found nothing — marking as attempted")
 
             _brave_upsert(fein, careers_url, platform, slug, conn)
+            if platform and slug and website_url:
+                domain = _root_domain(website_url)
+                if domain:
+                    _upsert_company_ats(
+                        conn,
+                        fein=fein,
+                        domain=domain,
+                        company_name=row.get("canonical_name") or name,
+                        platform=platform,
+                        slug=slug,
+                        priority=int(row.get("total_approvals") or 0),
+                    )
+                    log.info("  → company_ats upserted: %s / %s / %s", domain, platform, slug)
         else:
             log.info("  [DRY-RUN] would Brave-search %r on %s", search_name, website_url)
 
@@ -1496,8 +1886,9 @@ def main():
                         "kg_mid":          cached_mid,
                         "canonical_name":  existing.get("canonical_name"),
                         "canonical_source": existing.get("canonical_source"),
-                        "website_url":     existing.get("website_url"),
+                        "kg_url":          existing.get("kg_url"),
                         "wikidata_qid":    existing.get("wikidata_qid"),
+                        "_all_candidates": [],
                     }
                 else:
                     log.info("[%d/%d KG] %s", i, len(employers), name)
@@ -1506,9 +1897,10 @@ def main():
                         entry = {
                             "kg_mid":          kg.get("kg_mid"),
                             "canonical_name":  kg.get("name"),
-                            "canonical_source": "kg_api" if (kg.get("name") or kg.get("url")) else None,
-                            "website_url":     kg.get("url"),
+                            "canonical_source": "kg_api" if kg.get("name") else None,
+                            "kg_url":          kg.get("url"),
                             "wikidata_qid":    None,
+                            "_all_candidates": all_candidates,
                         }
                         if (kg.get("_score") or 0) < _KG_QUALITY_THRESHOLD:
                             upsert_quality_event(conn, fein, name, "low_confidence", kg, all_candidates, args.dry_run)
@@ -1518,8 +1910,9 @@ def main():
                             "kg_mid":          None,
                             "canonical_name":  stripped or None,
                             "canonical_source": "regex" if stripped else None,
-                            "website_url":     None,
+                            "kg_url":          None,
                             "wikidata_qid":    None,
+                            "_all_candidates": all_candidates,
                         }
                         upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, args.dry_run)
 
@@ -1533,20 +1926,54 @@ def main():
             log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
             sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
 
-            for entry in kg_map.values():
+            _fein_to_emp = {e["employer_fein"]: e for e in employers}
+            for fein, entry in kg_map.items():
                 if entry.get("skip"):
                     continue
                 mid = entry.get("kg_mid")
+                emp_row = _fein_to_emp.get(fein, {})
+                assigned_domain = emp_row.get("assigned_domain")
+
                 if mid:
                     sp = sparql_map.get(mid, {})
-                    entry["wikidata_qid"]    = sp.get("qid")
-                    entry["jobs_url"]        = sp.get("jobs_url")
-                    entry["glassdoor_id"]    = sp.get("glassdoor_id")
-                    entry["crunchbase_id"]   = sp.get("crunchbase_id")
-                    if not entry.get("website_url"):
-                        entry["website_url"] = sp.get("website") or None
+                    sparql_p856   = sp.get("website") or None
+
+                    # Domain gate — verify KG entity before accepting any of its data.
+                    if assigned_domain and not _kg_domain_gate(entry.get("kg_url"), sparql_p856, assigned_domain):
+                        log.warning(
+                            "  [%s] KG domain mismatch: kg_url=%r p856=%r assigned=%r — discarding",
+                            fein, entry.get("kg_url"), sparql_p856, assigned_domain,
+                        )
+                        upsert_quality_event(
+                            conn, fein, emp_row.get("employer_name", ""),
+                            "kg_domain_mismatch",
+                            {"name": entry.get("canonical_name"), "kg_mid": mid, "_score": 0},
+                            entry.get("_all_candidates", []),
+                            args.dry_run,
+                        )
+                        stripped = strip_legal_suffixes(emp_row.get("employer_name", ""))
+                        entry["kg_mid"]          = None
+                        entry["canonical_name"]  = stripped or None
+                        entry["canonical_source"] = "regex" if stripped else None
+                        entry["wikidata_qid"]    = None
+                        entry["jobs_url"]        = None
+                        entry["glassdoor_id"]    = None
+                        entry["crunchbase_id"]   = None
+                    else:
+                        entry["wikidata_qid"]  = sp.get("qid")
+                        entry["jobs_url"]      = sp.get("jobs_url")
+                        entry["glassdoor_id"]  = sp.get("glassdoor_id")
+                        entry["crunchbase_id"] = sp.get("crunchbase_id")
                 else:
-                    entry["jobs_url"] = None
+                    entry["jobs_url"] = entry["glassdoor_id"] = entry["crunchbase_id"] = None
+
+                # website_url: always from assigned_domain (LCA email-first).
+                if assigned_domain:
+                    entry["website_url"] = "https://" + assigned_domain
+                elif emp_row.get("poc_email_domain"):
+                    entry["website_url"] = "https://" + emp_row["poc_email_domain"]
+                else:
+                    entry["website_url"] = None
 
             # ── Phase 3: career probe + upsert ───────────────────────────────────
             log.info("Phase 3: career probe for %d employers …", len(employers))
