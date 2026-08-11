@@ -10,6 +10,16 @@ from datetime import datetime, date, timedelta
 from db.connection import get_conn
 
 
+def parse_company_ats_key(company: str) -> "int | None":
+    """Return the integer id from a 'ca:{id}' key, or None if not a ca: key or malformed."""
+    if not isinstance(company, str) or not company.startswith("ca:"):
+        return None
+    try:
+        return int(company[3:])
+    except ValueError:
+        return None
+
+
 class ContentHashConflict(Exception):
     """Raised by complete_pending_detail when content_hash already exists for a different job."""
 
@@ -158,8 +168,8 @@ def mark_first_scan_complete(company):
 
     company_ats entries use the 'ca:{id}' key prefix — routed to company_ats.
     """
-    if company.startswith("ca:"):
-        id_ = int(company[3:])
+    id_ = parse_company_ats_key(company)
+    if id_ is not None:
         conn = get_conn()
         try:
             conn.execute("""
@@ -202,8 +212,8 @@ def update_company_check(company, found_jobs):
 
     company_ats entries use the 'ca:{id}' key prefix — routed to company_ats.
     """
-    if company.startswith("ca:"):
-        id_ = int(company[3:])
+    id_ = parse_company_ats_key(company)
+    if id_ is not None:
         conn = get_conn()
         try:
             if found_jobs:
@@ -680,8 +690,8 @@ def get_company_row(company: str) -> "dict | None":
     company_ats entries use the 'ca:{id}' prefix — routed to company_ats.
     Returns None if company not found in either table.
     """
-    if company.startswith("ca:"):
-        id_ = int(company[3:])
+    id_ = parse_company_ats_key(company)
+    if id_ is not None:
         conn = get_conn()
         try:
             row = conn.execute("""

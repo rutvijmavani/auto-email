@@ -120,88 +120,87 @@ def detect_pattern(local: str, first: str, middle: str, last: str) -> tuple[str 
     if not tokens:
         return None, False
 
-    # Direct match (no digits)
     pid = _try_match(local, tokens)
     if pid is not None:
         return pid, False
 
-    # Digit substitution: replace each digit sequence with placeholder, try again
-    digit_spans = [(m.start(), m.end()) for m in _DIGIT_RE.finditer(local)]
-    if not digit_spans:
+    if not _DIGIT_RE.search(local):
         return None, False
 
-    # Build a version with all digit sequences replaced by a literal sentinel
     _DIGIT_SENTINEL = "\x00d\x00"
-    scrubbed = _DIGIT_RE.sub(_DIGIT_SENTINEL, local)
-    parts = scrubbed.split(_DIGIT_SENTINEL)
+    parts = _DIGIT_RE.sub(_DIGIT_SENTINEL, local).split(_DIGIT_SENTINEL)
 
-    # Try matching with {d} injected between each pair of parts
     for sep in SEPARATORS:
-        rejoined = f"{{d}}{sep}".join(parts) if sep else "{d}".join(parts)
-        # Now check if joining token values with sep gives us each part
         pid = _try_match_with_digit_slots(parts, sep, tokens)
         if pid is not None:
             return pid, True
 
-    return None, True  # had digits but unrecognized
+    return None, True
 
 
 def _try_match_with_digit_slots(parts: list[str], sep: str, tokens: dict[str, str]) -> str | None:
     """
-    Try to assign name tokens to fill the non-digit slots in `parts`.
-    parts = local split on digit sequences, e.g. ["j", "smith"] for "j2smith"
+    Match each non-digit segment of `parts` via _try_match, then reassemble.
+
+    parts = local split on digit sequences (e.g. ["jsmith",""] for "jsmith2").
+    sep   = candidate separator to strip from edges adjacent to each digit gap.
+
+    Each segment is matched with _try_match, which internally tries all token
+    combinations and all separators — so multi-token segments like "jsmith" are
+    correctly matched as "{fi}{ln}" with sep="". The sep arg is used only for
+    stripping chars that separate the name tokens from the digit in the original
+    string (e.g. "john." → "john" when sep=".").
+
+    Separator tracking: left_seps[i] = sep stripped from the trailing edge of
+    parts[i] (before the digit gap); right_seps[i] = sep stripped from the
+    leading edge of parts[i] (after the prior digit gap). Both are re-inserted
+    in the returned pattern_id so it faithfully represents the original layout.
+
+    Examples (tokens = {fi:"j", fn:"john", ln:"smith"}):
+      parts=["jsmith",""],       sep="" → "{fi}{ln}{d}"     (jsmith2)
+      parts=["j","smith"],       sep="" → "{fi}{d}{ln}"     (j2smith)
+      parts=["john.",".smith"],  sep="."→ "{fn}.{d}.{ln}"  (john.2.smith)
+      parts=["john","smith"],    sep="" → "{fn}{d}{ln}"     (john2smith)
+      parts=["john2","smith3","doe"], sep="" → multi-digit  (handled)
     """
-    if len(parts) == 1:
-        # Digit at start or end: try matching the non-digit part
-        stripped = parts[0]
-        pid = _try_match(stripped, tokens)
-        if pid:
-            # Determine digit position from original: leading vs trailing
-            return f"{{d}}{pid}" if not stripped else f"{pid}{{d}}"
+    stripped   = []
+    left_seps  = []  # sep stripped from trailing edge of parts[i] (before gap)
+    right_seps = []  # sep stripped from leading  edge of parts[i] (after gap)
+
+    for i, part in enumerate(parts):
+        s, ls, rs = part, "", ""
+        if sep:
+            if i > 0 and s.startswith(sep):         # digit gap was to the left
+                rs, s = sep, s[len(sep):]
+            if i < len(parts) - 1 and s.endswith(sep):  # digit gap is to the right
+                ls, s = sep, s[:-len(sep)]
+        left_seps.append(ls)
+        right_seps.append(rs)
+        stripped.append(s)
+
+    segment_pids = []
+    for part in stripped:
+        if not part:
+            segment_pids.append(None)
+            continue
+        pid = _try_match(part, tokens)
+        if pid is None:
+            return None
+        segment_pids.append(pid)
+
+    if not any(pid is not None for pid in segment_pids):
         return None
 
-    # Multiple parts — each part must be a token value (or empty for leading/trailing digit)
-    token_names  = list(tokens.keys())
-    token_values = list(tokens.values())
+    pieces = []
+    for i, pid in enumerate(segment_pids):
+        if i > 0:
+            pieces.append(left_seps[i - 1])
+            pieces.append("{d}")
+            pieces.append(right_seps[i])
+        if pid is not None:
+            pieces.append(pid)
 
-    n_slots = len(parts)  # number of non-digit segments
-    # Try assigning one token per non-empty slot
-    non_empty_parts = [(i, p) for i, p in enumerate(parts) if p]
-    if not non_empty_parts:
-        return None
-
-    from itertools import permutations
-    for selected in permutations(range(len(token_names)), len(non_empty_parts)):
-        match = True
-        for (slot_idx, part), tok_idx in zip(non_empty_parts, selected):
-            if token_values[tok_idx] != part:
-                match = False
-                break
-        if match:
-            # Reconstruct pattern_id with {d} placeholders between segments
-            result_parts = []
-            sel_iter = iter(selected)
-            for i, part in enumerate(parts):
-                if part:
-                    tok_idx = next(sel_iter)
-                    result_parts.append(f"{{{token_names[tok_idx]}}}")
-                else:
-                    result_parts.append("{d}")
-                if i < len(parts) - 1:
-                    result_parts.append(f"{{d}}" if not part else sep if sep else "")
-            # Simpler: build from non_empty_parts assignments with {d} between
-            pieces = []
-            assigned = {slot_idx: token_names[tok_idx]
-                        for (slot_idx, _), tok_idx in zip(non_empty_parts, selected)}
-            for i, part in enumerate(parts):
-                if i > 0:
-                    pieces.append("{d}")
-                    if sep:
-                        pieces.append(sep)
-                if part:
-                    pieces.append(f"{{{assigned[i]}}}")
-            return "".join(pieces) if pieces else None
-    return None
+    return "".join(pieces) or None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -187,12 +187,26 @@ def rebuild_poll_queues() -> dict:
     finally:
         conn.close()
 
+    # Fetch monitorable set first so stale poll_stats rows (companies that have
+    # been removed from monitoring) are excluded from the ZSET rebuild.
+    try:
+        monitorable     = get_monitorable_companies()
+        monitorable_set = {c["company"] for c in monitorable}
+    except Exception as exc:
+        logger.warning("rebuild: could not fetch monitorable companies: %s", exc)
+        monitorable     = []
+        monitorable_set = None  # unknown — skip filter to avoid dropping valid entries
+
     # ── Categorise ────────────────────────────────────────────────────────────
     new_companies:     list = []   # never polled AND never full-scanned
     stale_companies:   list = []   # have history; schedule from a previous cycle
     current_companies: list = []   # have history; schedule within current cycle
 
     for row in rows:
+        # Drop companies no longer in monitoring (is_monitored flipped off, etc.)
+        if monitorable_set is not None and row["company"] not in monitorable_set:
+            continue
+
         never_polled   = row["last_poll_at"]     is None
         never_fullscan = row["last_full_scan_at"] is None
 
@@ -215,16 +229,11 @@ def rebuild_poll_queues() -> dict:
     # yet (fresh deployment, or newly added company).  Merge into new_companies
     # so they get the same fullscan-first treatment and spread window.
     known = {row["company"] for row in rows}
-    try:
-        monitorable = get_monitorable_companies()
-        unregistered = [
-            {"company": c["company"]}
-            for c in monitorable
-            if c["company"] not in known
-        ]
-    except Exception as exc:
-        logger.warning("rebuild: could not fetch monitorable companies: %s", exc)
-        unregistered = []
+    unregistered = [
+        {"company": c["company"]}
+        for c in monitorable
+        if c["company"] not in known
+    ]
 
     if unregistered:
         new_companies.extend(unregistered)

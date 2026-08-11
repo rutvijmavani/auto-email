@@ -432,6 +432,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 slug_info=slug_info,
                 config=config,
                 request_id=request_id,
+                display_name=display_name,
             )
             if _fetch_complete:
                 mark_first_scan_complete(company)
@@ -632,6 +633,7 @@ def _handle_first_scan(
     slug_info=None,
     config: dict = None,
     request_id: str = "",
+    display_name: str = "",
 ) -> int:
     """
     Bootstrap a company's first scan with fresh/stale split.

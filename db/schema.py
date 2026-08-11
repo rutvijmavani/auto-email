@@ -1708,12 +1708,14 @@ def init_db():
     # Rollup columns on dol_h1b_employers — computed from soc_breakdown at upsert time.
     # Fast single-company wage lookup without aggregating soc_breakdown.
     for col, typ in [
-        ("wage_from_min", "REAL"),
-        ("wage_from_max", "REAL"),
-        ("wage_from_avg", "REAL"),
-        ("wage_to_min",   "REAL"),
-        ("wage_to_max",   "REAL"),
-        ("wage_to_avg",   "REAL"),
+        ("wage_from_min",   "REAL"),
+        ("wage_from_max",   "REAL"),
+        ("wage_from_avg",   "REAL"),
+        ("wage_from_count", "INTEGER"),
+        ("wage_to_min",     "REAL"),
+        ("wage_to_max",     "REAL"),
+        ("wage_to_avg",     "REAL"),
+        ("wage_to_count",   "INTEGER"),
     ]:
         c.execute(f"ALTER TABLE dol_h1b_employers ADD COLUMN IF NOT EXISTS {col} {typ}")
 

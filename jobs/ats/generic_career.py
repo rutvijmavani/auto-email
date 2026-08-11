@@ -836,7 +836,7 @@ def _build_next_request(url, body, param_info, offset, page_num):
         parsed = urlparse(url)
         qs     = parse_qs(parsed.query, keep_blank_values=True)
         qs[param_info["param"]] = [str(new_value)]
-        new_qs   = urlencode({k: v[0] for k, v in qs.items()})
+        new_qs   = urlencode(qs, doseq=True)
         next_url = urlunparse(parsed._replace(query=new_qs))
         return next_url, body
     else:
@@ -952,7 +952,7 @@ def _extract_date_value(val):
         for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
                     "%B %d, %Y", "%b %d, %Y"]:
             try:
-                return datetime.strptime(val[:20], fmt)
+                return datetime.strptime(val[:20], fmt).replace(tzinfo=timezone.utc)
             except ValueError:
                 continue
     return None

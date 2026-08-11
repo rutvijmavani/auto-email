@@ -169,7 +169,8 @@ PROJECT_DIR="${PROJECT_DIR}"
 SRC_DIR="\$PROJECT_DIR/deploy/systemd"
 STAGING_DIR="/usr/local/share/mail-pipeline/systemd"
 mkdir -p "\$STAGING_DIR"
-for src in "\$SRC_DIR"/*.service; do
+for src in "\$SRC_DIR"/*.service "\$SRC_DIR"/*.timer; do
+    [[ -f "\$src" ]] || continue
     unit="\$(basename "\$src")"
     [[ "\$unit" == "cloudflare-tunnel.service" ]] && continue
     cp "\$src" "\$STAGING_DIR/\$unit"

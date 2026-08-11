@@ -104,9 +104,15 @@ def _stale_feins() -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def step1_sync_dol(dry_run: bool) -> bool:
-    return _run(
+    ok = _run(
         [PYTHON, str(SCRIPTS_DIR / "sync_dol_lca.py")],
-        dry_run, "Step 1: DOL LCA sync",
+        dry_run, "Step 1a: DOL LCA sync",
+    )
+    if not ok:
+        return False
+    return _run(
+        [PYTHON, str(SCRIPTS_DIR / "build_email_patterns.py")],
+        dry_run, "Step 1b: rebuild email patterns",
     )
 
 

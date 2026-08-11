@@ -255,6 +255,7 @@ def aggregate(df: pd.DataFrame) -> dict:
                 "wage_to_max":     max(wage_to_vals)    if wage_to_vals   else None,
                 "wage_to_sum":     sum(wage_to_vals)    if wage_to_vals   else None,
                 "wage_count":      len(wage_from_vals),
+                "wage_to_count":   len(wage_to_vals),
             }
 
         # Yearly breakdown
@@ -326,7 +327,8 @@ def aggregate(df: pd.DataFrame) -> dict:
         wt_sum   = sum(s["wage_to_sum"]   for s in soc_data.values() if s["wage_to_sum"]   is not None)
         wf_max   = max((s["wage_from_max"] for s in soc_data.values() if s["wage_from_max"] is not None), default=None)
         wt_max   = max((s["wage_to_max"]   for s in soc_data.values() if s["wage_to_max"]   is not None), default=None)
-        w_count  = sum(s["wage_count"] for s in soc_data.values())
+        w_count  = sum(s["wage_count"]    for s in soc_data.values())
+        wt_count = sum(s["wage_to_count"] for s in soc_data.values())
 
         results[fein] = {
             "employer": {
@@ -350,10 +352,12 @@ def aggregate(df: pd.DataFrame) -> dict:
                 "top_job_titles":      top_job_titles,
                 "wage_from_min":       min(all_from) if all_from else None,
                 "wage_from_max":       wf_max,
-                "wage_from_avg":       round(wf_sum / w_count, 2) if w_count > 0 else None,
+                "wage_from_avg":       round(wf_sum / w_count,  2) if w_count  > 0 else None,
+                "wage_from_count":     w_count,
                 "wage_to_min":         min(all_to)   if all_to   else None,
                 "wage_to_max":         wt_max,
-                "wage_to_avg":         round(wt_sum  / w_count, 2) if w_count > 0 else None,
+                "wage_to_avg":         round(wt_sum  / wt_count, 2) if wt_count > 0 else None,
+                "wage_to_count":       wt_count,
             },
             "soc":          soc_data,
             "yearly":       yearly_data,
@@ -454,13 +458,13 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     total_filed, total_certified, total_denied, total_withdrawn,
                     total_positions, certified_positions, approval_rate,
                     top_job_titles, quarters_processed, poc_email_domain, last_updated,
-                    wage_from_min, wage_from_max, wage_from_avg,
-                    wage_to_min,   wage_to_max,   wage_to_avg
+                    wage_from_min, wage_from_max, wage_from_avg, wage_from_count,
+                    wage_to_min,   wage_to_max,   wage_to_avg,   wage_to_count
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s,
                     %s, ARRAY[%s]::TEXT[], %s, NOW(),
-                    %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s
                 )
                 ON CONFLICT (employer_fein) DO UPDATE SET
                     employer_name       = EXCLUDED.employer_name,
@@ -491,17 +495,27 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     wage_from_min       = LEAST(dol_h1b_employers.wage_from_min, EXCLUDED.wage_from_min),
                     wage_from_max       = GREATEST(dol_h1b_employers.wage_from_max, EXCLUDED.wage_from_max),
                     wage_from_avg       = CASE
+                        WHEN EXCLUDED.wage_from_avg IS NOT NULL AND dol_h1b_employers.wage_from_avg IS NOT NULL
+                        THEN (dol_h1b_employers.wage_from_avg * dol_h1b_employers.wage_from_count
+                              + EXCLUDED.wage_from_avg * EXCLUDED.wage_from_count)
+                             / NULLIF(dol_h1b_employers.wage_from_count + EXCLUDED.wage_from_count, 0)
                         WHEN EXCLUDED.wage_from_avg IS NOT NULL
                         THEN EXCLUDED.wage_from_avg
                         ELSE dol_h1b_employers.wage_from_avg
                     END,
+                    wage_from_count     = COALESCE(dol_h1b_employers.wage_from_count, 0) + EXCLUDED.wage_from_count,
                     wage_to_min         = LEAST(dol_h1b_employers.wage_to_min, EXCLUDED.wage_to_min),
                     wage_to_max         = GREATEST(dol_h1b_employers.wage_to_max, EXCLUDED.wage_to_max),
                     wage_to_avg         = CASE
+                        WHEN EXCLUDED.wage_to_avg IS NOT NULL AND dol_h1b_employers.wage_to_avg IS NOT NULL
+                        THEN (dol_h1b_employers.wage_to_avg * dol_h1b_employers.wage_to_count
+                              + EXCLUDED.wage_to_avg * EXCLUDED.wage_to_count)
+                             / NULLIF(dol_h1b_employers.wage_to_count + EXCLUDED.wage_to_count, 0)
                         WHEN EXCLUDED.wage_to_avg IS NOT NULL
                         THEN EXCLUDED.wage_to_avg
                         ELSE dol_h1b_employers.wage_to_avg
-                    END
+                    END,
+                    wage_to_count       = COALESCE(dol_h1b_employers.wage_to_count, 0) + EXCLUDED.wage_to_count
             """, (
                 fein, e["employer_name"], e["employer_name_norm"],
                 e["employer_city"], e["employer_state"],
@@ -510,8 +524,8 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 e["total_filed"], e["total_certified"], e["total_denied"], e["total_withdrawn"],
                 e["total_positions"], e["certified_positions"], approval_rate,
                 json.dumps(merged_titles), quarter, e["poc_email_domain"],
-                e["wage_from_min"], e["wage_from_max"], e["wage_from_avg"],
-                e["wage_to_min"],   e["wage_to_max"],   e["wage_to_avg"],
+                e["wage_from_min"], e["wage_from_max"], e["wage_from_avg"], e["wage_from_count"],
+                e["wage_to_min"],   e["wage_to_max"],   e["wage_to_avg"],   e["wage_to_count"],
             ))
             emp_count += 1
 

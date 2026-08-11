@@ -228,7 +228,8 @@ def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain
     verification_url = kg_url or sparql_p856
     if not verification_url:
         return False
-    return _root_domain(verification_url) == assigned_domain
+    host = (urlparse(verification_url).hostname or "").removeprefix("www.")
+    return host == assigned_domain or host.endswith("." + assigned_domain)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,7 +322,7 @@ def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
 def _coverage_weighted_score(legal_name: str, entity_name: str | None) -> float:
     """Coverage-weighted match score between legal_name and entity_name.
 
-    Score = best_raw × max(legal_coverage, entity_coverage), where:
+    Score = best_raw x max(legal_coverage, entity_coverage), where:
       best_raw      = highest WRatio between any entity prefix and any legal prefix
       legal_cov     = tokens in winning legal prefix  / total legal sig tokens
       entity_cov    = tokens in winning entity prefix / total entity sig tokens
@@ -1071,6 +1072,8 @@ def _resolve_website_redirect(url: str) -> str:
       - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
       - Redirect → different root domain   → return resolved (genuine rebrand)
     """
+    if not _is_public_url(url):
+        return url
     parsed   = urlparse(url)
     root_url = f"{parsed.scheme}://{parsed.netloc}/"
     final_url = None
@@ -1375,7 +1378,10 @@ def _upsert_company_ats(
         ON CONFLICT (domain, platform) DO UPDATE SET
             employer_fein = COALESCE(company_ats.employer_fein, EXCLUDED.employer_fein),
             company_name  = COALESCE(company_ats.company_name,  EXCLUDED.company_name),
-            slug          = EXCLUDED.slug,
+            slug          = CASE
+                                WHEN company_ats.reviewed_at IS NOT NULL THEN company_ats.slug
+                                ELSE EXCLUDED.slug
+                            END,
             priority      = GREATEST(company_ats.priority, EXCLUDED.priority)
     """, (fein, domain, company_name, platform, slug, priority))
     conn.commit()
@@ -1449,13 +1455,14 @@ def process_employer(
         cached_mid   = existing_row.get("kg_mid") if existing_row else None
 
         assigned_domain = emp.get("assigned_domain")
+        all_candidates  = []
+        kg_url          = None
 
         if cached_mid and not force:
             log.info("  KG MID cached: %s", cached_mid)
             kg_mid           = cached_mid
             canonical_name   = existing_row.get("canonical_name")
             canonical_source = existing_row.get("canonical_source")
-            kg_url           = existing_row.get("website_url")
         else:
             log.info("  KG API …")
             kg, all_candidates = kg_search(name)
@@ -1561,38 +1568,38 @@ def process_employer(
                 except Exception as e:
                     log.warning("  HTML fingerprint failed: %s", e)
 
-        # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
-        # Runs when we have no platform yet regardless of whether careers_url was found.
-        if not detected_platform and website_url:
-            _cp_domain = _root_domain(website_url)
-            _cp_name   = canonical_name or name
-            log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
-            try:
-                from jobs.career_page import detect_via_career_page
-                _cp_result = detect_via_career_page(_cp_name, _cp_domain)
-                if _cp_result:
-                    detected_platform = _cp_result["platform"]
-                    detected_slug     = _cp_result.get("slug")
-                    log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
-            except Exception as e:
-                log.warning("  Phase 6 (career_page) failed: %s", e)
+    # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
+    # Runs when platform still unknown, whether jobs_url or website_url was found.
+    if not detected_platform and website_url:
+        _cp_domain = _root_domain(website_url)
+        _cp_name   = canonical_name or name
+        log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
+        try:
+            from jobs.career_page import detect_via_career_page
+            _cp_result = detect_via_career_page(_cp_name, _cp_domain)
+            if _cp_result:
+                detected_platform = _cp_result["platform"]
+                detected_slug     = _cp_result.get("slug")
+                log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+        except Exception as e:
+            log.warning("  Phase 6 (career_page) failed: %s", e)
 
-        # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
-        if not detected_platform and website_url:
-            _cd_domain = _root_domain(website_url)
-            log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
-            try:
-                from jobs.ats.career_detector import detect_company
-                _cd_results = detect_company(_cd_domain)
-                if _cd_results:
-                    _best = _cd_results[0]
-                    detected_platform = _best["platform"]
-                    detected_slug     = _best.get("slug")
-                    if not careers_url:
-                        careers_url = _best.get("source_url")
-                    log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
-            except Exception as e:
-                log.warning("  Phase 7 (career_detector) failed: %s", e)
+    # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
+    if not detected_platform and website_url:
+        _cd_domain = _root_domain(website_url)
+        log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
+        try:
+            from jobs.ats.career_detector import detect_company
+            _cd_results = detect_company(_cd_domain)
+            if _cd_results:
+                _best = _cd_results[0]
+                detected_platform = _best["platform"]
+                detected_slug     = _best.get("slug")
+                if not careers_url:
+                    careers_url = _best.get("source_url")
+                log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
+        except Exception as e:
+            log.warning("  Phase 7 (career_detector) failed: %s", e)
 
     if careers_url:
         log.info(
