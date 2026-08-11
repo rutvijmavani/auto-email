@@ -147,6 +147,7 @@ for src in "\$SRC_DIR"/*.service "\$SRC_DIR"/*.timer; do
         ext="\${unit##*.}"
         if [[ "\$ext" == "timer" ]]; then
             systemctl enable "\$unit" || true
+            systemctl start  "\$unit" || true
         else
             systemctl enable "\${unit%.service}" || true
         fi

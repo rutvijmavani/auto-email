@@ -51,22 +51,26 @@ export default {
         redirect: "follow",
       });
 
-      // Read incrementally up to maxBytes — avoids buffering huge responses
-      const reader = resp.body.getReader();
-      const chunks = [];
-      let received = 0;
-      while (received < maxBytes) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const slice = value.slice(0, maxBytes - received);
-        chunks.push(slice);
-        received += slice.byteLength;
+      // Read incrementally up to maxBytes — avoids buffering huge responses.
+      // resp.body may be null for 204 No Content or HEAD responses.
+      let text = "";
+      if (resp.body) {
+        const reader = resp.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (received < maxBytes) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const slice = value.slice(0, maxBytes - received);
+          chunks.push(slice);
+          received += slice.byteLength;
+        }
+        reader.cancel().catch(() => {});
+        const buf = new Uint8Array(received);
+        let pos = 0;
+        for (const c of chunks) { buf.set(c, pos); pos += c.byteLength; }
+        text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
       }
-      reader.cancel().catch(() => {});
-      const buf = new Uint8Array(received);
-      let pos = 0;
-      for (const c of chunks) { buf.set(c, pos); pos += c.byteLength; }
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
 
       return Response.json({
         status:    resp.status,

@@ -963,7 +963,9 @@ if ca_entries:
             st.markdown("")
             btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
             btn_type  = "secondary" if ca_monitored else "primary"
-            if st.button(btn_label, key=f"ca_toggle_{ca_id}", type=btn_type):
+            btn_disabled = not ca_monitored and not ca_slug
+            if st.button(btn_label, key=f"ca_toggle_{ca_id}", type=btn_type,
+                         disabled=btn_disabled):
                 new_val = not ca_monitored
                 try:
                     conn = get_conn()
@@ -980,7 +982,7 @@ if ca_entries:
                     st.rerun()
                 except Exception as exc:
                     log.exception("Failed to toggle is_monitored for company_ats id=%s", ca_id)
-                    st.error(f"Error: {exc}")
+                    st.error("Failed to update monitoring status. Check logs for details.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

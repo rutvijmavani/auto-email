@@ -767,7 +767,10 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         api_paths.extend(_extract_api_paths(bundle))
 
     seen_api = set()
+    api_probe_count = 0
     for path in api_paths:
+        if api_probe_count >= _MAX_API_PROBES:
+            break
         if path in seen_api:
             continue
         seen_api.add(path)
@@ -775,6 +778,7 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         resp, _ = _fetch(api_url, session, referer=final_url, is_api=True)
         if not resp:
             continue
+        api_probe_count += 1
         logger.debug("[detector] API probe page=%d path=%s", len(visited), path)
         hits_before_api = len(hits)
         _handle(scan(resp), "API")

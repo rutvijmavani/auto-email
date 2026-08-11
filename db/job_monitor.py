@@ -361,6 +361,13 @@ def get_monitorable_companies():
               AND platform IS NOT NULL
               AND platform NOT IN ('unknown', 'unsupported')
               AND slug IS NOT NULL
+              AND (
+                  platform != 'custom'
+                  OR (
+                      json_extract_text(slug, '$.url') IS NOT NULL
+                      AND json_extract_text(slug, '$.url') <> ''
+                  )
+              )
 
             ORDER BY company ASC
         """).fetchall()

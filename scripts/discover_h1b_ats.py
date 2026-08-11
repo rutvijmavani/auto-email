@@ -1661,13 +1661,32 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
     cur = conn.cursor()
     cur.execute("""
         SELECT h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
-               COALESCE(d.total_certified, 0) AS total_approvals
+               COALESCE(
+                   SUM(
+                       u.new_employment_approval +
+                       u.continuation_approval +
+                       u.change_same_employer_approval +
+                       u.new_concurrent_approval +
+                       u.change_of_employer_approval +
+                       u.amended_approval
+                   ),
+                   d.total_certified,
+                   0
+               ) AS total_approvals
         FROM h1b_ats_discovery h
         LEFT JOIN dol_h1b_employers d ON d.employer_fein = h.employer_fein
+        LEFT JOIN uscis_h1b_petitions u
+               ON u.tax_id = RIGHT(h.employer_fein, 4)
+              AND (
+                  u.employer_legal_norm = d.employer_name_norm
+               OR u.employer_name_norm  = d.trade_name_dba_norm
+              )
         WHERE h.last_checked IS NOT NULL
           AND h.brave_checked_at IS NULL
           AND h.careers_url IS NULL
           AND h.website_url IS NOT NULL
+        GROUP BY h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
+                 d.total_certified
         ORDER BY h.last_checked ASC
         LIMIT %s
     """, (limit,))

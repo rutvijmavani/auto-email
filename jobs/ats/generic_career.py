@@ -186,86 +186,93 @@ def _capture_responses(career_url, company):
 
     captured = []
 
+    _MAX_CAPTURED = 500
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/145.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;"
-                    "q=0.9,application/json,*/*;q=0.8"
+        try:
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/145.0.0.0 Safari/537.36"
                 ),
-            }
-        )
-        page = context.new_page()
+                viewport={"width": 1280, "height": 800},
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;"
+                        "q=0.9,application/json,*/*;q=0.8"
+                    ),
+                }
+            )
+            page = context.new_page()
 
-        def on_response(response):
-            try:
-                url = response.url
-                ct  = response.headers.get("content-type", "").lower()
-
-                # Skip obviously useless responses
-                if _should_skip_url(url):
+            def on_response(response):
+                if len(captured) >= _MAX_CAPTURED:
                     return
+                try:
+                    url = response.url
+                    ct  = response.headers.get("content-type", "").lower()
 
-                body = response.body()
-                if not body or len(body) < 100:
-                    return
+                    # Skip obviously useless responses
+                    if _should_skip_url(url):
+                        return
 
-                # Try JSON parse regardless of content-type
-                data = _try_parse_json(body)
-                if data is not None:
-                    captured.append({
-                        "url":     url,
-                        "method":  response.request.method,
-                        "headers": dict(response.request.headers),
-                        "body":    response.request.post_data,
-                        "data":    data,
-                        "source":  "json",
-                        "score":   0,
-                    })
-                    return
+                    body = response.body()
+                    if not body or len(body) < 100:
+                        return
 
-                # For HTML responses, extract embedded JSON
-                if "html" in ct and len(body) > 500:
-                    embedded = _extract_embedded_json(body.decode("utf-8", errors="ignore"))
-                    for item in embedded:
+                    # Try JSON parse regardless of content-type
+                    data = _try_parse_json(body)
+                    if data is not None:
                         captured.append({
                             "url":     url,
                             "method":  response.request.method,
                             "headers": dict(response.request.headers),
-                            "body":    None,
-                            "data":    item["data"],
-                            "source":  item["source"],
+                            "body":    response.request.post_data,
+                            "data":    data,
+                            "source":  "json",
                             "score":   0,
                         })
+                        return
 
-            except Exception:
-                pass
+                    # For HTML responses, extract embedded JSON
+                    if "html" in ct and len(body) > 500:
+                        embedded = _extract_embedded_json(body.decode("utf-8", errors="ignore"))
+                        for item in embedded:
+                            if len(captured) >= _MAX_CAPTURED:
+                                break
+                            captured.append({
+                                "url":     url,
+                                "method":  response.request.method,
+                                "headers": dict(response.request.headers),
+                                "body":    None,
+                                "data":    item["data"],
+                                "source":  item["source"],
+                                "score":   0,
+                            })
 
-        page.on("response", on_response)
+                except Exception:
+                    pass
 
-        try:
-            page.goto(career_url, wait_until="networkidle", timeout=30000)
-        except Exception:
+            page.on("response", on_response)
+
             try:
-                page.goto(career_url, wait_until="domcontentloaded",
-                          timeout=20000)
-                time.sleep(PAGE_LOAD_WAIT)
-            except Exception as e:
-                logger.error("generic_career: navigation failed for %s: %s",
-                             career_url, e)
-                browser.close()
-                return []
+                page.goto(career_url, wait_until="networkidle", timeout=30000)
+            except Exception:
+                try:
+                    page.goto(career_url, wait_until="domcontentloaded",
+                              timeout=20000)
+                    time.sleep(PAGE_LOAD_WAIT)
+                except Exception as e:
+                    logger.error("generic_career: navigation failed for %s: %s",
+                                 career_url, e)
+                    return []
 
-        time.sleep(3)
-        browser.close()
+            time.sleep(3)
+        finally:
+            browser.close()
 
     return captured
 
@@ -542,8 +549,8 @@ def _classify_value(field_name, value):
     if isinstance(value, str) and ISO_DATE_PATTERN.match(value.strip()):
         return "date"
 
-    # Unix timestamp (int)
-    if isinstance(value, int):
+    # Unix timestamp (int) — bool is a subclass of int; exclude it explicitly
+    if isinstance(value, int) and not isinstance(value, bool):
         if UNIX_TS_MS_MIN <= value:
             return "date"  # milliseconds
         if UNIX_TS_MIN <= value < UNIX_TS_MS_MIN:
@@ -595,19 +602,21 @@ def _load_cached_mapping(url_hash):
     try:
         from db.connection import get_discovery_conn
         conn = get_discovery_conn()
-        row  = conn.execute(
-            "SELECT mapping_json, updated_at FROM generic_career_mappings "
-            "WHERE url_hash = ?",
-            (url_hash,)
-        ).fetchone()
-        conn.close()
+        try:
+            row = conn.execute(
+                "SELECT mapping_json, updated_at FROM generic_career_mappings "
+                "WHERE url_hash = ?",
+                (url_hash,)
+            ).fetchone()
+        finally:
+            conn.close()
         if row:
             return {
                 "mapping":    json.loads(row["mapping_json"]),
                 "updated_at": row["updated_at"],
             }
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("generic_career: could not load mapping cache: %s", e)
     return None
 
 
@@ -674,8 +683,8 @@ def _extract_jobs_array(data):
         nonlocal best_list, best_len
         if depth > 4:
             return
-        if isinstance(obj, list) and len(obj) > best_len:
-            if obj and isinstance(obj[0], dict):
+        if isinstance(obj, list):
+            if len(obj) > best_len and obj and isinstance(obj[0], dict):
                 # Verify it looks like jobs (has 3+ string fields)
                 sample = obj[0]
                 str_fields = sum(1 for v in sample.values()
@@ -683,6 +692,9 @@ def _extract_jobs_array(data):
                 if str_fields >= 2:
                     best_list = obj
                     best_len  = len(obj)
+            # Always recurse into list elements — job arrays may be nested inside
+            for item in obj:
+                _search(item, depth + 1)
         elif isinstance(obj, dict):
             for v in obj.values():
                 _search(v, depth + 1)
@@ -946,7 +958,10 @@ def _extract_date_value(val):
         if not val:
             return None
         try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except (ValueError, AttributeError):
             pass
         for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",

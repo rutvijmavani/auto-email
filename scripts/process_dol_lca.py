@@ -2,7 +2,7 @@
 scripts/process_dol_lca.py — DOL LCA quarterly file ingestion
 
 Loads a DOL H-1B LCA Excel disclosure file, aggregates per employer FEIN,
-and upserts into six tables:
+and upserts into five tables:
   - dol_h1b_employers      (employer-level totals + metadata + wage rollup)
   - dol_h1b_soc_breakdown  (per employer × SOC code + wage aggregates)
   - dol_h1b_yearly         (per employer × year)
@@ -149,9 +149,12 @@ def _is_generic_email(local: str) -> bool:
 
 def _normalize_wage(value, unit: str) -> float | None:
     """Convert a wage value to annual equivalent. Returns None if unparseable."""
+    import math
     try:
         amount = float(str(value).replace(",", "").strip())
     except (ValueError, TypeError):
+        return None
+    if not math.isfinite(amount):
         return None
     multiplier = _WAGE_ANNUAL_MULTIPLIER.get(unit.lower().strip() if unit else "", None)
     if multiplier is None:
@@ -200,8 +203,12 @@ def aggregate(df: pd.DataFrame) -> dict:
         h1b_dependent  = _parse_bool(group.get("H-1B_DEPENDENT",  pd.Series()).iloc[-1] if "H-1B_DEPENDENT"  in group else None)
         willful_viol   = _parse_bool(group.get("WILLFUL_VIOLATOR", pd.Series()).iloc[-1] if "WILLFUL_VIOLATOR" in group else None)
         if "EMPLOYER_POC_EMAIL" in group.columns and group["EMPLOYER_POC_EMAIL"].notna().any():
-            _poc_by_date = group[group["EMPLOYER_POC_EMAIL"].notna()].sort_values("_dec_date", ascending=False, na_position="last")
-            poc_email_domain = _extract_email_domain(_poc_by_date["EMPLOYER_POC_EMAIL"].iloc[0])
+            _non_blank = group[group["EMPLOYER_POC_EMAIL"].notna() & (group["EMPLOYER_POC_EMAIL"].str.strip() != "")]
+            if not _non_blank.empty:
+                _poc_by_date = _non_blank.sort_values("_dec_date", ascending=False, na_position="last")
+                poc_email_domain = _extract_email_domain(_poc_by_date["EMPLOYER_POC_EMAIL"].iloc[0])
+            else:
+                poc_email_domain = None
         else:
             poc_email_domain = None
 
@@ -296,11 +303,11 @@ def aggregate(df: pd.DataFrame) -> dict:
         # Per-row POC contacts — one entry per unique email seen in this quarter
         poc_rows: dict[str, dict] = {}
         for _, row in group.iterrows():
-            email_raw = str(row["_poc_email"]).strip()
+            email_raw = str(row["_poc_email"]).strip().lower()
             if not email_raw or "@" not in email_raw:
                 continue
             local, domain_part = email_raw.rsplit("@", 1)
-            domain_part = domain_part.strip().lower()
+            domain_part = domain_part.strip()
             if domain_part in _GENERIC_DOMAINS:
                 continue
             is_generic = _is_generic_email(local)
@@ -323,8 +330,8 @@ def aggregate(df: pd.DataFrame) -> dict:
         # Employer-level wage rollup (across all SOC codes for this FEIN)
         all_from = [v for s in soc_data.values() if s["wage_from_min"] is not None
                     for v in ([s["wage_from_min"]] if s["wage_count"] > 0 else [])]
-        all_to   = [v for s in soc_data.values() if s["wage_to_min"]   is not None
-                    for v in ([s["wage_to_min"]] if s["wage_count"] > 0 else [])]
+        all_to   = [s["wage_to_min"] for s in soc_data.values()
+                    if s["wage_to_min"] is not None and s["wage_to_count"] > 0]
         wf_sum   = sum(s["wage_from_sum"] for s in soc_data.values() if s["wage_from_sum"] is not None)
         wt_sum   = sum(s["wage_to_sum"]   for s in soc_data.values() if s["wage_to_sum"]   is not None)
         wf_max   = max((s["wage_from_max"] for s in soc_data.values() if s["wage_from_max"] is not None), default=None)

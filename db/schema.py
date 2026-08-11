@@ -241,7 +241,7 @@ def _cleanup_seen_job_ids(c):
             SELECT company FROM prospective_companies
         )
         AND company NOT IN (
-            SELECT 'ca:' || id::text FROM company_ats WHERE is_monitored = TRUE
+            SELECT 'ca:' || id::text FROM company_ats
         )
     """)
     cutoff = (datetime.now() - timedelta(days=90)).isoformat()
