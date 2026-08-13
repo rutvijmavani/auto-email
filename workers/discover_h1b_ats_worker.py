@@ -268,21 +268,9 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         det_slug     = result.get("detected_slug")
         res_careers  = result.get("careers_url")
 
-        # Determine ats_source from the result — process_employer logs the phase
-        # but doesn't return it directly. We infer from what was available:
-        # jobs_url (P10311) → phase1_kg; otherwise check phase order.
-        if result.get("jobs_url") and det_platform:
-            ats_src = "phase1_kg"
-        elif det_platform:
-            # Discovery worker always runs Phase 7 last — can't distinguish
-            # phase6 vs phase7 from result alone. Use 'discovery' as fallback;
-            # per-phase attribution is tracked in enrichment worker where we
-            # control each phase individually.
-            ats_src = "discovery"
-        else:
-            ats_src = None
-
-        careers_src = "discovery" if res_careers and not company.get("careers_url") else None
+        # process_employer() now propagates the actual phase that found each signal.
+        ats_src     = result.get("ats_source")
+        careers_src = result.get("careers_source") if res_careers and not company.get("careers_url") else None
 
         duration_ms = int((time.time() - t_start) * 1000)
         try:
@@ -343,10 +331,22 @@ def run_worker(once: bool = False) -> None:
             petition_count = int(score)
 
             # Member is JSON: {"fein": "...", "trigger": "..."}
+            # Legacy bare-FEIN members (from older staleness_checker) are accepted as fallback.
             try:
                 data    = json.loads(raw_member)
                 fein    = data["fein"]
                 trigger = data.get("trigger", "enrichment")
+            except (json.JSONDecodeError, KeyError):
+                # Treat as bare FEIN if it looks like one (digits only)
+                bare = raw_member.strip() if isinstance(raw_member, str) else raw_member.decode(errors="replace").strip()
+                if bare.isdigit():
+                    fein    = bare
+                    trigger = "staleness"
+                    log.debug("Legacy bare-FEIN member %r — treating as staleness trigger", bare)
+                else:
+                    log.error("Malformed discovery queue member %r — sending to DLQ", raw_member)
+                    r.lpush(DISCOVERY_DLQ, raw_member)
+                    continue
             except Exception as e:
                 log.error("Malformed discovery queue member %r: %s — sending to DLQ", raw_member, e)
                 r.lpush(DISCOVERY_DLQ, raw_member)

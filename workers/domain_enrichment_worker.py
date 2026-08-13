@@ -225,10 +225,13 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
             (employer_fein, domain, company_name, platform, slug, source, priority)
         VALUES (%s, %s, %s, %s, %s, 'enrichment', %s)
         ON CONFLICT (domain, platform) DO UPDATE SET
-            slug         = EXCLUDED.slug,
+            slug          = CASE
+                                WHEN company_ats.reviewed_at IS NOT NULL THEN company_ats.slug
+                                ELSE EXCLUDED.slug
+                            END,
             employer_fein = COALESCE(EXCLUDED.employer_fein, company_ats.employer_fein),
-            source       = EXCLUDED.source,
-            detected_at  = NOW()
+            source        = EXCLUDED.source,
+            detected_at   = NOW()
     """, (fein, domain, company_name, platform, slug, petition_count))
 
 

@@ -719,9 +719,6 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
     visited.add(final_url)
     logger.debug("[detector] page=%d url=%s", len(visited), final_url)
 
-    if first_200_url is not None and first_200_url[0] is None:
-        first_200_url[0] = final_url
-
     def _handle(result, source_label):
         if not result:
             return
@@ -761,7 +758,11 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
             logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
             return []
 
-    # Company territory confirmed — full scan: JS bundles + API probes
+    # Company territory confirmed — record this as the first successful company-territory URL
+    if first_200_url is not None and first_200_url[0] is None:
+        first_200_url[0] = final_url
+
+    # Full scan: JS bundles + API probes
     api_paths = []
     for src in _script_srcs(html, final_url):
         bundle, _ = _fetch(src, session, referer=final_url, is_script=True)

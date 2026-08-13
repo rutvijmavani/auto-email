@@ -16,6 +16,7 @@
 import re
 import json
 import requests
+import tldextract
 from urllib.parse import urljoin, urlparse, parse_qs
 from bs4 import BeautifulSoup
 
@@ -155,16 +156,20 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                     logger.debug("[P3a tentative Eightfold] %r via %s — continuing scan",
                                  company, url)
                     tentative_eightfold = result
+                    tentative_eightfold["_matched_url"] = final_url or url
                 # Always keep scanning past Eightfold — harder ATS may follow.
             else:
                 logger.info("[P3a HIT] %r → %s / %s via %s",
                             company, result["platform"], result["slug"], url)
                 result["careers_url"] = final_url or url
                 return result
-        # Track the redirect destination even when content is blocked (403/non-200).
-        # A redirect from domain/careers to any URL is strong evidence of a valid careers page.
+        # Track the redirect destination when it stays on the company domain or lands
+        # on a known ATS — SSO/auth redirects to unrelated hosts are not careers evidence.
         if final_url and final_url != url and not first_redirect_url:
-            first_redirect_url = final_url
+            _final_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
+            _domain_root = tldextract.extract(domain).registered_domain or domain
+            if _final_root == _domain_root or match_ats_pattern(final_url):
+                first_redirect_url = final_url
         if html is not None and first_career_html is None:
             first_career_html = html
             first_career_url  = final_url
@@ -187,7 +192,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     if tentative_eightfold:
         logger.info("[P3a HIT Eightfold fallback] %r → %s / %s",
                     company, tentative_eightfold["platform"], tentative_eightfold["slug"])
-        tentative_eightfold["careers_url"] = first_career_url or first_redirect_url
+        tentative_eightfold["careers_url"] = tentative_eightfold.pop("_matched_url", first_career_url or first_redirect_url)
         return tentative_eightfold
 
     # MISS — no ATS detected, but return the best careers URL hint we found

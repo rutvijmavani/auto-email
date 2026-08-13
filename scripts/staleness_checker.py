@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -182,9 +183,10 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
     added = 0
     pipe = r.pipeline(transaction=False)
     for i, row in enumerate(rows):
+        member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
         pipe.zadd(
             DISCOVERY_QUEUE,
-            {row["employer_fein"]: row["petition_count"]},
+            {member: row["petition_count"]},
             nx=False,
         )
         added += 1

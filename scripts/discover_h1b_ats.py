@@ -38,6 +38,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+import tldextract
 from urllib.parse import urljoin, urlparse
 
 from rapidfuzz import process as fuzz_process, utils as fuzz_utils
@@ -207,10 +208,10 @@ def strip_legal_suffixes(name: str) -> str:
 
 
 def _root_domain(url: str) -> str:
-    """'careers.amazon.com' → 'amazon.com'"""
-    host  = urlparse(url).hostname or ""
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    """'careers.amazon.co.uk' → 'amazon.co.uk' (PSL-aware registrable domain)."""
+    host = urlparse(url).hostname or ""
+    ext  = tldextract.extract(host)
+    return ext.registered_domain or host
 
 
 def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain: str) -> bool:
@@ -1541,16 +1542,20 @@ def process_employer(
     careers_url       = None
     detected_platform = None
     detected_slug     = None
+    ats_source        = None   # which phase found the ATS platform
+    careers_source    = None   # which phase found the careers URL
 
     if jobs_url:
         # P10311 found — use it as the careers URL, no further probing needed
-        careers_url = jobs_url
+        careers_url    = jobs_url
+        careers_source = "phase1_kg"
         log.info("  P10311 jobs URL: %s", jobs_url)
         from jobs.ats.patterns import match_ats_pattern as _map
         _hit = _map(jobs_url)
         if _hit:
             detected_platform = _hit["platform"]
             detected_slug     = _hit.get("slug")
+            ats_source        = "phase1_kg"
     elif website_url:
         # Phase 3: 19-pattern probe
         website_url = _resolve_website_redirect(website_url)
@@ -1559,6 +1564,10 @@ def process_employer(
             careers_url, detected_platform, detected_slug = discover_careers_url(
                 website_url
             )
+            if careers_url:
+                careers_source = "phase3"
+            if detected_platform:
+                ats_source = "phase3"
         except Exception as e:
             log.warning("  Career probe failed: %s", e)
 
@@ -1568,13 +1577,16 @@ def process_employer(
             log.info("  Brave search fallback for %r …", search_name)
             brave_url = brave_career_search(search_name, website_url=website_url)
             if brave_url:
-                careers_url = brave_url
+                careers_url    = brave_url
+                careers_source = "phase4"
                 log.info("  Brave found: %s", brave_url)
                 # Phase 5: fingerprint the Brave result page
                 try:
                     html, _ = _fetch_html(brave_url)
                     if html:
                         detected_platform, detected_slug = _find_ats_in_html(html)
+                        if detected_platform:
+                            ats_source = "phase5"
                 except Exception as e:
                     log.warning("  HTML fingerprint failed: %s", e)
 
@@ -1591,9 +1603,11 @@ def process_employer(
                 if _cp_result.get("platform"):
                     detected_platform = _cp_result["platform"]
                     detected_slug     = _cp_result.get("slug")
+                    ats_source        = "phase6"
                     log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
                 if not careers_url and _cp_result.get("careers_url"):
-                    careers_url = _cp_result["careers_url"]
+                    careers_url    = _cp_result["careers_url"]
+                    careers_source = "phase6"
                     log.info("  Phase 6 careers_url: %s", careers_url)
         except Exception as e:
             log.warning("  Phase 6 (career_page) failed: %s", e)
@@ -1613,17 +1627,23 @@ def process_employer(
                 if _best_slug:
                     detected_slug = _best_slug
                 if not careers_url:
-                    careers_url = _best.get("source_url")
+                    careers_url    = _best.get("source_url")
+                    careers_source = "phase7"
+                if detected_platform:
+                    ats_source = "phase7"
                 log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
 
     # Update website_url when careers discovery reveals a different real domain.
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
+    # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
     if careers_url and website_url:
         _careers_root = _root_domain(careers_url)
         _website_root = _root_domain(website_url)
-        if _careers_root and _website_root and _careers_root != _website_root:
+        if (_careers_root and _website_root
+                and _careers_root != _website_root
+                and _careers_root not in _KNOWN_ATS_DOMAINS):
             log.info("  Updating website_url: %s → https://%s (via careers domain)",
                      website_url, _careers_root)
             website_url = f"https://{_careers_root}"
@@ -1650,6 +1670,8 @@ def process_employer(
         "detected_slug":    detected_slug,
         "glassdoor_id":     glassdoor_id,
         "crunchbase_id":    crunchbase_id,
+        "ats_source":       ats_source,
+        "careers_source":   careers_source,
     }
 
     upsert_discovery(result, conn, dry_run=dry_run)
@@ -1665,6 +1687,7 @@ def process_employer(
                 WHERE employer_fein = %s AND platform = %s AND domain != %s
                   AND is_monitored = TRUE
             """, (fein, detected_platform, domain))
+            conn.commit()  # commit deactivation independently — _upsert_company_ats may early-return
             _upsert_company_ats(
                 conn,
                 fein=fein,

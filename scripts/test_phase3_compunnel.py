@@ -11,9 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import logging
 logging.basicConfig(level=logging.DEBUG, format="%(name)s  %(message)s")
 
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 from urllib.parse import urlparse
 import requests
 
@@ -46,7 +43,7 @@ TIMEOUT = 10
 def probe(url: str, company_root: str):
     try:
         r = requests.get(url, timeout=TIMEOUT, allow_redirects=True,
-                         verify=False, headers={"User-Agent": "Mozilla/5.0"})
+                         headers={"User-Agent": "Mozilla/5.0"})
         final_url  = r.url
         final_root = _root_domain(final_url)
         redirected = final_url.rstrip("/") != url.rstrip("/")

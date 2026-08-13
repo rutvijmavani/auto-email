@@ -7,10 +7,12 @@ import secrets
 import socket
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import requests as _requests
+import tldextract as _tldextract
 from flask import Flask, request, jsonify, make_response, redirect
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
@@ -50,6 +52,10 @@ def _cors(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
     response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
     return response
+
+
+def _cors_preflight():
+    return _cors(make_response('', 204))
 
 
 @app.before_request
@@ -358,6 +364,12 @@ def oauth_callback():
     return jsonify({"status": "authorized", "email": gmail_email})
 
 
+# Bounded executor for background verify/enrich tasks — prevents thread explosion
+# under rapid extension requests for the same company.
+_VERIFY_EXECUTOR   = ThreadPoolExecutor(max_workers=8)
+_INFLIGHT_FEINS    = set()          # FEINs with an active background task
+_INFLIGHT_LOCK     = threading.Lock()
+
 _VERIFY_HEAD_TIMEOUT = 8   # seconds — fast, never block the request
 _VERIFY_GOOD_CODES   = {200, 301, 302, 303, 307, 308}
 _PRIVATE_NETS = [
@@ -369,17 +381,24 @@ _PRIVATE_NETS = [
 
 
 def _is_private_host(host: str) -> bool:
-    """Return True when host resolves to a private/loopback address."""
+    """Return True when ANY address getaddrinfo returns is private/loopback (fail closed)."""
     try:
-        addr = ipaddress.ip_address(socket.gethostbyname(host))
-        return any(addr in net for net in _PRIVATE_NETS)
+        results = socket.getaddrinfo(host, None)
+        if not results:
+            return True
+        for _family, _type, _proto, _canon, sockaddr in results:
+            addr = ipaddress.ip_address(sockaddr[0])
+            if any(addr in net for net in _PRIVATE_NETS):
+                return True
+        return False
     except Exception:
         return True  # treat unresolvable as private (fail closed)
 
 
 def _host_root(host: str) -> str:
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    """Return the PSL-aware registrable domain (e.g. 'acme.co.uk' not 'co.uk')."""
+    ext = _tldextract.extract(host)
+    return ext.registered_domain or host
 
 
 def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
@@ -428,12 +447,24 @@ def _trigger_enrichment(fein: str) -> None:
     try:
         r = get_redis()
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
+        workers_ok = True
         for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-            subprocess.run(
+            res = subprocess.run(
                 ["sudo", "systemctl", "start", unit],
                 check=False, timeout=10, capture_output=True,
             )
-        logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
+            if res.returncode != 0:
+                logger.warning(
+                    "verify-company: systemctl start %s rc=%d: %s",
+                    unit, res.returncode, res.stderr.decode(errors="replace").strip(),
+                )
+                workers_ok = False
+        if workers_ok:
+            logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
+        else:
+            logger.warning(
+                "verify-company: queued re-enrichment fein=%s but worker start(s) failed", fein,
+            )
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
 
@@ -448,13 +479,21 @@ def verify_company():
     POST body: {"fein": "123456789", "user_id": 1}   (user_id optional)
     Response:  {"careers_url": "...", "ats_platform": "...", "stale": bool}
     """
-    if _API_KEY and not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
+    if request.method == 'OPTIONS':
+        return _cors_preflight()
+
+    if not _API_KEY:
+        return jsonify({'error': 'API key not configured'}), 503
+    if not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
         return jsonify({'error': 'unauthorized'}), 401
 
-    data = request.get_json(silent=True) or {}
-    fein = (data.get('fein') or '').strip()
-    if not fein:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'request body must be a JSON object'}), 400
+    fein = data.get('fein')
+    if not isinstance(fein, str) or not fein.strip():
         return jsonify({'error': 'fein is required'}), 400
+    fein = fein.strip()
 
     conn = get_conn()
     try:
@@ -489,9 +528,25 @@ def verify_company():
         'stale':        False,
     }
 
+    def _submit(fn, *args):
+        """Submit to bounded executor; skip if this FEIN is already in-flight."""
+        with _INFLIGHT_LOCK:
+            if fein in _INFLIGHT_FEINS:
+                return
+            _INFLIGHT_FEINS.add(fein)
+
+        def _wrapped():
+            try:
+                fn(*args)
+            finally:
+                with _INFLIGHT_LOCK:
+                    _INFLIGHT_FEINS.discard(fein)
+
+        _VERIFY_EXECUTOR.submit(_wrapped)
+
     # If there's no careers_url, queue for enrichment and return
     if not careers_url:
-        threading.Thread(target=_trigger_enrichment, args=(fein,), daemon=True).start()
+        _submit(_trigger_enrichment, fein)
         payload['stale'] = True
         return jsonify(payload), 200
 
@@ -520,7 +575,7 @@ def verify_company():
             )
             _trigger_enrichment(fein)
 
-    threading.Thread(target=_background_verify, daemon=True).start()
+    _submit(_background_verify)
     return jsonify(payload), 200
 
 

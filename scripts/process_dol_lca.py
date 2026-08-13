@@ -27,6 +27,7 @@ Design decisions (see docs/dol_h1b_pipeline.md, docs/email-pattern-inference.md)
 
 import argparse
 import json
+import tldextract
 import os
 import re
 import sys
@@ -291,13 +292,14 @@ def aggregate(df: pd.DataFrame) -> dict:
                 continue
             domain_counts[domain_part] = domain_counts.get(domain_part, 0) + 1
         total_emails = sum(domain_counts.values())
+        root_totals: dict[str, int] = {}
         if domain_counts:
-            # Group subdomains by root (last 2 parts) and sum counts.
-            # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030) wins over raw max.
-            root_totals: dict[str, int] = {}
+            # Group subdomains by PSL-aware registrable domain and sum counts.
+            # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030).
+            # tldextract handles multi-label TLDs: acme.co.uk → acme.co.uk, not co.uk.
             for _d, _cnt in domain_counts.items():
-                _parts = _d.split(".")
-                _root  = ".".join(_parts[-2:]) if len(_parts) >= 2 else _d
+                _ext  = tldextract.extract(_d)
+                _root = _ext.registered_domain or _d
                 root_totals[_root] = root_totals.get(_root, 0) + _cnt
             assigned_domain = max(root_totals, key=root_totals.get)
             confidence      = root_totals[assigned_domain] / total_emails
@@ -378,7 +380,7 @@ def aggregate(df: pd.DataFrame) -> dict:
             "soc":          soc_data,
             "yearly":       yearly_data,
             "domain_map":   {
-                "domain_counts":  domain_counts,
+                "domain_counts":  root_totals,   # PSL-aware root → count (not raw emails)
                 "total_emails":   total_emails,
                 "assigned_domain": assigned_domain,
                 "confidence":      confidence,
@@ -593,9 +595,18 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 year_count += 1
 
             # fein_domain_map — merge domain count JSON with existing row
+            # MIGRATION NOTE (2026-08-13): domain_counts semantics changed from
+            # raw-email-domain → count  to  PSL-registrable-domain → count.
+            # After deploying this change, reset and re-ingest all LCA files:
+            #   UPDATE fein_domain_map SET domain_counts='{}', total_emails=0,
+            #          assigned_domain=NULL, confidence=NULL, low_confidence=FALSE;
+            #   python scripts/process_dol_lca.py --file <all quarters>
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
-                conn.execute(r"""
+                # domain_counts stores PSL-aware registrable_domain → count (not raw emails).
+                # ON CONFLICT merges by summing per root; argmax gives assigned_domain.
+                # No regex needed — keys are already roots (tldextract applied in Python).
+                conn.execute("""
                     INSERT INTO fein_domain_map
                         (employer_fein, domain_counts, total_emails,
                          assigned_domain, confidence, low_confidence, updated_at)
@@ -613,9 +624,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                         ),
                         total_emails    = fein_domain_map.total_emails + EXCLUDED.total_emails,
                         assigned_domain = (
-                            -- Group raw domains by root (last 2 parts), pick root of
-                            -- highest-count group. ny.email.gs.com → gs.com wins.
-                            SELECT regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
+                            SELECT key
                             FROM jsonb_each_text(
                                 (SELECT jsonb_object_agg(key,
                                     COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
@@ -624,38 +633,29 @@ def upsert(aggregated: dict, quarter: str) -> None:
                                      fein_domain_map.domain_counts || EXCLUDED.domain_counts
                                  ) AS key)
                             )
-                            GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
-                            ORDER BY SUM(value::int) DESC LIMIT 1
+                            ORDER BY value::int DESC LIMIT 1
                         ),
                         confidence      = (
-                            SELECT MAX(grp)::float / NULLIF(SUM(grp), 0)
-                            FROM (
-                                SELECT SUM(value::int) AS grp
-                                FROM jsonb_each_text(
-                                    (SELECT jsonb_object_agg(key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
-                                     FROM jsonb_object_keys(
-                                         fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                     ) AS key)
-                                )
-                                GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
-                            ) _grps
+                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)
+                            FROM jsonb_each_text(
+                                (SELECT jsonb_object_agg(key,
+                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
+                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
+                                 FROM jsonb_object_keys(
+                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                 ) AS key)
+                            )
                         ),
                         low_confidence  = (
-                            SELECT MAX(grp)::float / NULLIF(SUM(grp), 0) < 0.70
-                            FROM (
-                                SELECT SUM(value::int) AS grp
-                                FROM jsonb_each_text(
-                                    (SELECT jsonb_object_agg(key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
-                                     FROM jsonb_object_keys(
-                                         fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                     ) AS key)
-                                )
-                                GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
-                            ) _grps
+                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0) < 0.70
+                            FROM jsonb_each_text(
+                                (SELECT jsonb_object_agg(key,
+                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
+                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
+                                 FROM jsonb_object_keys(
+                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                 ) AS key)
+                            )
                         ),
                         updated_at      = NOW()
                 """, (

@@ -187,12 +187,13 @@ def _ct_crtsh(domain: str) -> list[str]:
         return []
 
 
-def _ct_domains(domain: str) -> "tuple[list[str], int | None]":
-    """certspotter primary, crt.sh fallback. Returns (candidates, retry_after_or_None)."""
+def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
+    """certspotter primary, crt.sh fallback. Returns (candidates, retry_after_or_None, source)."""
     candidates, retry_after = _ct_certspotter(domain)
-    if not candidates and retry_after is None:
-        candidates = _ct_crtsh(domain)
-    return candidates, retry_after
+    if candidates or retry_after is not None:
+        return candidates, retry_after, "certspotter"
+    candidates = _ct_crtsh(domain)
+    return candidates, None, "crtsh"
 
 
 def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int | None]":
@@ -234,15 +235,15 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
 
     # Step 3 — CT log (certspotter → crt.sh fallback)
     log.debug("querying CT logs for %s", domain)
-    candidates, retry_after = _ct_domains(domain)
+    candidates, retry_after, ct_source = _ct_domains(domain)
 
     if retry_after is not None:
         return None, "ct_quota", retry_after
 
     for candidate in candidates:
         if _has_web(candidate):
-            log.info("public_domain: %s → %s (certspotter)", domain, candidate)
-            return candidate, "certspotter", None
+            log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
+            return candidate, ct_source, None
 
     log.debug("no public domain signal for %s", domain)
     return None, "no_signal", None
