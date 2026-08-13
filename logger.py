@@ -66,7 +66,17 @@ _MONTHLY_COMMANDS = frozenset({
 # Long-running processes that use TimedRotatingFileHandler (rotates at midnight)
 # instead of a dated filename so the file doesn't grow unbounded for weeks.
 # Log files: scheduler.log, api.log → rotate to scheduler.log.YYYY-MM-DD etc.
-_LONG_RUNNING_COMMANDS = frozenset({"scheduler", "api", "email_processor"})
+_LONG_RUNNING_COMMANDS = frozenset({
+    "scheduler", "api", "email_processor",
+    "domain_enrichment_worker", "discover_h1b_ats_worker",
+})
+
+# Subset of _LONG_RUNNING_COMMANDS that get extended retention (LOG_RETENTION_WORKER_DAYS).
+# These workers run sporadically in multi-hour batches — 14-day retention is too short
+# to compare runs across the 90-day staleness cycle.
+_WORKER_COMMANDS = frozenset({
+    "domain_enrichment_worker", "discover_h1b_ats_worker",
+})
 
 # Map CLI flag → log filename prefix
 # Pipeline sets this via init_logging(command="monitor") at startup
@@ -186,13 +196,17 @@ def _cleanup_old_logs() -> tuple[int, int]:
                                 (e.g. build_ats_slug_list_YYYY-MM-DD.log)
                                 and gets 35d retention.
 
-      *.log.YYYY-MM-DD          TimedRotatingFileHandler rotation backups   14d
+      *.log.YYYY-MM-DD          TimedRotatingFileHandler rotation backups
                                 for long-running processes:
-                                  pipeline.log.2026-05-01
-                                  scheduler_2026-05-06.log.2026-05-10
+                                  scheduler, api, email_processor          14d
+                                  domain_enrichment_worker,
+                                  discover_h1b_ats_worker                  30d
+                                    (longer: sporadic runs, 90d staleness
+                                     cycle means you need weeks of history)
 
-      *.log  (no date suffix)   Plain logs from long-running processes:     14d
-                                  scheduler.log, fullscan.log, pipeline.log
+      *.log  (no date suffix)   Plain logs from long-running processes:
+                                  scheduler.log, api.log                   14d
+                                  domain_enrichment_worker.log             30d
                                 Only deleted once the process stops writing
                                 (mtime ages out naturally).
     """
@@ -202,14 +216,19 @@ def _cleanup_old_logs() -> tuple[int, int]:
     # Import retention constants from config — fall back to safe defaults if
     # config is unavailable (e.g., during unit tests that import logger directly).
     try:
-        from config import LOG_RETENTION_DAILY_DAYS, LOG_RETENTION_MONTHLY_DAYS
+        from config import (
+            LOG_RETENTION_DAILY_DAYS, LOG_RETENTION_MONTHLY_DAYS,
+            LOG_RETENTION_WORKER_DAYS,
+        )
     except ImportError:
         LOG_RETENTION_DAILY_DAYS   = 14
         LOG_RETENTION_MONTHLY_DAYS = 35
+        LOG_RETENTION_WORKER_DAYS  = 30
 
     now            = datetime.now()
     daily_cutoff   = now - timedelta(days=LOG_RETENTION_DAILY_DAYS)
     monthly_cutoff = now - timedelta(days=LOG_RETENTION_MONTHLY_DAYS)
+    worker_cutoff  = now - timedelta(days=LOG_RETENTION_WORKER_DAYS)
 
     deleted, errors = 0, 0
     for entry in LOG_DIR.iterdir():
@@ -244,8 +263,11 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 # TimedRotatingFileHandler backups from long-running processes:
                 #   pipeline.log.2026-05-01
                 #   scheduler_2026-05-06.log.2026-05-10
-                #   scheduler_2026-05-23.log.2026-05-23
-                if mtime < daily_cutoff:
+                #   domain_enrichment_worker.log.2026-08-13
+                # Worker processes get extended retention (30d vs 14d).
+                is_worker = any(name.startswith(w) for w in _WORKER_COMMANDS)
+                cutoff = worker_cutoff if is_worker else daily_cutoff
+                if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
                 continue
@@ -255,7 +277,9 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 # These are written by long-running processes whose mtime is
                 # always "now" while the process runs.  They are only deleted
                 # once the process stops and the file stops being written to.
-                if mtime < daily_cutoff:
+                is_worker = any(name.startswith(w) for w in _WORKER_COMMANDS)
+                cutoff = worker_cutoff if is_worker else daily_cutoff
+                if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
 

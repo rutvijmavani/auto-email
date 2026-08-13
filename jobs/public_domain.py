@@ -1,0 +1,236 @@
+"""
+jobs/public_domain.py — Public domain resolution for H1B pipeline enrichment.
+
+Resolves internal/email domains (e.g. fmr.com, jpmchase.com) to the company's
+real public-facing website domain (e.g. fidelity.com, jpmorgan.com).
+
+Three-step algorithm:
+  1. HTTP redirect follow    — jpmchase.com → jpmorgan.com
+  2. Root-domain fallback   — ny.email.gs.com → gs.com → goldmansachs.com
+  3. CT log (certspotter)   — fmr.com → fidelity.com via cert SANs
+     Fallback: crt.sh if certspotter unavailable.
+
+Returns (public_domain, method, retry_after) where retry_after is non-None
+only on certspotter 429 — caller should re-queue the company with that delay.
+"""
+
+import time
+from urllib.parse import urlparse
+
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from config import CERTSPOTTER_API_KEY
+from logger import get_logger
+
+log = get_logger(__name__)
+
+# Root domains belonging to cloud / email / CDN providers — never a real company domain
+GENERIC_ROOTS = {
+    "outlook.com", "hotmail.com", "gmail.com", "yahoo.com",
+    "pphosted.com", "mimecast.com", "proofpoint.com", "messagelabs.com",
+    "cloudflare.com", "fastly.com", "akamai.com", "amazonaws.com",
+    "azure.com", "cloudfront.net", "googleusercontent.com",
+    "office365.com", "microsoft.com", "googlehosted.com",
+}
+
+_REDIRECT_TIMEOUT = 8
+_WEB_TIMEOUT      = 6
+_CT_TIMEOUT       = 20
+_CRTSH_TIMEOUT    = 30
+
+# Module-level certspotter backoff — avoid hammering after a 429
+_certspotter_retry_after: float = 0.0
+
+
+def _root(u: str) -> str:
+    if "://" not in u:
+        u = "https://" + u
+    h = urlparse(u).hostname or ""
+    p = h.split(".")
+    return ".".join(p[-2:]) if len(p) >= 2 else h
+
+
+def _redirect_domain(host: str) -> "str | None":
+    """
+    Follow HTTP redirects on host. Returns:
+      str  — root domain of final URL differs from host → redirect found
+      ""   — final URL has same root as host → already public
+      None — connection error / DNS fail
+    """
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(
+                f"{scheme}://{host}", verify=False,
+                allow_redirects=True, timeout=_REDIRECT_TIMEOUT,
+            )
+            final = _root(r.url)
+            return final if final != _root(host) else ""
+        except Exception:
+            continue
+    return None
+
+
+def _has_web(root: str) -> bool:
+    """Return True if root domain serves any HTTP response (status < 500)."""
+    for scheme in ("https", "http"):
+        try:
+            r = requests.get(
+                f"{scheme}://{root}", timeout=_WEB_TIMEOUT,
+                allow_redirects=True, verify=False,
+            )
+            if r.status_code < 500:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
+    """
+    Query SSLmate certspotter for all certs issued under domain.
+    Extracts and ranks root domains found across all certificate SANs.
+
+    Returns (candidates, retry_after_seconds_or_None).
+    retry_after is non-None on HTTP 429 — caller re-queues with that delay.
+    """
+    global _certspotter_retry_after
+
+    if time.time() < _certspotter_retry_after:
+        wait = int(_certspotter_retry_after - time.time())
+        log.debug("certspotter in-process backoff: %ds remaining", wait)
+        return [], wait
+
+    headers = {"User-Agent": "python-h1b-discovery/1.0"}
+    if CERTSPOTTER_API_KEY:
+        headers["Authorization"] = f"Bearer {CERTSPOTTER_API_KEY}"
+
+    try:
+        r = requests.get(
+            "https://api.certspotter.com/v1/issuances",
+            params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
+            headers=headers,
+            timeout=_CT_TIMEOUT,
+        )
+        if r.status_code == 429:
+            retry_after = int(r.headers.get("Retry-After", 3600))
+            _certspotter_retry_after = time.time() + retry_after
+            log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
+            return [], retry_after
+
+        if r.status_code != 200:
+            log.warning("certspotter HTTP %d for %s", r.status_code, domain)
+            return [], None
+
+        certs = r.json()
+        roots: dict[str, int] = {}
+        for cert in certs:
+            for d in cert.get("dns_names", []):
+                d = d.lstrip("*.")
+                if d == domain:
+                    continue
+                root = _root(d)
+                if root and root not in GENERIC_ROOTS:
+                    roots[root] = roots.get(root, 0) + 1
+
+        top = sorted(roots, key=lambda x: -roots[x])[:10]
+        log.debug("certspotter: %d certs for %s → top roots: %s", len(certs), domain, top)
+        return top, None
+
+    except Exception as e:
+        log.warning("certspotter error for %s: %s", domain, e)
+        return [], None
+
+
+def _ct_crtsh(domain: str) -> list[str]:
+    """crt.sh fallback — slower, sometimes unavailable."""
+    try:
+        r = requests.get(
+            f"https://crt.sh/?q={domain}&output=json",
+            timeout=_CRTSH_TIMEOUT,
+            headers={"User-Agent": "python-h1b-discovery/1.0"},
+        )
+        if r.status_code != 200:
+            log.warning("crt.sh HTTP %d for %s", r.status_code, domain)
+            return []
+
+        roots: dict[str, int] = {}
+        for cert in r.json():
+            for d in cert.get("name_value", "").replace("\n", ",").split(","):
+                d = d.strip().lstrip("*.")
+                if not d or d == domain:
+                    continue
+                root = _root(d)
+                if root and root not in GENERIC_ROOTS:
+                    roots[root] = roots.get(root, 0) + 1
+
+        top = sorted(roots, key=lambda x: -roots[x])[:10]
+        log.debug("crt.sh: top roots for %s: %s", domain, top)
+        return top
+
+    except Exception as e:
+        log.warning("crt.sh error for %s: %s", domain, e)
+        return []
+
+
+def _ct_domains(domain: str) -> "tuple[list[str], int | None]":
+    """certspotter primary, crt.sh fallback. Returns (candidates, retry_after_or_None)."""
+    candidates, retry_after = _ct_certspotter(domain)
+    if not candidates and retry_after is None:
+        candidates = _ct_crtsh(domain)
+    return candidates, retry_after
+
+
+def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int | None]":
+    """
+    Resolve an internal/email domain to the company's real public domain.
+
+    Returns (public_domain, method, retry_after):
+      public_domain — resolved domain string, or None if unresolvable
+      method        — 'http_redirect' | 'root_fallback' | 'certspotter' |
+                      'crtsh' | 'same_domain' | 'ct_quota' | 'no_signal'
+      retry_after   — seconds before re-queuing (certspotter 429), else None
+    """
+    domain = assigned_domain.lower().strip()
+
+    # Step 1 — HTTP redirect on full domain
+    redir = _redirect_domain(domain)
+    if redir is None:
+        log.debug("DNS fail for %s — trying root fallback", domain)
+    elif redir == "":
+        log.debug("%s already resolves publicly", domain)
+        return None, "same_domain", None
+    else:
+        log.info("public_domain: %s → %s (http_redirect)", domain, redir)
+        return redir, "http_redirect", None
+
+    # Step 2 — Root-domain fallback (strip subdomain prefix)
+    parts = domain.split(".")
+    if len(parts) > 2:
+        root_try = ".".join(parts[-2:])
+        redir = _redirect_domain(root_try)
+        if redir is None:
+            pass
+        elif redir == "":
+            log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
+            return root_try, "root_fallback", None
+        else:
+            log.info("public_domain: %s → %s (root_fallback)", domain, redir)
+            return redir, "root_fallback", None
+
+    # Step 3 — CT log (certspotter → crt.sh fallback)
+    log.debug("querying CT logs for %s", domain)
+    candidates, retry_after = _ct_domains(domain)
+
+    if retry_after is not None:
+        return None, "ct_quota", retry_after
+
+    for candidate in candidates:
+        if _has_web(candidate):
+            log.info("public_domain: %s → %s (certspotter)", domain, candidate)
+            return candidate, "certspotter", None
+
+    log.debug("no public domain signal for %s", domain)
+    return None, "no_signal", None

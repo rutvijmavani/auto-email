@@ -42,6 +42,11 @@ LOG_RETENTION_DAILY_DAYS   = 14
 # written before the previous month's is deleted.
 LOG_RETENTION_MONTHLY_DAYS = 35
 
+# Worker process logs (domain_enrichment_worker, discover_h1b_ats_worker)
+# 30 days — longer than daily because staleness cycle is 90 days and regression
+# comparisons need a few weeks of history across sporadic runs.
+LOG_RETENTION_WORKER_DAYS  = 30
+
 # ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
 # ─────────────────────────────────────────
@@ -338,6 +343,31 @@ DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b
 
 CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
 CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
+
+CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOMAIN ENRICHMENT WORKER
+# ─────────────────────────────────────────────────────────────────────────────
+DOMAIN_ENRICHMENT_QUEUE   = "domain_enrichment_queue"   # Redis ZSET, score=petition_count
+DOMAIN_ENRICHMENT_DELAYED = "domain_enrichment:delayed" # Redis ZSET, score=not_before timestamp
+DOMAIN_ENRICHMENT_DLQ     = "domain_enrichment:dlq"     # Redis LIST — failed companies
+DISCOVERY_QUEUE           = "discovery_queue"            # Redis ZSET, score=petition_count
+DISCOVERY_DLQ             = "discovery:dlq"              # Redis LIST — failed discovery
+ENRICHMENT_MAX_RETRIES    = int(os.getenv("ENRICHMENT_MAX_RETRIES", "3"))
+ENRICHMENT_HEARTBEAT_S    = int(os.getenv("ENRICHMENT_HEARTBEAT_S", "30"))
+DISCOVERY_MAX_RETRIES     = int(os.getenv("DISCOVERY_MAX_RETRIES", "3"))
+DISCOVERY_HEARTBEAT_S     = int(os.getenv("DISCOVERY_HEARTBEAT_S", "30"))
+
+# Staleness checker thresholds
+ENRICH_STALENESS_DAYS            = int(os.getenv("ENRICH_STALENESS_DAYS",            "90"))  # re-enrich after N days
+STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))   # min petition_count for discovery re-run
+STALENESS_ENRICHMENT_ZADD_BATCH  = int(os.getenv("STALENESS_ENRICHMENT_ZADD_BATCH",  "500"))  # pipeline batch size
+
+# On-demand verification (user visits company page)
+# Score used when a career URL fails HEAD check — sits above any petition_count value
+# so this company is processed before all normally-queued items.
+ENRICHMENT_HIGH_PRIORITY_SCORE   = int(os.getenv("ENRICHMENT_HIGH_PRIORITY_SCORE",  "999999"))
 
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))

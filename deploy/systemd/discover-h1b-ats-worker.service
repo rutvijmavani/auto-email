@@ -1,0 +1,34 @@
+[Unit]
+Description=H1B ATS discovery worker (KG + Brave + career_detector pipeline)
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/python -m workers.discover_h1b_ats_worker
+Restart=on-failure
+RestartSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindPaths=/home/opc/mail
+ReadWritePaths=/home/opc/mail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=discover-h1b-ats-worker
+
+[Install]
+WantedBy=multi-user.target

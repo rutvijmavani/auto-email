@@ -92,17 +92,19 @@ _RICH_SLUG_PLATFORMS = {"phenom", "talentbrew", "avature"}
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_via_career_page(company, domain):
+def detect_via_career_page(company, domain, *, careers_url=None):
     """
     Phase 3a: Scan company career page for ATS fingerprints.
 
     Args:
-        company: company name  e.g. "Stripe"
-        domain:  company domain e.g. "stripe.com"
+        company:     company name  e.g. "Stripe"
+        domain:      company domain e.g. "stripe.com"
+        careers_url: if provided, skip path probing — verify this URL and scan it.
+                     Falls back to full probing if the URL is not accessible.
 
     Returns:
-        {"platform": ..., "slug": ...}  if found
-        None                            if not found
+        {"platform": ..., "slug": ..., "careers_url": ...}  on hit or URL-only find
+        None                                                  if nothing found at all
     """
     if not domain:
         logger.debug("[P3a] No domain for %r — skipping", company)
@@ -112,20 +114,40 @@ def detect_via_career_page(company, domain):
     if domain.startswith("http"):
         domain = re.sub(r'^https?://', '', domain).rstrip('/')
 
-    logger.debug("[P3a] Scanning: company=%r domain=%s", company, domain)
+    logger.debug("[P3a] Scanning: company=%r domain=%s careers_url=%s",
+                 company, domain, careers_url)
 
-    # ── Layer 1 + 2: scan standard career paths ────────────────────────────
-    first_career_html = None
-    first_career_url  = None
-    # Eightfold is treated as tentative — many companies embed Eightfold
-    # tracking / LinkedIn RMS scripts on their career page without actually
-    # being Eightfold customers (e.g. Netflix uses Workday but loads an
-    # Eightfold real-time-listing widget).  We keep scanning and only fall
-    # back to the Eightfold result if no harder ATS is found in Layer 3.
+    # ── Mode 1: careers_url already known — verify + scan, skip probing ───────
+    if careers_url:
+        result, html, final_url = _fetch_and_scan(careers_url, company)
+        if result and result.get("platform"):
+            result["careers_url"] = final_url or careers_url
+            logger.info("[P3a HIT via careers_url] %r → %s / %s",
+                        company, result["platform"], result["slug"])
+            return result
+        if html is not None:
+            # Accessible but ATS not found in top-level HTML — follow job links
+            job_result = _follow_job_links(html, final_url or careers_url, company, domain)
+            if job_result:
+                logger.info("[P3a HIT via job link] %r → %s / %s",
+                            company, job_result["platform"], job_result["slug"])
+                job_result["careers_url"] = final_url or careers_url
+                return job_result
+            return {"platform": None, "slug": None, "careers_url": final_url or careers_url}
+        # careers_url not accessible — fall through to full probing
+        logger.debug("[P3a] careers_url not accessible, falling back to path probe")
+
+    # ── Mode 2: probe standard career paths ───────────────────────────────────
+    # Use www.domain as probe base to avoid apex→www redirect overhead
+    probe_base = domain if domain.startswith("www.") else f"www.{domain}"
+
+    first_career_html  = None
+    first_career_url   = None
+    first_redirect_url = None
     tentative_eightfold = None
 
     for path in CAREER_PATHS:
-        url = f"https://{domain}{path}"
+        url = f"https://{probe_base}{path}"
         result, html, final_url = _fetch_and_scan(url, company)
         if result:
             if result["platform"] == "eightfold":
@@ -137,7 +159,12 @@ def detect_via_career_page(company, domain):
             else:
                 logger.info("[P3a HIT] %r → %s / %s via %s",
                             company, result["platform"], result["slug"], url)
+                result["careers_url"] = final_url or url
                 return result
+        # Track the redirect destination even when content is blocked (403/non-200).
+        # A redirect from domain/careers to any URL is strong evidence of a valid careers page.
+        if final_url and final_url != url and not first_redirect_url:
+            first_redirect_url = final_url
         if html is not None and first_career_html is None:
             first_career_html = html
             first_career_url  = final_url
@@ -152,6 +179,7 @@ def detect_via_career_page(company, domain):
         if result:
             logger.info("[P3a HIT via job link] %r → %s / %s",
                         company, result["platform"], result["slug"])
+            result["careers_url"] = first_career_url
             return result
 
     # ── Eightfold fallback ─────────────────────────────────────────────────
@@ -159,7 +187,15 @@ def detect_via_career_page(company, domain):
     if tentative_eightfold:
         logger.info("[P3a HIT Eightfold fallback] %r → %s / %s",
                     company, tentative_eightfold["platform"], tentative_eightfold["slug"])
+        tentative_eightfold["careers_url"] = first_career_url or first_redirect_url
         return tentative_eightfold
+
+    # MISS — no ATS detected, but return the best careers URL hint we found
+    # so the caller can still save the careers page location.
+    careers_hint = first_career_url or first_redirect_url
+    if careers_hint:
+        logger.debug("[P3a MISS] %r (domain=%s) — careers_url hint: %s", company, domain, careers_hint)
+        return {"platform": None, "slug": None, "careers_url": careers_hint}
 
     logger.debug("[P3a MISS] %r (domain=%s)", company, domain)
     return None
@@ -263,15 +299,19 @@ def _fetch_and_scan(url, company):
         )
         final_url = resp.url
 
-        # Layer 1: redirect URL
+        # Layer 1: redirect URL — check ATS pattern before 200 gate
         if final_url != url:
-            logger.debug("[P3a] Redirect: %s → %s", url, final_url)
             r = match_ats_pattern(final_url)
             if r and _slug_ok(r, company):
+                logger.debug("[P3a] ATS redirect: %s → %s", url, final_url)
                 return _enrich_eightfold_domain(r, final_url), None, final_url
 
         if resp.status_code != 200:
             return None, None, None
+
+        # Only log redirects that produced usable content (200)
+        if final_url != url:
+            logger.debug("[P3a] Redirect: %s → %s", url, final_url)
 
         # Layer 2: deep HTML scan
         r = _scan_html(resp.text, company)

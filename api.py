@@ -3,6 +3,8 @@ import hmac
 import json
 import os
 import secrets
+import subprocess
+import threading
 from datetime import datetime, timezone
 
 import requests as _requests
@@ -15,8 +17,13 @@ from googleapiclient.discovery import build
 load_dotenv()
 
 from logger import get_logger, init_logging, cleanup_logs_if_due
-from config import REDIS_EMAIL_PUSH
+from config import (
+    DOMAIN_ENRICHMENT_QUEUE,
+    ENRICHMENT_HIGH_PRIORITY_SCORE,
+    REDIS_EMAIL_PUSH,
+)
 from db.applications import add_application
+from db.connection import get_conn
 from db.gmail_tokens import upsert_token, update_watch
 from workers.redis_client import get_redis
 
@@ -346,6 +353,122 @@ def oauth_callback():
         return jsonify({"error": "token stored but watch failed — retry /oauth/start"}), 500
 
     return jsonify({"status": "authorized", "email": gmail_email})
+
+
+_VERIFY_HEAD_TIMEOUT = 8   # seconds — fast, never block the request
+_VERIFY_GOOD_CODES   = {200, 301, 302, 303, 307, 308}
+
+
+def _head_ok(url: str) -> bool:
+    """Return True if a HEAD request to url returns a plausible success code."""
+    try:
+        resp = _requests.head(
+            url,
+            allow_redirects=True,
+            timeout=_VERIFY_HEAD_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        return resp.status_code in _VERIFY_GOOD_CODES
+    except Exception:
+        return False
+
+
+def _trigger_enrichment(fein: str) -> None:
+    """Push fein to enrichment queue at HIGH priority and start workers. Fire-and-forget."""
+    try:
+        r = get_redis()
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
+        for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
+            subprocess.run(
+                ["sudo", "systemctl", "start", unit],
+                check=False, timeout=10, capture_output=True,
+            )
+        logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
+    except Exception as exc:
+        logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
+
+
+@app.route('/verify-company', methods=['POST', 'OPTIONS'])
+def verify_company():
+    """
+    On-demand career URL verification. Called by the UI/extension when a user
+    visits a company page. Always returns immediately with cached data.
+    If the careers_url fails a HEAD check, re-enrichment is triggered silently.
+
+    POST body: {"fein": "123456789", "user_id": 1}   (user_id optional)
+    Response:  {"careers_url": "...", "ats_platform": "...", "stale": bool}
+    """
+    if _API_KEY and not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
+        return jsonify({'error': 'unauthorized'}), 401
+
+    data = request.get_json(silent=True) or {}
+    fein = (data.get('fein') or '').strip()
+    if not fein:
+        return jsonify({'error': 'fein is required'}), 400
+
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT
+                f.employer_fein,
+                f.public_domain,
+                f.careers_url,
+                f.last_enriched_at,
+                ca.ats_platform,
+                ca.ats_slug,
+                ca.careers_url_verified_at
+            FROM fein_domain_map f
+            LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
+            WHERE f.employer_fein = %s
+            LIMIT 1
+        """, (fein,)).fetchone()
+    except Exception as exc:
+        logger.error("verify-company: DB error for fein=%s: %s", fein, exc)
+        return jsonify({'error': 'internal error'}), 500
+    finally:
+        conn.close()
+
+    if row is None:
+        return jsonify({'error': 'company not found'}), 404
+
+    careers_url = row['careers_url']
+    payload = {
+        'careers_url':  careers_url,
+        'ats_platform': row['ats_platform'],
+        'ats_slug':     row['ats_slug'],
+        'stale':        False,
+    }
+
+    # If there's no careers_url, queue for enrichment and return
+    if not careers_url:
+        threading.Thread(target=_trigger_enrichment, args=(fein,), daemon=True).start()
+        payload['stale'] = True
+        return jsonify(payload), 200
+
+    # Fire-and-forget HEAD check — never block the HTTP response
+    def _background_verify():
+        ok = _head_ok(careers_url)
+        if ok:
+            # Mark URL as verified so staleness_checker skips it longer
+            try:
+                conn2 = get_conn()
+                conn2.execute(
+                    "UPDATE fein_domain_map SET careers_url_verified_at = NOW() WHERE employer_fein = %s",
+                    (fein,),
+                )
+                conn2.commit()
+                conn2.close()
+            except Exception as exc:
+                logger.warning("verify-company: failed to update verified_at fein=%s: %s", fein, exc)
+        else:
+            logger.info(
+                "verify-company: HEAD failed for careers_url=%s fein=%s — triggering re-enrichment",
+                careers_url, fein,
+            )
+            _trigger_enrichment(fein)
+
+    threading.Thread(target=_background_verify, daemon=True).start()
+    return jsonify(payload), 200
 
 
 if __name__ == '__main__':

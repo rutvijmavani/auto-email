@@ -68,6 +68,7 @@ from config import (
     REDIS_POLL_FULLSCAN,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
+    DOMAIN_ENRICHMENT_QUEUE,
 )
 logger = get_logger(__name__)
 
@@ -826,20 +827,44 @@ def _process_company(company_row, position, total):
     logger.info("── [%d/%d] %r  platform=%s",
                 position, total, company, platform)
 
-    # ── ATS re-detection intentionally disabled ───────────
-    # detect_ats() is unreliable and overwrites working configs with wrong
-    # results when it misidentifies a company's ATS tenant (e.g. assigned
-    # Gartner's Workday slug to SAP America after SF timeouts pushed
-    # consecutive_empty_days to 14+). Run --detect-ats manually only.
-    # Logging still fires so stale companies are visible in logs.
+    # ── Re-enrichment trigger (consecutive empty days) ────
+    # When a company returns zero jobs for JOB_MONITOR_REDETECT_DAYS consecutive
+    # days, its careers_url or ATS slug may have changed. Push to the enrichment
+    # queue so domain_enrichment_worker re-verifies public_domain + careers_url,
+    # then automatically pushes to discovery_queue for ATS re-detection.
+    # Only fires when employer_fein is known (H1B-tracked companies).
     if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
-        domain = company_row.get("domain")
-        logger.warning(
-            "Re-detection needed for %r (domain=%s, empty_days=%d) "
-            "— skipped (inline re-detection disabled, run --detect-ats manually)",
-            company, domain,
-            company_row.get("consecutive_empty_days", 0),
-        )
+        fein       = company_row.get("employer_fein")
+        empty_days = company_row.get("consecutive_empty_days", 0)
+        domain     = company_row.get("domain")
+        if fein:
+            try:
+                from workers.redis_client import get_redis
+                import subprocess
+                r = get_redis()
+                # Use petition_count=1 as placeholder score — staleness signal,
+                # not a priority signal. Existing score is preserved if higher (XX flag).
+                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: 1}, xx=False, gt=False)
+                for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
+                    subprocess.run(
+                        ["sudo", "systemctl", "start", unit],
+                        check=False, timeout=10, capture_output=True,
+                    )
+                logger.info(
+                    "Re-enrichment queued for %r (fein=%s domain=%s empty_days=%d)",
+                    company, fein, domain, empty_days,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to queue re-enrichment for %r (fein=%s): %s",
+                    company, fein, exc,
+                )
+        else:
+            logger.warning(
+                "Re-detection needed for %r (domain=%s empty_days=%d) "
+                "— no employer_fein, cannot queue enrichment",
+                company, domain, empty_days,
+            )
 
     if platform == "unknown" or not slug:
         logger.warning("Skipping %r — unknown ATS", company)

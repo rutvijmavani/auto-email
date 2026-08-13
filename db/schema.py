@@ -1594,6 +1594,47 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_fein_domain_low_conf
         ON fein_domain_map (low_confidence)
     """)
+    # Enrichment worker columns — safe no-op on fresh installs
+    c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS trigger_source TEXT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain TEXT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_method TEXT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_enriched_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
+
+    # Pipeline performance metrics — one row per company per worker run.
+    # Tracks which phase found public_domain / careers_url / ATS so regressions
+    # are visible without log diving.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS h1b_enrichment_metrics (
+            id                   BIGSERIAL    PRIMARY KEY,
+            employer_fein        TEXT         NOT NULL,
+            run_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            worker               TEXT         NOT NULL,
+            trigger              TEXT,
+            public_domain_method TEXT,
+            public_domain        TEXT,
+            careers_source       TEXT,
+            careers_url          TEXT,
+            ats_source           TEXT,
+            ats_platform         TEXT,
+            ats_slug             TEXT,
+            duration_ms          INT
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_fein
+        ON h1b_enrichment_metrics (employer_fein)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_run_at
+        ON h1b_enrichment_metrics (run_at DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_worker
+        ON h1b_enrichment_metrics (worker, run_at DESC)
+    """)
 
     # lca_contacts: one row per unique POC email — deduplicated across all quarterly files.
     # email is PK — same HR contact across 50 filings = 1 row (last filing wins).
@@ -1656,6 +1697,7 @@ def init_db():
             platform                TEXT        NOT NULL,
             slug                    TEXT        NOT NULL,
             source                  TEXT        NOT NULL,
+            trigger_source          TEXT,
             is_monitored            BOOLEAN     NOT NULL DEFAULT FALSE,
             status                  TEXT        NOT NULL DEFAULT 'pending',
             priority                INTEGER     NOT NULL DEFAULT 0,

@@ -1183,6 +1183,11 @@ def discover_careers_url(
                 )
                 return final_url, result["platform"], result["slug"]
 
+        # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
+        if final_root != company_root:
+            log.debug("  %s → jumped to external domain %s, skipping", url, final_root)
+            continue
+
         # Fingerprint HTML for embedded ATS
         platform, slug = _find_ats_in_html(html)
         log.debug(
@@ -1581,11 +1586,15 @@ def process_employer(
         log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
         try:
             from jobs.career_page import detect_via_career_page
-            _cp_result = detect_via_career_page(_cp_name, _cp_domain)
+            _cp_result = detect_via_career_page(_cp_name, _cp_domain, careers_url=careers_url)
             if _cp_result:
-                detected_platform = _cp_result["platform"]
-                detected_slug     = _cp_result.get("slug")
-                log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+                if _cp_result.get("platform"):
+                    detected_platform = _cp_result["platform"]
+                    detected_slug     = _cp_result.get("slug")
+                    log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+                if not careers_url and _cp_result.get("careers_url"):
+                    careers_url = _cp_result["careers_url"]
+                    log.info("  Phase 6 careers_url: %s", careers_url)
         except Exception as e:
             log.warning("  Phase 6 (career_page) failed: %s", e)
 
@@ -1595,7 +1604,7 @@ def process_employer(
         log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
-            _cd_results = detect_company(_cd_domain)
+            _cd_results = detect_company(_cd_domain, seed_url=careers_url or None)
             if _cd_results:
                 # Prefer a result with a non-empty slug; fall back to partial detection
                 _best = next((r for r in _cd_results if r.get("slug")), _cd_results[0])
@@ -1608,6 +1617,16 @@ def process_employer(
                 log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
+
+    # Update website_url when careers discovery reveals a different real domain.
+    # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
+    if careers_url and website_url:
+        _careers_root = _root_domain(careers_url)
+        _website_root = _root_domain(website_url)
+        if _careers_root and _website_root and _careers_root != _website_root:
+            log.info("  Updating website_url: %s → https://%s (via careers domain)",
+                     website_url, _careers_root)
+            website_url = f"https://{_careers_root}"
 
     if careers_url:
         log.info(

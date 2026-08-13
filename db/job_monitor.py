@@ -331,41 +331,44 @@ def get_monitorable_companies():
         # json_extract_text() is a safe PL/pgSQL helper defined in init_db()
         # that returns NULL for non-JSON input (catches cast exceptions).
         rows = conn.execute("""
-            SELECT company, ats_platform, ats_slug,
-                   ats_detected_at, first_scanned_at,
-                   last_checked_at, consecutive_empty_days
-            FROM prospective_companies
-            WHERE ats_platform IS NOT NULL
-              AND ats_platform NOT IN ('unknown', 'unsupported')
-              AND ats_slug IS NOT NULL
+            SELECT pc.company, pc.ats_platform, pc.ats_slug,
+                   pc.ats_detected_at, pc.first_scanned_at,
+                   pc.last_checked_at, pc.consecutive_empty_days,
+                   f.employer_fein
+            FROM prospective_companies pc
+            LEFT JOIN fein_domain_map f ON f.assigned_domain = pc.domain
+            WHERE pc.ats_platform IS NOT NULL
+              AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+              AND pc.ats_slug IS NOT NULL
               AND (
-                  ats_platform != 'custom'
+                  pc.ats_platform != 'custom'
                   OR
-                  (ats_platform = 'custom'
-                   AND json_extract_text(ats_slug, '$.url') IS NOT NULL
-                   AND json_extract_text(ats_slug, '$.url') <> '')
+                  (pc.ats_platform = 'custom'
+                   AND json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                   AND json_extract_text(pc.ats_slug, '$.url') <> '')
               )
 
             UNION ALL
 
             SELECT
-                'ca:' || id::text          AS company,
-                platform                   AS ats_platform,
-                slug                       AS ats_slug,
+                'ca:' || ca.id::text       AS company,
+                ca.platform                AS ats_platform,
+                ca.slug                    AS ats_slug,
                 NULL                       AS ats_detected_at,
-                first_scanned_at,
-                last_checked_at,
-                consecutive_empty_days
-            FROM company_ats
-            WHERE is_monitored = TRUE
-              AND platform IS NOT NULL
-              AND platform NOT IN ('unknown', 'unsupported')
-              AND slug IS NOT NULL
+                ca.first_scanned_at,
+                ca.last_checked_at,
+                ca.consecutive_empty_days,
+                ca.employer_fein
+            FROM company_ats ca
+            WHERE ca.is_monitored = TRUE
+              AND ca.platform IS NOT NULL
+              AND ca.platform NOT IN ('unknown', 'unsupported')
+              AND ca.slug IS NOT NULL
               AND (
-                  platform != 'custom'
+                  ca.platform != 'custom'
                   OR (
-                      json_extract_text(slug, '$.url') IS NOT NULL
-                      AND json_extract_text(slug, '$.url') <> ''
+                      json_extract_text(ca.slug, '$.url') IS NOT NULL
+                      AND json_extract_text(ca.slug, '$.url') <> ''
                   )
               )
 

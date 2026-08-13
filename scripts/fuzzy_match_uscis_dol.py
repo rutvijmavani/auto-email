@@ -313,6 +313,58 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
     if not dry_run and queued > 0:
         log.info("%d ambiguous entries queued — h1b-llm-worker will resolve them asynchronously", queued)
 
+    if not dry_run:
+        _populate_enrichment_queue(conn, r)
+
+
+def _populate_enrichment_queue(conn, r) -> None:
+    """
+    After fuzzy matching completes, push all eligible FEINs to domain_enrichment_queue.
+    Eligible = public_domain IS NULL OR last_enriched_at < 90 days ago.
+    Score = petition_count (highest priority first).
+    Then start the enrichment workers via systemctl.
+    """
+    from config import DOMAIN_ENRICHMENT_QUEUE
+    import subprocess
+
+    rows = conn.execute("""
+        SELECT f.employer_fein,
+               COALESCE(u.petition_count, 0) AS petition_count
+        FROM fein_domain_map f
+        LEFT JOIN (
+            SELECT dh.employer_fein, COUNT(*) AS petition_count
+            FROM uscis_dol_fuzzy_map um
+            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
+            GROUP BY dh.employer_fein
+        ) u ON u.employer_fein = f.employer_fein
+        WHERE f.public_domain IS NULL
+           OR f.last_enriched_at < NOW() - INTERVAL '90 days'
+    """).fetchall()
+
+    if not rows:
+        log.info("enrichment queue: no eligible companies — skipping")
+        return
+
+    pipe = r.pipeline()
+    for row in rows:
+        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {row["employer_fein"]: row["petition_count"]})
+    pipe.execute()
+    log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", len(rows))
+
+    # Start enrichment workers — systemctl start is a no-op if already running
+    for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
+        try:
+            result = subprocess.run(
+                ["sudo", "systemctl", "start", unit],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                log.info("started %s", unit)
+            else:
+                log.warning("systemctl start %s failed: %s", unit, result.stderr.strip())
+        except Exception as exc:
+            log.warning("could not start %s: %s", unit, exc)
+
 
 def _backfill_candidates() -> None:
     """

@@ -359,6 +359,18 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: fullscan queue metrics failed: %s", exc)
         metrics["fullscan"] = {"depth": 0, "delay_s": 0.0}
 
+    # ── enrichment + discovery (informational — not autoscaled) ─────────────
+    try:
+        from config import DOMAIN_ENRICHMENT_QUEUE, DISCOVERY_QUEUE
+        enrich_depth   = r.zcard(DOMAIN_ENRICHMENT_QUEUE)
+        discovery_depth = r.zcard(DISCOVERY_QUEUE)
+        metrics["domain_enrichment"] = {"depth": enrich_depth,   "delay_s": 0.0}
+        metrics["discovery"]         = {"depth": discovery_depth, "delay_s": 0.0}
+    except Exception as exc:
+        logger.warning("manager: enrichment/discovery queue metrics failed: %s", exc)
+        metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0}
+        metrics["discovery"]         = {"depth": 0, "delay_s": 0.0}
+
     return metrics
 
 

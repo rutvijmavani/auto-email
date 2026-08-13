@@ -292,8 +292,15 @@ def aggregate(df: pd.DataFrame) -> dict:
             domain_counts[domain_part] = domain_counts.get(domain_part, 0) + 1
         total_emails = sum(domain_counts.values())
         if domain_counts:
-            assigned_domain = max(domain_counts, key=domain_counts.get)
-            confidence      = domain_counts[assigned_domain] / total_emails
+            # Group subdomains by root (last 2 parts) and sum counts.
+            # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030) wins over raw max.
+            root_totals: dict[str, int] = {}
+            for _d, _cnt in domain_counts.items():
+                _parts = _d.split(".")
+                _root  = ".".join(_parts[-2:]) if len(_parts) >= 2 else _d
+                root_totals[_root] = root_totals.get(_root, 0) + _cnt
+            assigned_domain = max(root_totals, key=root_totals.get)
+            confidence      = root_totals[assigned_domain] / total_emails
             low_confidence  = confidence < 0.70
         else:
             assigned_domain = None
@@ -606,49 +613,49 @@ def upsert(aggregated: dict, quarter: str) -> None:
                         ),
                         total_emails    = fein_domain_map.total_emails + EXCLUDED.total_emails,
                         assigned_domain = (
-                            SELECT key FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
-                                )
+                            -- Group raw domains by root (last 2 parts), pick root of
+                            -- highest-count group. ny.email.gs.com → gs.com wins.
+                            SELECT regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
+                            FROM jsonb_each_text(
+                                (SELECT jsonb_object_agg(key,
+                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
+                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
+                                 FROM jsonb_object_keys(
+                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                 ) AS key)
                             )
-                            ORDER BY value::int DESC LIMIT 1
+                            GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
+                            ORDER BY SUM(value::int) DESC LIMIT 1
                         ),
                         confidence      = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)
-                            FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
+                            SELECT MAX(grp)::float / NULLIF(SUM(grp), 0)
+                            FROM (
+                                SELECT SUM(value::int) AS grp
+                                FROM jsonb_each_text(
+                                    (SELECT jsonb_object_agg(key,
                                         COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
+                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
+                                     FROM jsonb_object_keys(
+                                         fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                     ) AS key)
                                 )
-                            )
+                                GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
+                            ) _grps
                         ),
                         low_confidence  = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0) < 0.70
-                            FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
+                            SELECT MAX(grp)::float / NULLIF(SUM(grp), 0) < 0.70
+                            FROM (
+                                SELECT SUM(value::int) AS grp
+                                FROM jsonb_each_text(
+                                    (SELECT jsonb_object_agg(key,
                                         COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
+                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
+                                     FROM jsonb_object_keys(
+                                         fein_domain_map.domain_counts || EXCLUDED.domain_counts
+                                     ) AS key)
                                 )
-                            )
+                                GROUP BY regexp_replace(key, '^(?:[^.]+\.)*([^.]+\.[^.]+)$', '\1')
+                            ) _grps
                         ),
                         updated_at      = NOW()
                 """, (

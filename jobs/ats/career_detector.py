@@ -684,11 +684,16 @@ def find_next_pages(html, current_url, visited=None):
 # Single-page processor — fetch one URL, scan, return next candidates
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_page(url, session, visited, hits, best, referer=None, company_root=None):
+def _process_page(url, session, visited, hits, best, referer=None, company_root=None,
+                  first_200_url=None):
     """
     Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
     Records hits into shared dicts. Returns scored next-page candidates.
     Does NOT recurse — BFS queue in detect_company drives traversal.
+
+    first_200_url: mutable [None] container — set to the final URL of the first
+                   page that returns HTML (200), so callers can capture career URL
+                   even on a complete ATS miss.
 
     Leaf conditions (return [] immediately):
       Rule 1  — new complete ATS hit found → children share the same ATS, useless.
@@ -713,6 +718,9 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         return []
     visited.add(final_url)
     logger.debug("[detector] page=%d url=%s", len(visited), final_url)
+
+    if first_200_url is not None and first_200_url[0] is None:
+        first_200_url[0] = final_url
 
     def _handle(result, source_label):
         if not result:
@@ -894,9 +902,12 @@ def _filter_listing_candidates(candidates, pagination_roots, sampled_patterns, c
 # BFS driver — breadth-first so sibling branches share the page budget
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_company(company_domain, session=None):
+def detect_company(company_domain, session=None, *, seed_url=None):
     """
     Detect all ATS platforms for a company given only its domain.
+
+    seed_url: if provided, start BFS from this URL instead of probing all
+              CAREER_PATHS. Use when careers_url is already known from Phase 6.
 
     Uses BFS so all candidates at depth N are explored before any at depth N+1.
     This guarantees siblings (e.g. nomura.com early-careers AND nomuraholdings.com)
@@ -929,12 +940,17 @@ def detect_company(company_domain, session=None):
 
     # Seed the BFS queue: (url, referer)
     queue = deque()
-    for path in CAREER_PATHS:
-        queue.append((f"https://{domain}{path}", None))
-    root = _host_root(domain)
-    if len(domain.split(".")) > 1:
-        for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-            queue.append((f"https://{subdomain}.{root}", None))
+    if seed_url:
+        queue.append((seed_url, None))
+    else:
+        for path in CAREER_PATHS:
+            queue.append((f"https://{domain}{path}", None))
+        root = _host_root(domain)
+        if len(domain.split(".")) > 1:
+            for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
+                queue.append((f"https://{subdomain}.{root}", None))
+
+    first_200_url = [None]  # mutable — _process_page sets this on first successful fetch
 
     # BFS until queue drains. Two leaf conditions bound the crawl:
     #   Rule 1  — page yields a new ATS hit → don't enqueue its children
@@ -949,6 +965,7 @@ def detect_company(company_domain, session=None):
         next_candidates = _process_page(
             url, session, visited, hits, best, referer,
             company_root=company_root,
+            first_200_url=first_200_url,
         )
         filtered = _filter_listing_candidates(
             next_candidates, pagination_roots, sampled_patterns, confirmed_patterns
@@ -963,5 +980,9 @@ def detect_company(company_domain, session=None):
         logger.info("[detector] DONE domain=%s partial platform=%s (no slug)",
                     domain, best[0]["platform"])
         return [best[0]]
+    if first_200_url[0]:
+        logger.info("[detector] DONE domain=%s — no ATS found, career URL: %s",
+                    domain, first_200_url[0])
+        return [{"platform": None, "slug": None, "source_url": first_200_url[0]}]
     logger.info("[detector] DONE domain=%s — no ATS found", domain)
     return []

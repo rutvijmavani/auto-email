@@ -1,0 +1,225 @@
+"""
+scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery queues.
+
+Enrichment staleness:
+    fein_domain_map WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'
+    AND is_monitored = TRUE (or public_domain IS NULL for uninitialised rows)
+    → ZADD domain_enrichment_queue petition_count fein
+    → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
+
+Discovery staleness:
+    company_ats WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_STALENESS_DAYS> days'
+    AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
+    (also catches companies with no ATS yet and petition_count >= threshold)
+    → ZADD discovery_queue petition_count fein
+    → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
+
+Usage:
+    python scripts/staleness_checker.py
+    python scripts/staleness_checker.py --dry-run
+    python scripts/staleness_checker.py --enrichment-only
+    python scripts/staleness_checker.py --discovery-only
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from config import (
+    DISCOVER_REDETECT_EMPTY_DAYS,
+    DISCOVERY_QUEUE,
+    DOMAIN_ENRICHMENT_QUEUE,
+    ENRICH_STALENESS_DAYS,
+    REDIS_DB_MAINTENANCE,
+    STALENESS_DISCOVERY_MIN_PETITIONS,
+    STALENESS_ENRICHMENT_ZADD_BATCH,
+)
+from db.connection import get_conn
+from logger import get_logger, init_logging
+from workers.redis_client import get_redis
+
+log = get_logger(__name__)
+
+
+def _is_maintenance(r) -> bool:
+    try:
+        return bool(r.exists(REDIS_DB_MAINTENANCE))
+    except Exception as exc:
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        return False
+
+
+def _start_workers(*units: str, dry_run: bool = False) -> None:
+    for unit in units:
+        if dry_run:
+            log.info("[dry-run] would start %s", unit)
+            continue
+        try:
+            subprocess.run(
+                ["sudo", "systemctl", "start", unit],
+                check=False,
+                timeout=10,
+                capture_output=True,
+            )
+            log.info("started %s", unit)
+        except Exception as exc:
+            log.warning("could not start %s: %s", unit, exc)
+
+
+def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
+    """Push stale enrichment companies to domain_enrichment_queue. Returns count added."""
+    rows = conn.execute("""
+        SELECT
+            f.employer_fein,
+            COALESCE(u.petition_count, 0) AS petition_count
+        FROM fein_domain_map f
+        LEFT JOIN (
+            SELECT dh.employer_fein, COUNT(*) AS petition_count
+            FROM uscis_dol_fuzzy_map um
+            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
+            GROUP BY dh.employer_fein
+        ) u ON u.employer_fein = f.employer_fein
+        WHERE (
+            f.public_domain IS NULL
+            OR f.last_enriched_at < NOW() - INTERVAL %s
+        )
+        ORDER BY petition_count DESC
+    """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
+
+    if not rows:
+        log.info("enrichment staleness: no stale companies")
+        return 0
+
+    log.info("enrichment staleness: %d companies eligible", len(rows))
+
+    if dry_run:
+        for row in rows[:5]:
+            log.info("[dry-run] would ZADD %s score=%s fein=%s",
+                     DOMAIN_ENRICHMENT_QUEUE, row["petition_count"], row["employer_fein"])
+        if len(rows) > 5:
+            log.info("[dry-run] ... and %d more", len(rows) - 5)
+        return len(rows)
+
+    added = 0
+    pipe = r.pipeline(transaction=False)
+    for i, row in enumerate(rows):
+        pipe.zadd(
+            DOMAIN_ENRICHMENT_QUEUE,
+            {row["employer_fein"]: row["petition_count"]},
+            nx=False,   # update score if already present (re-score by latest petition_count)
+        )
+        added += 1
+        if (i + 1) % STALENESS_ENRICHMENT_ZADD_BATCH == 0:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+
+    if added % STALENESS_ENRICHMENT_ZADD_BATCH != 0:
+        pipe.execute()
+
+    log.info("enrichment staleness: ZADD %d feins → %s", added, DOMAIN_ENRICHMENT_QUEUE)
+    _start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+    return added
+
+
+def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
+    """Push stale discovery companies to discovery_queue. Returns count added."""
+    rows = conn.execute("""
+        SELECT
+            f.employer_fein,
+            COALESCE(u.petition_count, 0) AS petition_count
+        FROM fein_domain_map f
+        LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
+        LEFT JOIN (
+            SELECT dh.employer_fein, COUNT(*) AS petition_count
+            FROM uscis_dol_fuzzy_map um
+            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
+            GROUP BY dh.employer_fein
+        ) u ON u.employer_fein = f.employer_fein
+        WHERE COALESCE(u.petition_count, 0) >= %s
+          AND (
+              ca.employer_fein IS NULL                              -- no ATS record yet
+              OR ca.last_discovered_at IS NULL                     -- never discovered
+              OR ca.last_discovered_at < NOW() - INTERVAL %s      -- stale
+          )
+        ORDER BY petition_count DESC
+    """, (
+        STALENESS_DISCOVERY_MIN_PETITIONS,
+        f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
+    )).fetchall()
+
+    if not rows:
+        log.info("discovery staleness: no stale companies")
+        return 0
+
+    log.info("discovery staleness: %d companies eligible", len(rows))
+
+    if dry_run:
+        for row in rows[:5]:
+            log.info("[dry-run] would ZADD %s score=%s fein=%s",
+                     DISCOVERY_QUEUE, row["petition_count"], row["employer_fein"])
+        if len(rows) > 5:
+            log.info("[dry-run] ... and %d more", len(rows) - 5)
+        return len(rows)
+
+    added = 0
+    pipe = r.pipeline(transaction=False)
+    for i, row in enumerate(rows):
+        pipe.zadd(
+            DISCOVERY_QUEUE,
+            {row["employer_fein"]: row["petition_count"]},
+            nx=False,
+        )
+        added += 1
+        if (i + 1) % STALENESS_ENRICHMENT_ZADD_BATCH == 0:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+
+    if added % STALENESS_ENRICHMENT_ZADD_BATCH != 0:
+        pipe.execute()
+
+    log.info("discovery staleness: ZADD %d feins → %s", added, DISCOVERY_QUEUE)
+    _start_workers("discover-h1b-ats-worker@1", "discover-h1b-ats-worker@2")
+    return added
+
+
+def main(args: argparse.Namespace) -> None:
+    r = get_redis()
+
+    if _is_maintenance(r):
+        log.info("maintenance window active — skipping staleness check")
+        return
+
+    conn = get_conn()
+    try:
+        t0 = time.time()
+
+        enrich_added = 0
+        discovery_added = 0
+
+        if not args.discovery_only:
+            enrich_added = run_enrichment_staleness(conn, r, dry_run=args.dry_run)
+
+        if not args.enrichment_only:
+            discovery_added = run_discovery_staleness(conn, r, dry_run=args.dry_run)
+
+        elapsed = time.time() - t0
+        log.info(
+            "staleness_checker done in %.1fs — enrichment: %d, discovery: %d%s",
+            elapsed, enrich_added, discovery_added,
+            " [dry-run]" if args.dry_run else "",
+        )
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    init_logging("staleness_checker")
+    parser = argparse.ArgumentParser(description="Push stale H1B companies to enrichment/discovery queues")
+    parser.add_argument("--dry-run",          action="store_true", help="Log what would be queued without writing to Redis")
+    parser.add_argument("--enrichment-only",  action="store_true", help="Only run enrichment staleness check")
+    parser.add_argument("--discovery-only",   action="store_true", help="Only run discovery staleness check")
+    main(parser.parse_args())
