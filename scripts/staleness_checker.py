@@ -39,6 +39,7 @@ from config import (
     STALENESS_ENRICHMENT_ZADD_BATCH,
 )
 from db.connection import get_conn
+from db.job_monitor import get_monitorable_companies
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 
@@ -59,19 +60,29 @@ def _start_workers(*units: str, dry_run: bool = False) -> None:
             log.info("[dry-run] would start %s", unit)
             continue
         try:
-            subprocess.run(
+            res = subprocess.run(
                 ["sudo", "systemctl", "start", unit],
                 check=False,
                 timeout=10,
                 capture_output=True,
             )
-            log.info("started %s", unit)
+            if res.returncode == 0:
+                log.info("started %s", unit)
+            else:
+                log.warning("systemctl start %s rc=%d: %s", unit, res.returncode,
+                            res.stderr.decode(errors="replace").strip())
         except Exception as exc:
             log.warning("could not start %s: %s", unit, exc)
 
 
 def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale enrichment companies to domain_enrichment_queue. Returns count added."""
+    # public_domain IS NULL: always re-enrich (uninitialised).
+    # stale last_enriched_at: only re-enrich companies actively monitored by job_monitor.
+    monitored_feins = {
+        row["employer_fein"] for row in get_monitorable_companies()
+        if row.get("employer_fein")
+    }
     rows = conn.execute("""
         SELECT
             f.employer_fein,
@@ -85,10 +96,13 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         ) u ON u.employer_fein = f.employer_fein
         WHERE (
             f.public_domain IS NULL
-            OR f.last_enriched_at < NOW() - INTERVAL %s
+            OR (
+                f.last_enriched_at < NOW() - INTERVAL %s
+                AND f.employer_fein = ANY(%s)
+            )
         )
         ORDER BY petition_count DESC
-    """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
+    """, (f"{ENRICH_STALENESS_DAYS} days", list(monitored_feins))).fetchall()
 
     if not rows:
         log.info("enrichment staleness: no stale companies")
@@ -142,8 +156,8 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         WHERE COALESCE(u.petition_count, 0) >= %s
           AND (
               ca.employer_fein IS NULL                              -- no ATS record yet
-              OR ca.last_discovered_at IS NULL                     -- never discovered
-              OR ca.last_discovered_at < NOW() - INTERVAL %s      -- stale
+              OR f.last_discovered_at IS NULL                      -- never discovered
+              OR f.last_discovered_at < NOW() - INTERVAL %s       -- stale
           )
         ORDER BY petition_count DESC
     """, (

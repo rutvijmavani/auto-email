@@ -193,11 +193,10 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
     Returns True on success (or permanent skip), False on transient error.
     trigger values: 'enrichment' | 're_detection' | 'staleness' | 'manual'
     """
-    m = _get_discover_ats()
-
     conn = get_conn()
     t_start = time.time()
     try:
+        m = _get_discover_ats()
         company = _load_company(conn, fein)
         if not company:
             log.warning("fein=%s not found in fein_domain_map — skipping", fein)
@@ -349,7 +348,8 @@ def run_worker(once: bool = False) -> None:
                 fein    = data["fein"]
                 trigger = data.get("trigger", "enrichment")
             except Exception as e:
-                log.error("Malformed discovery queue member %r: %s — skipping", raw_member, e)
+                log.error("Malformed discovery queue member %r: %s — sending to DLQ", raw_member, e)
+                r.lpush(DISCOVERY_DLQ, raw_member)
                 continue
 
             retry_count = _get_retry_count(r, fein)

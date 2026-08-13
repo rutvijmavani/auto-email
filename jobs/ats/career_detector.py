@@ -938,17 +938,20 @@ def detect_company(company_domain, session=None, *, seed_url=None):
     sampled_patterns   = {}     # url template  → detail pages sampled
     confirmed_patterns = set()  # templates fully sampled — drop all further matches
 
-    # Seed the BFS queue: (url, referer)
+    # Seed the BFS queue: seed_url first (if provided), then CAREER_PATHS + subdomain fallbacks
     queue = deque()
+    seen_seeds: set = set()
     if seed_url:
         queue.append((seed_url, None))
-    else:
-        for path in CAREER_PATHS:
-            queue.append((f"https://{domain}{path}", None))
-        root = _host_root(domain)
-        if len(domain.split(".")) > 1:
-            for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-                queue.append((f"https://{subdomain}.{root}", None))
+        seen_seeds.add(seed_url)
+    for path in CAREER_PATHS:
+        candidate = f"https://{domain}{path}"
+        if candidate not in seen_seeds:
+            queue.append((candidate, None))
+    root = _host_root(domain)
+    if len(domain.split(".")) > 1:
+        for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
+            queue.append((f"https://{subdomain}.{root}", None))
 
     first_200_url = [None]  # mutable — _process_page sets this on first successful fetch
 

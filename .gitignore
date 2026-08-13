@@ -60,3 +60,8 @@ Thumbs.db
 results/build_ats_list_test.txt
 
 .claude/worktrees/
+
+# ─────────────────────────────────────────
+# Wrangler (Cloudflare Workers CLI)
+# ─────────────────────────────────────────
+.wrangler/cache/

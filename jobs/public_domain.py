@@ -61,13 +61,19 @@ def _redirect_domain(host: str) -> "str | None":
       None — connection error / DNS fail
     """
     for scheme in ("https", "http"):
+        url = f"{scheme}://{host}"
         try:
-            r = requests.get(
-                f"{scheme}://{host}", verify=False,
-                allow_redirects=True, timeout=_REDIRECT_TIMEOUT,
-            )
+            r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT)
             final = _root(r.url)
             return final if final != _root(host) else ""
+        except requests.exceptions.SSLError:
+            log.debug("_redirect_domain: SSL error for %s — retrying without TLS verify", url)
+            try:
+                r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False)
+                final = _root(r.url)
+                return final if final != _root(host) else ""
+            except Exception:
+                continue
         except Exception:
             continue
     return None
@@ -76,13 +82,19 @@ def _redirect_domain(host: str) -> "str | None":
 def _has_web(root: str) -> bool:
     """Return True if root domain serves any HTTP response (status < 500)."""
     for scheme in ("https", "http"):
+        url = f"{scheme}://{root}"
         try:
-            r = requests.get(
-                f"{scheme}://{root}", timeout=_WEB_TIMEOUT,
-                allow_redirects=True, verify=False,
-            )
+            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True)
             if r.status_code < 500:
                 return True
+        except requests.exceptions.SSLError:
+            log.debug("_has_web: SSL error for %s — retrying without TLS verify", url)
+            try:
+                r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False)
+                if r.status_code < 500:
+                    return True
+            except Exception:
+                pass
         except Exception:
             pass
     return False

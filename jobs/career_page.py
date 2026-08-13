@@ -307,7 +307,7 @@ def _fetch_and_scan(url, company):
                 return _enrich_eightfold_domain(r, final_url), None, final_url
 
         if resp.status_code != 200:
-            return None, None, None
+            return None, None, final_url
 
         # Only log redirects that produced usable content (200)
         if final_url != url:

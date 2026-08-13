@@ -595,7 +595,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
             # fein_domain_map — merge domain count JSON with existing row
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
-                conn.execute("""
+                conn.execute(r"""
                     INSERT INTO fein_domain_map
                         (employer_fein, domain_counts, total_emails,
                          assigned_domain, confidence, low_confidence, updated_at)

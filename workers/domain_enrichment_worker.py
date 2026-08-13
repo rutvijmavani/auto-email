@@ -301,8 +301,10 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             log.warning("Phase 6 error for fein=%s: %s", fein, e)
             p6_result = None
 
+        p6_platform = None
+        p6_slug     = None
         if p6_result:
-            p6_careers = p6_result.get("careers_url")
+            p6_careers  = p6_result.get("careers_url")
             p6_platform = p6_result.get("platform")
             p6_slug     = p6_result.get("slug")
 
@@ -316,8 +318,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                            p6_platform, p6_slug, petition_count)
                 log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
 
-        # Use Phase 3 ATS if Phase 6 didn't find one
-        elif p3_platform and p3_slug:
+        # Use Phase 3 ATS whenever Phase 6 found no platform (even if p6_result is present)
+        if not p6_platform and p3_platform and p3_slug:
             _write_ats(conn, fein, probe_domain, employer_name,
                        p3_platform, p3_slug, petition_count)
             log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
@@ -328,15 +330,15 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if petition_count > 0:
             _push_to_discovery(r, fein, petition_count)
 
-        # ── Metrics ───────────────────────────────────────────────────────────
+        # ── Metrics — reflect only persisted ATS data ─────────────────────────
         ats_source   = None
         ats_platform = None
         ats_slug     = None
-        if p6_result and p6_result.get("platform"):
+        if p6_platform and p6_slug:
             ats_source   = "phase6"
-            ats_platform = p6_result["platform"]
-            ats_slug     = p6_result.get("slug")
-        elif p3_platform:
+            ats_platform = p6_platform
+            ats_slug     = p6_slug
+        elif p3_platform and p3_slug:
             ats_source   = "phase3"
             ats_platform = p3_platform
             ats_slug     = p3_slug
@@ -411,6 +413,7 @@ def run_worker(once: bool = False) -> None:
             retry_count = _get_retry_count(r, fein)
             if retry_count >= ENRICHMENT_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
+                _clear_retry(r, fein)
                 continue
 
             success = _process_company(r, fein, petition_count)
@@ -420,6 +423,7 @@ def run_worker(once: bool = False) -> None:
                 count = _incr_retry(r, fein)
                 if count >= ENRICHMENT_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
+                    _clear_retry(r, fein)
                 else:
                     # Re-queue for retry — same petition_count score
                     r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: petition_count})

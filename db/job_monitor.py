@@ -336,7 +336,13 @@ def get_monitorable_companies():
                    pc.last_checked_at, pc.consecutive_empty_days,
                    f.employer_fein
             FROM prospective_companies pc
-            LEFT JOIN fein_domain_map f ON f.assigned_domain = pc.domain
+            LEFT JOIN LATERAL (
+                SELECT employer_fein
+                FROM fein_domain_map
+                WHERE assigned_domain = pc.domain
+                ORDER BY confidence DESC NULLS LAST, employer_fein
+                LIMIT 1
+            ) f ON true
             WHERE pc.ats_platform IS NOT NULL
               AND pc.ats_platform NOT IN ('unknown', 'unsupported')
               AND pc.ats_slug IS NOT NULL

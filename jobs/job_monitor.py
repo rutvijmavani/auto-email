@@ -842,14 +842,16 @@ def _process_company(company_row, position, total):
                 from workers.redis_client import get_redis
                 import subprocess
                 r = get_redis()
-                # Use petition_count=1 as placeholder score — staleness signal,
-                # not a priority signal. Existing score is preserved if higher (XX flag).
-                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: 1}, xx=False, gt=False)
+                # score=1 raises score only if no entry exists (gt=True never lowers existing score)
+                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: 1}, gt=True)
                 for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-                    subprocess.run(
+                    res = subprocess.run(
                         ["sudo", "systemctl", "start", unit],
                         check=False, timeout=10, capture_output=True,
                     )
+                    if res.returncode != 0:
+                        logger.warning("systemctl start %s rc=%d: %s", unit, res.returncode,
+                                       res.stderr.decode(errors="replace").strip())
                 logger.info(
                     "Re-enrichment queued for %r (fein=%s domain=%s empty_days=%d)",
                     company, fein, domain, empty_days,

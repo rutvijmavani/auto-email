@@ -126,12 +126,19 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                   f"no_signal: {no_signal} ({_pct(no_signal, pd_total)})")
 
         # Top unresolved companies (high petition_count, no public domain)
+        # Use the latest metrics row per employer so resolved companies are excluded.
         if no_signal_top > 0:
             unresolved = conn.execute("""
                 SELECT m.employer_fein, e.employer_name,
                        COALESCE(u.petition_count, 0) AS petition_count,
                        f.assigned_domain
-                FROM h1b_enrichment_metrics m
+                FROM (
+                    SELECT DISTINCT ON (employer_fein)
+                        employer_fein, public_domain_method
+                    FROM h1b_enrichment_metrics
+                    WHERE run_at > NOW() - INTERVAL %s
+                    ORDER BY employer_fein, run_at DESC
+                ) m
                 JOIN dol_h1b_employers e ON e.employer_fein = m.employer_fein
                 JOIN fein_domain_map f   ON f.employer_fein = m.employer_fein
                 LEFT JOIN (
@@ -141,7 +148,6 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                     GROUP BY dh.employer_fein
                 ) u ON u.employer_fein = m.employer_fein
                 WHERE m.public_domain_method = 'no_signal'
-                  AND m.run_at > NOW() - INTERVAL %s
                 ORDER BY petition_count DESC
                 LIMIT %s
             """, (f"{days} days", no_signal_top)).fetchall()
@@ -171,13 +177,17 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         cu_total = sum(r["n"] for r in cu_rows)
         _phase_table(cu_rows, cu_total, "Source phase")
 
-        # Companies with careers_url but still no ATS
+        # Companies where the latest metrics row has a careers_url but no ATS
         no_ats_careers = conn.execute("""
-            SELECT COUNT(DISTINCT employer_fein) AS n
-            FROM h1b_enrichment_metrics
-            WHERE careers_url IS NOT NULL
-              AND ats_platform IS NULL
-              AND run_at > NOW() - INTERVAL %s
+            SELECT COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein)
+                    employer_fein, careers_url, ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - INTERVAL %s
+                ORDER BY employer_fein, run_at DESC
+            ) latest
+            WHERE careers_url IS NOT NULL AND ats_platform IS NULL
         """, (f"{days} days",)).fetchone()["n"]
         if no_ats_careers:
             print(f"\n  ⚠  {no_ats_careers} companies have careers_url but no ATS detected "
@@ -271,4 +281,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-signal-top",  type=int, default=10,
                         help="Top N unresolved companies to show (default: 10)")
     args = parser.parse_args()
+    if args.days < 1:
+        parser.error("--days must be at least 1")
     run_report(days=args.days, no_signal_top=args.no_signal_top)

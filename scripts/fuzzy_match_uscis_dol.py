@@ -320,11 +320,11 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
 def _populate_enrichment_queue(conn, r) -> None:
     """
     After fuzzy matching completes, push all eligible FEINs to domain_enrichment_queue.
-    Eligible = public_domain IS NULL OR last_enriched_at < 90 days ago.
+    Eligible = public_domain IS NULL OR last_enriched_at < ENRICH_STALENESS_DAYS ago.
     Score = petition_count (highest priority first).
     Then start the enrichment workers via systemctl.
     """
-    from config import DOMAIN_ENRICHMENT_QUEUE
+    from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
     import subprocess
 
     rows = conn.execute("""
@@ -338,8 +338,8 @@ def _populate_enrichment_queue(conn, r) -> None:
             GROUP BY dh.employer_fein
         ) u ON u.employer_fein = f.employer_fein
         WHERE f.public_domain IS NULL
-           OR f.last_enriched_at < NOW() - INTERVAL '90 days'
-    """).fetchall()
+           OR f.last_enriched_at < NOW() - INTERVAL %s
+    """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
 
     if not rows:
         log.info("enrichment queue: no eligible companies — skipping")

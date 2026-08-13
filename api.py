@@ -1,11 +1,14 @@
 import base64
 import hmac
+import ipaddress
 import json
 import os
 import secrets
+import socket
 import subprocess
 import threading
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import requests as _requests
 from flask import Flask, request, jsonify, make_response, redirect
@@ -357,10 +360,41 @@ def oauth_callback():
 
 _VERIFY_HEAD_TIMEOUT = 8   # seconds — fast, never block the request
 _VERIFY_GOOD_CODES   = {200, 301, 302, 303, 307, 308}
+_PRIVATE_NETS = [
+    ipaddress.ip_network(r) for r in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7",
+    )
+]
 
 
-def _head_ok(url: str) -> bool:
-    """Return True if a HEAD request to url returns a plausible success code."""
+def _is_private_host(host: str) -> bool:
+    """Return True when host resolves to a private/loopback address."""
+    try:
+        addr = ipaddress.ip_address(socket.gethostbyname(host))
+        return any(addr in net for net in _PRIVATE_NETS)
+    except Exception:
+        return True  # treat unresolvable as private (fail closed)
+
+
+def _host_root(host: str) -> str:
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
+    """
+    Return True if url returns a plausible success code.
+    Pre-validates scheme and rejects private/loopback hosts.
+    After redirect, requires the final host to be within initial_root or allowed_root.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    hostname = parsed.hostname or ""
+    if not hostname or _is_private_host(hostname):
+        return False
+    initial_root = _host_root(hostname)
     try:
         resp = _requests.head(
             url,
@@ -368,6 +402,22 @@ def _head_ok(url: str) -> bool:
             timeout=_VERIFY_HEAD_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0"},
         )
+        final_parsed = urlparse(resp.url)
+        if final_parsed.scheme not in ("http", "https"):
+            return False
+        final_host = final_parsed.hostname or ""
+        if _is_private_host(final_host):
+            return False
+        if allowed_root or initial_root:
+            final_root = _host_root(final_host)
+            allowed = {initial_root}
+            if allowed_root:
+                allowed.add(allowed_root)
+            if final_root not in allowed:
+                logger.warning(
+                    "verify-company: redirect to unexpected domain %s (allowed %s)", final_root, allowed
+                )
+                return False
         return resp.status_code in _VERIFY_GOOD_CODES
     except Exception:
         return False
@@ -414,9 +464,9 @@ def verify_company():
                 f.public_domain,
                 f.careers_url,
                 f.last_enriched_at,
+                f.careers_url_verified_at,
                 ca.ats_platform,
-                ca.ats_slug,
-                ca.careers_url_verified_at
+                ca.ats_slug
             FROM fein_domain_map f
             LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
             WHERE f.employer_fein = %s
@@ -446,20 +496,23 @@ def verify_company():
         return jsonify(payload), 200
 
     # Fire-and-forget HEAD check — never block the HTTP response
+    _allowed_root = row.get("public_domain") or None
+
     def _background_verify():
-        ok = _head_ok(careers_url)
+        ok = _head_ok(careers_url, allowed_root=_allowed_root)
         if ok:
             # Mark URL as verified so staleness_checker skips it longer
+            conn2 = get_conn()
             try:
-                conn2 = get_conn()
                 conn2.execute(
                     "UPDATE fein_domain_map SET careers_url_verified_at = NOW() WHERE employer_fein = %s",
                     (fein,),
                 )
                 conn2.commit()
-                conn2.close()
             except Exception as exc:
                 logger.warning("verify-company: failed to update verified_at fein=%s: %s", fein, exc)
+            finally:
+                conn2.close()
         else:
             logger.info(
                 "verify-company: HEAD failed for careers_url=%s fein=%s — triggering re-enrichment",
