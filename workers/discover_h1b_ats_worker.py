@@ -365,12 +365,20 @@ def run_worker(once: bool = False) -> None:
                     trigger = "staleness"
                     log.debug("Legacy bare-FEIN member %r — treating as staleness trigger", bare)
                 else:
+                    _dlq_payload = json.dumps({
+                        "fein": "MALFORMED", "error_reason": "malformed_member",
+                        "raw": repr(raw_member), "failed_at": time.time(),
+                    })
                     log.error("Malformed discovery queue member %r — sending to DLQ", raw_member)
-                    r.lpush(DISCOVERY_DLQ, raw_member)
+                    r.lpush(DISCOVERY_DLQ, _dlq_payload)
                     continue
             except Exception as e:
+                _dlq_payload = json.dumps({
+                    "fein": "MALFORMED", "error_reason": str(e),
+                    "raw": repr(raw_member), "failed_at": time.time(),
+                })
                 log.error("Malformed discovery queue member %r: %s — sending to DLQ", raw_member, e)
-                r.lpush(DISCOVERY_DLQ, raw_member)
+                r.lpush(DISCOVERY_DLQ, _dlq_payload)
                 continue
 
             # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)

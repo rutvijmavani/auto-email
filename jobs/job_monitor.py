@@ -479,6 +479,7 @@ def run():
         "new_jobs_found":         0,
         "jobs_matched_filters":   0,
         "api_failure_list":       [],
+        "enrichment_queued":      0,
     }
     stats_lock = threading.Lock()
 
@@ -698,6 +699,21 @@ def run():
                             }
                         _merge_company_stats(stats, stats_lock, _uc_stats)
 
+    # ── Start enrichment workers once if any company was queued ──────────────
+    if stats["enrichment_queued"]:
+        import subprocess
+        for _unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
+            try:
+                _res = subprocess.run(
+                    ["sudo", "systemctl", "start", _unit],
+                    check=False, timeout=10, capture_output=True,
+                )
+                if _res.returncode != 0:
+                    logger.warning("systemctl start %s rc=%d: %s", _unit, _res.returncode,
+                                   _res.stderr.decode(errors="replace").strip())
+            except Exception as _exc:
+                logger.warning("could not start %s: %s", _unit, _exc)
+
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
     pdf_generated = False
@@ -791,6 +807,7 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
         stats["new_jobs_found"]         += company_stats.get("new",            0)
         if company_stats.get("failure_name"):
             stats["api_failure_list"].append(company_stats["failure_name"])
+        stats["enrichment_queued"] += company_stats.get("queued_enrichment", 0)
 
 
 # ─────────────────────────────────────────
@@ -840,18 +857,10 @@ def _process_company(company_row, position, total):
         if fein:
             try:
                 from workers.redis_client import get_redis
-                import subprocess
                 r = get_redis()
                 # score=1 raises score only if no entry exists (gt=True never lowers existing score)
                 r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: 1}, gt=True)
-                for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-                    res = subprocess.run(
-                        ["sudo", "systemctl", "start", unit],
-                        check=False, timeout=10, capture_output=True,
-                    )
-                    if res.returncode != 0:
-                        logger.warning("systemctl start %s rc=%d: %s", unit, res.returncode,
-                                       res.stderr.decode(errors="replace").strip())
+                result["queued_enrichment"] = 1
                 logger.info(
                     "Re-enrichment queued for %r (fein=%s domain=%s empty_days=%d)",
                     company, fein, domain, empty_days,

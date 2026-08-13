@@ -278,7 +278,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             _requeue_delayed(r, fein, petition_count, retry_after)
             return True
 
-        probe_domain = public_domain or (assigned if method == "same_domain" else assigned)
+        probe_domain = public_domain or assigned
         website_url  = f"https://www.{probe_domain}"
 
         _write_domain(conn, fein, public_domain, method)
@@ -407,7 +407,9 @@ def _reclaim_inflight(r) -> None:
 def run_worker(once: bool = False) -> None:
     r = get_redis()
     processed = {"n": 0}
-    hb = Heartbeat(r, "domain_enrichment_worker",
+    _instance = os.environ.get("WORKER_INSTANCE", "")
+    _hb_name  = f"domain_enrichment_worker@{_instance}" if _instance else "domain_enrichment_worker"
+    hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=ENRICHMENT_HEARTBEAT_S).start()
 
     log.info("domain-enrichment-worker started")

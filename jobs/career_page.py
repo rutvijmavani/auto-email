@@ -127,14 +127,30 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                         company, result["platform"], result["slug"])
             return result
         if html is not None:
-            # Accessible but ATS not found in top-level HTML — follow job links
-            job_result = _follow_job_links(html, final_url or careers_url, company, domain)
-            if job_result:
-                logger.info("[P3a HIT via job link] %r → %s / %s",
-                            company, job_result["platform"], job_result["slug"])
-                job_result["careers_url"] = final_url or careers_url
-                return job_result
-            return {"platform": None, "slug": None, "careers_url": final_url or careers_url}
+            effective_url = final_url or careers_url
+            # Guard: only follow job links if the redirect stayed on-domain.
+            # A redirect to an unrelated host (SSO, CDN) would scan the wrong
+            # company's page and produce false-positive ATS hits.
+            def _reg_domain(u: str) -> str:
+                if "://" not in u:
+                    u = "https://" + u
+                ext = tldextract.extract(urlparse(u).hostname or "")
+                return ext.registered_domain or urlparse(u).hostname or ""
+            company_root  = _reg_domain("https://" + domain)
+            effective_root = _reg_domain(effective_url)
+            careers_root  = _reg_domain(careers_url)
+            on_domain = effective_root in (company_root, careers_root)
+            if on_domain:
+                job_result = _follow_job_links(html, effective_url, company, domain)
+                if job_result:
+                    logger.info("[P3a HIT via job link] %r → %s / %s",
+                                company, job_result["platform"], job_result["slug"])
+                    job_result["careers_url"] = effective_url
+                    return job_result
+            else:
+                logger.debug("[P3a] careers_url redirected off-domain (%s → %s) — skipping job link scan",
+                             careers_url, effective_url)
+            return {"platform": None, "slug": None, "careers_url": effective_url}
         # careers_url not accessible — fall through to full probing
         logger.debug("[P3a] careers_url not accessible, falling back to path probe")
 

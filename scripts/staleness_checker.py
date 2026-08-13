@@ -37,7 +37,7 @@ from config import (
     ENRICH_STALENESS_DAYS,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
-    STALENESS_ENRICHMENT_ZADD_BATCH,
+    STALENESS_ZADD_BATCH,
 )
 from db.connection import get_conn
 from db.job_monitor import get_monitorable_companies
@@ -128,11 +128,11 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
             nx=False,   # update score if already present (re-score by latest petition_count)
         )
         added += 1
-        if (i + 1) % STALENESS_ENRICHMENT_ZADD_BATCH == 0:
+        if (i + 1) % STALENESS_ZADD_BATCH == 0:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
 
-    if added % STALENESS_ENRICHMENT_ZADD_BATCH != 0:
+    if added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()
 
     log.info("enrichment staleness: ZADD %d feins → %s", added, DOMAIN_ENRICHMENT_QUEUE)
@@ -189,11 +189,11 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
             nx=False,
         )
         added += 1
-        if (i + 1) % STALENESS_ENRICHMENT_ZADD_BATCH == 0:
+        if (i + 1) % STALENESS_ZADD_BATCH == 0:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
 
-    if added % STALENESS_ENRICHMENT_ZADD_BATCH != 0:
+    if added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()
 
     log.info("discovery staleness: ZADD %d feins → %s", added, DISCOVERY_QUEUE)

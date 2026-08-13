@@ -1,7 +1,7 @@
 [Unit]
 Description=H1B enrichment/discovery staleness checker
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target postgresql.service
+After=network-online.target postgresql.service redis.service
 Wants=network-online.target
 OnFailure=recruiter-pipeline-alert@%p.service
 
@@ -16,7 +16,8 @@ TimeoutStartSec=600
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=no
+ProtectHome=tmpfs
+BindPaths=/home/opc/mail
 ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal

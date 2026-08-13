@@ -5,7 +5,6 @@ import json
 import os
 import secrets
 import socket
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -457,28 +456,15 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
 
 
 def _trigger_enrichment(fein: str) -> None:
-    """Push fein to enrichment queue at HIGH priority and start workers. Fire-and-forget."""
+    """Push fein to enrichment queue at HIGH priority. Fire-and-forget.
+
+    Workers are started on demand by staleness_checker; no systemctl here so
+    the web process doesn't require sudo and doesn't repeat the call per request.
+    """
     try:
         r = get_redis()
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
-        workers_ok = True
-        for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-            res = subprocess.run(
-                ["sudo", "systemctl", "start", unit],
-                check=False, timeout=10, capture_output=True,
-            )
-            if res.returncode != 0:
-                logger.warning(
-                    "verify-company: systemctl start %s rc=%d: %s",
-                    unit, res.returncode, res.stderr.decode(errors="replace").strip(),
-                )
-                workers_ok = False
-        if workers_ok:
-            logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
-        else:
-            logger.warning(
-                "verify-company: queued re-enrichment fein=%s but worker start(s) failed", fein,
-            )
+        logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
 
@@ -552,6 +538,9 @@ def verify_company():
         def _wrapped():
             try:
                 fn(*args)
+            except Exception as _exc:
+                logger.error("background task %s failed for fein=%s: %s",
+                             fn.__name__, fein, _exc, exc_info=True)
             finally:
                 with _INFLIGHT_LOCK:
                     _INFLIGHT_FEINS.discard(fein)

@@ -13,28 +13,8 @@ logging.basicConfig(level=logging.DEBUG, format="%(name)s  %(message)s")
 
 from urllib.parse import urlparse
 import requests
-
-# ── Phase 3 lists (copied from discover_h1b_ats.py) ──────────────────────────
-_CAREER_PATHS = [
-    "/careers", "/careers/", "/careers/jobs", "/jobs", "/jobs/",
-    "/about/careers", "/company/careers", "/en/careers", "/us/careers",
-    "/en/jobs", "/en-us/careers", "/join-us", "/work-with-us",
-    "/work-here", "/opportunities", "/open-positions",
-]
-
-_CAREER_SUBDOMAINS = [
-    "https://careers.{domain}",
-    "https://jobs.{domain}",
-    "https://work.{domain}",
-]
-
-
-def _root_domain(url_or_host: str) -> str:
-    if "://" not in url_or_host:
-        url_or_host = "https://" + url_or_host
-    host = urlparse(url_or_host).hostname or ""
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+from scripts.discover_h1b_ats import _CAREER_PATHS, _CAREER_SUBDOMAINS
+from jobs.public_domain import _root as _root_domain
 
 
 TIMEOUT = 10

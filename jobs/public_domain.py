@@ -68,13 +68,9 @@ def _redirect_domain(host: str) -> "str | None":
             final = _root(r.url)
             return final if final != _root(host) else ""
         except requests.exceptions.SSLError:
-            log.debug("_redirect_domain: SSL error for %s — retrying without TLS verify", url)
-            try:
-                r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False)
-                final = _root(r.url)
-                return final if final != _root(host) else ""
-            except Exception:
-                continue
+            # Invalid cert breaks the redirect chain — we can't trust the destination.
+            log.debug("_redirect_domain: SSL error for %s — no redirect signal", url)
+            continue
         except Exception:
             continue
     return None
@@ -128,7 +124,11 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             timeout=_CT_TIMEOUT,
         )
         if r.status_code == 429:
-            retry_after = int(r.headers.get("Retry-After", 3600))
+            _ra = r.headers.get("Retry-After", "3600")
+            try:
+                retry_after = int(_ra)
+            except (ValueError, TypeError):
+                retry_after = 3600  # HTTP-date or unparseable — safe fallback
             _certspotter_retry_after = time.time() + retry_after
             log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
             return [], retry_after

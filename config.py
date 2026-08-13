@@ -364,7 +364,7 @@ DISCOVERY_HEARTBEAT_S     = int(os.getenv("DISCOVERY_HEARTBEAT_S", "30"))
 # Staleness checker thresholds
 ENRICH_STALENESS_DAYS            = int(os.getenv("ENRICH_STALENESS_DAYS",            "90"))  # re-enrich after N days
 STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))   # min petition_count for discovery re-run
-STALENESS_ENRICHMENT_ZADD_BATCH  = int(os.getenv("STALENESS_ENRICHMENT_ZADD_BATCH",  "500"))  # pipeline batch size
+STALENESS_ZADD_BATCH             = int(os.getenv("STALENESS_ZADD_BATCH",             "500"))  # Redis pipeline batch size for staleness queue pushes
 
 # On-demand verification (user visits company page)
 # Score used when a career URL fails HEAD check — sits above any petition_count value

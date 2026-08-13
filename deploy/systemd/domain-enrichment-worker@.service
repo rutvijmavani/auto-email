@@ -13,6 +13,7 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
+Environment=WORKER_INSTANCE=%i
 ExecStart=/home/opc/mail/venv/bin/python -m workers.domain_enrichment_worker
 Restart=on-failure
 RestartSec=30s
@@ -29,6 +30,3 @@ ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=domain-enrichment-worker@%i
-
-[Install]
-WantedBy=multi-user.target

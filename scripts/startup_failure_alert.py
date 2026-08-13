@@ -55,6 +55,9 @@ _DEDUP_WINDOW_S     = 3600   # suppress duplicate alerts for 1 hour
 _VALID_SERVICES = frozenset({
     "recruiter-scheduler",
     "recruiter-watchdog",
+    "discover-h1b-ats-worker",
+    "domain-enrichment-worker",
+    "staleness-checker",
 })
 
 
