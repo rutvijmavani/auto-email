@@ -171,8 +171,11 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             if _final_root == _domain_root or match_ats_pattern(final_url):
                 first_redirect_url = final_url
         if html is not None and first_career_html is None:
-            first_career_html = html
-            first_career_url  = final_url
+            _page_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
+            _probe_root = tldextract.extract(domain).registered_domain or domain
+            if _page_root == _probe_root or match_ats_pattern(final_url):
+                first_career_html = html
+                first_career_url  = final_url
 
     # ── Layer 3: follow job listing links ─────────────────────────────────
     # Individual job pages almost always link to or embed the ATS directly

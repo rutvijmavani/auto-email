@@ -301,7 +301,7 @@ def aggregate(df: pd.DataFrame) -> dict:
                 _ext  = tldextract.extract(_d)
                 _root = _ext.registered_domain or _d
                 root_totals[_root] = root_totals.get(_root, 0) + _cnt
-            assigned_domain = max(root_totals, key=root_totals.get)
+            assigned_domain = min(root_totals, key=lambda k: (-root_totals[k], k))
             confidence      = root_totals[assigned_domain] / total_emails
             low_confidence  = confidence < 0.70
         else:
@@ -633,7 +633,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                                      fein_domain_map.domain_counts || EXCLUDED.domain_counts
                                  ) AS key)
                             )
-                            ORDER BY value::int DESC LIMIT 1
+                            ORDER BY value::int DESC, key ASC LIMIT 1
                         ),
                         confidence      = (
                             SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)

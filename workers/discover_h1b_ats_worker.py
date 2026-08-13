@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config import (
     DISCOVERY_DLQ,
     DISCOVERY_HEARTBEAT_S,
+    DISCOVERY_INFLIGHT,
     DISCOVERY_MAX_RETRIES,
     DISCOVERY_QUEUE,
     REDIS_DB_MAINTENANCE,
@@ -304,16 +305,36 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Inflight crash recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reclaim_inflight(r) -> None:
+    """Re-queue any FEINs left in the inflight ZSET from a prior crash or SIGKILL."""
+    items = r.zrange(DISCOVERY_INFLIGHT, 0, -1, withscores=True)
+    if not items:
+        return
+    log.warning("reclaiming %d inflight FEINs from prior run", len(items))
+    for fein, score in items:
+        member = json.dumps({"fein": fein, "trigger": "staleness"})
+        r.zadd(DISCOVERY_QUEUE, {member: int(score)}, gt=True)
+        r.zrem(DISCOVERY_INFLIGHT, fein)
+        log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_worker(once: bool = False) -> None:
     r = get_redis()
     processed = {"n": 0}
-    hb = Heartbeat(r, "discover_h1b_ats_worker",
+    _instance  = os.environ.get("WORKER_INSTANCE", "")
+    _hb_name   = f"discover_h1b_ats_worker@{_instance}" if _instance else "discover_h1b_ats_worker"
+    hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=DISCOVERY_HEARTBEAT_S).start()
 
     log.info("discover-h1b-ats-worker started")
+    _reclaim_inflight(r)
 
     try:
         while True:
@@ -352,9 +373,14 @@ def run_worker(once: bool = False) -> None:
                 r.lpush(DISCOVERY_DLQ, raw_member)
                 continue
 
+            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
+            r.zadd(DISCOVERY_INFLIGHT, {fein: petition_count})
+
             retry_count = _get_retry_count(r, fein)
             if retry_count >= DISCOVERY_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
+                _clear_retry(r, fein)
+                r.zrem(DISCOVERY_INFLIGHT, fein)
                 continue
 
             success = _process_company(fein, petition_count, trigger)
@@ -372,6 +398,8 @@ def run_worker(once: bool = False) -> None:
                                 fein, count, DISCOVERY_MAX_RETRIES)
             else:
                 _clear_retry(r, fein)
+
+            r.zrem(DISCOVERY_INFLIGHT, fein)
 
             if once:
                 break

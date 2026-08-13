@@ -758,9 +758,14 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
             logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
             return []
 
-    # Company territory confirmed — record this as the first successful company-territory URL
+    # Company territory confirmed — record this as the first successful company-territory URL.
+    # Exclude root-path redirects landing on the main company domain (homepage redirects);
+    # career subdomains (careers.company.com/) have a different netloc and are kept.
     if first_200_url is not None and first_200_url[0] is None:
-        first_200_url[0] = final_url
+        _fp    = urlparse(final_url)
+        _fhost = (_fp.hostname or "").removeprefix("www.")
+        if _fp.path.rstrip("/") or _fhost != company_root:
+            first_200_url[0] = final_url
 
     # Full scan: JS bundles + API probes
     api_paths = []
@@ -907,8 +912,9 @@ def detect_company(company_domain, session=None, *, seed_url=None):
     """
     Detect all ATS platforms for a company given only its domain.
 
-    seed_url: if provided, start BFS from this URL instead of probing all
-              CAREER_PATHS. Use when careers_url is already known from Phase 6.
+    seed_url: if provided, prioritize this URL at the front of the BFS queue;
+              standard CAREER_PATHS and subdomain fallbacks are still enqueued
+              after it. Use when careers_url is already known from Phase 6.
 
     Uses BFS so all candidates at depth N are explored before any at depth N+1.
     This guarantees siblings (e.g. nomura.com early-careers AND nomuraholdings.com)

@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config import (
     DOMAIN_ENRICHMENT_DELAYED,
     DOMAIN_ENRICHMENT_DLQ,
+    DOMAIN_ENRICHMENT_INFLIGHT,
     DOMAIN_ENRICHMENT_QUEUE,
     DISCOVERY_QUEUE,
     ENRICHMENT_HEARTBEAT_S,
@@ -384,6 +385,22 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Inflight crash recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _reclaim_inflight(r) -> None:
+    """Re-queue any FEINs left in the inflight ZSET from a prior crash or SIGKILL."""
+    items = r.zrange(DOMAIN_ENRICHMENT_INFLIGHT, 0, -1, withscores=True)
+    if not items:
+        return
+    log.warning("reclaiming %d inflight FEINs from prior run", len(items))
+    for fein, score in items:
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: int(score)}, gt=True)
+        r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
+        log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,6 +411,7 @@ def run_worker(once: bool = False) -> None:
                    lambda: processed["n"], interval_s=ENRICHMENT_HEARTBEAT_S).start()
 
     log.info("domain-enrichment-worker started")
+    _reclaim_inflight(r)
 
     try:
         while True:
@@ -413,10 +431,14 @@ def run_worker(once: bool = False) -> None:
             fein, score = result[0]
             petition_count = int(score)
 
+            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
+            r.zadd(DOMAIN_ENRICHMENT_INFLIGHT, {fein: petition_count})
+
             retry_count = _get_retry_count(r, fein)
             if retry_count >= ENRICHMENT_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
+                r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
                 continue
 
             success = _process_company(r, fein, petition_count)
@@ -428,10 +450,14 @@ def run_worker(once: bool = False) -> None:
                     _move_to_dlq(r, fein, "processing_error", count)
                     _clear_retry(r, fein)
                 else:
-                    # Re-queue for retry — same petition_count score
-                    r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: petition_count})
-                    log.warning("fein=%s re-queued for retry (%d/%d)",
-                                fein, count, ENRICHMENT_MAX_RETRIES)
+                    delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
+                    _requeue_delayed(r, fein, petition_count, delay_s)
+                    log.warning("fein=%s retry %d/%d in %ds",
+                                fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
+            else:
+                _clear_retry(r, fein)
+
+            r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
 
             if once:
                 break

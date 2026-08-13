@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tldextract as _tldextract
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
@@ -878,6 +879,15 @@ def run():
                 domain = _domain_from_url(job_url)
             elif career_page and _is_valid_url(career_page):
                 domain = _domain_from_url(career_page)
+
+            # Normalize to PSL registered domain so the dedup guard in
+            # _upsert_company_ats (which checks prospective_companies WHERE
+            # domain = <psl_root>) matches correctly. Subdomains entered in
+            # the form (e.g. "careers.company.com") would otherwise never
+            # match the discovery pipeline's PSL-computed domain ("company.com").
+            if domain:
+                _ext = _tldextract.extract(domain)
+                domain = _ext.registered_domain or domain
 
             # ── Store raw curls BEFORE any parsing ───────────────
             # This ensures we always have the original curl for

@@ -43,7 +43,7 @@ fein_domain_map                        petition_count per employer
 After `fuzzy_match_uscis_dol.py` completes:
 - Populate `domain_enrichment_queue` (Redis ZSET)
 - Score = petition_count for each company
-- Only rows WHERE `public_domain IS NULL` OR `last_enriched_at > 90 days`
+- Only rows WHERE `public_domain IS NULL` OR `last_enriched_at < NOW() - INTERVAL '90 days'`
 
 **Why USCIS must complete before enrichment queue is populated:**
 petition_count is the priority score. Without it, all companies get score=0
@@ -113,8 +113,10 @@ STEP 4 — Push to discovery_queue
 ### Failure Handling
 - Transient errors (network, timeout): retry up to 3× with exponential backoff
 - Permanent failures (bad domain, no web presence after all steps): push to DLQ
-- CT log 429: read `Retry-After` header → re-queue item with score = now() + retry_after
-  (no sleep, no quota file — just re-queue and move on to next item)
+- CT log 429: read `Retry-After` header → store item in `DOMAIN_ENRICHMENT_DELAYED` ZSET
+  scored by `time.time() + retry_after`; `_flush_delayed()` moves ready items into
+  `domain_enrichment_queue` before each ZPOPMAX. Future timestamps are never written
+  directly to `domain_enrichment_queue` (which uses petition_count as score).
 
 ### Quota Tracking
 - `cf_quota.json` — shared with existing workers (CF Worker calls)

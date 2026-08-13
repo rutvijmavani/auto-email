@@ -349,11 +349,13 @@ CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search 
 # ─────────────────────────────────────────────────────────────────────────────
 # DOMAIN ENRICHMENT WORKER
 # ─────────────────────────────────────────────────────────────────────────────
-DOMAIN_ENRICHMENT_QUEUE   = "domain_enrichment_queue"   # Redis ZSET, score=petition_count
-DOMAIN_ENRICHMENT_DELAYED = "domain_enrichment:delayed" # Redis ZSET, score=not_before timestamp
-DOMAIN_ENRICHMENT_DLQ     = "domain_enrichment:dlq"     # Redis LIST — failed companies
-DISCOVERY_QUEUE           = "discovery_queue"            # Redis ZSET, score=petition_count
-DISCOVERY_DLQ             = "discovery:dlq"              # Redis LIST — failed discovery
+DOMAIN_ENRICHMENT_QUEUE    = "domain_enrichment_queue"    # Redis ZSET, score=petition_count
+DOMAIN_ENRICHMENT_DELAYED  = "domain_enrichment:delayed"  # Redis ZSET, score=not_before timestamp
+DOMAIN_ENRICHMENT_DLQ      = "domain_enrichment:dlq"      # Redis LIST — failed companies
+DOMAIN_ENRICHMENT_INFLIGHT = "domain_enrichment:inflight" # Redis ZSET — in-progress FEINs (crash recovery)
+DISCOVERY_QUEUE            = "discovery_queue"             # Redis ZSET, score=petition_count
+DISCOVERY_DLQ              = "discovery:dlq"               # Redis LIST — failed discovery
+DISCOVERY_INFLIGHT         = "discovery:inflight"          # Redis ZSET — in-progress FEINs (crash recovery)
 ENRICHMENT_MAX_RETRIES    = int(os.getenv("ENRICHMENT_MAX_RETRIES", "3"))
 ENRICHMENT_HEARTBEAT_S    = int(os.getenv("ENRICHMENT_HEARTBEAT_S", "30"))
 DISCOVERY_MAX_RETRIES     = int(os.getenv("DISCOVERY_MAX_RETRIES", "3"))

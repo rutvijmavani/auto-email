@@ -345,10 +345,15 @@ def _populate_enrichment_queue(conn, r) -> None:
         log.info("enrichment queue: no eligible companies — skipping")
         return
 
-    pipe = r.pipeline()
-    for row in rows:
+    _ZADD_BATCH = 500
+    pipe = r.pipeline(transaction=False)
+    for i, row in enumerate(rows):
         pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {row["employer_fein"]: row["petition_count"]})
-    pipe.execute()
+        if (i + 1) % _ZADD_BATCH == 0:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+    if len(rows) % _ZADD_BATCH != 0:
+        pipe.execute()
     log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", len(rows))
 
     # Start enrichment workers — systemctl start is a no-op if already running

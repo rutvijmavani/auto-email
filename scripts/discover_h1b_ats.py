@@ -1679,15 +1679,6 @@ def process_employer(
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
         domain = _root_domain(result["website_url"])
         if domain:
-            # Deactivate any monitored rows for the same FEIN + platform on a different domain
-            # so get_monitorable_companies() cannot return stale duplicates.
-            conn.execute("""
-                UPDATE company_ats
-                SET is_monitored = FALSE
-                WHERE employer_fein = %s AND platform = %s AND domain != %s
-                  AND is_monitored = TRUE
-            """, (fein, detected_platform, domain))
-            conn.commit()  # commit deactivation independently — _upsert_company_ats may early-return
             _upsert_company_ats(
                 conn,
                 fein=fein,

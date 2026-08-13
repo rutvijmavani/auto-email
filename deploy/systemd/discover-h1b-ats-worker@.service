@@ -13,6 +13,7 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
+Environment=WORKER_INSTANCE=%i
 ExecStart=/home/opc/mail/venv/bin/python -m workers.discover_h1b_ats_worker
 Restart=on-failure
 RestartSec=30s

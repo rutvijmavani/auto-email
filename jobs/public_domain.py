@@ -18,6 +18,7 @@ import time
 from urllib.parse import urlparse
 
 import requests
+import tldextract as _tldextract
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -49,8 +50,8 @@ def _root(u: str) -> str:
     if "://" not in u:
         u = "https://" + u
     h = urlparse(u).hostname or ""
-    p = h.split(".")
-    return ".".join(p[-2:]) if len(p) >= 2 else h
+    ext = _tldextract.extract(h)
+    return ext.registered_domain or h
 
 
 def _redirect_domain(host: str) -> "str | None":
@@ -219,10 +220,10 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         log.info("public_domain: %s → %s (http_redirect)", domain, redir)
         return redir, "http_redirect", None
 
-    # Step 2 — Root-domain fallback (strip subdomain prefix)
-    parts = domain.split(".")
-    if len(parts) > 2:
-        root_try = ".".join(parts[-2:])
+    # Step 2 — Root-domain fallback (strip subdomain prefix via PSL)
+    ext      = _tldextract.extract(domain)
+    root_try = ext.registered_domain
+    if root_try and root_try != domain:
         redir = _redirect_domain(root_try)
         if redir is None:
             pass

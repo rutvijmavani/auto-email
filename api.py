@@ -370,8 +370,9 @@ _VERIFY_EXECUTOR   = ThreadPoolExecutor(max_workers=8)
 _INFLIGHT_FEINS    = set()          # FEINs with an active background task
 _INFLIGHT_LOCK     = threading.Lock()
 
-_VERIFY_HEAD_TIMEOUT = 8   # seconds — fast, never block the request
-_VERIFY_GOOD_CODES   = {200, 301, 302, 303, 307, 308}
+_VERIFY_HEAD_TIMEOUT  = 8   # seconds — fast, never block the request
+_VERIFY_GOOD_CODES    = {200, 201, 204, 206}  # 2xx only; redirects handled in manual loop
+_VERIFY_MAX_REDIRECTS = 10
 _PRIVATE_NETS = [
     ipaddress.ip_network(r) for r in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -403,9 +404,10 @@ def _host_root(host: str) -> str:
 
 def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
     """
-    Return True if url returns a plausible success code.
-    Pre-validates scheme and rejects private/loopback hosts.
-    After redirect, requires the final host to be within initial_root or allowed_root.
+    Return True if url returns a 2xx response.
+    Pre-validates scheme and rejects private/loopback hosts before every hop.
+    Follows redirects manually (allow_redirects=False) to validate each hop's
+    scheme, resolved addresses, and allowed registrable domain before connecting.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -414,30 +416,42 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
     if not hostname or _is_private_host(hostname):
         return False
     initial_root = _host_root(hostname)
+    allowed = {initial_root}
+    if allowed_root:
+        allowed.add(allowed_root)
+    current_url = url
     try:
-        resp = _requests.head(
-            url,
-            allow_redirects=True,
-            timeout=_VERIFY_HEAD_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        final_parsed = urlparse(resp.url)
-        if final_parsed.scheme not in ("http", "https"):
-            return False
-        final_host = final_parsed.hostname or ""
-        if _is_private_host(final_host):
-            return False
-        if allowed_root or initial_root:
-            final_root = _host_root(final_host)
-            allowed = {initial_root}
-            if allowed_root:
-                allowed.add(allowed_root)
-            if final_root not in allowed:
+        for _ in range(_VERIFY_MAX_REDIRECTS):
+            resp = _requests.head(
+                current_url,
+                allow_redirects=False,
+                timeout=_VERIFY_HEAD_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if resp.status_code in _VERIFY_GOOD_CODES:
+                return True
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                return False
+            location = resp.headers.get("Location", "")
+            if not location:
+                return False
+            from urllib.parse import urljoin
+            next_url = urljoin(current_url, location)
+            next_parsed = urlparse(next_url)
+            if next_parsed.scheme not in ("http", "https"):
+                return False
+            next_host = next_parsed.hostname or ""
+            if not next_host or _is_private_host(next_host):
+                return False
+            next_root = _host_root(next_host)
+            if next_root not in allowed:
                 logger.warning(
-                    "verify-company: redirect to unexpected domain %s (allowed %s)", final_root, allowed
+                    "verify-company: redirect to unexpected domain %s (allowed %s)",
+                    next_root, allowed,
                 )
                 return False
-        return resp.status_code in _VERIFY_GOOD_CODES
+            current_url = next_url
+        return False  # too many redirects
     except Exception:
         return False
 

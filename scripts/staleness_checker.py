@@ -8,7 +8,7 @@ Enrichment staleness:
     → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
 Discovery staleness:
-    company_ats WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_STALENESS_DAYS> days'
+    fein_domain_map WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
     AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
     (also catches companies with no ATS yet and petition_count >= threshold)
     → ZADD discovery_queue petition_count fein
@@ -147,7 +147,6 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
             f.employer_fein,
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
-        LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
         LEFT JOIN (
             SELECT dh.employer_fein, COUNT(*) AS petition_count
             FROM uscis_dol_fuzzy_map um
@@ -156,7 +155,7 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         ) u ON u.employer_fein = f.employer_fein
         WHERE COALESCE(u.petition_count, 0) >= %s
           AND (
-              ca.employer_fein IS NULL                              -- no ATS record yet
+              NOT EXISTS (SELECT 1 FROM company_ats WHERE employer_fein = f.employer_fein)
               OR f.last_discovered_at IS NULL                      -- never discovered
               OR f.last_discovered_at < NOW() - INTERVAL %s       -- stale
           )
@@ -236,6 +235,7 @@ if __name__ == "__main__":
     init_logging("staleness_checker")
     parser = argparse.ArgumentParser(description="Push stale H1B companies to enrichment/discovery queues")
     parser.add_argument("--dry-run",          action="store_true", help="Log what would be queued without writing to Redis")
-    parser.add_argument("--enrichment-only",  action="store_true", help="Only run enrichment staleness check")
-    parser.add_argument("--discovery-only",   action="store_true", help="Only run discovery staleness check")
+    _mode = parser.add_mutually_exclusive_group()
+    _mode.add_argument("--enrichment-only",  action="store_true", help="Only run enrichment staleness check")
+    _mode.add_argument("--discovery-only",   action="store_true", help="Only run discovery staleness check")
     main(parser.parse_args())
