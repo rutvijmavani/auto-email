@@ -147,10 +147,11 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                                 company, job_result["platform"], job_result["slug"])
                     job_result["careers_url"] = effective_url
                     return job_result
+                return {"platform": None, "slug": None, "careers_url": effective_url}
             else:
                 logger.debug("[P3a] careers_url redirected off-domain (%s → %s) — skipping job link scan",
                              careers_url, effective_url)
-            return {"platform": None, "slug": None, "careers_url": effective_url}
+                return {"platform": None, "slug": None, "careers_url": careers_url}
         # careers_url not accessible — fall through to full probing
         logger.debug("[P3a] careers_url not accessible, falling back to path probe")
 
@@ -181,17 +182,54 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                 return result
         # Track the redirect destination when it stays on the company domain or lands
         # on a known ATS — SSO/auth redirects to unrelated hosts are not careers evidence.
-        if final_url and final_url != url and not first_redirect_url:
+        # A redirect to the bare root path (e.g. /careers → /) is a homepage redirect, not a careers hint.
+        # Only use redirects from successful responses (html not None) or ATS pattern hits (result not None);
+        # a 404 at the redirected URL is not evidence of a valid careers page.
+        if final_url and final_url != url and not first_redirect_url and (result is not None or html is not None):
             _final_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
             _domain_root = tldextract.extract(domain).registered_domain or domain
-            if _final_root == _domain_root or match_ats_pattern(final_url):
+            _final_path  = urlparse(final_url).path
+            if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
                 first_redirect_url = final_url
         if html is not None and first_career_html is None:
             _page_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
             _probe_root = tldextract.extract(domain).registered_domain or domain
-            if _page_root == _probe_root or match_ats_pattern(final_url):
+            _page_path  = urlparse(final_url).path
+            if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
                 first_career_html = html
                 first_career_url  = final_url
+
+    # ── Apex fallback — retry with bare domain if www. probe produced nothing ───
+    # Some companies serve careers only from the apex (e.g. example.com/careers)
+    # and have no www. DNS entry, causing all www.-prefixed probes to fail.
+    if first_career_html is None and not domain.startswith("www."):
+        for path in CAREER_PATHS:
+            url = f"https://{domain}{path}"
+            result, html, final_url = _fetch_and_scan(url, company)
+            if result:
+                if result["platform"] == "eightfold":
+                    if tentative_eightfold is None:
+                        logger.debug("[P3a tentative Eightfold apex] %r via %s", company, url)
+                        tentative_eightfold = result
+                        tentative_eightfold["_matched_url"] = final_url or url
+                else:
+                    logger.info("[P3a HIT apex] %r → %s / %s via %s",
+                                company, result["platform"], result["slug"], url)
+                    result["careers_url"] = final_url or url
+                    return result
+            if final_url and final_url != url and not first_redirect_url and (result is not None or html is not None):
+                _final_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
+                _domain_root = tldextract.extract(domain).registered_domain or domain
+                _final_path  = urlparse(final_url).path
+                if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
+                    first_redirect_url = final_url
+            if html is not None and first_career_html is None:
+                _page_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
+                _probe_root = tldextract.extract(domain).registered_domain or domain
+                _page_path  = urlparse(final_url).path
+                if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
+                    first_career_html = html
+                    first_career_url  = final_url
 
     # ── Layer 3: follow job listing links ─────────────────────────────────
     # Individual job pages almost always link to or embed the ATS directly

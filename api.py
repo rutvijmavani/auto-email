@@ -6,9 +6,10 @@ import os
 import secrets
 import socket
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests as _requests
 import tldextract as _tldextract
@@ -369,13 +370,16 @@ _VERIFY_EXECUTOR   = ThreadPoolExecutor(max_workers=8)
 _INFLIGHT_FEINS    = set()          # FEINs with an active background task
 _INFLIGHT_LOCK     = threading.Lock()
 
-_VERIFY_HEAD_TIMEOUT  = 8   # seconds — fast, never block the request
+_VERIFY_HEAD_TIMEOUT  = 8   # seconds per hop — fast, never block the request
+_VERIFY_TOTAL_TIMEOUT = 30  # seconds total across all hops — prevents 10×8s worst case
 _VERIFY_GOOD_CODES    = {200, 201, 204, 206}  # 2xx only; redirects handled in manual loop
 _VERIFY_MAX_REDIRECTS = 10
 _PRIVATE_NETS = [
     ipaddress.ip_network(r) for r in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-        "127.0.0.0/8", "169.254.0.0/16", "::1/128", "fc00::/7",
+        "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8",
+        "100.64.0.0/10",   # CGNAT / shared address space (RFC 6598)
+        "::1/128", "fc00::/7", "fe80::/10",   # loopback, ULA, link-local
     )
 ]
 
@@ -389,6 +393,9 @@ def _is_private_host(host: str) -> bool:
         for _family, _type, _proto, _canon, sockaddr in results:
             addr = ipaddress.ip_address(sockaddr[0])
             if any(addr in net for net in _PRIVATE_NETS):
+                return True
+            mapped = getattr(addr, "ipv4_mapped", None)
+            if mapped and any(mapped in net for net in _PRIVATE_NETS):
                 return True
         return False
     except Exception:
@@ -417,10 +424,13 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
     initial_root = _host_root(hostname)
     allowed = {initial_root}
     if allowed_root:
-        allowed.add(allowed_root)
+        allowed.add(_host_root(allowed_root))  # normalize through PSL before comparing
     current_url = url
+    _deadline = time.monotonic() + _VERIFY_TOTAL_TIMEOUT
     try:
         for _ in range(_VERIFY_MAX_REDIRECTS):
+            if time.monotonic() > _deadline:
+                return False
             resp = _requests.head(
                 current_url,
                 allow_redirects=False,
@@ -429,12 +439,27 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
             )
             if resp.status_code in _VERIFY_GOOD_CODES:
                 return True
+            if resp.status_code == 405:
+                # Server rejected HEAD — fall back to GET (stream=True to avoid body download)
+                try:
+                    gr = _requests.get(
+                        current_url,
+                        allow_redirects=False,
+                        stream=True,
+                        timeout=_VERIFY_HEAD_TIMEOUT,
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                    gr.close()
+                    if gr.status_code in _VERIFY_GOOD_CODES:
+                        return True
+                    resp = gr  # treat GET response as HEAD — fall through to redirect handling
+                except Exception:
+                    return False
             if resp.status_code not in (301, 302, 303, 307, 308):
                 return False
             location = resp.headers.get("Location", "")
             if not location:
                 return False
-            from urllib.parse import urljoin
             next_url = urljoin(current_url, location)
             next_parsed = urlparse(next_url)
             if next_parsed.scheme not in ("http", "https"):
@@ -494,6 +519,8 @@ def verify_company():
     if not isinstance(fein, str) or not fein.strip():
         return jsonify({'error': 'fein is required'}), 400
     fein = fein.strip()
+    if not fein.isdigit() or len(fein) != 9:
+        return jsonify({'error': 'fein must be a 9-digit number'}), 400
 
     conn = get_conn()
     try:
@@ -504,11 +531,12 @@ def verify_company():
                 f.careers_url,
                 f.last_enriched_at,
                 f.careers_url_verified_at,
-                ca.ats_platform,
-                ca.ats_slug
+                ca.platform AS ats_platform,
+                ca.slug     AS ats_slug
             FROM fein_domain_map f
             LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
             WHERE f.employer_fein = %s
+            ORDER BY ca.slug NULLS LAST
             LIMIT 1
         """, (fein,)).fetchone()
     except Exception as exc:
@@ -521,11 +549,23 @@ def verify_company():
         return jsonify({'error': 'company not found'}), 404
 
     careers_url = row['careers_url']
+    # Determine staleness synchronously from DB timestamp; the background HEAD
+    # check will trigger re-enrichment if needed but can't update this response.
+    _verified_at = row.get('careers_url_verified_at')
+    if not careers_url:
+        _is_stale = True
+    elif _verified_at is None:
+        _is_stale = True  # never verified
+    else:
+        if _verified_at.tzinfo is None:  # guard: psycopg2 returns aware for TIMESTAMPTZ, but be safe
+            _verified_at = _verified_at.replace(tzinfo=timezone.utc)
+        _age_days = (datetime.now(timezone.utc) - _verified_at).days
+        _is_stale = _age_days > 30
     payload = {
         'careers_url':  careers_url,
         'ats_platform': row['ats_platform'],
         'ats_slug':     row['ats_slug'],
-        'stale':        False,
+        'stale':        _is_stale,
     }
 
     def _submit(fn, *args):
@@ -545,12 +585,17 @@ def verify_company():
                 with _INFLIGHT_LOCK:
                     _INFLIGHT_FEINS.discard(fein)
 
-        _VERIFY_EXECUTOR.submit(_wrapped)
+        try:
+            _VERIFY_EXECUTOR.submit(_wrapped)
+        except Exception as _sub_exc:
+            # submit() itself failed (e.g. executor shut down) — release inflight slot
+            logger.error("executor.submit failed for fein=%s: %s", fein, _sub_exc)
+            with _INFLIGHT_LOCK:
+                _INFLIGHT_FEINS.discard(fein)
 
-    # If there's no careers_url, queue for enrichment and return
+    # If there's no careers_url, queue for enrichment and return immediately
     if not careers_url:
         _submit(_trigger_enrichment, fein)
-        payload['stale'] = True
         return jsonify(payload), 200
 
     # Fire-and-forget HEAD check — never block the HTTP response
@@ -569,6 +614,10 @@ def verify_company():
                 conn2.commit()
             except Exception as exc:
                 logger.warning("verify-company: failed to update verified_at fein=%s: %s", fein, exc)
+                try:
+                    conn2.rollback()
+                except Exception:
+                    pass
             finally:
                 conn2.close()
         else:

@@ -693,9 +693,10 @@ def run_health_check() -> int:
                     for r in rows
                 )
 
-            # Public domain
-            no_signal = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
-            pd_found  = pd_total - no_signal
+            # Public domain — NULL method (worker crashed before writing) counts as unresolved
+            no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
+            null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
+            pd_found    = pd_total - no_signal - null_method
             pd_detail = _breakdown(pd_rows, pd_total)
             if no_signal / pd_total > 0.15 if pd_total else False:
                 _row("WARNING", "public domain",

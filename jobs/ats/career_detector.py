@@ -21,6 +21,8 @@ import logging
 from html import unescape as _html_unescape
 from urllib.parse import urljoin, urlparse
 
+import tldextract as _tldextract
+
 from jobs.career_page import CAREER_PATHS
 
 logger = logging.getLogger(__name__)
@@ -618,8 +620,8 @@ def find_next_pages(html, current_url, visited=None):
     """
     parsed_base = urlparse(current_url)
     base_domain = parsed_base.netloc
-    base_parts  = base_domain.split(".")
-    brand       = base_parts[-2] if len(base_parts) >= 2 else base_domain
+    # Use tldextract so ccTLDs (e.g. .co.jp) don't produce wrong brand ("co" instead of "nomura")
+    brand = _tldextract.extract(base_domain).domain or base_domain
 
     pairs = re.findall(
         r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -646,7 +648,7 @@ def find_next_pages(html, current_url, visited=None):
 
         # Allow same domain OR brand-family domain (bidirectional).
         # e.g. nomura.com ↔ nomuraholdings.com: "nomura" appears in both.
-        target_brand = parsed.netloc.split(".")[-2] if "." in parsed.netloc else parsed.netloc
+        target_brand = _tldextract.extract(parsed.hostname or parsed.netloc).domain or parsed.netloc
         if parsed.netloc != base_domain and brand not in parsed.netloc and target_brand not in base_domain:
             continue
 
@@ -949,8 +951,12 @@ def detect_company(company_domain, session=None, *, seed_url=None):
     queue = deque()
     seen_seeds: set = set()
     if seed_url:
-        queue.append((seed_url, None))
-        seen_seeds.add(seed_url)
+        _seed_parsed = urlparse(seed_url)
+        if _seed_parsed.scheme in ("http", "https") and _seed_parsed.hostname:
+            queue.append((seed_url, None))
+            seen_seeds.add(seed_url)
+        else:
+            logger.debug("career_detector: ignoring seed_url with invalid scheme/host: %r", seed_url)
     for path in CAREER_PATHS:
         candidate = f"https://{domain}{path}"
         if candidate not in seen_seeds:

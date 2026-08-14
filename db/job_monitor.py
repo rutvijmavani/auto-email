@@ -334,7 +334,9 @@ def get_monitorable_companies():
             SELECT pc.company, pc.ats_platform, pc.ats_slug,
                    pc.ats_detected_at, pc.first_scanned_at,
                    pc.last_checked_at, pc.consecutive_empty_days,
-                   f.employer_fein
+                   pc.domain,
+                   f.employer_fein,
+                   COALESCE(u.petition_count, 0)::int AS petition_count
             FROM prospective_companies pc
             LEFT JOIN LATERAL (
                 SELECT employer_fein
@@ -343,6 +345,7 @@ def get_monitorable_companies():
                 ORDER BY confidence DESC NULLS LAST, employer_fein
                 LIMIT 1
             ) f ON true
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE pc.ats_platform IS NOT NULL
               AND pc.ats_platform NOT IN ('unknown', 'unsupported')
               AND pc.ats_slug IS NOT NULL
@@ -364,8 +367,11 @@ def get_monitorable_companies():
                 ca.first_scanned_at,
                 ca.last_checked_at,
                 ca.consecutive_empty_days,
-                ca.employer_fein
+                ca.domain,
+                ca.employer_fein,
+                COALESCE(u.petition_count, 0)::int AS petition_count
             FROM company_ats ca
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = ca.employer_fein
             WHERE ca.is_monitored = TRUE
               AND ca.platform IS NOT NULL
               AND ca.platform NOT IN ('unknown', 'unsupported')

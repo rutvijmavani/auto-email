@@ -49,17 +49,17 @@ def _regression_block(conn, col, label, days):
         FROM (
             SELECT
                 CASE
-                    WHEN run_at > NOW() - INTERVAL '{days} days' THEN 'recent'
+                    WHEN run_at > NOW() - %s::interval THEN 'recent'
                     ELSE 'prior'
                 END AS period,
                 {col}
             FROM h1b_enrichment_metrics
-            WHERE run_at > NOW() - INTERVAL '{days * 2} days'
+            WHERE run_at > NOW() - %s::interval
               AND {col} IS NOT NULL
         ) sub
         GROUP BY period, {col}
         ORDER BY period DESC, n DESC
-    """)
+    """, (f"{days} days", f"{days * 2} days"))
     rows = cur.fetchall()
     if not rows:
         return
@@ -110,7 +110,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             SELECT public_domain_method, COUNT(*) AS n
             FROM h1b_enrichment_metrics
             WHERE worker = 'domain_enrichment'
-              AND run_at > NOW() - INTERVAL %s
+              AND run_at > NOW() - %s::interval
             GROUP BY public_domain_method
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -118,11 +118,12 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         pd_total = sum(r["n"] for r in pd_rows)
         _phase_table(pd_rows, pd_total, "Resolution method")
 
-        no_signal = next((r["n"] for r in pd_rows
-                          if r["public_domain_method"] == "no_signal"), 0)
+        no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
+        null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
+        unresolved  = no_signal + null_method
         if pd_total:
-            print(f"\n  Coverage: {pd_total - no_signal}/{pd_total} resolved "
-                  f"({_pct(pd_total - no_signal, pd_total)})  "
+            print(f"\n  Coverage: {pd_total - unresolved}/{pd_total} resolved "
+                  f"({_pct(pd_total - unresolved, pd_total)})  "
                   f"no_signal: {no_signal} ({_pct(no_signal, pd_total)})")
 
         # Top unresolved companies (high petition_count, no public domain)
@@ -136,7 +137,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                     SELECT DISTINCT ON (employer_fein)
                         employer_fein, public_domain_method
                     FROM h1b_enrichment_metrics
-                    WHERE run_at > NOW() - INTERVAL %s
+                    WHERE run_at > NOW() - %s::interval
                     ORDER BY employer_fein, run_at DESC
                 ) m
                 JOIN dol_h1b_employers e ON e.employer_fein = m.employer_fein
@@ -169,7 +170,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             SELECT careers_source, COUNT(*) AS n
             FROM h1b_enrichment_metrics
             WHERE careers_url IS NOT NULL
-              AND run_at > NOW() - INTERVAL %s
+              AND run_at > NOW() - %s::interval
             GROUP BY careers_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -184,7 +185,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 SELECT DISTINCT ON (employer_fein)
                     employer_fein, careers_url, ats_platform
                 FROM h1b_enrichment_metrics
-                WHERE run_at > NOW() - INTERVAL %s
+                WHERE run_at > NOW() - %s::interval
                 ORDER BY employer_fein, run_at DESC
             ) latest
             WHERE careers_url IS NOT NULL AND ats_platform IS NULL
@@ -202,7 +203,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             SELECT ats_source, COUNT(*) AS n
             FROM h1b_enrichment_metrics
             WHERE ats_platform IS NOT NULL
-              AND run_at > NOW() - INTERVAL %s
+              AND run_at > NOW() - %s::interval
             GROUP BY ats_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -215,7 +216,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             SELECT ats_platform, COUNT(DISTINCT employer_fein) AS companies
             FROM h1b_enrichment_metrics
             WHERE ats_platform IS NOT NULL
-              AND run_at > NOW() - INTERVAL %s
+              AND run_at > NOW() - %s::interval
             GROUP BY ats_platform
             ORDER BY companies DESC
             LIMIT 15
@@ -253,7 +254,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)) AS p95_ms,
                 MAX(duration_ms)                      AS max_ms
             FROM h1b_enrichment_metrics
-            WHERE run_at > NOW() - INTERVAL %s
+            WHERE run_at > NOW() - %s::interval
               AND duration_ms IS NOT NULL
             GROUP BY worker
             ORDER BY worker

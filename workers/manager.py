@@ -52,6 +52,10 @@ from config import (
     CONCURRENCY_FLOOR,
     CONCURRENCY_FLOOR_DEFAULT,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
+    DOMAIN_ENRICHMENT_QUEUE,
+    DOMAIN_ENRICHMENT_DELAYED,
+    DISCOVERY_QUEUE,
+    DISCOVERY_DELAYED,
 )
 
 logger = get_logger(__name__)
@@ -361,11 +365,26 @@ def _get_queue_metrics(r) -> dict:
 
     # ── enrichment + discovery (informational — not autoscaled) ─────────────
     try:
-        from config import DOMAIN_ENRICHMENT_QUEUE, DISCOVERY_QUEUE
-        enrich_depth   = r.zcard(DOMAIN_ENRICHMENT_QUEUE)
+        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE)
         discovery_depth = r.zcard(DISCOVERY_QUEUE)
-        metrics["domain_enrichment"] = {"depth": enrich_depth,   "delay_s": 0.0}
-        metrics["discovery"]         = {"depth": discovery_depth, "delay_s": 0.0}
+
+        # Delay = how long the most-overdue item in the delayed ZSET has been past its not_before
+        enrich_delay = 0.0
+        oldest_enrich = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
+        if oldest_enrich:
+            _, _ts = oldest_enrich[0]
+            if _ts < now:
+                enrich_delay = max(0.0, now - _ts)
+
+        discovery_delay = 0.0
+        oldest_disc = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
+        if oldest_disc:
+            _, _ts = oldest_disc[0]
+            if _ts < now:
+                discovery_delay = max(0.0, now - _ts)
+
+        metrics["domain_enrichment"] = {"depth": enrich_depth,    "delay_s": enrich_delay}
+        metrics["discovery"]         = {"depth": discovery_depth,  "delay_s": discovery_delay}
     except Exception as exc:
         logger.warning("manager: enrichment/discovery queue metrics failed: %s", exc)
         metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0}

@@ -573,7 +573,7 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     if domain:
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
-        if result and result.get("platform") not in {
+        if result and result.get("platform") and result.get("platform") not in {
             "eightfold", "taleo", "successfactors"
         }:
             logger.info("[sync] %r: ATS from domain — %s",

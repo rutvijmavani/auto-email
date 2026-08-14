@@ -456,6 +456,19 @@ def upsert(aggregated: dict, quarter: str) -> None:
         if skipped:
             log.warning("%d employers already have quarter %s — will skip their rows", skipped, quarter)
 
+        # Pre-fetch existing domain counts so the merge can be done in Python (once per fein)
+        existing_domain_counts: dict = {}
+        existing_email_totals:  dict = {}
+        if feins:
+            fdm_rows = conn.execute("""
+                SELECT employer_fein, domain_counts, total_emails
+                FROM fein_domain_map
+                WHERE employer_fein = ANY(%s)
+            """, (feins,)).fetchall()
+            for _r in fdm_rows:
+                existing_domain_counts[_r["employer_fein"]] = _r["domain_counts"] or {}
+                existing_email_totals[_r["employer_fein"]]  = _r["total_emails"]  or 0
+
         emp_count = soc_count = year_count = poc_count = 0
 
         for fein, data in aggregated.items():
@@ -603,68 +616,42 @@ def upsert(aggregated: dict, quarter: str) -> None:
             #   python scripts/process_dol_lca.py --file <all quarters>
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
+                # Merge new domain counts with existing DB row in Python, then plain-upsert.
                 # domain_counts stores PSL-aware registrable_domain → count (not raw emails).
-                # ON CONFLICT merges by summing per root; argmax gives assigned_domain.
                 # No regex needed — keys are already roots (tldextract applied in Python).
+                _prev_counts = existing_domain_counts.get(fein, {})
+                _prev_total  = existing_email_totals.get(fein, 0)
+                _merged: dict = dict(_prev_counts)
+                for _dom, _cnt in dm["domain_counts"].items():
+                    _merged[_dom] = _merged.get(_dom, 0) + _cnt
+                _merged_total = _prev_total + dm["total_emails"]
+                if _merged:
+                    _assigned = sorted(_merged, key=lambda k: (-_merged[k], k))[0]
+                    _conf     = _merged[_assigned] / _merged_total
+                    _low_conf = _conf < 0.70
+                else:
+                    _assigned = None
+                    _conf     = None
+                    _low_conf = False
                 conn.execute("""
                     INSERT INTO fein_domain_map
                         (employer_fein, domain_counts, total_emails,
                          assigned_domain, confidence, low_confidence, updated_at)
                     VALUES (%s, %s::jsonb, %s, %s, %s, %s, NOW())
                     ON CONFLICT (employer_fein) DO UPDATE SET
-                        domain_counts   = (
-                            SELECT jsonb_object_agg(
-                                key,
-                                COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                            )
-                            FROM jsonb_object_keys(
-                                fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                            ) AS key
-                        ),
-                        total_emails    = fein_domain_map.total_emails + EXCLUDED.total_emails,
-                        assigned_domain = (
-                            SELECT key
-                            FROM jsonb_each_text(
-                                (SELECT jsonb_object_agg(key,
-                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
-                                 FROM jsonb_object_keys(
-                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                 ) AS key)
-                            )
-                            ORDER BY value::int DESC, key ASC LIMIT 1
-                        ),
-                        confidence      = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)
-                            FROM jsonb_each_text(
-                                (SELECT jsonb_object_agg(key,
-                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
-                                 FROM jsonb_object_keys(
-                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                 ) AS key)
-                            )
-                        ),
-                        low_confidence  = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0) < 0.70
-                            FROM jsonb_each_text(
-                                (SELECT jsonb_object_agg(key,
-                                    COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                    + COALESCE((EXCLUDED.domain_counts->>key)::int, 0))
-                                 FROM jsonb_object_keys(
-                                     fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                 ) AS key)
-                            )
-                        ),
+                        domain_counts   = EXCLUDED.domain_counts,
+                        total_emails    = EXCLUDED.total_emails,
+                        assigned_domain = EXCLUDED.assigned_domain,
+                        confidence      = EXCLUDED.confidence,
+                        low_confidence  = EXCLUDED.low_confidence,
                         updated_at      = NOW()
                 """, (
                     fein,
-                    json.dumps(dm["domain_counts"]),
-                    dm["total_emails"],
-                    dm["assigned_domain"],
-                    dm["confidence"],
-                    dm["low_confidence"],
+                    json.dumps(_merged),
+                    _merged_total,
+                    _assigned,
+                    _conf,
+                    _low_conf,
                 ))
 
             # lca_contacts — one row per unique email, last filing wins on conflict

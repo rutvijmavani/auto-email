@@ -11,7 +11,7 @@ Discovery staleness:
     fein_domain_map WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
     AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
     (also catches companies with no ATS yet and petition_count >= threshold)
-    → ZADD discovery_queue petition_count fein
+    → ZADD discovery_queue petition_count {"fein": ..., "trigger": "staleness"}
     → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
 
 Usage:
@@ -24,7 +24,6 @@ Usage:
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 
@@ -43,6 +42,7 @@ from db.connection import get_conn
 from db.job_monitor import get_monitorable_companies
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
+from workers.worker_control import start_workers as _start_workers
 
 log = get_logger(__name__)
 
@@ -55,27 +55,6 @@ def _is_maintenance(r) -> bool:
         return False
 
 
-def _start_workers(*units: str, dry_run: bool = False) -> None:
-    for unit in units:
-        if dry_run:
-            log.info("[dry-run] would start %s", unit)
-            continue
-        try:
-            res = subprocess.run(
-                ["sudo", "systemctl", "start", unit],
-                check=False,
-                timeout=10,
-                capture_output=True,
-            )
-            if res.returncode == 0:
-                log.info("started %s", unit)
-            else:
-                log.warning("systemctl start %s rc=%d: %s", unit, res.returncode,
-                            res.stderr.decode(errors="replace").strip())
-        except Exception as exc:
-            log.warning("could not start %s: %s", unit, exc)
-
-
 def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale enrichment companies to domain_enrichment_queue. Returns count added."""
     # public_domain IS NULL: always re-enrich (uninitialised).
@@ -84,26 +63,39 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         row["employer_fein"] for row in get_monitorable_companies()
         if row.get("employer_fein")
     }
-    rows = conn.execute("""
-        SELECT
-            f.employer_fein,
-            COALESCE(u.petition_count, 0) AS petition_count
-        FROM fein_domain_map f
-        LEFT JOIN (
-            SELECT dh.employer_fein, COUNT(*) AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
-            GROUP BY dh.employer_fein
-        ) u ON u.employer_fein = f.employer_fein
-        WHERE (
-            f.public_domain IS NULL
-            OR (
-                f.last_enriched_at < NOW() - INTERVAL %s
-                AND f.employer_fein = ANY(%s)
+
+    _stale_interval = f"{ENRICH_STALENESS_DAYS} days"
+    if monitored_feins:
+        rows = conn.execute("""
+            SELECT
+                f.employer_fein,
+                COALESCE(u.petition_count, 0) AS petition_count
+            FROM fein_domain_map f
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE (
+                -- Never resolved: re-enrich if also past the staleness window
+                -- (prevents re-queuing every day for companies that reliably fail)
+                (f.public_domain IS NULL
+                    AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval))
+                OR (
+                    (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
+                    AND f.employer_fein = ANY(%s::text[])
+                )
             )
-        )
-        ORDER BY petition_count DESC
-    """, (f"{ENRICH_STALENESS_DAYS} days", list(monitored_feins))).fetchall()
+            ORDER BY petition_count DESC
+        """, (_stale_interval, _stale_interval, list(monitored_feins))).fetchall()
+    else:
+        # No monitored companies — only pick up uninitialised rows (public_domain IS NULL)
+        rows = conn.execute("""
+            SELECT
+                f.employer_fein,
+                COALESCE(u.petition_count, 0) AS petition_count
+            FROM fein_domain_map f
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE f.public_domain IS NULL
+              AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
+            ORDER BY petition_count DESC
+        """, (_stale_interval,)).fetchall()
 
     if not rows:
         log.info("enrichment staleness: no stale companies")
@@ -125,7 +117,7 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         pipe.zadd(
             DOMAIN_ENRICHMENT_QUEUE,
             {row["employer_fein"]: row["petition_count"]},
-            nx=False,   # update score if already present (re-score by latest petition_count)
+            gt=True,    # only raise score — prevents lowering a high-priority item
         )
         added += 1
         if (i + 1) % STALENESS_ZADD_BATCH == 0:
@@ -147,17 +139,12 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
             f.employer_fein,
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
-        LEFT JOIN (
-            SELECT dh.employer_fein, COUNT(*) AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
-            GROUP BY dh.employer_fein
-        ) u ON u.employer_fein = f.employer_fein
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE COALESCE(u.petition_count, 0) >= %s
           AND (
               NOT EXISTS (SELECT 1 FROM company_ats WHERE employer_fein = f.employer_fein)
               OR f.last_discovered_at IS NULL                      -- never discovered
-              OR f.last_discovered_at < NOW() - INTERVAL %s       -- stale
+              OR f.last_discovered_at < NOW() - %s::interval      -- stale
           )
         ORDER BY petition_count DESC
     """, (
@@ -186,7 +173,7 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         pipe.zadd(
             DISCOVERY_QUEUE,
             {member: row["petition_count"]},
-            nx=False,
+            gt=True,    # only raise score — prevents lowering a high-priority item
         )
         added += 1
         if (i + 1) % STALENESS_ZADD_BATCH == 0:

@@ -482,6 +482,9 @@ def run():
         "enrichment_queued":      0,
     }
     stats_lock = threading.Lock()
+    # Shared event set on first successful ZADD — survives even if _process_company
+    # later raises (the dict-return path would lose the signal in that case).
+    _enrichment_queued_event = threading.Event()
 
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     if missed:
@@ -489,7 +492,8 @@ def run():
         with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
-                    _process_company, company_row, i + 1, len(missed)
+                    _process_company, company_row, i + 1, len(missed),
+                    _enrichment_queued_event,
                 ): company_row["company"]
                 for i, company_row in enumerate(missed)
             }
@@ -678,7 +682,8 @@ def run():
                 with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as _uc_exec:
                     _uc_futures = {
                         _uc_exec.submit(
-                            _process_company, company_row, i + 1, len(_retry_rows)
+                            _process_company, company_row, i + 1, len(_retry_rows),
+                            _enrichment_queued_event,
                         ): company_row["company"]
                         for i, company_row in enumerate(_retry_rows)
                     }
@@ -700,19 +705,11 @@ def run():
                         _merge_company_stats(stats, stats_lock, _uc_stats)
 
     # ── Start enrichment workers once if any company was queued ──────────────
-    if stats["enrichment_queued"]:
-        import subprocess
-        for _unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-            try:
-                _res = subprocess.run(
-                    ["sudo", "systemctl", "start", _unit],
-                    check=False, timeout=10, capture_output=True,
-                )
-                if _res.returncode != 0:
-                    logger.warning("systemctl start %s rc=%d: %s", _unit, _res.returncode,
-                                   _res.stderr.decode(errors="replace").strip())
-            except Exception as _exc:
-                logger.warning("could not start %s: %s", _unit, _exc)
+    # Check both the stats counter AND the event — the event is set immediately
+    # on ZADD success and survives even if _process_company raised afterwards.
+    if stats["enrichment_queued"] or _enrichment_queued_event.is_set():
+        from workers.worker_control import start_workers as _start_workers
+        _start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -817,13 +814,15 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
 # ─────────────────────────────────────────
 _REDETECT_SEMAPHORE = threading.Semaphore(1)
 
-def _process_company(company_row, position, total):
+def _process_company(company_row, position, total, _enrichment_event=None):
     """
     Process one company: fetch jobs, filter, save new ones.
     Called by ThreadPoolExecutor — one call per company.
 
     Returns dict of per-company stats for aggregation in run().
     Never raises — all exceptions caught and returned as failure.
+    _enrichment_event: threading.Event set immediately on successful ZADD so
+    the worker-start signal survives even if this function later raises.
     """
     company  = company_row["company"]
     platform = company_row.get("ats_platform", "unknown")
@@ -858,9 +857,12 @@ def _process_company(company_row, position, total):
             try:
                 from workers.redis_client import get_redis
                 r = get_redis()
-                # score=1 raises score only if no entry exists (gt=True never lowers existing score)
-                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: 1}, gt=True)
+                # score=petition_count; gt=True only raises an existing score, never lowers it
+                petition_count = company_row.get("petition_count") or 1
+                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: petition_count}, gt=True)
                 result["queued_enrichment"] = 1
+                if _enrichment_event is not None:
+                    _enrichment_event.set()
                 logger.info(
                     "Re-enrichment queued for %r (fein=%s domain=%s empty_days=%d)",
                     company, fein, domain, empty_days,

@@ -354,6 +354,7 @@ DOMAIN_ENRICHMENT_DELAYED  = "domain_enrichment:delayed"  # Redis ZSET, score=no
 DOMAIN_ENRICHMENT_DLQ      = "domain_enrichment:dlq"      # Redis LIST — failed companies
 DOMAIN_ENRICHMENT_INFLIGHT = "domain_enrichment:inflight" # Redis ZSET — in-progress FEINs (crash recovery)
 DISCOVERY_QUEUE            = "discovery_queue"             # Redis ZSET, score=petition_count
+DISCOVERY_DELAYED          = "discovery:delayed"           # Redis ZSET, score=not_before timestamp
 DISCOVERY_DLQ              = "discovery:dlq"               # Redis LIST — failed discovery
 DISCOVERY_INFLIGHT         = "discovery:inflight"          # Redis ZSET — in-progress FEINs (crash recovery)
 ENRICHMENT_MAX_RETRIES    = int(os.getenv("ENRICHMENT_MAX_RETRIES", "3"))

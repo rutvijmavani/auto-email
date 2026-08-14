@@ -60,13 +60,38 @@ _VALID_SERVICES = frozenset({
     "staleness-checker",
 })
 
+# One-shot services (Type=oneshot): they run once and exit — OnFailure fires on a
+# single non-zero exit, not after repeated crash-restart cycles.  The alert body
+# uses different wording for these.
+_ONESHOT_SERVICES = frozenset({
+    "staleness-checker",
+})
+
+# Template units whose OnFailure passes %N (e.g. "domain-enrichment-worker@1").
+# Any "<base>@<instance>" where base is in this set is accepted.
+_VALID_TEMPLATES = frozenset({
+    "discover-h1b-ats-worker",
+    "domain-enrichment-worker",
+})
+
 
 def _validate_service(service: str) -> None:
-    """Raise ValueError if service is not in the known-good allowlist."""
-    if service not in _VALID_SERVICES:
-        raise ValueError(
-            f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)}"
-        )
+    """Raise ValueError if service is not in the known-good allowlist.
+
+    Accepts both exact names and template instances (<base>@<N>) when base is
+    in _VALID_TEMPLATES — e.g. 'domain-enrichment-worker@1' is accepted.
+    """
+    if service in _VALID_SERVICES:
+        return
+    if "@" in service:
+        base = service.split("@", 1)[0]
+        if base in _VALID_TEMPLATES:
+            return
+    raise ValueError(
+        f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)} "
+        f"or a template instance like '<name>@<N>' where name is in "
+        f"{sorted(_VALID_TEMPLATES)}"
+    )
 
 
 def _claim_alert_slot(service: str) -> bool:
@@ -175,9 +200,21 @@ def _get_journal_tail(service: str, lines: int = 30) -> str:
 _SERVICE_DISPLAY = {
     "recruiter-scheduler": "Scheduler (main pipeline process)",
     "recruiter-watchdog":  "Watchdog (health monitor)",
+    "staleness-checker":   "Staleness Checker (enrichment queue populator)",
 }
 
 _DIAGNOSE_HINTS = {
+    "staleness-checker": [
+        "Check Redis is running: <code>systemctl status redis</code>",
+        "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
+        f"Check .env file exists and is readable: <code>ls -la {_PROJECT_DIR}/.env</code>",
+        "Check for Python errors: <code>journalctl -u staleness-checker -n 50</code>",
+        f"Try running manually: <code>cd {_PROJECT_DIR} &amp;&amp; source venv/bin/activate "
+        "&amp;&amp; python -m scripts.staleness_checker</code>",
+        "Reset failed state and re-run after fixing: "
+        "<code>sudo systemctl reset-failed staleness-checker "
+        "&amp;&amp; sudo systemctl start staleness-checker</code>",
+    ],
     "recruiter-scheduler": [
         "Check Redis is running: <code>systemctl status redis</code>",
         "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
@@ -219,6 +256,16 @@ def send_startup_failure_alert(service: str) -> None:
         f"sudo systemctl start {service}</code>",
     ])
 
+    base_service = service.split("@", 1)[0]
+    is_oneshot   = base_service in _ONESHOT_SERVICES
+    what_happened = (
+        "The service failed to complete successfully (non-zero exit code). "
+        "Check the journal for the error and restart manually after fixing."
+        if is_oneshot else
+        "The service crashed and was restarted 5&nbsp;times within 5&nbsp;minutes. "
+        "systemd has stopped retrying — the service is now in <strong>failed</strong> state."
+    )
+
     journal_text = _get_journal_tail(service, lines=30)
     hints_html   = "".join(
         f'<li style="margin:4px 0;">{h}</li>' for h in hints
@@ -242,11 +289,7 @@ def send_startup_failure_alert(service: str) -> None:
     </tr>
     <tr>
       <td style="color:#7f1d1d;font-weight:700;padding:4px 0;">What happened</td>
-      <td style="color:#1e293b;">
-        The service crashed and was restarted 5&nbsp;times within 5&nbsp;minutes.
-        systemd has stopped retrying — the service is now in
-        <strong>failed</strong> state.
-      </td>
+      <td style="color:#1e293b;">{what_happened}</td>
     </tr>
   </table>
 </div>
@@ -265,13 +308,18 @@ def send_startup_failure_alert(service: str) -> None:
             font-size:11px;line-height:1.5;overflow:auto;
             white-space:pre-wrap;word-break:break-all;">{html.escape(journal_text)}</pre>
 
+{"" if is_oneshot else """
 <p style="color:#64748b;font-size:12px;margin-top:16px;">
   ⚠ The watchdog's self-healing (5-minute restart loop) cannot help here —
   this alert fires specifically when the service is crashing too fast for any
   automated recovery to succeed.  Manual fix is required.
-</p>"""
+</p>"""}"""
 
-    subject = f"🆘 Pipeline FAILED: {service} — repeated startup crashes, manual fix needed"
+    subject = (
+        f"🆘 Pipeline FAILED: {service} — failed to complete, manual fix needed"
+        if is_oneshot else
+        f"🆘 Pipeline FAILED: {service} — repeated startup crashes, manual fix needed"
+    )
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject

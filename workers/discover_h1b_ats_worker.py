@@ -36,6 +36,7 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
+    DISCOVERY_DELAYED,
     DISCOVERY_DLQ,
     DISCOVERY_HEARTBEAT_S,
     DISCOVERY_INFLIGHT,
@@ -108,6 +109,31 @@ def _clear_retry(r, fein: str) -> None:
 # DLQ
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _requeue_delayed(r, fein: str, trigger: str, petition_count: int, delay_s: float) -> None:
+    """Park a failed FEIN in the delayed ZSET; score = not_before timestamp."""
+    payload = json.dumps({"fein": fein, "trigger": trigger, "petition_count": petition_count})
+    r.zadd(DISCOVERY_DELAYED, {payload: time.time() + delay_s})
+
+
+def _flush_delayed(r) -> None:
+    """Move any delayed items whose not_before has passed back to the main queue."""
+    items = r.zrangebyscore(DISCOVERY_DELAYED, "-inf", time.time(), withscores=True)
+    for raw, score in items:
+        try:
+            data = json.loads(raw)
+            member = json.dumps({"fein": data["fein"], "trigger": data.get("trigger", "staleness")})
+            r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
+        except Exception as exc:
+            log.warning("delayed flush: malformed entry %r — sending to DLQ (%s)", raw, exc)
+            dlq_payload = json.dumps({
+                "fein": "MALFORMED", "error_reason": str(exc),
+                "raw": repr(raw), "failed_at": time.time(),
+            })
+            r.lpush(DISCOVERY_DLQ, dlq_payload)
+        finally:
+            r.zrem(DISCOVERY_DELAYED, raw)
+
+
 def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
     payload = json.dumps({
         "fein":         fein,
@@ -136,21 +162,12 @@ def _load_company(conn, fein: str) -> "dict | None":
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
         JOIN dol_h1b_employers e USING (employer_fein)
-        LEFT JOIN (
-            SELECT dh.employer_fein, COUNT(*) AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
-            GROUP BY dh.employer_fein
-        ) u ON u.employer_fein = f.employer_fein
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE f.employer_fein = %s
     """, (fein,)).fetchone()
     if not row:
         return None
-    return dict(zip(
-        ["fein", "assigned_domain", "public_domain", "careers_url",
-         "kg_checked", "employer_name", "petition_count"],
-        row,
-    ))
+    return dict(row)
 
 
 def _write_metric(conn, fein: str, trigger: str,
@@ -194,9 +211,10 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
     Returns True on success (or permanent skip), False on transient error.
     trigger values: 'enrichment' | 're_detection' | 'staleness' | 'manual'
     """
-    conn = get_conn()
+    conn = None
     t_start = time.time()
     try:
+        conn = get_conn()
         m = _get_discover_ats()
         company = _load_company(conn, fein)
         if not company:
@@ -251,6 +269,7 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
                 prefetched=None, skip_brave=False,
             )
             _mark_kg_checked(conn, fein)
+            conn.commit()  # commit KG mark immediately — accurate even if result is bad
         else:
             # Subsequent pass: KG MID already cached in h1b_ats_discovery.
             # process_employer reads it via get_discovery_row → cached_mid path.
@@ -261,6 +280,12 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
                 prefetched=None, skip_brave=False,
             )
 
+        if not isinstance(result, dict):
+            log.error("fein=%s: process_employer returned %s — treating as failure",
+                      fein, type(result).__name__)
+            return False
+
+        # Only stamp last_discovered_at after confirming we got a valid result dict
         _write_last_discovered(conn, fein)
         conn.commit()
 
@@ -295,30 +320,40 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
 
     except Exception as exc:
         log.error("unexpected error discovering fein=%s: %s", fein, exc, exc_info=True)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return False
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inflight crash recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reclaim_inflight(r) -> None:
-    """Re-queue any FEINs left in the inflight ZSET from a prior crash or SIGKILL."""
-    items = r.zrange(DISCOVERY_INFLIGHT, 0, -1, withscores=True)
+def _reclaim_inflight(r, inflight_key: str) -> None:
+    """Re-queue any FEINs left in this instance's inflight ZSET from a prior crash or SIGKILL."""
+    items = r.zrange(inflight_key, 0, -1, withscores=True)
     if not items:
         return
-    log.warning("reclaiming %d inflight FEINs from prior run", len(items))
-    for fein, score in items:
-        member = json.dumps({"fein": fein, "trigger": "staleness"})
-        r.zadd(DISCOVERY_QUEUE, {member: int(score)}, gt=True)
-        r.zrem(DISCOVERY_INFLIGHT, fein)
-        log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
+    log.warning("reclaiming %d inflight FEINs from prior run (key=%s)", len(items), inflight_key)
+    for raw_member, score in items:
+        # Inflight member is JSON {"fein": ..., "trigger": ...}; legacy bare-fein fallback.
+        try:
+            data     = json.loads(raw_member)
+            fein_r   = data["fein"]
+            trigger_r = data.get("trigger", "staleness")
+        except (json.JSONDecodeError, KeyError, TypeError):
+            fein_r    = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
+            trigger_r = "staleness"
+        queue_member = json.dumps({"fein": fein_r, "trigger": trigger_r})
+        r.zadd(DISCOVERY_QUEUE, {queue_member: int(score)}, gt=True)
+        r.zrem(inflight_key, raw_member)
+        log.info("reclaimed inflight fein=%s trigger=%s score=%d", fein_r, trigger_r, int(score))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,8 +368,11 @@ def run_worker(once: bool = False) -> None:
     hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=DISCOVERY_HEARTBEAT_S).start()
 
-    log.info("discover-h1b-ats-worker started")
-    _reclaim_inflight(r)
+    # Use a per-instance inflight key so @1 and @2 don't reclaim each other's active items
+    _inflight_key = f"{DISCOVERY_INFLIGHT}:{_instance}" if _instance else DISCOVERY_INFLIGHT
+
+    log.info("discover-h1b-ats-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
+    _reclaim_inflight(r, _inflight_key)
 
     try:
         while True:
@@ -342,11 +380,21 @@ def run_worker(once: bool = False) -> None:
                 log.info("Maintenance window active — pausing 30s")
                 time.sleep(30)
 
+            _flush_delayed(r)
+
             # Pop highest petition_count company
             result = r.zpopmax(DISCOVERY_QUEUE, count=1)
             if not result:
-                log.info("Discovery queue empty — exiting")
-                break
+                earliest = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
+                if not earliest:
+                    log.info("Discovery queue empty — exiting")
+                    break
+                _, next_ts = earliest[0]
+                wait_s = max(1.0, next_ts - time.time())
+                log.info("Discovery queue empty; %d delayed item(s) — sleeping %.0fs",
+                         r.zcard(DISCOVERY_DELAYED), wait_s)
+                time.sleep(wait_s)
+                continue
 
             raw_member, score = result[0]
             petition_count = int(score)
@@ -357,8 +405,10 @@ def run_worker(once: bool = False) -> None:
                 data    = json.loads(raw_member)
                 fein    = data["fein"]
                 trigger = data.get("trigger", "enrichment")
-            except (json.JSONDecodeError, KeyError):
-                # Treat as bare FEIN if it looks like one (digits only)
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # Treat as bare FEIN if it looks like one (digits only).
+                # TypeError is needed because json.loads("123456789") returns int,
+                # and int["fein"] raises TypeError, not KeyError.
                 bare = raw_member.strip() if isinstance(raw_member, str) else raw_member.decode(errors="replace").strip()
                 if bare.isdigit():
                     fein    = bare
@@ -381,14 +431,16 @@ def run_worker(once: bool = False) -> None:
                 r.lpush(DISCOVERY_DLQ, _dlq_payload)
                 continue
 
-            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
-            r.zadd(DISCOVERY_INFLIGHT, {fein: petition_count})
+            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start).
+            # Store JSON so _reclaim_inflight can restore the original trigger.
+            inflight_member = json.dumps({"fein": fein, "trigger": trigger})
+            r.zadd(_inflight_key, {inflight_member: petition_count})
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= DISCOVERY_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
-                r.zrem(DISCOVERY_INFLIGHT, fein)
+                r.zrem(_inflight_key, inflight_member)
                 continue
 
             success = _process_company(fein, petition_count, trigger)
@@ -398,16 +450,17 @@ def run_worker(once: bool = False) -> None:
                 count = _incr_retry(r, fein)
                 if count >= DISCOVERY_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
+                    _clear_retry(r, fein)
                 else:
-                    # Re-queue for retry — preserve original trigger and score
-                    member = json.dumps({"fein": fein, "trigger": trigger})
-                    r.zadd(DISCOVERY_QUEUE, {member: petition_count})
-                    log.warning("fein=%s re-queued for retry (%d/%d)",
-                                fein, count, DISCOVERY_MAX_RETRIES)
+                    # Exponential backoff: 30s → 120s → 480s
+                    delay_s = 30 * (4 ** (count - 1))
+                    _requeue_delayed(r, fein, trigger, petition_count, delay_s)
+                    log.warning("fein=%s retry %d/%d — delayed %.0fs",
+                                fein, count, DISCOVERY_MAX_RETRIES, delay_s)
             else:
                 _clear_retry(r, fein)
 
-            r.zrem(DISCOVERY_INFLIGHT, fein)
+            r.zrem(_inflight_key, inflight_member)
 
             if once:
                 break

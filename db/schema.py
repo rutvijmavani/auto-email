@@ -1785,6 +1785,21 @@ def init_db():
     _cleanup_seen_job_ids(c)
     _cleanup_unmatched_emails(c)
 
+    c.execute("""
+        CREATE OR REPLACE VIEW uscis_petition_counts AS
+            SELECT um.dol_fein AS employer_fein,
+                   COALESCE(SUM(
+                       p.new_employment_approval + p.continuation_approval +
+                       p.change_same_employer_approval + p.new_concurrent_approval +
+                       p.change_of_employer_approval + p.amended_approval
+                   ), 0)::bigint AS petition_count
+            FROM uscis_dol_fuzzy_map um
+            LEFT JOIN uscis_h1b_petitions p
+                ON p.employer_legal_norm = um.employer_legal_norm
+                AND p.tax_id = um.tax_id
+            GROUP BY um.dol_fein
+    """)
+
     conn.commit()
     conn.close()
     print("[OK] Database initialized: PostgreSQL recruiter_pipeline")

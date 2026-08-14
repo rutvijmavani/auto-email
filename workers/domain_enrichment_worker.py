@@ -12,7 +12,8 @@ For each company FEIN:
 Worker exits cleanly when queue is empty — not a perpetual daemon.
 Started by:
   - fuzzy_match_uscis_dol.py   (after bulk queue population)
-  - staleness_checker cron      (>90 days stale companies)
+  - staleness_checker cron      (every ENRICH_STALENESS_DAYS days, default 90; also for
+                                  companies with public_domain IS NULL regardless of age)
   - API endpoint                (on-demand user-triggered re-enrichment)
 
 Usage:
@@ -36,6 +37,7 @@ from config import (
     ENRICHMENT_HEARTBEAT_S,
     ENRICHMENT_MAX_RETRIES,
     REDIS_DB_MAINTENANCE,
+    STALENESS_DISCOVERY_MIN_PETITIONS,
 )
 from db.connection import get_conn
 from jobs.career_page import detect_via_career_page
@@ -103,11 +105,17 @@ def _flush_delayed(r) -> int:
     for item in items:
         try:
             data = json.loads(item)
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {data["fein"]: data["petition_count"]})
-            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {data["fein"]: data["petition_count"]}, gt=True)
             moved += 1
         except Exception as e:
             log.warning("Failed to flush delayed item %s: %s", item, e)
+            dlq_payload = json.dumps({
+                "fein": "MALFORMED", "error_reason": str(e),
+                "raw": repr(item), "failed_at": time.time(),
+            })
+            r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
+        finally:
+            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
     if moved:
         log.info("Flushed %d delayed items to enrichment queue", moved)
     return moved
@@ -165,20 +173,12 @@ def _load_company(conn, fein: str) -> "dict | None":
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
         JOIN dol_h1b_employers e USING (employer_fein)
-        LEFT JOIN (
-            SELECT employer_fein, COUNT(*) AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
-            GROUP BY dh.employer_fein
-        ) u ON u.employer_fein = f.employer_fein
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE f.employer_fein = %s
     """, (fein,)).fetchone()
     if not row:
         return None
-    return dict(zip(
-        ["fein", "assigned_domain", "careers_url", "employer_name", "petition_count"],
-        row,
-    ))
+    return dict(row)
 
 
 def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> None:
@@ -226,13 +226,11 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
             (employer_fein, domain, company_name, platform, slug, source, priority)
         VALUES (%s, %s, %s, %s, %s, 'enrichment', %s)
         ON CONFLICT (domain, platform) DO UPDATE SET
-            slug          = CASE
-                                WHEN company_ats.reviewed_at IS NOT NULL THEN company_ats.slug
-                                ELSE EXCLUDED.slug
-                            END,
+            slug          = EXCLUDED.slug,
             employer_fein = COALESCE(EXCLUDED.employer_fein, company_ats.employer_fein),
             source        = EXCLUDED.source,
             detected_at   = NOW()
+        WHERE company_ats.reviewed_at IS NULL
     """, (fein, domain, company_name, platform, slug, petition_count))
 
 
@@ -251,17 +249,18 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
     Run full enrichment for one company.
     Returns True on success (or permanent skip), False on transient error.
     """
-    conn = get_conn()
+    conn = None
     t_start = time.time()
     try:
+        conn = get_conn()
         company = _load_company(conn, fein)
         if not company:
-            log.warning("fein=%s not found in fein_domain_map — skipping", fein)
+            log.warning("fein=%s trigger=%s not found in fein_domain_map — permanent skip (LCA not yet ingested?)", fein, trigger)
             return True
 
         assigned = company["assigned_domain"]
         if not assigned:
-            log.warning("fein=%s has no assigned_domain — skipping", fein)
+            log.warning("fein=%s trigger=%s assigned_domain is NULL — permanent skip (no email domain in LCA data)", fein, trigger)
             return True
 
         employer_name  = company["employer_name"]
@@ -279,7 +278,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             return True
 
         probe_domain = public_domain or assigned
-        website_url  = f"https://www.{probe_domain}"
+        website_url  = f"https://{probe_domain}"
 
         _write_domain(conn, fein, public_domain, method)
         conn.commit()
@@ -293,6 +292,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             careers_url, p3_platform, p3_slug = _phase3(website_url)
             if careers_url:
                 _write_careers(conn, fein, careers_url)
+                existing_careers = careers_url  # keep in sync so phase6 sees it as already set
                 conn.commit()
                 log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
 
@@ -331,7 +331,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 4: push to discovery_queue ───────────────────────────────────
-        if petition_count > 0:
+        if petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
             _push_to_discovery(r, fein, petition_count)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
@@ -375,28 +375,30 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
     except Exception as exc:
         log.error("unexpected error enriching fein=%s: %s", fein, exc, exc_info=True)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         return False
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Inflight crash recovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reclaim_inflight(r) -> None:
-    """Re-queue any FEINs left in the inflight ZSET from a prior crash or SIGKILL."""
-    items = r.zrange(DOMAIN_ENRICHMENT_INFLIGHT, 0, -1, withscores=True)
+def _reclaim_inflight(r, inflight_key: str) -> None:
+    """Re-queue any FEINs left in the per-instance inflight ZSET from a prior crash."""
+    items = r.zrange(inflight_key, 0, -1, withscores=True)
     if not items:
         return
-    log.warning("reclaiming %d inflight FEINs from prior run", len(items))
+    log.warning("reclaiming %d inflight FEINs from %s", len(items), inflight_key)
     for fein, score in items:
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: int(score)}, gt=True)
-        r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
+        r.zrem(inflight_key, fein)
         log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
 
 
@@ -412,8 +414,10 @@ def run_worker(once: bool = False) -> None:
     hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=ENRICHMENT_HEARTBEAT_S).start()
 
-    log.info("domain-enrichment-worker started")
-    _reclaim_inflight(r)
+    _inflight_key = f"{DOMAIN_ENRICHMENT_INFLIGHT}:{_instance}" if _instance else DOMAIN_ENRICHMENT_INFLIGHT
+
+    log.info("domain-enrichment-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
+    _reclaim_inflight(r, _inflight_key)
 
     try:
         while True:
@@ -427,20 +431,28 @@ def run_worker(once: bool = False) -> None:
             # Pop highest petition_count company
             result = r.zpopmax(DOMAIN_ENRICHMENT_QUEUE, count=1)
             if not result:
-                log.info("Enrichment queue empty — exiting")
-                break
+                earliest = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
+                if not earliest:
+                    log.info("Enrichment queue empty — exiting")
+                    break
+                _, next_ts = earliest[0]
+                wait_s = max(1.0, next_ts - time.time())
+                log.info("Enrichment queue empty; %d delayed item(s) — sleeping %.0fs",
+                         r.zcard(DOMAIN_ENRICHMENT_DELAYED), wait_s)
+                time.sleep(wait_s)
+                continue
 
             fein, score = result[0]
             petition_count = int(score)
 
             # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
-            r.zadd(DOMAIN_ENRICHMENT_INFLIGHT, {fein: petition_count})
+            r.zadd(_inflight_key, {fein: petition_count})
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= ENRICHMENT_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
-                r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
+                r.zrem(_inflight_key, fein)
                 continue
 
             success = _process_company(r, fein, petition_count)
@@ -459,7 +471,7 @@ def run_worker(once: bool = False) -> None:
             else:
                 _clear_retry(r, fein)
 
-            r.zrem(DOMAIN_ENRICHMENT_INFLIGHT, fein)
+            r.zrem(_inflight_key, fein)
 
             if once:
                 break

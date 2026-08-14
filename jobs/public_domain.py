@@ -14,6 +14,7 @@ Returns (public_domain, method, retry_after) where retry_after is non-None
 only on certspotter 429 — caller should re-queue the company with that delay.
 """
 
+import ipaddress
 import time
 from urllib.parse import urlparse
 
@@ -21,12 +22,21 @@ import requests
 import tldextract as _tldextract
 import urllib3
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+_urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
 
 from config import CERTSPOTTER_API_KEY
 from logger import get_logger
 
 log = get_logger(__name__)
+
+
+def _is_private_ip_literal(host: str) -> bool:
+    """Return True if host is an IP address literal in a private/loopback/link-local range."""
+    try:
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local
+    except ValueError:
+        return False  # hostname, not an IP literal
 
 # Root domains belonging to cloud / email / CDN providers — never a real company domain
 GENERIC_ROOTS = {
@@ -68,9 +78,20 @@ def _redirect_domain(host: str) -> "str | None":
             final = _root(r.url)
             return final if final != _root(host) else ""
         except requests.exceptions.SSLError:
-            # Invalid cert breaks the redirect chain — we can't trust the destination.
-            log.debug("_redirect_domain: SSL error for %s — no redirect signal", url)
-            continue
+            # verify=False is intentional: company domains frequently have self-signed or
+            # expired certs. We only use the redirect destination's domain name, never
+            # the response body, so cert validity doesn't affect correctness. This
+            # function is only called on domains already in our internal database.
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
+                    r2 = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False)
+                final = _root(r2.url)
+                return final if final != _root(host) else ""
+            except Exception:
+                log.debug("_redirect_domain: SSL error for %s — no redirect signal", url)
+                continue
         except Exception:
             continue
     return None
@@ -85,9 +106,14 @@ def _has_web(root: str) -> bool:
             if r.status_code < 500:
                 return True
         except requests.exceptions.SSLError:
+            # Same verify=False rationale as _redirect_domain: internal DB domains only,
+            # we only check response status, not content.
             log.debug("_has_web: SSL error for %s — retrying without TLS verify", url)
             try:
-                r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
+                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False)
                 if r.status_code < 500:
                     return True
             except Exception:
@@ -108,7 +134,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
     global _certspotter_retry_after
 
     if time.time() < _certspotter_retry_after:
-        wait = int(_certspotter_retry_after - time.time())
+        wait = max(1, int(_certspotter_retry_after - time.time()))
         log.debug("certspotter in-process backoff: %ds remaining", wait)
         return [], wait
 
@@ -148,7 +174,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
                 if root and root not in GENERIC_ROOTS:
                     roots[root] = roots.get(root, 0) + 1
 
-        top = sorted(roots, key=lambda x: -roots[x])[:10]
+        top = sorted(roots, key=lambda x: (-roots[x], x))[:10]
         log.debug("certspotter: %d certs for %s → top roots: %s", len(certs), domain, top)
         return top, None
 
@@ -179,7 +205,7 @@ def _ct_crtsh(domain: str) -> list[str]:
                 if root and root not in GENERIC_ROOTS:
                     roots[root] = roots.get(root, 0) + 1
 
-        top = sorted(roots, key=lambda x: -roots[x])[:10]
+        top = sorted(roots, key=lambda x: (-roots[x], x))[:10]
         log.debug("crt.sh: top roots for %s: %s", domain, top)
         return top
 
@@ -191,8 +217,14 @@ def _ct_crtsh(domain: str) -> list[str]:
 def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
     """certspotter primary, crt.sh fallback. Returns (candidates, retry_after_or_None, source)."""
     candidates, retry_after = _ct_certspotter(domain)
-    if candidates or retry_after is not None:
-        return candidates, retry_after, "certspotter"
+    if candidates:
+        return candidates, None, "certspotter"
+    if retry_after is not None:
+        # certspotter in backoff — still try crt.sh before propagating quota error
+        fallback = _ct_crtsh(domain)
+        if fallback:
+            return fallback, None, "crtsh"
+        return [], retry_after, "certspotter"
     candidates = _ct_crtsh(domain)
     return candidates, None, "crtsh"
 
@@ -209,16 +241,27 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     """
     domain = assigned_domain.lower().strip()
 
+    if _is_private_ip_literal(domain):
+        log.warning("public_domain: rejecting private address %s", domain)
+        return None, "no_signal", None
+
     # Step 1 — HTTP redirect on full domain
     redir = _redirect_domain(domain)
     if redir is None:
         log.debug("DNS fail for %s — trying root fallback", domain)
     elif redir == "":
-        log.debug("%s already resolves publicly", domain)
-        return None, "same_domain", None
-    else:
+        # Only accept "already public" for root domains. A subdomain like
+        # ny.email.gs.com resolves within the same root (gs.com), but the
+        # real public site may be at goldmansachs.com — fall through to CT log.
+        if not _tldextract.extract(domain).subdomain:
+            log.debug("%s already resolves publicly", domain)
+            return None, "same_domain", None
+        log.debug("%s resolves within its root but has subdomain — continuing", domain)
+    elif redir not in GENERIC_ROOTS:
         log.info("public_domain: %s → %s (http_redirect)", domain, redir)
         return redir, "http_redirect", None
+    else:
+        log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
     # Step 2 — Root-domain fallback (strip subdomain prefix via PSL)
     ext      = _tldextract.extract(domain)
@@ -228,11 +271,14 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         if redir is None:
             pass
         elif redir == "":
-            log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
-            return root_try, "root_fallback", None
-        else:
+            if root_try not in GENERIC_ROOTS:
+                log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
+                return root_try, "root_fallback", None
+        elif redir not in GENERIC_ROOTS:
             log.info("public_domain: %s → %s (root_fallback)", domain, redir)
             return redir, "root_fallback", None
+        else:
+            log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
     # Step 3 — CT log (certspotter → crt.sh fallback)
     log.debug("querying CT logs for %s", domain)

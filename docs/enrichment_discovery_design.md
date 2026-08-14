@@ -315,7 +315,8 @@ last_discovered_at     TIMESTAMP -- when discovery worker last processed this ro
 
 ### company_ats (existing, verify)
 ```
-ats_platform, ats_slug, source_url, last_detected_at — should exist
+employer_fein, domain, company_name, platform, slug, source, priority, detected_at — exist
+is_monitored, reviewed_at, first_scanned_at, last_checked_at, consecutive_empty_days — exist
 trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 ```
 
@@ -349,7 +350,7 @@ job_fetcher_worker:
         → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
 
 staleness_checker (daily cron):
-    WHERE last_discovered_at < NOW() - INTERVAL '90 days' (DISCOVER_REDETECT_EMPTY_DAYS=30)
+    WHERE last_discovered_at < NOW() - INTERVAL '30 days' (DISCOVER_REDETECT_EMPTY_DAYS=30)
       AND petition_count >= threshold
         → ZADD discovery_queue petition_count fein
         → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2

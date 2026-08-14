@@ -31,16 +31,12 @@ def probe(url: str, company_root: str):
         return {
             "status":        r.status_code,
             "final_url":     final_url,
-            "html_len":      len(r.text),
+            "html_len":      len(r.content),
             "redirected":    redirected,
             "jumped_domain": jumped,
             "final_root":    final_root,
         }
-    except requests.exceptions.ConnectionError as e:
-        return {"error": f"ConnectionError: {e}"}
-    except requests.exceptions.Timeout:
-        return {"error": "Timeout"}
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         return {"error": str(e)}
 
 
@@ -77,7 +73,7 @@ def run_phase3(website_url: str):
             elif r["status"] != 200:
                 flag = f"  ← {r['status']}"
             elif r["html_len"] > 0:
-                flag = f"  ← {r['html_len']} bytes"
+                flag = f"  ← {r['html_len']} B"
 
             final = r["final_url"] if r["redirected"] else "(no redirect)"
             print(f"  {url:<45} {r['status']:>6}  {final}{flag}")

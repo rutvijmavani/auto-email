@@ -1183,6 +1183,10 @@ def discover_careers_url(
                     url, result["platform"], result["slug"],
                 )
                 return final_url, result["platform"], result["slug"]
+            # Pattern didn't match (e.g. new ATS subdomain without a known slug format).
+            # Keep the URL as a hint so later phases can re-detect, but don't discard it.
+            log.debug("  %s → ATS domain (%s) but no slug match — keeping URL", url, final_root)
+            return final_url, None, None
 
         # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
         if final_root != company_root:
@@ -1350,6 +1354,10 @@ def _upsert_company_ats(
     ON CONFLICT (domain, platform): update slug + priority but never touch is_monitored
     or status, so a previously reviewed entry is not reset.
 
+    Before inserting, deletes any unreviewed row for the same (employer_fein, platform)
+    with a different domain — handles the case where website_url was rewritten between
+    runs (e.g. gs.com → goldmansachs.com) so dedup on (domain, platform) still works.
+
     Skips the write if this domain+platform is already actively monitored in
     prospective_companies (ats_platform not null/unknown/unsupported) or in
     company_ats (is_monitored=TRUE) — prevents duplicate monitoring.
@@ -1381,6 +1389,18 @@ def _upsert_company_ats(
             domain, platform,
         )
         return
+
+    # Remove any stale row for the same FEIN+platform with a different domain
+    # (e.g. website_url was rewritten from gs.com → goldmansachs.com between runs).
+    # Only touch unreviewed rows so manually-reviewed entries are never lost.
+    if fein:
+        cur.execute("""
+            DELETE FROM company_ats
+            WHERE employer_fein = %s
+              AND platform = %s
+              AND domain != %s
+              AND reviewed_at IS NULL
+        """, (fein, platform, domain))
 
     cur.execute("""
         INSERT INTO company_ats
@@ -1627,11 +1647,13 @@ def process_employer(
                 if _best_slug:
                     detected_slug = _best_slug
                 if not careers_url:
-                    careers_url    = _best.get("source_url")
-                    careers_source = "phase7"
+                    _src_url = _best.get("source_url")
+                    if _src_url:
+                        careers_url    = _src_url
+                        careers_source = "phase7"
                 if detected_platform:
                     ats_source = "phase7"
-                log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
+                    log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
 
@@ -1639,11 +1661,13 @@ def process_employer(
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
     # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
     if careers_url and website_url:
+        from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)
         _website_root = _root_domain(website_url)
         if (_careers_root and _website_root
                 and _careers_root != _website_root
-                and _careers_root not in _KNOWN_ATS_DOMAINS):
+                and _careers_root not in _KNOWN_ATS_DOMAINS
+                and _careers_root not in _GENERIC_ROOTS):
             log.info("  Updating website_url: %s → https://%s (via careers domain)",
                      website_url, _careers_root)
             website_url = f"https://{_careers_root}"

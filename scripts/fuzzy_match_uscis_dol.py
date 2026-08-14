@@ -44,6 +44,7 @@ _FUZZY_AUTO_THRESHOLD  = 95   # score >= this → auto-match without LLM (match_
 _FUZZY_DOMINANT_SCORE  = 80   # dominant-winner rule: best >= this AND gap >= _FUZZY_DOMINANT_GAP
 _FUZZY_DOMINANT_GAP    = 25   # minimum gap between best and second score to auto-match
 _TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto threshold
+_ZADD_PIPELINE_BATCH   = 500  # flush Redis pipeline every N items to cap memory per batch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,50 +326,33 @@ def _populate_enrichment_queue(conn, r) -> None:
     Then start the enrichment workers via systemctl.
     """
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
-    import subprocess
+    from workers.worker_control import start_workers
 
     rows = conn.execute("""
         SELECT f.employer_fein,
                COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
-        LEFT JOIN (
-            SELECT dh.employer_fein, COUNT(*) AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            JOIN dol_h1b_employers dh ON dh.employer_fein = um.dol_fein
-            GROUP BY dh.employer_fein
-        ) u ON u.employer_fein = f.employer_fein
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE f.public_domain IS NULL
-           OR f.last_enriched_at < NOW() - INTERVAL %s
+           OR f.last_enriched_at IS NULL
+           OR f.last_enriched_at < NOW() - %s::interval
     """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
 
     if not rows:
         log.info("enrichment queue: no eligible companies — skipping")
         return
 
-    _ZADD_BATCH = 500
     pipe = r.pipeline(transaction=False)
     for i, row in enumerate(rows):
-        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {row["employer_fein"]: row["petition_count"]})
-        if (i + 1) % _ZADD_BATCH == 0:
+        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {row["employer_fein"]: row["petition_count"]}, gt=True)
+        if (i + 1) % _ZADD_PIPELINE_BATCH == 0:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
-    if len(rows) % _ZADD_BATCH != 0:
+    if len(rows) % _ZADD_PIPELINE_BATCH != 0:
         pipe.execute()
     log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", len(rows))
 
-    # Start enrichment workers — systemctl start is a no-op if already running
-    for unit in ("domain-enrichment-worker@1", "domain-enrichment-worker@2"):
-        try:
-            result = subprocess.run(
-                ["sudo", "systemctl", "start", unit],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode == 0:
-                log.info("started %s", unit)
-            else:
-                log.warning("systemctl start %s failed: %s", unit, result.stderr.strip())
-        except Exception as exc:
-            log.warning("could not start %s: %s", unit, exc)
+    start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
 
 
 def _backfill_candidates() -> None:
