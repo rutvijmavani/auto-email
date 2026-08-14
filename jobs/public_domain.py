@@ -74,8 +74,9 @@ def _redirect_domain(host: str) -> "str | None":
     for scheme in ("https", "http"):
         url = f"{scheme}://{host}"
         try:
-            r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT)
+            r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, stream=True)
             final = _root(r.url)
+            r.close()
             return final if final != _root(host) else ""
         except requests.exceptions.SSLError:
             # verify=False is intentional: company domains frequently have self-signed or
@@ -86,8 +87,9 @@ def _redirect_domain(host: str) -> "str | None":
                 import warnings
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                    r2 = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False)
+                    r2 = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
                 final = _root(r2.url)
+                r2.close()
                 return final if final != _root(host) else ""
             except Exception:
                 log.debug("_redirect_domain: SSL error for %s — no redirect signal", url)
@@ -102,8 +104,10 @@ def _has_web(root: str) -> bool:
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
         try:
-            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True)
-            if r.status_code < 500:
+            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, stream=True)
+            status = r.status_code
+            r.close()
+            if status < 500:
                 return True
         except requests.exceptions.SSLError:
             # Same verify=False rationale as _redirect_domain: internal DB domains only,
@@ -113,8 +117,10 @@ def _has_web(root: str) -> bool:
                 import warnings
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False)
-                if r.status_code < 500:
+                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False, stream=True)
+                status = r.status_code
+                r.close()
+                if status < 500:
                     return True
             except Exception:
                 pass
@@ -187,7 +193,8 @@ def _ct_crtsh(domain: str) -> list[str]:
     """crt.sh fallback — slower, sometimes unavailable."""
     try:
         r = requests.get(
-            f"https://crt.sh/?q={domain}&output=json",
+            "https://crt.sh/",
+            params={"q": domain, "output": "json"},
             timeout=_CRTSH_TIMEOUT,
             headers={"User-Agent": "python-h1b-discovery/1.0"},
         )
@@ -255,7 +262,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         # real public site may be at goldmansachs.com — fall through to CT log.
         if not _tldextract.extract(domain).subdomain:
             log.debug("%s already resolves publicly", domain)
-            return None, "same_domain", None
+            return domain, "same_domain", None
         log.debug("%s resolves within its root but has subdomain — continuing", domain)
     elif redir not in GENERIC_ROOTS:
         log.info("public_domain: %s → %s (http_redirect)", domain, redir)

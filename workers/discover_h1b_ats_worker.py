@@ -51,6 +51,17 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
+# Lua script: atomically pop the highest-score member from KEYS[1] (queue)
+# and add it to KEYS[2] (inflight ZSET) with the same score.
+# Returns {member, score} or {} when the queue is empty.
+# Using a single round-trip eliminates the crash window between zpopmax and zadd.
+_ATOMIC_POP_LUA = """
+local res = redis.call('ZPOPMAX', KEYS[1], 1)
+if #res == 0 then return {} end
+redis.call('ZADD', KEYS[2], tonumber(res[2]), res[1])
+return {res[1], res[2]}
+"""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Lazy imports — heavy dependencies loaded once on first use
@@ -123,15 +134,19 @@ def _flush_delayed(r) -> None:
             data = json.loads(raw)
             member = json.dumps({"fein": data["fein"], "trigger": data.get("trigger", "staleness")})
             r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
-        except Exception as exc:
+            r.zrem(DISCOVERY_DELAYED, raw)  # only remove after successful insert
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            # Malformed payload — cannot be re-queued; send to DLQ and discard
             log.warning("delayed flush: malformed entry %r — sending to DLQ (%s)", raw, exc)
             dlq_payload = json.dumps({
                 "fein": "MALFORMED", "error_reason": str(exc),
                 "raw": repr(raw), "failed_at": time.time(),
             })
             r.lpush(DISCOVERY_DLQ, dlq_payload)
-        finally:
             r.zrem(DISCOVERY_DELAYED, raw)
+        except Exception as exc:
+            # Transient Redis error — leave in DELAYED so next flush cycle retries
+            log.warning("delayed flush: ZADD failed for %r — will retry next cycle (%s)", raw, exc)
 
 
 def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
@@ -262,10 +277,12 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         # Run full discovery pipeline via process_employer().
         # kg_checked=False → KG always runs on first pass (even if careers_url set).
         # pass skip_brave=False so Phase 4 (Brave) runs — this worker is the right place.
+        # Use force=True for re_detection/manual triggers so _is_recently_checked is bypassed.
+        _force = trigger in ("re_detection", "manual")
         if not kg_checked:
             # First pass: always run KG (prefetched=None forces inline KG call)
             result = m.process_employer(
-                emp, conn, dry_run=False, force=False,
+                emp, conn, dry_run=False, force=_force,
                 prefetched=None, skip_brave=False,
             )
             _mark_kg_checked(conn, fein)
@@ -273,10 +290,8 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         else:
             # Subsequent pass: KG MID already cached in h1b_ats_discovery.
             # process_employer reads it via get_discovery_row → cached_mid path.
-            # Use force=True on re_detection trigger so the recency guard is bypassed.
-            force = trigger in ("re_detection", "manual")
             result = m.process_employer(
-                emp, conn, dry_run=False, force=force,
+                emp, conn, dry_run=False, force=_force,
                 prefetched=None, skip_brave=False,
             )
 
@@ -373,6 +388,7 @@ def run_worker(once: bool = False) -> None:
 
     log.info("discover-h1b-ats-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
     _reclaim_inflight(r, _inflight_key)
+    _pop_to_inflight = r.register_script(_ATOMIC_POP_LUA)
 
     try:
         while True:
@@ -382,9 +398,10 @@ def run_worker(once: bool = False) -> None:
 
             _flush_delayed(r)
 
-            # Pop highest petition_count company
-            result = r.zpopmax(DISCOVERY_QUEUE, count=1)
-            if not result:
+            # Atomically pop highest petition_count member from queue
+            # and add it to inflight in a single Lua call — no crash window.
+            _pop_result = _pop_to_inflight(keys=[DISCOVERY_QUEUE, _inflight_key])
+            if not _pop_result:
                 earliest = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
                 if not earliest:
                     log.info("Discovery queue empty — exiting")
@@ -396,8 +413,8 @@ def run_worker(once: bool = False) -> None:
                 time.sleep(wait_s)
                 continue
 
-            raw_member, score = result[0]
-            petition_count = int(score)
+            raw_member     = _pop_result[0]             # bytes — already written to inflight
+            petition_count = int(float(_pop_result[1])) # score returned as bytes by Lua
 
             # Member is JSON: {"fein": "...", "trigger": "..."}
             # Legacy bare-FEIN members (from older staleness_checker) are accepted as fallback.
@@ -421,6 +438,7 @@ def run_worker(once: bool = False) -> None:
                     })
                     log.error("Malformed discovery queue member %r — sending to DLQ", raw_member)
                     r.lpush(DISCOVERY_DLQ, _dlq_payload)
+                    r.zrem(_inflight_key, raw_member)
                     continue
             except Exception as e:
                 _dlq_payload = json.dumps({
@@ -429,18 +447,14 @@ def run_worker(once: bool = False) -> None:
                 })
                 log.error("Malformed discovery queue member %r: %s — sending to DLQ", raw_member, e)
                 r.lpush(DISCOVERY_DLQ, _dlq_payload)
+                r.zrem(_inflight_key, raw_member)
                 continue
-
-            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start).
-            # Store JSON so _reclaim_inflight can restore the original trigger.
-            inflight_member = json.dumps({"fein": fein, "trigger": trigger})
-            r.zadd(_inflight_key, {inflight_member: petition_count})
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= DISCOVERY_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
-                r.zrem(_inflight_key, inflight_member)
+                r.zrem(_inflight_key, raw_member)
                 continue
 
             success = _process_company(fein, petition_count, trigger)
@@ -460,7 +474,7 @@ def run_worker(once: bool = False) -> None:
             else:
                 _clear_retry(r, fein)
 
-            r.zrem(_inflight_key, inflight_member)
+            r.zrem(_inflight_key, raw_member)
 
             if once:
                 break

@@ -326,7 +326,7 @@ def _populate_enrichment_queue(conn, r) -> None:
     Then start the enrichment workers via systemctl.
     """
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
-    from workers.worker_control import start_workers
+    from workers.worker_control import start_workers, ENRICHMENT_WORKERS
 
     rows = conn.execute("""
         SELECT f.employer_fein,
@@ -344,7 +344,8 @@ def _populate_enrichment_queue(conn, r) -> None:
 
     pipe = r.pipeline(transaction=False)
     for i, row in enumerate(rows):
-        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {row["employer_fein"]: row["petition_count"]}, gt=True)
+        member = json.dumps({"fein": row["employer_fein"], "trigger": "fuzzy_match"})
+        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
         if (i + 1) % _ZADD_PIPELINE_BATCH == 0:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
@@ -352,7 +353,7 @@ def _populate_enrichment_queue(conn, r) -> None:
         pipe.execute()
     log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", len(rows))
 
-    start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+    start_workers(*ENRICHMENT_WORKERS)
 
 
 def _backfill_candidates() -> None:

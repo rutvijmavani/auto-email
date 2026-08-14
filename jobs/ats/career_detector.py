@@ -961,10 +961,11 @@ def detect_company(company_domain, session=None, *, seed_url=None):
         candidate = f"https://{domain}{path}"
         if candidate not in seen_seeds:
             queue.append((candidate, None))
-    root = _host_root(domain)
     if len(domain.split(".")) > 1:
         for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-            queue.append((f"https://{subdomain}.{root}", None))
+            candidate = f"https://{subdomain}.{company_root}"
+            if candidate not in seen_seeds:
+                queue.append((candidate, None))
 
     first_200_url = [None]  # mutable — _process_page sets this on first successful fetch
 

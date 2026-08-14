@@ -41,6 +41,8 @@ from datetime import datetime, timezone
 import tldextract
 from urllib.parse import urljoin, urlparse
 
+_tldextract = tldextract.TLDExtract(suffix_list_urls=())
+
 from rapidfuzz import process as fuzz_process, utils as fuzz_utils
 from rapidfuzz.fuzz import ratio as fuzz_ratio, WRatio
 
@@ -210,7 +212,7 @@ def strip_legal_suffixes(name: str) -> str:
 def _root_domain(url: str) -> str:
     """'careers.amazon.co.uk' → 'amazon.co.uk' (PSL-aware registrable domain)."""
     host = urlparse(url).hostname or ""
-    ext  = tldextract.extract(host)
+    ext  = _tldextract.extract(host)
     return ext.registered_domain or host
 
 
@@ -1156,6 +1158,7 @@ def discover_careers_url(
     for path in _CAREER_PATHS:
         candidates.append(base + path)
 
+    _fallback = None  # ATS-domain hit with no slug match — returned only if no better result found
     for url in candidates:
         html, final_url = _fetch_html(url)
         if html is None:
@@ -1184,9 +1187,12 @@ def discover_careers_url(
                 )
                 return final_url, result["platform"], result["slug"]
             # Pattern didn't match (e.g. new ATS subdomain without a known slug format).
-            # Keep the URL as a hint so later phases can re-detect, but don't discard it.
-            log.debug("  %s → ATS domain (%s) but no slug match — keeping URL", url, final_root)
-            return final_url, None, None
+            # Record as fallback hint but keep probing remaining candidates — a later
+            # candidate may yield the slug-bearing URL (e.g. company.com/careers → ATS).
+            log.debug("  %s → ATS domain (%s) but no slug match — keeping as fallback", url, final_root)
+            if _fallback is None:
+                _fallback = (final_url, None, None)
+            continue
 
         # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
         if final_root != company_root:
@@ -1201,7 +1207,7 @@ def discover_careers_url(
         )
         return final_url, platform, slug
 
-    return None, None, None
+    return _fallback or (None, None, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1400,6 +1406,7 @@ def _upsert_company_ats(
               AND platform = %s
               AND domain != %s
               AND reviewed_at IS NULL
+              AND is_monitored = FALSE
         """, (fein, platform, domain))
 
     cur.execute("""

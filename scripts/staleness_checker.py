@@ -42,7 +42,7 @@ from db.connection import get_conn
 from db.job_monitor import get_monitorable_companies
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
-from workers.worker_control import start_workers as _start_workers
+from workers.worker_control import start_workers as _start_workers, ENRICHMENT_WORKERS, DISCOVERY_WORKERS
 
 log = get_logger(__name__)
 
@@ -114,9 +114,10 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     added = 0
     pipe = r.pipeline(transaction=False)
     for i, row in enumerate(rows):
+        member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
         pipe.zadd(
             DOMAIN_ENRICHMENT_QUEUE,
-            {row["employer_fein"]: row["petition_count"]},
+            {member: row["petition_count"]},
             gt=True,    # only raise score — prevents lowering a high-priority item
         )
         added += 1
@@ -128,7 +129,7 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         pipe.execute()
 
     log.info("enrichment staleness: ZADD %d feins → %s", added, DOMAIN_ENRICHMENT_QUEUE)
-    _start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+    _start_workers(*ENRICHMENT_WORKERS)
     return added
 
 
@@ -142,9 +143,8 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE COALESCE(u.petition_count, 0) >= %s
           AND (
-              NOT EXISTS (SELECT 1 FROM company_ats WHERE employer_fein = f.employer_fein)
-              OR f.last_discovered_at IS NULL                      -- never discovered
-              OR f.last_discovered_at < NOW() - %s::interval      -- stale
+              f.last_discovered_at IS NULL                        -- never discovered
+              OR f.last_discovered_at < NOW() - %s::interval      -- stale (ATS may have changed)
           )
         ORDER BY petition_count DESC
     """, (
@@ -184,7 +184,7 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         pipe.execute()
 
     log.info("discovery staleness: ZADD %d feins → %s", added, DISCOVERY_QUEUE)
-    _start_workers("discover-h1b-ats-worker@1", "discover-h1b-ats-worker@2")
+    _start_workers(*DISCOVERY_WORKERS)
     return added
 
 

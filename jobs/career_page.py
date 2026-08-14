@@ -16,14 +16,23 @@
 import re
 import json
 import requests
-import tldextract
+import tldextract as _tldextract_mod
 from urllib.parse import urljoin, urlparse, parse_qs
+
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 from bs4 import BeautifulSoup
 
 from logger import get_logger
 from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
 
 logger = get_logger(__name__)
+
+
+def _reg_domain(u: str) -> str:
+    if "://" not in u:
+        u = "https://" + u
+    ext = _tldextract.extract(urlparse(u).hostname or "")
+    return ext.registered_domain or urlparse(u).hostname or ""
 
 HEADERS = {
     "User-Agent": (
@@ -131,16 +140,12 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             # Guard: only follow job links if the redirect stayed on-domain.
             # A redirect to an unrelated host (SSO, CDN) would scan the wrong
             # company's page and produce false-positive ATS hits.
-            def _reg_domain(u: str) -> str:
-                if "://" not in u:
-                    u = "https://" + u
-                ext = tldextract.extract(urlparse(u).hostname or "")
-                return ext.registered_domain or urlparse(u).hostname or ""
             company_root  = _reg_domain("https://" + domain)
             effective_root = _reg_domain(effective_url)
             careers_root  = _reg_domain(careers_url)
+            effective_path = urlparse(effective_url).path
             on_domain = effective_root in (company_root, careers_root)
-            if on_domain:
+            if on_domain and effective_path not in ("", "/"):
                 job_result = _follow_job_links(html, effective_url, company, domain)
                 if job_result:
                     logger.info("[P3a HIT via job link] %r → %s / %s",
@@ -186,14 +191,14 @@ def detect_via_career_page(company, domain, *, careers_url=None):
         # Only use redirects from successful responses (html not None) or ATS pattern hits (result not None);
         # a 404 at the redirected URL is not evidence of a valid careers page.
         if final_url and final_url != url and not first_redirect_url and (result is not None or html is not None):
-            _final_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
-            _domain_root = tldextract.extract(domain).registered_domain or domain
+            _final_root  = _reg_domain(final_url)
+            _domain_root = _reg_domain(domain)
             _final_path  = urlparse(final_url).path
             if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
                 first_redirect_url = final_url
         if html is not None and first_career_html is None:
-            _page_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
-            _probe_root = tldextract.extract(domain).registered_domain or domain
+            _page_root  = _reg_domain(final_url)
+            _probe_root = _reg_domain(domain)
             _page_path  = urlparse(final_url).path
             if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
                 first_career_html = html
@@ -218,14 +223,14 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                     result["careers_url"] = final_url or url
                     return result
             if final_url and final_url != url and not first_redirect_url and (result is not None or html is not None):
-                _final_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
-                _domain_root = tldextract.extract(domain).registered_domain or domain
+                _final_root  = _reg_domain(final_url)
+                _domain_root = _reg_domain(domain)
                 _final_path  = urlparse(final_url).path
                 if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
                     first_redirect_url = final_url
             if html is not None and first_career_html is None:
-                _page_root  = tldextract.extract(urlparse(final_url).hostname or "").registered_domain or ""
-                _probe_root = tldextract.extract(domain).registered_domain or domain
+                _page_root  = _reg_domain(final_url)
+                _probe_root = _reg_domain(domain)
                 _page_path  = urlparse(final_url).path
                 if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
                     first_career_html = html

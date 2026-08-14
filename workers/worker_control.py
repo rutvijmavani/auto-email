@@ -15,6 +15,9 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
+ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
+
 
 def start_workers(*units: str, dry_run: bool = False) -> None:
     """Start one or more systemd units via `sudo systemctl start`.

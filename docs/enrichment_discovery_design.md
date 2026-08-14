@@ -146,7 +146,7 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Discovery Queue Sources (4)
 1. `domain_enrichment_worker` — after enrichment completes for a company above threshold
-2. `staleness_checker` cron — `last_discovered_at > 90 days AND petition_count >= threshold`
+2. `staleness_checker` cron — `last_discovered_at > DISCOVER_REDETECT_EMPTY_DAYS (30d) AND petition_count >= threshold`
 3. `job_fetcher_worker` — `consecutive_zero_jobs > threshold` (re-detection trigger)
 4. Admin script — new ATS platform added → push all monitored companies
 

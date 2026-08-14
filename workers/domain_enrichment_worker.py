@@ -63,6 +63,7 @@ except Exception as _e:
 
 def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
     if not _PHASE3_AVAILABLE:
+        log.debug("phase3 unavailable (import-time failure) — skipping for %s", website_url)
         return None, None, None
     try:
         return _discover_careers_url(website_url)
@@ -105,7 +106,9 @@ def _flush_delayed(r) -> int:
     for item in items:
         try:
             data = json.loads(item)
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {data["fein"]: data["petition_count"]}, gt=True)
+            member = json.dumps({"fein": data["fein"], "trigger": "delayed_retry"})
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: data["petition_count"]}, gt=True)
+            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
         except Exception as e:
             log.warning("Failed to flush delayed item %s: %s", item, e)
@@ -114,7 +117,6 @@ def _flush_delayed(r) -> int:
                 "raw": repr(item), "failed_at": time.time(),
             })
             r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
-        finally:
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
     if moved:
         log.info("Flushed %d delayed items to enrichment queue", moved)
@@ -227,7 +229,7 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
         VALUES (%s, %s, %s, %s, %s, 'enrichment', %s)
         ON CONFLICT (domain, platform) DO UPDATE SET
             slug          = EXCLUDED.slug,
-            employer_fein = COALESCE(EXCLUDED.employer_fein, company_ats.employer_fein),
+            employer_fein = COALESCE(company_ats.employer_fein, EXCLUDED.employer_fein),
             source        = EXCLUDED.source,
             detected_at   = NOW()
         WHERE company_ats.reviewed_at IS NULL
@@ -286,6 +288,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         # ── Step 2: Phase 3 — career path probe ───────────────────────────────
         careers_url = existing_careers  # don't overwrite an existing good URL
+        _had_careers_before = bool(existing_careers)   # snapshot before phase3 may update it
         p3_platform = p3_slug = None
 
         if not careers_url:
@@ -349,7 +352,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         careers_source = None
         final_careers  = careers_url
-        if final_careers and not existing_careers:
+        if final_careers and not _had_careers_before:
             if p6_result and p6_result.get("careers_url") == final_careers:
                 careers_source = "phase6"
             else:
@@ -396,9 +399,16 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
     if not items:
         return
     log.warning("reclaiming %d inflight FEINs from %s", len(items), inflight_key)
-    for fein, score in items:
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: int(score)}, gt=True)
-        r.zrem(inflight_key, fein)
+    for raw_member, score in items:
+        try:
+            data = json.loads(raw_member)
+            fein = data["fein"]
+        except Exception:
+            raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
+            fein = raw_str.strip()
+        member = json.dumps({"fein": fein, "trigger": "reclaimed"})
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: int(score)}, gt=True)
+        r.zrem(inflight_key, raw_member)
         log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
 
 
@@ -419,10 +429,20 @@ def run_worker(once: bool = False) -> None:
     log.info("domain-enrichment-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
     _reclaim_inflight(r, _inflight_key)
 
+    _MAINTENANCE_MAX_S = 4 * 3600  # exit if stuck in maintenance for 4+ hours
+
     try:
         while True:
+            _maint_start = None
             while _is_maintenance(r):
-                log.info("Maintenance window active — pausing 30s")
+                if _maint_start is None:
+                    _maint_start = time.monotonic()
+                elapsed = time.monotonic() - _maint_start
+                if elapsed > _MAINTENANCE_MAX_S:
+                    log.error("Maintenance window exceeded %dh — exiting to allow restart",
+                              _MAINTENANCE_MAX_S // 3600)
+                    return
+                log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
             # Move any delayed items that are now ready
@@ -442,20 +462,39 @@ def run_worker(once: bool = False) -> None:
                 time.sleep(wait_s)
                 continue
 
-            fein, score = result[0]
+            raw_member, score = result[0]
             petition_count = int(score)
 
+            # Parse fein + trigger — JSON format; bare-FEIN fallback for legacy queue entries
+            try:
+                data = json.loads(raw_member)
+                fein    = data["fein"]
+                trigger = data.get("trigger", "enrichment")
+            except (json.JSONDecodeError, KeyError, TypeError):
+                raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
+                if raw_str.strip().lstrip("-").isdigit():
+                    fein    = raw_str.strip()
+                    trigger = "enrichment"
+                else:
+                    log.error("malformed queue member %r — sending to DLQ", raw_member)
+                    dlq_payload = json.dumps({
+                        "fein": "MALFORMED", "error_reason": "malformed_member",
+                        "raw": repr(raw_member), "failed_at": time.time(),
+                    })
+                    r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
+                    continue
+
             # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
-            r.zadd(_inflight_key, {fein: petition_count})
+            r.zadd(_inflight_key, {raw_member: petition_count})
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= ENRICHMENT_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
-                r.zrem(_inflight_key, fein)
+                r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(r, fein, petition_count)
+            success = _process_company(r, fein, petition_count, trigger=trigger)
             processed["n"] += 1
 
             if not success:
@@ -471,7 +510,7 @@ def run_worker(once: bool = False) -> None:
             else:
                 _clear_retry(r, fein)
 
-            r.zrem(_inflight_key, fein)
+            r.zrem(_inflight_key, raw_member)
 
             if once:
                 break

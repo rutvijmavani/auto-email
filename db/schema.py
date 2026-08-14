@@ -222,6 +222,11 @@ def _cleanup_custom_ats_inspection(c):
     """)
 
 
+def _cleanup_h1b_enrichment_metrics(c):
+    cutoff = (datetime.now() - timedelta(days=RETENTION_MONITOR_STATS)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM h1b_enrichment_metrics WHERE run_at < %s", (cutoff,))
+
+
 def _cleanup_unmatched_emails(c):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     c.execute("DELETE FROM unmatched_emails WHERE created_at < %s", (cutoff,))
@@ -1784,20 +1789,50 @@ def init_db():
     _cleanup_custom_ats_inspection(c)
     _cleanup_seen_job_ids(c)
     _cleanup_unmatched_emails(c)
+    _cleanup_h1b_enrichment_metrics(c)
 
+    # Two disjoint sets of USCIS petitions contribute to each DOL FEIN:
+    #   1. Fuzzy/LLM-matched rows (in uscis_dol_fuzzy_map)
+    #   2. Direct-matched rows (employer_legal_norm = employer_name_norm + last-4 FEIN match)
+    #      — populate_unmatched() excludes these from uscis_dol_unmatched, so they never
+    #        enter uscis_dol_fuzzy_map. Without the UNION they contribute 0 to the view.
+    # The two sets are mutually exclusive by construction (populate_unmatched filters both),
+    # so UNION ALL is safe — no (employer_legal_norm, tax_id) pair can appear in both.
     c.execute("""
         CREATE OR REPLACE VIEW uscis_petition_counts AS
-            SELECT um.dol_fein AS employer_fein,
-                   COALESCE(SUM(
-                       p.new_employment_approval + p.continuation_approval +
-                       p.change_same_employer_approval + p.new_concurrent_approval +
-                       p.change_of_employer_approval + p.amended_approval
-                   ), 0)::bigint AS petition_count
-            FROM uscis_dol_fuzzy_map um
-            LEFT JOIN uscis_h1b_petitions p
-                ON p.employer_legal_norm = um.employer_legal_norm
-                AND p.tax_id = um.tax_id
-            GROUP BY um.dol_fein
+            SELECT employer_fein, SUM(petition_count)::bigint AS petition_count FROM (
+                -- Fuzzy/LLM matched USCIS → DOL (via uscis_dol_fuzzy_map)
+                SELECT um.dol_fein AS employer_fein,
+                       COALESCE(SUM(
+                           p.new_employment_approval + p.continuation_approval +
+                           p.change_same_employer_approval + p.new_concurrent_approval +
+                           p.change_of_employer_approval + p.amended_approval
+                       ), 0) AS petition_count
+                FROM uscis_dol_fuzzy_map um
+                LEFT JOIN uscis_h1b_petitions p
+                    ON p.employer_legal_norm = um.employer_legal_norm
+                    AND p.tax_id = um.tax_id
+                GROUP BY um.dol_fein
+
+                UNION ALL
+
+                -- Direct matches (norm name + last-4 FEIN) — never inserted into fuzzy_map
+                SELECT d.employer_fein,
+                       COALESCE(SUM(
+                           p.new_employment_approval + p.continuation_approval +
+                           p.change_same_employer_approval + p.new_concurrent_approval +
+                           p.change_of_employer_approval + p.amended_approval
+                       ), 0) AS petition_count
+                FROM dol_h1b_employers d
+                JOIN uscis_h1b_petitions p
+                    ON (
+                        p.employer_legal_norm = d.employer_name_norm
+                     OR p.employer_name_norm  = d.trade_name_dba_norm
+                    )
+                   AND right(d.employer_fein, 4) = p.tax_id
+                GROUP BY d.employer_fein
+            ) sub
+            GROUP BY employer_fein
     """)
 
     conn.commit()

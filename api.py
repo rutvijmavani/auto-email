@@ -372,8 +372,9 @@ _INFLIGHT_LOCK     = threading.Lock()
 
 _VERIFY_HEAD_TIMEOUT  = 8   # seconds per hop — fast, never block the request
 _VERIFY_TOTAL_TIMEOUT = 30  # seconds total across all hops — prevents 10×8s worst case
-_VERIFY_GOOD_CODES    = {200, 201, 204, 206}  # 2xx only; redirects handled in manual loop
+_VERIFY_GOOD_CODES    = {200, 201, 204, 206, 403}  # 2xx + 403 (bot-blocked pages exist but are valid)
 _VERIFY_MAX_REDIRECTS = 10
+_VERIFY_STALE_DAYS    = 30  # re-verify after this many days
 _PRIVATE_NETS = [
     ipaddress.ip_network(r) for r in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -431,10 +432,11 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
         for _ in range(_VERIFY_MAX_REDIRECTS):
             if time.monotonic() > _deadline:
                 return False
+            _hop_timeout = min(_VERIFY_HEAD_TIMEOUT, max(1.0, _deadline - time.monotonic()))
             resp = _requests.head(
                 current_url,
                 allow_redirects=False,
-                timeout=_VERIFY_HEAD_TIMEOUT,
+                timeout=_hop_timeout,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             if resp.status_code in _VERIFY_GOOD_CODES:
@@ -446,7 +448,7 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
                         current_url,
                         allow_redirects=False,
                         stream=True,
-                        timeout=_VERIFY_HEAD_TIMEOUT,
+                        timeout=_hop_timeout,
                         headers={"User-Agent": "Mozilla/5.0"},
                     )
                     gr.close()
@@ -488,7 +490,8 @@ def _trigger_enrichment(fein: str) -> None:
     """
     try:
         r = get_redis()
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
+        member = json.dumps({"fein": fein, "trigger": "on_demand"})
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
         logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
@@ -529,14 +532,15 @@ def verify_company():
                 f.employer_fein,
                 f.public_domain,
                 f.careers_url,
-                f.last_enriched_at,
                 f.careers_url_verified_at,
                 ca.platform AS ats_platform,
                 ca.slug     AS ats_slug
             FROM fein_domain_map f
             LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
             WHERE f.employer_fein = %s
-            ORDER BY ca.slug NULLS LAST
+            ORDER BY ca.priority ASC NULLS LAST,
+                     ca.detected_at DESC NULLS LAST,
+                     ca.slug NULLS LAST
             LIMIT 1
         """, (fein,)).fetchone()
     except Exception as exc:
@@ -560,7 +564,7 @@ def verify_company():
         if _verified_at.tzinfo is None:  # guard: psycopg2 returns aware for TIMESTAMPTZ, but be safe
             _verified_at = _verified_at.replace(tzinfo=timezone.utc)
         _age_days = (datetime.now(timezone.utc) - _verified_at).days
-        _is_stale = _age_days > 30
+        _is_stale = _age_days > _VERIFY_STALE_DAYS
     payload = {
         'careers_url':  careers_url,
         'ats_platform': row['ats_platform'],
