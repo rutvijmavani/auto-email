@@ -1667,7 +1667,9 @@ def process_employer(
     # Update website_url when careers discovery reveals a different real domain.
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
     # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
-    if careers_url and website_url:
+    # Only trust verified sources — Brave search (phase4) URLs are not verified by direct probe.
+    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6", "phase7"}
+    if careers_url and website_url and careers_source in _REWRITE_TRUSTED_SOURCES:
         from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)
         _website_root = _root_domain(website_url)

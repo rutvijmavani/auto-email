@@ -1802,6 +1802,9 @@ def init_db():
         CREATE OR REPLACE VIEW uscis_petition_counts AS
             SELECT employer_fein, SUM(petition_count)::bigint AS petition_count FROM (
                 -- Fuzzy/LLM matched USCIS → DOL (via uscis_dol_fuzzy_map)
+                -- NOT EXISTS guard: if DOL data was re-ingested after fuzzy matching ran,
+                -- a fuzzy_map entry might now satisfy the direct-match criteria too.
+                -- Exclude those petitions from this branch so they're only counted once (below).
                 SELECT um.dol_fein AS employer_fein,
                        COALESCE(SUM(
                            p.new_employment_approval + p.continuation_approval +
@@ -1812,6 +1815,12 @@ def init_db():
                 LEFT JOIN uscis_h1b_petitions p
                     ON p.employer_legal_norm = um.employer_legal_norm
                     AND p.tax_id = um.tax_id
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM dol_h1b_employers d2
+                    WHERE (um.employer_legal_norm = d2.employer_name_norm
+                        OR um.employer_legal_norm = d2.trade_name_dba_norm)
+                      AND right(d2.employer_fein, 4) = um.tax_id
+                )
                 GROUP BY um.dol_fein
 
                 UNION ALL

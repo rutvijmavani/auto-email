@@ -207,7 +207,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     # ── Apex fallback — retry with bare domain if www. probe produced nothing ───
     # Some companies serve careers only from the apex (e.g. example.com/careers)
     # and have no www. DNS entry, causing all www.-prefixed probes to fail.
-    if first_career_html is None and not domain.startswith("www."):
+    if first_career_html is None and first_redirect_url is None and tentative_eightfold is None and not domain.startswith("www."):
         for path in CAREER_PATHS:
             url = f"https://{domain}{path}"
             result, html, final_url = _fetch_and_scan(url, company)

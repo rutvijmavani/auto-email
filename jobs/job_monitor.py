@@ -489,11 +489,13 @@ def run():
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
+        from workers.redis_client import get_redis as _get_redis
+        _shared_r = _get_redis()
         with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
                     _process_company, company_row, i + 1, len(missed),
-                    _enrichment_queued_event,
+                    _enrichment_queued_event, _shared_r,
                 ): company_row["company"]
                 for i, company_row in enumerate(missed)
             }
@@ -708,8 +710,8 @@ def run():
     # Check both the stats counter AND the event — the event is set immediately
     # on ZADD success and survives even if _process_company raised afterwards.
     if stats["enrichment_queued"] or _enrichment_queued_event.is_set():
-        from workers.worker_control import start_workers as _start_workers
-        _start_workers("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+        from workers.worker_control import start_workers as _start_workers, ENRICHMENT_WORKERS
+        _start_workers(*ENRICHMENT_WORKERS)
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -814,7 +816,7 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
 # ─────────────────────────────────────────
 _REDETECT_SEMAPHORE = threading.Semaphore(1)
 
-def _process_company(company_row, position, total, _enrichment_event=None):
+def _process_company(company_row, position, total, _enrichment_event=None, _r=None):
     """
     Process one company: fetch jobs, filter, save new ones.
     Called by ThreadPoolExecutor — one call per company.
@@ -856,10 +858,10 @@ def _process_company(company_row, position, total, _enrichment_event=None):
         if fein:
             try:
                 from workers.redis_client import get_redis
-                r = get_redis()
+                r = _r if _r is not None else get_redis()
                 # score=petition_count; gt=True only raises an existing score, never lowers it
                 petition_count = company_row.get("petition_count") or 1
-                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {fein: petition_count}, gt=True)
+                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
                 result["queued_enrichment"] = 1
                 if _enrichment_event is not None:
                     _enrichment_event.set()

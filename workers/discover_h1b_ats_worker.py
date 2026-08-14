@@ -279,21 +279,13 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         # pass skip_brave=False so Phase 4 (Brave) runs — this worker is the right place.
         # Use force=True for re_detection/manual triggers so _is_recently_checked is bypassed.
         _force = trigger in ("re_detection", "manual")
+        result = m.process_employer(
+            emp, conn, dry_run=False, force=_force,
+            prefetched=None, skip_brave=False,
+        )
         if not kg_checked:
-            # First pass: always run KG (prefetched=None forces inline KG call)
-            result = m.process_employer(
-                emp, conn, dry_run=False, force=_force,
-                prefetched=None, skip_brave=False,
-            )
             _mark_kg_checked(conn, fein)
             conn.commit()  # commit KG mark immediately — accurate even if result is bad
-        else:
-            # Subsequent pass: KG MID already cached in h1b_ats_discovery.
-            # process_employer reads it via get_discovery_row → cached_mid path.
-            result = m.process_employer(
-                emp, conn, dry_run=False, force=_force,
-                prefetched=None, skip_brave=False,
-            )
 
         if not isinstance(result, dict):
             log.error("fein=%s: process_employer returned %s — treating as failure",
@@ -406,6 +398,10 @@ def run_worker(once: bool = False) -> None:
                 if not earliest:
                     log.info("Discovery queue empty — exiting")
                     break
+                if once:
+                    log.info("Discovery queue empty (--once); %d delayed item(s) — exiting",
+                             r.zcard(DISCOVERY_DELAYED))
+                    break
                 _, next_ts = earliest[0]
                 wait_s = max(1.0, next_ts - time.time())
                 log.info("Discovery queue empty; %d delayed item(s) — sleeping %.0fs",
@@ -413,8 +409,8 @@ def run_worker(once: bool = False) -> None:
                 time.sleep(wait_s)
                 continue
 
-            raw_member     = _pop_result[0]             # bytes — already written to inflight
-            petition_count = int(float(_pop_result[1])) # score returned as bytes by Lua
+            raw_member     = _pop_result[0]             # str (decode_responses=True) — already in inflight
+            petition_count = int(float(_pop_result[1])) # str score returned by Lua
 
             # Member is JSON: {"fein": "...", "trigger": "..."}
             # Legacy bare-FEIN members (from older staleness_checker) are accepted as fallback.

@@ -411,7 +411,7 @@ def _host_root(host: str) -> str:
 
 def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
     """
-    Return True if url returns a 2xx response.
+    Return True if url returns a response in _VERIFY_GOOD_CODES (2xx or 403).
     Pre-validates scheme and rejects private/loopback hosts before every hop.
     Follows redirects manually (allow_redirects=False) to validate each hop's
     scheme, resolved addresses, and allowed registrable domain before connecting.

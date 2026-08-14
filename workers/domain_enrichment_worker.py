@@ -84,6 +84,17 @@ def _is_maintenance(r) -> bool:
         return False
 
 
+# Atomically pops the highest-scoring member from KEYS[1] and writes it to
+# KEYS[2] (inflight ZSET) with the same score. Returns {member, score} or {}
+# when the queue is empty. Single round-trip eliminates the crash window between
+# zpopmax and zadd that would lose the item on SIGKILL.
+_ATOMIC_POP_LUA = """
+local res = redis.call('ZPOPMAX', KEYS[1], 1)
+if #res == 0 then return {} end
+redis.call('ZADD', KEYS[2], tonumber(res[2]), res[1])
+return {res[1], res[2]}
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Delayed queue — certspotter 429 re-queue with not_before timestamp
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,7 +249,7 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
 
 def _push_to_discovery(r, fein: str, petition_count: int) -> None:
     member = json.dumps({"fein": fein, "trigger": "enrichment"})
-    r.zadd(DISCOVERY_QUEUE, {member: petition_count})
+    r.zadd(DISCOVERY_QUEUE, {member: petition_count}, gt=True)
     log.debug("pushed %s to discovery_queue (petition_count=%d)", fein, petition_count)
 
 
@@ -429,6 +440,7 @@ def run_worker(once: bool = False) -> None:
     log.info("domain-enrichment-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
     _reclaim_inflight(r, _inflight_key)
 
+    _pop_to_inflight = r.register_script(_ATOMIC_POP_LUA)
     _MAINTENANCE_MAX_S = 4 * 3600  # exit if stuck in maintenance for 4+ hours
 
     try:
@@ -448,12 +460,16 @@ def run_worker(once: bool = False) -> None:
             # Move any delayed items that are now ready
             _flush_delayed(r)
 
-            # Pop highest petition_count company
-            result = r.zpopmax(DOMAIN_ENRICHMENT_QUEUE, count=1)
-            if not result:
+            # Atomically pop highest petition_count member and write to inflight
+            _pop_result = _pop_to_inflight(keys=[DOMAIN_ENRICHMENT_QUEUE, _inflight_key])
+            if not _pop_result:
                 earliest = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
                 if not earliest:
                     log.info("Enrichment queue empty — exiting")
+                    break
+                if once:
+                    log.info("Enrichment queue empty (--once); %d delayed item(s) — exiting",
+                             r.zcard(DOMAIN_ENRICHMENT_DELAYED))
                     break
                 _, next_ts = earliest[0]
                 wait_s = max(1.0, next_ts - time.time())
@@ -462,7 +478,8 @@ def run_worker(once: bool = False) -> None:
                 time.sleep(wait_s)
                 continue
 
-            raw_member, score = result[0]
+            raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
+            score      = _pop_result[1]  # str score returned by Lua
             petition_count = int(score)
 
             # Parse fein + trigger — JSON format; bare-FEIN fallback for legacy queue entries
@@ -482,10 +499,8 @@ def run_worker(once: bool = False) -> None:
                         "raw": repr(raw_member), "failed_at": time.time(),
                     })
                     r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
+                    r.zrem(_inflight_key, raw_member)
                     continue
-
-            # Mark in-flight before any processing — survives SIGKILL (reclaimed on next start)
-            r.zadd(_inflight_key, {raw_member: petition_count})
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= ENRICHMENT_MAX_RETRIES:

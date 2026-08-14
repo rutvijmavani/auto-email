@@ -19,7 +19,8 @@ import time
 from urllib.parse import urlparse
 
 import requests
-import tldextract as _tldextract
+import tldextract
+_tldextract = tldextract.TLDExtract(suffix_list_urls=())
 import urllib3
 
 _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
@@ -294,7 +295,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     if retry_after is not None:
         return None, "ct_quota", retry_after
 
-    for candidate in candidates:
+    for candidate in candidates[:10]:
         if _has_web(candidate):
             log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
             return candidate, ct_source, None

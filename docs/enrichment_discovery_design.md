@@ -4,7 +4,7 @@
 
 ## 1. Full Pipeline
 
-```
+```text
 LCA upload                              USCIS H1B upload
     ↓                                       ↓
 sync_dol_lca.py                        process_uscis_h1b.py
@@ -64,13 +64,13 @@ Light ATS detection as a bonus (Phase 6 may return platform+slug for free).
 - **Not always-on**: terminates between batches, unlike job monitor
 
 ### Fixed Worker Count
-- N workers (to be determined based on server capacity)
+- 2 workers (domain-enrichment-worker@1, domain-enrichment-worker@2)
 - Quota is the real throttle, not worker count
 - Extra workers = redundancy only, not throughput gain
 
 ### Processing Steps (per company)
 
-```
+```text
 STEP 1 — Public domain resolution
     a. HTTP redirect check (no quota):
        GET assigned_domain → follow redirects → extract root domain
@@ -107,7 +107,7 @@ STEP 3 — Phase 6: career_page (CF Worker quota)
 
 STEP 4 — Push to discovery_queue
     IF petition_count >= threshold:
-        ZADD discovery_queue petition_count company_fein
+        ZADD discovery_queue petition_count {"fein": company_fein, "trigger": "fuzzy_match"|"staleness"|"on_demand"|...}
 ```
 
 ### Failure Handling
@@ -141,7 +141,7 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 - **Not always-on**: same event-driven batch model as enrichment worker
 
 ### Fixed Worker Count
-- N workers (to be determined)
+- 2 workers (discover-h1b-ats-worker@1, discover-h1b-ats-worker@2)
 - Same quota-throttled model
 
 ### Discovery Queue Sources (4)
@@ -152,7 +152,7 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Processing Steps (per company)
 
-```
+```text
 ats_platform already set (from enrichment)?
     YES → skip entirely UNLESS re-detection trigger (source = job_fetcher or admin)
 
@@ -203,7 +203,7 @@ When triggered by job_fetcher or admin script:
 ## 5. Queue Design
 
 ### domain_enrichment_queue
-```
+```text
 Type:  Redis ZSET
 Key:   domain_enrichment_queue
 Score: petition_count  (higher = processed first)
@@ -220,7 +220,7 @@ Consumption:
 ```
 
 ### discovery_queue
-```
+```text
 Type:  Redis ZSET
 Key:   discovery_queue
 Score: petition_count
@@ -231,7 +231,7 @@ Consumption:
 ```
 
 ### DLQ (Dead Letter Queue)
-```
+```text
 domain_enrichment:dlq
 discovery:dlq
 
@@ -253,7 +253,7 @@ Admin script: review + manual retry
 
 ## 6. Worker Lifecycle (On-Demand Batch)
 
-```
+```text
 Event occurs (LCA upload / USCIS upload / staleness cron / re-detection trigger)
     ↓
 Queue populated
@@ -278,7 +278,7 @@ Queue draining may take multiple days for initial 25k load — that is expected 
 
 Each worker needs:
 
-```
+```text
 1. Worker script
    - init_logging + get_logger  (logs/ directory)
    - Redis heartbeat every N seconds
@@ -314,7 +314,7 @@ last_discovered_at     TIMESTAMP -- when discovery worker last processed this ro
 ```
 
 ### company_ats (existing, verify)
-```
+```text
 employer_fein, domain, company_name, platform, slug, source, priority, detected_at — exist
 is_monitored, reviewed_at, first_scanned_at, last_checked_at, consecutive_empty_days — exist
 trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
@@ -325,7 +325,7 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 ## 9. Refresh / Staleness
 
 ### Enrichment triggers (3 ways workers start)
-```
+```text
 1. fuzzy_match_uscis_dol.py completes
        → bulk populate domain_enrichment_queue (all null/stale public_domain rows)
        → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
@@ -342,7 +342,7 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 ```
 
 ### Discovery triggers
-```
+```text
 job_fetcher_worker:
     consecutive_zero_jobs > JOB_MONITOR_REDETECT_DAYS (14)
         → ZADD discovery_queue petition_count fein
@@ -350,7 +350,7 @@ job_fetcher_worker:
         → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
 
 staleness_checker (daily cron):
-    WHERE last_discovered_at < NOW() - INTERVAL '30 days' (DISCOVER_REDETECT_EMPTY_DAYS=30)
+    WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
       AND petition_count >= threshold
         → ZADD discovery_queue petition_count fein
         → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
@@ -362,7 +362,7 @@ Admin script (new ATS platform added):
 ```
 
 ### On-demand verification (stale-while-revalidate)
-```
+```text
 User visits company X in UI
     ↓
 Background: HEAD/GET careers_url (cheap, no quota cost)
@@ -388,7 +388,7 @@ Penalty = one visit with stale data, self-correcting.
 The existing `discover_h1b_ats.py` currently runs as a nightly 3 AM systemd service.
 Once `discover_h1b_ats_worker` is implemented and tested in production, retire it:
 
-```
+```text
 systemctl disable <3am-discover-service>
 systemctl stop    <3am-discover-service>
 remove unit file from install-systemd.sh
@@ -462,7 +462,7 @@ One row appended per company per worker run. Allows trend analysis over time
 ### Viewing
 
 **`scripts/health_check.py`** — summary block added to existing health check:
-```
+```text
   H1B PIPELINE METRICS  (last 7 days)
   ──────────────────────────────────────────────────────────
   Public domain    18,421 processed  http_redirect 68%  root_fallback 18%

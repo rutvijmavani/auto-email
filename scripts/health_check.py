@@ -635,34 +635,46 @@ def run_health_check() -> int:
         from db.connection import get_conn as _get_conn
         conn = _get_conn()
 
-        # Public domain breakdown (enrichment worker)
+        # Public domain breakdown (enrichment worker) — newest run per fein only
         pd_rows = conn.execute("""
             SELECT public_domain_method, COUNT(*) AS n
-            FROM h1b_enrichment_metrics
-            WHERE worker = 'domain_enrichment'
-              AND run_at > NOW() - INTERVAL '7 days'
+            FROM (
+                SELECT DISTINCT ON (employer_fein) public_domain_method
+                FROM h1b_enrichment_metrics
+                WHERE worker = 'domain_enrichment'
+                  AND run_at > NOW() - INTERVAL '7 days'
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY public_domain_method
             ORDER BY n DESC
         """).fetchall()
 
-        # Career URL breakdown (both workers)
+        # Career URL breakdown (both workers) — newest run per fein only
         cu_rows = conn.execute("""
             SELECT careers_source, COUNT(*) AS n
-            FROM h1b_enrichment_metrics
-            WHERE careers_source IS NOT NULL
-              AND careers_url IS NOT NULL
-              AND run_at > NOW() - INTERVAL '7 days'
+            FROM (
+                SELECT DISTINCT ON (employer_fein) careers_source
+                FROM h1b_enrichment_metrics
+                WHERE careers_source IS NOT NULL
+                  AND careers_url IS NOT NULL
+                  AND run_at > NOW() - INTERVAL '7 days'
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY careers_source
             ORDER BY n DESC
         """).fetchall()
 
-        # ATS detection breakdown (both workers)
+        # ATS detection breakdown (both workers) — newest run per fein only
         ats_rows = conn.execute("""
             SELECT ats_source, COUNT(*) AS n
-            FROM h1b_enrichment_metrics
-            WHERE ats_source IS NOT NULL
-              AND ats_platform IS NOT NULL
-              AND run_at > NOW() - INTERVAL '7 days'
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_source
+                FROM h1b_enrichment_metrics
+                WHERE ats_source IS NOT NULL
+                  AND ats_platform IS NOT NULL
+                  AND run_at > NOW() - INTERVAL '7 days'
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY ats_source
             ORDER BY n DESC
         """).fetchall()
