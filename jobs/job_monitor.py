@@ -487,10 +487,10 @@ def run():
     _enrichment_queued_event = threading.Event()
 
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
+    from workers.redis_client import get_redis as _get_redis
+    _shared_r = _get_redis()
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
-        from workers.redis_client import get_redis as _get_redis
-        _shared_r = _get_redis()
         with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
@@ -685,7 +685,7 @@ def run():
                     _uc_futures = {
                         _uc_exec.submit(
                             _process_company, company_row, i + 1, len(_retry_rows),
-                            _enrichment_queued_event,
+                            _enrichment_queued_event, _shared_r,
                         ): company_row["company"]
                         for i, company_row in enumerate(_retry_rows)
                     }

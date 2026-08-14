@@ -59,7 +59,7 @@ Find the correct public domain and careers URL for all 25k target companies.
 Light ATS detection as a bonus (Phase 6 may return platform+slug for free).
 
 ### Trigger / Lifecycle
-- **Start**: queue-watcher detects `ZCARD domain_enrichment_queue > 0` → starts worker(s)
+- **Start**: staleness_checker or api.py calls `systemctl start domain-enrichment-worker@{1,2}` directly
 - **Stop**: worker exits cleanly when `ZPOPMAX` returns empty (queue drained)
 - **Not always-on**: terminates between batches, unlike job monitor
 
@@ -371,7 +371,7 @@ Background: HEAD/GET careers_url (cheap, no quota cost)
     YES → mark careers_url_verified_at = NOW(), show cached data (fast path)
     NO  (non-200 / redirects to wrong domain) →
             show cached data immediately  (never block the user)
-            ZADD domain_enrichment_queue HIGH_PRIORITY fein
+            ZADD domain_enrichment_queue ENRICHMENT_HIGH_PRIORITY_SCORE {"fein": ..., "trigger": "on_demand"}
             systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
             worker re-detects careers_url in background
             UI updates when fresh result written back

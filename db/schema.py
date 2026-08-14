@@ -1817,8 +1817,11 @@ def init_db():
                     AND p.tax_id = um.tax_id
                 WHERE NOT EXISTS (
                     SELECT 1 FROM dol_h1b_employers d2
+                    JOIN uscis_h1b_petitions p2
+                        ON p2.employer_legal_norm = um.employer_legal_norm
+                       AND p2.tax_id = um.tax_id
                     WHERE (um.employer_legal_norm = d2.employer_name_norm
-                        OR um.employer_legal_norm = d2.trade_name_dba_norm)
+                        OR p2.employer_name_norm  = d2.trade_name_dba_norm)
                       AND right(d2.employer_fein, 4) = um.tax_id
                 )
                 GROUP BY um.dol_fein

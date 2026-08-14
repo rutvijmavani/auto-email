@@ -28,6 +28,7 @@ Design decisions (see docs/dol_h1b_pipeline.md, docs/email-pattern-inference.md)
 import argparse
 import json
 import tldextract
+_tldextract = tldextract.TLDExtract(suffix_list_urls=())
 import os
 import re
 import sys
@@ -298,7 +299,7 @@ def aggregate(df: pd.DataFrame) -> dict:
             # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030).
             # tldextract handles multi-label TLDs: acme.co.uk → acme.co.uk, not co.uk.
             for _d, _cnt in domain_counts.items():
-                _ext  = tldextract.extract(_d)
+                _ext  = _tldextract.extract(_d)
                 _root = _ext.registered_domain or _d
                 root_totals[_root] = root_totals.get(_root, 0) + _cnt
             assigned_domain = min(root_totals, key=lambda k: (-root_totals[k], k))

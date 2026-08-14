@@ -21,7 +21,8 @@ import logging
 from html import unescape as _html_unescape
 from urllib.parse import urljoin, urlparse
 
-import tldextract as _tldextract
+import tldextract as _tldextract_mod
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 
 from jobs.career_page import CAREER_PATHS
 

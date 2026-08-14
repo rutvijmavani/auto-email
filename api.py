@@ -491,7 +491,7 @@ def _trigger_enrichment(fein: str) -> None:
     try:
         r = get_redis()
         member = json.dumps({"fein": fein, "trigger": "on_demand"})
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, nx=False)
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
         logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)

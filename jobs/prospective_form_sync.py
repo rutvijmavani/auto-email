@@ -37,7 +37,8 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import tldextract as _tldextract
+import tldextract as _tldextract_mod
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv

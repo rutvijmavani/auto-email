@@ -480,7 +480,7 @@ def run_worker(once: bool = False) -> None:
 
             raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
             score      = _pop_result[1]  # str score returned by Lua
-            petition_count = int(score)
+            petition_count = int(float(score))
 
             # Parse fein + trigger — JSON format; bare-FEIN fallback for legacy queue entries
             try:

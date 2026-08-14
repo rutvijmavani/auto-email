@@ -382,10 +382,20 @@ def run_worker(once: bool = False) -> None:
     _reclaim_inflight(r, _inflight_key)
     _pop_to_inflight = r.register_script(_ATOMIC_POP_LUA)
 
+    _MAINTENANCE_MAX_S = 4 * 3600  # exit if stuck in maintenance for 4+ hours
+
     try:
         while True:
+            _maint_start = None
             while _is_maintenance(r):
-                log.info("Maintenance window active — pausing 30s")
+                if _maint_start is None:
+                    _maint_start = time.monotonic()
+                elapsed = time.monotonic() - _maint_start
+                if elapsed > _MAINTENANCE_MAX_S:
+                    log.error("Maintenance window exceeded %dh — exiting to allow restart",
+                              _MAINTENANCE_MAX_S // 3600)
+                    return
+                log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
             _flush_delayed(r)

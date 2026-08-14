@@ -4,7 +4,7 @@ scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/
 Enrichment staleness:
     fein_domain_map WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'
     AND is_monitored = TRUE (or public_domain IS NULL for uninitialised rows)
-    → ZADD domain_enrichment_queue petition_count fein
+    → ZADD domain_enrichment_queue petition_count {"fein": ..., "trigger": "staleness"}
     → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
 Discovery staleness:
