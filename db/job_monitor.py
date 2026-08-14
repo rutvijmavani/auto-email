@@ -330,7 +330,7 @@ def get_monitorable_companies():
     try:
         # json_extract_text() is a safe PL/pgSQL helper defined in init_db()
         # that returns NULL for non-JSON input (catches cast exceptions).
-        rows = conn.execute("""
+        rows = conn.execute(r"""
             SELECT pc.company, pc.ats_platform, pc.ats_slug,
                    pc.ats_detected_at, pc.first_scanned_at,
                    pc.last_checked_at, pc.consecutive_empty_days,
