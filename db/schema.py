@@ -958,10 +958,11 @@ def init_db():
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
 
-    # monitor_stats: new per-run metrics (in_flight, fallback_scanned)
+    # monitor_stats: new per-run metrics (in_flight, fallback_scanned, enrichment_queued)
     for col, defn in [
-        ("in_flight",        "INTEGER DEFAULT 0"),
-        ("fallback_scanned", "INTEGER DEFAULT 0"),
+        ("in_flight",          "INTEGER DEFAULT 0"),
+        ("fallback_scanned",   "INTEGER DEFAULT 0"),
+        ("enrichment_queued",  "INTEGER DEFAULT 0"),
     ]:
         c.execute(
             f"ALTER TABLE monitor_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
@@ -1550,6 +1551,14 @@ def init_db():
     c.execute("""
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS sample_apply_url TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS ats_source TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS careers_source TEXT
     """)
 
     # ── KG quality events — low-confidence / no-match companies for review ────

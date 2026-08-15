@@ -99,9 +99,9 @@ return {res[1], res[2]}
 # Delayed queue — certspotter 429 re-queue with not_before timestamp
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int) -> None:
+def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry") -> None:
     """Push company to delayed ZSET scored by not_before timestamp."""
-    payload = json.dumps({"fein": fein, "petition_count": petition_count})
+    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger})
     not_before = time.time() + delay_s
     r.zadd(DOMAIN_ENRICHMENT_DELAYED, {payload: not_before})
     log.info("re-queued %s to delayed queue — retry in %ds", fein, delay_s)
@@ -117,7 +117,7 @@ def _flush_delayed(r) -> int:
     for item in items:
         try:
             data = json.loads(item)
-            member = json.dumps({"fein": data["fein"], "trigger": "delayed_retry"})
+            member = json.dumps({"fein": data["fein"], "trigger": data.get("trigger", "delayed_retry")})
             r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: data["petition_count"]}, gt=True)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
@@ -287,7 +287,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
             log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
-            _requeue_delayed(r, fein, petition_count, retry_after)
+            _requeue_delayed(r, fein, petition_count, retry_after, trigger)
             return True
 
         probe_domain = public_domain or assigned
@@ -300,11 +300,13 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         # ── Step 2: Phase 3 — career path probe ───────────────────────────────
         careers_url = existing_careers  # don't overwrite an existing good URL
         _had_careers_before = bool(existing_careers)   # snapshot before phase3 may update it
+        _careers_source_this_run = None
         p3_platform = p3_slug = None
 
         if not careers_url:
             careers_url, p3_platform, p3_slug = _phase3(website_url)
             if careers_url:
+                _careers_source_this_run = "phase3"
                 _write_careers(conn, fein, careers_url)
                 existing_careers = careers_url  # keep in sync so phase6 sees it as already set
                 conn.commit()
@@ -327,6 +329,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             p6_slug     = p6_result.get("slug")
 
             if p6_careers and not existing_careers:
+                _careers_source_this_run = "phase6"
                 _write_careers(conn, fein, p6_careers)
                 careers_url = p6_careers
                 log.info("fein=%s careers_url=%s (phase6)", fein, p6_careers)
@@ -361,13 +364,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             ats_platform = p3_platform
             ats_slug     = p3_slug
 
-        careers_source = None
         final_careers  = careers_url
-        if final_careers and not _had_careers_before:
-            if p6_result and p6_result.get("careers_url") == final_careers:
-                careers_source = "phase6"
-            else:
-                careers_source = "phase3"
+        careers_source = _careers_source_this_run if (final_careers and not _had_careers_before) else None
 
         duration_ms = int((time.time() - t_start) * 1000)
         try:

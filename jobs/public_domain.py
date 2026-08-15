@@ -48,10 +48,11 @@ GENERIC_ROOTS = {
     "office365.com", "microsoft.com", "googlehosted.com",
 }
 
-_REDIRECT_TIMEOUT = 8
-_WEB_TIMEOUT      = 6
-_CT_TIMEOUT       = 20
-_CRTSH_TIMEOUT    = 30
+_REDIRECT_TIMEOUT    = 8
+_WEB_TIMEOUT         = 6
+_CT_TIMEOUT          = 20
+_CRTSH_TIMEOUT       = 30
+_CT_PROBE_BUDGET_S   = 60
 
 # Module-level certspotter backoff — avoid hammering after a 429
 _certspotter_retry_after: float = 0.0
@@ -295,7 +296,11 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     if retry_after is not None:
         return None, "ct_quota", retry_after
 
+    _ct_budget_start = time.time()
     for candidate in candidates[:10]:
+        if time.time() - _ct_budget_start > _CT_PROBE_BUDGET_S:
+            log.debug("CT probe budget exhausted for %s — stopping early", domain)
+            break
         if _has_web(candidate):
             log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
             return candidate, ct_source, None

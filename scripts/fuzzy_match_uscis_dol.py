@@ -333,8 +333,7 @@ def _populate_enrichment_queue(conn, r) -> None:
                COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
-        WHERE f.public_domain IS NULL
-           OR f.last_enriched_at IS NULL
+        WHERE f.last_enriched_at IS NULL
            OR f.last_enriched_at < NOW() - %s::interval
     """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
 

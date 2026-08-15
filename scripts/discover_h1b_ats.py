@@ -1309,9 +1309,9 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         INSERT INTO h1b_ats_discovery
             (employer_fein, employer_name, canonical_name, canonical_source,
              wikidata_qid, kg_mid, website_url, jobs_url,
-             careers_url, detected_platform, detected_slug,
+             careers_url, careers_source, detected_platform, detected_slug, ats_source,
              glassdoor_id, crunchbase_id, last_checked)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (employer_fein) DO UPDATE SET
             employer_name     = EXCLUDED.employer_name,
             canonical_name    = EXCLUDED.canonical_name,
@@ -1321,8 +1321,10 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             website_url       = COALESCE(EXCLUDED.website_url,      h1b_ats_discovery.website_url),
             jobs_url          = COALESCE(EXCLUDED.jobs_url,         h1b_ats_discovery.jobs_url),
             careers_url       = COALESCE(EXCLUDED.careers_url,      h1b_ats_discovery.careers_url),
+            careers_source    = COALESCE(EXCLUDED.careers_source,   h1b_ats_discovery.careers_source),
             detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
             detected_slug     = COALESCE(EXCLUDED.detected_slug,    h1b_ats_discovery.detected_slug),
+            ats_source        = COALESCE(EXCLUDED.ats_source,       h1b_ats_discovery.ats_source),
             glassdoor_id      = COALESCE(EXCLUDED.glassdoor_id,     h1b_ats_discovery.glassdoor_id),
             crunchbase_id     = COALESCE(EXCLUDED.crunchbase_id,    h1b_ats_discovery.crunchbase_id),
             last_checked      = NOW()
@@ -1336,8 +1338,10 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data.get("website_url"),
         data.get("jobs_url"),
         data.get("careers_url"),
+        data.get("careers_source"),
         data.get("detected_platform"),
         data.get("detected_slug"),
+        data.get("ats_source"),
         data.get("glassdoor_id"),
         data.get("crunchbase_id"),
     ))
@@ -1625,7 +1629,8 @@ def process_employer(
         log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
         try:
             from jobs.career_page import detect_via_career_page
-            _cp_result = detect_via_career_page(_cp_name, _cp_domain, careers_url=careers_url)
+            _phase6_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
+            _cp_result = detect_via_career_page(_cp_name, _cp_domain, careers_url=_phase6_seed)
             if _cp_result:
                 if _cp_result.get("platform"):
                     detected_platform = _cp_result["platform"]
