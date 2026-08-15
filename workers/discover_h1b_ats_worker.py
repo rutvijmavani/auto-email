@@ -129,7 +129,7 @@ def _requeue_delayed(r, fein: str, trigger: str, petition_count: int, delay_s: f
 def _flush_delayed(r) -> None:
     """Move any delayed items whose not_before has passed back to the main queue."""
     items = r.zrangebyscore(DISCOVERY_DELAYED, "-inf", time.time(), withscores=True)
-    for raw, score in items:
+    for raw, _ in items:
         try:
             data = json.loads(raw)
             member = json.dumps({"fein": data["fein"], "trigger": data.get("trigger", "staleness")})
@@ -423,7 +423,7 @@ def run_worker(once: bool = False) -> None:
                              r.zcard(DISCOVERY_DELAYED))
                     break
                 _, next_ts = earliest[0]
-                wait_s = max(1.0, next_ts - time.time())
+                wait_s = min(30.0, max(1.0, next_ts - time.time()))
                 log.info("Discovery queue empty; %d delayed item(s) — sleeping %.0fs",
                          r.zcard(DISCOVERY_DELAYED), wait_s)
                 time.sleep(wait_s)

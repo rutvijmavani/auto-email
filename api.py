@@ -483,16 +483,18 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
         return False
 
 
-def _trigger_enrichment(fein: str) -> None:
+def _trigger_enrichment(fein: str, r=None) -> None:
     """Push fein to enrichment queue at HIGH priority. Fire-and-forget.
 
     Workers are started on demand by staleness_checker; no systemctl here so
     the web process doesn't require sudo and doesn't repeat the call per request.
+    Accepts a pre-created Redis client (r) so the caller can initialise it in
+    the request thread rather than inside the thread-pool worker.
     """
     try:
-        r = get_redis()
+        _r = r if r is not None else get_redis()
         member = json.dumps({"fein": fein, "trigger": "on_demand"})
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
+        _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
         logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
@@ -573,6 +575,13 @@ def verify_company():
         'stale':        _is_stale,
     }
 
+    # Pre-create Redis client in the request thread so background tasks don't
+    # call get_redis() inside the thread-pool worker (avoids thread-safety issues).
+    try:
+        _r_client = get_redis()
+    except Exception:
+        _r_client = None
+
     def _submit(fn, *args):
         """Submit to bounded executor; skip if this FEIN is already in-flight or global cap reached."""
         with _INFLIGHT_LOCK:
@@ -604,7 +613,7 @@ def verify_company():
 
     # If there's no careers_url, queue for enrichment and return immediately
     if not careers_url:
-        _submit(_trigger_enrichment, fein)
+        _submit(_trigger_enrichment, fein, _r_client)
         return jsonify(payload), 200
 
     # Fire-and-forget HEAD check — never block the HTTP response
@@ -634,7 +643,7 @@ def verify_company():
                 "verify-company: HEAD failed for careers_url=%s fein=%s — triggering re-enrichment",
                 careers_url, fein,
             )
-            _trigger_enrichment(fein)
+            _trigger_enrichment(fein, _r_client)
 
     _submit(_background_verify)
     return jsonify(payload), 200

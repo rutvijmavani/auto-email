@@ -980,6 +980,33 @@ def _process_company(company_row, position, total, _enrichment_event=None, _r=No
     if not raw_jobs:
         logger.info("No jobs returned for %r", company)
         update_company_check(company, found_jobs=False)
+        # Re-check threshold with the just-incremented count — the pre-run check at the
+        # top of this function used the old value, so a company that crossed the threshold
+        # during this run would be missed for a full day without this second check.
+        if not result.get("queued_enrichment"):
+            _new_empty = (company_row.get("consecutive_empty_days") or 0) + 1
+            if _new_empty >= JOB_MONITOR_REDETECT_DAYS:
+                fein   = company_row.get("employer_fein")
+                domain = company_row.get("domain")
+                if fein:
+                    try:
+                        from workers.redis_client import get_redis
+                        r = _r if _r is not None else get_redis()
+                        petition_count = company_row.get("petition_count") or 1
+                        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
+                        result["queued_enrichment"] = 1
+                        if _enrichment_event is not None:
+                            _enrichment_event.set()
+                        logger.info(
+                            "Re-enrichment queued (threshold just crossed) for %r "
+                            "(fein=%s domain=%s empty_days=%d)",
+                            company, fein, domain, _new_empty,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to queue re-enrichment for %r (fein=%s): %s",
+                            company, fein, exc,
+                        )
         print(f"  [{position}/{total}] {company} — 0 jobs")
         return result
 

@@ -163,6 +163,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
                 retry_after = int(_ra)
             except (ValueError, TypeError):
                 retry_after = 3600  # HTTP-date or unparseable — safe fallback
+            retry_after = min(retry_after, 3600)
             _certspotter_retry_after = time.time() + retry_after
             log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
             return [], retry_after

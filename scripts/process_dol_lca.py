@@ -608,13 +608,10 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 """, (fein, year, y["filed"], y["certified"], y["denied"], y["withdrawn"], y["positions"]))
                 year_count += 1
 
-            # fein_domain_map — merge domain count JSON with existing row
-            # MIGRATION NOTE (2026-08-13): domain_counts semantics changed from
-            # raw-email-domain → count  to  PSL-registrable-domain → count.
-            # After deploying this change, reset and re-ingest all LCA files:
-            #   UPDATE fein_domain_map SET domain_counts='{}', total_emails=0,
-            #          assigned_domain=NULL, confidence=NULL, low_confidence=FALSE;
-            #   python scripts/process_dol_lca.py --file <all quarters>
+            # fein_domain_map — merge domain count JSON with existing row.
+            # Legacy rows with raw subdomain keys (e.g. email.gs.com) are automatically
+            # re-rooted to their registrable domain during the merge below; no reset or
+            # re-ingest is needed when deploying to a DB that has pre-migration data.
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
                 # Merge new domain counts with existing DB row in Python, then plain-upsert.
