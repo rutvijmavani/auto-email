@@ -235,19 +235,26 @@ Consumption:
 domain_enrichment:dlq
 discovery:dlq
 
-Per entry:
-    company_fein
-    error_reason      (network_fail | quota_exhausted | bad_domain | no_web_presence)
-    retry_count
-    failed_at
-    last_error
+Per entry — max-retry failures (_move_to_dlq):
+    fein              company FEIN that exhausted retries
+    error_reason      "max_retries_exceeded" | "processing_error"
+    retry_count       attempt count at time of DLQ push
+    failed_at         Unix timestamp
+
+Per entry — malformed delayed-queue payloads:
+    fein              "MALFORMED" literal
+    error_reason      "malformed_payload"
+    last_error        exception text
+    retry_count       0
+    raw               repr() of the offending Redis member
+    failed_at         Unix timestamp
 
 Admin script: review + manual retry
 ```
 
 ### Queue Depth Monitoring
-- Manager reads `ZCARD` (not `LLEN`) for ZSET queues
-- Small manager update needed to handle ZSET alongside existing LIST queues
+- Manager reads `ZCARD` for enrichment and discovery ZSET queues; `LLEN` for detail/fullscan LIST queues
+- `_get_queue_metrics` returns `domain_enrichment` and `discovery` keys alongside `detail`, `scan`, `fullscan`
 
 ---
 
@@ -307,10 +314,11 @@ Each worker needs:
 
 ### fein_domain_map (additions)
 ```sql
-public_domain_method   TEXT      -- 'http_redirect' | 'root_fallback' | 'certspotter' | 'crtsh'
-last_enriched_at       TIMESTAMP -- when enrichment worker last processed this row
-kg_checked             BOOLEAN   -- whether KG has been queried for this company
-last_discovered_at     TIMESTAMP -- when discovery worker last processed this row
+public_domain_method      TEXT        -- 'http_redirect' | 'root_fallback' | 'certspotter' | 'crtsh'
+last_enriched_at          TIMESTAMPTZ -- when enrichment worker last processed this row
+kg_checked                BOOLEAN     -- whether KG has been queried for this company
+last_discovered_at        TIMESTAMPTZ -- when discovery worker last processed this row
+careers_url_verified_at   TIMESTAMPTZ -- when the careers URL was last HEAD-checked as reachable
 ```
 
 ### company_ats (existing, verify)
@@ -331,9 +339,16 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
        → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
 2. staleness_checker (daily cron)
-       WHERE last_enriched_at < NOW() - INTERVAL '90 days'
-         AND is_monitored = TRUE
-       → ZADD domain_enrichment_queue petition_count fein
+       WHERE (
+         -- Never resolved but past staleness window (prevents re-queue every day for persistent fails)
+         (public_domain IS NULL
+           AND (last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'))
+         OR
+         -- Stale or never processed, only for actively monitored companies
+         (last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days')
+         AND employer_fein IN (monitored_feins from get_monitorable_companies())
+       )
+       → ZADD domain_enrichment_queue petition_count {"fein": ..., "trigger": "staleness"}
        → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
 3. User visits company page (on-demand verification — see below)

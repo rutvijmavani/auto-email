@@ -139,8 +139,12 @@ def _flush_delayed(r) -> None:
             # Malformed payload — cannot be re-queued; send to DLQ and discard
             log.warning("delayed flush: malformed entry %r — sending to DLQ (%s)", raw, exc)
             dlq_payload = json.dumps({
-                "fein": "MALFORMED", "error_reason": str(exc),
-                "raw": repr(raw), "failed_at": time.time(),
+                "fein":         "MALFORMED",
+                "error_reason": "malformed_payload",
+                "last_error":   str(exc),
+                "retry_count":  0,
+                "raw":          repr(raw),
+                "failed_at":    time.time(),
             })
             r.lpush(DISCOVERY_DLQ, dlq_payload)
             r.zrem(DISCOVERY_DELAYED, raw)

@@ -76,14 +76,9 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
         return None
 
-_MULTI_LABEL_SLDS = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "gen", "ne", "me"}
-
 def _host_root(hostname: str) -> str:
-    """Return the registrable domain, handling multi-label TLDs like .co.uk."""
-    parts = hostname.split(".")
-    if len(parts) >= 3 and parts[-2] in _MULTI_LABEL_SLDS:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+    """Return the registrable domain using the PSL-aware offline tldextract instance."""
+    return _tldextract.extract(hostname).registered_domain or hostname
 
 def _make_session():
     if _CURL_AVAILABLE:

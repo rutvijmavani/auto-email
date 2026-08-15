@@ -623,6 +623,60 @@ class TestQueueMetrics(unittest.TestCase):
         # scan and fullscan should still compute
         self.assertEqual(metrics["scan"]["depth"], 5)
 
+    def test_enrichment_depth_from_zcard(self):
+        """domain_enrichment depth = ZCARD(domain_enrichment_queue)."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zrange.return_value = []
+        r.zcard.side_effect = lambda k: 42 if "domain_enrichment_queue" in k else 0
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["domain_enrichment"]["depth"], 42)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
+
+    def test_discovery_depth_from_zcard(self):
+        """discovery depth = ZCARD(discovery_queue)."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zrange.return_value = []
+        r.zcard.side_effect = lambda k: 17 if "discovery_queue" in k else 0
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["discovery"]["depth"], 17)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
+
+    def test_enrichment_delay_from_delayed_zset(self):
+        """domain_enrichment delay comes from domain_enrichment:delayed ZSET score."""
+        now = time.time()
+        overdue_by = 120
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zcard.return_value = 0
+        r.zrange.side_effect = lambda key, start, stop, withscores=False: (
+            [(b"item", now - overdue_by)] if "domain_enrichment:delayed" in key else []
+        )
+        metrics = mgr._get_queue_metrics(r)
+        self.assertAlmostEqual(metrics["domain_enrichment"]["delay_s"], overdue_by, delta=2)
+
+    def test_discovery_delay_from_delayed_zset(self):
+        """discovery delay comes from discovery:delayed ZSET score."""
+        now = time.time()
+        overdue_by = 240
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zcard.return_value = 0
+        r.zrange.side_effect = lambda key, start, stop, withscores=False: (
+            [(b"item", now - overdue_by)] if "discovery:delayed" in key else []
+        )
+        metrics = mgr._get_queue_metrics(r)
+        self.assertAlmostEqual(metrics["discovery"]["delay_s"], overdue_by, delta=2)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 7 — busy_ms: SCAN+sum, missing keys, utilization computation
