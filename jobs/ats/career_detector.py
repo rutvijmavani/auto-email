@@ -926,7 +926,10 @@ def detect_company(company_domain, session=None, *, seed_url=None):
         List of {"platform": ..., "slug": ..., "source_url": ...}
         — one entry per unique (platform, slug) pair found across the full crawl.
         — slug="" if platform detected but tenant URL not found (partial).
-        — empty list if nothing found.
+        — [{"platform": None, "slug": None, "source_url": url}] if no ATS found
+          but a 200-OK career URL was discovered; callers must check platform is
+          None before reading platform/slug.
+        — [] if no ATS and no career URL found.
     """
     from collections import deque
 

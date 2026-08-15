@@ -496,8 +496,10 @@ One row appended per company per worker run. Allows trend analysis over time
 
 ### Retention
 
-Metrics rows are historical — keep indefinitely (table is small, ~25k rows per full run).
-No automated cleanup. If it grows, add a `RETENTION_ENRICHMENT_METRICS_DAYS` config var.
+`RETENTION_ENRICHMENT_METRICS_DAYS = 90` (config.py) — rows older than 90 days are deleted
+automatically. `db/schema.py`'s `_cleanup_h1b_enrichment_metrics` runs this DELETE and is
+invoked by `init_db()` on every startup. Kept longer than `RETENTION_MONITOR_STATS` (60 days)
+because pipeline debugging benefits from a full quarter of phase-by-phase history.
 
 ---
 

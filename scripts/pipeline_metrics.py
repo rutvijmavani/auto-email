@@ -223,12 +223,16 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         ats_total = sum(r["n"] for r in ats_rows)
         _phase_table(ats_rows, ats_total, "Detection phase")
 
-        # ATS platform breakdown
+        # ATS platform breakdown — latest run per employer only
         plat_rows = conn.execute("""
-            SELECT ats_platform, COUNT(DISTINCT employer_fein) AS companies
-            FROM h1b_enrichment_metrics
-            WHERE ats_platform IS NOT NULL
-              AND run_at > NOW() - %s::interval
+            SELECT ats_platform, COUNT(*) AS companies
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE ats_platform IS NOT NULL
+                  AND run_at > NOW() - %s::interval
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY ats_platform
             ORDER BY companies DESC
             LIMIT 15
