@@ -192,6 +192,8 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.employer_fein,
             f.assigned_domain,
             f.careers_url,
+            f.public_domain,
+            f.public_domain_method,
             e.employer_name,
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
@@ -205,14 +207,23 @@ def _load_company(conn, fein: str) -> "dict | None":
 
 
 def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> None:
-    conn.execute("""
-        UPDATE fein_domain_map
-        SET public_domain        = %s,
-            public_domain_method = %s,
-            last_enriched_at     = NOW(),
-            updated_at           = NOW()
-        WHERE employer_fein = %s
-    """, (public_domain, method, fein))
+    if public_domain is not None:
+        conn.execute("""
+            UPDATE fein_domain_map
+            SET public_domain        = %s,
+                public_domain_method = %s,
+                last_enriched_at     = NOW(),
+                updated_at           = NOW()
+            WHERE employer_fein = %s
+        """, (public_domain, method, fein))
+    else:
+        # Resolution failed — preserve any previously stored domain; only advance the staleness timestamp
+        conn.execute("""
+            UPDATE fein_domain_map
+            SET last_enriched_at = NOW(),
+                updated_at       = NOW()
+            WHERE employer_fein = %s
+        """, (fein,))
 
 
 def _write_metric(conn, fein: str, trigger: str,
@@ -286,8 +297,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             log.warning("fein=%s trigger=%s assigned_domain is NULL — permanent skip (no email domain in LCA data)", fein, trigger)
             return True
 
-        employer_name  = company["employer_name"]
+        employer_name    = company["employer_name"]
         existing_careers = company["careers_url"]
+        stored_public    = company["public_domain"]
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
@@ -300,12 +312,17 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             _requeue_delayed(r, fein, petition_count, retry_after, trigger)
             return True
 
-        probe_domain = public_domain or assigned
-        website_url  = f"https://{probe_domain}"
+        # When resolution fails, fall back to the previously stored public_domain so
+        # downstream phases probe the best-known domain rather than the raw assigned one.
+        effective_public = public_domain or stored_public
+        probe_domain     = effective_public or assigned
+        website_url      = f"https://{probe_domain}"
 
+        # _write_domain only persists public_domain/method when resolution succeeded;
+        # on failure it advances last_enriched_at only (preserves existing stored domain).
         _write_domain(conn, fein, public_domain, method)
         conn.commit()
-        log.info("fein=%s public_domain=%s method=%s", fein, public_domain, method)
+        log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
 
         # ── Step 2: Phase 3 — career path probe ───────────────────────────────
         careers_url = existing_careers  # don't overwrite an existing good URL

@@ -657,7 +657,7 @@ class TestQueueMetrics(unittest.TestCase):
         r.zcount.return_value = 0
         r.zcard.return_value = 0
         r.zrange.side_effect = lambda key, start, stop, withscores=False: (
-            [(b"item", now - overdue_by)] if "domain_enrichment:delayed" in key else []
+            [(b"item", now - overdue_by)] if key == mgr.DOMAIN_ENRICHMENT_DELAYED else []
         )
         metrics = mgr._get_queue_metrics(r)
         self.assertAlmostEqual(metrics["domain_enrichment"]["delay_s"], overdue_by, delta=2)
@@ -672,7 +672,7 @@ class TestQueueMetrics(unittest.TestCase):
         r.zcount.return_value = 0
         r.zcard.return_value = 0
         r.zrange.side_effect = lambda key, start, stop, withscores=False: (
-            [(b"item", now - overdue_by)] if "discovery:delayed" in key else []
+            [(b"item", now - overdue_by)] if key == mgr.DISCOVERY_DELAYED else []
         )
         metrics = mgr._get_queue_metrics(r)
         self.assertAlmostEqual(metrics["discovery"]["delay_s"], overdue_by, delta=2)
