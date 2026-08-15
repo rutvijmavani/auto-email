@@ -515,4 +515,4 @@ No automated cleanup. If it grows, add a `RETENTION_ENRICHMENT_METRICS_DAYS` con
    - Reference script: /tmp/test_pd4.py (8/8 passing, ready to integrate)
 5. **Re-detection threshold** — `JOB_MONITOR_REDETECT_DAYS = 14` (already in config.py)
    and `DISCOVER_REDETECT_EMPTY_DAYS = 30` for discovery staleness
-6. **Staleness interval** — 90 days for enrichment refresh (to be added to config.py)
+6. **Staleness interval** — `ENRICH_STALENESS_DAYS = 90` (in config.py); enrichment refresh after 90 days

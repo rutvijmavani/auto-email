@@ -120,6 +120,9 @@ def _flush_delayed(r) -> int:
             fein     = data["fein"]
             trigger  = data.get("trigger", "delayed_retry")
             pc       = data["petition_count"]
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": trigger}): pc}, gt=True)
+            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
+            moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             # Malformed payload — cannot be re-queued; discard to DLQ
             log.warning("Failed to flush delayed item %r: %s — sending to DLQ", item, e)
@@ -133,14 +136,9 @@ def _flush_delayed(r) -> int:
             })
             r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
-            continue
         except Exception as e:
-            # Transient Redis error — leave item in DELAYED so next flush cycle retries
+            # Transient Redis error (from parse or zadd/zrem) — leave in DELAYED for retry
             log.warning("delayed flush: Redis error for %r — will retry next cycle (%s)", item, e)
-            continue
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": trigger}): pc}, gt=True)
-        r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
-        moved += 1
     if moved:
         log.info("Flushed %d delayed items to enrichment queue", moved)
     return moved

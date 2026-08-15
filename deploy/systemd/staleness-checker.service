@@ -13,7 +13,6 @@ WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
 ExecStart=/home/opc/mail/venv/bin/python -m scripts.staleness_checker
 TimeoutStartSec=600
-NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=tmpfs
