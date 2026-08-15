@@ -620,7 +620,14 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 # Merge new domain counts with existing DB row in Python, then plain-upsert.
                 # domain_counts stores PSL-aware registrable_domain → count (not raw emails).
                 # No regex needed — keys are already roots (tldextract applied in Python).
-                _prev_counts = existing_domain_counts.get(fein, {})
+                # Normalize keys from DB — rows written before PSL migration may have
+                # raw subdomain keys (e.g. email.gs.com); re-root them so merging is correct.
+                _raw_prev    = existing_domain_counts.get(fein, {})
+                _prev_counts: dict = {}
+                for _pk, _pv in _raw_prev.items():
+                    _pext = _tldextract.extract(_pk)
+                    _proot = _pext.registered_domain or _pk
+                    _prev_counts[_proot] = _prev_counts.get(_proot, 0) + _pv
                 _prev_total  = existing_email_totals.get(fein, 0)
                 _merged: dict = dict(_prev_counts)
                 for _dom, _cnt in dm["domain_counts"].items():

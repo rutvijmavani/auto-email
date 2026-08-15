@@ -36,6 +36,7 @@ from config import (
     RETENTION_PIPELINE_ALERTS,
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
+    RETENTION_ENRICHMENT_METRICS_DAYS,
 )
 
 
@@ -223,7 +224,7 @@ def _cleanup_custom_ats_inspection(c):
 
 
 def _cleanup_h1b_enrichment_metrics(c):
-    cutoff = (datetime.now() - timedelta(days=RETENTION_MONITOR_STATS)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now() - timedelta(days=RETENTION_ENRICHMENT_METRICS_DAYS)).strftime("%Y-%m-%d")
     c.execute("DELETE FROM h1b_enrichment_metrics WHERE run_at < %s", (cutoff,))
 
 

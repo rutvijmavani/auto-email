@@ -406,8 +406,14 @@ def run_worker(once: bool = False) -> None:
             if not _pop_result:
                 earliest = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
                 if not earliest:
-                    log.info("Discovery queue empty — exiting")
-                    break
+                    # Guard against producer-enqueue race: re-flush and re-check once before
+                    # exiting — a producer may have pushed an item while we still appear
+                    # running to systemd (so its `systemctl start` is a no-op).
+                    _flush_delayed(r)
+                    if r.zcard(DISCOVERY_QUEUE) == 0:
+                        log.info("Discovery queue empty — exiting")
+                        break
+                    continue
                 if once:
                     log.info("Discovery queue empty (--once); %d delayed item(s) — exiting",
                              r.zcard(DISCOVERY_DELAYED))

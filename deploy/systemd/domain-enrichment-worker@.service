@@ -30,3 +30,6 @@ ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=domain-enrichment-worker@%i
+
+[Install]
+WantedBy=multi-user.target

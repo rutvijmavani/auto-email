@@ -463,8 +463,15 @@ def run_worker(once: bool = False) -> None:
             if not _pop_result:
                 earliest = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
                 if not earliest:
-                    log.info("Enrichment queue empty — exiting")
-                    break
+                    # Guard against producer-enqueue race: a producer may have pushed an item
+                    # between our Lua pop attempt and here while we still appear running to
+                    # systemd (so its `systemctl start` is a no-op). Re-flush and re-check
+                    # once; if still empty it is safe to exit.
+                    _flush_delayed(r)
+                    if r.zcard(DOMAIN_ENRICHMENT_QUEUE) == 0:
+                        log.info("Enrichment queue empty — exiting")
+                        break
+                    continue
                 if once:
                     log.info("Enrichment queue empty (--once); %d delayed item(s) — exiting",
                              r.zcard(DOMAIN_ENRICHMENT_DELAYED))
@@ -517,7 +524,7 @@ def run_worker(once: bool = False) -> None:
                     _clear_retry(r, fein)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
-                    _requeue_delayed(r, fein, petition_count, delay_s)
+                    _requeue_delayed(r, fein, petition_count, delay_s, trigger)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:

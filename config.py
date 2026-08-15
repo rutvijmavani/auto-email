@@ -66,6 +66,8 @@ RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
 DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
 RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
+RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
+VERIFY_TASK_QUEUE_CAP          = 200    # max concurrent+queued background verify/enrich tasks
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely

@@ -26,6 +26,7 @@ from config import (
     DOMAIN_ENRICHMENT_QUEUE,
     ENRICHMENT_HIGH_PRIORITY_SCORE,
     REDIS_EMAIL_PUSH,
+    VERIFY_TASK_QUEUE_CAP,
 )
 from db.applications import add_application
 from db.connection import get_conn
@@ -573,9 +574,13 @@ def verify_company():
     }
 
     def _submit(fn, *args):
-        """Submit to bounded executor; skip if this FEIN is already in-flight."""
+        """Submit to bounded executor; skip if this FEIN is already in-flight or global cap reached."""
         with _INFLIGHT_LOCK:
             if fein in _INFLIGHT_FEINS:
+                return
+            if len(_INFLIGHT_FEINS) >= VERIFY_TASK_QUEUE_CAP:
+                logger.warning("verify task queue full (%d) — dropping task for fein=%s",
+                               VERIFY_TASK_QUEUE_CAP, fein)
                 return
             _INFLIGHT_FEINS.add(fein)
 
