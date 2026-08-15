@@ -328,29 +328,30 @@ def _populate_enrichment_queue(conn, r) -> None:
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
     from workers.worker_control import start_workers, ENRICHMENT_WORKERS
 
-    rows = conn.execute("""
+    cur = conn.execute("""
         SELECT f.employer_fein,
                COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE f.last_enriched_at IS NULL
            OR f.last_enriched_at < NOW() - %s::interval
-    """, (f"{ENRICH_STALENESS_DAYS} days",)).fetchall()
-
-    if not rows:
-        log.info("enrichment queue: no eligible companies — skipping")
-        return
+    """, (f"{ENRICH_STALENESS_DAYS} days",))
 
     pipe = r.pipeline(transaction=False)
-    for i, row in enumerate(rows):
+    i = 0
+    for row in cur:
         member = json.dumps({"fein": row["employer_fein"], "trigger": "fuzzy_match"})
         pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
-        if (i + 1) % _ZADD_PIPELINE_BATCH == 0:
+        i += 1
+        if i % _ZADD_PIPELINE_BATCH == 0:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
-    if len(rows) % _ZADD_PIPELINE_BATCH != 0:
+    if i == 0:
+        log.info("enrichment queue: no eligible companies — skipping")
+        return
+    if i % _ZADD_PIPELINE_BATCH != 0:
         pipe.execute()
-    log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", len(rows))
+    log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", i)
 
     start_workers(*ENRICHMENT_WORKERS)
 

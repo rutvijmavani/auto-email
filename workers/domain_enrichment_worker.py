@@ -487,11 +487,11 @@ def run_worker(once: bool = False) -> None:
                              r.zcard(DOMAIN_ENRICHMENT_DELAYED))
                     break
                 _, next_ts = earliest[0]
-                wait_s = max(1.0, next_ts - time.time())
+                wait_s = min(30.0, max(1.0, next_ts - time.time()))
                 log.info("Enrichment queue empty; %d delayed item(s) — sleeping %.0fs",
                          r.zcard(DOMAIN_ENRICHMENT_DELAYED), wait_s)
                 time.sleep(wait_s)
-                continue
+                continue  # re-check main queue after each short sleep
 
             raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
             score      = _pop_result[1]  # str score returned by Lua

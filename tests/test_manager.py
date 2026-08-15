@@ -630,7 +630,7 @@ class TestQueueMetrics(unittest.TestCase):
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zrange.return_value = []
-        r.zcard.side_effect = lambda k: 42 if "domain_enrichment_queue" in k else 0
+        r.zcard.side_effect = lambda k: 42 if k == mgr.DOMAIN_ENRICHMENT_QUEUE else 0
         metrics = mgr._get_queue_metrics(r)
         self.assertEqual(metrics["domain_enrichment"]["depth"], 42)
         self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
@@ -642,7 +642,7 @@ class TestQueueMetrics(unittest.TestCase):
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zrange.return_value = []
-        r.zcard.side_effect = lambda k: 17 if "discovery_queue" in k else 0
+        r.zcard.side_effect = lambda k: 17 if k == mgr.DISCOVERY_QUEUE else 0
         metrics = mgr._get_queue_metrics(r)
         self.assertEqual(metrics["discovery"]["depth"], 17)
         self.assertEqual(metrics["discovery"]["delay_s"], 0.0)

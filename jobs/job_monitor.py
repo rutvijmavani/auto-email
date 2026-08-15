@@ -814,8 +814,6 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
 # Logic is identical to the original sequential loop body.
 # Only difference: uses semaphore instead of between_companies_delay().
 # ─────────────────────────────────────────
-_REDETECT_SEMAPHORE = threading.Semaphore(1)
-
 def _process_company(company_row, position, total, _enrichment_event=None, _r=None):
     """
     Process one company: fetch jobs, filter, save new ones.

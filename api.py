@@ -539,7 +539,7 @@ def verify_company():
             FROM fein_domain_map f
             LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
             WHERE f.employer_fein = %s
-            ORDER BY ca.priority ASC NULLS LAST,
+            ORDER BY ca.priority DESC NULLS LAST,
                      ca.detected_at DESC NULLS LAST,
                      ca.slug NULLS LAST
             LIMIT 1

@@ -141,7 +141,8 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                     SELECT DISTINCT ON (employer_fein)
                         employer_fein, public_domain_method
                     FROM h1b_enrichment_metrics
-                    WHERE run_at > NOW() - %s::interval
+                    WHERE worker = 'domain_enrichment'
+                      AND run_at > NOW() - %s::interval
                     ORDER BY employer_fein, run_at DESC
                 ) m
                 JOIN dol_h1b_employers e ON e.employer_fein = m.employer_fein

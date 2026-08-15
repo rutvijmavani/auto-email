@@ -259,10 +259,12 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     if redir is None:
         log.debug("DNS fail for %s — trying root fallback", domain)
     elif redir == "":
-        # Only accept "already public" for root domains. A subdomain like
-        # ny.email.gs.com resolves within the same root (gs.com), but the
-        # real public site may be at goldmansachs.com — fall through to CT log.
-        if not _tldextract.extract(domain).subdomain:
+        # Accept "already public" for root domains and www-prefixed subdomains.
+        # A subdomain like ny.email.gs.com resolves within the same root (gs.com),
+        # but the real public site may be at goldmansachs.com — fall through to CT log.
+        # www is a standard public alias, not a meaningful subdomain.
+        sub = _tldextract.extract(domain).subdomain
+        if not sub or sub == "www":
             log.debug("%s already resolves publicly", domain)
             return domain, "same_domain", None
         log.debug("%s resolves within its root but has subdomain — continuing", domain)
