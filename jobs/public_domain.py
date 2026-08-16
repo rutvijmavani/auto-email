@@ -15,6 +15,7 @@ only on certspotter 429 — caller should re-queue the company with that delay.
 """
 
 import ipaddress
+import json
 import socket
 import time
 from urllib.parse import urljoin, urlparse
@@ -109,10 +110,24 @@ _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6
 _CT_TIMEOUT          = 20
 _CRTSH_TIMEOUT       = 30
+_CT_MAX_BYTES        = 20 * 1024 * 1024  # 20 MiB — guard against oversized CT responses
 _CT_PROBE_BUDGET_S   = 60
 
 # Module-level certspotter backoff — avoid hammering after a 429
 _certspotter_retry_after: float = 0.0
+
+
+def _bounded_json(r, max_bytes: int = _CT_MAX_BYTES):
+    """Read a streaming response body up to max_bytes, then JSON-parse.
+    Raises ValueError when the body exceeds the limit."""
+    chunks = []
+    received = 0
+    for chunk in r.iter_content(chunk_size=65536):
+        received += len(chunk)
+        if received > max_bytes:
+            raise ValueError(f"CT response body exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+    return json.loads(b"".join(chunks))
 
 
 def _root(u: str) -> str:
@@ -251,6 +266,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             params={"domain": domain, "include_subdomains": "true", "expand": "dns_names"},
             headers=headers,
             timeout=_CT_TIMEOUT,
+            stream=True,
         )
         if r.status_code == 429:
             _ra = r.headers.get("Retry-After", "3600")
@@ -267,7 +283,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             log.warning("certspotter HTTP %d for %s", r.status_code, domain)
             return [], None
 
-        certs = r.json()
+        certs = _bounded_json(r)
         roots: dict[str, int] = {}
         for cert in certs:
             for d in cert.get("dns_names", []):
@@ -295,13 +311,14 @@ def _ct_crtsh(domain: str) -> list[str]:
             params={"q": domain, "output": "json"},
             timeout=_CRTSH_TIMEOUT,
             headers={"User-Agent": "python-h1b-discovery/1.0"},
+            stream=True,
         )
         if r.status_code != 200:
             log.warning("crt.sh HTTP %d for %s", r.status_code, domain)
             return []
 
         roots: dict[str, int] = {}
-        for cert in r.json():
+        for cert in _bounded_json(r):
             for d in cert.get("name_value", "").replace("\n", ",").split(","):
                 d = d.strip().removeprefix("*.")
                 if not d or d == domain:

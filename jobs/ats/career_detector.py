@@ -762,8 +762,10 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
     if first_200_url is not None and first_200_url[0] is None:
         _fp    = urlparse(final_url)
         _fhost = (_fp.hostname or "").removeprefix("www.")
-        _freg  = _tldextract.extract(_fhost).registered_domain or _fhost
-        if _fp.path.rstrip("/") or _freg != company_root:
+        # Use hostname (not registrable domain) so career subdomains like
+        # careers.company.com are kept even when their path is root "/".
+        # Only reject root-path URLs on the bare company domain (homepage redirects).
+        if _fp.path.rstrip("/") or _fhost != company_root:
             first_200_url[0] = final_url
 
     # Full scan: JS bundles + API probes

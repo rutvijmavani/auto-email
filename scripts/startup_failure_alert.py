@@ -23,6 +23,7 @@ Trigger condition:
 
 import html
 import os
+import re
 import smtplib
 import sys
 import time
@@ -67,31 +68,65 @@ _ONESHOT_SERVICES = frozenset({
     "staleness-checker",
 })
 
-# Template units whose OnFailure passes %N (e.g. "domain-enrichment-worker@1").
-# Any "<base>@<instance>" where base is in this set is accepted.
+# Template units whose OnFailure passes %p-%i (e.g. "domain-enrichment-worker-1").
+# Accepted as "<base>-<N>" format; bare "@N" legacy format also accepted.
 _VALID_TEMPLATES = frozenset({
     "discover-h1b-ats-worker",
     "domain-enrichment-worker",
 })
 
+# Matches "prefix-N" produced by OnFailure=...@%p-%i.service in template worker units.
+_TEMPLATE_INSTANCE_RE = re.compile(r'^(.+)-(\d+)$')
+
 
 def _validate_service(service: str) -> None:
     """Raise ValueError if service is not in the known-good allowlist.
 
-    Accepts both exact names and template instances (<base>@<N>) when base is
-    in _VALID_TEMPLATES — e.g. 'domain-enrichment-worker@1' is accepted.
+    Accepts:
+      - exact names in _VALID_SERVICES ("recruiter-scheduler")
+      - "<base>-<N>" format when base is in _VALID_TEMPLATES ("domain-enrichment-worker-1")
+      - legacy "<base>@<N>" format when base is in _VALID_TEMPLATES
     """
     if service in _VALID_SERVICES:
+        return
+    m = _TEMPLATE_INSTANCE_RE.match(service)
+    if m and m.group(1) in _VALID_TEMPLATES:
         return
     if "@" in service:
         base = service.split("@", 1)[0]
         if base in _VALID_TEMPLATES:
             return
     raise ValueError(
-        f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)} "
-        f"or a template instance like '<name>@<N>' where name is in "
-        f"{sorted(_VALID_TEMPLATES)}"
+        f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)}, "
+        f"'<name>-<N>' or '<name>@<N>' where name is in {sorted(_VALID_TEMPLATES)}"
     )
+
+
+def _resolve_service_arg(raw: str) -> tuple[str, str]:
+    """Parse the systemd OnFailure argument into (service_key, journal_unit).
+
+    service_key   — used for dedup flag, display, hints lookup
+    journal_unit  — the actual systemd unit name passed to journalctl -u
+
+    Handles the three formats OnFailure= can produce:
+      "recruiter-scheduler"        (%p, non-template)   → journal "recruiter-scheduler.service"
+      "domain-enrichment-worker-1" (%p-%i, template)    → journal "domain-enrichment-worker@1.service"
+      "domain-enrichment-worker@1" (legacy %N path)     → journal "domain-enrichment-worker@1.service"
+    """
+    if raw.endswith(".service"):
+        raw = raw[: -len(".service")]
+
+    m = _TEMPLATE_INSTANCE_RE.match(raw)
+    if m and m.group(1) in _VALID_TEMPLATES:
+        prefix, instance = m.group(1), m.group(2)
+        return raw, f"{prefix}@{instance}.service"
+
+    if "@" in raw:
+        base = raw.split("@", 1)[0]
+        if base in _VALID_TEMPLATES:
+            return raw, f"{raw}.service"
+
+    return raw, f"{raw}.service"
 
 
 def _claim_alert_slot(service: str) -> bool:
@@ -176,13 +211,19 @@ def _claim_alert_slot(service: str) -> bool:
 # journalctl so the email is self-contained
 # ─────────────────────────────────────────
 
-def _get_journal_tail(service: str, lines: int = 30) -> str:
-    """Return the last `lines` journal entries for `service` as plain text."""
+def _get_journal_tail(service: str, lines: int = 30, journal_unit: str | None = None) -> str:
+    """Return the last `lines` journal entries for `service` as plain text.
+
+    journal_unit overrides the unit name passed to journalctl — used for template
+    instances where the journalctl unit differs from the service_key
+    (e.g. service_key="domain-enrichment-worker-1", unit="domain-enrichment-worker@1.service").
+    """
     _validate_service(service)
+    unit = journal_unit or f"{service}.service"
     try:
         import subprocess
         result = subprocess.run(
-            ["/usr/bin/journalctl", "-u", service, "-n", str(lines), "--no-pager",
+            ["/usr/bin/journalctl", "-u", unit, "-n", str(lines), "--no-pager",
              "--output=short-precise"],
             capture_output=True, text=True, timeout=10,
         )
@@ -190,7 +231,7 @@ def _get_journal_tail(service: str, lines: int = 30) -> str:
             return result.stdout.strip()
     except Exception:
         pass
-    return f"(could not retrieve journal — run: journalctl -u {service} -n 50)"
+    return f"(could not retrieve journal — run: journalctl -u {unit} -n 50)"
 
 
 # ─────────────────────────────────────────
@@ -237,7 +278,7 @@ _DIAGNOSE_HINTS = {
 }
 
 
-def send_startup_failure_alert(service: str) -> None:
+def send_startup_failure_alert(service: str, journal_unit: str) -> None:
     _validate_service(service)   # validate before any I/O so invalid service fails fast
 
     if not EMAIL or not APP_PASSWORD:
@@ -251,12 +292,14 @@ def send_startup_failure_alert(service: str) -> None:
     now_str      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     display_name = _SERVICE_DISPLAY.get(service, service)
     hints        = _DIAGNOSE_HINTS.get(service, [
-        f"Check logs: <code>journalctl -u {service} -n 50</code>",
-        f"Re-enable: <code>sudo systemctl reset-failed {service} && "
-        f"sudo systemctl start {service}</code>",
+        f"Check logs: <code>journalctl -u {journal_unit} -n 50</code>",
+        f"Re-enable: <code>sudo systemctl reset-failed {journal_unit} && "
+        f"sudo systemctl start {journal_unit}</code>",
     ])
 
-    base_service = service.split("@", 1)[0]
+    # Derive base for oneshot check — strips instance suffix ("domain-enrichment-worker-1" → base)
+    _m = _TEMPLATE_INSTANCE_RE.match(service)
+    base_service = _m.group(1) if (_m and _m.group(1) in _VALID_TEMPLATES) else service.split("@", 1)[0]
     is_oneshot   = base_service in _ONESHOT_SERVICES
     what_happened = (
         "The service failed to complete successfully (non-zero exit code). "
@@ -266,7 +309,7 @@ def send_startup_failure_alert(service: str) -> None:
         "systemd has stopped retrying — the service is now in <strong>failed</strong> state."
     )
 
-    journal_text = _get_journal_tail(service, lines=30)
+    journal_text = _get_journal_tail(service, lines=30, journal_unit=journal_unit)
     hints_html   = "".join(
         f'<li style="margin:4px 0;">{h}</li>' for h in hints
     )
@@ -394,9 +437,5 @@ if __name__ == "__main__":
               file=sys.stderr)
         sys.exit(1)
 
-    service_name = sys.argv[1]
-    # Normalise: systemd passes %n which may include .service suffix
-    if service_name.endswith(".service"):
-        service_name = service_name[: -len(".service")]
-
-    send_startup_failure_alert(service_name)
+    service_name, journal_unit = _resolve_service_arg(sys.argv[1])
+    send_startup_failure_alert(service_name, journal_unit)

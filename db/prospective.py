@@ -116,12 +116,14 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
     conn.commit()
     inserted = c.rowcount > 0
     if not inserted:
-        # Update domain/platform/slug if company already existed and values are provided
+        # Update domain/platform/slug if company already existed and values are provided.
+        # Treat 'unknown'/'unsupported' as sentinels — replace them when a real platform
+        # is supplied, same as NULL.  Slug empty-string is likewise treated as absent.
         c.execute("""
             UPDATE prospective_companies
             SET domain       = COALESCE(NULLIF(domain, ''), ?),
-                ats_platform = COALESCE(ats_platform, ?),
-                ats_slug     = COALESCE(ats_slug, ?)
+                ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), ?),
+                ats_slug     = COALESCE(NULLIF(ats_slug, ''), ?)
             WHERE company = ?
         """, (domain, platform, slug, company))
         conn.commit()

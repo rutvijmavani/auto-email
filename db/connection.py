@@ -204,11 +204,13 @@ class _Connection:
                 for row in cur:
                     ...
         """
-        return self._conn.cursor(
+        cur = self._conn.cursor(
             name=name,
             cursor_factory=psycopg2.extras.RealDictCursor,
             withhold=False,
         )
+        cur.itersize = itersize
+        return cur
 
     # ── Shorthand execute ────────────────
 

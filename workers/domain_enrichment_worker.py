@@ -120,7 +120,7 @@ def _flush_delayed(r) -> int:
             fein     = data["fein"]
             trigger  = data.get("trigger", "delayed_retry")
             pc       = data["petition_count"]
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": trigger}): pc}, gt=True)
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein}): pc}, gt=True)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -269,7 +269,7 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
 
 
 def _push_to_discovery(r, fein: str, petition_count: int) -> None:
-    member = json.dumps({"fein": fein, "trigger": "enrichment"})
+    member = json.dumps({"fein": fein})
     r.zadd(DISCOVERY_QUEUE, {member: petition_count}, gt=True)
     log.debug("pushed %s to discovery_queue (petition_count=%d)", fein, petition_count)
 
@@ -290,11 +290,26 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         company = _load_company(conn, fein)
         if not company:
             log.warning("fein=%s trigger=%s not found in fein_domain_map — permanent skip (LCA not yet ingested?)", fein, trigger)
+            try:
+                conn.execute(
+                    "INSERT INTO fein_domain_map (employer_fein, last_enriched_at)"
+                    " VALUES (%s, NOW())"
+                    " ON CONFLICT (employer_fein) DO UPDATE SET last_enriched_at = NOW()",
+                    (fein,),
+                )
+                conn.commit()
+            except Exception:
+                pass
             return True
 
         assigned = company["assigned_domain"]
         if not assigned:
             log.warning("fein=%s trigger=%s assigned_domain is NULL — permanent skip (no email domain in LCA data)", fein, trigger)
+            conn.execute(
+                "UPDATE fein_domain_map SET last_enriched_at = NOW() WHERE employer_fein = %s",
+                (fein,),
+            )
+            conn.commit()
             return True
 
         employer_name      = company["employer_name"]
@@ -443,7 +458,7 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         except Exception:
             raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
             fein = raw_str.strip()
-        member = json.dumps({"fein": fein, "trigger": "reclaimed"})
+        member = json.dumps({"fein": fein})
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
         log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
