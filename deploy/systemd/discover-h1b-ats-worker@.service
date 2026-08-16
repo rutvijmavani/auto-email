@@ -5,7 +5,7 @@ After=network-online.target
 Wants=network-online.target
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%N.service
+OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
 Type=simple

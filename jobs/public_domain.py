@@ -76,6 +76,35 @@ GENERIC_ROOTS = {
     "office365.com", "microsoft.com", "googlehosted.com",
 }
 
+# Domains belonging to bot-protection / DDoS-mitigation vendors.
+# When a redirect chain ends on one of these, the origin domain is the real company domain.
+_CHALLENGE_DOMAINS = frozenset({
+    "perfdrive.com",     # PerfDrive / Shape Security (F5)
+    "imperva.com",       # Imperva
+    "incapsula.com",     # Imperva legacy brand
+    "sucuri.net",        # Sucuri (GoDaddy)
+    "radwarecloud.com",  # Radware Bot Manager
+    "reblaze.com",       # Reblaze
+    "perimeterx.net",   # PerimeterX (HUMAN Security)
+    "ddos-guard.net",    # DDoS-Guard
+    "datadome.co",       # DataDome
+    "kasada.io",         # Kasada
+})
+
+# Response headers that identify a bot-protection challenge page served from the company's
+# own domain (e.g. Cloudflare JS challenge stays on company.com but sets cf-ray).
+_CHALLENGE_HEADERS = frozenset({
+    "cf-ray",              # Cloudflare
+    "x-iinfo",             # Imperva (inline mode — served from company domain)
+    "x-sucuri-id",         # Sucuri (inline mode)
+    "x-px-access-denied",  # PerimeterX
+})
+
+
+def _is_challenge_response(headers: dict) -> bool:
+    """Return True if response headers indicate a bot-protection challenge page."""
+    return any(h in headers for h in _CHALLENGE_HEADERS)
+
 _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6
 _CT_TIMEOUT          = 20
@@ -114,6 +143,7 @@ def _redirect_domain(host: str) -> "str | None":
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
         try:
+            _last_headers: dict = {}
             for _ in range(_REDIRECT_MAX_HOPS):
                 hop_host = urlparse(current).hostname or ""
                 if not hop_host or not _is_public_host(hop_host):
@@ -146,6 +176,7 @@ def _redirect_domain(host: str) -> "str | None":
                                 break
                 r.close()
                 if r.status_code not in _REDIRECT_CODES:
+                    _last_headers = dict(r.headers)
                     break  # current is the final URL
                 loc = r.headers.get("Location", "")
                 if not loc:
@@ -159,6 +190,11 @@ def _redirect_domain(host: str) -> "str | None":
             if current is None:
                 continue  # try next scheme
             final = _root(current)
+            # If the chain landed on a bot-protection vendor domain, the origin is the real domain.
+            if final in _CHALLENGE_DOMAINS or _is_challenge_response(_last_headers):
+                log.debug("_redirect_domain: challenge page detected (%s) — origin %s is real domain",
+                          final, host)
+                return ""
             return final if final != _root(host) else ""
         except Exception:
             continue
@@ -173,6 +209,8 @@ def _has_web(root: str) -> bool:
     is live and serving HTTP, which is all the caller cares about.
     """
     if not _is_public_host(root):
+        return False
+    if root in _CHALLENGE_DOMAINS:
         return False
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"

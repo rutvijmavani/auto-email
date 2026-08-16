@@ -488,7 +488,11 @@ def run():
 
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     from workers.redis_client import get_redis as _get_redis
-    _shared_r = _get_redis()
+    try:
+        _shared_r = _get_redis()
+    except Exception as _redis_exc:
+        logger.warning("Redis unavailable — enrichment queueing disabled: %s", _redis_exc)
+        _shared_r = None
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
         with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
@@ -821,12 +825,14 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             company, domain, empty_days,
         )
         return
+    _cooldown_acquired = False
     try:
         r = _r if _r is not None else _get_redis()
         _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
         if not r.set(_cooldown_key, 1, nx=True, ex=JOB_MONITOR_REDETECT_DAYS * 86400):
             logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
             return
+        _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
         result["queued_enrichment"] = 1
@@ -838,6 +844,11 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             tag, company, fein, domain, empty_days,
         )
     except Exception as exc:
+        if _cooldown_acquired:
+            try:
+                r.delete(_cooldown_key)
+            except Exception:
+                pass
         logger.warning("Failed to queue re-enrichment for %r (fein=%s): %s", company, fein, exc)
 
 

@@ -688,15 +688,6 @@ def run_health_check() -> int:
             _row("WARNING", "h1b metrics", "no data yet — workers haven't run")
             warnings += 1
         else:
-            def _pct_str(rows, total):
-                if not total:
-                    return "no data"
-                return "  ".join(
-                    f"{r['public_domain_method'] or r.get('careers_source') or r.get('ats_source') or '?'} "
-                    f"{r['n'] / total * 100:.0f}%"
-                    for r in rows
-                )
-
             def _breakdown(rows, total):
                 if not total:
                     return "no data"
@@ -710,7 +701,7 @@ def run_health_check() -> int:
             null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
             pd_found    = pd_total - no_signal - null_method
             pd_detail = _breakdown(pd_rows, pd_total)
-            if no_signal / pd_total > 0.15 if pd_total else False:
+            if pd_total and no_signal / pd_total > 0.15:
                 _row("WARNING", "public domain",
                      f"{pd_found}/{pd_total} resolved  {pd_detail}")
                 warnings += 1

@@ -39,8 +39,13 @@ def _phase_table(rows, total, label):
         print(f"  {phase:<18} {count:>8}  {_pct(count, total):>7}")
 
 
+_REGRESSION_COLS = frozenset({"public_domain_method", "careers_source", "ats_source"})
+
+
 def _regression_block(conn, col, label, days):
     """Compare phase distribution: last N days vs prior N days."""
+    if col not in _REGRESSION_COLS:
+        raise ValueError(f"Unknown metric column: {col!r}")
     cur = conn.execute(f"""
         SELECT
             period,
@@ -133,7 +138,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         # Top unresolved companies (high petition_count, no public domain)
         # Use the latest metrics row per employer so resolved companies are excluded.
         if no_signal_top > 0:
-            unresolved = conn.execute("""
+            unresolved_rows = conn.execute("""
                 SELECT m.employer_fein, e.employer_name,
                        COALESCE(u.petition_count, 0) AS petition_count,
                        f.assigned_domain
@@ -158,11 +163,11 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 LIMIT %s
             """, (f"{days} days", no_signal_top)).fetchall()
 
-            if unresolved:
+            if unresolved_rows:
                 print(f"\n  Top {no_signal_top} unresolved (no_signal) — high priority targets:")
                 print(f"  {'FEIN':<14} {'Petitions':>10}  {'Domain':<25}  Name")
                 print(f"  {_SEP}")
-                for r in unresolved:
+                for r in unresolved_rows:
                     print(f"  {r['employer_fein']:<14} {r['petition_count']:>10}  "
                           f"{r['assigned_domain'] or '—':<25}  {r['employer_name']}")
 

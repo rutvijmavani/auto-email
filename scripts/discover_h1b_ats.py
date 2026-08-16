@@ -211,6 +211,8 @@ def strip_legal_suffixes(name: str) -> str:
 
 def _root_domain(url: str) -> str:
     """'careers.amazon.co.uk' → 'amazon.co.uk' (PSL-aware registrable domain)."""
+    if "://" not in url:
+        url = "https://" + url
     host = urlparse(url).hostname or ""
     ext  = _tldextract.extract(host)
     return ext.registered_domain or host
