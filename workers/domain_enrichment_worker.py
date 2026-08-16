@@ -297,9 +297,10 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             log.warning("fein=%s trigger=%s assigned_domain is NULL — permanent skip (no email domain in LCA data)", fein, trigger)
             return True
 
-        employer_name    = company["employer_name"]
-        existing_careers = company["careers_url"]
-        stored_public    = company["public_domain"]
+        employer_name      = company["employer_name"]
+        existing_careers   = company["careers_url"]
+        stored_public      = company["public_domain"]
+        db_petition_count  = company["petition_count"]
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
@@ -363,20 +364,20 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
             if p6_platform and p6_slug:
                 _write_ats(conn, fein, probe_domain, employer_name,
-                           p6_platform, p6_slug, petition_count)
+                           p6_platform, p6_slug, db_petition_count)
                 log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
 
         # Use Phase 3 ATS whenever Phase 6 found no platform (even if p6_result is present)
         if not p6_platform and p3_platform and p3_slug:
             _write_ats(conn, fein, probe_domain, employer_name,
-                       p3_platform, p3_slug, petition_count)
+                       p3_platform, p3_slug, db_petition_count)
             log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
 
         conn.commit()
 
         # ── Step 4: push to discovery_queue ───────────────────────────────────
-        if petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
-            _push_to_discovery(r, fein, petition_count)
+        if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
+            _push_to_discovery(r, fein, db_petition_count)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
         ats_source   = None

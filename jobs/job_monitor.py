@@ -815,7 +815,6 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
 
 def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, empty_days, *, log_label=""):
     """Queue fein for domain re-enrichment. Sets result['queued_enrichment']=1 on success."""
-    from workers.redis_client import get_redis as _get_redis
     fein   = company_row.get("employer_fein")
     domain = company_row.get("domain")
     if not fein:
@@ -825,16 +824,19 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             company, domain, empty_days,
         )
         return
+    if _r is None:
+        logger.debug("Redis unavailable — skipping re-enrichment for %r (fein=%s)", company, fein)
+        return
     _cooldown_acquired = False
     try:
-        r = _r if _r is not None else _get_redis()
+        r = _r
         _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
         if not r.set(_cooldown_key, 1, nx=True, ex=JOB_MONITOR_REDETECT_DAYS * 86400):
             logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein}): petition_count}, gt=True)
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()

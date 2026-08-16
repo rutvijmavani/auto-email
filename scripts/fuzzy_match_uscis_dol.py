@@ -348,7 +348,7 @@ def _populate_enrichment_queue(conn, r) -> None:
                OR f.last_enriched_at < NOW() - %s::interval
         """, (f"{ENRICH_STALENESS_DAYS} days",))
         for row in named_cur:
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "fuzzy_match"})
+            member = json.dumps({"fein": row["employer_fein"]})
             pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
             i += 1
             if i % _ZADD_PIPELINE_BATCH == 0:

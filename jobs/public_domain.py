@@ -220,21 +220,6 @@ def _has_web(root: str) -> bool:
             r.close()
             if status < 500:
                 return True
-        except requests.exceptions.SSLError:
-            # Same verify=False rationale as _redirect_domain: internal DB domains only,
-            # we only check response status, not content.
-            log.debug("_has_web: SSL error for %s — retrying without TLS verify", url)
-            try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, verify=False, stream=True)
-                status = r.status_code
-                r.close()
-                if status < 500:
-                    return True
-            except Exception:
-                pass
         except Exception:
             pass
     return False

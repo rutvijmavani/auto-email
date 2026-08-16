@@ -79,7 +79,7 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, workers, cursor_name, log_
                     dry_run_sample.append(row)
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
+            member = json.dumps({"fein": row["employer_fein"]})
             pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
