@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 
 import requests as _requests
-import tldextract as _tldextract
 from flask import Flask, request, jsonify, make_response, redirect
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
@@ -404,13 +403,7 @@ def _is_private_host(host: str) -> bool:
         return True  # treat unresolvable as private (fail closed)
 
 
-def _host_root(host: str) -> str:
-    """Return the PSL-aware registrable domain (e.g. 'acme.co.uk' not 'co.uk')."""
-    ext = _tldextract.extract(host)
-    return ext.registered_domain or host
-
-
-def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
+def _head_ok(url: str) -> bool:
     """
     Return True if url returns a response in _VERIFY_GOOD_CODES (2xx or 403).
     Pre-validates scheme and rejects private/loopback hosts before every hop.
@@ -606,10 +599,8 @@ def verify_company():
         return jsonify(payload), 200
 
     # Fire-and-forget HEAD check — never block the HTTP response
-    _allowed_root = row.get("public_domain") or None
-
     def _background_verify():
-        ok = _head_ok(careers_url, allowed_root=_allowed_root)
+        ok = _head_ok(careers_url)
         if ok:
             # Mark URL as verified so staleness_checker skips it longer
             conn2 = get_conn()

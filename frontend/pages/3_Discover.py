@@ -226,6 +226,64 @@ def load_company_ats_entries(fein: str) -> list[dict]:
     return df.to_dict("records") if not df.empty else []
 
 
+@st.cache_data(ttl=300)
+def load_email_data(fein: str) -> dict | None:
+    """Load email domain map + patterns for a FEIN. Returns None if no data."""
+    df = _query(
+        """
+        SELECT
+            f.domain_counts,
+            f.assigned_domain,
+            f.confidence,
+            f.low_confidence,
+            f.total_emails,
+            ep.patterns,
+            ep.total_unique_personal
+        FROM fein_domain_map f
+        LEFT JOIN email_patterns ep ON ep.domain = f.assigned_domain
+        WHERE f.employer_fein = %s
+        """,
+        (fein,),
+    )
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "domain_counts":        row.get("domain_counts") or {},
+        "assigned_domain":      row.get("assigned_domain"),
+        "confidence":           row.get("confidence"),
+        "low_confidence":       bool(row.get("low_confidence")),
+        "total_emails":         int(row.get("total_emails") or 0),
+        "patterns":             row.get("patterns") or [],
+        "total_unique_personal": int(row.get("total_unique_personal") or 0),
+    }
+
+
+_TOKEN_LABELS = {
+    "fn": "{first}", "fi": "{f}", "ln": "{last}", "li": "{l}",
+    "mn": "{middle}", "mi": "{m}",
+}
+
+
+def _fmt_pattern(pattern_id: str, domain: str) -> str:
+    """Convert a pattern_id like 'fn.ln' to '{first}.{last}@domain.com'."""
+    # Split on sep while preserving it
+    parts = re.split(r'([.\-_])', pattern_id)
+    out = []
+    for p in parts:
+        if p in (".", "-", "_"):
+            out.append(p)
+        else:
+            # Handle fn[:2] style truncations
+            m = re.match(r'^(\w+)\[:\d+\]$', p)
+            base = m.group(1) if m else p
+            label = _TOKEN_LABELS.get(base, f"{{{p}}}")
+            if m:
+                label = label.rstrip("}") + "[:N]}"
+            out.append(label)
+    return "".join(out) + f"@{domain}"
+
+
 def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
     """
     Run a quick inline ATS discovery from the UI.
@@ -646,6 +704,69 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Email Patterns panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.divider()
+st.markdown("#### Email Patterns")
+
+email_data = load_email_data(fein)
+
+if email_data is None:
+    st.info("No email data yet for this employer. Run `process_dol_lca.py` to populate.")
+else:
+    domain_counts: dict = email_data["domain_counts"]
+    assigned      = email_data["assigned_domain"]
+    confidence    = email_data["confidence"]
+    low_conf      = email_data["low_confidence"]
+    total_emails  = email_data["total_emails"]
+    patterns      = email_data["patterns"]
+    total_personal = email_data["total_unique_personal"]
+
+    em1, em2 = st.columns([1, 2])
+
+    with em1:
+        if assigned:
+            conf_str = f"{confidence * 100:.0f}%" if confidence is not None else "—"
+            conf_help = "Fraction of LCA emails that match the assigned domain. Low confidence = ambiguous."
+            st.metric("Assigned email domain", assigned,
+                      delta="⚠ low confidence" if low_conf else None,
+                      delta_color="off" if low_conf else "normal",
+                      help=conf_help)
+            st.caption(f"Confidence: {conf_str}  ·  {total_emails:,} total LCA emails")
+        else:
+            st.info("No email domain assigned yet.")
+
+        # Domain distribution
+        if domain_counts:
+            sorted_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:8]
+            st.markdown("**Email domain distribution**")
+            for dom, cnt in sorted_domains:
+                pct = cnt / total_emails * 100 if total_emails else 0
+                marker = " ✓" if dom == assigned else ""
+                st.progress(pct / 100, text=f"`{dom}`{marker}  {cnt:,} ({pct:.0f}%)")
+
+    with em2:
+        if patterns and assigned:
+            st.markdown(f"**Email format patterns** — `@{assigned}`")
+            st.caption(f"Detected from {total_personal:,} unique personal LCA contacts (≥5% threshold)")
+            for p in sorted(patterns, key=lambda x: -x.get("probability", 0)):
+                prob     = p.get("probability", 0)
+                example  = p.get("example_local", "")
+                pid      = p.get("pattern_id", "")
+                fmt      = _fmt_pattern(pid, assigned)
+                has_digit = p.get("has_digit", False)
+                digit_note = "  `+digit`" if has_digit else ""
+                st.progress(
+                    min(prob, 1.0),
+                    text=f"`{fmt}`{digit_note}  —  **{prob*100:.0f}%**  *(e.g. `{example}@{assigned}`)*",
+                )
+        elif assigned:
+            st.info(f"No patterns yet for `{assigned}`. Run `build_email_patterns.py` to populate.")
+        else:
+            st.info("Assign an email domain first to see format patterns.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ATS Discovery panel
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -811,6 +932,8 @@ else:
                             pipeline_name,
                             priority=1,
                             domain=website,
+                            platform=platform,
+                            slug=slug,
                         )
                         # Feed URLs to the sheet only for new inserts.
                         if inserted:
@@ -823,7 +946,6 @@ else:
                                 )
                             except Exception as _se:
                                 log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
-                                st.warning("ATS detection queuing failed — company was added to pipeline.")
                         # Mark is_monitored only after pipeline insert succeeds
                         conn = get_conn()
                         try:
@@ -838,7 +960,7 @@ else:
                             conn.close()
                         load_ats_discovery.clear()
                         if inserted:
-                            st.success("Added to pipeline! Queued for ATS detection.")
+                            st.success(f"Added to monitoring! ({platform} · ready to scan)")
                         else:
                             st.info("Already in pipeline.")
                         st.rerun()
@@ -846,30 +968,28 @@ else:
                         log.exception("Failed to add %r to pipeline", name)
                         st.error(f"Error: {exc}")
     else:
-        # No ATS detected — let user paste apply URL
-        st.warning("ATS not detected from careers page. If you find the apply URL, paste it below.")
+        # No ATS detected — let user paste a real job listing URL for form sync to process
+        st.warning("ATS not detected from careers page. Paste a real job listing URL below — "
+                   "the pipeline will detect the ATS automatically.")
 
         paste_url = st.text_input(
-            "Apply / job listing URL",
+            "Job listing URL",
             placeholder="https://boards.greenhouse.io/stripe  or  https://stripe.wd1.myworkdayjobs.com/…",
             key=f"paste_ats_url_{fein}",
         )
 
         if paste_url:
-            matched = _match_ats_from_url(paste_url)
-            if matched:
-                p2 = matched["platform"]
-                s2 = matched.get("slug")
-                st.success(f"Detected: **{p2}**" + (f"  ·  slug: `{s2}`" if s2 else ""))
-
-                if st.button("Confirm and add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
+            if not paste_url.startswith(("http://", "https://")):
+                st.error("Please paste a full URL starting with https://")
+            else:
+                if st.button("Add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
                     try:
                         pipeline_name = canonical if canonical != "—" else name
-                        # Insert into pipeline first; only mark is_monitored on success
                         inserted = add_prospective_company(
                             pipeline_name,
                             priority=1,
                             domain=website,
+                            # platform/slug intentionally omitted — form sync will detect
                         )
                         if inserted:
                             try:
@@ -881,32 +1001,82 @@ else:
                                 )
                             except Exception as _se:
                                 log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
-                                st.warning("ATS detection queuing failed — company was added to pipeline.")
+                                st.warning("Could not queue for detection — added to pipeline but ATS detection must be run manually.")
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
                             cur.execute("""
                                 UPDATE h1b_ats_discovery
-                                SET detected_platform = %s,
-                                    detected_slug     = %s,
-                                    careers_url       = COALESCE(careers_url, %s),
-                                    is_monitored      = TRUE
+                                SET careers_url  = COALESCE(careers_url, %s),
+                                    is_monitored = TRUE
                                 WHERE employer_fein = %s
-                            """, (p2, s2, paste_url, fein))
+                            """, (paste_url, fein))
                             conn.commit()
                         finally:
                             conn.close()
                         load_ats_discovery.clear()
                         if inserted:
-                            st.success("Added to pipeline! Queued for ATS detection.")
+                            st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
                         else:
                             st.info("Already in pipeline.")
                         st.rerun()
                     except Exception as exc:
-                        log.exception("Failed to confirm ATS for %r", name)
+                        log.exception("Failed to add %r to pipeline", name)
                         st.error(f"Error: {exc}")
-            else:
-                st.error("Could not detect ATS from that URL. Check the URL and try again.")
+
+    # ── Wrong ATS override ───────────────────────────────────────────────────
+    if platform:
+        with st.expander("Wrong ATS? Fix it"):
+            st.caption("Paste a real job listing URL — the pipeline will re-detect the correct ATS.")
+            override_url = st.text_input(
+                "Job listing URL",
+                placeholder="https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/…",
+                key=f"override_url_{fein}",
+            )
+            if override_url:
+                if not override_url.startswith(("http://", "https://")):
+                    st.error("Please paste a full URL starting with https://")
+                else:
+                    if st.button("Submit correction", key=f"override_btn_{fein}", type="primary"):
+                        try:
+                            pipeline_name = canonical if canonical != "—" else name
+                            inserted = add_prospective_company(pipeline_name, priority=1, domain=website)
+                            if not inserted:
+                                # Company already in pipeline with wrong platform — reset so form sync can re-detect
+                                _oc = get_conn()
+                                try:
+                                    _oc.cursor().execute(
+                                        "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = ?",
+                                        (pipeline_name,),
+                                    )
+                                    _oc.commit()
+                                finally:
+                                    _oc.close()
+                            try:
+                                submit_to_prospective_sheet(
+                                    company         = pipeline_name,
+                                    career_page_url = disc.get("careers_url"),
+                                    job_url         = override_url,
+                                    domain          = website,
+                                )
+                            except Exception as _se:
+                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
+                                st.warning("Could not queue for re-detection — run form sync manually.")
+                            _dc = get_conn()
+                            try:
+                                _dc.cursor().execute(
+                                    "UPDATE h1b_ats_discovery SET is_monitored = TRUE WHERE employer_fein = %s",
+                                    (fein,),
+                                )
+                                _dc.commit()
+                            finally:
+                                _dc.close()
+                            load_ats_discovery.clear()
+                            st.success("Correction submitted — ATS will be re-detected on next form sync run.")
+                            st.rerun()
+                        except Exception as exc:
+                            log.exception("ATS override failed for %r", name)
+                            st.error(f"Error: {exc}")
 
     # ── Re-run discovery ──────────────────────────────────────────────────────
     checked = disc.get("last_checked")

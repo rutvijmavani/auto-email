@@ -61,16 +61,11 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, workers, cursor_name, log_
     Returns count of rows processed. Handles dry-run logging (first 5 rows),
     pipeline batching (STALENESS_ZADD_BATCH), final flush, and worker startup.
     """
-    import psycopg2.extras
-
     added = 0
     dry_run_sample: list = []
     pipe = None if dry_run else r.pipeline(transaction=False)
 
-    with conn._conn.cursor(
-        name=cursor_name,
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    ) as cur:
+    with conn.named_cursor(cursor_name) as cur:
         cur.itersize = 500
         cur.execute(sql, params)
         for row in cur:

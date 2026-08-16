@@ -196,7 +196,8 @@ def _redirect_domain(host: str) -> "str | None":
                           final, host)
                 return ""
             return final if final != _root(host) else ""
-        except Exception:
+        except Exception as _exc:
+            log.debug("_redirect_domain: scheme probe failed for %r (%s): %s", host, scheme, _exc)
             continue
     return None
 
@@ -270,7 +271,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
         roots: dict[str, int] = {}
         for cert in certs:
             for d in cert.get("dns_names", []):
-                d = d.lstrip("*.")
+                d = d.removeprefix("*.")
                 if d == domain:
                     continue
                 root = _root(d)
@@ -302,7 +303,7 @@ def _ct_crtsh(domain: str) -> list[str]:
         roots: dict[str, int] = {}
         for cert in r.json():
             for d in cert.get("name_value", "").replace("\n", ",").split(","):
-                d = d.strip().lstrip("*.")
+                d = d.strip().removeprefix("*.")
                 if not d or d == domain:
                     continue
                 root = _root(d)

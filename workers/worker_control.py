@@ -26,7 +26,11 @@ def start_workers(*units: str, dry_run: bool = False) -> None:
     this after populating a queue is always safe — it only starts idle workers.
     Failures are logged as warnings; the caller is never interrupted.
     """
+    _known = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
     for unit in units:
+        if unit not in _known:
+            log.warning("start_workers: unknown unit %r — skipping", unit)
+            continue
         if dry_run:
             log.info("[dry-run] would start %s", unit)
             continue

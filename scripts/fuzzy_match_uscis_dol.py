@@ -328,16 +328,11 @@ def _populate_enrichment_queue(conn, r) -> None:
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
     from workers.worker_control import start_workers, ENRICHMENT_WORKERS
 
-    import psycopg2.extras
-
     # Named server-side cursor: PostgreSQL streams rows on demand instead of
     # buffering the full result set in memory before the first row arrives.
     pipe = r.pipeline(transaction=False)
     i = 0
-    with conn._conn.cursor(
-        name="populate_enrichment_queue",
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    ) as named_cur:
+    with conn.named_cursor("populate_enrichment_queue") as named_cur:
         named_cur.itersize = 500
         named_cur.execute("""
             SELECT f.employer_fein,

@@ -631,7 +631,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                     _merged[_dom] = _merged.get(_dom, 0) + _cnt
                 _merged_total = _prev_total + dm["total_emails"]
                 if _merged:
-                    _assigned = sorted(_merged, key=lambda k: (-_merged[k], k))[0]
+                    _assigned = min(_merged, key=lambda k: (-_merged[k], k))
                     _conf     = _merged[_assigned] / _merged_total
                     _low_conf = _conf < 0.70
                 else:

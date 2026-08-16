@@ -1684,6 +1684,7 @@ def process_employer(
         # Phase 7 (career_detector BFS) can surface off-domain job boards as the
         # careers URL. Only trust the website_url rewrite when careers URL belongs
         # to the same root domain that was actually crawled.
+        _cd_domain = _root_domain(website_url) if careers_source == "phase7" else ""
         _phase7_off_domain = (
             careers_source == "phase7"
             and _careers_root != _cd_domain

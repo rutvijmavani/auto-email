@@ -701,7 +701,7 @@ def run_health_check() -> int:
             null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
             pd_found    = pd_total - no_signal - null_method
             pd_detail = _breakdown(pd_rows, pd_total)
-            if pd_total and no_signal / pd_total > 0.15:
+            if pd_total and (no_signal + null_method) / pd_total > 0.15:
                 _row("WARNING", "public domain",
                      f"{pd_found}/{pd_total} resolved  {pd_detail}")
                 warnings += 1

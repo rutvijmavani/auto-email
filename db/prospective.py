@@ -86,13 +86,17 @@ def _normalize_company(name):
     return normalized
 
 
-def add_prospective_company(company, priority=0, domain=None):
+def add_prospective_company(company, priority=0, domain=None, platform=None, slug=None):
     """
     Add a company to the prospective list.
     Silently ignores duplicates (INSERT OR IGNORE).
     Returns True if newly inserted, False if already existed.
     Raises ValueError if company name is empty/whitespace.
-    Domain is used for Phase 3a HTML redirect scan during ATS detection.
+
+    platform/slug: pass when already known (e.g. from H1B discovery pipeline)
+    so the company is immediately monitorable without a separate --detect-ats run.
+    When omitted, ats_platform stays NULL and get_detection_queue() will pick it
+    up as Priority 1 (new, never detected).
     """
     company = _normalize_company(company)
     conn = get_conn()
@@ -100,28 +104,26 @@ def add_prospective_company(company, priority=0, domain=None):
     # ats_detected_at stamped at INSERT — never NULL — prevents stale companies
     # from triggering automatic re-detection on every monitor run.
     #
-    # ats_platform explicitly set to NULL (overriding schema DEFAULT 'unknown')
-    # so get_detection_queue() can distinguish:
-    #   NULL     → new company, never through ATS detection  (priority 1)
-    #   'unknown'→ detection ran, nothing found              (priority 3)
-    # The schema DEFAULT 'unknown' is intentional only for pre-existing rows
-    # that pre-date the column; fresh inserts must be NULL.
+    # ats_platform: NULL when unknown (get_detection_queue Priority 1),
+    #               set here when already detected by caller.
     # ON CONFLICT(company) DO NOTHING replaces INSERT OR IGNORE (SQLite).
     c.execute("""
         INSERT INTO prospective_companies
-            (company, priority, status, domain, ats_detected_at, ats_platform)
-        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, NULL)
+            (company, priority, status, domain, ats_detected_at, ats_platform, ats_slug)
+        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, ?, ?)
         ON CONFLICT(company) DO NOTHING
-    """, (company, priority, domain))
+    """, (company, priority, domain, platform, slug))
     conn.commit()
     inserted = c.rowcount > 0
-    # Update domain if company already existed and domain provided
-    if not inserted and domain:
+    if not inserted:
+        # Update domain/platform/slug if company already existed and values are provided
         c.execute("""
             UPDATE prospective_companies
-            SET domain = ?
-            WHERE company = ? AND (domain IS NULL OR domain = '')
-        """, (domain, company))
+            SET domain       = COALESCE(NULLIF(domain, ''), ?),
+                ats_platform = COALESCE(ats_platform, ?),
+                ats_slug     = COALESCE(ats_slug, ?)
+            WHERE company = ?
+        """, (domain, platform, slug, company))
         conn.commit()
     conn.close()
     return inserted
