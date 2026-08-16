@@ -44,6 +44,10 @@ log = get_logger(__name__)
 
 CERTIFIED_STATUSES = {"Certified", "Certified-Withdrawn"}
 
+# Stable lock ID for pg_advisory_xact_lock — prevents two concurrent upsert()
+# calls from interleaving their read-merge-write cycles on the same FEINs.
+_UPSERT_LOCK_ID = 0x70726F63_6573734C  # hex for "processL"
+
 _GENERIC_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
     "aol.com", "icloud.com", "protonmail.com", "live.com",
@@ -439,6 +443,12 @@ def _merge_job_titles(new_titles: list, existing_json) -> list:
 def upsert(aggregated: dict, quarter: str) -> None:
     conn = get_conn()
     try:
+        # Serialize concurrent upsert calls — two parallel runs processing
+        # different LCA files can overlap on the same FEIN; without this lock
+        # the read-merge-write cycle is not atomic and one run's counts can
+        # silently overwrite the other's.
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_UPSERT_LOCK_ID,))
+
         # Check which FEINs already have this quarter processed
         feins = list(aggregated.keys())
         existing        = {}

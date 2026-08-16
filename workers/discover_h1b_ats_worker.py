@@ -132,7 +132,7 @@ def _flush_delayed(r) -> None:
     for raw, _ in items:
         try:
             data = json.loads(raw)
-            member = json.dumps({"fein": data["fein"], "trigger": data.get("trigger", "staleness")})
+            member = json.dumps({"fein": data["fein"]})
             r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
             r.zrem(DISCOVERY_DELAYED, raw)  # only remove after successful insert
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -358,18 +358,15 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         return
     log.warning("reclaiming %d inflight FEINs from prior run (key=%s)", len(items), inflight_key)
     for raw_member, score in items:
-        # Inflight member is JSON {"fein": ..., "trigger": ...}; legacy bare-fein fallback.
         try:
-            data     = json.loads(raw_member)
-            fein_r   = data["fein"]
-            trigger_r = data.get("trigger", "staleness")
+            data  = json.loads(raw_member)
+            fein_r = data["fein"]
         except (json.JSONDecodeError, KeyError, TypeError):
-            fein_r    = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
-            trigger_r = "staleness"
-        queue_member = json.dumps({"fein": fein_r, "trigger": trigger_r})
+            fein_r = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
+        queue_member = json.dumps({"fein": fein_r})
         r.zadd(DISCOVERY_QUEUE, {queue_member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight fein=%s trigger=%s score=%d", fein_r, trigger_r, int(score))
+        log.info("reclaimed inflight fein=%s score=%d", fein_r, int(score))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -4,14 +4,14 @@ scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/
 Enrichment staleness:
     fein_domain_map WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'
     AND is_monitored = TRUE (or public_domain IS NULL for uninitialised rows)
-    → ZADD domain_enrichment_queue petition_count {"fein": ..., "trigger": "staleness"}
+    → ZADD domain_enrichment_queue petition_count {"fein": ...}
     → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
 Discovery staleness:
     fein_domain_map WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
     AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
     (also catches companies with no ATS yet and petition_count >= threshold)
-    → ZADD discovery_queue petition_count {"fein": ..., "trigger": "staleness"}
+    → ZADD discovery_queue petition_count {"fein": ...}
     → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
 
 Usage:

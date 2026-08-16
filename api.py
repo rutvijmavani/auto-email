@@ -468,8 +468,11 @@ def _head_ok(url: str) -> bool:
 def _trigger_enrichment(fein: str, r=None) -> None:
     """Push fein to enrichment queue at HIGH priority. Fire-and-forget.
 
-    Workers are started on demand by staleness_checker; no systemctl here so
-    the web process doesn't require sudo and doesn't repeat the call per request.
+    Workers are started on demand by staleness_checker (cron); no systemctl
+    here so the web process doesn't require sudo.  Worst-case latency when no
+    worker is running: up to ENRICH_STALENESS_DAYS (default 90 days) until the
+    next staleness_checker cron fires and starts a worker.  For on-demand
+    responsiveness, ensure at least one enrichment worker is always running.
     Accepts a pre-created Redis client (r) so the caller can initialise it in
     the request thread rather than inside the thread-pool worker.
     """

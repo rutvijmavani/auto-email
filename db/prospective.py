@@ -20,7 +20,7 @@ def submit_to_prospective_sheet(
     job_url: str | None = None,
     domain: str | None = None,
     notes: str = "via H1B Discover",
-) -> None:
+) -> bool:
     """
     Append one row to the 'Prospective' Google Sheet tab so that
     prospective_form_sync.py picks it up on next run and runs full
@@ -30,8 +30,9 @@ def submit_to_prospective_sheet(
       Timestamp | Company Name | Job URL | Domain | Career Page URL |
       XML/Sitemap URL | Listing Curl | Detail Curl | Notes
 
-    Failures are logged and swallowed — callers must not depend on this
-    succeeding (the company is already in the DB at this point).
+    Returns True when the row was successfully appended, False on failure.
+    Failures are logged but not raised — callers should check the return
+    value and show an appropriate warning when False.
     """
     import logging
     import gspread
@@ -67,8 +68,10 @@ def submit_to_prospective_sheet(
             notes,                                              # Notes
         ]
         ws.append_row(row, value_input_option="USER_ENTERED")
+        return True
     except Exception as exc:
         _log.warning("submit_to_prospective_sheet failed for %r: %s", company, exc)
+        return False
 
 
 def _normalize_company(name):
@@ -119,11 +122,16 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
         # Update domain/platform/slug if company already existed and values are provided.
         # Treat 'unknown'/'unsupported' as sentinels — replace them when a real platform
         # is supplied, same as NULL.  Slug empty-string is likewise treated as absent.
+        # Each field: keep the existing value when it is already real; otherwise
+        # upgrade to the incoming value — but only when the incoming value is
+        # non-NULL/non-empty.  COALESCE(?, existing) means a NULL incoming arg
+        # falls back to the stored value, so sentinels like "unknown" are
+        # preserved rather than erased.
         c.execute("""
             UPDATE prospective_companies
-            SET domain       = COALESCE(NULLIF(domain, ''), ?),
-                ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), ?),
-                ats_slug     = COALESCE(NULLIF(ats_slug, ''), ?)
+            SET domain       = COALESCE(NULLIF(domain, ''),                                     COALESCE(?, domain)),
+                ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), COALESCE(?, ats_platform)),
+                ats_slug     = COALESCE(NULLIF(ats_slug, ''),                                   COALESCE(?, ats_slug))
             WHERE company = ?
         """, (domain, platform, slug, company))
         conn.commit()

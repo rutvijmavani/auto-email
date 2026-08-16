@@ -119,15 +119,19 @@ _certspotter_retry_after: float = 0.0
 
 def _bounded_json(r, max_bytes: int = _CT_MAX_BYTES):
     """Read a streaming response body up to max_bytes, then JSON-parse.
-    Raises ValueError when the body exceeds the limit."""
+    Raises ValueError when the body exceeds the limit.
+    Always closes the response, including when the size limit is exceeded."""
     chunks = []
     received = 0
-    for chunk in r.iter_content(chunk_size=65536):
-        received += len(chunk)
-        if received > max_bytes:
-            raise ValueError(f"CT response body exceeds {max_bytes} bytes")
-        chunks.append(chunk)
-    return json.loads(b"".join(chunks))
+    try:
+        for chunk in r.iter_content(chunk_size=65536):
+            received += len(chunk)
+            if received > max_bytes:
+                raise ValueError(f"CT response body exceeds {max_bytes} bytes")
+            chunks.append(chunk)
+        return json.loads(b"".join(chunks))
+    finally:
+        r.close()
 
 
 def _root(u: str) -> str:
@@ -138,8 +142,11 @@ def _root(u: str) -> str:
     return ext.registered_domain or h
 
 
-_REDIRECT_MAX_HOPS = 8
-_REDIRECT_CODES    = frozenset((301, 302, 303, 307, 308))
+_REDIRECT_MAX_HOPS   = 8
+_REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
+# Total wall-clock budget per _redirect_domain call across all schemes/hops.
+# Worst case without a budget: _REDIRECT_MAX_HOPS × _REDIRECT_TIMEOUT × 2 schemes = 128 s.
+_REDIRECT_BUDGET_S   = 20
 
 
 def _redirect_domain(host: str) -> "str | None":
@@ -155,11 +162,15 @@ def _redirect_domain(host: str) -> "str | None":
     company domains frequently have self-signed or expired certs; we only use the
     final URL's domain name, never the response body.
     """
+    _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
         try:
             _last_headers: dict = {}
             for _ in range(_REDIRECT_MAX_HOPS):
+                if time.monotonic() > _budget_deadline:
+                    log.debug("_redirect_domain: budget exceeded for %s — aborting", host)
+                    return None
                 hop_host = urlparse(current).hostname or ""
                 if not hop_host or not _is_public_host(hop_host):
                     log.debug("_redirect_domain: non-public host in chain: %s", hop_host)

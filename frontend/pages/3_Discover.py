@@ -992,15 +992,14 @@ else:
                             # platform/slug intentionally omitted — form sync will detect
                         )
                         if inserted:
-                            try:
-                                submit_to_prospective_sheet(
-                                    company        = pipeline_name,
-                                    career_page_url= disc.get("careers_url"),
-                                    job_url        = paste_url,
-                                    domain         = website,
-                                )
-                            except Exception as _se:
-                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
+                            sheet_ok = submit_to_prospective_sheet(
+                                company        = pipeline_name,
+                                career_page_url= disc.get("careers_url"),
+                                job_url        = paste_url,
+                                domain         = website,
+                            )
+                            if not sheet_ok:
+                                log.warning("Sheet queue failed for %r", pipeline_name)
                                 st.warning("Could not queue for detection — added to pipeline but ATS detection must be run manually.")
                         conn = get_conn()
                         try:
@@ -1015,8 +1014,10 @@ else:
                         finally:
                             conn.close()
                         load_ats_discovery.clear()
-                        if inserted:
+                        if inserted and sheet_ok:
                             st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
+                        elif inserted:
+                            st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
                         else:
                             st.info("Already in pipeline.")
                         st.rerun()
@@ -1052,15 +1053,14 @@ else:
                                     _oc.commit()
                                 finally:
                                     _oc.close()
-                            try:
-                                submit_to_prospective_sheet(
-                                    company         = pipeline_name,
-                                    career_page_url = disc.get("careers_url"),
-                                    job_url         = override_url,
-                                    domain          = website,
-                                )
-                            except Exception as _se:
-                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
+                            _sheet_ok = submit_to_prospective_sheet(
+                                company         = pipeline_name,
+                                career_page_url = disc.get("careers_url"),
+                                job_url         = override_url,
+                                domain          = website,
+                            )
+                            if not _sheet_ok:
+                                log.warning("Sheet queue failed for %r", pipeline_name)
                                 st.warning("Could not queue for re-detection — run form sync manually.")
                             _dc = get_conn()
                             try:
@@ -1072,7 +1072,10 @@ else:
                             finally:
                                 _dc.close()
                             load_ats_discovery.clear()
-                            st.success("Correction submitted — ATS will be re-detected on next form sync run.")
+                            if _sheet_ok:
+                                st.success("Correction submitted — ATS will be re-detected on next form sync run.")
+                            else:
+                                st.info("Company updated — run form sync manually to trigger re-detection.")
                             st.rerun()
                         except Exception as exc:
                             log.exception("ATS override failed for %r", name)
