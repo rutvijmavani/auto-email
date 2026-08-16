@@ -134,6 +134,16 @@ def _redirect_domain(host: str) -> "str | None":
                         log.debug("_redirect_domain: SSL error for %s — no redirect signal", current)
                         current = None
                         break
+                    # SSL-unverified: cross-root redirects are untrusted — only same-root hops allowed.
+                    if r.status_code in _REDIRECT_CODES:
+                        _loc = r.headers.get("Location", "")
+                        if _loc:
+                            _next_host = urlparse(urljoin(current, _loc)).hostname or ""
+                            if _root(_next_host) != _root(urlparse(current).hostname or ""):
+                                log.debug("_redirect_domain: cross-root redirect via verify=False — aborting")
+                                r.close()
+                                current = None
+                                break
                 r.close()
                 if r.status_code not in _REDIRECT_CODES:
                     break  # current is the final URL

@@ -1679,7 +1679,15 @@ def process_employer(
         from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)
         _website_root = _root_domain(website_url)
-        if (_careers_root and _website_root
+        # Phase 7 (career_detector BFS) can surface off-domain job boards as the
+        # careers URL. Only trust the website_url rewrite when careers URL belongs
+        # to the same root domain that was actually crawled.
+        _phase7_off_domain = (
+            careers_source == "phase7"
+            and _careers_root != _root_domain(_cd_domain)
+        )
+        if (not _phase7_off_domain
+                and _careers_root and _website_root
                 and _careers_root != _website_root
                 and _careers_root not in _KNOWN_ATS_DOMAINS
                 and _careers_root not in _GENERIC_ROOTS):

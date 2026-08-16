@@ -64,9 +64,11 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         if row.get("employer_fein")
     }
 
+    import psycopg2.extras
+
     _stale_interval = f"{ENRICH_STALENESS_DAYS} days"
     if monitored_feins:
-        rows = conn.execute("""
+        _sql    = """
             SELECT
                 f.employer_fein,
                 COALESCE(u.petition_count, 0) AS petition_count
@@ -83,10 +85,11 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
                 )
             )
             ORDER BY petition_count DESC
-        """, (_stale_interval, _stale_interval, list(monitored_feins))).fetchall()
+        """
+        _params = (_stale_interval, _stale_interval, list(monitored_feins))
     else:
         # No monitored companies — only pick up uninitialised rows (public_domain IS NULL)
-        rows = conn.execute("""
+        _sql    = """
             SELECT
                 f.employer_fein,
                 COALESCE(u.petition_count, 0) AS petition_count
@@ -95,35 +98,49 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
             WHERE f.public_domain IS NULL
               AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
             ORDER BY petition_count DESC
-        """, (_stale_interval,)).fetchall()
+        """
+        _params = (_stale_interval,)
 
-    if not rows:
+    added = 0
+    dry_run_sample: list = []
+    pipe = None if dry_run else r.pipeline(transaction=False)
+
+    with conn._conn.cursor(
+        name="enrichment_staleness",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as cur:
+        cur.itersize = 500
+        cur.execute(_sql, _params)
+        for row in cur:
+            if dry_run:
+                if len(dry_run_sample) < 5:
+                    dry_run_sample.append(row)
+                added += 1
+                continue
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
+            pipe.zadd(
+                DOMAIN_ENRICHMENT_QUEUE,
+                {member: row["petition_count"]},
+                gt=True,    # only raise score — prevents lowering a high-priority item
+            )
+            added += 1
+            if added % STALENESS_ZADD_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+
+    if not added:
         log.info("enrichment staleness: no stale companies")
         return 0
 
-    log.info("enrichment staleness: %d companies eligible", len(rows))
+    log.info("enrichment staleness: %d companies eligible", added)
 
     if dry_run:
-        for row in rows[:5]:
+        for row in dry_run_sample:
             log.info("[dry-run] would ZADD %s score=%s fein=%s",
                      DOMAIN_ENRICHMENT_QUEUE, row["petition_count"], row["employer_fein"])
-        if len(rows) > 5:
-            log.info("[dry-run] ... and %d more", len(rows) - 5)
-        return len(rows)
-
-    added = 0
-    pipe = r.pipeline(transaction=False)
-    for i, row in enumerate(rows):
-        member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
-        pipe.zadd(
-            DOMAIN_ENRICHMENT_QUEUE,
-            {member: row["petition_count"]},
-            gt=True,    # only raise score — prevents lowering a high-priority item
-        )
-        added += 1
-        if (i + 1) % STALENESS_ZADD_BATCH == 0:
-            pipe.execute()
-            pipe = r.pipeline(transaction=False)
+        if added > 5:
+            log.info("[dry-run] ... and %d more", added - 5)
+        return added
 
     if added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()
@@ -135,50 +152,63 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
 
 def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale discovery companies to discovery_queue. Returns count added."""
-    rows = conn.execute("""
-        SELECT
-            f.employer_fein,
-            COALESCE(u.petition_count, 0) AS petition_count
-        FROM fein_domain_map f
-        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
-        WHERE COALESCE(u.petition_count, 0) >= %s
-          AND (
-              f.last_discovered_at IS NULL                        -- never discovered
-              OR f.last_discovered_at < NOW() - %s::interval      -- stale (ATS may have changed)
-          )
-        ORDER BY petition_count DESC
-    """, (
-        STALENESS_DISCOVERY_MIN_PETITIONS,
-        f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
-    )).fetchall()
+    import psycopg2.extras
 
-    if not rows:
+    added = 0
+    dry_run_sample: list = []
+    pipe = None if dry_run else r.pipeline(transaction=False)
+
+    with conn._conn.cursor(
+        name="discovery_staleness",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as cur:
+        cur.itersize = 500
+        cur.execute("""
+            SELECT
+                f.employer_fein,
+                COALESCE(u.petition_count, 0) AS petition_count
+            FROM fein_domain_map f
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE COALESCE(u.petition_count, 0) >= %s
+              AND (
+                  f.last_discovered_at IS NULL                        -- never discovered
+                  OR f.last_discovered_at < NOW() - %s::interval      -- stale (ATS may have changed)
+              )
+            ORDER BY petition_count DESC
+        """, (
+            STALENESS_DISCOVERY_MIN_PETITIONS,
+            f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
+        ))
+        for row in cur:
+            if dry_run:
+                if len(dry_run_sample) < 5:
+                    dry_run_sample.append(row)
+                added += 1
+                continue
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
+            pipe.zadd(
+                DISCOVERY_QUEUE,
+                {member: row["petition_count"]},
+                gt=True,    # only raise score — prevents lowering a high-priority item
+            )
+            added += 1
+            if added % STALENESS_ZADD_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+
+    if not added:
         log.info("discovery staleness: no stale companies")
         return 0
 
-    log.info("discovery staleness: %d companies eligible", len(rows))
+    log.info("discovery staleness: %d companies eligible", added)
 
     if dry_run:
-        for row in rows[:5]:
+        for row in dry_run_sample:
             log.info("[dry-run] would ZADD %s score=%s fein=%s",
                      DISCOVERY_QUEUE, row["petition_count"], row["employer_fein"])
-        if len(rows) > 5:
-            log.info("[dry-run] ... and %d more", len(rows) - 5)
-        return len(rows)
-
-    added = 0
-    pipe = r.pipeline(transaction=False)
-    for i, row in enumerate(rows):
-        member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
-        pipe.zadd(
-            DISCOVERY_QUEUE,
-            {member: row["petition_count"]},
-            gt=True,    # only raise score — prevents lowering a high-priority item
-        )
-        added += 1
-        if (i + 1) % STALENESS_ZADD_BATCH == 0:
-            pipe.execute()
-            pipe = r.pipeline(transaction=False)
+        if added > 5:
+            log.info("[dry-run] ... and %d more", added - 5)
+        return added
 
     if added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()

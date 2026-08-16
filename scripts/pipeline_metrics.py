@@ -225,6 +225,19 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         _phase_table(ats_rows, ats_total, "Detection phase")
 
         # ATS platform breakdown — latest run per employer only
+        # Compute total across ALL platforms first so percentages use the real denominator.
+        _plat_total_row = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE ats_platform IS NOT NULL
+                  AND run_at > NOW() - %s::interval
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+        """, (f"{days} days",)).fetchone()
+        plat_total = (_plat_total_row["total"] if _plat_total_row else 0) or 0
+
         plat_rows = conn.execute("""
             SELECT ats_platform, COUNT(*) AS companies
             FROM (
@@ -240,7 +253,6 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         """, (f"{days} days",)).fetchall()
 
         if plat_rows:
-            plat_total = sum(r["companies"] for r in plat_rows)
             print(f"\n  Platform breakdown  (top 15 by company count):")
             print(f"  {'Platform':<25} {'Companies':>10}  {'%':>7}")
             print(f"  {_SEP[:46]}")
