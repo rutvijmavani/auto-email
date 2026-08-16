@@ -55,6 +55,59 @@ def _is_maintenance(r) -> bool:
         return False
 
 
+def _stream_and_zadd(conn, r, sql, params, queue_key, workers, cursor_name, log_prefix, dry_run):
+    """Stream a SELECT query via named cursor and ZADD each row to queue_key.
+
+    Returns count of rows processed. Handles dry-run logging (first 5 rows),
+    pipeline batching (STALENESS_ZADD_BATCH), final flush, and worker startup.
+    """
+    import psycopg2.extras
+
+    added = 0
+    dry_run_sample: list = []
+    pipe = None if dry_run else r.pipeline(transaction=False)
+
+    with conn._conn.cursor(
+        name=cursor_name,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as cur:
+        cur.itersize = 500
+        cur.execute(sql, params)
+        for row in cur:
+            if dry_run:
+                if len(dry_run_sample) < 5:
+                    dry_run_sample.append(row)
+                added += 1
+                continue
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
+            pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
+            added += 1
+            if added % STALENESS_ZADD_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+
+    if not added:
+        log.info("%s: no stale companies", log_prefix)
+        return 0
+
+    log.info("%s: %d companies eligible", log_prefix, added)
+
+    if dry_run:
+        for row in dry_run_sample:
+            log.info("[dry-run] would ZADD %s score=%s fein=%s",
+                     queue_key, row["petition_count"], row["employer_fein"])
+        if added > 5:
+            log.info("[dry-run] ... and %d more", added - 5)
+        return added
+
+    if added % STALENESS_ZADD_BATCH != 0:
+        pipe.execute()
+
+    log.info("%s: ZADD %d feins → %s", log_prefix, added, queue_key)
+    _start_workers(*workers)
+    return added
+
+
 def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale enrichment companies to domain_enrichment_queue. Returns count added."""
     # public_domain IS NULL: always re-enrich (uninitialised).
@@ -63,8 +116,6 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         row["employer_fein"] for row in get_monitorable_companies()
         if row.get("employer_fein")
     }
-
-    import psycopg2.extras
 
     _stale_interval = f"{ENRICH_STALENESS_DAYS} days"
     if monitored_feins:
@@ -101,69 +152,21 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         """
         _params = (_stale_interval,)
 
-    added = 0
-    dry_run_sample: list = []
-    pipe = None if dry_run else r.pipeline(transaction=False)
-
-    with conn._conn.cursor(
-        name="enrichment_staleness",
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    ) as cur:
-        cur.itersize = 500
-        cur.execute(_sql, _params)
-        for row in cur:
-            if dry_run:
-                if len(dry_run_sample) < 5:
-                    dry_run_sample.append(row)
-                added += 1
-                continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
-            pipe.zadd(
-                DOMAIN_ENRICHMENT_QUEUE,
-                {member: row["petition_count"]},
-                gt=True,    # only raise score — prevents lowering a high-priority item
-            )
-            added += 1
-            if added % STALENESS_ZADD_BATCH == 0:
-                pipe.execute()
-                pipe = r.pipeline(transaction=False)
-
-    if not added:
-        log.info("enrichment staleness: no stale companies")
-        return 0
-
-    log.info("enrichment staleness: %d companies eligible", added)
-
-    if dry_run:
-        for row in dry_run_sample:
-            log.info("[dry-run] would ZADD %s score=%s fein=%s",
-                     DOMAIN_ENRICHMENT_QUEUE, row["petition_count"], row["employer_fein"])
-        if added > 5:
-            log.info("[dry-run] ... and %d more", added - 5)
-        return added
-
-    if added % STALENESS_ZADD_BATCH != 0:
-        pipe.execute()
-
-    log.info("enrichment staleness: ZADD %d feins → %s", added, DOMAIN_ENRICHMENT_QUEUE)
-    _start_workers(*ENRICHMENT_WORKERS)
-    return added
+    return _stream_and_zadd(
+        conn, r, _sql, _params,
+        queue_key=DOMAIN_ENRICHMENT_QUEUE,
+        workers=ENRICHMENT_WORKERS,
+        cursor_name="enrichment_staleness",
+        log_prefix="enrichment staleness",
+        dry_run=dry_run,
+    )
 
 
 def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale discovery companies to discovery_queue. Returns count added."""
-    import psycopg2.extras
-
-    added = 0
-    dry_run_sample: list = []
-    pipe = None if dry_run else r.pipeline(transaction=False)
-
-    with conn._conn.cursor(
-        name="discovery_staleness",
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    ) as cur:
-        cur.itersize = 500
-        cur.execute("""
+    return _stream_and_zadd(
+        conn, r,
+        sql="""
             SELECT
                 f.employer_fein,
                 COALESCE(u.petition_count, 0) AS petition_count
@@ -175,47 +178,17 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
                   OR f.last_discovered_at < NOW() - %s::interval      -- stale (ATS may have changed)
               )
             ORDER BY petition_count DESC
-        """, (
+        """,
+        params=(
             STALENESS_DISCOVERY_MIN_PETITIONS,
             f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
-        ))
-        for row in cur:
-            if dry_run:
-                if len(dry_run_sample) < 5:
-                    dry_run_sample.append(row)
-                added += 1
-                continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "staleness"})
-            pipe.zadd(
-                DISCOVERY_QUEUE,
-                {member: row["petition_count"]},
-                gt=True,    # only raise score — prevents lowering a high-priority item
-            )
-            added += 1
-            if added % STALENESS_ZADD_BATCH == 0:
-                pipe.execute()
-                pipe = r.pipeline(transaction=False)
-
-    if not added:
-        log.info("discovery staleness: no stale companies")
-        return 0
-
-    log.info("discovery staleness: %d companies eligible", added)
-
-    if dry_run:
-        for row in dry_run_sample:
-            log.info("[dry-run] would ZADD %s score=%s fein=%s",
-                     DISCOVERY_QUEUE, row["petition_count"], row["employer_fein"])
-        if added > 5:
-            log.info("[dry-run] ... and %d more", added - 5)
-        return added
-
-    if added % STALENESS_ZADD_BATCH != 0:
-        pipe.execute()
-
-    log.info("discovery staleness: ZADD %d feins → %s", added, DISCOVERY_QUEUE)
-    _start_workers(*DISCOVERY_WORKERS)
-    return added
+        ),
+        queue_key=DISCOVERY_QUEUE,
+        workers=DISCOVERY_WORKERS,
+        cursor_name="discovery_staleness",
+        log_prefix="discovery staleness",
+        dry_run=dry_run,
+    )
 
 
 def main(args: argparse.Namespace) -> None:

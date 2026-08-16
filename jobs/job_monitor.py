@@ -824,12 +824,11 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
     try:
         r = _r if _r is not None else _get_redis()
         _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
-        if r.exists(_cooldown_key):
+        if not r.set(_cooldown_key, 1, nx=True, ex=JOB_MONITOR_REDETECT_DAYS * 86400):
             logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
             return
         petition_count = company_row.get("petition_count") or 1
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
-        r.set(_cooldown_key, 1, ex=JOB_MONITOR_REDETECT_DAYS * 86400)
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()

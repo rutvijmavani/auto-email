@@ -423,10 +423,6 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
     hostname = parsed.hostname or ""
     if not hostname or _is_private_host(hostname):
         return False
-    initial_root = _host_root(hostname)
-    allowed = {initial_root}
-    if allowed_root:
-        allowed.add(_host_root(allowed_root))  # normalize through PSL before comparing
     current_url = url
     _deadline = time.monotonic() + _VERIFY_TOTAL_TIMEOUT
     try:
@@ -469,13 +465,6 @@ def _head_ok(url: str, allowed_root: "str | None" = None) -> bool:
                 return False
             next_host = next_parsed.hostname or ""
             if not next_host or _is_private_host(next_host):
-                return False
-            next_root = _host_root(next_host)
-            if next_root not in allowed:
-                logger.warning(
-                    "verify-company: redirect to unexpected domain %s (allowed %s)",
-                    next_root, allowed,
-                )
                 return False
             current_url = next_url
         return False  # too many redirects

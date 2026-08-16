@@ -1684,7 +1684,7 @@ def process_employer(
         # to the same root domain that was actually crawled.
         _phase7_off_domain = (
             careers_source == "phase7"
-            and _careers_root != _root_domain(_cd_domain)
+            and _careers_root != _cd_domain
         )
         if (not _phase7_off_domain
                 and _careers_root and _website_root

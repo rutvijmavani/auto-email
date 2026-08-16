@@ -151,6 +151,10 @@ def _redirect_domain(host: str) -> "str | None":
                 if not loc:
                     break
                 current = urljoin(current, loc)
+            else:
+                # All hops consumed while still in redirect chain — last Location is unverified.
+                log.debug("_redirect_domain: hop limit reached for %s — rejecting chain", host)
+                current = None
 
             if current is None:
                 continue  # try next scheme
