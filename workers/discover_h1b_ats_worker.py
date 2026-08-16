@@ -248,6 +248,11 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         probe_domain = company["public_domain"] or company["assigned_domain"]
         if not probe_domain:
             log.warning("fein=%s has no domain — skipping", fein)
+            # Stamp last_discovered_at so the staleness cron does not re-queue this
+            # company on every run — without it, last_discovered_at stays NULL and
+            # the company re-enters the queue each day despite nothing to discover.
+            _write_last_discovered(conn, fein)
+            conn.commit()
             return True
 
         log.info("discovering fein=%s domain=%s name=%r trigger=%s",

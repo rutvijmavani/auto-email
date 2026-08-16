@@ -328,24 +328,32 @@ def _populate_enrichment_queue(conn, r) -> None:
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
     from workers.worker_control import start_workers, ENRICHMENT_WORKERS
 
-    cur = conn.execute("""
-        SELECT f.employer_fein,
-               COALESCE(u.petition_count, 0) AS petition_count
-        FROM fein_domain_map f
-        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
-        WHERE f.last_enriched_at IS NULL
-           OR f.last_enriched_at < NOW() - %s::interval
-    """, (f"{ENRICH_STALENESS_DAYS} days",))
+    import psycopg2.extras
 
+    # Named server-side cursor: PostgreSQL streams rows on demand instead of
+    # buffering the full result set in memory before the first row arrives.
     pipe = r.pipeline(transaction=False)
     i = 0
-    for row in cur:
-        member = json.dumps({"fein": row["employer_fein"], "trigger": "fuzzy_match"})
-        pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
-        i += 1
-        if i % _ZADD_PIPELINE_BATCH == 0:
-            pipe.execute()
-            pipe = r.pipeline(transaction=False)
+    with conn._conn.cursor(
+        name="populate_enrichment_queue",
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as named_cur:
+        named_cur.itersize = 500
+        named_cur.execute("""
+            SELECT f.employer_fein,
+                   COALESCE(u.petition_count, 0) AS petition_count
+            FROM fein_domain_map f
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE f.last_enriched_at IS NULL
+               OR f.last_enriched_at < NOW() - %s::interval
+        """, (f"{ENRICH_STALENESS_DAYS} days",))
+        for row in named_cur:
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "fuzzy_match"})
+            pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
+            i += 1
+            if i % _ZADD_PIPELINE_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
     if i == 0:
         log.info("enrichment queue: no eligible companies — skipping")
         return

@@ -809,6 +809,34 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
         stats["enrichment_queued"] += company_stats.get("queued_enrichment", 0)
 
 
+def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, empty_days, *, log_label=""):
+    """Queue fein for domain re-enrichment. Sets result['queued_enrichment']=1 on success."""
+    from workers.redis_client import get_redis as _get_redis
+    fein   = company_row.get("employer_fein")
+    domain = company_row.get("domain")
+    if not fein:
+        logger.warning(
+            "Re-detection needed for %r (domain=%s empty_days=%d) "
+            "— no employer_fein, cannot queue enrichment",
+            company, domain, empty_days,
+        )
+        return
+    try:
+        r = _r if _r is not None else _get_redis()
+        petition_count = company_row.get("petition_count") or 1
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
+        result["queued_enrichment"] = 1
+        if _enrichment_event is not None:
+            _enrichment_event.set()
+        tag = f" ({log_label})" if log_label else ""
+        logger.info(
+            "Re-enrichment queued%s for %r (fein=%s domain=%s empty_days=%d)",
+            tag, company, fein, domain, empty_days,
+        )
+    except Exception as exc:
+        logger.warning("Failed to queue re-enrichment for %r (fein=%s): %s", company, fein, exc)
+
+
 # ─────────────────────────────────────────
 # WORKER — one company per thread call
 # Logic is identical to the original sequential loop body.
@@ -850,34 +878,10 @@ def _process_company(company_row, position, total, _enrichment_event=None, _r=No
     # then automatically pushes to discovery_queue for ATS re-detection.
     # Only fires when employer_fein is known (H1B-tracked companies).
     if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
-        fein       = company_row.get("employer_fein")
-        empty_days = company_row.get("consecutive_empty_days", 0)
-        domain     = company_row.get("domain")
-        if fein:
-            try:
-                from workers.redis_client import get_redis
-                r = _r if _r is not None else get_redis()
-                # score=petition_count; gt=True only raises an existing score, never lowers it
-                petition_count = company_row.get("petition_count") or 1
-                r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
-                result["queued_enrichment"] = 1
-                if _enrichment_event is not None:
-                    _enrichment_event.set()
-                logger.info(
-                    "Re-enrichment queued for %r (fein=%s domain=%s empty_days=%d)",
-                    company, fein, domain, empty_days,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Failed to queue re-enrichment for %r (fein=%s): %s",
-                    company, fein, exc,
-                )
-        else:
-            logger.warning(
-                "Re-detection needed for %r (domain=%s empty_days=%d) "
-                "— no employer_fein, cannot queue enrichment",
-                company, domain, empty_days,
-            )
+        _enqueue_re_enrichment(
+            company, company_row, result, _r, _enrichment_event,
+            empty_days=company_row.get("consecutive_empty_days", 0),
+        )
 
     if platform == "unknown" or not slug:
         logger.warning("Skipping %r — unknown ATS", company)
@@ -986,27 +990,10 @@ def _process_company(company_row, position, total, _enrichment_event=None, _r=No
         if not result.get("queued_enrichment"):
             _new_empty = (company_row.get("consecutive_empty_days") or 0) + 1
             if _new_empty >= JOB_MONITOR_REDETECT_DAYS:
-                fein   = company_row.get("employer_fein")
-                domain = company_row.get("domain")
-                if fein:
-                    try:
-                        from workers.redis_client import get_redis
-                        r = _r if _r is not None else get_redis()
-                        petition_count = company_row.get("petition_count") or 1
-                        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "re_detection"}): petition_count}, gt=True)
-                        result["queued_enrichment"] = 1
-                        if _enrichment_event is not None:
-                            _enrichment_event.set()
-                        logger.info(
-                            "Re-enrichment queued (threshold just crossed) for %r "
-                            "(fein=%s domain=%s empty_days=%d)",
-                            company, fein, domain, _new_empty,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to queue re-enrichment for %r (fein=%s): %s",
-                            company, fein, exc,
-                        )
+                _enqueue_re_enrichment(
+                    company, company_row, result, _r, _enrichment_event,
+                    _new_empty, log_label="threshold just crossed",
+                )
         print(f"  [{position}/{total}] {company} — 0 jobs")
         return result
 

@@ -15,8 +15,9 @@ only on certspotter 429 — caller should re-queue the company with that delay.
 """
 
 import ipaddress
+import socket
 import time
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 import tldextract
@@ -38,6 +39,33 @@ def _is_private_ip_literal(host: str) -> bool:
         return addr.is_private or addr.is_loopback or addr.is_link_local
     except ValueError:
         return False  # hostname, not an IP literal
+
+
+def _is_public_host(host: str) -> bool:
+    """Return True if host resolves only to globally-routable addresses.
+
+    Blocks loopback, link-local, RFC1918, CGNAT (100.64/10), and cloud metadata
+    (169.254.169.254) — same set as api.py/_is_private_host.  Returns False on
+    DNS failure (fail-closed).
+    """
+    if not host:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+        if not infos:
+            return False
+        for info in infos:
+            addr = ipaddress.ip_address(info[4][0])
+            if (
+                addr.is_loopback or addr.is_link_local or addr.is_private
+                or addr.is_reserved or addr.is_unspecified or addr.is_multicast
+                or (isinstance(addr, ipaddress.IPv4Address)
+                    and addr in ipaddress.IPv4Network("100.64.0.0/10"))
+            ):
+                return False
+        return True
+    except Exception:
+        return False
 
 # Root domains belonging to cloud / email / CDN providers — never a real company domain
 GENERIC_ROOTS = {
@@ -66,47 +94,76 @@ def _root(u: str) -> str:
     return ext.registered_domain or h
 
 
+_REDIRECT_MAX_HOPS = 8
+_REDIRECT_CODES    = frozenset((301, 302, 303, 307, 308))
+
+
 def _redirect_domain(host: str) -> "str | None":
     """
     Follow HTTP redirects on host. Returns:
       str  — root domain of final URL differs from host → redirect found
       ""   — final URL has same root as host → already public
-      None — connection error / DNS fail
+      None — connection error / DNS fail / redirect chain leads to a private host
+
+    Redirects are followed manually so every intermediate hop is validated as a
+    publicly-routable address before connecting (prevents SSRF via redirect chain).
+    verify=False is applied only when the initial HTTPS attempt raises SSLError —
+    company domains frequently have self-signed or expired certs; we only use the
+    final URL's domain name, never the response body.
     """
     for scheme in ("https", "http"):
-        url = f"{scheme}://{host}"
+        current = f"{scheme}://{host}"
         try:
-            r = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, stream=True)
-            final = _root(r.url)
-            r.close()
+            for _ in range(_REDIRECT_MAX_HOPS):
+                hop_host = urlparse(current).hostname or ""
+                if not hop_host or not _is_public_host(hop_host):
+                    log.debug("_redirect_domain: non-public host in chain: %s", hop_host)
+                    current = None
+                    break
+                try:
+                    r = requests.get(current, allow_redirects=False,
+                                     timeout=_REDIRECT_TIMEOUT, stream=True)
+                except requests.exceptions.SSLError:
+                    try:
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
+                            r = requests.get(current, allow_redirects=False,
+                                             timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
+                    except Exception:
+                        log.debug("_redirect_domain: SSL error for %s — no redirect signal", current)
+                        current = None
+                        break
+                r.close()
+                if r.status_code not in _REDIRECT_CODES:
+                    break  # current is the final URL
+                loc = r.headers.get("Location", "")
+                if not loc:
+                    break
+                current = urljoin(current, loc)
+
+            if current is None:
+                continue  # try next scheme
+            final = _root(current)
             return final if final != _root(host) else ""
-        except requests.exceptions.SSLError:
-            # verify=False is intentional: company domains frequently have self-signed or
-            # expired certs. We only use the redirect destination's domain name, never
-            # the response body, so cert validity doesn't affect correctness. This
-            # function is only called on domains already in our internal database.
-            try:
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                    r2 = requests.get(url, allow_redirects=True, timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
-                final = _root(r2.url)
-                r2.close()
-                return final if final != _root(host) else ""
-            except Exception:
-                log.debug("_redirect_domain: SSL error for %s — no redirect signal", url)
-                continue
         except Exception:
             continue
     return None
 
 
 def _has_web(root: str) -> bool:
-    """Return True if root domain serves any HTTP response (status < 500)."""
+    """Return True if root domain serves any HTTP response (status < 500).
+
+    Validates that root resolves only to public addresses before connecting.
+    Redirects are not followed — a 3xx response (< 500) still means the domain
+    is live and serving HTTP, which is all the caller cares about.
+    """
+    if not _is_public_host(root):
+        return False
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
         try:
-            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, stream=True)
+            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
             status = r.status_code
             r.close()
             if status < 500:
@@ -119,7 +176,7 @@ def _has_web(root: str) -> bool:
                 import warnings
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=True, verify=False, stream=True)
+                    r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, verify=False, stream=True)
                 status = r.status_code
                 r.close()
                 if status < 500:
@@ -163,7 +220,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
                 retry_after = int(_ra)
             except (ValueError, TypeError):
                 retry_after = 3600  # HTTP-date or unparseable — safe fallback
-            retry_after = min(retry_after, 3600)
+            retry_after = max(1, min(retry_after, 3600))
             _certspotter_retry_after = time.time() + retry_after
             log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
             return [], retry_after

@@ -677,6 +677,24 @@ class TestQueueMetrics(unittest.TestCase):
         metrics = mgr._get_queue_metrics(r)
         self.assertAlmostEqual(metrics["discovery"]["delay_s"], overdue_by, delta=2)
 
+    def test_enrichment_discovery_redis_zcard_failure(self):
+        """zcard failure in enrichment/discovery block falls back to zero; other pools unaffected."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 5   # scan/fullscan have overdue items
+        r.zrange.return_value = []  # no delayed items
+        r.zcard.side_effect = Exception("Redis connection refused")
+        metrics = mgr._get_queue_metrics(r)
+        # enrichment + discovery fall back to zeros on zcard failure
+        self.assertEqual(metrics["domain_enrichment"]["depth"], 0)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
+        self.assertEqual(metrics["discovery"]["depth"], 0)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
+        # scan and fullscan are in separate try blocks — still report normally
+        self.assertEqual(metrics["scan"]["depth"], 5)
+        self.assertEqual(metrics["fullscan"]["depth"], 5)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 7 — busy_ms: SCAN+sum, missing keys, utilization computation
@@ -1038,7 +1056,7 @@ class TestBootstrapMode(unittest.TestCase):
     def test_bootstrap_ceil_values_match_production_fleet(self):
         """Bootstrap ceilings should match current production defaults."""
         self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     10)
-        self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],    6)
+        self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],   10)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["fullscan"],  5)
 
     def test_bootstrap_days_required_is_28(self):
@@ -1103,8 +1121,8 @@ class TestScalingParams(unittest.TestCase):
             self.assertIn("delay_warn_s", mgr._FALLBACK_PARAMS[pool])
 
     def test_delay_warn_values_are_sensible(self):
-        """DELAY_WARN_S values: detail=60, scan=1800, fullscan=7200 (fallbacks)."""
-        self.assertEqual(mgr._FALLBACK_PARAMS["detail"]["delay_warn_s"],   60)
+        """DELAY_WARN_S values: detail=300, scan=1800, fullscan=7200 (fallbacks)."""
+        self.assertEqual(mgr._FALLBACK_PARAMS["detail"]["delay_warn_s"],  300)
         self.assertEqual(mgr._FALLBACK_PARAMS["scan"]["delay_warn_s"],   1800)
         self.assertEqual(mgr._FALLBACK_PARAMS["fullscan"]["delay_warn_s"], 7200)
 
