@@ -1,15 +1,13 @@
 import base64
 import hmac
-import ipaddress
 import json
 import os
 import secrets
-import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse, urljoin
+from urllib.parse import urlparse, urljoin
 
 import requests as _requests
 from flask import Flask, request, jsonify, make_response, redirect
@@ -31,6 +29,7 @@ from db.applications import add_application
 from db.connection import get_conn
 from db.gmail_tokens import upsert_token, update_watch
 from workers.redis_client import get_redis
+from jobs.http_safe import is_private_host as _is_private_host, make_safe_session as _make_safe_session
 
 _GMAIL_SCOPES       = ["https://www.googleapis.com/auth/gmail.readonly"]
 _CLIENT_ID          = os.environ.get("GMAIL_CLIENT_ID", "")
@@ -41,6 +40,14 @@ _GIST_CONFIG_URL    = os.environ.get("GIST_CONFIG_URL", "")  # same Gist used by
 
 init_logging('api')
 logger = get_logger(__name__)
+
+try:
+    from workers.startup import validate_startup
+    validate_startup("api", check_db=False, check_config=False)
+except SystemExit as _startup_exc:
+    raise RuntimeError(
+        "api: Redis startup check failed — see stderr above"
+    ) from _startup_exc
 
 app = Flask(__name__)
 
@@ -375,91 +382,7 @@ _VERIFY_TOTAL_TIMEOUT = 30  # seconds total across all hops — prevents 10×8s 
 _VERIFY_GOOD_CODES    = {200, 201, 204, 206, 403}  # 2xx + 403 (bot-blocked pages exist but are valid)
 _VERIFY_MAX_REDIRECTS = 10
 _VERIFY_STALE_DAYS    = 30  # re-verify after this many days
-_PRIVATE_NETS = [
-    ipaddress.ip_network(r) for r in (
-        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-        "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8",
-        "100.64.0.0/10",   # CGNAT / shared address space (RFC 6598)
-        "::1/128", "fc00::/7", "fe80::/10",   # loopback, ULA, link-local
-    )
-]
-
-
-def _is_private_host(host: str) -> bool:
-    """Return True when ANY address getaddrinfo returns is private/loopback (fail closed)."""
-    try:
-        results = socket.getaddrinfo(host, None)
-        if not results:
-            return True
-        for _family, _type, _proto, _canon, sockaddr in results:
-            addr = ipaddress.ip_address(sockaddr[0])
-            if any(addr in net for net in _PRIVATE_NETS):
-                return True
-            mapped = getattr(addr, "ipv4_mapped", None)
-            if mapped and any(mapped in net for net in _PRIVATE_NETS):
-                return True
-        return False
-    except Exception:
-        return True  # treat unresolvable as private (fail closed)
-
-
-class _SSRFAdapter(_requests.adapters.HTTPAdapter):
-    """Closes the DNS-rebinding TOCTOU gap in _head_ok.
-
-    The gap: _is_private_host() calls socket.getaddrinfo once; then requests/
-    urllib3 calls getaddrinfo again internally at connect time.  A DNS server
-    that returns different IPs on successive queries (TTL=0) can slip a private
-    IP through after our check passes.
-
-    Fix — for HTTP (no TLS): resolve once, validate ALL returned IPs, replace
-    the URL hostname with the resolved IP so urllib3 re-resolves IP→IP (no-op).
-    Fix — for HTTPS (with TLS): resolve + validate all IPs, keep the original
-    hostname in the URL so TLS SNI and certificate validation are unaffected.
-    DNS-rebinding on HTTPS is practically infeasible: the rebinding target must
-    also present a valid cert for the public domain, which an attacker cannot
-    forge.
-    """
-
-    def send(self, request, *args, **kwargs):
-        parsed = urlparse(request.url)
-        host = parsed.hostname or ""
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-
-        if not host:
-            raise ConnectionError("SSRF: empty hostname")
-
-        try:
-            addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise ConnectionError(f"SSRF: DNS resolution failed for {host!r}: {exc}") from exc
-        if not addrs:
-            raise ConnectionError(f"SSRF: no DNS results for {host!r}")
-
-        safe_ip = None
-        for _fam, _typ, _prt, _can, sockaddr in addrs:
-            ip = ipaddress.ip_address(sockaddr[0])
-            if any(ip in net for net in _PRIVATE_NETS):
-                raise ConnectionError(f"SSRF: {host!r} → private {ip}")
-            mapped = getattr(ip, "ipv4_mapped", None)
-            if mapped and any(mapped in net for net in _PRIVATE_NETS):
-                raise ConnectionError(f"SSRF: {host!r} → IPv4-mapped private {ip}")
-            if safe_ip is None:
-                safe_ip = sockaddr[0]
-
-        if parsed.scheme == "http":
-            # Rewrite URL to use resolved IP — prevents urllib3 from re-resolving.
-            # Host header preserves virtual-hosting / HTTP/1.1 semantics.
-            ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
-            netloc = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
-            request.url = urlunparse(parsed._replace(netloc=netloc))
-            request.headers.setdefault("Host", host)
-
-        return super().send(request, *args, **kwargs)
-
-
-_verify_session = _requests.Session()
-_verify_session.mount("http://",  _SSRFAdapter())
-_verify_session.mount("https://", _SSRFAdapter())
+_verify_session = _make_safe_session()
 
 
 def _head_ok(url: str) -> bool:
@@ -467,7 +390,7 @@ def _head_ok(url: str) -> bool:
     Return True if url returns a response in _VERIFY_GOOD_CODES (2xx or 403).
     Pre-validates scheme and rejects private/loopback hosts before every hop.
     Follows redirects manually (allow_redirects=False) to validate each hop's
-    scheme, resolved addresses, and allowed registrable domain before connecting.
+    scheme and resolved addresses before connecting.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -593,6 +516,7 @@ def verify_company():
         logger.error("verify-company: DB error for fein=%s: %s", fein, exc)
         return jsonify({'error': 'internal error'}), 500
     finally:
+        conn.rollback()
         conn.close()
 
     if row is None:

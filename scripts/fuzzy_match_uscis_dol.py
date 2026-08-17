@@ -321,12 +321,11 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
 def _populate_enrichment_queue(conn, r) -> None:
     """
     After fuzzy matching completes, push all eligible FEINs to domain_enrichment_queue.
-    Eligible = public_domain IS NULL OR last_enriched_at < ENRICH_STALENESS_DAYS ago.
+    Eligible = last_enriched_at IS NULL OR last_enriched_at older than ENRICH_STALENESS_DAYS.
     Score = petition_count (highest priority first).
-    Then start the enrichment workers via systemctl.
+    Workers are started on demand by manager.py (autoscaled on queue depth).
     """
     from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
-    from workers.worker_control import start_workers, ENRICHMENT_WORKERS
 
     # Named server-side cursor: PostgreSQL streams rows on demand instead of
     # buffering the full result set in memory before the first row arrives.
@@ -355,8 +354,6 @@ def _populate_enrichment_queue(conn, r) -> None:
     if i % _ZADD_PIPELINE_BATCH != 0:
         pipe.execute()
     log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", i)
-
-    start_workers(*ENRICHMENT_WORKERS)
 
 
 def _backfill_candidates() -> None:

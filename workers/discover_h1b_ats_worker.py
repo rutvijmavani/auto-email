@@ -121,9 +121,9 @@ def _clear_retry(r, fein: str) -> None:
 # DLQ
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _requeue_delayed(r, fein: str, trigger: str, petition_count: int, delay_s: float) -> None:
+def _requeue_delayed(r, fein: str, trigger: str, petition_count: int, delay_s: float, source=None) -> None:
     """Park a failed FEIN in the delayed ZSET; score = not_before timestamp."""
-    payload = json.dumps({"fein": fein, "trigger": trigger, "petition_count": petition_count})
+    payload = json.dumps({"fein": fein, "trigger": trigger, "petition_count": petition_count, "source": source})
     r.zadd(DISCOVERY_DELAYED, {payload: time.time() + delay_s})
 
 
@@ -133,7 +133,11 @@ def _flush_delayed(r) -> None:
     for raw, _ in items:
         try:
             data = json.loads(raw)
-            member = json.dumps({"fein": data["fein"]})
+            member = json.dumps({
+                "fein":    data["fein"],
+                "trigger": data.get("trigger"),
+                "source":  data.get("source"),
+            })
             r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
             r.zrem(DISCOVERY_DELAYED, raw)  # only remove after successful insert
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -367,8 +371,6 @@ def _process_company(fein: str, petition_count: int, trigger: str,
                              "platform=%s slug=%s", fein, det_platform, det_slug)
 
         # ── Metrics ───────────────────────────────────────────────────────────
-        det_platform = result.get("detected_platform")
-        det_slug     = result.get("detected_slug")
         res_careers  = result.get("careers_url")
 
         # process_employer() now propagates the actual phase that found each signal.
@@ -419,13 +421,12 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         return
     log.warning("reclaiming %d inflight FEINs from prior run (key=%s)", len(items), inflight_key)
     for raw_member, score in items:
+        member = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
         try:
-            data  = json.loads(raw_member)
-            fein_r = data["fein"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            fein_r = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
-        queue_member = json.dumps({"fein": fein_r})
-        r.zadd(DISCOVERY_QUEUE, {queue_member: int(score)}, gt=True)
+            fein_r = json.loads(member)["fein"]
+        except Exception:
+            fein_r = member
+        r.zadd(DISCOVERY_QUEUE, {member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
         log.info("reclaimed inflight fein=%s score=%d", fein_r, int(score))
 
@@ -522,7 +523,6 @@ def run_worker(once: bool = False) -> None:
                     r.zrem(_inflight_key, raw_member)
                     continue
             except Exception as e:
-                source = None  # noqa: F841 — ensures name is bound before DLQ branch
                 _dlq_payload = json.dumps({
                     "fein": "MALFORMED", "error_reason": str(e),
                     "raw": repr(raw_member), "failed_at": time.time(),
@@ -550,7 +550,7 @@ def run_worker(once: bool = False) -> None:
                 else:
                     # Exponential backoff: 30s → 120s → 480s
                     delay_s = 30 * (4 ** (count - 1))
-                    _requeue_delayed(r, fein, trigger, petition_count, delay_s)
+                    _requeue_delayed(r, fein, trigger, petition_count, delay_s, source=source)
                     log.warning("fein=%s retry %d/%d — delayed %.0fs",
                                 fein, count, DISCOVERY_MAX_RETRIES, delay_s)
             else:

@@ -100,9 +100,9 @@ return {res[1], res[2]}
 # Delayed queue — certspotter 429 re-queue with not_before timestamp
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry") -> None:
+def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry", source=None) -> None:
     """Push company to delayed ZSET scored by not_before timestamp."""
-    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger})
+    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger, "source": source})
     not_before = time.time() + delay_s
     r.zadd(DOMAIN_ENRICHMENT_DELAYED, {payload: not_before})
     log.info("re-queued %s to delayed queue — retry in %ds", fein, delay_s)
@@ -121,7 +121,7 @@ def _flush_delayed(r) -> int:
             fein     = data["fein"]
             trigger  = data.get("trigger", "delayed_retry")
             pc       = data["petition_count"]
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein}): pc}, gt=True)
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "source": data.get("source")}): pc}, gt=True)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -331,7 +331,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
             log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
-            _requeue_delayed(r, fein, petition_count, retry_after, trigger)
+            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source)
             return True
 
         # When resolution fails, fall back to the previously stored public_domain so
@@ -458,13 +458,11 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         return
     log.warning("reclaiming %d inflight FEINs from %s", len(items), inflight_key)
     for raw_member, score in items:
+        member = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
         try:
-            data = json.loads(raw_member)
-            fein = data["fein"]
+            fein = json.loads(member)["fein"]
         except Exception:
-            raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
-            fein = raw_str.strip()
-        member = json.dumps({"fein": fein})
+            fein = member.strip()
         r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
         log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
@@ -576,7 +574,7 @@ def run_worker(once: bool = False) -> None:
                     _clear_retry(r, fein)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
-                    _requeue_delayed(r, fein, petition_count, delay_s, trigger)
+                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:

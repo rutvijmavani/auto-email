@@ -934,12 +934,13 @@ else:
 
     st.markdown("")  # spacing
 
+    pipeline_st = None
     if platform:
         badge_col, action_col = st.columns([2, 3])
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            _domain_hint = next((ca.get("domain") for ca in (ca_entries or [])), None)
+            _domain_hint = next((ca.get("domain") for ca in (ca_entries or []) if ca.get("domain")), None)
             pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint)
             if monitored or pipeline_st or ca_any_monitored:
                 if ca_any_monitored and not monitored and not pipeline_st:
@@ -1069,7 +1070,7 @@ else:
                                 _oc = get_conn()
                                 try:
                                     _oc.cursor().execute(
-                                        "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = ?",
+                                        "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
                                         (pipeline_name,),
                                     )
                                     _oc.commit()

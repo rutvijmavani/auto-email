@@ -371,8 +371,8 @@ def _get_queue_metrics(r) -> dict:
 
     # ── enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─────────
     try:
-        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE)
-        discovery_depth = r.zcard(DISCOVERY_QUEUE)
+        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE) + r.zcard(DOMAIN_ENRICHMENT_DELAYED)
+        discovery_depth = r.zcard(DISCOVERY_QUEUE) + r.zcard(DISCOVERY_DELAYED)
 
         # Delay = how long the most-overdue item in the delayed ZSET has been past its not_before
         enrich_delay = 0.0

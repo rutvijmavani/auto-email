@@ -1086,6 +1086,13 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
         ON prospective_companies(company)
     """)
+    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py that
+    # cross-checks prospective_companies.domain against company_ats.domain.
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pc_domain_norm
+        ON prospective_companies (regexp_replace(LOWER(domain), '^www\\.', ''))
+        WHERE domain IS NOT NULL
+    """)
 
     # ── Multi-user migrations (2026-07-15) ───────────────────────────────────
     # All statements are idempotent (IF NOT EXISTS / ON CONFLICT / IF EXISTS).
@@ -1616,6 +1623,13 @@ def init_db():
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
+    # Expression index: supports the LATERAL join in job_monitor.py that matches
+    # assigned_domain to prospective_companies.domain (both www-stripped, lowercased).
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_fdm_assigned_domain_norm
+        ON fein_domain_map (regexp_replace(LOWER(assigned_domain), '^www\\.', ''))
+        WHERE assigned_domain IS NOT NULL
+    """)
 
     # Pipeline performance metrics — one row per company per worker run.
     # Tracks which phase found public_domain / careers_url / ATS so regressions
@@ -1746,6 +1760,13 @@ def init_db():
     # Safe no-op on fresh installs (column already in CREATE TABLE above)
     c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS trigger_source TEXT")
     c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ")
+    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py that
+    # cross-checks company_ats.domain against prospective_companies.domain.
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ca_domain_norm
+        ON company_ats (regexp_replace(LOWER(domain), '^www\\.', ''))
+        WHERE domain IS NOT NULL
+    """)
 
     # ── Wage aggregates on existing tables (2026-08-10) ───────────────────────
     # Wages normalized to annual equivalent at ingest time:

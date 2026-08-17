@@ -18,15 +18,21 @@ log = get_logger(__name__)
 ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
 DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 
+# Allowlist also includes plain unit names (no instance suffix) so callers
+# that pass the template unit don't get silently skipped.
+_KNOWN_UNITS = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS + (
+    "domain-enrichment-worker",
+    "discover-h1b-ats-worker",
+))
+
 
 def stop_workers(*units: str, dry_run: bool = False) -> None:
     """Stop one or more systemd units via `sudo systemctl stop`.
 
     Failures are logged as warnings; the caller is never interrupted.
     """
-    _known = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
     for unit in units:
-        if unit not in _known:
+        if unit not in _KNOWN_UNITS:
             log.warning("stop_workers: unknown unit %r — skipping", unit)
             continue
         if dry_run:
@@ -55,9 +61,8 @@ def start_workers(*units: str, dry_run: bool = False) -> None:
     this after populating a queue is always safe — it only starts idle workers.
     Failures are logged as warnings; the caller is never interrupted.
     """
-    _known = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
     for unit in units:
-        if unit not in _known:
+        if unit not in _KNOWN_UNITS:
             log.warning("start_workers: unknown unit %r — skipping", unit)
             continue
         if dry_run:

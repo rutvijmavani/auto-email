@@ -104,7 +104,8 @@ _CHALLENGE_HEADERS = frozenset({
 
 def _is_challenge_response(headers: dict) -> bool:
     """Return True if response headers indicate a bot-protection challenge page."""
-    return any(h in headers for h in _CHALLENGE_HEADERS)
+    lower_keys = {k.lower() for k in headers}
+    return bool(_CHALLENGE_HEADERS & lower_keys)
 
 _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6

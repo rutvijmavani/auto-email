@@ -131,9 +131,15 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
             UPDATE prospective_companies
             SET domain       = COALESCE(NULLIF(domain, ''),                                     COALESCE(?, domain)),
                 ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), COALESCE(?, ats_platform)),
-                ats_slug     = COALESCE(NULLIF(ats_slug, ''),                                   COALESCE(?, ats_slug))
+                ats_slug     = CASE
+                    WHEN NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported') IS NULL
+                         THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
+                    WHEN ? = ats_platform
+                         THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
+                    ELSE ats_slug
+                END
             WHERE company = ?
-        """, (domain, platform, slug, company))
+        """, (domain, platform, slug, platform, slug, company))
         conn.commit()
     conn.close()
     return inserted

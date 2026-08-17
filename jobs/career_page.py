@@ -19,6 +19,8 @@ import requests
 import tldextract as _tldextract_mod
 from urllib.parse import urljoin, urlparse, parse_qs
 
+from jobs.http_safe import make_safe_session as _make_safe_session
+
 _tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 from bs4 import BeautifulSoup
 
@@ -26,6 +28,8 @@ from logger import get_logger
 from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
 
 logger = get_logger(__name__)
+
+_safe_session = _make_safe_session()
 
 
 def _reg_domain(u: str) -> str:
@@ -361,7 +365,7 @@ def _fetch_and_scan(url, company):
         final_url— URL after redirects
     """
     try:
-        resp = requests.get(
+        resp = _safe_session.get(
             url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
         )
         final_url = resp.url
@@ -390,7 +394,7 @@ def _fetch_and_scan(url, company):
         # Retry on HTTP
         try:
             http_url = url.replace("https://", "http://", 1)
-            resp     = requests.get(
+            resp     = _safe_session.get(
                 http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
             )
             if resp.url != http_url:
