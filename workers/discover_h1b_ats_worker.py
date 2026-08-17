@@ -42,6 +42,7 @@ from config import (
     DISCOVERY_INFLIGHT,
     DISCOVERY_MAX_RETRIES,
     DISCOVERY_QUEUE,
+    JOB_MONITOR_REDETECT_DAYS,
     REDIS_DB_MAINTENANCE,
 )
 from db.connection import get_conn
@@ -220,15 +221,57 @@ def _write_last_discovered(conn, fein: str) -> None:
     """, (fein,))
 
 
+def _mark_old_rows_stale(conn, fein: str, new_platform: str) -> int:
+    """Set stale_since on silent company_ats rows for this FEIN whose platform changed.
+
+    Only marks rows where:
+      - consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS (they triggered redetect)
+      - stale_since IS NULL (not already marked)
+      - platform != new_platform (the newly confirmed/changed ATS)
+    Returns count updated.
+    """
+    cur = conn.execute("""
+        UPDATE company_ats
+        SET stale_since = NOW()
+        WHERE employer_fein = %s
+          AND consecutive_empty_days >= %s
+          AND stale_since IS NULL
+          AND platform != %s
+    """, (fein, JOB_MONITOR_REDETECT_DAYS, new_platform))
+    return cur.rowcount
+
+
+def _update_prospective_ats(conn, probe_domain: str, new_platform: str, new_slug: str) -> int:
+    """Update prospective_companies in-place with the newly detected ATS.
+
+    Matched by normalized domain. Only updates when platform or slug changed.
+    Sets is_monitored=FALSE to require human review before job monitor picks it up.
+    Returns count updated.
+    """
+    cur = conn.execute("""
+        UPDATE prospective_companies
+        SET ats_platform    = %s,
+            ats_slug        = %s,
+            is_monitored    = FALSE,
+            ats_detected_at = NOW()
+        WHERE LOWER(regexp_replace(domain, '^www\\.', '')) =
+              LOWER(regexp_replace(%s, '^www\\.', ''))
+          AND (%s IS DISTINCT FROM ats_platform OR %s IS DISTINCT FROM ats_slug)
+    """, (new_platform, new_slug, probe_domain, new_platform, new_slug))
+    return cur.rowcount
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-company processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
+def _process_company(fein: str, petition_count: int, trigger: str,
+                     source: "str | None" = None) -> bool:
     """
     Run full ATS discovery for one company.
     Returns True on success (or permanent skip), False on transient error.
-    trigger values: 'enrichment' | 're_detection' | 'staleness' | 'manual'
+    trigger: 'enrichment' | 're_detection' | 'staleness' | 'redetect' | 'manual'
+    source:  'company_ats' | 'prospective' | None — controls post-detection stale/update logic.
     """
     conn = None
     t_start = time.time()
@@ -304,6 +347,24 @@ def _process_company(fein: str, petition_count: int, trigger: str) -> bool:
         # Only stamp last_discovered_at after confirming we got a valid result dict
         _write_last_discovered(conn, fein)
         conn.commit()
+
+        # ── Redetect post-processing ──────────────────────────────────────────
+        det_platform = result.get("detected_platform")
+        det_slug     = result.get("detected_slug")
+
+        if source in ("company_ats", "prospective") and det_platform:
+            if source == "company_ats":
+                stale_count = _mark_old_rows_stale(conn, fein, det_platform)
+                conn.commit()
+                if stale_count:
+                    log.info("fein=%s redetect: marked %d old row(s) stale (new_platform=%s)",
+                             fein, stale_count, det_platform)
+            elif source == "prospective" and det_slug:
+                updated = _update_prospective_ats(conn, probe_domain, det_platform, det_slug)
+                conn.commit()
+                if updated:
+                    log.info("fein=%s redetect: updated prospective_companies "
+                             "platform=%s slug=%s", fein, det_platform, det_slug)
 
         # ── Metrics ───────────────────────────────────────────────────────────
         det_platform = result.get("detected_platform")
@@ -434,12 +495,13 @@ def run_worker(once: bool = False) -> None:
             raw_member     = _pop_result[0]             # str (decode_responses=True) — already in inflight
             petition_count = int(float(_pop_result[1])) # str score returned by Lua
 
-            # Member is JSON: {"fein": "...", "trigger": "..."}
+            # Member is JSON: {"fein": "...", "trigger": "...", "source": "..."}
             # Legacy bare-FEIN members (from older staleness_checker) are accepted as fallback.
             try:
                 data    = json.loads(raw_member)
                 fein    = data["fein"]
                 trigger = data.get("trigger", "enrichment")
+                source  = data.get("source")  # "company_ats" | "prospective" | None
             except (json.JSONDecodeError, KeyError, TypeError):
                 # Treat as bare FEIN if it looks like one (digits only).
                 # TypeError is needed because json.loads("123456789") returns int,
@@ -448,6 +510,7 @@ def run_worker(once: bool = False) -> None:
                 if bare.isdigit():
                     fein    = bare
                     trigger = "staleness"
+                    source  = None
                     log.debug("Legacy bare-FEIN member %r — treating as staleness trigger", bare)
                 else:
                     _dlq_payload = json.dumps({
@@ -459,6 +522,7 @@ def run_worker(once: bool = False) -> None:
                     r.zrem(_inflight_key, raw_member)
                     continue
             except Exception as e:
+                source = None  # noqa: F841 — ensures name is bound before DLQ branch
                 _dlq_payload = json.dumps({
                     "fein": "MALFORMED", "error_reason": str(e),
                     "raw": repr(raw_member), "failed_at": time.time(),
@@ -475,7 +539,7 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(fein, petition_count, trigger)
+            success = _process_company(fein, petition_count, trigger, source=source)
             processed["n"] += 1
 
             if not success:

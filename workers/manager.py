@@ -56,6 +56,9 @@ from config import (
     DOMAIN_ENRICHMENT_DELAYED,
     DISCOVERY_QUEUE,
     DISCOVERY_DELAYED,
+    REDETECT_QUEUE,
+    ATS_MANAGER_SCALE_UP_THRESHOLD,
+    ATS_MANAGER_IDLE_CYCLES,
 )
 
 logger = get_logger(__name__)
@@ -89,6 +92,9 @@ _FALLBACK_PARAMS: dict = {
 _scale_up_cycles:   dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _scale_down_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _urgent_active:     dict = {"scan": False, "detail": False, "fullscan": False}
+
+# ── ATS pool idle-cycle counters (simple on/off logic, not Layer 0 formula) ───
+_ats_idle_cycles:   dict = {"domain_enrichment": 0, "discovery": 0}
 
 # ── Layer 2 constants ──────────────────────────────────────────────────────────
 RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN × this = stable during recovery
@@ -363,9 +369,9 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: fullscan queue metrics failed: %s", exc)
         metrics["fullscan"] = {"depth": 0, "delay_s": 0.0}
 
-    # ── enrichment + discovery (informational — not autoscaled) ─────────────
+    # ── enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─────────
     try:
-        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE)
+        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE)
         discovery_depth = r.zcard(DISCOVERY_QUEUE)
 
         # Delay = how long the most-overdue item in the delayed ZSET has been past its not_before
@@ -1287,6 +1293,67 @@ def _check_error_spikes(r) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ATS pool autoscaling (simple on/off, not Layer 0 formula)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_ats_alive_count(r, hb_prefix: str) -> int:
+    """Count alive ATS worker instances by scanning worker:alive:{hb_prefix}* keys."""
+    cursor = 0
+    count = 0
+    while True:
+        cursor, keys = r.scan(cursor, match=f"worker:alive:{hb_prefix}*", count=50)
+        count += len(keys)
+        if cursor == 0:
+            break
+    return count
+
+
+def _run_ats_pool_cycle(
+    r,
+    pool_label: str,
+    combined_depth: int,
+    worker_units: tuple,
+    hb_prefix: str,
+) -> None:
+    """Simple on/off autoscaling for ATS enrichment/discovery pools.
+
+    depth == 0: increment idle counter; stop all workers when idle >= ATS_MANAGER_IDLE_CYCLES.
+    depth > 0:  reset idle counter; ensure at least one worker is alive;
+                start second worker when depth >= ATS_MANAGER_SCALE_UP_THRESHOLD.
+    """
+    from workers.worker_control import start_workers, stop_workers
+
+    alive = _get_ats_alive_count(r, hb_prefix)
+
+    if combined_depth == 0:
+        _ats_idle_cycles[pool_label] = _ats_idle_cycles.get(pool_label, 0) + 1
+        if _ats_idle_cycles[pool_label] >= ATS_MANAGER_IDLE_CYCLES and alive > 0:
+            logger.info(
+                "manager [%s]: idle for %d cycles — stopping workers",
+                pool_label, _ats_idle_cycles[pool_label],
+            )
+            stop_workers(*worker_units)
+            _ats_idle_cycles[pool_label] = 0
+        return
+
+    _ats_idle_cycles[pool_label] = 0
+
+    if alive == 0:
+        logger.info(
+            "manager [%s]: depth=%d, no workers alive — starting %s",
+            pool_label, combined_depth, worker_units[0],
+        )
+        start_workers(worker_units[0])
+
+    if combined_depth >= ATS_MANAGER_SCALE_UP_THRESHOLD and alive < len(worker_units):
+        logger.info(
+            "manager [%s]: depth=%d >= threshold=%d — starting %s",
+            pool_label, combined_depth, ATS_MANAGER_SCALE_UP_THRESHOLD, worker_units[-1],
+        )
+        start_workers(worker_units[-1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main manager loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1466,6 +1533,26 @@ def run_manager() -> None:
                             "manager: Layer 2 check failed [%s]: %s", pool, exc,
                             exc_info=True,
                         )
+
+                # ── ATS pool autoscaling (simple on/off, not Layer 0) ────────
+                try:
+                    from workers.worker_control import ENRICHMENT_WORKERS, DISCOVERY_WORKERS
+                    _run_ats_pool_cycle(
+                        r,
+                        pool_label="domain_enrichment",
+                        combined_depth=queue_data.get("domain_enrichment", {}).get("depth", 0),
+                        worker_units=ENRICHMENT_WORKERS,
+                        hb_prefix="domain_enrichment_worker",
+                    )
+                    _run_ats_pool_cycle(
+                        r,
+                        pool_label="discovery",
+                        combined_depth=queue_data.get("discovery", {}).get("depth", 0),
+                        worker_units=DISCOVERY_WORKERS,
+                        hb_prefix="discover_h1b_ats_worker",
+                    )
+                except Exception as exc:
+                    logger.error("manager: ATS pool cycle failed: %s", exc, exc_info=True)
 
                 # ── Update prev_depth for next cycle's inflow_rate snapshot ────
                 for pool in pools:

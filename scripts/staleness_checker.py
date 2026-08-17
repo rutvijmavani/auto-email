@@ -1,24 +1,35 @@
 """
-scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery queues.
+scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery/redetect queues.
 
-Enrichment staleness:
+Pass 1 — Enrichment staleness:
     fein_domain_map WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'
     AND is_monitored = TRUE (or public_domain IS NULL for uninitialised rows)
     → ZADD domain_enrichment_queue petition_count {"fein": ...}
-    → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
 
-Discovery staleness:
+Pass 2 — Discovery staleness:
     fein_domain_map WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
     AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
-    (also catches companies with no ATS yet and petition_count >= threshold)
     → ZADD discovery_queue petition_count {"fein": ...}
-    → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
+
+Pass 3 — ATS re-detection staleness:
+    company_ats WHERE is_monitored=TRUE AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
+        AND platform NOT IN ('unknown','unsupported') AND stale_since IS NULL
+    prospective_companies WHERE consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
+        AND ats_platform NOT IN ('unknown','unsupported','custom')
+    → ZADD redetect_queue petition_count {"fein": ..., "source": "company_ats"|"prospective"}
+
+Pass 4 — Stale row purge:
+    DELETE FROM company_ats WHERE stale_since IS NOT NULL AND stale_since < NOW() - ATS_STALE_TTL_DAYS days
+
+Worker lifecycle is managed by manager.py (autoscaled on queue depth) — this script
+only populates the queues and never starts workers directly.
 
 Usage:
     python scripts/staleness_checker.py
     python scripts/staleness_checker.py --dry-run
     python scripts/staleness_checker.py --enrichment-only
     python scripts/staleness_checker.py --discovery-only
+    python scripts/staleness_checker.py --redetect-only
 """
 
 import argparse
@@ -30,10 +41,13 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
+    ATS_STALE_TTL_DAYS,
     DISCOVER_REDETECT_EMPTY_DAYS,
     DISCOVERY_QUEUE,
     DOMAIN_ENRICHMENT_QUEUE,
     ENRICH_STALENESS_DAYS,
+    JOB_MONITOR_REDETECT_DAYS,
+    REDETECT_QUEUE,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
     STALENESS_ZADD_BATCH,
@@ -42,7 +56,6 @@ from db.connection import get_conn
 from db.job_monitor import get_monitorable_companies
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
-from workers.worker_control import start_workers as _start_workers, ENRICHMENT_WORKERS, DISCOVERY_WORKERS
 
 log = get_logger(__name__)
 
@@ -55,11 +68,12 @@ def _is_maintenance(r) -> bool:
         return False
 
 
-def _stream_and_zadd(conn, r, sql, params, queue_key, workers, cursor_name, log_prefix, dry_run):
+def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, dry_run):
     """Stream a SELECT query via named cursor and ZADD each row to queue_key.
 
     Returns count of rows processed. Handles dry-run logging (first 5 rows),
-    pipeline batching (STALENESS_ZADD_BATCH), final flush, and worker startup.
+    pipeline batching (STALENESS_ZADD_BATCH), and final flush.
+    Worker lifecycle is managed by manager.py — this function never starts workers.
     """
     added = 0
     dry_run_sample: list = []
@@ -99,7 +113,6 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, workers, cursor_name, log_
         pipe.execute()
 
     log.info("%s: ZADD %d feins → %s", log_prefix, added, queue_key)
-    _start_workers(*workers)
     return added
 
 
@@ -150,7 +163,6 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     return _stream_and_zadd(
         conn, r, _sql, _params,
         queue_key=DOMAIN_ENRICHMENT_QUEUE,
-        workers=ENRICHMENT_WORKERS,
         cursor_name="enrichment_staleness",
         log_prefix="enrichment staleness",
         dry_run=dry_run,
@@ -179,11 +191,123 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
             f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
         ),
         queue_key=DISCOVERY_QUEUE,
-        workers=DISCOVERY_WORKERS,
         cursor_name="discovery_staleness",
         log_prefix="discovery staleness",
         dry_run=dry_run,
     )
+
+
+def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
+    """Push companies with silent monitored ATS paths to redetect_queue (pass 3).
+
+    Two sub-queries:
+      3a. company_ats: is_monitored=TRUE, consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS,
+          platform not unknown/unsupported, stale_since IS NULL
+      3b. prospective_companies: same empty-days condition, platform not unknown/unsupported/custom
+          — joined to fein_domain_map via domain to get FEIN.
+
+    Returns total count queued.
+    """
+    redetect_days = JOB_MONITOR_REDETECT_DAYS
+    added = 0
+    pipe = None if dry_run else r.pipeline(transaction=False)
+
+    # 3a — company_ats silent rows
+    with conn.named_cursor("redetect_company_ats") as cur:
+        cur.itersize = 500
+        cur.execute("""
+            SELECT DISTINCT
+                ca.employer_fein,
+                COALESCE(u.petition_count, 0) AS petition_count
+            FROM company_ats ca
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = ca.employer_fein
+            WHERE ca.is_monitored = TRUE
+              AND ca.consecutive_empty_days >= %s
+              AND ca.platform NOT IN ('unknown', 'unsupported')
+              AND ca.stale_since IS NULL
+              AND ca.employer_fein IS NOT NULL
+            ORDER BY petition_count DESC
+        """, (redetect_days,))
+        for row in cur:
+            if dry_run:
+                log.info("[dry-run] would ZADD redetect_queue score=%s fein=%s source=company_ats",
+                         row["petition_count"], row["employer_fein"])
+                added += 1
+                continue
+            member = json.dumps({"fein": row["employer_fein"], "source": "company_ats"})
+            pipe.zadd(REDETECT_QUEUE, {member: row["petition_count"]}, gt=True)
+            added += 1
+            if added % STALENESS_ZADD_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+
+    # 3b — prospective_companies silent rows
+    with conn.named_cursor("redetect_prospective") as cur:
+        cur.itersize = 500
+        cur.execute("""
+            SELECT DISTINCT
+                f.employer_fein,
+                COALESCE(u.petition_count, 0) AS petition_count
+            FROM prospective_companies pc
+            JOIN fein_domain_map f
+                ON LOWER(regexp_replace(f.assigned_domain, '^www\\.', '')) =
+                   LOWER(regexp_replace(pc.domain, '^www\\.', ''))
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE pc.consecutive_empty_days >= %s
+              AND pc.ats_platform IS NOT NULL
+              AND pc.ats_platform NOT IN ('unknown', 'unsupported', 'custom')
+            ORDER BY petition_count DESC
+        """, (redetect_days,))
+        for row in cur:
+            if dry_run:
+                log.info("[dry-run] would ZADD redetect_queue score=%s fein=%s source=prospective",
+                         row["petition_count"], row["employer_fein"])
+                added += 1
+                continue
+            member = json.dumps({"fein": row["employer_fein"], "source": "prospective"})
+            pipe.zadd(REDETECT_QUEUE, {member: row["petition_count"]}, gt=True)
+            added += 1
+            if added % STALENESS_ZADD_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+
+    if not dry_run and pipe is not None and added % STALENESS_ZADD_BATCH != 0:
+        pipe.execute()
+
+    if not added:
+        log.info("redetect staleness: no companies need re-detection")
+    else:
+        log.info("redetect staleness: %d companies queued → %s", added, REDETECT_QUEUE)
+    return added
+
+
+def run_stale_purge(conn, dry_run: bool = False) -> int:
+    """Delete company_ats rows where stale_since exceeded ATS_STALE_TTL_DAYS (pass 4).
+
+    Returns count of rows deleted (or would-be-deleted in dry-run).
+    """
+    if dry_run:
+        row = conn.execute("""
+            SELECT COUNT(*) FROM company_ats
+            WHERE stale_since IS NOT NULL
+              AND stale_since < NOW() - make_interval(days => %s)
+        """, (ATS_STALE_TTL_DAYS,)).fetchone()
+        count = row[0] if row else 0
+        log.info("[dry-run] stale purge: %d company_ats rows would be deleted", count)
+        return count
+
+    cur = conn.execute("""
+        DELETE FROM company_ats
+        WHERE stale_since IS NOT NULL
+          AND stale_since < NOW() - make_interval(days => %s)
+    """, (ATS_STALE_TTL_DAYS,))
+    conn.commit()
+    count = cur.rowcount
+    if count:
+        log.info("stale purge: deleted %d stale company_ats rows", count)
+    else:
+        log.info("stale purge: no stale rows to delete")
+    return count
 
 
 def main(args: argparse.Namespace) -> None:
@@ -199,17 +323,24 @@ def main(args: argparse.Namespace) -> None:
 
         enrich_added = 0
         discovery_added = 0
+        redetect_added = 0
+        purged = 0
 
-        if not args.discovery_only:
+        if not args.discovery_only and not args.redetect_only:
             enrich_added = run_enrichment_staleness(conn, r, dry_run=args.dry_run)
 
-        if not args.enrichment_only:
+        if not args.enrichment_only and not args.redetect_only:
             discovery_added = run_discovery_staleness(conn, r, dry_run=args.dry_run)
+
+        if not args.enrichment_only and not args.discovery_only:
+            redetect_added = run_redetect_staleness(conn, r, dry_run=args.dry_run)
+            purged = run_stale_purge(conn, dry_run=args.dry_run)
 
         elapsed = time.time() - t0
         log.info(
-            "staleness_checker done in %.1fs — enrichment: %d, discovery: %d%s",
-            elapsed, enrich_added, discovery_added,
+            "staleness_checker done in %.1fs — enrichment: %d, discovery: %d, "
+            "redetect: %d, purged: %d%s",
+            elapsed, enrich_added, discovery_added, redetect_added, purged,
             " [dry-run]" if args.dry_run else "",
         )
     finally:
@@ -223,4 +354,5 @@ if __name__ == "__main__":
     _mode = parser.add_mutually_exclusive_group()
     _mode.add_argument("--enrichment-only",  action="store_true", help="Only run enrichment staleness check")
     _mode.add_argument("--discovery-only",   action="store_true", help="Only run discovery staleness check")
+    _mode.add_argument("--redetect-only",    action="store_true", help="Only run redetect staleness check + stale purge")
     main(parser.parse_args())

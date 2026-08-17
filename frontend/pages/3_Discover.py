@@ -186,9 +186,11 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
     """, (fein, fein))
 
 
-def _pipeline_status(employer_name: str, canonical_name: str | None = None) -> str | None:
+def _pipeline_status(employer_name: str, canonical_name: str | None = None, domain: str | None = None) -> str | None:
     """Return existing pipeline status string, or None if not in pipeline.
-    Checks both the raw DOL name and canonical_name (added via ATS panel).
+    Checks both the raw DOL name and canonical_name first, then falls back to
+    domain match — needed because company names differ across tables
+    (e.g. "Amazon" in prospective_companies vs "Amazon.com LLC" in company_ats).
     """
     names = [employer_name.strip()]
     if canonical_name and canonical_name not in ("—", employer_name.strip()):
@@ -202,7 +204,18 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None) -> s
             names,
         )
         row = cur.fetchone()
-        return dict(row)["status"] if row else None
+        if row:
+            return dict(row)["status"]
+        if domain:
+            cur.execute(
+                "SELECT status FROM prospective_companies "
+                "WHERE LOWER(regexp_replace(domain, '^www\\.', '')) "
+                "    = LOWER(regexp_replace(%s, '^www\\.', '')) LIMIT 1",
+                (domain,),
+            )
+            row = cur.fetchone()
+            return dict(row)["status"] if row else None
+        return None
     finally:
         conn.close()
 
@@ -914,6 +927,11 @@ else:
     slug     = disc.get("detected_slug")
     monitored = disc.get("is_monitored", False)
 
+    # Load company_ats entries here so both the ATS badge and the review panel
+    # below can share the same data without a second query.
+    ca_entries = load_company_ats_entries(fein)
+    ca_any_monitored = any(ca.get("is_monitored") for ca in (ca_entries or []))
+
     st.markdown("")  # spacing
 
     if platform:
@@ -921,9 +939,13 @@ else:
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None)
-            if monitored or pipeline_st:
-                st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
+            _domain_hint = next((ca.get("domain") for ca in (ca_entries or [])), None)
+            pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint)
+            if monitored or pipeline_st or ca_any_monitored:
+                if ca_any_monitored and not monitored and not pipeline_st:
+                    st.info("Already monitored via ATS detection — see entries below")
+                else:
+                    st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
             else:
                 if st.button("Add to monitoring", key=f"add_mon_{fein}", type="primary"):
                     try:
@@ -1101,7 +1123,6 @@ else:
 # company_ats review panel — flip is_monitored after manual review
 # ─────────────────────────────────────────────────────────────────────────────
 
-ca_entries = load_company_ats_entries(fein)
 if ca_entries:
     st.divider()
     st.markdown("#### Detected ATS entries (pending review)")
@@ -1136,7 +1157,10 @@ if ca_entries:
             st.markdown("")
             btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
             btn_type  = "secondary" if ca_monitored else "primary"
-            btn_disabled = not ca_monitored and not ca_slug
+            already_in_pipeline = bool(pipeline_st) and not ca_monitored
+            btn_disabled = (not ca_monitored and not ca_slug) or already_in_pipeline
+            if already_in_pipeline:
+                st.caption(f"Already monitored via pipeline ({pipeline_st}) — disable that first")
             if st.button(btn_label, key=f"ca_toggle_{ca_id}", type=btn_type,
                          disabled=btn_disabled):
                 new_val = not ca_monitored

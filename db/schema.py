@@ -1745,6 +1745,7 @@ def init_db():
     """)
     # Safe no-op on fresh installs (column already in CREATE TABLE above)
     c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS trigger_source TEXT")
+    c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ")
 
     # ── Wage aggregates on existing tables (2026-08-10) ───────────────────────
     # Wages normalized to annual equivalent at ingest time:

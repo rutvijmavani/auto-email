@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urlunparse, urljoin
 
 import requests as _requests
 from flask import Flask, request, jsonify, make_response, redirect
@@ -403,6 +403,65 @@ def _is_private_host(host: str) -> bool:
         return True  # treat unresolvable as private (fail closed)
 
 
+class _SSRFAdapter(_requests.adapters.HTTPAdapter):
+    """Closes the DNS-rebinding TOCTOU gap in _head_ok.
+
+    The gap: _is_private_host() calls socket.getaddrinfo once; then requests/
+    urllib3 calls getaddrinfo again internally at connect time.  A DNS server
+    that returns different IPs on successive queries (TTL=0) can slip a private
+    IP through after our check passes.
+
+    Fix — for HTTP (no TLS): resolve once, validate ALL returned IPs, replace
+    the URL hostname with the resolved IP so urllib3 re-resolves IP→IP (no-op).
+    Fix — for HTTPS (with TLS): resolve + validate all IPs, keep the original
+    hostname in the URL so TLS SNI and certificate validation are unaffected.
+    DNS-rebinding on HTTPS is practically infeasible: the rebinding target must
+    also present a valid cert for the public domain, which an attacker cannot
+    forge.
+    """
+
+    def send(self, request, *args, **kwargs):
+        parsed = urlparse(request.url)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        if not host:
+            raise ConnectionError("SSRF: empty hostname")
+
+        try:
+            addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ConnectionError(f"SSRF: DNS resolution failed for {host!r}: {exc}") from exc
+        if not addrs:
+            raise ConnectionError(f"SSRF: no DNS results for {host!r}")
+
+        safe_ip = None
+        for _fam, _typ, _prt, _can, sockaddr in addrs:
+            ip = ipaddress.ip_address(sockaddr[0])
+            if any(ip in net for net in _PRIVATE_NETS):
+                raise ConnectionError(f"SSRF: {host!r} → private {ip}")
+            mapped = getattr(ip, "ipv4_mapped", None)
+            if mapped and any(mapped in net for net in _PRIVATE_NETS):
+                raise ConnectionError(f"SSRF: {host!r} → IPv4-mapped private {ip}")
+            if safe_ip is None:
+                safe_ip = sockaddr[0]
+
+        if parsed.scheme == "http":
+            # Rewrite URL to use resolved IP — prevents urllib3 from re-resolving.
+            # Host header preserves virtual-hosting / HTTP/1.1 semantics.
+            ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
+            netloc = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
+            request.url = urlunparse(parsed._replace(netloc=netloc))
+            request.headers.setdefault("Host", host)
+
+        return super().send(request, *args, **kwargs)
+
+
+_verify_session = _requests.Session()
+_verify_session.mount("http://",  _SSRFAdapter())
+_verify_session.mount("https://", _SSRFAdapter())
+
+
 def _head_ok(url: str) -> bool:
     """
     Return True if url returns a response in _VERIFY_GOOD_CODES (2xx or 403).
@@ -423,7 +482,7 @@ def _head_ok(url: str) -> bool:
             if time.monotonic() > _deadline:
                 return False
             _hop_timeout = min(_VERIFY_HEAD_TIMEOUT, max(1.0, _deadline - time.monotonic()))
-            resp = _requests.head(
+            resp = _verify_session.head(
                 current_url,
                 allow_redirects=False,
                 timeout=_hop_timeout,
@@ -434,7 +493,7 @@ def _head_ok(url: str) -> bool:
             if resp.status_code == 405:
                 # Server rejected HEAD — fall back to GET (stream=True to avoid body download)
                 try:
-                    gr = _requests.get(
+                    gr = _verify_session.get(
                         current_url,
                         allow_redirects=False,
                         stream=True,
@@ -468,11 +527,10 @@ def _head_ok(url: str) -> bool:
 def _trigger_enrichment(fein: str, r=None) -> None:
     """Push fein to enrichment queue at HIGH priority. Fire-and-forget.
 
-    Workers are started on demand by staleness_checker (cron); no systemctl
-    here so the web process doesn't require sudo.  Worst-case latency when no
-    worker is running: up to ENRICH_STALENESS_DAYS (default 90 days) until the
-    next staleness_checker cron fires and starts a worker.  For on-demand
-    responsiveness, ensure at least one enrichment worker is always running.
+    Workers are started on demand by manager.py (autoscaled on queue depth);
+    no systemctl here so the web process doesn't require sudo.  Worst-case
+    latency when no worker is running: up to one manager cycle (60s) before
+    the manager detects queue depth > 0 and starts a worker.
     Accepts a pre-created Redis client (r) so the caller can initialise it in
     the request thread rather than inside the thread-pool worker.
     """

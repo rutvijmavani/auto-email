@@ -19,6 +19,35 @@ ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2"
 DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 
 
+def stop_workers(*units: str, dry_run: bool = False) -> None:
+    """Stop one or more systemd units via `sudo systemctl stop`.
+
+    Failures are logged as warnings; the caller is never interrupted.
+    """
+    _known = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
+    for unit in units:
+        if unit not in _known:
+            log.warning("stop_workers: unknown unit %r — skipping", unit)
+            continue
+        if dry_run:
+            log.info("[dry-run] would stop %s", unit)
+            continue
+        try:
+            res = subprocess.run(
+                ["sudo", "-n", "systemctl", "stop", unit],
+                check=False,
+                timeout=10,
+                capture_output=True,
+            )
+            if res.returncode == 0:
+                log.info("stopped %s", unit)
+            else:
+                log.warning("systemctl stop %s rc=%d: %s", unit, res.returncode,
+                            res.stderr.decode(errors="replace").strip())
+        except Exception as exc:
+            log.warning("could not stop %s: %s", unit, exc)
+
+
 def start_workers(*units: str, dry_run: bool = False) -> None:
     """Start one or more systemd units via `sudo systemctl start`.
 

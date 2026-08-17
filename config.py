@@ -359,6 +359,10 @@ DISCOVERY_QUEUE            = "discovery_queue"             # Redis ZSET, score=p
 DISCOVERY_DELAYED          = "discovery:delayed"           # Redis ZSET, score=not_before timestamp
 DISCOVERY_DLQ              = "discovery:dlq"               # Redis LIST — failed discovery
 DISCOVERY_INFLIGHT         = "discovery:inflight"          # Redis ZSET — in-progress FEINs (crash recovery)
+REDETECT_QUEUE             = "redetect_queue"              # Redis ZSET — silent monitored companies awaiting re-detection
+ATS_STALE_TTL_DAYS         = int(os.getenv("ATS_STALE_TTL_DAYS",             "30"))   # days before stale company_ats rows are purged
+ATS_MANAGER_SCALE_UP_THRESHOLD = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD", "50"))  # queue depth → start 2nd enrichment/discovery worker
+ATS_MANAGER_IDLE_CYCLES    = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",        "3"))    # consecutive empty poll cycles → stop workers
 ENRICHMENT_MAX_RETRIES    = int(os.getenv("ENRICHMENT_MAX_RETRIES", "3"))
 ENRICHMENT_HEARTBEAT_S    = int(os.getenv("ENRICHMENT_HEARTBEAT_S", "30"))
 DISCOVERY_MAX_RETRIES     = int(os.getenv("DISCOVERY_MAX_RETRIES", "3"))

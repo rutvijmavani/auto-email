@@ -303,6 +303,14 @@ def get_all_monitored_companies():
                 domain
             FROM company_ats
             WHERE is_monitored = TRUE
+              AND stale_since IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM prospective_companies pc
+                  WHERE LOWER(regexp_replace(pc.domain, '^www\.', '')) =
+                        LOWER(regexp_replace(company_ats.domain, '^www\.', ''))
+                    AND pc.ats_platform IS NOT NULL
+                    AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+              )
 
             ORDER BY company ASC
         """).fetchall()
@@ -373,6 +381,7 @@ def get_monitorable_companies():
             FROM company_ats ca
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = ca.employer_fein
             WHERE ca.is_monitored = TRUE
+              AND ca.stale_since IS NULL
               AND ca.platform IS NOT NULL
               AND ca.platform NOT IN ('unknown', 'unsupported')
               AND ca.slug IS NOT NULL
@@ -382,6 +391,13 @@ def get_monitorable_companies():
                       json_extract_text(ca.slug, '$.url') IS NOT NULL
                       AND json_extract_text(ca.slug, '$.url') <> ''
                   )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM prospective_companies pc
+                  WHERE LOWER(regexp_replace(pc.domain, '^www\.', '')) =
+                        LOWER(regexp_replace(ca.domain, '^www\.', ''))
+                    AND pc.ats_platform IS NOT NULL
+                    AND pc.ats_platform NOT IN ('unknown', 'unsupported')
               )
 
             ORDER BY company ASC

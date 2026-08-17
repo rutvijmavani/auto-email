@@ -36,6 +36,7 @@ from config import (
     DISCOVERY_QUEUE,
     ENRICHMENT_HEARTBEAT_S,
     ENRICHMENT_MAX_RETRIES,
+    REDETECT_QUEUE,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
 )
@@ -268,20 +269,25 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
     """, (fein, domain, company_name, platform, slug, petition_count))
 
 
-def _push_to_discovery(r, fein: str, petition_count: int) -> None:
-    member = json.dumps({"fein": fein})
+def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None) -> None:
+    payload: dict = {"fein": fein}
+    if source is not None:
+        payload["source"] = source
+    member = json.dumps(payload)
     r.zadd(DISCOVERY_QUEUE, {member: petition_count}, gt=True)
-    log.debug("pushed %s to discovery_queue (petition_count=%d)", fein, petition_count)
+    log.debug("pushed %s to discovery_queue (petition_count=%d source=%s)", fein, petition_count, source)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-company processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment") -> bool:
+def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment",
+                     source: "str | None" = None) -> bool:
     """
     Run full enrichment for one company.
     Returns True on success (or permanent skip), False on transient error.
+    source: forwarded from REDETECT_QUEUE payload ("company_ats"|"prospective"|None).
     """
     conn = None
     t_start = time.time()
@@ -392,7 +398,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         # ── Step 4: push to discovery_queue ───────────────────────────────────
         if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
-            _push_to_discovery(r, fein, db_petition_count)
+            _push_to_discovery(r, fein, db_petition_count, source=source)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
         ats_source   = None
@@ -501,17 +507,18 @@ def run_worker(once: bool = False) -> None:
             # Move any delayed items that are now ready
             _flush_delayed(r)
 
-            # Atomically pop highest petition_count member and write to inflight
-            _pop_result = _pop_to_inflight(keys=[DOMAIN_ENRICHMENT_QUEUE, _inflight_key])
+            # Poll REDETECT_QUEUE first (priority); fall back to DOMAIN_ENRICHMENT_QUEUE
+            _pop_result = _pop_to_inflight(keys=[REDETECT_QUEUE, _inflight_key])
+            _from_redetect = bool(_pop_result)
+            if not _pop_result:
+                _pop_result = _pop_to_inflight(keys=[DOMAIN_ENRICHMENT_QUEUE, _inflight_key])
+
             if not _pop_result:
                 earliest = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
                 if not earliest:
-                    # Guard against producer-enqueue race: a producer may have pushed an item
-                    # between our Lua pop attempt and here while we still appear running to
-                    # systemd (so its `systemctl start` is a no-op). Re-flush and re-check
-                    # once; if still empty it is safe to exit.
+                    # Guard against producer-enqueue race: re-flush and re-check once.
                     _flush_delayed(r)
-                    if r.zcard(DOMAIN_ENRICHMENT_QUEUE) == 0:
+                    if r.zcard(DOMAIN_ENRICHMENT_QUEUE) == 0 and r.zcard(REDETECT_QUEUE) == 0:
                         log.info("Enrichment queue empty — exiting")
                         break
                     continue
@@ -524,22 +531,24 @@ def run_worker(once: bool = False) -> None:
                 log.info("Enrichment queue empty; %d delayed item(s) — sleeping %.0fs",
                          r.zcard(DOMAIN_ENRICHMENT_DELAYED), wait_s)
                 time.sleep(wait_s)
-                continue  # re-check main queue after each short sleep
+                continue
 
             raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
             score      = _pop_result[1]  # str score returned by Lua
             petition_count = int(float(score))
 
-            # Parse fein + trigger — JSON format; bare-FEIN fallback for legacy queue entries
+            # Parse fein + trigger + source from JSON payload; bare-FEIN fallback for legacy entries
             try:
-                data = json.loads(raw_member)
+                data    = json.loads(raw_member)
                 fein    = data["fein"]
-                trigger = data.get("trigger", "enrichment")
+                trigger = data.get("trigger", "redetect" if _from_redetect else "enrichment")
+                source  = data.get("source")  # "company_ats" | "prospective" | None
             except (json.JSONDecodeError, KeyError, TypeError):
                 raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
                 if raw_str.strip().lstrip("-").isdigit():
                     fein    = raw_str.strip()
                     trigger = "enrichment"
+                    source  = None
                 else:
                     log.error("malformed queue member %r — sending to DLQ", raw_member)
                     dlq_payload = json.dumps({
@@ -557,7 +566,7 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(r, fein, petition_count, trigger=trigger)
+            success = _process_company(r, fein, petition_count, trigger=trigger, source=source)
             processed["n"] += 1
 
             if not success:
