@@ -31,7 +31,7 @@ import json
 from datetime import datetime
 import html
 from bs4 import BeautifulSoup
-from jobs.ats.base import fetch_html, slugify, validate_company_match
+from jobs.ats.base import fetch_html, slugify, validate_company_match, country_to_alpha2, alpha2_to_country_name
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -201,8 +201,8 @@ def fetch_job_detail(job):
         title       = ld.get("title", "") or job.get("title", "")
         date_str    = ld.get("datePosted", "")
         posted_at   = _parse_date(date_str)
-        description = _extract_description(ld)
-        location    = _extract_location(ld)
+        description          = _extract_description(ld)
+        location, alpha2     = _extract_location(ld)
 
         # Job ID from identifier — more reliable than URL
         identifier = ld.get("identifier", {})
@@ -211,12 +211,13 @@ def fetch_job_detail(job):
         else:
             job_id = job.get("job_id", "")
 
-        job              = dict(job)
-        job["title"]       = title
-        job["location"]    = location
-        job["posted_at"]   = posted_at
-        job["description"] = description
-        job["job_id"]      = job_id
+        job                  = dict(job)
+        job["title"]         = title
+        job["location"]      = location
+        job["posted_at"]     = posted_at
+        job["description"]   = description
+        job["job_id"]        = job_id
+        job["_country_code"] = alpha2
 
         return job
 
@@ -387,34 +388,41 @@ def _extract_json_ld(soup):
 
 def _extract_location(ld):
     """
-    Extract location string from JSON-LD jobLocation.
+    Extract location string and ISO alpha-2 country code from JSON-LD jobLocation.
 
-    Phenom structure:
-      "jobLocation": {
-        "address": {
-          "addressLocality": "Bellevue",
-          "addressRegion":   "WA",
-          "addressCountry":  "United States"
-        }
-      }
-    Also handles list of locations.
+    Phenom addressCountry uses full official names consistently:
+      "United States of America"  (US jobs, confirmed Cisco + HPE)
+      "India"                     (non-US jobs, expected)
+    country_to_alpha2() normalises any format via pycountry.lookup().
+
+    Returns (location_str, alpha2_code).
+    location_str omits country for US jobs and appends full country name for
+    non-US so is_us_location() fallback works correctly.
+    Also handles list of locations (takes first).
     """
     try:
         locations = ld.get("jobLocation", [])
         if isinstance(locations, dict):
             locations = [locations]
         if not locations:
-            return ""
+            return "", ""
 
-        addr  = locations[0].get("address", {})
+        addr         = locations[0].get("address", {})
+        country_raw  = (addr.get("addressCountry") or "").strip()
+        alpha2       = country_to_alpha2(country_raw)
+
         parts = [
             addr.get("addressLocality", ""),
             addr.get("addressRegion", ""),
-            addr.get("addressCountry", ""),
         ]
-        return ", ".join(p for p in parts if p)
+        if alpha2 and alpha2 != "US":
+            parts.append(alpha2_to_country_name(alpha2))
+        elif not alpha2 and country_raw:
+            parts.append(country_raw)
+
+        return ", ".join(p for p in parts if p), alpha2
     except Exception:
-        return ""
+        return "", ""
 
 
 def _extract_description(ld):

@@ -290,10 +290,12 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             retry_after = max(1, min(retry_after, 3600))
             _certspotter_retry_after = time.time() + retry_after
             log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
+            r.close()
             return [], retry_after
 
         if r.status_code != 200:
             log.warning("certspotter HTTP %d for %s", r.status_code, domain)
+            r.close()
             return [], None
 
         certs = _bounded_json(r)

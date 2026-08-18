@@ -400,3 +400,23 @@ def alpha2_to_country_name(code: str) -> str:
         return getattr(c, "common_name", c.name) if c else code
     except Exception:
         return code
+
+
+def country_to_alpha2(raw: str) -> str:
+    """
+    Convert any country representation to ISO 3166-1 alpha-2.
+
+    Handles alpha-2 ("IN"), alpha-3 ("USA"), and full names ("United States of America").
+    Uses pycountry.countries.lookup() which searches all fields in one call.
+    Returns "" if unrecognized or pycountry is unavailable.
+    """
+    if not raw:
+        return ""
+    try:
+        import pycountry
+        c = pycountry.countries.lookup(raw.strip())
+        return c.alpha_2
+    except LookupError:
+        return ""
+    except Exception:
+        return ""

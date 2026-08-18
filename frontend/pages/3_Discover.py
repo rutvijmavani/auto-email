@@ -103,11 +103,11 @@ def _trigger_careers_check(url: str, fein: str) -> None:
 
 
 @st.fragment(run_every=2)
-def _careers_verify_badge(fein: str) -> None:
+def _careers_verify_badge(fein: str, careers: str) -> None:
     """Polls Redis every 2 s and updates the careers-URL verification badge in place.
     Once a terminal result (ok/failed) is seen it is cached in session_state so
     subsequent fragment reruns skip the Redis call entirely."""
-    _cache_key = f"_hc_result_{fein}"
+    _cache_key = f"_hc_result_{fein}_{careers}"
     _cached = st.session_state.get(_cache_key)
     if _cached is not None:
         if _cached == "ok":
@@ -380,8 +380,8 @@ def load_email_data(fein: str) -> dict | None:
         "assigned_domain":      row.get("assigned_domain"),
         "confidence":           row.get("confidence"),
         "low_confidence":       bool(row.get("low_confidence")),
-        "total_emails":         int(row.get("total_emails") or 0),
-        "patterns":             row.get("patterns") or [],
+        "total_emails":         0 if pd.isna(row.get("total_emails")) else int(row.get("total_emails")),
+        "patterns":             [] if pd.isna(row.get("patterns")) else (row.get("patterns") or []),
         "total_unique_personal": 0 if pd.isna(row.get("total_unique_personal")) else int(row.get("total_unique_personal")),
     }
 
@@ -989,7 +989,7 @@ else:
     if careers:
         _trigger_careers_check(careers, fein)  # no-op if already in-flight
         with d3:
-            _careers_verify_badge(fein)
+            _careers_verify_badge(fein, careers)
 
     # ── Official jobs URL (editable) ──────────────────────────────────────────
     if jobs_url and jobs_url != careers:
@@ -1202,32 +1202,30 @@ else:
                             if not _sheet_ok:
                                 log.warning("Sheet queue failed for %r", pipeline_name)
                                 st.warning("Could not queue for re-detection — run form sync manually.")
-                            _dc = get_conn()
-                            try:
-                                _cur = _dc.cursor()
-                                _cur.execute(
-                                    """UPDATE h1b_ats_discovery
-                                       SET is_monitored = TRUE,
-                                           detected_platform = NULL,
-                                           detected_slug = NULL
-                                       WHERE employer_fein = %s""",
-                                    (fein,),
-                                )
-                                _cur.execute(
-                                    """UPDATE company_ats
-                                       SET is_monitored = FALSE
-                                       WHERE employer_fein = %s
-                                         AND platform = %s""",
-                                    (fein, platform),
-                                )
-                                _dc.commit()
-                            finally:
-                                _dc.close()
-                            load_ats_discovery.clear()
-                            if _sheet_ok:
-                                st.success("Correction submitted — ATS will be re-detected on next form sync run.")
                             else:
-                                st.info("Company updated — run form sync manually to trigger re-detection.")
+                                _dc = get_conn()
+                                try:
+                                    _cur = _dc.cursor()
+                                    _cur.execute(
+                                        """UPDATE h1b_ats_discovery
+                                           SET is_monitored = TRUE,
+                                               detected_platform = NULL,
+                                               detected_slug = NULL
+                                           WHERE employer_fein = %s""",
+                                        (fein,),
+                                    )
+                                    _cur.execute(
+                                        """UPDATE company_ats
+                                           SET is_monitored = FALSE
+                                           WHERE employer_fein = %s
+                                             AND platform = %s""",
+                                        (fein, platform),
+                                    )
+                                    _dc.commit()
+                                finally:
+                                    _dc.close()
+                                load_ats_discovery.clear()
+                                st.success("Correction submitted — ATS will be re-detected on next form sync run.")
                             st.rerun()
                         except Exception as exc:
                             log.exception("ATS override failed for %r", name)

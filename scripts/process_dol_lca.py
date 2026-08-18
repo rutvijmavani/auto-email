@@ -639,7 +639,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 _merged: dict = dict(_prev_counts)
                 for _dom, _cnt in dm["domain_counts"].items():
                     _merged[_dom] = _merged.get(_dom, 0) + _cnt
-                _merged_total = _prev_total + dm["total_emails"]
+                _merged_total = max(_prev_total + dm["total_emails"], sum(_merged.values()))
                 if _merged:
                     _assigned = min(_merged, key=lambda k: (-_merged[k], k))
                     _conf     = _merged[_assigned] / _merged_total

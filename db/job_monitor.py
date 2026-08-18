@@ -353,7 +353,7 @@ def get_monitorable_companies():
             LEFT JOIN LATERAL (
                 SELECT employer_fein
                 FROM fein_domain_map
-                WHERE regexp_replace(LOWER(assigned_domain), '^www\.', '') = regexp_replace(LOWER(pc.domain), '^www\.', '')
+                WHERE regexp_replace(regexp_replace(LOWER(assigned_domain), '^https?://', ''), '^www\.', '') = regexp_replace(regexp_replace(LOWER(pc.domain), '^https?://', ''), '^www\.', '')
                 ORDER BY confidence DESC NULLS LAST, employer_fein
                 LIMIT 1
             ) f ON true

@@ -40,7 +40,7 @@ import html as html_lib
 from collections import Counter
 from datetime import datetime
 from bs4 import BeautifulSoup
-from jobs.ats.base import fetch_html, slugify, validate_company_match
+from jobs.ats.base import fetch_html, slugify, validate_company_match, country_to_alpha2, alpha2_to_country_name
 
 
 # ─────────────────────────────────────────
@@ -225,8 +225,8 @@ def fetch_job_detail(job):
         title       = ld.get("title", "") or job.get("title", "")
         date_str    = ld.get("datePosted", "")
         posted_at   = _parse_date(date_str)
-        description = _extract_description(ld)
-        location    = _extract_location(ld)
+        description          = _extract_description(ld)
+        location, alpha2     = _extract_location(ld)
 
         # Job ID — use identifier (ATS req ID) as canonical job_id
         # External job_id from URL is a different system ID
@@ -236,12 +236,13 @@ def fetch_job_detail(job):
         else:
             job_id = job.get("job_id", "")
 
-        job              = dict(job)
-        job["title"]       = title
-        job["location"]    = location
-        job["posted_at"]   = posted_at
-        job["description"] = description
-        job["job_id"]      = job_id
+        job                  = dict(job)
+        job["title"]         = title
+        job["location"]      = location
+        job["posted_at"]     = posted_at
+        job["description"]   = description
+        job["job_id"]        = job_id
+        job["_country_code"] = alpha2
 
         return job
 
@@ -442,36 +443,40 @@ def _extract_json_ld(soup):
 
 def _extract_location(ld):
     """
-    Extract location from JSON-LD jobLocation.
+    Extract location string and ISO alpha-2 country code from JSON-LD jobLocation.
 
-    TalentBrew structure (list of Place objects):
-      "jobLocation": [
-        {
-          "@type": "Place",
-          "address": {
-            "addressLocality": "Mountain View",
-            "addressRegion":   "California",
-            "addressCountry":  "United States"
-          }
-        }
-      ]
-    Returns first location as "City, State, Country".
+    TalentBrew addressCountry is inconsistent across tenants:
+      "IN"                   (ISO alpha-2)  e.g. NetApp India
+      "USA"                  (ISO alpha-3)  e.g. 7-Eleven US
+      "United States"        (full name)    possible
+    country_to_alpha2() handles all three formats via pycountry.lookup().
+
+    Returns (location_str, alpha2_code).
+    location_str omits country for US jobs (City, State only) and appends
+    the full country name for non-US jobs so is_us_location() fallback works.
     """
     try:
         locations = ld.get("jobLocation", [])
         if isinstance(locations, dict):
             locations = [locations]
         if not locations:
-            return ""
-        addr  = locations[0].get("address", {})
+            return "", ""
+        addr         = locations[0].get("address", {})
+        country_raw  = (addr.get("addressCountry") or "").strip()
+        alpha2       = country_to_alpha2(country_raw)
+
         parts = [
             addr.get("addressLocality", ""),
             addr.get("addressRegion", ""),
-            addr.get("addressCountry", ""),
         ]
-        return ", ".join(p for p in parts if p)
+        if alpha2 and alpha2 != "US":
+            parts.append(alpha2_to_country_name(alpha2))
+        elif not alpha2 and country_raw:
+            parts.append(country_raw)
+
+        return ", ".join(p for p in parts if p), alpha2
     except Exception:
-        return ""
+        return "", ""
 
 
 def _extract_description(ld):

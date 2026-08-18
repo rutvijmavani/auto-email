@@ -395,12 +395,12 @@ def _get_queue_metrics(r) -> dict:
             if _ts < now:
                 discovery_delay = max(0.0, now - _ts)
 
-        metrics["domain_enrichment"] = {"depth": enrich_depth,    "delay_s": enrich_delay}
-        metrics["discovery"]         = {"depth": discovery_depth,  "delay_s": discovery_delay}
+        metrics["domain_enrichment"] = {"depth": enrich_depth,   "delay_s": enrich_delay,   "depth_known": True}
+        metrics["discovery"]         = {"depth": discovery_depth, "delay_s": discovery_delay, "depth_known": True}
     except Exception as exc:
         logger.warning("manager: enrichment/discovery queue metrics failed: %s", exc)
-        metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0}
-        metrics["discovery"]         = {"depth": 0, "delay_s": 0.0}
+        metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
+        metrics["discovery"]         = {"depth": 0, "delay_s": 0.0, "depth_known": False}
 
     return metrics
 
@@ -1543,20 +1543,24 @@ def run_manager() -> None:
                 # ── ATS pool autoscaling (simple on/off, not Layer 0) ────────
                 try:
                     from workers.worker_control import ENRICHMENT_WORKERS, DISCOVERY_WORKERS
-                    _run_ats_pool_cycle(
-                        r,
-                        pool_label="domain_enrichment",
-                        combined_depth=queue_data.get("domain_enrichment", {}).get("depth", 0),
-                        worker_units=ENRICHMENT_WORKERS,
-                        hb_prefix="domain_enrichment_worker",
-                    )
-                    _run_ats_pool_cycle(
-                        r,
-                        pool_label="discovery",
-                        combined_depth=queue_data.get("discovery", {}).get("depth", 0),
-                        worker_units=DISCOVERY_WORKERS,
-                        hb_prefix="discover_h1b_ats_worker",
-                    )
+                    _enrich_data = queue_data.get("domain_enrichment", {})
+                    if _enrich_data.get("depth_known", True):
+                        _run_ats_pool_cycle(
+                            r,
+                            pool_label="domain_enrichment",
+                            combined_depth=_enrich_data.get("depth", 0),
+                            worker_units=ENRICHMENT_WORKERS,
+                            hb_prefix="domain_enrichment_worker",
+                        )
+                    _discov_data = queue_data.get("discovery", {})
+                    if _discov_data.get("depth_known", True):
+                        _run_ats_pool_cycle(
+                            r,
+                            pool_label="discovery",
+                            combined_depth=_discov_data.get("depth", 0),
+                            worker_units=DISCOVERY_WORKERS,
+                            hb_prefix="discover_h1b_ats_worker",
+                        )
                 except Exception as exc:
                     logger.error("manager: ATS pool cycle failed: %s", exc, exc_info=True)
 
