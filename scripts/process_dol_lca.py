@@ -619,9 +619,9 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 year_count += 1
 
             # fein_domain_map — merge domain count JSON with existing row.
-            # Legacy rows with raw subdomain keys (e.g. email.gs.com) are automatically
-            # re-rooted to their registrable domain during the merge below; no reset or
-            # re-ingest is needed when deploying to a DB that has pre-migration data.
+            # Legacy rows with raw subdomain keys (e.g. email.gs.com) are re-rooted
+            # to their registrable domain only when a later quarter re-processes that
+            # FEIN; FEINs that never reappear retain raw subdomain keys indefinitely.
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
                 # Merge new domain counts with existing DB row in Python, then plain-upsert.

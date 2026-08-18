@@ -306,8 +306,8 @@ def get_all_monitored_companies():
               AND stale_since IS NULL
               AND NOT EXISTS (
                   SELECT 1 FROM prospective_companies pc
-                  WHERE LOWER(regexp_replace(pc.domain, '^www\.', '')) =
-                        LOWER(regexp_replace(company_ats.domain, '^www\.', ''))
+                  WHERE regexp_replace(LOWER(regexp_replace(pc.domain, '^https?://', '')), '^www\.', '') =
+                        regexp_replace(LOWER(regexp_replace(company_ats.domain, '^https?://', '')), '^www\.', '')
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
                     AND pc.ats_slug IS NOT NULL
@@ -398,8 +398,8 @@ def get_monitorable_companies():
               )
               AND NOT EXISTS (
                   SELECT 1 FROM prospective_companies pc
-                  WHERE LOWER(regexp_replace(pc.domain, '^www\.', '')) =
-                        LOWER(regexp_replace(ca.domain, '^www\.', ''))
+                  WHERE regexp_replace(LOWER(regexp_replace(pc.domain, '^https?://', '')), '^www\.', '') =
+                        regexp_replace(LOWER(regexp_replace(ca.domain, '^https?://', '')), '^www\.', '')
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
                     AND pc.ats_slug IS NOT NULL

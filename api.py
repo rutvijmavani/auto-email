@@ -22,7 +22,7 @@ load_dotenv()
 from logger import get_logger, init_logging, cleanup_logs_if_due
 from config import (
     DOMAIN_ENRICHMENT_QUEUE,
-    ENRICHMENT_HIGH_PRIORITY_SCORE,
+    ENRICHMENT_ON_DEMAND_SCORE,
     REDIS_EMAIL_PUSH,
     VERIFY_TASK_QUEUE_CAP,
 )
@@ -384,7 +384,17 @@ _VERIFY_TOTAL_TIMEOUT = 30  # seconds total across all hops — prevents 10×8s 
 _VERIFY_GOOD_CODES    = {200, 201, 204, 206, 403}  # 2xx + 403 (bot-blocked pages exist but are valid)
 _VERIFY_MAX_REDIRECTS = 10
 _VERIFY_STALE_DAYS    = 30  # re-verify after this many days
-_verify_session = _make_safe_session()
+_verify_session_local = threading.local()
+
+
+def _get_verify_session():
+    """Return a per-thread safe session, creating it lazily on first use."""
+    if not getattr(_verify_session_local, "session", None):
+        _verify_session_local.session = _make_safe_session()
+    return _verify_session_local.session
+
+_HEAD_CHECK_KEY_PREFIX = "enrichment:head_check:"
+_HEAD_CHECK_TTL        = 120  # seconds — long enough for st.fragment to poll 2–3 cycles
 
 
 def _head_ok(url: str) -> bool:
@@ -407,7 +417,8 @@ def _head_ok(url: str) -> bool:
             if time.monotonic() > _deadline:
                 return False
             _hop_timeout = min(_VERIFY_HEAD_TIMEOUT, max(1.0, _deadline - time.monotonic()))
-            resp = _verify_session.head(
+            _sess = _get_verify_session()
+            resp = _sess.head(
                 current_url,
                 allow_redirects=False,
                 timeout=_hop_timeout,
@@ -418,7 +429,7 @@ def _head_ok(url: str) -> bool:
             if resp.status_code == 405:
                 # Server rejected HEAD — fall back to GET (stream=True to avoid body download)
                 try:
-                    gr = _verify_session.get(
+                    gr = _sess.get(
                         current_url,
                         allow_redirects=False,
                         stream=True,
@@ -450,20 +461,25 @@ def _head_ok(url: str) -> bool:
 
 
 def _trigger_enrichment(fein: str, r=None) -> None:
-    """Push fein to enrichment queue at HIGH priority. Fire-and-forget.
+    """Push fein to enrichment queue at normal priority. Fire-and-forget.
 
-    Workers are started on demand by manager.py (autoscaled on queue depth);
-    no systemctl here so the web process doesn't require sudo.  Worst-case
-    latency when no worker is running: up to one manager cycle (60s) before
-    the manager detects queue depth > 0 and starts a worker.
+    Uses ENRICHMENT_ON_DEMAND_SCORE (default 500) so user-triggered checks
+    don't starve scheduled enrichment when many users visit profiles at once.
+    nx=True prevents adding a second ZSET member if the exact same JSON is
+    already queued; cross-trigger dedup (different trigger values for the same
+    FEIN) is handled by _INFLIGHT_FEINS in the caller — only one background
+    task per FEIN runs at a time.
     Accepts a pre-created Redis client (r) so the caller can initialise it in
     the request thread rather than inside the thread-pool worker.
     """
     try:
         _r = r if r is not None else get_redis()
         member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None})
-        _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
-        logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
+        added = _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_ON_DEMAND_SCORE}, nx=True)
+        if added:
+            logger.info("verify-company: queued re-enrichment fein=%s", fein)
+        else:
+            logger.debug("verify-company: fein=%s already queued — skipped", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
 
@@ -585,9 +601,11 @@ def verify_company():
         _submit(_trigger_enrichment, fein, _r_client)
         return jsonify(payload), 200
 
-    # Fire-and-forget HEAD check — never block the HTTP response
+    # Fire-and-forget HEAD check — never block the HTTP response.
+    # Writes result to Redis so the Discover page st.fragment can poll it.
     def _background_verify():
         ok = _head_ok(careers_url)
+        _hc_key = f"{_HEAD_CHECK_KEY_PREFIX}{fein}"
         if ok:
             # Mark URL as verified so staleness_checker skips it longer
             conn2 = get_conn()
@@ -605,11 +623,19 @@ def verify_company():
                     pass
             finally:
                 conn2.close()
+            try:
+                (_r_client or get_redis()).set(_hc_key, "ok", ex=_HEAD_CHECK_TTL)
+            except Exception as exc:
+                logger.debug("verify-company: Redis head_check write failed fein=%s: %s", fein, exc)
         else:
             logger.info(
                 "verify-company: HEAD failed for careers_url=%s fein=%s — triggering re-enrichment",
                 careers_url, fein,
             )
+            try:
+                (_r_client or get_redis()).set(_hc_key, "failed", ex=_HEAD_CHECK_TTL)
+            except Exception as exc:
+                logger.debug("verify-company: Redis head_check write failed fein=%s: %s", fein, exc)
             _trigger_enrichment(fein, _r_client)
 
     _submit(_background_verify)

@@ -1402,17 +1402,27 @@ def _upsert_company_ats(
         )
         return
 
-    # Remove any stale row for the same FEIN+platform with a different domain
-    # (e.g. website_url was rewritten from gs.com → goldmansachs.com between runs).
-    # Only touch unreviewed rows so manually-reviewed entries are never lost.
+    # Remove stale rows for the same FEIN+platform whose domain no longer matches
+    # any known employer URL (website_url or careers_url in h1b_ats_discovery).
+    # Preserves legitimate brand-domain entries (e.g. lifeatspotify.com alongside
+    # spotify.com) — those still appear in h1b_ats_discovery's known URLs.
+    # Only touches unreviewed, un-monitored rows.
     if fein:
         cur.execute("""
-            DELETE FROM company_ats
-            WHERE employer_fein = %s
-              AND platform = %s
-              AND domain != %s
-              AND reviewed_at IS NULL
-              AND is_monitored = FALSE
+            DELETE FROM company_ats ca_del
+            WHERE ca_del.employer_fein = %s
+              AND ca_del.platform = %s
+              AND ca_del.domain != %s
+              AND ca_del.reviewed_at IS NULL
+              AND ca_del.is_monitored = FALSE
+              AND NOT EXISTS (
+                  SELECT 1 FROM h1b_ats_discovery had
+                  WHERE had.employer_fein = ca_del.employer_fein
+                    AND (
+                        regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', '') = ca_del.domain
+                     OR regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', '') = ca_del.domain
+                    )
+              )
         """, (fein, platform, domain))
 
     cur.execute("""

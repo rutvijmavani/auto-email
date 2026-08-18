@@ -314,6 +314,14 @@ def send_startup_failure_alert(service: str, journal_unit: str) -> None:
         f'<li style="margin:4px 0;">{h}</li>' for h in hints
     )
 
+    _watchdog_note = "" if is_oneshot else (
+        '<p style="color:#64748b;font-size:12px;margin-top:16px;">'
+        "⚠ The watchdog's self-healing (5-minute restart loop) cannot help here —"
+        " this alert fires specifically when the service is crashing too fast for any"
+        " automated recovery to succeed.  Manual fix is required."
+        "</p>"
+    )
+
     body_html = f"""
 <p style="color:#ef4444;font-size:18px;font-weight:700;margin:0 0 16px;">
   🆘 Manual intervention required
@@ -351,12 +359,7 @@ def send_startup_failure_alert(service: str, journal_unit: str) -> None:
             font-size:11px;line-height:1.5;overflow:auto;
             white-space:pre-wrap;word-break:break-all;">{html.escape(journal_text)}</pre>
 
-{"" if is_oneshot else """
-<p style="color:#64748b;font-size:12px;margin-top:16px;">
-  ⚠ The watchdog's self-healing (5-minute restart loop) cannot help here —
-  this alert fires specifically when the service is crashing too fast for any
-  automated recovery to succeed.  Manual fix is required.
-</p>"""}"""
+{_watchdog_note}"""
 
     subject = (
         f"🆘 Pipeline FAILED: {service} — failed to complete, manual fix needed"

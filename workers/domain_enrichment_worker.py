@@ -303,8 +303,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                     (fein,),
                 )
                 conn.commit()
-            except Exception:
-                pass
+            except Exception as _placeholder_exc:
+                log.warning("fein=%s: placeholder insert into fein_domain_map failed: %s", fein, _placeholder_exc)
             return True
 
         assigned = company["assigned_domain"]
@@ -524,6 +524,9 @@ def run_worker(once: bool = False) -> None:
                     if r.zcard(DOMAIN_ENRICHMENT_QUEUE) == 0 and r.zcard(REDETECT_QUEUE) == 0:
                         log.info("Enrichment queue empty — exiting")
                         break
+                    # Queues are non-empty but another worker drained the item we tried to pop.
+                    # Sleep briefly to avoid tight Redis polling when workers race.
+                    time.sleep(1)
                     continue
                 if once:
                     log.info("Enrichment queue empty (--once); %d delayed item(s) — exiting",

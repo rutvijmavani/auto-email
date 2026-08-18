@@ -374,9 +374,11 @@ STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETIT
 STALENESS_ZADD_BATCH             = int(os.getenv("STALENESS_ZADD_BATCH",             "500"))  # Redis pipeline batch size for staleness queue pushes
 
 # On-demand verification (user visits company page)
-# Score used when a career URL fails HEAD check — sits above any petition_count value
-# so this company is processed before all normally-queued items.
+# High-priority score — reserved for future use where immediate processing is warranted.
 ENRICHMENT_HIGH_PRIORITY_SCORE   = int(os.getenv("ENRICHMENT_HIGH_PRIORITY_SCORE",  "999999"))
+# Normal score for API-triggered re-enrichment; sits mid-queue, does not starve
+# scheduled work when many users visit profiles simultaneously.
+ENRICHMENT_ON_DEMAND_SCORE       = int(os.getenv("ENRICHMENT_ON_DEMAND_SCORE",        "500"))
 
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))

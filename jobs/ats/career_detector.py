@@ -643,8 +643,9 @@ def find_next_pages(html, current_url, visited=None):
     """
     parsed_base = urlparse(current_url)
     base_domain = parsed_base.netloc
-    # Use tldextract so ccTLDs (e.g. .co.jp) don't produce wrong brand ("co" instead of "nomura")
-    brand = _tldextract.extract(base_domain).domain or base_domain
+    # Use hostname (no port/userinfo) so tldextract doesn't misparse "host:port" as a label.
+    # Fall back to netloc so brand matching still works when hostname is unavailable.
+    brand = _tldextract.extract(parsed_base.hostname or base_domain).domain or base_domain
 
     pairs = re.findall(
         r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',

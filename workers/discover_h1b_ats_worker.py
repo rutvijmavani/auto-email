@@ -485,6 +485,9 @@ def run_worker(once: bool = False) -> None:
                     if r.zcard(DISCOVERY_QUEUE) == 0:
                         log.info("Discovery queue empty — exiting")
                         break
+                    # Queue is non-empty but another worker drained the item we tried to pop.
+                    # Sleep briefly to avoid tight Redis polling when workers race.
+                    time.sleep(1)
                     continue
                 if once:
                     log.info("Discovery queue empty (--once); %d delayed item(s) — exiting",

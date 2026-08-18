@@ -11,6 +11,7 @@ import logging
 import re
 import sys
 import os
+import threading
 from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
@@ -20,11 +21,93 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from db.connection import get_conn
 from db.prospective import add_prospective_company, submit_to_prospective_sheet
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
+from workers.redis_client import get_redis as _get_redis
+from jobs.http_safe import make_safe_session as _make_safe_session, is_private_host as _is_private_host
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 _INLINE_PROBE_TIMEOUT = 30  # seconds; caps career-page probe in inline discovery
 
 log = logging.getLogger(__name__)
+
+# ── Background careers-URL verification ──────────────────────────────────────
+# One thread per FEIN; result written to Redis so st.fragment can poll it.
+
+_HEAD_CHECK_KEY_PREFIX  = "enrichment:head_check:"
+_HEAD_CHECK_TTL         = 120          # seconds
+_HEAD_CHECK_GOOD_CODES  = {200, 201, 204, 206, 403}
+_HEAD_CHECK_TIMEOUT     = 10           # seconds per attempt
+_discover_session       = _make_safe_session()
+_DISCOVER_INFLIGHT: set = set()
+_DISCOVER_LOCK          = threading.Lock()
+_DISCOVER_EXECUTOR      = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _careers_head_ok(url: str) -> bool:
+    """Lightweight HEAD check for the Discover page. Returns True on 2xx/403."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname or ""
+        if not host or _is_private_host(host):
+            return False
+        resp = _discover_session.head(
+            url, allow_redirects=True, timeout=_HEAD_CHECK_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code in _HEAD_CHECK_GOOD_CODES:
+            return True
+        if resp.status_code == 405:
+            resp = _discover_session.get(
+                url, allow_redirects=True, stream=True, timeout=_HEAD_CHECK_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.close()
+            return resp.status_code in _HEAD_CHECK_GOOD_CODES
+        return False
+    except Exception:
+        return False
+
+
+def _trigger_careers_check(url: str, fein: str) -> None:
+    """Submit a background HEAD check if one isn't already running for this FEIN."""
+    with _DISCOVER_LOCK:
+        if fein in _DISCOVER_INFLIGHT:
+            return
+        _DISCOVER_INFLIGHT.add(fein)
+
+    def _run():
+        try:
+            ok = _careers_head_ok(url)
+            try:
+                _get_redis().set(
+                    f"{_HEAD_CHECK_KEY_PREFIX}{fein}",
+                    "ok" if ok else "failed",
+                    ex=_HEAD_CHECK_TTL,
+                )
+            except Exception as _re:
+                log.debug("discover: Redis head_check write failed fein=%s: %s", fein, _re)
+        finally:
+            with _DISCOVER_LOCK:
+                _DISCOVER_INFLIGHT.discard(fein)
+
+    _DISCOVER_EXECUTOR.submit(_run)
+
+
+@st.fragment(run_every=2)
+def _careers_verify_badge(fein: str) -> None:
+    """Polls Redis every 2 s and updates the careers-URL verification badge in place."""
+    try:
+        result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}")
+    except Exception:
+        result = None
+
+    if result is None:
+        st.caption("⏳ Verifying careers page…")
+    elif result in (b"ok", "ok"):
+        st.caption("✅ Careers page verified")
+    else:
+        st.warning("⚠️ Careers page may have moved — check back soon")
 
 st.set_page_config(page_title="Discover", page_icon="🔎", layout="wide")
 
@@ -880,8 +963,12 @@ else:
                 st.session_state[_sk] = True
                 st.rerun()
 
-    # ── Careers page (editable) ───────────────────────────────────────────────
+    # ── Careers page (editable) + live verification badge ────────────────────
     _url_editor(d3, "Careers page", "careers_url", "edit_careers", careers)
+    if careers:
+        _trigger_careers_check(careers, fein)  # no-op if already in-flight
+        with d3:
+            _careers_verify_badge(fein)
 
     # ── Official jobs URL (editable) ──────────────────────────────────────────
     if jobs_url and jobs_url != careers:
