@@ -1028,7 +1028,7 @@ else:
                                 company        = pipeline_name,
                                 career_page_url= disc.get("careers_url"),
                                 job_url        = paste_url,
-                                domain         = website,
+                                domain         = _norm_domain(website),
                             )
                             if not sheet_ok:
                                 log.warning("Sheet queue failed for %r", pipeline_name)
@@ -1039,9 +1039,9 @@ else:
                             cur.execute("""
                                 UPDATE h1b_ats_discovery
                                 SET careers_url  = COALESCE(careers_url, %s),
-                                    is_monitored = TRUE
+                                    is_monitored = CASE WHEN %s THEN TRUE ELSE is_monitored END
                                 WHERE employer_fein = %s
-                            """, (paste_url, fein))
+                            """, (paste_url, inserted, fein))
                             conn.commit()
                         finally:
                             conn.close()
@@ -1073,7 +1073,7 @@ else:
                     if st.button("Submit correction", key=f"override_btn_{fein}", type="primary"):
                         try:
                             pipeline_name = canonical if canonical != "—" else name
-                            inserted = add_prospective_company(pipeline_name, priority=1, domain=website)
+                            inserted = add_prospective_company(pipeline_name, priority=1, domain=_norm_domain(website))
                             if not inserted:
                                 # Company already in pipeline with wrong platform — reset so form sync can re-detect
                                 _oc = get_conn()
@@ -1089,7 +1089,7 @@ else:
                                 company         = pipeline_name,
                                 career_page_url = disc.get("careers_url"),
                                 job_url         = override_url,
-                                domain          = website,
+                                domain          = _norm_domain(website),
                             )
                             if not _sheet_ok:
                                 log.warning("Sheet queue failed for %r", pipeline_name)

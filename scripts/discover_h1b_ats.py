@@ -1676,21 +1676,17 @@ def process_employer(
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
     # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
     # Only trust verified sources — Brave search (phase4) URLs are not verified by direct probe.
-    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6", "phase7"}
+    # phase7 (career_detector BFS) intentionally excluded: its careers URL may be
+    # off-domain (a job board), and the guard _careers_root != _cd_domain cancelled
+    # the outer _careers_root != _website_root condition, making phase7 rewrites
+    # always unreachable. phase3 and phase6 are verified probes; their redirects
+    # reliably indicate the company's real domain.
+    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6"}
     if careers_url and website_url and careers_source in _REWRITE_TRUSTED_SOURCES:
         from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)
         _website_root = _root_domain(website_url)
-        # Phase 7 (career_detector BFS) can surface off-domain job boards as the
-        # careers URL. Only trust the website_url rewrite when careers URL belongs
-        # to the same root domain that was actually crawled.
-        _cd_domain = _root_domain(website_url) if careers_source == "phase7" else ""
-        _phase7_off_domain = (
-            careers_source == "phase7"
-            and _careers_root != _cd_domain
-        )
-        if (not _phase7_off_domain
-                and _careers_root and _website_root
+        if (_careers_root and _website_root
                 and _careers_root != _website_root
                 and _careers_root not in _KNOWN_ATS_DOMAINS
                 and _careers_root not in _GENERIC_ROOTS):

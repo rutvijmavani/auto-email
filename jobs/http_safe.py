@@ -106,7 +106,10 @@ class SSRFAdapter(HTTPAdapter):
             ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
             netloc  = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
             request.url = urlunparse(parsed._replace(netloc=netloc))
-            request.headers.setdefault("Host", host)
+            # Include port in Host header only when non-default (RFC 7230 §5.4).
+            _default_port = 80
+            host_header = f"{host}:{parsed.port}" if parsed.port and parsed.port != _default_port else host
+            request.headers.setdefault("Host", host_header)
 
         return super().send(request, *args, **kwargs)
 

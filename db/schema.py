@@ -1086,11 +1086,14 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
         ON prospective_companies(company)
     """)
-    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py that
-    # cross-checks prospective_companies.domain against company_ats.domain.
+    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py and
+    # the domain-lookup in 3_Discover.py _pipeline_status. The expression strips
+    # the URL scheme (https?://) then the www. prefix, matching the query predicate.
+    # Dropped and recreated so IF NOT EXISTS does not silently retain the old expression.
+    c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
     c.execute("""
-        CREATE INDEX IF NOT EXISTS idx_pc_domain_norm
-        ON prospective_companies (regexp_replace(LOWER(domain), '^www\\.', ''))
+        CREATE INDEX idx_pc_domain_norm
+        ON prospective_companies (regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', ''))
         WHERE domain IS NOT NULL
     """)
 

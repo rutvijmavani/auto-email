@@ -198,9 +198,13 @@ class _Connection:
         Use for large result sets — PostgreSQL streams rows on demand instead
         of buffering the full result in memory before the first row arrives.
 
+        IMPORTANT: the returned cursor is a raw psycopg2 cursor and does NOT
+        go through _adapt_sql. Callers must use %s placeholders (PostgreSQL
+        style), not ? (SQLite style).
+
         Example:
             with conn.named_cursor("my_cursor") as cur:
-                cur.execute(sql, params)
+                cur.execute("SELECT * FROM t WHERE id = %s", (id,))
                 for row in cur:
                     ...
         """
