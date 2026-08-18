@@ -1633,12 +1633,20 @@ def init_db():
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
     # Expression index: supports the LATERAL join in job_monitor.py that matches
-    # assigned_domain to prospective_companies.domain (both www-stripped, lowercased).
-    c.execute("""
-        CREATE INDEX IF NOT EXISTS idx_fdm_assigned_domain_norm
-        ON fein_domain_map (regexp_replace(LOWER(assigned_domain), '^www\\.', ''))
-        WHERE assigned_domain IS NOT NULL
-    """)
+    # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
+    # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.
+    # Only dropped and recreated when the stored expression is stale (lacks https?://).
+    _idx_fdm_row = c.execute("""
+        SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'idx_fdm_assigned_domain_norm' AND tablename = 'fein_domain_map'
+    """).fetchone()
+    if _idx_fdm_row is None or "https?://" not in (_idx_fdm_row["indexdef"] or ""):
+        c.execute("DROP INDEX IF EXISTS idx_fdm_assigned_domain_norm")
+        c.execute("""
+            CREATE INDEX idx_fdm_assigned_domain_norm
+            ON fein_domain_map (regexp_replace(regexp_replace(LOWER(assigned_domain), '^https?://', ''), '^www\\.', ''))
+            WHERE assigned_domain IS NOT NULL
+        """)
 
     # Pipeline performance metrics — one row per company per worker run.
     # Tracks which phase found public_domain / careers_url / ATS so regressions

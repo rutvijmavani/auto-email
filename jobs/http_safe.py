@@ -72,7 +72,13 @@ class SSRFAdapter(HTTPAdapter):
     def send(self, request, *args, **kwargs):
         parsed = urlparse(request.url)
         host   = parsed.hostname or ""
-        port   = parsed.port or (443 if parsed.scheme == "https" else 80)
+        try:
+            explicit_port = parsed.port
+        except ValueError as exc:
+            raise requests.exceptions.ConnectionError(
+                f"SSRF: invalid port in URL: {exc}"
+            ) from exc
+        port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
         if not host:
             raise requests.exceptions.ConnectionError("SSRF: empty hostname")
@@ -104,11 +110,11 @@ class SSRFAdapter(HTTPAdapter):
             # Rewrite URL to the resolved IP so urllib3 won't re-resolve.
             # Host header preserves virtual-hosting / HTTP/1.1 semantics.
             ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
-            netloc  = f"{ip_host}:{parsed.port}" if parsed.port else ip_host
+            netloc  = f"{ip_host}:{explicit_port}" if explicit_port else ip_host
             request.url = urlunparse(parsed._replace(netloc=netloc))
             # Include port in Host header only when non-default (RFC 7230 §5.4).
             _default_port = 80
-            host_header = f"{host}:{parsed.port}" if parsed.port and parsed.port != _default_port else host
+            host_header = f"{host}:{explicit_port}" if explicit_port and explicit_port != _default_port else host
             request.headers.setdefault("Host", host_header)
 
         return super().send(request, *args, **kwargs)

@@ -375,8 +375,8 @@ def _get_queue_metrics(r) -> dict:
     try:
         # Include inflight ZSETs so workers are not stopped while actively processing items
         # (items move from queue → inflight atomically, leaving queues temporarily empty).
-        _enrich_inflight  = sum(r.zcard(k) for k in r.scan_iter(f"{DOMAIN_ENRICHMENT_INFLIGHT}*", count=10))
-        _discov_inflight  = sum(r.zcard(k) for k in r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10))
+        _enrich_inflight  = sum(r.zcard(k) for k in set(r.scan_iter(f"{DOMAIN_ENRICHMENT_INFLIGHT}*", count=10)))
+        _discov_inflight  = sum(r.zcard(k) for k in set(r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10)))
         enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE) + r.zcard(DOMAIN_ENRICHMENT_DELAYED) + _enrich_inflight
         discovery_depth = r.zcard(DISCOVERY_QUEUE) + r.zcard(DISCOVERY_DELAYED) + _discov_inflight
 

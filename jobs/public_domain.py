@@ -330,6 +330,7 @@ def _ct_crtsh(domain: str) -> list[str]:
         )
         if r.status_code != 200:
             log.warning("crt.sh HTTP %d for %s", r.status_code, domain)
+            r.close()
             return []
 
         roots: dict[str, int] = {}

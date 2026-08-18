@@ -496,14 +496,23 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
     if referer:
         headers["Referer"] = referer
 
-    _host = urlparse(url).hostname or ""
-    if _host and _is_private_host(_host):
+    _parsed_entry = urlparse(url)
+    if _parsed_entry.scheme not in ("http", "https"):
+        logger.debug("[detector] blocked: non-HTTP(S) scheme %r in %s", _parsed_entry.scheme, url)
+        return None, url
+    _host = _parsed_entry.hostname or ""
+    if not _host:
+        logger.debug("[detector] blocked: empty hostname in %s", url)
+        return None, url
+    if _is_private_host(_host):
         logger.debug("[detector] SSRF: blocked private host %r in %s", _host, url)
         return None, url
 
     def _get(target):
+        _prev = target
         _max = 10
         while _max > 0:
+            headers["Sec-Fetch-Site"] = _sec_fetch_site(target, _prev if _prev != target else referer)
             r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False)
             if r.status_code not in (301, 302, 303, 307, 308):
                 return r
@@ -519,7 +528,8 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             if _nh and _is_private_host(_nh):
                 logger.debug("[detector] SSRF redirect blocked: private host %r in %s", _nh, next_url)
                 return None
-            target = next_url
+            _prev   = target
+            target  = next_url
             _max -= 1
         return r
 

@@ -605,7 +605,7 @@ def verify_company():
     # Writes result to Redis so the Discover page st.fragment can poll it.
     def _background_verify():
         ok = _head_ok(careers_url)
-        _hc_key = f"{_HEAD_CHECK_KEY_PREFIX}{fein}"
+        _hc_key = f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{careers_url.rstrip('/')}"
         if ok:
             # Mark URL as verified so staleness_checker skips it longer
             conn2 = get_conn()

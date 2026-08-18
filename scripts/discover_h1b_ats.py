@@ -1791,18 +1791,20 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
 
 
 def _brave_upsert(fein: str, careers_url: "str | None",
-                  platform: "str | None", slug: "str | None", conn) -> None:
+                  platform: "str | None", slug: "str | None", conn,
+                  ats_source: str = "brave_pass",
+                  careers_source: str = "brave_pass") -> None:
     """Mark brave_checked_at and persist any career URL found."""
     conn.cursor().execute("""
         UPDATE h1b_ats_discovery
         SET brave_checked_at  = NOW(),
             careers_url       = COALESCE(%s, careers_url),
-            careers_source    = CASE WHEN %s IS NOT NULL THEN 'brave_pass' ELSE careers_source END,
+            careers_source    = CASE WHEN %s IS NOT NULL THEN %s ELSE careers_source END,
             detected_platform = COALESCE(%s, detected_platform),
             detected_slug     = COALESCE(%s, detected_slug),
-            ats_source        = CASE WHEN %s IS NOT NULL THEN 'brave_pass' ELSE ats_source END
+            ats_source        = CASE WHEN %s IS NOT NULL THEN %s ELSE ats_source END
         WHERE employer_fein = %s
-    """, (careers_url, careers_url, platform, slug, platform, fein))
+    """, (careers_url, careers_url, careers_source, platform, slug, platform, ats_source, fein))
     conn.commit()
 
 
@@ -1834,25 +1836,31 @@ def _run_brave_pass(conn, r, args) -> None:
                             i - 1, len(candidates))
                 break
 
-            brave_url = brave_career_search(search_name, website_url=website_url)
+            brave_url   = brave_career_search(search_name, website_url=website_url)
+            _ats_source = "brave_pass"
             if brave_url:
                 careers_url = brave_url
                 hit = _map(brave_url)
                 if hit:
-                    platform = hit["platform"]
-                    slug     = hit.get("slug")
+                    platform    = hit["platform"]
+                    slug        = hit.get("slug")
+                    _ats_source = "phase4"
                 else:
                     try:
                         html_content, _ = _fetch_html(brave_url)
                         if html_content:
                             platform, slug = _find_ats_in_html(html_content)
+                            if platform:
+                                _ats_source = "phase5"
                     except Exception as e:
                         log.warning("  HTML fingerprint failed: %s", e)
                 log.info("  Brave → %s  platform=%s", careers_url, platform)
             else:
                 log.info("  Brave found nothing — marking as attempted")
 
-            _brave_upsert(fein, careers_url, platform, slug, conn)
+            _brave_upsert(fein, careers_url, platform, slug, conn,
+                          ats_source=_ats_source,
+                          careers_source=_ats_source if careers_url else "brave_pass")
             if platform and slug and website_url:
                 domain = _root_domain(website_url)
                 if domain:

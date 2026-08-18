@@ -84,7 +84,7 @@ def _trigger_careers_check(url: str, fein: str) -> None:
             ok = _careers_head_ok(url)
             try:
                 _get_redis().set(
-                    f"{_HEAD_CHECK_KEY_PREFIX}{fein}",
+                    f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{url.rstrip('/')}",
                     "ok" if ok else "failed",
                     ex=_HEAD_CHECK_TTL,
                 )
@@ -117,7 +117,7 @@ def _careers_verify_badge(fein: str, careers: str) -> None:
         return
 
     try:
-        result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}")
+        result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{careers.rstrip('/')}")
     except Exception:
         result = None
 
@@ -381,7 +381,7 @@ def load_email_data(fein: str) -> dict | None:
         "confidence":           row.get("confidence"),
         "low_confidence":       bool(row.get("low_confidence")),
         "total_emails":         0 if pd.isna(row.get("total_emails")) else int(row.get("total_emails")),
-        "patterns":             [] if pd.isna(row.get("patterns")) else (row.get("patterns") or []),
+        "patterns":             row.get("patterns") if isinstance(row.get("patterns"), list) else [],
         "total_unique_personal": 0 if pd.isna(row.get("total_unique_personal")) else int(row.get("total_unique_personal")),
     }
 
@@ -1156,11 +1156,12 @@ else:
                         load_ats_discovery.clear()
                         if inserted and sheet_ok:
                             st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
+                            st.rerun()
                         elif inserted:
                             st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
                         else:
                             st.info("Already in pipeline.")
-                        st.rerun()
+                            st.rerun()
                     except Exception as exc:
                         log.exception("Failed to add %r to pipeline", name)
                         st.error(f"Error: {exc}")
@@ -1226,7 +1227,7 @@ else:
                                     _dc.close()
                                 load_ats_discovery.clear()
                                 st.success("Correction submitted — ATS will be re-detected on next form sync run.")
-                            st.rerun()
+                                st.rerun()
                         except Exception as exc:
                             log.exception("ATS override failed for %r", name)
                             st.error(f"Error: {exc}")
