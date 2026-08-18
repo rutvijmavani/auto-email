@@ -757,7 +757,7 @@ else:
             for dom, cnt in sorted_domains:
                 pct = cnt / total_emails * 100 if total_emails else 0
                 marker = " ✓" if dom == assigned else ""
-                st.progress(pct / 100, text=f"`{dom}`{marker}  {cnt:,} ({pct:.0f}%)")
+                st.progress(min(pct / 100, 1.0), text=f"`{dom}`{marker}  {cnt:,} ({pct:.0f}%)")
 
     with em2:
         if patterns and assigned:
@@ -1088,7 +1088,11 @@ else:
                             _dc = get_conn()
                             try:
                                 _dc.cursor().execute(
-                                    "UPDATE h1b_ats_discovery SET is_monitored = TRUE WHERE employer_fein = %s",
+                                    """UPDATE h1b_ats_discovery
+                                       SET is_monitored = TRUE,
+                                           detected_platform = NULL,
+                                           detected_slug = NULL
+                                       WHERE employer_fein = %s""",
                                     (fein,),
                                 )
                                 _dc.commit()

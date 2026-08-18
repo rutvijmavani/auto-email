@@ -121,7 +121,7 @@ def _flush_delayed(r) -> int:
             fein     = data["fein"]
             trigger  = data.get("trigger", "delayed_retry")
             pc       = data["petition_count"]
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "source": data.get("source")}): pc}, gt=True)
+            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source")}): pc}, gt=True)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -459,13 +459,19 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
     log.warning("reclaiming %d inflight FEINs from %s", len(items), inflight_key)
     for raw_member, score in items:
         member = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
+        dest_queue = DOMAIN_ENRICHMENT_QUEUE
         try:
-            fein = json.loads(member)["fein"]
+            parsed = json.loads(member)
+            fein = parsed["fein"]
+            # Items from REDETECT_QUEUE (produced by staleness_checker) have no trigger field;
+            # items from DOMAIN_ENRICHMENT_QUEUE always carry trigger. Use absence as a signal.
+            if "trigger" not in parsed:
+                dest_queue = REDETECT_QUEUE
         except Exception:
             fein = member.strip()
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: int(score)}, gt=True)
+        r.zadd(dest_queue, {member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight fein=%s score=%d", fein, int(score))
+        log.info("reclaimed inflight fein=%s score=%d → %s", fein, int(score), dest_queue)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

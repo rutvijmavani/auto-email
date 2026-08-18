@@ -135,7 +135,7 @@ def _flush_delayed(r) -> None:
             data = json.loads(raw)
             member = json.dumps({
                 "fein":    data["fein"],
-                "trigger": data.get("trigger"),
+                "trigger": data.get("trigger") or "enrichment",
                 "source":  data.get("source"),
             })
             r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
@@ -321,8 +321,11 @@ def _process_company(fein: str, petition_count: int, trigger: str,
             and existing_row.get("detected_slug")
         )
 
-        # Skip re-discovery if ATS already detected, UNLESS trigger forces re-detection
-        if already_has_ats and trigger not in ("re_detection", "manual"):
+        # Skip re-discovery if ATS already detected, UNLESS trigger forces re-detection.
+        # source "company_ats" / "prospective" means this item came via the REDETECT_QUEUE
+        # path — those should also run even when trigger defaults to "enrichment".
+        if already_has_ats and trigger not in ("re_detection", "manual") \
+                and source not in ("company_ats", "prospective"):
             log.info("fein=%s ATS already detected (%s/%s) — skipping (trigger=%s)",
                      fein, existing_row["detected_platform"],
                      existing_row.get("detected_slug"), trigger)
@@ -334,7 +337,8 @@ def _process_company(fein: str, petition_count: int, trigger: str,
         # kg_checked=False → KG always runs on first pass (even if careers_url set).
         # pass skip_brave=False so Phase 4 (Brave) runs — this worker is the right place.
         # Use force=True for re_detection/manual triggers so _is_recently_checked is bypassed.
-        _force = trigger in ("re_detection", "manual")
+        # Also force for re-detection-path items (source "company_ats"/"prospective").
+        _force = trigger in ("re_detection", "manual") or source in ("company_ats", "prospective")
         result = m.process_employer(
             emp, conn, dry_run=False, force=_force,
             prefetched=None, skip_brave=False,

@@ -179,12 +179,12 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         cu_rows = conn.execute("""
             SELECT careers_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) careers_source
+                SELECT DISTINCT ON (employer_fein) careers_source, careers_url
                 FROM h1b_enrichment_metrics
-                WHERE careers_url IS NOT NULL
-                  AND run_at > NOW() - %s::interval
+                WHERE run_at > NOW() - %s::interval
                 ORDER BY employer_fein, run_at DESC
             ) sub
+            WHERE careers_url IS NOT NULL
             GROUP BY careers_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -216,12 +216,12 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         ats_rows = conn.execute("""
             SELECT ats_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) ats_source
+                SELECT DISTINCT ON (employer_fein) ats_source, ats_platform
                 FROM h1b_enrichment_metrics
-                WHERE ats_platform IS NOT NULL
-                  AND run_at > NOW() - %s::interval
+                WHERE run_at > NOW() - %s::interval
                 ORDER BY employer_fein, run_at DESC
             ) sub
+            WHERE ats_platform IS NOT NULL
             GROUP BY ats_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -236,10 +236,10 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             FROM (
                 SELECT DISTINCT ON (employer_fein) ats_platform
                 FROM h1b_enrichment_metrics
-                WHERE ats_platform IS NOT NULL
-                  AND run_at > NOW() - %s::interval
+                WHERE run_at > NOW() - %s::interval
                 ORDER BY employer_fein, run_at DESC
             ) sub
+            WHERE ats_platform IS NOT NULL
         """, (f"{days} days",)).fetchone()
         plat_total = (_plat_total_row["total"] if _plat_total_row else 0) or 0
 
@@ -248,10 +248,10 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             FROM (
                 SELECT DISTINCT ON (employer_fein) ats_platform
                 FROM h1b_enrichment_metrics
-                WHERE ats_platform IS NOT NULL
-                  AND run_at > NOW() - %s::interval
+                WHERE run_at > NOW() - %s::interval
                 ORDER BY employer_fein, run_at DESC
             ) sub
+            WHERE ats_platform IS NOT NULL
             GROUP BY ats_platform
             ORDER BY companies DESC
             LIMIT 15

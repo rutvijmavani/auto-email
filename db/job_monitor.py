@@ -283,7 +283,7 @@ def get_all_monitored_companies():
     """
     conn = get_conn()
     try:
-        rows = conn.execute("""
+        rows = conn.execute(r"""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
                    last_checked_at, consecutive_empty_days,

@@ -288,11 +288,11 @@ def run_stale_purge(conn, dry_run: bool = False) -> int:
     """
     if dry_run:
         row = conn.execute("""
-            SELECT COUNT(*) FROM company_ats
+            SELECT COUNT(*) AS stale_count FROM company_ats
             WHERE stale_since IS NOT NULL
               AND stale_since < NOW() - make_interval(days => %s)
         """, (ATS_STALE_TTL_DAYS,)).fetchone()
-        count = row[0] if row else 0
+        count = row["stale_count"] if row else 0
         log.info("[dry-run] stale purge: %d company_ats rows would be deleted", count)
         return count
 

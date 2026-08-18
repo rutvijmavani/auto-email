@@ -93,8 +93,8 @@ def _validate_service(service: str) -> None:
     if m and m.group(1) in _VALID_TEMPLATES:
         return
     if "@" in service:
-        base = service.split("@", 1)[0]
-        if base in _VALID_TEMPLATES:
+        base, _, suffix = service.partition("@")
+        if base in _VALID_TEMPLATES and suffix.isdigit():
             return
     raise ValueError(
         f"Unknown service {service!r} — must be one of {sorted(_VALID_SERVICES)}, "

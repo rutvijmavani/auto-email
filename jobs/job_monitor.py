@@ -836,7 +836,7 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein}): petition_count}, gt=True)
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect"}): petition_count}, gt=True)
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()

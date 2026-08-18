@@ -1299,13 +1299,13 @@ def _check_error_spikes(r) -> None:
 def _get_ats_alive_count(r, hb_prefix: str) -> int:
     """Count alive ATS worker instances by scanning worker:alive:{hb_prefix}* keys."""
     cursor = 0
-    count = 0
+    seen: set = set()
     while True:
         cursor, keys = r.scan(cursor, match=f"worker:alive:{hb_prefix}*", count=50)
-        count += len(keys)
+        seen.update(keys)
         if cursor == 0:
             break
-    return count
+    return len(seen)
 
 
 def _run_ats_pool_cycle(

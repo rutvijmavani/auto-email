@@ -2,7 +2,7 @@
 Description=Daily H1B staleness checker (enrichment + discovery queues)
 
 [Timer]
-OnCalendar=*-*-* 04:00:00
+OnCalendar=*-*-* 05:00:00
 AccuracySec=5min
 Persistent=true
 

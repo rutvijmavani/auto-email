@@ -1,3 +1,4 @@
+import atexit
 import base64
 import hmac
 import json
@@ -374,6 +375,7 @@ def oauth_callback():
 # Bounded executor for background verify/enrich tasks — prevents thread explosion
 # under rapid extension requests for the same company.
 _VERIFY_EXECUTOR   = ThreadPoolExecutor(max_workers=8)
+atexit.register(_VERIFY_EXECUTOR.shutdown, wait=False)
 _INFLIGHT_FEINS    = set()          # FEINs with an active background task
 _INFLIGHT_LOCK     = threading.Lock()
 
@@ -459,7 +461,7 @@ def _trigger_enrichment(fein: str, r=None) -> None:
     """
     try:
         _r = r if r is not None else get_redis()
-        member = json.dumps({"fein": fein})
+        member = json.dumps({"fein": fein, "trigger": "on_demand"})
         _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
         logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:

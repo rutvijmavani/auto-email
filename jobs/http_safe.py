@@ -23,7 +23,13 @@ _PRIVATE_NETS = [
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
         "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8",
         "100.64.0.0/10",   # CGNAT / shared address space (RFC 6598)
+        "192.0.0.0/24",    # IETF protocol assignments (RFC 5736)
+        "198.18.0.0/15",   # benchmarking (RFC 2544)
+        "224.0.0.0/4",     # multicast
+        "240.0.0.0/4",     # reserved
         "::1/128", "fc00::/7", "fe80::/10",  # loopback, ULA, link-local
+        "ff00::/8",        # IPv6 multicast
+        "64:ff9b::/96",    # IPv4-mapped / NAT64
     )
 ]
 
@@ -59,7 +65,7 @@ class SSRFAdapter(HTTPAdapter):
     and certificate validation are unaffected. DNS-rebinding on HTTPS requires the
     attacker to also hold a valid cert for the public domain — practically infeasible.
 
-    Raises ConnectionError (caught as RequestException by callers) on any SSRF risk.
+    Raises requests.exceptions.ConnectionError on any SSRF risk.
     """
 
     def send(self, request, *args, **kwargs):
@@ -68,26 +74,26 @@ class SSRFAdapter(HTTPAdapter):
         port   = parsed.port or (443 if parsed.scheme == "https" else 80)
 
         if not host:
-            raise ConnectionError("SSRF: empty hostname")
+            raise requests.exceptions.ConnectionError("SSRF: empty hostname")
 
         try:
             addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         except OSError as exc:
-            raise ConnectionError(
+            raise requests.exceptions.ConnectionError(
                 f"SSRF: DNS resolution failed for {host!r}: {exc}"
             ) from exc
 
         if not addrs:
-            raise ConnectionError(f"SSRF: no DNS results for {host!r}")
+            raise requests.exceptions.ConnectionError(f"SSRF: no DNS results for {host!r}")
 
         safe_ip = None
         for _fam, _typ, _prt, _can, sockaddr in addrs:
             ip = ipaddress.ip_address(sockaddr[0])
             if any(ip in net for net in _PRIVATE_NETS):
-                raise ConnectionError(f"SSRF: {host!r} resolves to private {ip}")
+                raise requests.exceptions.ConnectionError(f"SSRF: {host!r} resolves to private {ip}")
             mapped = getattr(ip, "ipv4_mapped", None)
             if mapped and any(mapped in net for net in _PRIVATE_NETS):
-                raise ConnectionError(
+                raise requests.exceptions.ConnectionError(
                     f"SSRF: {host!r} resolves to IPv4-mapped private {ip}"
                 )
             if safe_ip is None:

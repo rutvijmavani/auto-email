@@ -25,6 +25,7 @@ import tldextract as _tldextract_mod
 _tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 
 from jobs.career_page import CAREER_PATHS
+from jobs.http_safe import is_private_host as _is_private_host
 
 logger = logging.getLogger(__name__)
 
@@ -495,11 +496,33 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
     if referer:
         headers["Referer"] = referer
 
+    _host = urlparse(url).hostname or ""
+    if _host and _is_private_host(_host):
+        logger.debug("[detector] SSRF: blocked private host %r in %s", _host, url)
+        return None, url
+
     def _get(target):
-        return session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=True)
+        _max = 10
+        while _max > 0:
+            r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False)
+            if r.status_code not in (301, 302, 303, 307, 308):
+                return r
+            location = r.headers.get("Location") or ""
+            if not location:
+                return r
+            next_url = urljoin(target, location)
+            _nh = urlparse(next_url).hostname or ""
+            if _nh and _is_private_host(_nh):
+                logger.debug("[detector] SSRF redirect blocked: private host %r in %s", _nh, next_url)
+                return None
+            target = next_url
+            _max -= 1
+        return r
 
     try:
         resp = _get(url)
+        if resp is None:
+            return None, url
         if resp.status_code == 200:
             return resp.text, resp.url
         logger.debug("[detector] %s → HTTP %s", url, resp.status_code)
