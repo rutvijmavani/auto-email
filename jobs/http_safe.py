@@ -27,6 +27,7 @@ _PRIVATE_NETS = [
         "198.18.0.0/15",   # benchmarking (RFC 2544)
         "224.0.0.0/4",     # multicast
         "240.0.0.0/4",     # reserved
+        "::/128",                              # unspecified address
         "::1/128", "fc00::/7", "fe80::/10",  # loopback, ULA, link-local
         "ff00::/8",        # IPv6 multicast
         "64:ff9b::/96",    # IPv4-mapped / NAT64

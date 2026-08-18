@@ -511,7 +511,11 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             if not location:
                 return r
             next_url = urljoin(target, location)
-            _nh = urlparse(next_url).hostname or ""
+            _parsed_next = urlparse(next_url)
+            if _parsed_next.scheme not in ("http", "https"):
+                logger.debug("[detector] redirect blocked: non-HTTP(S) scheme %r in %s", _parsed_next.scheme, next_url)
+                return None
+            _nh = _parsed_next.hostname or ""
             if _nh and _is_private_host(_nh):
                 logger.debug("[detector] SSRF redirect blocked: private host %r in %s", _nh, next_url)
                 return None

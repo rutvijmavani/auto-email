@@ -11,7 +11,7 @@ import logging
 import re
 import sys
 import os
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -186,6 +186,15 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
     """, (fein, fein))
 
 
+def _norm_domain(url: str | None) -> str | None:
+    """Strip scheme, path, query, and www. prefix from a URL or bare hostname."""
+    if not url:
+        return None
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = (parsed.hostname or url).lower()
+    return re.sub(r'^www\.', '', host)
+
+
 def _pipeline_status(employer_name: str, canonical_name: str | None = None, domain: str | None = None) -> str | None:
     """Return existing pipeline status string, or None if not in pipeline.
     Checks both the raw DOL name and canonical_name first, then falls back to
@@ -206,12 +215,13 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None, doma
         row = cur.fetchone()
         if row:
             return dict(row)["status"]
-        if domain:
+        norm = _norm_domain(domain)
+        if norm:
             cur.execute(
                 "SELECT status FROM prospective_companies "
-                "WHERE LOWER(regexp_replace(domain, '^www\\.', '')) "
-                "    = LOWER(regexp_replace(%s, '^www\\.', '')) LIMIT 1",
-                (domain,),
+                "WHERE regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', '') "
+                "    = %s LIMIT 1",
+                (norm,),
             )
             row = cur.fetchone()
             return dict(row)["status"] if row else None
@@ -934,14 +944,13 @@ else:
 
     st.markdown("")  # spacing
 
-    pipeline_st = None
+    _domain_hint = next((ca.get("domain") for ca in (ca_entries or []) if ca.get("domain")), None)
+    pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint or website)
     if platform:
         badge_col, action_col = st.columns([2, 3])
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            _domain_hint = next((ca.get("domain") for ca in (ca_entries or []) if ca.get("domain")), None)
-            pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint)
             if monitored or pipeline_st or ca_any_monitored:
                 if ca_any_monitored and not monitored and not pipeline_st:
                     st.info("Already monitored via ATS detection — see entries below")
@@ -954,7 +963,7 @@ else:
                         inserted = add_prospective_company(
                             pipeline_name,
                             priority=1,
-                            domain=website,
+                            domain=_norm_domain(website),
                             platform=platform,
                             slug=slug,
                         )
@@ -1011,7 +1020,7 @@ else:
                         inserted = add_prospective_company(
                             pipeline_name,
                             priority=1,
-                            domain=website,
+                            domain=_norm_domain(website),
                             # platform/slug intentionally omitted — form sync will detect
                         )
                         if inserted:
@@ -1098,8 +1107,7 @@ else:
                                 )
                                 _cur.execute(
                                     """UPDATE company_ats
-                                       SET is_monitored = FALSE,
-                                           ats_source = NULL
+                                       SET is_monitored = FALSE
                                        WHERE employer_fein = %s
                                          AND platform = %s""",
                                     (fein, platform),

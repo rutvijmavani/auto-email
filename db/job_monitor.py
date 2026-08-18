@@ -310,6 +310,10 @@ def get_all_monitored_companies():
                         LOWER(regexp_replace(company_ats.domain, '^www\.', ''))
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+                    AND pc.ats_slug IS NOT NULL
+                    AND (pc.ats_platform != 'custom'
+                         OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                             AND json_extract_text(pc.ats_slug, '$.url') <> ''))
               )
 
             ORDER BY company ASC
@@ -398,6 +402,10 @@ def get_monitorable_companies():
                         LOWER(regexp_replace(ca.domain, '^www\.', ''))
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+                    AND pc.ats_slug IS NOT NULL
+                    AND (pc.ats_platform != 'custom'
+                         OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                             AND json_extract_text(pc.ats_slug, '$.url') <> ''))
               )
 
             ORDER BY company ASC

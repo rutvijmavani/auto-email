@@ -1,8 +1,8 @@
 [Unit]
 Description=H1B ATS discovery worker (KG + Brave + career_detector pipeline)
 Documentation=https://github.com/rutvijmavani/auto-email
-After=network-online.target
-Wants=network-online.target
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target postgresql.service redis.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
 OnFailure=recruiter-pipeline-alert@%p.service
