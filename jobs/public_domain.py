@@ -377,7 +377,9 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
                       'crtsh' | 'same_domain' | 'ct_quota' | 'no_signal'
       retry_after   — seconds before re-queuing (certspotter 429), else None
     """
-    domain = assigned_domain.lower().strip()
+    domain = (assigned_domain or "").lower().strip()
+    if not domain:
+        return None, "no_signal", None
 
     if _is_private_ip_literal(domain):
         log.warning("public_domain: rejecting private address %s", domain)

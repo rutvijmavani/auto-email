@@ -320,4 +320,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.days < 1:
         parser.error("--days must be at least 1")
+    if args.no_signal_top < 0:
+        parser.error("--no-signal-top must be 0 or greater")
     run_report(days=args.days, no_signal_top=args.no_signal_top)

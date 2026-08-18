@@ -550,7 +550,7 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         if "ssl" in str(e).lower() or "SSL" in type(e).__name__:
             try:
                 resp = _get(url.replace("https://", "http://", 1))
-                if resp.status_code == 200:
+                if resp is not None and resp.status_code == 200:
                     return resp.text, resp.url
             except Exception:
                 pass

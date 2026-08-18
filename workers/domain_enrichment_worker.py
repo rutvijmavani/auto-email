@@ -402,7 +402,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 4: push to discovery_queue ───────────────────────────────────
-        if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
+        if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS or origin_queue == REDETECT_QUEUE:
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────

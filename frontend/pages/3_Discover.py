@@ -376,7 +376,7 @@ def load_email_data(fein: str) -> dict | None:
         return None
     row = df.iloc[0]
     return {
-        "domain_counts":        row.get("domain_counts") or {},
+        "domain_counts":        row.get("domain_counts") if isinstance(row.get("domain_counts"), dict) else {},
         "assigned_domain":      row.get("assigned_domain"),
         "confidence":           row.get("confidence"),
         "low_confidence":       bool(row.get("low_confidence")),
@@ -1131,16 +1131,15 @@ else:
                             domain=_norm_domain(website),
                             # platform/slug intentionally omitted — form sync will detect
                         )
-                        if inserted:
-                            sheet_ok = submit_to_prospective_sheet(
-                                company        = pipeline_name,
-                                career_page_url= disc.get("careers_url"),
-                                job_url        = paste_url,
-                                domain         = _norm_domain(website),
-                            )
-                            if not sheet_ok:
-                                log.warning("Sheet queue failed for %r", pipeline_name)
-                                st.warning("Could not queue for detection — added to pipeline but ATS detection must be run manually.")
+                        sheet_ok = submit_to_prospective_sheet(
+                            company        = pipeline_name,
+                            career_page_url= disc.get("careers_url"),
+                            job_url        = paste_url,
+                            domain         = _norm_domain(website),
+                        )
+                        if not sheet_ok:
+                            log.warning("Sheet queue failed for %r", pipeline_name)
+                            st.warning("Could not queue for detection — run form sync manually to trigger ATS detection.")
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
@@ -1154,8 +1153,11 @@ else:
                         finally:
                             conn.close()
                         load_ats_discovery.clear()
-                        if inserted and sheet_ok:
+                        if sheet_ok and inserted:
                             st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
+                            st.rerun()
+                        elif sheet_ok:
+                            st.success("Re-queued for ATS detection — will be re-scanned after form sync runs.")
                             st.rerun()
                         elif inserted:
                             st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
@@ -1183,17 +1185,6 @@ else:
                         try:
                             pipeline_name = canonical if canonical != "—" else name
                             inserted = add_prospective_company(pipeline_name, priority=1, domain=_norm_domain(website))
-                            if not inserted:
-                                # Company already in pipeline with wrong platform — reset so form sync can re-detect
-                                _oc = get_conn()
-                                try:
-                                    _oc.cursor().execute(
-                                        "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
-                                        (pipeline_name,),
-                                    )
-                                    _oc.commit()
-                                finally:
-                                    _oc.close()
                             _sheet_ok = submit_to_prospective_sheet(
                                 company         = pipeline_name,
                                 career_page_url = disc.get("careers_url"),
@@ -1204,6 +1195,17 @@ else:
                                 log.warning("Sheet queue failed for %r", pipeline_name)
                                 st.warning("Could not queue for re-detection — run form sync manually.")
                             else:
+                                if not inserted:
+                                    # Company already in pipeline — reset platform so form sync can re-detect
+                                    _oc = get_conn()
+                                    try:
+                                        _oc.cursor().execute(
+                                            "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
+                                            (pipeline_name,),
+                                        )
+                                        _oc.commit()
+                                    finally:
+                                        _oc.close()
                                 _dc = get_conn()
                                 try:
                                     _cur = _dc.cursor()

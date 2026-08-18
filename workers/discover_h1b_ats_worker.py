@@ -324,7 +324,7 @@ def _process_company(fein: str, petition_count: int, trigger: str,
         # Skip re-discovery if ATS already detected, UNLESS trigger forces re-detection.
         # source "company_ats" / "prospective" means this item came via the REDETECT_QUEUE
         # path — those should also run even when trigger defaults to "enrichment".
-        if already_has_ats and trigger not in ("re_detection", "manual") \
+        if already_has_ats and trigger not in ("re_detection", "manual", "redetect") \
                 and source not in ("company_ats", "prospective"):
             log.info("fein=%s ATS already detected (%s/%s) — skipping (trigger=%s)",
                      fein, existing_row["detected_platform"],
@@ -338,7 +338,7 @@ def _process_company(fein: str, petition_count: int, trigger: str,
         # pass skip_brave=False so Phase 4 (Brave) runs — this worker is the right place.
         # Use force=True for re_detection/manual triggers so _is_recently_checked is bypassed.
         # Also force for re-detection-path items (source "company_ats"/"prospective").
-        _force = trigger in ("re_detection", "manual") or source in ("company_ats", "prospective")
+        _force = trigger in ("re_detection", "manual", "redetect") or source in ("company_ats", "prospective")
         result = m.process_employer(
             emp, conn, dry_run=False, force=_force,
             prefetched=None, skip_brave=False,

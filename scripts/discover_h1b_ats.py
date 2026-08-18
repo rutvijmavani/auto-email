@@ -1420,7 +1420,9 @@ def _upsert_company_ats(
                   WHERE had.employer_fein = ca_del.employer_fein
                     AND (
                         regexp_replace(regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
                      OR regexp_replace(regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
                     )
               )
         """, (fein, platform, domain))
@@ -1858,9 +1860,10 @@ def _run_brave_pass(conn, r, args) -> None:
             else:
                 log.info("  Brave found nothing — marking as attempted")
 
+            _careers_source = "phase4" if brave_url else "brave_pass"
             _brave_upsert(fein, careers_url, platform, slug, conn,
                           ats_source=_ats_source,
-                          careers_source=_ats_source if careers_url else "brave_pass")
+                          careers_source=_careers_source if careers_url else "brave_pass")
             if platform and slug and website_url:
                 domain = _root_domain(website_url)
                 if domain:
