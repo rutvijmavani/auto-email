@@ -133,7 +133,7 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
                 ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), COALESCE(?, ats_platform)),
                 ats_slug     = CASE
                     WHEN NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported') IS NULL
-                         THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
+                         THEN COALESCE(NULLIF(?, ''), NULLIF(ats_slug, ''), ats_slug)
                     WHEN ? = ats_platform
                          THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
                     ELSE ats_slug

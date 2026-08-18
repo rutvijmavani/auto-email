@@ -1087,13 +1087,22 @@ else:
                                 st.warning("Could not queue for re-detection — run form sync manually.")
                             _dc = get_conn()
                             try:
-                                _dc.cursor().execute(
+                                _cur = _dc.cursor()
+                                _cur.execute(
                                     """UPDATE h1b_ats_discovery
                                        SET is_monitored = TRUE,
                                            detected_platform = NULL,
                                            detected_slug = NULL
                                        WHERE employer_fein = %s""",
                                     (fein,),
+                                )
+                                _cur.execute(
+                                    """UPDATE company_ats
+                                       SET is_monitored = FALSE,
+                                           ats_source = NULL
+                                       WHERE employer_fein = %s
+                                         AND platform = %s""",
+                                    (fein, platform),
                                 )
                                 _dc.commit()
                             finally:

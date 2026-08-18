@@ -240,7 +240,7 @@ def _mark_old_rows_stale(conn, fein: str, new_platform: str) -> int:
         WHERE employer_fein = %s
           AND consecutive_empty_days >= %s
           AND stale_since IS NULL
-          AND platform != %s
+          AND platform IS DISTINCT FROM %s
     """, (fein, JOB_MONITOR_REDETECT_DAYS, new_platform))
     return cur.rowcount
 

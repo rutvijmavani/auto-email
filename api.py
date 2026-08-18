@@ -461,7 +461,7 @@ def _trigger_enrichment(fein: str, r=None) -> None:
     """
     try:
         _r = r if r is not None else get_redis()
-        member = json.dumps({"fein": fein, "trigger": "on_demand"})
+        member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None})
         _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_HIGH_PRIORITY_SCORE}, gt=True)
         logger.info("verify-company: queued high-priority re-enrichment fein=%s", fein)
     except Exception as exc:

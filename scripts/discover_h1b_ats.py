@@ -1791,10 +1791,12 @@ def _brave_upsert(fein: str, careers_url: "str | None",
         UPDATE h1b_ats_discovery
         SET brave_checked_at  = NOW(),
             careers_url       = COALESCE(%s, careers_url),
+            careers_source    = CASE WHEN %s IS NOT NULL THEN 'brave_pass' ELSE careers_source END,
             detected_platform = COALESCE(%s, detected_platform),
-            detected_slug     = COALESCE(%s, detected_slug)
+            detected_slug     = COALESCE(%s, detected_slug),
+            ats_source        = CASE WHEN %s IS NOT NULL THEN 'brave_pass' ELSE ats_source END
         WHERE employer_fein = %s
-    """, (careers_url, platform, slug, fein))
+    """, (careers_url, careers_url, platform, slug, platform, fein))
     conn.commit()
 
 

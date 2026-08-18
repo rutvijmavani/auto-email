@@ -52,15 +52,17 @@ def _regression_block(conn, col, label, days):
             {col},
             COUNT(*) AS n
         FROM (
-            SELECT
+            SELECT DISTINCT ON (employer_fein, period)
                 CASE
                     WHEN run_at > NOW() - %s::interval THEN 'recent'
                     ELSE 'prior'
                 END AS period,
+                employer_fein,
                 {col}
             FROM h1b_enrichment_metrics
             WHERE run_at > NOW() - %s::interval
               AND {col} IS NOT NULL
+            ORDER BY employer_fein, period, run_at DESC
         ) sub
         GROUP BY period, {col}
         ORDER BY period DESC, n DESC

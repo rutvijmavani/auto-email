@@ -68,12 +68,14 @@ def _is_maintenance(r) -> bool:
         return False
 
 
-def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, dry_run):
+def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, dry_run,
+                     trigger="enrichment", source=None):
     """Stream a SELECT query via named cursor and ZADD each row to queue_key.
 
     Returns count of rows processed. Handles dry-run logging (first 5 rows),
     pipeline batching (STALENESS_ZADD_BATCH), and final flush.
     Worker lifecycle is managed by manager.py — this function never starts workers.
+    trigger/source are embedded in every member for consistent queue format across all producers.
     """
     added = 0
     dry_run_sample: list = []
@@ -88,7 +90,7 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                     dry_run_sample.append(row)
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"]})
+            member = json.dumps({"fein": row["employer_fein"], "trigger": trigger, "source": source})
             pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
@@ -103,8 +105,8 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
 
     if dry_run:
         for row in dry_run_sample:
-            log.info("[dry-run] would ZADD %s score=%s fein=%s",
-                     queue_key, row["petition_count"], row["employer_fein"])
+            log.info("[dry-run] would ZADD %s score=%s fein=%s trigger=%s",
+                     queue_key, row["petition_count"], row["employer_fein"], trigger)
         if added > 5:
             log.info("[dry-run] ... and %d more", added - 5)
         return added

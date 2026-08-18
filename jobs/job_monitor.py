@@ -710,6 +710,22 @@ def run():
                             }
                         _merge_company_stats(stats, stats_lock, _uc_stats)
 
+    # ── Re-enrichment check for covered companies ─────────────────────────────
+    # Background workers scan covered companies but never call _process_company,
+    # so needs_redetection is never evaluated for them here.
+    if covered and _shared_r is not None:
+        for _cov_row in covered:
+            if needs_redetection(_cov_row, JOB_MONITOR_REDETECT_DAYS):
+                _cov_result: dict = {"queued_enrichment": 0}
+                _enqueue_re_enrichment(
+                    _cov_row["company"], _cov_row, _cov_result,
+                    _shared_r, _enrichment_queued_event,
+                    empty_days=_cov_row.get("consecutive_empty_days", 0),
+                )
+                if _cov_result.get("queued_enrichment"):
+                    with stats_lock:
+                        stats["enrichment_queued"] += 1
+
     # ── Start enrichment workers once if any company was queued ──────────────
     # Check both the stats counter AND the event — the event is set immediately
     # on ZADD success and survives even if _process_company raised afterwards.
@@ -813,6 +829,20 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
         stats["enrichment_queued"] += company_stats.get("queued_enrichment", 0)
 
 
+def _redetect_reason(company_row) -> str:
+    """Return a short description of why this company needs re-detection."""
+    platform   = company_row.get("ats_platform", "unknown")
+    slug       = company_row.get("ats_slug")
+    empty_days = company_row.get("consecutive_empty_days", 0) or 0
+    if not platform or platform == "unknown":
+        return "unknown_platform"
+    if platform == "custom":
+        return "custom_no_curl"
+    if not slug:
+        return "no_slug"
+    return f"empty_days={empty_days}"
+
+
 def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, empty_days, *, log_label=""):
     """Queue fein for domain re-enrichment. Sets result['queued_enrichment']=1 on success."""
     fein   = company_row.get("employer_fein")
@@ -836,14 +866,15 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect"}): petition_count}, gt=True)
+        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect", "source": None}): petition_count}, gt=True)
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()
         tag = f" ({log_label})" if log_label else ""
+        _reason = _redetect_reason(company_row)
         logger.info(
-            "Re-enrichment queued%s for %r (fein=%s domain=%s empty_days=%d)",
-            tag, company, fein, domain, empty_days,
+            "Re-enrichment queued%s for %r (fein=%s domain=%s trigger=%s)",
+            tag, company, fein, domain, _reason,
         )
     except Exception as exc:
         if _cooldown_acquired:

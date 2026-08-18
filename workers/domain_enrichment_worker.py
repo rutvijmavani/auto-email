@@ -269,13 +269,12 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
     """, (fein, domain, company_name, platform, slug, petition_count))
 
 
-def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None) -> None:
-    payload: dict = {"fein": fein}
-    if source is not None:
-        payload["source"] = source
-    member = json.dumps(payload)
+def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None,
+                       trigger: str = "enrichment") -> None:
+    member = json.dumps({"fein": fein, "trigger": trigger, "source": source})
     r.zadd(DISCOVERY_QUEUE, {member: petition_count}, gt=True)
-    log.debug("pushed %s to discovery_queue (petition_count=%d source=%s)", fein, petition_count, source)
+    log.debug("pushed %s to discovery_queue (petition_count=%d trigger=%s source=%s)",
+              fein, petition_count, trigger, source)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,7 +397,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         # ── Step 4: push to discovery_queue ───────────────────────────────────
         if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS:
-            _push_to_discovery(r, fein, db_petition_count, source=source)
+            _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
         ats_source   = None

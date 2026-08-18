@@ -3,6 +3,7 @@ Description=H1B enrichment/discovery staleness checker
 Documentation=https://github.com/rutvijmavani/auto-email
 After=network-online.target postgresql.service redis.service
 Wants=network-online.target
+Requires=postgresql.service redis.service
 OnFailure=recruiter-pipeline-alert@%p.service
 
 [Service]
