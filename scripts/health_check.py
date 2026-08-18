@@ -630,8 +630,8 @@ def run_health_check() -> int:
 
     # ── H1B PIPELINE METRICS ─────────────────────────────────────────────────
     _section("H1B PIPELINE METRICS  (last 7 days)")
+    conn = None
     try:
-        conn = None
         from db.connection import get_conn as _get_conn
         conn = _get_conn()
 

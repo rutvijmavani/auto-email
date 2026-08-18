@@ -1089,13 +1089,19 @@ def init_db():
     # Expression index: supports the NOT EXISTS anti-join in job_monitor.py and
     # the domain-lookup in 3_Discover.py _pipeline_status. The expression strips
     # the URL scheme (https?://) then the www. prefix, matching the query predicate.
-    # Dropped and recreated so IF NOT EXISTS does not silently retain the old expression.
-    c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
-    c.execute("""
-        CREATE INDEX idx_pc_domain_norm
-        ON prospective_companies (regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', ''))
-        WHERE domain IS NOT NULL
-    """)
+    # Only dropped and recreated when the stored expression differs — avoids an index
+    # rebuild on every init_db() call; IF NOT EXISTS would silently retain the old expression.
+    _idx_pc_row = c.execute("""
+        SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'idx_pc_domain_norm' AND tablename = 'prospective_companies'
+    """).fetchone()
+    if _idx_pc_row is None or "https?://" not in (_idx_pc_row["indexdef"] or ""):
+        c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
+        c.execute("""
+            CREATE INDEX idx_pc_domain_norm
+            ON prospective_companies (regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', ''))
+            WHERE domain IS NOT NULL
+        """)
 
     # ── Multi-user migrations (2026-07-15) ───────────────────────────────────
     # All statements are idempotent (IF NOT EXISTS / ON CONFLICT / IF EXISTS).
@@ -1763,8 +1769,9 @@ def init_db():
     # Safe no-op on fresh installs (column already in CREATE TABLE above)
     c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS trigger_source TEXT")
     c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ")
-    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py that
-    # cross-checks company_ats.domain against prospective_companies.domain.
+    # Expression index on company_ats.domain: strips the www. prefix so bare-domain
+    # lookups match www-prefixed stored values. company_ats.domain stores bare domains
+    # (no scheme), so no scheme-stripping is needed here.
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_ca_domain_norm
         ON company_ats (regexp_replace(LOWER(domain), '^www\\.', ''))

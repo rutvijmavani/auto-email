@@ -1419,8 +1419,8 @@ def _upsert_company_ats(
                   SELECT 1 FROM h1b_ats_discovery had
                   WHERE had.employer_fein = ca_del.employer_fein
                     AND (
-                        regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', '') = ca_del.domain
-                     OR regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', '') = ca_del.domain
+                        regexp_replace(regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
                     )
               )
         """, (fein, platform, domain))

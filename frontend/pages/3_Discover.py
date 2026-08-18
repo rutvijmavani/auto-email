@@ -36,7 +36,7 @@ _HEAD_CHECK_KEY_PREFIX  = "enrichment:head_check:"
 _HEAD_CHECK_TTL         = 120          # seconds
 _HEAD_CHECK_GOOD_CODES  = {200, 201, 204, 206, 403}
 _HEAD_CHECK_TIMEOUT     = 10           # seconds per attempt
-_discover_session       = _make_safe_session()
+_discover_session_local = threading.local()
 _DISCOVER_INFLIGHT: set = set()
 _DISCOVER_LOCK          = threading.Lock()
 _DISCOVER_EXECUTOR      = concurrent.futures.ThreadPoolExecutor(max_workers=4)
@@ -51,14 +51,17 @@ def _careers_head_ok(url: str) -> bool:
         host = parsed.hostname or ""
         if not host or _is_private_host(host):
             return False
-        resp = _discover_session.head(
+        if not getattr(_discover_session_local, "session", None):
+            _discover_session_local.session = _make_safe_session()
+        _sess = _discover_session_local.session
+        resp = _sess.head(
             url, allow_redirects=True, timeout=_HEAD_CHECK_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         if resp.status_code in _HEAD_CHECK_GOOD_CODES:
             return True
         if resp.status_code == 405:
-            resp = _discover_session.get(
+            resp = _sess.get(
                 url, allow_redirects=True, stream=True, timeout=_HEAD_CHECK_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0"},
             )
@@ -91,12 +94,28 @@ def _trigger_careers_check(url: str, fein: str) -> None:
             with _DISCOVER_LOCK:
                 _DISCOVER_INFLIGHT.discard(fein)
 
-    _DISCOVER_EXECUTOR.submit(_run)
+    try:
+        _DISCOVER_EXECUTOR.submit(_run)
+    except Exception as _sub_exc:
+        log.warning("discover: failed to submit career check for fein=%s: %s", fein, _sub_exc)
+        with _DISCOVER_LOCK:
+            _DISCOVER_INFLIGHT.discard(fein)
 
 
 @st.fragment(run_every=2)
 def _careers_verify_badge(fein: str) -> None:
-    """Polls Redis every 2 s and updates the careers-URL verification badge in place."""
+    """Polls Redis every 2 s and updates the careers-URL verification badge in place.
+    Once a terminal result (ok/failed) is seen it is cached in session_state so
+    subsequent fragment reruns skip the Redis call entirely."""
+    _cache_key = f"_hc_result_{fein}"
+    _cached = st.session_state.get(_cache_key)
+    if _cached is not None:
+        if _cached == "ok":
+            st.caption("✅ Careers page verified")
+        else:
+            st.warning("⚠️ Careers page may have moved — check back soon")
+        return
+
     try:
         result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}")
     except Exception:
@@ -105,8 +124,10 @@ def _careers_verify_badge(fein: str) -> None:
     if result is None:
         st.caption("⏳ Verifying careers page…")
     elif result in (b"ok", "ok"):
+        st.session_state[_cache_key] = "ok"
         st.caption("✅ Careers page verified")
     else:
+        st.session_state[_cache_key] = "failed"
         st.warning("⚠️ Careers page may have moved — check back soon")
 
 st.set_page_config(page_title="Discover", page_icon="🔎", layout="wide")
@@ -361,7 +382,7 @@ def load_email_data(fein: str) -> dict | None:
         "low_confidence":       bool(row.get("low_confidence")),
         "total_emails":         int(row.get("total_emails") or 0),
         "patterns":             row.get("patterns") or [],
-        "total_unique_personal": int(row.get("total_unique_personal") or 0),
+        "total_unique_personal": 0 if pd.isna(row.get("total_unique_personal")) else int(row.get("total_unique_personal")),
     }
 
 
@@ -833,7 +854,7 @@ else:
 
     with em1:
         if assigned:
-            conf_str = f"{confidence * 100:.0f}%" if confidence is not None else "—"
+            conf_str = f"{confidence * 100:.0f}%" if confidence is not None and not pd.isna(confidence) else "—"
             conf_help = "Fraction of LCA emails that match the assigned domain. Low confidence = ambiguous."
             st.metric("Assigned email domain", assigned,
                       delta="⚠ low confidence" if low_conf else None,

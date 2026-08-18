@@ -100,12 +100,16 @@ return {res[1], res[2]}
 # Delayed queue — certspotter 429 re-queue with not_before timestamp
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry", source=None) -> None:
-    """Push company to delayed ZSET scored by not_before timestamp."""
-    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger, "source": source})
+def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry",
+                     source=None, origin_queue: str = DOMAIN_ENRICHMENT_QUEUE) -> None:
+    """Push company to delayed ZSET scored by not_before timestamp.
+    origin_queue is stored in the payload so _flush_delayed can restore the item
+    to the correct queue (REDETECT_QUEUE vs DOMAIN_ENRICHMENT_QUEUE)."""
+    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger,
+                          "source": source, "origin_queue": origin_queue})
     not_before = time.time() + delay_s
     r.zadd(DOMAIN_ENRICHMENT_DELAYED, {payload: not_before})
-    log.info("re-queued %s to delayed queue — retry in %ds", fein, delay_s)
+    log.info("re-queued %s to delayed queue — retry in %ds (origin=%s)", fein, delay_s, origin_queue)
 
 
 def _flush_delayed(r) -> int:
@@ -121,7 +125,8 @@ def _flush_delayed(r) -> int:
             fein     = data["fein"]
             trigger  = data.get("trigger", "delayed_retry")
             pc       = data["petition_count"]
-            r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source")}): pc}, gt=True)
+            dest = data.get("origin_queue", DOMAIN_ENRICHMENT_QUEUE)
+            r.zadd(dest, {json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source"), "origin_queue": dest}): pc}, gt=True)
             r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -282,7 +287,8 @@ def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" =
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment",
-                     source: "str | None" = None) -> bool:
+                     source: "str | None" = None,
+                     origin_queue: str = DOMAIN_ENRICHMENT_QUEUE) -> bool:
     """
     Run full enrichment for one company.
     Returns True on success (or permanent skip), False on transient error.
@@ -330,7 +336,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
             log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
-            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source)
+            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source, origin_queue=origin_queue)
             return True
 
         # When resolution fails, fall back to the previously stored public_domain so
@@ -462,9 +468,11 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         try:
             parsed = json.loads(member)
             fein = parsed["fein"]
-            # Items from REDETECT_QUEUE (produced by staleness_checker) have no trigger field;
-            # items from DOMAIN_ENRICHMENT_QUEUE always carry trigger. Use absence as a signal.
-            if "trigger" not in parsed:
+            # Use explicit origin_queue if present; fall back to trigger-absence heuristic
+            # for items queued before this field was introduced.
+            if "origin_queue" in parsed:
+                dest_queue = parsed["origin_queue"]
+            elif "trigger" not in parsed:
                 dest_queue = REDETECT_QUEUE
         except Exception:
             fein = member.strip()
@@ -512,7 +520,7 @@ def run_worker(once: bool = False) -> None:
 
             # Poll REDETECT_QUEUE first (priority); fall back to DOMAIN_ENRICHMENT_QUEUE
             _pop_result = _pop_to_inflight(keys=[REDETECT_QUEUE, _inflight_key])
-            _from_redetect = bool(_pop_result)
+            _origin_queue = REDETECT_QUEUE if _pop_result else DOMAIN_ENRICHMENT_QUEUE
             if not _pop_result:
                 _pop_result = _pop_to_inflight(keys=[DOMAIN_ENRICHMENT_QUEUE, _inflight_key])
 
@@ -547,7 +555,7 @@ def run_worker(once: bool = False) -> None:
             try:
                 data    = json.loads(raw_member)
                 fein    = data["fein"]
-                trigger = data.get("trigger", "redetect" if _from_redetect else "enrichment")
+                trigger = data.get("trigger", "redetect" if _origin_queue == REDETECT_QUEUE else "enrichment")
                 source  = data.get("source")  # "company_ats" | "prospective" | None
             except (json.JSONDecodeError, KeyError, TypeError):
                 raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
@@ -572,7 +580,8 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(r, fein, petition_count, trigger=trigger, source=source)
+            success = _process_company(r, fein, petition_count, trigger=trigger, source=source,
+                                       origin_queue=_origin_queue)
             processed["n"] += 1
 
             if not success:
@@ -582,7 +591,8 @@ def run_worker(once: bool = False) -> None:
                     _clear_retry(r, fein)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
-                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source)
+                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source,
+                                     origin_queue=_origin_queue)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:

@@ -198,12 +198,13 @@ def _redirect_domain(host: str) -> "str | None":
                             _next_host = urlparse(urljoin(current, _loc)).hostname or ""
                             if _root(_next_host) != _root(urlparse(current).hostname or ""):
                                 log.debug("_redirect_domain: cross-root redirect via verify=False — aborting")
+                                _last_headers = dict(r.headers)
                                 r.close()
                                 current = None
                                 break
+                _last_headers = dict(r.headers)
                 r.close()
                 if r.status_code not in _REDIRECT_CODES:
-                    _last_headers = dict(r.headers)
                     break  # current is the final URL
                 loc = r.headers.get("Location", "")
                 if not loc:

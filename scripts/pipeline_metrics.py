@@ -61,9 +61,9 @@ def _regression_block(conn, col, label, days):
                 {col}
             FROM h1b_enrichment_metrics
             WHERE run_at > NOW() - %s::interval
-              AND {col} IS NOT NULL
             ORDER BY employer_fein, period, run_at DESC
         ) sub
+        WHERE {col} IS NOT NULL
         GROUP BY period, {col}
         ORDER BY period DESC, n DESC
     """, (f"{days} days", f"{days * 2} days"))
@@ -260,7 +260,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         """, (f"{days} days",)).fetchall()
 
         if plat_rows:
-            print(f"\n  Platform breakdown  (top 15 by company count):")
+            print("\n  Platform breakdown  (top 15 by company count):")
             print(f"  {'Platform':<25} {'Companies':>10}  {'%':>7}")
             print(f"  {_SEP[:46]}")
             for r in plat_rows:

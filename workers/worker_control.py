@@ -1,12 +1,13 @@
 """
-workers/worker_control.py — Shared helper for starting systemd worker units.
+workers/worker_control.py — Shared helper for starting and stopping systemd worker units.
 
 Used by:
-  - scripts/staleness_checker.py  (after pushing stale feins to queues)
-  - scripts/fuzzy_match_uscis_dol.py  (after bulk-queuing enrichment feins)
+  - scripts/staleness_checker.py     (after pushing stale feins to queues)
+  - scripts/fuzzy_match_uscis_dol.py (after bulk-queuing enrichment feins)
+  - workers/manager.py               (autoscaling — start/stop based on queue depth)
 
-Keeps the sudo systemctl start logic, timeout, and warning handling in one place
-so both callers stay in sync.
+Keeps the sudo systemctl start/stop logic, timeout, and warning handling in one place
+so all callers stay in sync.
 """
 
 import subprocess

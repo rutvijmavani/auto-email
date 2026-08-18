@@ -365,7 +365,13 @@ def init_logging(command: str = "pipeline") -> None:
     # would never fire for them.  They use plain FileHandler on a dated
     # filename; _cleanup_old_logs() handles deletion at startup instead.
     if command in _LONG_RUNNING_COMMANDS:
-        command_file = LOG_DIR / f"{command}.log"
+        # Multi-instance workers (e.g. domain_enrichment_worker@1, @2) inject
+        # WORKER_INSTANCE=%i via their systemd unit. Include the instance suffix
+        # in the filename so each instance gets its own file and TimedRotatingFileHandler
+        # — two handlers on the same path race on midnight rotation.
+        _instance = os.environ.get("WORKER_INSTANCE", "")
+        _suffix = f"_{_instance}" if _instance else ""
+        command_file = LOG_DIR / f"{command}{_suffix}.log"
         file_handler = logging.handlers.TimedRotatingFileHandler(
             command_file,
             when="midnight",

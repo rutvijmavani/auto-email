@@ -15,6 +15,7 @@
 
 import re
 import json
+import threading as _threading
 import requests
 import tldextract as _tldextract_mod
 from urllib.parse import urljoin, urlparse, parse_qs
@@ -29,7 +30,14 @@ from jobs.ats.patterns import match_ats_pattern, validate_slug_for_company
 
 logger = get_logger(__name__)
 
-_safe_session = _make_safe_session()
+_session_local = _threading.local()
+
+
+def _get_session():
+    """Return a per-thread safe session, creating it lazily on first use."""
+    if not getattr(_session_local, "session", None):
+        _session_local.session = _make_safe_session()
+    return _session_local.session
 
 
 def _reg_domain(u: str) -> str:
@@ -365,7 +373,7 @@ def _fetch_and_scan(url, company):
         final_url— URL after redirects
     """
     try:
-        resp = _safe_session.get(
+        resp = _get_session().get(
             url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
         )
         final_url = resp.url
@@ -394,7 +402,7 @@ def _fetch_and_scan(url, company):
         # Retry on HTTP
         try:
             http_url = url.replace("https://", "http://", 1)
-            resp     = _safe_session.get(
+            resp     = _get_session().get(
                 http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
             )
             if resp.url != http_url:

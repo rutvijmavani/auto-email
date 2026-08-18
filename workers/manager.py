@@ -54,8 +54,10 @@ from config import (
     REDIS_CONCURRENCY_LIMIT_PREFIX,
     DOMAIN_ENRICHMENT_QUEUE,
     DOMAIN_ENRICHMENT_DELAYED,
+    DOMAIN_ENRICHMENT_INFLIGHT,
     DISCOVERY_QUEUE,
     DISCOVERY_DELAYED,
+    DISCOVERY_INFLIGHT,
     REDETECT_QUEUE,
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
@@ -371,8 +373,12 @@ def _get_queue_metrics(r) -> dict:
 
     # ── enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─────────
     try:
-        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE) + r.zcard(DOMAIN_ENRICHMENT_DELAYED)
-        discovery_depth = r.zcard(DISCOVERY_QUEUE) + r.zcard(DISCOVERY_DELAYED)
+        # Include inflight ZSETs so workers are not stopped while actively processing items
+        # (items move from queue → inflight atomically, leaving queues temporarily empty).
+        _enrich_inflight  = sum(r.zcard(k) for k in r.scan_iter(f"{DOMAIN_ENRICHMENT_INFLIGHT}*", count=10))
+        _discov_inflight  = sum(r.zcard(k) for k in r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10))
+        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE) + r.zcard(DOMAIN_ENRICHMENT_DELAYED) + _enrich_inflight
+        discovery_depth = r.zcard(DISCOVERY_QUEUE) + r.zcard(DISCOVERY_DELAYED) + _discov_inflight
 
         # Delay = how long the most-overdue item in the delayed ZSET has been past its not_before
         enrich_delay = 0.0
