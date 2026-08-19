@@ -69,6 +69,7 @@ from config import (
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
     DOMAIN_ENRICHMENT_QUEUE,
+    REDETECT_QUEUE,
 )
 logger = get_logger(__name__)
 
@@ -866,7 +867,7 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.zadd(DOMAIN_ENRICHMENT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect", "source": None}): petition_count}, gt=True)
+        r.zadd(REDETECT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect", "source": None}): petition_count}, gt=True)
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()

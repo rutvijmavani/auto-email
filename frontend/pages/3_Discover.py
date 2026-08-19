@@ -1145,10 +1145,10 @@ else:
                             cur = conn.cursor()
                             cur.execute("""
                                 UPDATE h1b_ats_discovery
-                                SET careers_url  = COALESCE(careers_url, %s),
-                                    is_monitored = CASE WHEN %s THEN TRUE ELSE is_monitored END
+                                SET sample_apply_url = COALESCE(sample_apply_url, %s),
+                                    is_monitored     = CASE WHEN %s THEN TRUE ELSE is_monitored END
                                 WHERE employer_fein = %s
-                            """, (paste_url, inserted, fein))
+                            """, (paste_url, sheet_ok, fein))
                             conn.commit()
                         finally:
                             conn.close()
@@ -1161,6 +1161,7 @@ else:
                             st.rerun()
                         elif inserted:
                             st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
+                            st.rerun()
                         else:
                             st.info("Already in pipeline.")
                             st.rerun()
@@ -1195,20 +1196,15 @@ else:
                                 log.warning("Sheet queue failed for %r", pipeline_name)
                                 st.warning("Could not queue for re-detection — run form sync manually.")
                             else:
-                                if not inserted:
-                                    # Company already in pipeline — reset platform so form sync can re-detect
-                                    _oc = get_conn()
-                                    try:
-                                        _oc.cursor().execute(
-                                            "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
-                                            (pipeline_name,),
-                                        )
-                                        _oc.commit()
-                                    finally:
-                                        _oc.close()
                                 _dc = get_conn()
                                 try:
                                     _cur = _dc.cursor()
+                                    if not inserted:
+                                        # Company already in pipeline — reset platform so form sync can re-detect
+                                        _cur.execute(
+                                            "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
+                                            (pipeline_name,),
+                                        )
                                     _cur.execute(
                                         """UPDATE h1b_ats_discovery
                                            SET is_monitored = TRUE,

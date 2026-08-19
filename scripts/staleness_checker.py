@@ -252,8 +252,8 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                 COALESCE(u.petition_count, 0) AS petition_count
             FROM prospective_companies pc
             JOIN fein_domain_map f
-                ON LOWER(regexp_replace(f.assigned_domain, '^www\\.', '')) =
-                   LOWER(regexp_replace(pc.domain, '^www\\.', ''))
+                ON LOWER(regexp_replace(regexp_replace(f.assigned_domain, '^https?://', ''), '^www\\.', '')) =
+                   LOWER(regexp_replace(regexp_replace(pc.domain, '^https?://', ''), '^www\\.', ''))
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE pc.consecutive_empty_days >= %s
               AND pc.ats_platform IS NOT NULL
