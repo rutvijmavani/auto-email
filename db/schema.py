@@ -1577,6 +1577,8 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS careers_source TEXT
     """)
+    # careers_url moved to fein_domain_map as single source of truth
+    c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
 
     # ── KG quality events — low-confidence / no-match companies for review ────
     c.execute("""
@@ -1632,6 +1634,7 @@ def init_db():
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_source TEXT")
     # Expression index: supports the LATERAL join in job_monitor.py that matches
     # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
     # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.

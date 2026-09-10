@@ -1,22 +1,24 @@
 """
 scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery/redetect queues.
 
-Pass 1 — Enrichment staleness:
-    fein_domain_map WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'
-    AND is_monitored = TRUE (or public_domain IS NULL for uninitialised rows)
-    → ZADD domain_enrichment_queue petition_count {"fein": ...}
+Pass 1a — Enrichment staleness (no careers URL):
+    fein_domain_map WHERE careers_url IS NULL AND last_enriched_at stale
+    → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
+
+Pass 1b — Head-check staleness (careers URL known):
+    fein_domain_map WHERE careers_url IS NOT NULL AND last_enriched_at stale
+    → RPUSH head_check:batch {"fein": ..., "trigger": "staleness"}
 
 Pass 2 — Discovery staleness:
-    fein_domain_map WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
-    AND petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS
-    → ZADD discovery_queue petition_count {"fein": ...}
+    fein_domain_map WHERE last_discovered_at stale AND petition_count >= min
+    → ZADD discovery:batch petition_count {"fein": ..., "trigger": "staleness"}
 
 Pass 3 — ATS re-detection staleness:
     company_ats WHERE is_monitored=TRUE AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
         AND platform NOT IN ('unknown','unsupported') AND stale_since IS NULL
     prospective_companies WHERE consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
         AND ats_platform NOT IN ('unknown','unsupported','custom')
-    → ZADD redetect_queue petition_count {"fein": ..., "source": "company_ats"|"prospective"}
+    → RPUSH head_check:batch {"fein": ..., "trigger": "redetect", "source": "company_ats"|"prospective"}
 
 Pass 4 — Stale row purge:
     DELETE FROM company_ats WHERE stale_since IS NOT NULL AND stale_since < NOW() - ATS_STALE_TTL_DAYS days
@@ -43,11 +45,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config import (
     ATS_STALE_TTL_DAYS,
     DISCOVER_REDETECT_EMPTY_DAYS,
-    DISCOVERY_QUEUE,
-    DOMAIN_ENRICHMENT_QUEUE,
+    DISCOVERY_BATCH,
+    ENRICHMENT_BATCH,
     ENRICH_STALENESS_DAYS,
+    HEAD_CHECK_BATCH,
     JOB_MONITOR_REDETECT_DAYS,
-    REDETECT_QUEUE,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
     STALENESS_ZADD_BATCH,
@@ -69,8 +71,11 @@ def _is_maintenance(r) -> bool:
 
 
 def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, dry_run,
-                     trigger="enrichment", source=None):
-    """Stream a SELECT query via named cursor and ZADD each row to queue_key.
+                     trigger="enrichment", source=None, use_list=False):
+    """Stream a SELECT query via named cursor and push each row to queue_key.
+
+    use_list=False (default): ZADD to a ZSET with score=petition_count.
+    use_list=True: RPUSH to a LIST (HEAD_CHECK_BATCH); petition_count used only for SQL ordering.
 
     Returns count of rows processed. Handles dry-run logging (first 5 rows),
     pipeline batching (STALENESS_ZADD_BATCH), and final flush.
@@ -91,7 +96,10 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                 added += 1
                 continue
             member = json.dumps({"fein": row["employer_fein"], "trigger": trigger, "source": source})
-            pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
+            if use_list:
+                pipe.rpush(queue_key, member)
+            else:
+                pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
                 pipe.execute()
@@ -104,9 +112,14 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
     log.info("%s: %d companies eligible", log_prefix, added)
 
     if dry_run:
+        op = "RPUSH" if use_list else "ZADD"
         for row in dry_run_sample:
-            log.info("[dry-run] would ZADD %s score=%s fein=%s trigger=%s",
-                     queue_key, row["petition_count"], row["employer_fein"], trigger)
+            if use_list:
+                log.info("[dry-run] would %s %s fein=%s trigger=%s",
+                         op, queue_key, row["employer_fein"], trigger)
+            else:
+                log.info("[dry-run] would %s %s score=%s fein=%s trigger=%s",
+                         op, queue_key, row["petition_count"], row["employer_fein"], trigger)
         if added > 5:
             log.info("[dry-run] ... and %d more", added - 5)
         return added
@@ -114,65 +127,89 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
     if added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()
 
-    log.info("%s: ZADD %d feins → %s", log_prefix, added, queue_key)
+    op = "RPUSH" if use_list else "ZADD"
+    log.info("%s: %s %d feins → %s", log_prefix, op, added, queue_key)
     return added
 
 
 def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
-    """Push stale enrichment companies to domain_enrichment_queue. Returns count added."""
-    # public_domain IS NULL: always re-enrich (uninitialised).
-    # stale last_enriched_at: only re-enrich companies actively monitored by job_monitor.
+    """Push stale companies to the right queue based on whether careers_url is known.
+
+    Pass 1a — careers_url IS NULL → ENRICHMENT_BATCH (ZADD, needs full URL discovery)
+    Pass 1b — careers_url IS NOT NULL → HEAD_CHECK_BATCH (RPUSH, URL known, just verify liveness)
+
+    Returns total count added across both sub-passes.
+    """
     monitored_feins = {
         row["employer_fein"] for row in get_monitorable_companies()
         if row.get("employer_fein")
     }
 
     _stale_interval = f"{ENRICH_STALENESS_DAYS} days"
-    if monitored_feins:
-        _sql    = """
-            SELECT
-                f.employer_fein,
-                COALESCE(u.petition_count, 0) AS petition_count
-            FROM fein_domain_map f
-            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
-            WHERE (
-                -- Never resolved: re-enrich if also past the staleness window
-                -- (prevents re-queuing every day for companies that reliably fail)
-                (f.public_domain IS NULL
-                    AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval))
-                OR (
-                    (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
-                    AND f.employer_fein = ANY(%s::text[])
-                )
-            )
-            ORDER BY petition_count DESC
-        """
-        _params = (_stale_interval, _stale_interval, list(monitored_feins))
-    else:
-        # No monitored companies — only pick up uninitialised rows (public_domain IS NULL)
-        _sql    = """
-            SELECT
-                f.employer_fein,
-                COALESCE(u.petition_count, 0) AS petition_count
-            FROM fein_domain_map f
-            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
-            WHERE f.public_domain IS NULL
-              AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
-            ORDER BY petition_count DESC
-        """
-        _params = (_stale_interval,)
 
-    return _stream_and_zadd(
-        conn, r, _sql, _params,
-        queue_key=DOMAIN_ENRICHMENT_QUEUE,
-        cursor_name="enrichment_staleness",
-        log_prefix="enrichment staleness",
+    def _build_sql_params(careers_url_condition: str):
+        if monitored_feins:
+            sql = f"""
+                SELECT
+                    f.employer_fein,
+                    COALESCE(u.petition_count, 0) AS petition_count
+                FROM fein_domain_map f
+                LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+                WHERE {careers_url_condition}
+                  AND (
+                    (f.public_domain IS NULL
+                        AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval))
+                    OR (
+                        (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
+                        AND f.employer_fein = ANY(%s::text[])
+                    )
+                )
+                ORDER BY petition_count DESC
+            """
+            params = (_stale_interval, _stale_interval, list(monitored_feins))
+        else:
+            sql = f"""
+                SELECT
+                    f.employer_fein,
+                    COALESCE(u.petition_count, 0) AS petition_count
+                FROM fein_domain_map f
+                LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+                WHERE {careers_url_condition}
+                  AND f.public_domain IS NULL
+                  AND (f.last_enriched_at IS NULL OR f.last_enriched_at < NOW() - %s::interval)
+                ORDER BY petition_count DESC
+            """
+            params = (_stale_interval,)
+        return sql, params
+
+    # Pass 1a: no careers URL — needs full enrichment
+    sql_a, params_a = _build_sql_params("f.careers_url IS NULL")
+    added_a = _stream_and_zadd(
+        conn, r, sql_a, params_a,
+        queue_key=ENRICHMENT_BATCH,
+        cursor_name="enrichment_staleness_no_url",
+        log_prefix="enrichment staleness (no careers URL)",
         dry_run=dry_run,
+        trigger="staleness",
     )
+
+    # Pass 1b: careers URL known — just verify it's still alive
+    sql_b, params_b = _build_sql_params("f.careers_url IS NOT NULL")
+    added_b = _stream_and_zadd(
+        conn, r, sql_b, params_b,
+        queue_key=HEAD_CHECK_BATCH,
+        cursor_name="enrichment_staleness_has_url",
+        log_prefix="enrichment staleness (has careers URL)",
+        dry_run=dry_run,
+        trigger="staleness",
+        use_list=True,
+    )
+
+    return added_a + added_b
 
 
 def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
-    """Push stale discovery companies to discovery_queue. Returns count added."""
+    """Push stale discovery companies to discovery:batch. Returns count added."""
     return _stream_and_zadd(
         conn, r,
         sql="""
@@ -192,15 +229,19 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
             STALENESS_DISCOVERY_MIN_PETITIONS,
             f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
         ),
-        queue_key=DISCOVERY_QUEUE,
+        queue_key=DISCOVERY_BATCH,
         cursor_name="discovery_staleness",
         log_prefix="discovery staleness",
         dry_run=dry_run,
+        trigger="staleness",
     )
 
 
 def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
-    """Push companies with silent monitored ATS paths to redetect_queue (pass 3).
+    """Push companies with silent monitored ATS paths to head_check:batch with trigger=redetect (pass 3).
+
+    The head_check worker sees trigger="redetect" and routes the company through a liveness check
+    before enqueuing to discovery:redetect for full ATS re-detection.
 
     Two sub-queries:
       3a. company_ats: is_monitored=TRUE, consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS,
@@ -232,12 +273,12 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
         """, (redetect_days,))
         for row in cur:
             if dry_run:
-                log.info("[dry-run] would ZADD redetect_queue score=%s fein=%s source=company_ats",
-                         row["petition_count"], row["employer_fein"])
+                log.info("[dry-run] would RPUSH %s fein=%s trigger=redetect source=company_ats",
+                         HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "source": "company_ats"})
-            pipe.zadd(REDETECT_QUEUE, {member: row["petition_count"]}, gt=True)
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "redetect", "source": "company_ats"})
+            pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
                 pipe.execute()
@@ -262,12 +303,12 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
         """, (redetect_days,))
         for row in cur:
             if dry_run:
-                log.info("[dry-run] would ZADD redetect_queue score=%s fein=%s source=prospective",
-                         row["petition_count"], row["employer_fein"])
+                log.info("[dry-run] would RPUSH %s fein=%s trigger=redetect source=prospective",
+                         HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "source": "prospective"})
-            pipe.zadd(REDETECT_QUEUE, {member: row["petition_count"]}, gt=True)
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "redetect", "source": "prospective"})
+            pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
                 pipe.execute()
@@ -279,7 +320,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
     if not added:
         log.info("redetect staleness: no companies need re-detection")
     else:
-        log.info("redetect staleness: %d companies queued → %s", added, REDETECT_QUEUE)
+        log.info("redetect staleness: %d companies queued → %s (trigger=redetect)", added, HEAD_CHECK_BATCH)
     return added
 
 

@@ -1298,11 +1298,11 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
     if dry_run:
         log.info(
             "[DRY-RUN] fein=%s name=%r canonical=%r website=%r kg_mid=%r "
-            "jobs_url=%r careers=%r platform=%s slug=%s",
+            "jobs_url=%r platform=%s slug=%s",
             data["employer_fein"], data["employer_name"],
             data.get("canonical_name"), data.get("website_url"),
             data.get("kg_mid"), data.get("jobs_url"),
-            data.get("careers_url"), data.get("detected_platform"),
+            data.get("detected_platform"),
             data.get("detected_slug"),
         )
         return
@@ -1311,9 +1311,9 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         INSERT INTO h1b_ats_discovery
             (employer_fein, employer_name, canonical_name, canonical_source,
              wikidata_qid, kg_mid, website_url, jobs_url,
-             careers_url, careers_source, detected_platform, detected_slug, ats_source,
+             detected_platform, detected_slug, ats_source,
              glassdoor_id, crunchbase_id, last_checked)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (employer_fein) DO UPDATE SET
             employer_name     = EXCLUDED.employer_name,
             canonical_name    = EXCLUDED.canonical_name,
@@ -1322,8 +1322,6 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             kg_mid            = COALESCE(EXCLUDED.kg_mid,           h1b_ats_discovery.kg_mid),
             website_url       = COALESCE(EXCLUDED.website_url,      h1b_ats_discovery.website_url),
             jobs_url          = COALESCE(EXCLUDED.jobs_url,         h1b_ats_discovery.jobs_url),
-            careers_url       = COALESCE(EXCLUDED.careers_url,      h1b_ats_discovery.careers_url),
-            careers_source    = COALESCE(EXCLUDED.careers_source,   h1b_ats_discovery.careers_source),
             detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
             detected_slug     = COALESCE(EXCLUDED.detected_slug,    h1b_ats_discovery.detected_slug),
             ats_source        = COALESCE(EXCLUDED.ats_source,       h1b_ats_discovery.ats_source),
@@ -1339,8 +1337,6 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data.get("kg_mid"),
         data.get("website_url"),
         data.get("jobs_url"),
-        data.get("careers_url"),
-        data.get("careers_source"),
         data.get("detected_platform"),
         data.get("detected_slug"),
         data.get("ats_source"),
@@ -1403,7 +1399,7 @@ def _upsert_company_ats(
         return
 
     # Remove stale rows for the same FEIN+platform whose domain no longer matches
-    # any known employer URL (website_url or careers_url in h1b_ats_discovery).
+    # the known employer website_url in h1b_ats_discovery.
     # Preserves legitimate brand-domain entries (e.g. lifeatspotify.com alongside
     # spotify.com) — those still appear in h1b_ats_discovery's known URLs.
     # Only touches unreviewed, un-monitored rows.
@@ -1419,10 +1415,8 @@ def _upsert_company_ats(
                   SELECT 1 FROM h1b_ats_discovery had
                   WHERE had.employer_fein = ca_del.employer_fein
                     AND (
-                        regexp_replace(regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
-                     OR regexp_replace(regexp_replace(LOWER(had.website_url),  '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
-                     OR regexp_replace(regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
-                     OR regexp_replace(regexp_replace(LOWER(had.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
+                        regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
                     )
               )
         """, (fein, platform, domain))
@@ -1780,9 +1774,10 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
                   u.employer_legal_norm = d.employer_name_norm
                OR u.employer_name_norm  = d.trade_name_dba_norm
               )
+        LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = h.employer_fein
         WHERE h.last_checked IS NOT NULL
           AND h.brave_checked_at IS NULL
-          AND h.careers_url IS NULL
+          AND fdm.careers_url IS NULL
           AND h.website_url IS NOT NULL
         GROUP BY h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
                  d.total_certified
@@ -1796,17 +1791,25 @@ def _brave_upsert(fein: str, careers_url: "str | None",
                   platform: "str | None", slug: "str | None", conn,
                   ats_source: str = "brave_pass",
                   careers_source: str = "brave_pass") -> None:
-    """Mark brave_checked_at and persist any career URL found."""
-    conn.cursor().execute("""
+    """Mark brave_checked_at, persist ATS platform, and write careers_url to fein_domain_map."""
+    cur = conn.cursor()
+    cur.execute("""
         UPDATE h1b_ats_discovery
         SET brave_checked_at  = NOW(),
-            careers_url       = COALESCE(%s, careers_url),
-            careers_source    = CASE WHEN %s IS NOT NULL THEN %s ELSE careers_source END,
             detected_platform = COALESCE(%s, detected_platform),
             detected_slug     = COALESCE(%s, detected_slug),
             ats_source        = CASE WHEN %s IS NOT NULL THEN %s ELSE ats_source END
         WHERE employer_fein = %s
-    """, (careers_url, careers_url, careers_source, platform, slug, platform, ats_source, fein))
+    """, (platform, slug, platform, ats_source, fein))
+    if careers_url:
+        cur.execute("""
+            UPDATE fein_domain_map
+            SET careers_url    = %s,
+                careers_source = %s,
+                updated_at     = NOW()
+            WHERE employer_fein = %s
+              AND careers_url IS NULL
+        """, (careers_url, careers_source, fein))
     conn.commit()
 
 

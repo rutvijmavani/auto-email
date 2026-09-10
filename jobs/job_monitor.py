@@ -68,8 +68,7 @@ from config import (
     REDIS_POLL_FULLSCAN,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
-    DOMAIN_ENRICHMENT_QUEUE,
-    REDETECT_QUEUE,
+    HEAD_CHECK_BATCH,
 )
 logger = get_logger(__name__)
 
@@ -727,13 +726,6 @@ def run():
                     with stats_lock:
                         stats["enrichment_queued"] += 1
 
-    # ── Start enrichment workers once if any company was queued ──────────────
-    # Check both the stats counter AND the event — the event is set immediately
-    # on ZADD success and survives even if _process_company raised afterwards.
-    if stats["enrichment_queued"] or _enrichment_queued_event.is_set():
-        from workers.worker_control import start_workers as _start_workers, ENRICHMENT_WORKERS
-        _start_workers(*ENRICHMENT_WORKERS)
-
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
     pdf_generated = False
@@ -867,7 +859,7 @@ def _enqueue_re_enrichment(company, company_row, result, _r, _enrichment_event, 
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.zadd(REDETECT_QUEUE, {json.dumps({"fein": fein, "trigger": "redetect", "source": None}): petition_count}, gt=True)
+        r.lpush(HEAD_CHECK_BATCH, json.dumps({"fein": fein, "trigger": "redetect", "source": None}))
         result["queued_enrichment"] = 1
         if _enrichment_event is not None:
             _enrichment_event.set()

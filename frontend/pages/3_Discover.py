@@ -336,9 +336,15 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None, doma
 
 @st.cache_data(ttl=120)
 def load_ats_discovery(fein: str) -> dict | None:
-    """Load ATS discovery row for a given employer FEIN."""
+    """Load ATS discovery row for a given employer FEIN, with careers_url from fein_domain_map."""
     df = _query(
-        "SELECT * FROM h1b_ats_discovery WHERE employer_fein = %s", (fein,)
+        """
+        SELECT d.*, f.careers_url
+        FROM h1b_ats_discovery d
+        LEFT JOIN fein_domain_map f ON f.employer_fein = d.employer_fein
+        WHERE d.employer_fein = %s
+        """,
+        (fein,),
     )
     return df.to_dict("records")[0] if not df.empty else None
 
@@ -962,10 +968,16 @@ else:
                 else:
                     conn = get_conn()
                     try:
-                        conn.execute(
-                            f"UPDATE h1b_ats_discovery SET {db_col} = %s WHERE employer_fein = %s",
-                            (_to_save, fein),
-                        )
+                        if db_col == "careers_url":
+                            conn.execute(
+                                "UPDATE fein_domain_map SET careers_url = %s WHERE employer_fein = %s",
+                                (_to_save, fein),
+                            )
+                        else:
+                            conn.execute(
+                                f"UPDATE h1b_ats_discovery SET {db_col} = %s WHERE employer_fein = %s",
+                                (_to_save, fein),
+                            )
                         conn.commit()
                     finally:
                         conn.close()
@@ -1342,12 +1354,11 @@ def _resolve_quality_event(fein: str, careers_url: str | None, selected_kg_mid: 
             {"fein": fein, "url": careers_url},
         )
         if careers_url and selected_kg_mid:
-            # Backfill the resolved URL into h1b_ats_discovery if the row exists
+            # Backfill the resolved URL into fein_domain_map (single source of truth for careers_url)
             conn.execute(
                 """
-                UPDATE h1b_ats_discovery
-                   SET careers_url  = :url,
-                       last_checked = NOW()
+                UPDATE fein_domain_map
+                   SET careers_url = :url
                  WHERE employer_fein = :fein
                    AND (careers_url IS NULL OR careers_url != :url)
                 """,

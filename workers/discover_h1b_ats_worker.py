@@ -1,7 +1,8 @@
 """
 workers/discover_h1b_ats_worker.py — ATS discovery worker for H1B pipeline.
 
-Reads from Redis ZSET discovery_queue (score = petition_count, highest first).
+Reads from Redis ZSETs discovery:redetect (structural priority) then discovery:batch
+(score = petition_count, highest first).
 For each company FEIN runs the full discovery pipeline:
   1. Phase 1: Google Knowledge Graph → canonical name + Freebase MID
                (always runs on first pass — kg_checked=False, even if careers_url set)
@@ -36,12 +37,13 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
+    DISCOVERY_BATCH,
     DISCOVERY_DELAYED,
     DISCOVERY_DLQ,
     DISCOVERY_HEARTBEAT_S,
     DISCOVERY_INFLIGHT,
     DISCOVERY_MAX_RETRIES,
-    DISCOVERY_QUEUE,
+    DISCOVERY_REDETECT,
     JOB_MONITOR_REDETECT_DAYS,
     REDIS_DB_MAINTENANCE,
 )
@@ -52,11 +54,10 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
-# Lua script: atomically pop the highest-score member from KEYS[1] (queue)
+# Lua: atomically pop highest-score member from KEYS[1] (ZSET queue)
 # and add it to KEYS[2] (inflight ZSET) with the same score.
 # Returns {member, score} or {} when the queue is empty.
-# Using a single round-trip eliminates the crash window between zpopmax and zadd.
-_ATOMIC_POP_LUA = """
+_POP_ZSET_TO_INFLIGHT_LUA = """
 local res = redis.call('ZPOPMAX', KEYS[1], 1)
 if #res == 0 then return {} end
 redis.call('ZADD', KEYS[2], tonumber(res[2]), res[1])
@@ -133,12 +134,17 @@ def _flush_delayed(r) -> None:
     for raw, _ in items:
         try:
             data = json.loads(raw)
+            trigger_val = data.get("trigger") or "enrichment"
             member = json.dumps({
                 "fein":    data["fein"],
-                "trigger": data.get("trigger") or "enrichment",
+                "trigger": trigger_val,
                 "source":  data.get("source"),
             })
-            r.zadd(DISCOVERY_QUEUE, {member: data.get("petition_count", 0)}, gt=True)
+            pc = data.get("petition_count", 0)
+            if trigger_val == "redetect":
+                r.zadd(DISCOVERY_REDETECT, {member: pc}, gt=True)
+            else:
+                r.zadd(DISCOVERY_BATCH, {member: pc}, gt=True)
             r.zrem(DISCOVERY_DELAYED, raw)  # only remove after successful insert
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
             # Malformed payload — cannot be re-queued; send to DLQ and discard
@@ -379,7 +385,7 @@ def _process_company(fein: str, petition_count: int, trigger: str,
 
         # process_employer() now propagates the actual phase that found each signal.
         ats_src     = result.get("ats_source")
-        careers_src = result.get("careers_source") if res_careers and not company.get("careers_url") else None
+        careers_src = result.get("careers_source") if res_careers else None
 
         duration_ms = int((time.time() - t_start) * 1000)
         try:
@@ -427,10 +433,16 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
     for raw_member, score in items:
         member = raw_member if isinstance(raw_member, str) else raw_member.decode(errors="replace")
         try:
-            fein_r = json.loads(member)["fein"]
+            parsed    = json.loads(member)
+            fein_r    = parsed["fein"]
+            trig_r    = parsed.get("trigger", "enrichment")
         except Exception:
             fein_r = member
-        r.zadd(DISCOVERY_QUEUE, {member: int(score)}, gt=True)
+            trig_r = "enrichment"
+        if trig_r == "redetect":
+            r.zadd(DISCOVERY_REDETECT, {member: int(score)}, gt=True)
+        else:
+            r.zadd(DISCOVERY_BATCH, {member: int(score)}, gt=True)
         r.zrem(inflight_key, raw_member)
         log.info("reclaimed inflight fein=%s score=%d", fein_r, int(score))
 
@@ -452,7 +464,8 @@ def run_worker(once: bool = False) -> None:
 
     log.info("discover-h1b-ats-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
     _reclaim_inflight(r, _inflight_key)
-    _pop_to_inflight = r.register_script(_ATOMIC_POP_LUA)
+    _pop_redetect_to_inflight = r.register_script(_POP_ZSET_TO_INFLIGHT_LUA)
+    _pop_batch_to_inflight    = r.register_script(_POP_ZSET_TO_INFLIGHT_LUA)
 
     _MAINTENANCE_MAX_S = 4 * 3600  # exit if stuck in maintenance for 4+ hours
 
@@ -472,9 +485,11 @@ def run_worker(once: bool = False) -> None:
 
             _flush_delayed(r)
 
-            # Atomically pop highest petition_count member from queue
-            # and add it to inflight in a single Lua call — no crash window.
-            _pop_result = _pop_to_inflight(keys=[DISCOVERY_QUEUE, _inflight_key])
+            # Priority pop: redetect (dedicated ZSET) before batch.
+            # Both are ZSETs; same Lua script handles each.
+            _pop_result = _pop_redetect_to_inflight(keys=[DISCOVERY_REDETECT, _inflight_key])
+            if not _pop_result:
+                _pop_result = _pop_batch_to_inflight(keys=[DISCOVERY_BATCH, _inflight_key])
             if not _pop_result:
                 earliest = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
                 if not earliest:
@@ -482,20 +497,20 @@ def run_worker(once: bool = False) -> None:
                     # exiting — a producer may have pushed an item while we still appear
                     # running to systemd (so its `systemctl start` is a no-op).
                     _flush_delayed(r)
-                    if r.zcard(DISCOVERY_QUEUE) == 0:
-                        log.info("Discovery queue empty — exiting")
+                    if r.zcard(DISCOVERY_REDETECT) == 0 and r.zcard(DISCOVERY_BATCH) == 0:
+                        log.info("Discovery queues empty — exiting")
                         break
                     # Queue is non-empty but another worker drained the item we tried to pop.
                     # Sleep briefly to avoid tight Redis polling when workers race.
                     time.sleep(1)
                     continue
                 if once:
-                    log.info("Discovery queue empty (--once); %d delayed item(s) — exiting",
+                    log.info("Discovery queues empty (--once); %d delayed item(s) — exiting",
                              r.zcard(DISCOVERY_DELAYED))
                     break
                 _, next_ts = earliest[0]
                 wait_s = min(30.0, max(1.0, next_ts - time.time()))
-                log.info("Discovery queue empty; %d delayed item(s) — sleeping %.0fs",
+                log.info("Discovery queues empty; %d delayed item(s) — sleeping %.0fs",
                          r.zcard(DISCOVERY_DELAYED), wait_s)
                 time.sleep(wait_s)
                 continue

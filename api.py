@@ -1,14 +1,10 @@
-import atexit
 import base64
 import hmac
 import json
 import os
 import secrets
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin
 
 import requests as _requests
 from flask import Flask, request, jsonify, make_response, redirect
@@ -21,16 +17,14 @@ load_dotenv()
 
 from logger import get_logger, init_logging, cleanup_logs_if_due
 from config import (
-    DOMAIN_ENRICHMENT_QUEUE,
-    ENRICHMENT_ON_DEMAND_SCORE,
+    ENRICHMENT_ON_DEMAND,
+    HEAD_CHECK_ON_DEMAND,
     REDIS_EMAIL_PUSH,
-    VERIFY_TASK_QUEUE_CAP,
 )
 from db.applications import add_application
 from db.connection import get_conn
 from db.gmail_tokens import upsert_token, update_watch
 from workers.redis_client import get_redis
-from jobs.http_safe import is_private_host as _is_private_host, make_safe_session as _make_safe_session
 
 _GMAIL_SCOPES       = ["https://www.googleapis.com/auth/gmail.readonly"]
 _CLIENT_ID          = os.environ.get("GMAIL_CLIENT_ID", "")
@@ -372,114 +366,16 @@ def oauth_callback():
     return jsonify({"status": "authorized", "email": gmail_email})
 
 
-# Bounded executor for background verify/enrich tasks — prevents thread explosion
-# under rapid extension requests for the same company.
-_VERIFY_EXECUTOR   = ThreadPoolExecutor(max_workers=8)
-atexit.register(_VERIFY_EXECUTOR.shutdown, wait=False)
-_INFLIGHT_FEINS    = set()          # FEINs with an active background task
-_INFLIGHT_LOCK     = threading.Lock()
-
-_VERIFY_HEAD_TIMEOUT  = 8   # seconds per hop — fast, never block the request
-_VERIFY_TOTAL_TIMEOUT = 30  # seconds total across all hops — prevents 10×8s worst case
-_VERIFY_GOOD_CODES    = {200, 201, 204, 206, 403}  # 2xx + 403 (bot-blocked pages exist but are valid)
-_VERIFY_MAX_REDIRECTS = 10
-_VERIFY_STALE_DAYS    = 30  # re-verify after this many days
-_verify_session_local = threading.local()
-
-
-def _get_verify_session():
-    """Return a per-thread safe session, creating it lazily on first use."""
-    if not getattr(_verify_session_local, "session", None):
-        _verify_session_local.session = _make_safe_session()
-    return _verify_session_local.session
-
-_HEAD_CHECK_KEY_PREFIX = "enrichment:head_check:"
-_HEAD_CHECK_TTL        = 120  # seconds — long enough for st.fragment to poll 2–3 cycles
-
-
-def _head_ok(url: str) -> bool:
-    """
-    Return True if url returns a response in _VERIFY_GOOD_CODES (2xx or 403).
-    Pre-validates scheme and rejects private/loopback hosts before every hop.
-    Follows redirects manually (allow_redirects=False) to validate each hop's
-    scheme and resolved addresses before connecting.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return False
-    hostname = parsed.hostname or ""
-    if not hostname or _is_private_host(hostname):
-        return False
-    current_url = url
-    _deadline = time.monotonic() + _VERIFY_TOTAL_TIMEOUT
-    try:
-        for _ in range(_VERIFY_MAX_REDIRECTS):
-            if time.monotonic() > _deadline:
-                return False
-            _hop_timeout = min(_VERIFY_HEAD_TIMEOUT, max(1.0, _deadline - time.monotonic()))
-            _sess = _get_verify_session()
-            resp = _sess.head(
-                current_url,
-                allow_redirects=False,
-                timeout=_hop_timeout,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if resp.status_code in _VERIFY_GOOD_CODES:
-                return True
-            if resp.status_code == 405:
-                # Server rejected HEAD — fall back to GET (stream=True to avoid body download)
-                try:
-                    gr = _sess.get(
-                        current_url,
-                        allow_redirects=False,
-                        stream=True,
-                        timeout=_hop_timeout,
-                        headers={"User-Agent": "Mozilla/5.0"},
-                    )
-                    gr.close()
-                    if gr.status_code in _VERIFY_GOOD_CODES:
-                        return True
-                    resp = gr  # treat GET response as HEAD — fall through to redirect handling
-                except Exception:
-                    return False
-            if resp.status_code not in (301, 302, 303, 307, 308):
-                return False
-            location = resp.headers.get("Location", "")
-            if not location:
-                return False
-            next_url = urljoin(current_url, location)
-            next_parsed = urlparse(next_url)
-            if next_parsed.scheme not in ("http", "https"):
-                return False
-            next_host = next_parsed.hostname or ""
-            if not next_host or _is_private_host(next_host):
-                return False
-            current_url = next_url
-        return False  # too many redirects
-    except Exception:
-        return False
+_VERIFY_STALE_DAYS = 30  # re-verify after this many days
 
 
 def _trigger_enrichment(fein: str, r=None) -> None:
-    """Push fein to enrichment queue at normal priority. Fire-and-forget.
-
-    Uses ENRICHMENT_ON_DEMAND_SCORE (default 500) so user-triggered checks
-    don't starve scheduled enrichment when many users visit profiles at once.
-    nx=True prevents adding a second ZSET member if the exact same JSON is
-    already queued; cross-trigger dedup (different trigger values for the same
-    FEIN) is handled by _INFLIGHT_FEINS in the caller — only one background
-    task per FEIN runs at a time.
-    Accepts a pre-created Redis client (r) so the caller can initialise it in
-    the request thread rather than inside the thread-pool worker.
-    """
+    """LPUSH fein to enrichment:on_demand for immediate re-enrichment. Fire-and-forget."""
     try:
         _r = r if r is not None else get_redis()
         member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None})
-        added = _r.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: ENRICHMENT_ON_DEMAND_SCORE}, nx=True)
-        if added:
-            logger.info("verify-company: queued re-enrichment fein=%s", fein)
-        else:
-            logger.debug("verify-company: fein=%s already queued — skipped", fein)
+        _r.lpush(ENRICHMENT_ON_DEMAND, member)
+        logger.info("verify-company: queued re-enrichment fein=%s → enrichment:on_demand", fein)
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
 
@@ -560,85 +456,26 @@ def verify_company():
         'stale':        _is_stale,
     }
 
-    # Pre-create Redis client in the request thread so background tasks don't
-    # call get_redis() inside the thread-pool worker (avoids thread-safety issues).
     try:
         _r_client = get_redis()
     except Exception:
         _r_client = None
 
-    def _submit(fn, *args):
-        """Submit to bounded executor; skip if this FEIN is already in-flight or global cap reached."""
-        with _INFLIGHT_LOCK:
-            if fein in _INFLIGHT_FEINS:
-                return
-            if len(_INFLIGHT_FEINS) >= VERIFY_TASK_QUEUE_CAP:
-                logger.warning("verify task queue full (%d) — dropping task for fein=%s",
-                               VERIFY_TASK_QUEUE_CAP, fein)
-                return
-            _INFLIGHT_FEINS.add(fein)
-
-        def _wrapped():
-            try:
-                fn(*args)
-            except Exception as _exc:
-                logger.error("background task %s failed for fein=%s: %s",
-                             fn.__name__, fein, _exc, exc_info=True)
-            finally:
-                with _INFLIGHT_LOCK:
-                    _INFLIGHT_FEINS.discard(fein)
-
-        try:
-            _VERIFY_EXECUTOR.submit(_wrapped)
-        except Exception as _sub_exc:
-            # submit() itself failed (e.g. executor shut down) — release inflight slot
-            logger.error("executor.submit failed for fein=%s: %s", fein, _sub_exc)
-            with _INFLIGHT_LOCK:
-                _INFLIGHT_FEINS.discard(fein)
-
-    # If there's no careers_url, queue for enrichment and return immediately
     if not careers_url:
-        _submit(_trigger_enrichment, fein, _r_client)
-        return jsonify(payload), 200
-
-    # Fire-and-forget HEAD check — never block the HTTP response.
-    # Writes result to Redis so the Discover page st.fragment can poll it.
-    def _background_verify():
-        ok = _head_ok(careers_url)
-        _hc_key = f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{careers_url.rstrip('/')}"
-        if ok:
-            # Mark URL as verified so staleness_checker skips it longer
-            conn2 = get_conn()
-            try:
-                conn2.execute(
-                    "UPDATE fein_domain_map SET careers_url_verified_at = NOW() WHERE employer_fein = %s",
-                    (fein,),
+        # No careers URL — queue full enrichment to find one
+        _trigger_enrichment(fein, _r_client)
+    else:
+        # careers URL known — delegate liveness check to head_check_worker
+        try:
+            if _r_client is not None:
+                _r_client.lpush(
+                    HEAD_CHECK_ON_DEMAND,
+                    json.dumps({"fein": fein, "trigger": "on_demand", "source": None}),
                 )
-                conn2.commit()
-            except Exception as exc:
-                logger.warning("verify-company: failed to update verified_at fein=%s: %s", fein, exc)
-                try:
-                    conn2.rollback()
-                except Exception:
-                    pass
-            finally:
-                conn2.close()
-            try:
-                (_r_client or get_redis()).set(_hc_key, "ok", ex=_HEAD_CHECK_TTL)
-            except Exception as exc:
-                logger.debug("verify-company: Redis head_check write failed fein=%s: %s", fein, exc)
-        else:
-            logger.info(
-                "verify-company: HEAD failed for careers_url=%s fein=%s — triggering re-enrichment",
-                careers_url, fein,
-            )
-            try:
-                (_r_client or get_redis()).set(_hc_key, "failed", ex=_HEAD_CHECK_TTL)
-            except Exception as exc:
-                logger.debug("verify-company: Redis head_check write failed fein=%s: %s", fein, exc)
-            _trigger_enrichment(fein, _r_client)
+                logger.info("verify-company: queued head check fein=%s → head_check:on_demand", fein)
+        except Exception as exc:
+            logger.error("verify-company: failed to queue head check fein=%s: %s", fein, exc)
 
-    _submit(_background_verify)
     return jsonify(payload), 200
 
 

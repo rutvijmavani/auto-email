@@ -52,13 +52,14 @@ from config import (
     CONCURRENCY_FLOOR,
     CONCURRENCY_FLOOR_DEFAULT,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
-    DOMAIN_ENRICHMENT_QUEUE,
-    DOMAIN_ENRICHMENT_DELAYED,
-    DOMAIN_ENRICHMENT_INFLIGHT,
-    DISCOVERY_QUEUE,
-    DISCOVERY_DELAYED,
+    HEAD_CHECK_ON_DEMAND,
+    HEAD_CHECK_BATCH,
+    ENRICHMENT_ON_DEMAND,
+    ENRICHMENT_BATCH,
+    ENRICHMENT_INFLIGHT,
+    DISCOVERY_BATCH,
+    DISCOVERY_REDETECT,
     DISCOVERY_INFLIGHT,
-    REDETECT_QUEUE,
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
 )
@@ -96,7 +97,7 @@ _scale_down_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _urgent_active:     dict = {"scan": False, "detail": False, "fullscan": False}
 
 # ── ATS pool idle-cycle counters (simple on/off logic, not Layer 0 formula) ───
-_ats_idle_cycles:   dict = {"domain_enrichment": 0, "discovery": 0}
+_ats_idle_cycles:   dict = {"domain_enrichment": 0, "discovery": 0, "head_check": 0}
 
 # ── Layer 2 constants ──────────────────────────────────────────────────────────
 RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN × this = stable during recovery
@@ -371,36 +372,34 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: fullscan queue metrics failed: %s", exc)
         metrics["fullscan"] = {"depth": 0, "delay_s": 0.0}
 
-    # ── enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─────────
+    # ── head_check + enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─
     try:
-        # Include inflight ZSETs so workers are not stopped while actively processing items
-        # (items move from queue → inflight atomically, leaving queues temporarily empty).
-        _enrich_inflight  = sum(r.zcard(k) for k in set(r.scan_iter(f"{DOMAIN_ENRICHMENT_INFLIGHT}*", count=10)))
-        _discov_inflight  = sum(r.zcard(k) for k in set(r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10)))
-        enrich_depth    = r.zcard(DOMAIN_ENRICHMENT_QUEUE) + r.zcard(REDETECT_QUEUE) + r.zcard(DOMAIN_ENRICHMENT_DELAYED) + _enrich_inflight
-        discovery_depth = r.zcard(DISCOVERY_QUEUE) + r.zcard(DISCOVERY_DELAYED) + _discov_inflight
-
-        # Delay = how long the most-overdue item in the delayed ZSET has been past its not_before
-        enrich_delay = 0.0
-        oldest_enrich = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
-        if oldest_enrich:
-            _, _ts = oldest_enrich[0]
-            if _ts < now:
-                enrich_delay = max(0.0, now - _ts)
-
-        discovery_delay = 0.0
-        oldest_disc = r.zrange(DISCOVERY_DELAYED, 0, 0, withscores=True)
-        if oldest_disc:
-            _, _ts = oldest_disc[0]
-            if _ts < now:
-                discovery_delay = max(0.0, now - _ts)
-
-        metrics["domain_enrichment"] = {"depth": enrich_depth,   "delay_s": enrich_delay,   "depth_known": True}
-        metrics["discovery"]         = {"depth": discovery_depth, "delay_s": discovery_delay, "depth_known": True}
+        # head_check: two LISTs (on_demand + batch); no inflight tracking
+        head_check_depth = r.llen(HEAD_CHECK_ON_DEMAND) + r.llen(HEAD_CHECK_BATCH)
+        metrics["head_check"] = {"depth": head_check_depth, "delay_s": 0.0, "depth_known": True}
     except Exception as exc:
-        logger.warning("manager: enrichment/discovery queue metrics failed: %s", exc)
+        logger.warning("manager: head_check queue metrics failed: %s", exc)
+        metrics["head_check"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
+
+    try:
+        # enrichment: on_demand LIST + batch ZSET + inflight ZSET(s)
+        # Include inflight so workers are not stopped while actively processing items
+        # (items move from queue → inflight atomically, leaving queues temporarily empty).
+        _enrich_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{ENRICHMENT_INFLIGHT}*", count=10)))
+        enrich_depth = r.llen(ENRICHMENT_ON_DEMAND) + r.zcard(ENRICHMENT_BATCH) + _enrich_inflight
+        metrics["domain_enrichment"] = {"depth": enrich_depth, "delay_s": 0.0, "depth_known": True}
+    except Exception as exc:
+        logger.warning("manager: enrichment queue metrics failed: %s", exc)
         metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
-        metrics["discovery"]         = {"depth": 0, "delay_s": 0.0, "depth_known": False}
+
+    try:
+        # discovery: redetect ZSET + batch ZSET + inflight ZSET(s)
+        _discov_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10)))
+        discovery_depth = r.zcard(DISCOVERY_REDETECT) + r.zcard(DISCOVERY_BATCH) + _discov_inflight
+        metrics["discovery"] = {"depth": discovery_depth, "delay_s": 0.0, "depth_known": True}
+    except Exception as exc:
+        logger.warning("manager: discovery queue metrics failed: %s", exc)
+        metrics["discovery"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
 
     return metrics
 
@@ -1542,7 +1541,20 @@ def run_manager() -> None:
 
                 # ── ATS pool autoscaling (simple on/off, not Layer 0) ────────
                 try:
-                    from workers.worker_control import ENRICHMENT_WORKERS, DISCOVERY_WORKERS
+                    from workers.worker_control import (
+                        ENRICHMENT_WORKERS,
+                        DISCOVERY_WORKERS,
+                        HEAD_CHECK_WORKERS,
+                    )
+                    _hc_data = queue_data.get("head_check", {})
+                    if _hc_data.get("depth_known", True):
+                        _run_ats_pool_cycle(
+                            r,
+                            pool_label="head_check",
+                            combined_depth=_hc_data.get("depth", 0),
+                            worker_units=HEAD_CHECK_WORKERS,
+                            hb_prefix="head_check_worker",
+                        )
                     _enrich_data = queue_data.get("domain_enrichment", {})
                     if _enrich_data.get("depth_known", True):
                         _run_ats_pool_cycle(

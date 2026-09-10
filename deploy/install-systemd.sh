@@ -149,6 +149,9 @@ for src in "\$SRC_DIR"/*.service "\$SRC_DIR"/*.timer; do
             systemctl enable "\$unit" || true
             systemctl start  "\$unit" || true
         else
+            # Deprecated singleton units have no [Install] section — managed dynamically by manager.py.
+            [[ "\$unit" == "domain-enrichment-worker.service" ]] && continue
+            [[ "\$unit" == "discover-h1b-ats-worker.service" ]] && continue
             systemctl enable "\${unit%.service}" || true
         fi
     fi
@@ -264,6 +267,9 @@ for _unit_file in "$UNIT_STAGING_DIR"/*.service; do
     _unit="$(basename "$_unit_file")"
     [[ "$_unit" == "cloudflare-tunnel.service" ]] && continue
     [[ "$_unit" == *@* ]] && continue  # skip template units — enabled per-instance
+    # Deprecated singleton units have no [Install] section — skip to avoid systemctl enable failure.
+    [[ "$_unit" == "domain-enrichment-worker.service" ]] && continue
+    [[ "$_unit" == "discover-h1b-ats-worker.service" ]] && continue
     systemctl enable "${_unit%.service}"
 done
 

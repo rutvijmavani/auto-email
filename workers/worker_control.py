@@ -2,12 +2,16 @@
 workers/worker_control.py — Shared helper for starting and stopping systemd worker units.
 
 Used by:
-  - scripts/staleness_checker.py     (after pushing stale feins to queues)
   - scripts/fuzzy_match_uscis_dol.py (after bulk-queuing enrichment feins)
   - workers/manager.py               (autoscaling — start/stop based on queue depth)
 
 Keeps the sudo systemctl start/stop logic, timeout, and warning handling in one place
 so all callers stay in sync.
+
+Worker tuples (two instances each, managed by manager.py autoscaler):
+  HEAD_CHECK_WORKERS  — head-check-worker@{1,2}
+  ENRICHMENT_WORKERS  — domain-enrichment-worker@{1,2}
+  DISCOVERY_WORKERS   — discover-h1b-ats-worker@{1,2}
 """
 
 import subprocess
@@ -16,12 +20,14 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
+HEAD_CHECK_WORKERS = ("head-check-worker@1",          "head-check-worker@2")
 ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
 DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 
 # Allowlist also includes plain unit names (no instance suffix) so callers
 # that pass the template unit don't get silently skipped.
-_KNOWN_UNITS = frozenset(ENRICHMENT_WORKERS + DISCOVERY_WORKERS + (
+_KNOWN_UNITS = frozenset(HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS + (
+    "head-check-worker",
     "domain-enrichment-worker",
     "discover-h1b-ats-worker",
 ))

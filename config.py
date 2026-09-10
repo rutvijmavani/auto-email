@@ -349,36 +349,42 @@ CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler s
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOMAIN ENRICHMENT WORKER
+# ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
 # ─────────────────────────────────────────────────────────────────────────────
-DOMAIN_ENRICHMENT_QUEUE    = "domain_enrichment_queue"    # Redis ZSET, score=petition_count
-DOMAIN_ENRICHMENT_DELAYED  = "domain_enrichment:delayed"  # Redis ZSET, score=not_before timestamp
-DOMAIN_ENRICHMENT_DLQ      = "domain_enrichment:dlq"      # Redis LIST — failed companies
-DOMAIN_ENRICHMENT_INFLIGHT = "domain_enrichment:inflight" # Redis ZSET — in-progress FEINs (crash recovery)
-DISCOVERY_QUEUE            = "discovery_queue"             # Redis ZSET, score=petition_count
-DISCOVERY_DELAYED          = "discovery:delayed"           # Redis ZSET, score=not_before timestamp
-DISCOVERY_DLQ              = "discovery:dlq"               # Redis LIST — failed discovery
-DISCOVERY_INFLIGHT         = "discovery:inflight"          # Redis ZSET — in-progress FEINs (crash recovery)
-REDETECT_QUEUE             = "redetect_queue"              # Redis ZSET — silent monitored companies awaiting re-detection
-ATS_STALE_TTL_DAYS         = int(os.getenv("ATS_STALE_TTL_DAYS",             "30"))   # days before stale company_ats rows are purged
-ATS_MANAGER_SCALE_UP_THRESHOLD = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD", "50"))  # queue depth → start 2nd enrichment/discovery worker
-ATS_MANAGER_IDLE_CYCLES    = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",        "3"))    # consecutive empty poll cycles → stop workers
-ENRICHMENT_MAX_RETRIES    = int(os.getenv("ENRICHMENT_MAX_RETRIES", "3"))
-ENRICHMENT_HEARTBEAT_S    = int(os.getenv("ENRICHMENT_HEARTBEAT_S", "30"))
-DISCOVERY_MAX_RETRIES     = int(os.getenv("DISCOVERY_MAX_RETRIES", "3"))
-DISCOVERY_HEARTBEAT_S     = int(os.getenv("DISCOVERY_HEARTBEAT_S", "30"))
+# head_check worker — both lanes are LISTs (FIFO, no score needed)
+HEAD_CHECK_ON_DEMAND   = "head_check:on_demand"   # LIST — api.py (careers_url known)
+HEAD_CHECK_BATCH       = "head_check:batch"        # LIST — staleness_checker, job_monitor
+HEAD_CHECK_DLQ         = "head_check:dlq"          # LIST — failed head checks
+
+# enrichment worker — on_demand is LIST (priority), batch is ZSET (score=petition_count)
+ENRICHMENT_ON_DEMAND   = "enrichment:on_demand"   # LIST — api.py (careers_url NULL), head_check Cases 3,4,6
+ENRICHMENT_BATCH       = "enrichment:batch"        # ZSET — fuzzy_match, staleness, head_check Cases 3,4,6
+ENRICHMENT_DELAYED     = "enrichment:delayed"      # ZSET — score=not_before (Certspotter 429)
+ENRICHMENT_INFLIGHT    = "domain_enrichment:inflight"  # ZSET — crash recovery (key kept stable)
+ENRICHMENT_DLQ         = "enrichment:dlq"          # LIST — failed enrichment
+
+# discovery worker — redetect drains before batch (ZPOPMAX redetect first)
+DISCOVERY_REDETECT     = "discovery:redetect"      # ZSET — score=petition_count (jobs went silent)
+DISCOVERY_BATCH        = "discovery:batch"          # ZSET — score=petition_count (staleness, passthrough)
+DISCOVERY_DELAYED      = "discovery:delayed"        # ZSET — score=not_before (KG quota exhaustion)
+DISCOVERY_INFLIGHT     = "discovery:inflight"       # ZSET — crash recovery
+DISCOVERY_DLQ          = "discovery:dlq"            # LIST — failed discovery
+
+ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
+ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker
+ATS_MANAGER_IDLE_CYCLES         = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",         "3"))    # consecutive empty poll cycles → stop workers
+HEAD_CHECK_MAX_RETRIES          = int(os.getenv("HEAD_CHECK_MAX_RETRIES",           "3"))
+HEAD_CHECK_HEARTBEAT_S          = int(os.getenv("HEAD_CHECK_HEARTBEAT_S",           "30"))
+HEAD_CHECK_CACHE_TTL_S          = int(os.getenv("HEAD_CHECK_CACHE_TTL_S",           str(6 * 3600)))  # Redis TTL for head_check:{fein} cache
+ENRICHMENT_MAX_RETRIES          = int(os.getenv("ENRICHMENT_MAX_RETRIES",           "3"))
+ENRICHMENT_HEARTBEAT_S          = int(os.getenv("ENRICHMENT_HEARTBEAT_S",           "30"))
+DISCOVERY_MAX_RETRIES           = int(os.getenv("DISCOVERY_MAX_RETRIES",            "3"))
+DISCOVERY_HEARTBEAT_S           = int(os.getenv("DISCOVERY_HEARTBEAT_S",            "30"))
 
 # Staleness checker thresholds
-ENRICH_STALENESS_DAYS            = int(os.getenv("ENRICH_STALENESS_DAYS",            "90"))  # re-enrich after N days
-STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))   # min petition_count for discovery re-run
-STALENESS_ZADD_BATCH             = int(os.getenv("STALENESS_ZADD_BATCH",             "500"))  # Redis pipeline batch size for staleness queue pushes
-
-# On-demand verification (user visits company page)
-# High-priority score — reserved for future use where immediate processing is warranted.
-ENRICHMENT_HIGH_PRIORITY_SCORE   = int(os.getenv("ENRICHMENT_HIGH_PRIORITY_SCORE",  "999999"))
-# Normal score for API-triggered re-enrichment; sits mid-queue, does not starve
-# scheduled work when many users visit profiles simultaneously.
-ENRICHMENT_ON_DEMAND_SCORE       = int(os.getenv("ENRICHMENT_ON_DEMAND_SCORE",        "500"))
+ENRICH_STALENESS_DAYS             = int(os.getenv("ENRICH_STALENESS_DAYS",             "90"))   # re-enrich after N days
+STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))    # min petition_count for discovery re-run
+STALENESS_ZADD_BATCH              = int(os.getenv("STALENESS_ZADD_BATCH",              "500"))  # Redis pipeline batch size for staleness queue pushes
 
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))

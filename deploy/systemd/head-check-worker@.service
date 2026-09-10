@@ -1,11 +1,11 @@
 [Unit]
-Description=H1B ATS discovery worker (KG + Brave + career_detector pipeline)
+Description=H1B head check worker (careers URL liveness + routing) — instance %i
 Documentation=https://github.com/rutvijmavani/auto-email
 After=network-online.target postgresql.service redis.service
 Wants=network-online.target postgresql.service redis.service
 StartLimitBurst=5
 StartLimitIntervalSec=300s
-OnFailure=recruiter-pipeline-alert@%p.service
+OnFailure=recruiter-pipeline-alert@%p-%i.service
 
 [Service]
 Type=simple
@@ -13,7 +13,8 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
-ExecStart=/home/opc/mail/venv/bin/python -m workers.discover_h1b_ats_worker
+Environment=WORKER_INSTANCE=%i
+ExecStart=/home/opc/mail/venv/bin/python -m workers.head_check_worker
 Restart=on-failure
 RestartSec=30s
 KillMode=mixed
@@ -28,4 +29,4 @@ BindPaths=/home/opc/mail
 ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=discover-h1b-ats-worker
+SyslogIdentifier=head-check-worker@%i

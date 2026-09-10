@@ -29,14 +29,15 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
-    DOMAIN_ENRICHMENT_DELAYED,
-    DOMAIN_ENRICHMENT_DLQ,
-    DOMAIN_ENRICHMENT_INFLIGHT,
-    DOMAIN_ENRICHMENT_QUEUE,
-    DISCOVERY_QUEUE,
+    DISCOVERY_BATCH,
+    DISCOVERY_REDETECT,
+    ENRICHMENT_BATCH,
+    ENRICHMENT_DELAYED,
+    ENRICHMENT_DLQ,
     ENRICHMENT_HEARTBEAT_S,
+    ENRICHMENT_INFLIGHT,
     ENRICHMENT_MAX_RETRIES,
-    REDETECT_QUEUE,
+    ENRICHMENT_ON_DEMAND,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
 )
@@ -85,68 +86,66 @@ def _is_maintenance(r) -> bool:
         return False
 
 
-# Atomically pops the highest-scoring member from KEYS[1] and writes it to
-# KEYS[2] (inflight ZSET) with the same score. Returns {member, score} or {}
-# when the queue is empty. Single round-trip eliminates the crash window between
-# zpopmax and zadd that would lose the item on SIGKILL.
-_ATOMIC_POP_LUA = """
+# Atomically pops the highest-scoring member from a ZSET (KEYS[1]) and writes
+# it to the inflight ZSET (KEYS[2]) with the same score.
+_POP_ZSET_TO_INFLIGHT_LUA = """
 local res = redis.call('ZPOPMAX', KEYS[1], 1)
 if #res == 0 then return {} end
 redis.call('ZADD', KEYS[2], tonumber(res[2]), res[1])
 return {res[1], res[2]}
 """
 
+# Atomically pops from a LIST (KEYS[1]) and writes to the inflight ZSET (KEYS[2])
+# with score=0. petition_count is carried in the JSON payload, not the score.
+_POP_LIST_TO_INFLIGHT_LUA = """
+local res = redis.call('LPOP', KEYS[1])
+if res == nil or res == false then return {} end
+redis.call('ZADD', KEYS[2], 0, res)
+return {res, '0'}
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Delayed queue — certspotter 429 re-queue with not_before timestamp
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int, trigger: str = "delayed_retry",
-                     source=None, origin_queue: str = DOMAIN_ENRICHMENT_QUEUE) -> None:
-    """Push company to delayed ZSET scored by not_before timestamp.
-    origin_queue is stored in the payload so _flush_delayed can restore the item
-    to the correct queue (REDETECT_QUEUE vs DOMAIN_ENRICHMENT_QUEUE)."""
-    payload = json.dumps({"fein": fein, "petition_count": petition_count, "trigger": trigger,
-                          "source": source, "origin_queue": origin_queue})
+def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int,
+                     trigger: str = "delayed_retry", source=None) -> None:
+    """Push company to enrichment:delayed ZSET scored by not_before timestamp."""
+    payload = json.dumps({"fein": fein, "petition_count": petition_count,
+                          "trigger": trigger, "source": source})
     not_before = time.time() + delay_s
-    r.zadd(DOMAIN_ENRICHMENT_DELAYED, {payload: not_before})
-    log.info("re-queued %s to delayed queue — retry in %ds (origin=%s)", fein, delay_s, origin_queue)
+    r.zadd(ENRICHMENT_DELAYED, {payload: not_before})
+    log.info("re-queued %s to enrichment:delayed — retry in %ds", fein, delay_s)
 
 
 def _flush_delayed(r) -> int:
-    """Move delayed items that are now ready into the main enrichment queue. Returns count moved."""
+    """Promote enrichment:delayed items that are now ready into enrichment:batch. Returns count moved."""
     now = time.time()
-    items = r.zrangebyscore(DOMAIN_ENRICHMENT_DELAYED, "-inf", now, withscores=False)
+    items = r.zrangebyscore(ENRICHMENT_DELAYED, "-inf", now, withscores=False)
     if not items:
         return 0
     moved = 0
     for item in items:
         try:
-            data = json.loads(item)
-            fein     = data["fein"]
-            trigger  = data.get("trigger", "delayed_retry")
-            pc       = data["petition_count"]
-            dest = data.get("origin_queue", DOMAIN_ENRICHMENT_QUEUE)
-            r.zadd(dest, {json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source"), "origin_queue": dest}): pc}, gt=True)
-            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
+            data    = json.loads(item)
+            fein    = data["fein"]
+            trigger = data.get("trigger", "delayed_retry")
+            pc      = data["petition_count"]
+            member  = json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source")})
+            r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
+            r.zrem(ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            # Malformed payload — cannot be re-queued; discard to DLQ
             log.warning("Failed to flush delayed item %r: %s — sending to DLQ", item, e)
-            dlq_payload = json.dumps({
-                "fein":         "MALFORMED",
-                "error_reason": "malformed_payload",
-                "last_error":   str(e),
-                "retry_count":  0,
-                "raw":          repr(item),
-                "failed_at":    time.time(),
-            })
-            r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
-            r.zrem(DOMAIN_ENRICHMENT_DELAYED, item)
+            r.lpush(ENRICHMENT_DLQ, json.dumps({
+                "fein": "MALFORMED", "error_reason": "malformed_payload",
+                "last_error": str(e), "raw": repr(item), "failed_at": time.time(),
+            }))
+            r.zrem(ENRICHMENT_DELAYED, item)
         except Exception as e:
-            # Transient Redis error (from parse or zadd/zrem) — leave in DELAYED for retry
             log.warning("delayed flush: Redis error for %r — will retry next cycle (%s)", item, e)
     if moved:
-        log.info("Flushed %d delayed items to enrichment queue", moved)
+        log.info("Flushed %d delayed items to enrichment:batch", moved)
     return moved
 
 
@@ -184,7 +183,7 @@ def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
         "retry_count":  retry_count,
         "failed_at":    time.time(),
     })
-    r.lpush(DOMAIN_ENRICHMENT_DLQ, payload)
+    r.lpush(ENRICHMENT_DLQ, payload)
     log.error("DLQ: fein=%s reason=%s retries=%d", fein, error_reason, retry_count)
 
 
@@ -249,14 +248,14 @@ def _write_metric(conn, fein: str, trigger: str,
           careers_source, careers_url, ats_source, ats_platform, ats_slug, duration_ms))
 
 
-def _write_careers(conn, fein: str, careers_url: str) -> None:
+def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
     conn.execute("""
         UPDATE fein_domain_map
-        SET careers_url = %s,
-            updated_at  = NOW()
+        SET careers_url    = %s,
+            careers_source = %s,
+            updated_at     = NOW()
         WHERE employer_fein = %s
-          AND (careers_url IS NULL OR careers_url = '')
-    """, (careers_url, fein))
+    """, (careers_url, source, fein))
 
 
 def _write_ats(conn, fein: str, domain: str, company_name: str,
@@ -277,9 +276,13 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
 def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None,
                        trigger: str = "enrichment") -> None:
     member = json.dumps({"fein": fein, "trigger": trigger, "source": source})
-    r.zadd(DISCOVERY_QUEUE, {member: petition_count}, gt=True)
-    log.debug("pushed %s to discovery_queue (petition_count=%d trigger=%s source=%s)",
-              fein, petition_count, trigger, source)
+    if trigger == "redetect":
+        r.zadd(DISCOVERY_REDETECT, {member: petition_count}, gt=True)
+        log.debug("pushed %s to discovery:redetect (petition_count=%d)", fein, petition_count)
+    else:
+        r.zadd(DISCOVERY_BATCH, {member: petition_count}, gt=True)
+        log.debug("pushed %s to discovery:batch (trigger=%s petition_count=%d)",
+                  fein, trigger, petition_count)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -287,12 +290,11 @@ def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" =
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment",
-                     source: "str | None" = None,
-                     origin_queue: str = DOMAIN_ENRICHMENT_QUEUE) -> bool:
+                     source: "str | None" = None) -> bool:
     """
     Run full enrichment for one company.
     Returns True on success (or permanent skip), False on transient error.
-    source: forwarded from REDETECT_QUEUE payload ("company_ats"|"prospective"|None).
+    source: forwarded from queue payload ("company_ats"|"prospective"|None).
     """
     conn = None
     t_start = time.time()
@@ -336,7 +338,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
             log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
-            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source, origin_queue=origin_queue)
+            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source)
             return True
 
         # When resolution fails, fall back to the previously stored public_domain so
@@ -351,49 +353,49 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
         log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
 
-        # ── Step 2: Phase 3 — career path probe ───────────────────────────────
-        careers_url = existing_careers  # don't overwrite an existing good URL
-        _had_careers_before = bool(existing_careers)   # snapshot before phase3 may update it
+        # ── Step 2: Phase 3 — career path probe (always runs) ────────────────
+        # Routing upstream (entry check + head_check) guarantees we only arrive
+        # here when careers_url is missing or dead, so no guard needed.
+        careers_url = None
         _careers_source_this_run = None
         p3_platform = p3_slug = None
 
-        if not careers_url:
-            careers_url, p3_platform, p3_slug = _phase3(website_url)
-            if careers_url:
-                _careers_source_this_run = "phase3"
-                _write_careers(conn, fein, careers_url)
-                existing_careers = careers_url  # keep in sync so phase6 sees it as already set
-                conn.commit()
-                log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
+        careers_url, p3_platform, p3_slug = _phase3(website_url)
+        if careers_url:
+            _careers_source_this_run = "phase3"
+            _write_careers(conn, fein, careers_url, source="phase3")
+            conn.commit()
+            log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
 
-        # ── Step 3: Phase 6 — career page ATS scan ────────────────────────────
-        try:
-            p6_result = detect_via_career_page(
-                employer_name, probe_domain, careers_url=careers_url or None,
-            )
-        except Exception as e:
-            log.warning("Phase 6 error for fein=%s: %s", fein, e)
-            p6_result = None
-
+        # ── Step 3: Phase 6 — career page ATS scan (only if Phase 3 found nothing) ──
         p6_platform = None
         p6_slug     = None
-        if p6_result:
-            p6_careers  = p6_result.get("careers_url")
-            p6_platform = p6_result.get("platform")
-            p6_slug     = p6_result.get("slug")
+        if not careers_url:
+            try:
+                p6_result = detect_via_career_page(
+                    employer_name, probe_domain, careers_url=None,
+                )
+            except Exception as e:
+                log.warning("Phase 6 error for fein=%s: %s", fein, e)
+                p6_result = None
 
-            if p6_careers and not existing_careers:
-                _careers_source_this_run = "phase6"
-                _write_careers(conn, fein, p6_careers)
-                careers_url = p6_careers
-                log.info("fein=%s careers_url=%s (phase6)", fein, p6_careers)
+            if p6_result:
+                p6_careers  = p6_result.get("careers_url")
+                p6_platform = p6_result.get("platform")
+                p6_slug     = p6_result.get("slug")
 
-            if p6_platform and p6_slug:
-                _write_ats(conn, fein, probe_domain, employer_name,
-                           p6_platform, p6_slug, db_petition_count)
-                log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
+                if p6_careers:
+                    _careers_source_this_run = "phase6"
+                    _write_careers(conn, fein, p6_careers, source="phase6")
+                    careers_url = p6_careers
+                    log.info("fein=%s careers_url=%s (phase6)", fein, p6_careers)
 
-        # Use Phase 3 ATS whenever Phase 6 found no platform (even if p6_result is present)
+                if p6_platform and p6_slug:
+                    _write_ats(conn, fein, probe_domain, employer_name,
+                               p6_platform, p6_slug, db_petition_count)
+                    log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
+
+        # Use Phase 3 ATS whenever Phase 6 found no platform
         if not p6_platform and p3_platform and p3_slug:
             _write_ats(conn, fein, probe_domain, employer_name,
                        p3_platform, p3_slug, db_petition_count)
@@ -401,8 +403,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         conn.commit()
 
-        # ── Step 4: push to discovery_queue ───────────────────────────────────
-        if db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS or origin_queue == REDETECT_QUEUE:
+        # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
+        if (trigger != "on_demand"
+                and db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
@@ -419,7 +422,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             ats_slug     = p3_slug
 
         final_careers  = careers_url
-        careers_source = _careers_source_this_run if (final_careers and not _had_careers_before) else None
+        careers_source = _careers_source_this_run if final_careers else None
 
         duration_ms = int((time.time() - t_start) * 1000)
         try:
@@ -464,21 +467,17 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
     log.warning("reclaiming %d inflight FEINs from %s", len(items), inflight_key)
     for raw_member, score in items:
         member = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
-        dest_queue = DOMAIN_ENRICHMENT_QUEUE
         try:
             parsed = json.loads(member)
             fein = parsed["fein"]
-            # Use explicit origin_queue if present; fall back to trigger-absence heuristic
-            # for items queued before this field was introduced.
-            if "origin_queue" in parsed:
-                dest_queue = parsed["origin_queue"]
-            elif "trigger" not in parsed:
-                dest_queue = REDETECT_QUEUE
+            # petition_count from payload (on_demand items have score=0 in inflight).
+            pc = parsed.get("petition_count", int(score)) or int(score)
         except Exception:
             fein = member.strip()
-        r.zadd(dest_queue, {member: int(score)}, gt=True)
+            pc   = int(score)
+        r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight fein=%s score=%d → %s", fein, int(score), dest_queue)
+        log.info("reclaimed inflight fein=%s pc=%d → enrichment:batch", fein, pc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,12 +492,13 @@ def run_worker(once: bool = False) -> None:
     hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=ENRICHMENT_HEARTBEAT_S).start()
 
-    _inflight_key = f"{DOMAIN_ENRICHMENT_INFLIGHT}:{_instance}" if _instance else DOMAIN_ENRICHMENT_INFLIGHT
+    _inflight_key = f"{ENRICHMENT_INFLIGHT}:{_instance}" if _instance else ENRICHMENT_INFLIGHT
 
     log.info("domain-enrichment-worker started (instance=%r inflight=%s)", _instance, _inflight_key)
     _reclaim_inflight(r, _inflight_key)
 
-    _pop_to_inflight = r.register_script(_ATOMIC_POP_LUA)
+    _pop_list_to_inflight = r.register_script(_POP_LIST_TO_INFLIGHT_LUA)
+    _pop_zset_to_inflight = r.register_script(_POP_ZSET_TO_INFLIGHT_LUA)
     _MAINTENANCE_MAX_S = 4 * 3600  # exit if stuck in maintenance for 4+ hours
 
     try:
@@ -515,61 +515,60 @@ def run_worker(once: bool = False) -> None:
                 log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
-            # Move any delayed items that are now ready
+            # Promote any delayed items that are now ready → enrichment:batch
             _flush_delayed(r)
 
-            # Poll REDETECT_QUEUE first (priority); fall back to DOMAIN_ENRICHMENT_QUEUE
-            _pop_result = _pop_to_inflight(keys=[REDETECT_QUEUE, _inflight_key])
-            _origin_queue = REDETECT_QUEUE if _pop_result else DOMAIN_ENRICHMENT_QUEUE
+            # Pop on_demand LIST first (priority), fall back to batch ZSET
+            _pop_result = _pop_list_to_inflight(keys=[ENRICHMENT_ON_DEMAND, _inflight_key])
+            _tier = "on_demand"
             if not _pop_result:
-                _pop_result = _pop_to_inflight(keys=[DOMAIN_ENRICHMENT_QUEUE, _inflight_key])
+                _pop_result = _pop_zset_to_inflight(keys=[ENRICHMENT_BATCH, _inflight_key])
+                _tier = "batch"
 
             if not _pop_result:
-                earliest = r.zrange(DOMAIN_ENRICHMENT_DELAYED, 0, 0, withscores=True)
+                earliest = r.zrange(ENRICHMENT_DELAYED, 0, 0, withscores=True)
                 if not earliest:
                     # Guard against producer-enqueue race: re-flush and re-check once.
                     _flush_delayed(r)
-                    if r.zcard(DOMAIN_ENRICHMENT_QUEUE) == 0 and r.zcard(REDETECT_QUEUE) == 0:
-                        log.info("Enrichment queue empty — exiting")
+                    if r.llen(ENRICHMENT_ON_DEMAND) == 0 and r.zcard(ENRICHMENT_BATCH) == 0:
+                        log.info("Enrichment queues empty — exiting")
                         break
-                    # Queues are non-empty but another worker drained the item we tried to pop.
-                    # Sleep briefly to avoid tight Redis polling when workers race.
                     time.sleep(1)
                     continue
                 if once:
-                    log.info("Enrichment queue empty (--once); %d delayed item(s) — exiting",
-                             r.zcard(DOMAIN_ENRICHMENT_DELAYED))
+                    log.info("Enrichment queues empty (--once); %d delayed item(s) — exiting",
+                             r.zcard(ENRICHMENT_DELAYED))
                     break
                 _, next_ts = earliest[0]
                 wait_s = min(30.0, max(1.0, next_ts - time.time()))
-                log.info("Enrichment queue empty; %d delayed item(s) — sleeping %.0fs",
-                         r.zcard(DOMAIN_ENRICHMENT_DELAYED), wait_s)
+                log.info("Enrichment queues empty; %d delayed item(s) — sleeping %.0fs",
+                         r.zcard(ENRICHMENT_DELAYED), wait_s)
                 time.sleep(wait_s)
                 continue
 
             raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
-            score      = _pop_result[1]  # str score returned by Lua
-            petition_count = int(float(score))
 
-            # Parse fein + trigger + source from JSON payload; bare-FEIN fallback for legacy entries
+            # Parse fein + trigger + source + petition_count from JSON payload
             try:
-                data    = json.loads(raw_member)
-                fein    = data["fein"]
-                trigger = data.get("trigger", "redetect" if _origin_queue == REDETECT_QUEUE else "enrichment")
-                source  = data.get("source")  # "company_ats" | "prospective" | None
+                data           = json.loads(raw_member)
+                fein           = data["fein"]
+                trigger        = data.get("trigger", "enrichment")
+                source         = data.get("source")
+                # ZSET items carry score; LIST items carry petition_count in payload
+                petition_count = int(data.get("petition_count", 0)) or int(float(_pop_result[1]))
             except (json.JSONDecodeError, KeyError, TypeError):
                 raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
                 if raw_str.strip().lstrip("-").isdigit():
-                    fein    = raw_str.strip()
-                    trigger = "enrichment"
-                    source  = None
+                    fein           = raw_str.strip()
+                    trigger        = "enrichment"
+                    source         = None
+                    petition_count = int(float(_pop_result[1]))
                 else:
                     log.error("malformed queue member %r — sending to DLQ", raw_member)
-                    dlq_payload = json.dumps({
+                    r.lpush(ENRICHMENT_DLQ, json.dumps({
                         "fein": "MALFORMED", "error_reason": "malformed_member",
                         "raw": repr(raw_member), "failed_at": time.time(),
-                    })
-                    r.lpush(DOMAIN_ENRICHMENT_DLQ, dlq_payload)
+                    }))
                     r.zrem(_inflight_key, raw_member)
                     continue
 
@@ -580,8 +579,7 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(r, fein, petition_count, trigger=trigger, source=source,
-                                       origin_queue=_origin_queue)
+            success = _process_company(r, fein, petition_count, trigger=trigger, source=source)
             processed["n"] += 1
 
             if not success:
@@ -591,8 +589,7 @@ def run_worker(once: bool = False) -> None:
                     _clear_retry(r, fein)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
-                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source,
-                                     origin_queue=_origin_queue)
+                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:
