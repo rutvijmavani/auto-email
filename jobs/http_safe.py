@@ -1,5 +1,5 @@
-"""
-jobs/http_safe.py — SSRF-safe HTTP session for pipeline outbound requests.
+﻿"""
+jobs/http_safe.py â€” SSRF-safe HTTP session for pipeline outbound requests.
 
 Provides make_safe_session() which returns a requests.Session with SSRFAdapter
 mounted on both http:// and https://, closing the DNS-rebinding TOCTOU gap.
@@ -60,11 +60,11 @@ class SSRFAdapter(HTTPAdapter):
     calling getaddrinfo again at connect time. A DNS server with TTL=0 can
     return different IPs on successive queries, slipping a private IP through.
 
-    Fix — HTTP: resolve once, validate ALL returned IPs, rewrite the URL hostname
-    to the resolved IP so urllib3 re-resolves IP→IP (no-op), eliminating the race.
-    Fix — HTTPS: resolve + validate all IPs, keep the original hostname so TLS SNI
+    Fix â€” HTTP: resolve once, validate ALL returned IPs, rewrite the URL hostname
+    to the resolved IP so urllib3 re-resolves IPâ†’IP (no-op), eliminating the race.
+    Fix â€” HTTPS: resolve + validate all IPs, keep the original hostname so TLS SNI
     and certificate validation are unaffected. DNS-rebinding on HTTPS requires the
-    attacker to also hold a valid cert for the public domain — practically infeasible.
+    attacker to also hold a valid cert for the public domain â€” practically infeasible.
 
     Raises requests.exceptions.ConnectionError on any SSRF risk.
     """
@@ -112,10 +112,10 @@ class SSRFAdapter(HTTPAdapter):
             ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
             netloc  = f"{ip_host}:{explicit_port}" if explicit_port else ip_host
             request.url = urlunparse(parsed._replace(netloc=netloc))
-            # Include port in Host header only when non-default (RFC 7230 §5.4).
+            # Include port in Host header only when non-default (RFC 7230 Â§5.4).
             _default_port = 80
             host_header = f"{host}:{explicit_port}" if explicit_port and explicit_port != _default_port else host
-            request.headers.setdefault("Host", host_header)
+            request.headers["Host"] = host_header
 
         return super().send(request, *args, **kwargs)
 
@@ -126,3 +126,4 @@ def make_safe_session() -> requests.Session:
     session.mount("http://",  SSRFAdapter())
     session.mount("https://", SSRFAdapter())
     return session
+

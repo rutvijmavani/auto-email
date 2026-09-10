@@ -1,17 +1,17 @@
-# jobs/ats/career_detector.py — Universal ATS detector
+﻿# jobs/ats/career_detector.py â€” Universal ATS detector
 #
 # Algorithm (same logic at every page level):
 #
-#   for each level (career → listing → JD → apply):
+#   for each level (career â†’ listing â†’ JD â†’ apply):
 #       page_text = fetch(url)
-#       result = scan(page_text)          ← full raw-text keyword search
+#       result = scan(page_text)          â† full raw-text keyword search
 #       if result: return result
 #
 #       for src in script_srcs(page_text):
-#           result = scan(fetch(src))     ← JS bundle scan (catches Lever/Spotify)
+#           result = scan(fetch(src))     â† JS bundle scan (catches Lever/Spotify)
 #           if result: return result
 #
-#       next_url = find_next_page(page_text, current_url)   ← scoring-based
+#       next_url = find_next_page(page_text, current_url)   â† scoring-based
 #
 # No BeautifulSoup. No Playwright. Pure requests + re.
 
@@ -29,8 +29,8 @@ from jobs.http_safe import is_private_host as _is_private_host
 
 logger = logging.getLogger(__name__)
 
-# ─── Chrome impersonation ─────────────────────────────────────────────────────
-# curl_cffi matches Chrome's TLS fingerprint (JA3) + HTTP/2 — urllib3 is
+# â”€â”€â”€ Chrome impersonation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# curl_cffi matches Chrome's TLS fingerprint (JA3) + HTTP/2 â€” urllib3 is
 # fingerprinted immediately by Cloudflare/Akamai even with a Chrome UA.
 try:
     from curl_cffi.requests import Session as _CurlSession
@@ -65,12 +65,12 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         )
         data = resp.json()
         if data.get("error") or (data.get("status") or 0) >= 400:
-            logger.debug("[detector] CF Worker: %s → error=%s status=%s",
+            logger.debug("[detector] CF Worker: %s â†’ error=%s status=%s",
                          url, data.get("error"), data.get("status"))
             return None
         body = data.get("body") or ""
         final_url = data.get("final_url") or url
-        logger.debug("[detector] CF Worker: %s → %s (status=%s)",
+        logger.debug("[detector] CF Worker: %s â†’ %s (status=%s)",
                      url, final_url, data.get("status"))
         return body, final_url
     except Exception as exc:
@@ -84,9 +84,10 @@ def _host_root(hostname: str) -> str:
 def _make_session():
     if _CURL_AVAILABLE:
         return _CurlSession(impersonate="chrome124")
-    return _requests.Session()
+    from jobs.http_safe import make_safe_session as _make_safe_session_fn
+    return _make_safe_session_fn()
 
-# Headers for HTML page navigation — mirrors what Chrome sends on a user click
+# Headers for HTML page navigation â€” mirrors what Chrome sends on a user click
 _NAV_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
@@ -115,7 +116,7 @@ _SCRIPT_HEADERS = {
     "Sec-Ch-Ua-Platform": '"Windows"',
 }
 
-# Headers for XHR/fetch API calls made by JS — same-origin CORS requests
+# Headers for XHR/fetch API calls made by JS â€” same-origin CORS requests
 _API_HEADERS = {
     "Accept":            "application/json, text/plain, */*",
     "Accept-Language":   "en-US,en;q=0.9",
@@ -150,8 +151,8 @@ CONNECT_TIMEOUT = _CONNECT_TIMEOUT
 MAX_JS_BUNDLES = _MAX_JS_BUNDLES
 MAX_API_PROBES = _MAX_API_PROBES
 
-# JS bundle URLs containing these strings are analytics/infra — skip them
-# NOTE: do NOT add "chunk" here — webpack app bundles are named *.chunk.js
+# JS bundle URLs containing these strings are analytics/infra â€” skip them
+# NOTE: do NOT add "chunk" here â€” webpack app bundles are named *.chunk.js
 # and those ARE the files where ATS strings live
 _BUNDLE_SKIP = (
     "analytics", "tracking", "gtm", "google-tag", "fonts",
@@ -160,14 +161,14 @@ _BUNDLE_SKIP = (
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# API endpoint discovery — static analysis of JS bundles
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# API endpoint discovery â€” static analysis of JS bundles
 #
 # SPAs call internal APIs to load ATS config at runtime. The endpoint URL is a
 # string constant in the bundle. We find it, call it with the session (which
-# already has cookies from the page visit), and scan the JSON response — exactly
+# already has cookies from the page visit), and scan the JSON response â€” exactly
 # what the JS would have done, without executing any JS.
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Match string literals that look like internal API paths
 _API_PATH_RE = re.compile(
@@ -175,7 +176,7 @@ _API_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Only probe paths that mention career/job concepts — avoids noise
+# Only probe paths that mention career/job concepts â€” avoids noise
 _API_CAREER_KW = frozenset((
     "career", "job", "jobs", "recruit", "apply", "hire",
     "talent", "requisition", "ats", "position", "opening",
@@ -202,10 +203,10 @@ def _extract_api_paths(bundle_text):
     return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Extractor functions — called after keyword match confirms the platform
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Extractor functions â€” called after keyword match confirms the platform
 # Each takes raw text, returns {"platform": ..., "slug": ...} or None
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _extract_workday(text):
     m = re.search(
@@ -227,13 +228,13 @@ def _extract_workday(text):
 
 
 def _extract_greenhouse(text):
-    # Pattern 1: for= query param — most reliable, covers both embed variants:
+    # Pattern 1: for= query param â€” most reliable, covers both embed variants:
     #   job-boards.greenhouse.io/embed/job_app?for=<slug>   (more common)
     #   job-boards.greenhouse.io/embed/job_board?for=<slug>
     m = re.search(r'greenhouse\.io[^"\'<>\s]*[?&]for=([^&"\'<>\s]+)', text, re.IGNORECASE)
     if m:
         return {"platform": "greenhouse", "slug": m.group(1)}
-    # Pattern 2: path-based boards URL — boards.greenhouse.io/<slug>/jobs
+    # Pattern 2: path-based boards URL â€” boards.greenhouse.io/<slug>/jobs
     m = re.search(r'boards\.greenhouse\.io/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
     if m:
         slug = m.group(1)
@@ -247,7 +248,7 @@ def _extract_greenhouse(text):
 
 
 def _extract_successfactors(text):
-    # j2w.init({ssoCompanyId: ..., ssoUrl: ...}) — canonical fingerprint
+    # j2w.init({ssoCompanyId: ..., ssoUrl: ...}) â€” canonical fingerprint
     m_slug = re.search(r'["\']?ssoCompanyId["\']?\s*:\s*["\']([^"\']+)["\']', text, re.IGNORECASE)
     m_url  = re.search(
         r'["\']?ssoUrl["\']?\s*:\s*["\']https?://career(\d+)\.successfactors\.(com|eu)["\']',
@@ -312,7 +313,7 @@ def _extract_taleo(text):
 
 
 def _extract_tal(text):
-    # Taleo Business Edition / TALapply — uses .tal.net subdomains
+    # Taleo Business Edition / TALapply â€” uses .tal.net subdomains
     m = re.search(r'([a-z0-9-]+)\.tal\.net', text, re.IGNORECASE)
     if m:
         return {"platform": "taleo", "slug": m.group(1)}
@@ -324,7 +325,7 @@ def _extract_phenom(text):
     m = re.search(r'([a-z0-9-]+)\.phenompeople\.com', text, re.IGNORECASE)
     if m and m.group(1) != "cdn":
         return {"platform": "phenom", "slug": m.group(1)}
-    # cdn presence alone confirms Phenom — slug comes from patterns.py at fetch time
+    # cdn presence alone confirms Phenom â€” slug comes from patterns.py at fetch time
     return {"platform": "phenom", "slug": ""}
 
 
@@ -361,7 +362,7 @@ def _extract_avature(text):
     m = re.search(r'([a-z0-9-]+)\.avature\.net/([a-zA-Z0-9_/-]+)', text, re.IGNORECASE)
     if m:
         return {"platform": "avature", "slug": m.group(1)}
-    # Custom career page with avatureReferrerQueryParam key — confirms Avature but no slug yet
+    # Custom career page with avatureReferrerQueryParam key â€” confirms Avature but no slug yet
     return {"platform": "avature", "slug": ""}
 
 
@@ -398,10 +399,10 @@ def _extract_jobvite(text):
     return {"platform": "jobvite", "slug": ""}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Keyword → extractor table
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Keyword â†’ extractor table
 # Adding a new ATS = one line here + one extract_* function above
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 ATS_KEYWORDS = {
     "myworkdayjobs":             _extract_workday,
@@ -426,14 +427,14 @@ ATS_KEYWORDS = {
     "jobvite.com":               _extract_jobvite,
 }
 
-# Eightfold is treated as tentative — many companies embed it as a widget
+# Eightfold is treated as tentative â€” many companies embed it as a widget
 # without being Eightfold customers. Never return it if a harder ATS is found.
 _TENTATIVE_PLATFORMS = {"eightfold"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core scan — runs on any raw string (HTML or JS bundle)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Core scan â€” runs on any raw string (HTML or JS bundle)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def scan(text):
     """
@@ -456,9 +457,9 @@ def scan(text):
     return partial or tentative
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP fetch — full Chrome impersonation
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# HTTP fetch â€” full Chrome impersonation
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _sec_fetch_site(target_url, referer_url):
     """Compute Sec-Fetch-Site exactly as Chrome does."""
@@ -478,7 +479,7 @@ def _sec_fetch_site(target_url, referer_url):
 def _fetch(url, session, referer=None, is_script=False, is_api=False):
     """
     Fetch url with full Chrome headers. Cookie jar is managed by the session
-    automatically — same as a real browser maintaining state across pages.
+    automatically â€” same as a real browser maintaining state across pages.
 
     Args:
         referer:   URL of the page that linked here (sent as Referer header)
@@ -539,7 +540,7 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             return None, url
         if resp.status_code == 200:
             return resp.text, resp.url
-        logger.debug("[detector] %s → HTTP %s", url, resp.status_code)
+        logger.debug("[detector] %s â†’ HTTP %s", url, resp.status_code)
         if resp.status_code in (429, 403):
             result = _fetch_via_worker(url)
             if result:
@@ -555,16 +556,16 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             except Exception:
                 pass
         logger.debug("[detector] fetch error %s: %s", url, e)
-        # Network-level failure — try CF Worker (handles IP blocks, DNS fails)
+        # Network-level failure â€” try CF Worker (handles IP blocks, DNS fails)
         result = _fetch_via_worker(url)
         if result:
             return result
         return None, url
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Script src extraction — only fetches relevant bundles
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Script src extraction â€” only fetches relevant bundles
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _script_srcs(html, base_url):
     """
@@ -600,9 +601,9 @@ def _script_srcs(html, base_url):
     return (priority + same_dom + external)[:MAX_JS_BUNDLES]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Scoring-based next-page navigation
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _URL_SCORES = {
     "job": 3, "jobs": 3, "career": 3, "careers": 3,
@@ -625,7 +626,7 @@ _SKIP_HREF = re.compile(
     re.IGNORECASE,
 )
 
-# Path segments that indicate non-job content — never contain ATS signals
+# Path segments that indicate non-job content â€” never contain ATS signals
 _PATH_DENYLIST = re.compile(
     r'/(?:blog|tech-blog|news|press|events|life-at|life|perks|benefits|'
     r'values|diversity|inclusion|awards|media|podcast|video|gallery|'
@@ -635,7 +636,7 @@ _PATH_DENYLIST = re.compile(
     re.IGNORECASE,
 )
 
-# Already-tried top-level paths — don't cycle back to them
+# Already-tried top-level paths â€” don't cycle back to them
 _TOP_LEVEL_PATHS = frozenset({
     "", "/", "/careers", "/careers/", "/jobs", "/jobs/",
     "/about/careers", "/company/careers", "/en/careers",
@@ -649,7 +650,7 @@ def find_next_pages(html, current_url, visited=None):
     sorted highest first. Caller tries each in order until one resolves.
 
     Domain rule: allow same domain OR any domain that contains the brand keyword
-    (e.g. wayfair.com → aboutwayfair.com, spotify.com → lifeatspotify.com).
+    (e.g. wayfair.com â†’ aboutwayfair.com, spotify.com â†’ lifeatspotify.com).
     """
     parsed_base = urlparse(current_url)
     base_domain = parsed_base.netloc
@@ -662,7 +663,7 @@ def find_next_pages(html, current_url, visited=None):
         html, re.IGNORECASE | re.DOTALL,
     )
 
-    scored = {}  # url → score (dedup by url, keep highest)
+    scored = {}  # url â†’ score (dedup by url, keep highest)
 
     for raw_href, raw_anchor in pairs:
         href   = _html_unescape(raw_href.strip())
@@ -681,7 +682,7 @@ def find_next_pages(html, current_url, visited=None):
             continue
 
         # Allow same domain OR brand-family domain (bidirectional).
-        # e.g. nomura.com ↔ nomuraholdings.com: "nomura" appears in both.
+        # e.g. nomura.com â†” nomuraholdings.com: "nomura" appears in both.
         target_brand = _tldextract.extract(parsed.hostname or parsed.netloc).domain or parsed.netloc
         if parsed.netloc != base_domain and brand not in parsed.netloc and target_brand not in base_domain:
             continue
@@ -692,7 +693,7 @@ def find_next_pages(html, current_url, visited=None):
 
         path = parsed.path.rstrip("/")
 
-        # Skip content pages (blog, news, culture) — they never have ATS signals
+        # Skip content pages (blog, news, culture) â€” they never have ATS signals
         if _PATH_DENYLIST.search(path):
             continue
         if path in _TOP_LEVEL_PATHS:
@@ -716,24 +717,24 @@ def find_next_pages(html, current_url, visited=None):
     return sorted(scored, key=scored.get, reverse=True)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Single-page processor — fetch one URL, scan, return next candidates
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Single-page processor â€” fetch one URL, scan, return next candidates
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _process_page(url, session, visited, hits, best, referer=None, company_root=None,
                   first_200_url=None):
     """
     Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
     Records hits into shared dicts. Returns scored next-page candidates.
-    Does NOT recurse — BFS queue in detect_company drives traversal.
+    Does NOT recurse â€” BFS queue in detect_company drives traversal.
 
-    first_200_url: mutable [None] container — set to the final URL of the first
+    first_200_url: mutable [None] container â€” set to the final URL of the first
                    page that returns HTML (200), so callers can capture career URL
                    even on a complete ATS miss.
 
     Leaf conditions (return [] immediately):
-      Rule 1  — new complete ATS hit found → children share the same ATS, useless.
-      Signal 1 — page is not company territory:
+      Rule 1  â€” new complete ATS hit found â†’ children share the same ATS, useless.
+      Signal 1 â€” page is not company territory:
                    neither company brand in page domain
                    nor company root domain referenced anywhere in page HTML.
     """
@@ -765,25 +766,25 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
                 logger.info("[detector] HIT (%s) page=%d platform=%s slug=%s url=%s",
                             source_label, len(visited), result["platform"], result["slug"], final_url)
         elif best[0] is None:
-            logger.debug("[detector] PARTIAL (%s) page=%d platform=%s — continuing for slug",
+            logger.debug("[detector] PARTIAL (%s) page=%d platform=%s â€” continuing for slug",
                          source_label, len(visited), result["platform"])
             best[0] = result
 
-    # Always scan raw HTML — catches ATS slug even on external pages
+    # Always scan raw HTML â€” catches ATS slug even on external pages
     hits_before = len(hits)
     _handle(scan(html), "HTML")
 
-    # Rule 1: new complete ATS hit in HTML → leaf
+    # Rule 1: new complete ATS hit in HTML â†’ leaf
     if len(hits) > hits_before:
-        logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
+        logger.debug("[detector] rule1 (HTML): new hit â€” leaf %s", final_url)
         return []
 
-    # ── Signal 1: company territory check ────────────────────────────────────
+    # â”€â”€ Signal 1: company territory check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Company territory = brand name appears in the page's domain
     #                  OR company root domain is referenced anywhere in the HTML.
     # Both signals are derived from the email/company domain (e.g. "nomura.com"):
-    #   brand      = "nomura"   — first segment, appears in brand-family domains
-    #   company_root = "nomura.com" — full root, appears in cross-links and hrefs
+    #   brand      = "nomura"   â€” first segment, appears in brand-family domains
+    #   company_root = "nomura.com" â€” full root, appears in cross-links and hrefs
     # Neither uses the legal entity name which never matches website content.
     if company_root:
         company_brand = company_root.split('.')[0]
@@ -791,10 +792,10 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         in_domain     = company_brand in page_netloc
         in_html       = company_root in html.lower()
         if not in_domain and not in_html:
-            logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
+            logger.debug("[detector] signal1: not company territory â€” leaf %s", final_url)
             return []
 
-    # Company territory confirmed — record this as the first successful company-territory URL.
+    # Company territory confirmed â€” record this as the first successful company-territory URL.
     # Exclude root-path redirects landing on the main company domain (homepage redirects);
     # career subdomains (careers.company.com/) have a different netloc and are kept.
     if first_200_url is not None and first_200_url[0] is None:
@@ -815,7 +816,7 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         hits_before_js = len(hits)
         _handle(scan(bundle), "JS bundle")
         if len(hits) > hits_before_js:
-            logger.debug("[detector] rule1 (JS): new hit — leaf %s", final_url)
+            logger.debug("[detector] rule1 (JS): new hit â€” leaf %s", final_url)
             return []
         api_paths.extend(_extract_api_paths(bundle))
 
@@ -836,18 +837,18 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         hits_before_api = len(hits)
         _handle(scan(resp), "API")
         if len(hits) > hits_before_api:
-            logger.debug("[detector] rule1 (API): new hit — leaf %s", final_url)
+            logger.debug("[detector] rule1 (API): new hit â€” leaf %s", final_url)
             return []
 
-    # Company territory, no hit yet → follow links
+    # Company territory, no hit yet â†’ follow links
     candidates = find_next_pages(html, final_url, visited)
     logger.debug("[detector] candidates page=%d: %s", len(visited), candidates[:5])
     return [(c, final_url) for c in candidates]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Listing-page sampling — prevent crawling 250 identical job detail pages
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Listing-page sampling â€” prevent crawling 250 identical job detail pages
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _PAGINATION_PARAM_RE = re.compile(
     r'[?&](page|p|pg|offset|start|from)=\d+',
@@ -861,9 +862,9 @@ def _url_template(url):
     Normalise variable path segments so structurally identical job-listing URLs
     share a template string.
 
-      /careers/listing/ai-engineer/8044460  →  .../careers/listing/{slug}/{id}
-      /job/12345                             →  .../job/{id}
-      /careers/americas/                     →  .../careers/americas/   (unchanged)
+      /careers/listing/ai-engineer/8044460  â†’  .../careers/listing/{slug}/{id}
+      /job/12345                             â†’  .../job/{id}
+      /careers/americas/                     â†’  .../careers/americas/   (unchanged)
     """
     parsed = urlparse(url)
     parts  = [p for p in parsed.path.split('/') if p]
@@ -890,36 +891,36 @@ def _filter_listing_candidates(candidates, pagination_roots, sampled_patterns, c
     Gate BFS candidates to prevent runaway crawling of paginated job listings.
 
     Three candidate types:
-      1. Pagination links (?page=N, /page/N) — follow at most _N_LISTING_PAGES per root.
-      2. Job detail links  — URL template appears 3+ times in one batch (cluster signal).
+      1. Pagination links (?page=N, /page/N) â€” follow at most _N_LISTING_PAGES per root.
+      2. Job detail links  â€” URL template appears 3+ times in one batch (cluster signal).
                             Sample at most _M_DETAIL_SAMPLE per template across all batches.
                             Once sampled, add to confirmed_patterns and drop all further matches.
-      3. Everything else   — navigation, subdomains, regional sections — always pass through.
+      3. Everything else   â€” navigation, subdomains, regional sections â€” always pass through.
 
     Termination does NOT require a slug hit first. Pattern confirmation (same URL structure
-    repeated across enough pages) is sufficient — if we've seen 3 sample detail pages and
+    repeated across enough pages) is sufficient â€” if we've seen 3 sample detail pages and
     found nothing, the remaining 247 will almost certainly yield nothing either.
     """
     from collections import Counter
 
-    # Detect which templates appear ≥ 3 times in this batch → job listing cluster
+    # Detect which templates appear â‰¥ 3 times in this batch â†’ job listing cluster
     template_counts = Counter(_url_template(url) for url, _ in candidates)
     batch_job_templates = {t for t, c in template_counts.items() if c >= 3}
 
     filtered = []
     for url, referer in candidates:
-        # ── Pagination link ──────────────────────────────────────────────────
+        # â”€â”€ Pagination link â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if _PAGINATION_PARAM_RE.search(url) or _PAGE_PATH_RE.search(url):
             root = _pagination_root(url)
             seen = pagination_roots.get(root, 0)
             if seen >= _N_LISTING_PAGES:
-                logger.debug("[detector] listing-cap: dropping pagination %s (root seen %d×)", url, seen)
+                logger.debug("[detector] listing-cap: dropping pagination %s (root seen %dÃ—)", url, seen)
                 continue
             pagination_roots[root] = seen + 1
             filtered.append((url, referer))
             continue
 
-        # ── Job detail link ──────────────────────────────────────────────────
+        # â”€â”€ Job detail link â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         template = _url_template(url)
         is_job = (
             template in batch_job_templates
@@ -933,19 +934,19 @@ def _filter_listing_candidates(candidates, pagination_roots, sampled_patterns, c
             count = sampled_patterns.get(template, 0)
             if count >= _M_DETAIL_SAMPLE:
                 confirmed_patterns.add(template)
-                logger.debug("[detector] listing-cap: pattern confirmed %s — dropping %s", template, url)
+                logger.debug("[detector] listing-cap: pattern confirmed %s â€” dropping %s", template, url)
                 continue
             sampled_patterns[template] = count + 1
 
-        # ── Navigation / everything else ─────────────────────────────────────
+        # â”€â”€ Navigation / everything else â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         filtered.append((url, referer))
 
     return filtered
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BFS driver — breadth-first so sibling branches share the page budget
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# BFS driver â€” breadth-first so sibling branches share the page budget
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def detect_company(company_domain, session=None, *, seed_url=None):
     """
@@ -965,12 +966,12 @@ def detect_company(company_domain, session=None, *, seed_url=None):
 
     Returns:
         List of {"platform": ..., "slug": ..., "source_url": ...}
-        — one entry per unique (platform, slug) pair found across the full crawl.
-        — slug="" if platform detected but tenant URL not found (partial).
-        — [{"platform": None, "slug": None, "source_url": url}] if no ATS found
+        â€” one entry per unique (platform, slug) pair found across the full crawl.
+        â€” slug="" if platform detected but tenant URL not found (partial).
+        â€” [{"platform": None, "slug": None, "source_url": url}] if no ATS found
           but a 200-OK career URL was discovered; callers must check platform is
           None before reading platform/slug.
-        — [] if no ATS and no career URL found.
+        â€” [] if no ATS and no career URL found.
     """
     from collections import deque
 
@@ -981,11 +982,11 @@ def detect_company(company_domain, session=None, *, seed_url=None):
 
     company_root       = _host_root(domain)  # e.g. 'accenture.com' or 'amazon.co.uk'
     visited            = set()  # prevents re-fetching any URL
-    hits               = {}     # (platform, slug) → {platform, slug, source_url}
+    hits               = {}     # (platform, slug) â†’ {platform, slug, source_url}
     best               = [None] # fallback partial
-    pagination_roots   = {}     # listing root → paginated pages seen
-    sampled_patterns   = {}     # url template  → detail pages sampled
-    confirmed_patterns = set()  # templates fully sampled — drop all further matches
+    pagination_roots   = {}     # listing root â†’ paginated pages seen
+    sampled_patterns   = {}     # url template  â†’ detail pages sampled
+    confirmed_patterns = set()  # templates fully sampled â€” drop all further matches
 
     # Seed the BFS queue: seed_url first (if provided), then CAREER_PATHS + subdomain fallbacks
     queue = deque()
@@ -1009,11 +1010,11 @@ def detect_company(company_domain, session=None, *, seed_url=None):
                 queue.append((candidate, None))
                 seen_seeds.add(candidate)
 
-    first_200_url = [None]  # mutable — _process_page sets this on first successful fetch
+    first_200_url = [None]  # mutable â€” _process_page sets this on first successful fetch
 
     # BFS until queue drains. Two leaf conditions bound the crawl:
-    #   Rule 1  — page yields a new ATS hit → don't enqueue its children
-    #   Signal 1 — page not in company territory → scan only, no children
+    #   Rule 1  â€” page yields a new ATS hit â†’ don't enqueue its children
+    #   Signal 1 â€” page not in company territory â†’ scan only, no children
     # _filter_listing_candidates additionally caps job-listing clusters.
     while queue:
         if len(visited) >= _MAX_PAGES:
@@ -1040,8 +1041,9 @@ def detect_company(company_domain, session=None, *, seed_url=None):
                     domain, best[0]["platform"])
         return [best[0]]
     if first_200_url[0]:
-        logger.info("[detector] DONE domain=%s — no ATS found, career URL: %s",
+        logger.info("[detector] DONE domain=%s â€” no ATS found, career URL: %s",
                     domain, first_200_url[0])
         return [{"platform": None, "slug": None, "source_url": first_200_url[0]}]
-    logger.info("[detector] DONE domain=%s — no ATS found", domain)
+    logger.info("[detector] DONE domain=%s â€” no ATS found", domain)
     return []
+

@@ -1,24 +1,24 @@
-"""
-workers/manager.py — Autoscaler (Layer 0 + Layer 2)
+﻿"""
+workers/manager.py â€” Autoscaler (Layer 0 + Layer 2)
 
-Design doc: docs/scaling-redesign.md §4, §7, §16
+Design doc: docs/scaling-redesign.md Â§4, Â§7, Â§16
 
-Layer 0 (every 60s): delay + utilization formula → scale up/down/urgent per pool.
+Layer 0 (every 60s): delay + utilization formula â†’ scale up/down/urgent per pool.
 Layer 1 (midnight):  midnight recompute of worker_ceil from 28-day daily_peak history.
 Layer 2 (event):     Lever 1 backpressure + deadlock detection + worker borrowing.
 
 Worker busy_ms signal:
   Each worker publishes worker:{type}:busy_ms:{pid} after every job.
-  Scale-up:   util > 0.80 AND delay > WARN×0.5 (2 consecutive cycles).
-  Scale-down: util < 0.50 AND delay < WARN×0.25 (5 consecutive cycles).
-  Urgent:     delay >= WARN×0.75 regardless of utilization (1 cycle).
+  Scale-up:   util > 0.80 AND delay > WARNÃ—0.5 (2 consecutive cycles).
+  Scale-down: util < 0.50 AND delay < WARNÃ—0.25 (5 consecutive cycles).
+  Urgent:     delay >= WARNÃ—0.75 regardless of utilization (1 cycle).
 
 Layer 2 signals:
-  manager:lever1:{pool}:active  — set by manager when delay > DELAY_WARN_S;
+  manager:lever1:{pool}:active  â€” set by manager when delay > DELAY_WARN_S;
                                    read by scheduler/workers to halt inflow.
-  manager:borrow:{src}:{tgt}    — borrow count; used by effective_target to
+  manager:borrow:{src}:{tgt}    â€” borrow count; used by effective_target to
                                    prevent Layer 0 undoing borrows each cycle.
-  manager:snapshot:{pool}:D/R   — depth + inflow_rate snapshotted at Lever 1
+  manager:snapshot:{pool}:D/R   â€” depth + inflow_rate snapshotted at Lever 1
                                    trigger cycle 1 (before Lever 1 acts); used
                                    by learning loop to compute true_required.
 """
@@ -31,7 +31,7 @@ import time
 from datetime import datetime, timezone
 
 _HOSTNAME = socket.gethostname()
-_MANAGER_HB_TTL = 180  # 3× cycle length; stale after 3 missed cycles
+_MANAGER_HB_TTL = 180  # 3Ã— cycle length; stale after 3 missed cycles
 
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -52,6 +52,7 @@ from config import (
     CONCURRENCY_FLOOR,
     CONCURRENCY_FLOOR_DEFAULT,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
+    HEAD_CHECK_INFLIGHT,
     HEAD_CHECK_ON_DEMAND,
     HEAD_CHECK_BATCH,
     ENRICHMENT_ON_DEMAND,
@@ -68,10 +69,10 @@ logger = get_logger(__name__)
 
 SHADOW_MODE: bool = False
 
-# ── Cycle interval ─────────────────────────────────────────────────────────────
+# â”€â”€ Cycle interval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 MANAGER_CYCLE_S: int = 60
 
-# ── Bootstrap ceilings (used until 28 days of daily_peak data accumulates) ────
+# â”€â”€ Bootstrap ceilings (used until 28 days of daily_peak data accumulates) â”€â”€â”€â”€
 # detail raised to 10: burst arrivals (single scan can drop 300+ jobs) require
 # more headroom to drain fast enough to stay below the 300s delay_warn threshold.
 BOOTSTRAP_CEIL: dict = {
@@ -81,36 +82,36 @@ BOOTSTRAP_CEIL: dict = {
 }
 BOOTSTRAP_DAYS_REQUIRED: int = 28
 
-# ── DB pool budget (3 reserved for scheduler/manager) ─────────────────────────
+# â”€â”€ DB pool budget (3 reserved for scheduler/manager) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _DB_RESERVED: int = 3
 
-# ── Cold-start fallbacks for scaling_params (used until DB has real data) ──────
+# â”€â”€ Cold-start fallbacks for scaling_params (used until DB has real data) â”€â”€â”€â”€â”€â”€
 _FALLBACK_PARAMS: dict = {
     "detail":   {"fetch_p75": 1.5,   "delay_warn_s": 300},   # 300s = ~400 jobs at 2 workers; 60s was too tight, fired Lever 1 on every normal burst
     "scan":     {"fetch_p75": 120.0, "delay_warn_s": 1800},
     "fullscan": {"fetch_p75": 300.0, "delay_warn_s": 7200},
 }
 
-# ── Hysteresis cycle counters (in-memory, reset on manager restart) ────────────
+# â”€â”€ Hysteresis cycle counters (in-memory, reset on manager restart) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 _scale_up_cycles:   dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _scale_down_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _urgent_active:     dict = {"scan": False, "detail": False, "fullscan": False}
 
-# ── ATS pool idle-cycle counters (simple on/off logic, not Layer 0 formula) ───
+# â”€â”€ ATS pool idle-cycle counters (simple on/off logic, not Layer 0 formula) â”€â”€â”€
 _ats_idle_cycles:   dict = {"domain_enrichment": 0, "discovery": 0, "head_check": 0}
 
-# ── Layer 2 constants ──────────────────────────────────────────────────────────
-RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN × this = stable during recovery
+# â”€â”€ Layer 2 constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN Ã— this = stable during recovery
 DEADLOCK_HISTORY_CYCLES  = 4      # rolling window for 3-of-4 check
 DEADLOCK_RISING_MIN      = 3      # min cycles above WARN in window
 LEVER1_STABLE_REQUIRED   = 3      # consecutive stable cycles to lift Lever 1
 REINTRO_STABLE_REQUIRED   = 2      # consecutive stable cycles to end re-introduction
 REINTRO_DETAIL_BATCH_MAX  = 3      # max detail jobs pushed per scan/fullscan cycle during re-intro
 
-# ── Lever 1 max hold times (seconds) ──────────────────────────────────────────
+# â”€â”€ Lever 1 max hold times (seconds) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # For "scan" and "fullscan" pools, Lever 1 prevents scheduler dispatch, which
 # means the ZSET overdue count (and thus delay_s) GROWS under Lever 1 rather
-# than recovering — the normal stability condition can never be met.  A max
+# than recovering â€” the normal stability condition can never be met.  A max
 # hold ensures Lever 1 auto-lifts after this duration even if delay_s hasn't
 # returned to stable.  If conditions still warrant it, the manager re-fires
 # within one cycle (60s) automatically.
@@ -120,19 +121,19 @@ REINTRO_DETAIL_BATCH_MAX  = 3      # max detail jobs pushed per scan/fullscan cy
 LEVER1_MAX_HOLD_S: dict = {
     "scan":     300,   # 5 min
     "fullscan": 600,   # 10 min
-    "detail":   None,  # no limit — recovers naturally
+    "detail":   None,  # no limit â€” recovers naturally
 }
 
-# ── Layer 2 in-memory state (survives individual cycle failures; Redis holds ───
+# â”€â”€ Layer 2 in-memory state (survives individual cycle failures; Redis holds â”€â”€â”€
 # persistent borrow/lever1/reintro state across manager restarts)
 _prev_depth:           dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _lever1_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _reintro_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Scaling params — loaded once at startup, refreshed on 25h TTL expiry
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Scaling params â€” loaded once at startup, refreshed on 25h TTL expiry
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _compute_scaling_params() -> dict:
     """
@@ -184,7 +185,7 @@ def _compute_scaling_params() -> dict:
             if row and row["value"] is not None:
                 params["fullscan"]["fetch_p75"] = float(row["value"])
 
-            # scan DELAY_WARN_S: p10 of current_interval_s × 0.10
+            # scan DELAY_WARN_S: p10 of current_interval_s Ã— 0.10
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (
                     ORDER BY current_interval_s
@@ -196,7 +197,7 @@ def _compute_scaling_params() -> dict:
             if row and row["value"] is not None:
                 params["scan"]["delay_warn_s"] = max(300, int(row["value"]))
 
-            # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
+            # fullscan DELAY_WARN_S: avg(full_scan_interval_s) Ã— 0.10
             cur.execute("""
                 SELECT AVG(full_scan_interval_s) * 0.10 AS value
                 FROM company_poll_stats
@@ -215,7 +216,7 @@ def _compute_scaling_params() -> dict:
         )
     except Exception as exc:
         logger.warning(
-            "manager: DB scaling_params query failed (%s) — using fallbacks", exc,
+            "manager: DB scaling_params query failed (%s) â€” using fallbacks", exc,
         )
         params["computed_at"] = "fallback"
 
@@ -242,9 +243,9 @@ def _load_scaling_params(r) -> dict:
     return params
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Current pool sizes (from scheduler:health)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_pool_sizes(r) -> dict:
     """
@@ -268,9 +269,9 @@ def _get_pool_sizes(r) -> dict:
         return {"scan": 0, "detail": 0, "fullscan": 0}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Pool busy_ms — utilization signal
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Pool busy_ms â€” utilization signal
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_pool_busy_ms(r, pool: str) -> int:
     """
@@ -279,7 +280,7 @@ def _get_pool_busy_ms(r, pool: str) -> int:
     Each worker writes its accumulated busy ms in the current 60s window
     (detail_worker, scan_worker, fullscan each publish after every job,
     TTL = 120s so a worker mid-long-job still counts).  SCAN + GET is a
-    fast O(keys) operation — typically 2–10 keys per pool.
+    fast O(keys) operation â€” typically 2â€“10 keys per pool.
 
     Returns 0 if no keys found (workers not yet publishing or all idle).
     """
@@ -299,9 +300,9 @@ def _get_pool_busy_ms(r, pool: str) -> int:
     return total
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Queue metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_queue_metrics(r) -> dict:
     """
@@ -311,16 +312,16 @@ def _get_queue_metrics(r) -> dict:
               actual_delay = now - enqueued_at of LINDEX -1 (oldest item)
               enqueued_at is stored as a timestamp in the payload JSON under "enqueued_at"
 
-    scan:     queue_depth = ZCOUNT(poll:adaptive, -inf, now) — overdue only
+    scan:     queue_depth = ZCOUNT(poll:adaptive, -inf, now) â€” overdue only
               actual_delay = now - score of ZRANGE(0,0) by score (most-overdue company)
 
-    fullscan: queue_depth = ZCOUNT(poll:fullscan, -inf, now) — overdue only
+    fullscan: queue_depth = ZCOUNT(poll:fullscan, -inf, now) â€” overdue only
               actual_delay = same pattern
     """
     now = time.time()
     metrics: dict = {}
 
-    # ── detail ────────────────────────────────────────────────────────────────
+    # â”€â”€ detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         depth_adaptive = r.llen(REDIS_DETAIL_ADAPTIVE)
         depth_fullscan = r.llen(REDIS_DETAIL_FULLSCAN)
@@ -344,7 +345,7 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: detail queue metrics failed: %s", exc)
         metrics["detail"] = {"depth": 0, "delay_s": 0.0}
 
-    # ── scan ──────────────────────────────────────────────────────────────────
+    # â”€â”€ scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         scan_depth = r.zcount(REDIS_POLL_ADAPTIVE, "-inf", now)
         scan_delay = 0.0
@@ -358,7 +359,7 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: scan queue metrics failed: %s", exc)
         metrics["scan"] = {"depth": 0, "delay_s": 0.0}
 
-    # ── fullscan ──────────────────────────────────────────────────────────────
+    # â”€â”€ fullscan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
         fullscan_depth = r.zcount(REDIS_POLL_FULLSCAN, "-inf", now)
         fullscan_delay = 0.0
@@ -372,10 +373,11 @@ def _get_queue_metrics(r) -> dict:
         logger.warning("manager: fullscan queue metrics failed: %s", exc)
         metrics["fullscan"] = {"depth": 0, "delay_s": 0.0}
 
-    # ── head_check + enrichment + discovery (autoscaled by _run_ats_pool_cycle) ─
+    # â”€â”€ head_check + enrichment + discovery (autoscaled by _run_ats_pool_cycle) â”€
     try:
-        # head_check: two LISTs (on_demand + batch); no inflight tracking
-        head_check_depth = r.llen(HEAD_CHECK_ON_DEMAND) + r.llen(HEAD_CHECK_BATCH)
+        # head_check: two LISTs (on_demand + batch) + in-flight counter
+        _hc_inflight = int(r.get(HEAD_CHECK_INFLIGHT) or 0)
+        head_check_depth = r.llen(HEAD_CHECK_ON_DEMAND) + r.llen(HEAD_CHECK_BATCH) + _hc_inflight
         metrics["head_check"] = {"depth": head_check_depth, "delay_s": 0.0, "depth_known": True}
     except Exception as exc:
         logger.warning("manager: head_check queue metrics failed: %s", exc)
@@ -384,7 +386,7 @@ def _get_queue_metrics(r) -> dict:
     try:
         # enrichment: on_demand LIST + batch ZSET + inflight ZSET(s)
         # Include inflight so workers are not stopped while actively processing items
-        # (items move from queue → inflight atomically, leaving queues temporarily empty).
+        # (items move from queue â†’ inflight atomically, leaving queues temporarily empty).
         _enrich_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{ENRICHMENT_INFLIGHT}*", count=10)))
         enrich_depth = r.llen(ENRICHMENT_ON_DEMAND) + r.zcard(ENRICHMENT_BATCH) + _enrich_inflight
         metrics["domain_enrichment"] = {"depth": enrich_depth, "delay_s": 0.0, "depth_known": True}
@@ -404,9 +406,9 @@ def _get_queue_metrics(r) -> dict:
     return metrics
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Worker ceiling (bootstrap or midnight recompute)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_worker_ceil(r, pool: str) -> int:
     """
@@ -472,7 +474,7 @@ def _midnight_recompute(r, pools: list[str]) -> None:
                 r.set(f"manager:worker_ceil:{pool}", ceil_)
                 logger.warning(
                     "manager: midnight recompute [%s] bootstrap mode "
-                    "(%d/%d days) — ceiling=%d (fixed)",
+                    "(%d/%d days) â€” ceiling=%d (fixed)",
                     pool, n_records, BOOTSTRAP_DAYS_REQUIRED, ceil_,
                 )
                 continue
@@ -522,7 +524,7 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             else:
                 growth_buffer = 0
 
-            # volatility_buffer: std_dev of last 28 days × 0.25
+            # volatility_buffer: std_dev of last 28 days Ã— 0.25
             if len(peaks) >= 3:
                 std = statistics.stdev(peaks)
                 volatility_buffer = math.ceil(std * 0.25)
@@ -535,7 +537,7 @@ def _midnight_recompute(r, pools: list[str]) -> None:
 
             logger.info(
                 "manager: midnight recompute [%s] "
-                "peak_28d=%d growth_buf=%d vol_buf=%d → ceil=%d",
+                "peak_28d=%d growth_buf=%d vol_buf=%d â†’ ceil=%d",
                 pool, peak_nd, growth_buffer, volatility_buffer, new_ceil,
             )
 
@@ -545,15 +547,15 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Daily peak tracking (intraday)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _update_daily_peak_running(r, pool: str, n_workers: int) -> None:
     """
     If the current cycle had enough workers to show real demand, update the
     running daily peak.  Uses n_workers as proxy for demand (full util signal
-    requires busy_ms publishing from workers — not yet implemented).
+    requires busy_ms publishing from workers â€” not yet implemented).
     """
     key = f"manager:pool:{pool}:daily_peak:running"
     try:
@@ -565,16 +567,16 @@ def _update_daily_peak_running(r, pool: str, n_workers: int) -> None:
         logger.debug("manager: daily_peak:running update failed [%s]: %s", pool, exc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# pending_spawns — workers-in-flight counter (avoids double-spawning)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# pending_spawns â€” workers-in-flight counter (avoids double-spawning)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _incr_pending_spawns(r, pool: str, count: int) -> None:
     """
     Increment the pending_spawns counter when a spawn command is sent.
 
     Workers decrement this on startup.  TTL=90s auto-expires stale counts
-    (deadlock 9: worker failed to start before the window closes — next cycle
+    (deadlock 9: worker failed to start before the window closes â€” next cycle
     treats deficit correctly without the stuck counter blocking a respawn).
     """
     if SHADOW_MODE or count <= 0:
@@ -584,9 +586,9 @@ def _incr_pending_spawns(r, pool: str, count: int) -> None:
     r.expire(key, 90)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Re-introduction phase — rate-limited resume after Lever 1 lifts
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Re-introduction phase â€” rate-limited resume after Lever 1 lifts
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _set_reintro_active(r, pool: str) -> None:
     """
@@ -598,7 +600,7 @@ def _set_reintro_active(r, pool: str) -> None:
     """
     r.set(f"manager:reintro:{pool}:active", "1")
     logger.info(
-        "manager [%s]: re-introduction phase started — trickle dispatch active",
+        "manager [%s]: re-introduction phase started â€” trickle dispatch active",
         pool,
     )
 
@@ -610,13 +612,13 @@ def _is_reintro_active(r, pool: str) -> bool:
 def _clear_reintro(r, pool: str) -> None:
     r.delete(f"manager:reintro:{pool}:active")
     logger.info(
-        "manager [%s]: re-introduction complete — full dispatch resumed", pool
+        "manager [%s]: re-introduction complete â€” full dispatch resumed", pool
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Send or shadow-log a command
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _send_cmd(r, cmd: str) -> None:
     """Push a command to manager:cmds, or log it in shadow mode."""
@@ -626,9 +628,9 @@ def _send_cmd(r, cmd: str) -> None:
     r.rpush("manager:cmds", cmd)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # One-pool scaling decision
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _run_pool_cycle(
     r,
@@ -645,13 +647,13 @@ def _run_pool_cycle(
     Run one Layer 0 cycle for a single pool.  Returns a decision string.
 
     Decision modes:
-      urgent        — delay >= WARN×0.75; spawn to workers_target in 1 cycle
-      urgent_release— workers confirmed online after urgent; lift throttle
-      urgent_hold   — urgent active but still understaffed (at ceiling → Layer 2)
-      scale_up      — util > 0.80 AND delay > WARN×0.5, 2 consecutive cycles
-      scale_down    — util < 0.50 AND delay < WARN×0.25, 5 consecutive cycles
-      hold          — stable band (50–80% util, delay in bounds)
-      *_pending     — streak accumulating, not fired yet
+      urgent        â€” delay >= WARNÃ—0.75; spawn to workers_target in 1 cycle
+      urgent_releaseâ€” workers confirmed online after urgent; lift throttle
+      urgent_hold   â€” urgent active but still understaffed (at ceiling â†’ Layer 2)
+      scale_up      â€” util > 0.80 AND delay > WARNÃ—0.5, 2 consecutive cycles
+      scale_down    â€” util < 0.50 AND delay < WARNÃ—0.25, 5 consecutive cycles
+      hold          â€” stable band (50â€“80% util, delay in bounds)
+      *_pending     â€” streak accumulating, not fired yet
 
     Returns (decision, workers_target) so the caller can pass workers_target
     to _check_layer2 and _attempt_borrow without recomputing.
@@ -659,11 +661,11 @@ def _run_pool_cycle(
     fetch_p75    = params.get("fetch_p75",    _FALLBACK_PARAMS[pool]["fetch_p75"])
     delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
 
-    # ── Utilization ───────────────────────────────────────────────────────────
+    # â”€â”€ Utilization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     pool_capacity_ms = max(n_workers * MANAGER_CYCLE_S * 1000, 1)
     pool_utilization = min(pool_busy_ms / pool_capacity_ms, 1.0)
 
-    # ── Drain-rate formula ────────────────────────────────────────────────────
+    # â”€â”€ Drain-rate formula â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     time_left      = max(delay_warn_s - delay_s, 1)
     drain_rate     = depth / time_left
     workers_target = math.ceil(drain_rate * fetch_p75)
@@ -678,7 +680,7 @@ def _run_pool_cycle(
     # scale_up / scale_down use effective_target so borrowed workers are counted.
     effective_target = _get_effective_target(r, pool, workers_target)
 
-    # ── Urgent (1-cycle, no util gate — delay-triggered) ─────────────────────
+    # â”€â”€ Urgent (1-cycle, no util gate â€” delay-triggered) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     needs_urgent = (
         delay_s >= delay_warn_s * 0.75
         or (workers_target >= worker_ceil * 0.75 and workers_target > peak_nd)
@@ -690,7 +692,7 @@ def _run_pool_cycle(
         _scale_down_cycles[pool] = 0
         decision = "urgent"
         logger.warning(
-            "manager [%s]: URGENT — delay=%.0fs warn=%.0fs depth=%d "
+            "manager [%s]: URGENT â€” delay=%.0fs warn=%.0fs depth=%d "
             "util=%.0f%% target=%d current=%d ceil=%d",
             pool, delay_s, delay_warn_s, depth,
             pool_utilization * 100, workers_target, n_workers, worker_ceil,
@@ -704,14 +706,14 @@ def _run_pool_cycle(
             _scale_down_cycles[pool] = 1 if workers_target < n_workers - 1 else 0
             decision = "urgent_release"
             logger.info(
-                "manager [%s]: urgent RELEASED — workers=%d target=%d "
+                "manager [%s]: urgent RELEASED â€” workers=%d target=%d "
                 "delay=%.0fs util=%.0f%%",
                 pool, n_workers, workers_target, delay_s, pool_utilization * 100,
             )
         else:
             decision = "urgent_hold"
 
-    # ── Normal scale-up: util > 80% AND delay building AND understaffed ───────
+    # â”€â”€ Normal scale-up: util > 80% AND delay building AND understaffed â”€â”€â”€â”€â”€â”€â”€
     # Uses effective_target so a pool that lent workers doesn't see a false deficit.
     elif (pool_utilization > 0.80
           and delay_s > delay_warn_s * 0.5
@@ -722,7 +724,7 @@ def _run_pool_cycle(
             _scale_up_cycles[pool] = 0
             decision = "scale_up"
             logger.info(
-                "manager [%s]: SCALE UP — delay=%.0fs warn=%.0fs depth=%d "
+                "manager [%s]: SCALE UP â€” delay=%.0fs warn=%.0fs depth=%d "
                 "util=%.0f%% target=%d eff_target=%d current=%d",
                 pool, delay_s, delay_warn_s, depth,
                 pool_utilization * 100, workers_target, effective_target, n_workers,
@@ -732,7 +734,7 @@ def _run_pool_cycle(
         else:
             decision = "scale_up_pending"
 
-    # ── Normal scale-down: util < 50% AND delay low AND overstaffed ──────────
+    # â”€â”€ Normal scale-down: util < 50% AND delay low AND overstaffed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Uses effective_target so a pool that received borrowed workers doesn't
     # immediately scale them back down.
     elif (pool_utilization < 0.50
@@ -744,7 +746,7 @@ def _run_pool_cycle(
             _scale_down_cycles[pool] = 0
             decision = "scale_down"
             logger.info(
-                "manager [%s]: SCALE DOWN — delay=%.0fs warn=%.0fs depth=%d "
+                "manager [%s]: SCALE DOWN â€” delay=%.0fs warn=%.0fs depth=%d "
                 "util=%.0f%% target=%d eff_target=%d current=%d",
                 pool, delay_s, delay_warn_s, depth,
                 pool_utilization * 100, workers_target, effective_target, n_workers,
@@ -760,7 +762,7 @@ def _run_pool_cycle(
 
     logger.debug(
         "manager [%s]: n=%d target=%d eff=%d depth=%d delay=%.0fs warn=%.0fs "
-        "util=%.0f%% up=%d down=%d → %s",
+        "util=%.0f%% up=%d down=%d â†’ %s",
         pool, n_workers, workers_target, effective_target,
         depth, delay_s, delay_warn_s,
         pool_utilization * 100,
@@ -770,14 +772,14 @@ def _run_pool_cycle(
     return decision, workers_target
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Layer 2 — Lever 1 backpressure + deadlock detection + worker borrowing
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Layer 2 â€” Lever 1 backpressure + deadlock detection + worker borrowing
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _push_delay_history(r, pool: str, delay_s: float) -> list:
     """
     Maintain a Redis list of the last DEADLOCK_HISTORY_CYCLES delay readings.
-    Returns the list (oldest → newest) after the push.
+    Returns the list (oldest â†’ newest) after the push.
     """
     key = f"manager:layer2:{pool}:delay_history"
     pipe = r.pipeline()
@@ -793,7 +795,7 @@ def _is_deadlock_rising(delays: list, current_delay: float, delay_warn_s: float)
     True when:
     - at least DEADLOCK_RISING_MIN of the last DEADLOCK_HISTORY_CYCLES cycles
       had delay > DELAY_WARN_S, AND
-    - current_delay > delays[0] (directional — tolerates 1 brief dip without
+    - current_delay > delays[0] (directional â€” tolerates 1 brief dip without
       resetting the counter, unlike a strictly-monotonic check).
     """
     if len(delays) < DEADLOCK_HISTORY_CYCLES:
@@ -813,12 +815,12 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     """
     Activate Lever 1 backpressure for pool.
 
-    Writes manager:lever1:{pool}:active — read by scheduler dispatch loops and
+    Writes manager:lever1:{pool}:active â€” read by scheduler dispatch loops and
     scan_worker/fullscan before pushing to detail queues.
 
     Also snapshots D (depth) and R (inflow rate) at the trigger moment.
     These must be captured BEFORE Lever 1 acts, because by cycle 3 the queue
-    is already draining and R ≈ 0 — severely understating true demand.
+    is already draining and R â‰ˆ 0 â€” severely understating true demand.
 
     Inflow guard: skip if the queue is already draining (depth falling and no
     new inflow). URGENT scale-up is already handling it; halting inflow when
@@ -829,8 +831,8 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     inflow_rate = max(0.0, (depth - prev_depth) / MANAGER_CYCLE_S)
     if inflow_rate == 0.0 and depth < prev_depth:
         logger.debug(
-            "manager [%s]: Lever 1 skipped — queue draining "
-            "(depth %d→%d, inflow=0). URGENT workers handling it.",
+            "manager [%s]: Lever 1 skipped â€” queue draining "
+            "(depth %dâ†’%d, inflow=0). URGENT workers handling it.",
             pool, prev_depth, depth,
         )
         return
@@ -841,7 +843,7 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     pipe.set(f"manager:snapshot:{pool}:R", str(inflow_rate), ex=3600)
     pipe.execute()
     logger.warning(
-        "manager [%s]: LEVER 1 FIRED — backpressure active. "
+        "manager [%s]: LEVER 1 FIRED â€” backpressure active. "
         "depth=%d inflow_rate=%.4f/s",
         pool, depth, inflow_rate,
     )
@@ -853,7 +855,7 @@ def _lift_lever1(r, pool: str, reason: str = "stable") -> None:
     pipe.delete(f"manager:lever1:{pool}:active")
     pipe.delete(f"manager:lever1:{pool}:fired_at")
     pipe.execute()
-    logger.info("manager [%s]: Lever 1 LIFTED — reason=%s", pool, reason)
+    logger.info("manager [%s]: Lever 1 LIFTED â€” reason=%s", pool, reason)
 
 
 def _get_effective_target(r, pool: str, workers_target: int) -> int:
@@ -863,9 +865,9 @@ def _get_effective_target(r, pool: str, workers_target: int) -> int:
 
     effective_target = workers_target - borrowed_out + borrowed_in
 
-    Example — scan lent 2 workers to fullscan:
-      effective_target(scan)     = 8 - 2 + 0 = 6  → deficit=0, no re-spawn
-      effective_target(fullscan) = 5 - 0 + 2 = 7  → deficit=0, don't remove
+    Example â€” scan lent 2 workers to fullscan:
+      effective_target(scan)     = 8 - 2 + 0 = 6  â†’ deficit=0, no re-spawn
+      effective_target(fullscan) = 5 - 0 + 2 = 7  â†’ deficit=0, don't remove
     """
     borrowed_out = 0
     cursor = 0
@@ -902,7 +904,7 @@ def _get_effective_target(r, pool: str, workers_target: int) -> int:
 
 def _get_lendable(r, source_pool: str, n_workers: int, workers_target: int) -> int:
     """
-    Workers source_pool can lend all at once — those above its own target and
+    Workers source_pool can lend all at once â€” those above its own target and
     above WORKER_FLOOR. Already-borrowed-out workers are subtracted to avoid
     double-lending.
 
@@ -940,7 +942,7 @@ def _record_borrow(r, source_pool: str, target_pool: str, count: int) -> None:
     existing = int(r.get(key) or 0)
     r.set(key, existing + count)
     logger.warning(
-        "manager: BORROW %d workers %s → %s (running total: %d)",
+        "manager: BORROW %d workers %s â†’ %s (running total: %d)",
         count, source_pool, target_pool, existing + count,
     )
 
@@ -972,7 +974,7 @@ def _return_all_borrows(r, pool: str) -> None:
 
 def _compute_true_required(r, pool: str, params: dict) -> int:
     """
-    true_required = ceil((D × F / W) + (R × F))
+    true_required = ceil((D Ã— F / W) + (R Ã— F))
 
     Uses the snapshot taken at Lever 1 trigger cycle 1 (before Lever 1 acts).
     D = queue_depth at snapshot, R = inflow_rate at snapshot.
@@ -1005,7 +1007,7 @@ def _write_true_required(r, pool: str, n_required: int) -> None:
     if n_required > existing:
         r.set(key, n_required)
         logger.info(
-            "manager [%s]: learning loop — daily_peak updated to %d (was %d)",
+            "manager [%s]: learning loop â€” daily_peak updated to %d (was %d)",
             pool, n_required, existing,
         )
 
@@ -1023,14 +1025,14 @@ def _attempt_borrow(
     Priority for lending: detail > scan > fullscan (highest priority pool
     protected first; only lend from detail if its own Lever 1 is active).
 
-    Phase 1 — Lendable workers (above own target): take ALL at once.
-    Phase 2 — Unused capacity (one by one with a cycle gap between each).
+    Phase 1 â€” Lendable workers (above own target): take ALL at once.
+    Phase 2 â€” Unused capacity (one by one with a cycle gap between each).
     """
     priority   = ["detail", "scan", "fullscan"]
     sources    = [p for p in priority if p != target_pool]
     borrowed   = 0
 
-    # Phase 1: take all lendable (safe — source still meets its own target)
+    # Phase 1: take all lendable (safe â€” source still meets its own target)
     for source in sources:
         if source == "detail" and not _get_lever1_active(r, "detail"):
             continue  # never borrow from detail unless its own inflow is halted
@@ -1043,7 +1045,7 @@ def _attempt_borrow(
 
     if borrowed > 0:
         logger.warning(
-            "manager: DEADLOCK [%s] — borrowed %d lendable workers. "
+            "manager: DEADLOCK [%s] â€” borrowed %d lendable workers. "
             "Waiting 1 cycle to assess.",
             target_pool, borrowed,
         )
@@ -1061,14 +1063,14 @@ def _attempt_borrow(
         if available_above_floor > 0:
             _record_borrow(r, source, target_pool, 1)
             logger.warning(
-                "manager: DEADLOCK [%s] — borrowed 1 unused-capacity worker from %s. "
+                "manager: DEADLOCK [%s] â€” borrowed 1 unused-capacity worker from %s. "
                 "Waiting 1 cycle.",
                 target_pool, source,
             )
             return True
 
     logger.error(
-        "manager: DEADLOCK [%s] — no lendable or unused-capacity workers available; "
+        "manager: DEADLOCK [%s] â€” no lendable or unused-capacity workers available; "
         "deadlock cannot be resolved by borrowing",
         target_pool,
     )
@@ -1087,17 +1089,17 @@ def _check_layer2(
     workers_targets:  dict,
 ) -> None:
     """
-    Layer 2 check — runs after _run_pool_cycle for each pool every cycle.
+    Layer 2 check â€” runs after _run_pool_cycle for each pool every cycle.
 
     Steps:
       1. Update delay history (4-cycle rolling window for 3-of-4 check).
       2. Fire Lever 1 if delay crosses DELAY_WARN_S (first crossing only).
          Snapshots D and R before Lever 1 acts (learning loop input).
       3. Check Lever 1 lift: LEVER1_STABLE_REQUIRED consecutive cycles below
-         WARN × RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
+         WARN Ã— RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
          update today's daily_peak (learning loop).  Clear all borrow state.
       4. Deadlock detection: if Lever 1 active + pool at ceiling + delay
-         rising for 3 of last 4 cycles → attempt worker borrowing.
+         rising for 3 of last 4 cycles â†’ attempt worker borrowing.
     """
     delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
 
@@ -1131,7 +1133,7 @@ def _check_layer2(
                 force_lift = True
                 logger.warning(
                     "manager [%s]: Lever 1 max hold (%ds) exceeded "
-                    "(fired_at=%s delay=%.0fs) — force lifting; "
+                    "(fired_at=%s delay=%.0fs) â€” force lifting; "
                     "will re-fire this cycle if conditions still warrant it",
                     pool, max_hold, fired_at_raw.decode()
                     if isinstance(fired_at_raw, bytes) else fired_at_raw,
@@ -1149,7 +1151,7 @@ def _check_layer2(
             if true_req > 0:
                 _write_true_required(r, pool, true_req)
 
-            # Return all borrows — recovery complete
+            # Return all borrows â€” recovery complete
             _return_all_borrows(r, pool)
 
             # Enter rate-limited re-introduction phase so queues don't flood
@@ -1176,9 +1178,9 @@ def _check_layer2(
         _attempt_borrow(r, pool, pool_sizes, workers_targets)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Error spike / outage detection (mirrors _fast_error_check_loop logic)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _check_error_spikes(r) -> None:
     """
@@ -1190,15 +1192,15 @@ def _check_error_spikes(r) -> None:
       For each platform with an active spike flag:
         1. Skip if already in outage mode.
         2. If a before_rate snapshot exists from a previous action:
-             - error resolved   → reset consec_reductions counter
-             - still erroring   → increment consec_reductions; if >= threshold
-                                  → declare outage via manager:cmds
+             - error resolved   â†’ reset consec_reductions counter
+             - still erroring   â†’ increment consec_reductions; if >= threshold
+                                  â†’ declare outage via manager:cmds
         3. If error_rate still above threshold AND concurrency is at floor:
              - Snapshot current error_rate as before_rate (effectiveness check
                next cycle).
              - Send platform:deprioritize:{platform} via manager:cmds.
 
-    Worker-level removal is NOT done here — manager.py already handles pool
+    Worker-level removal is NOT done here â€” manager.py already handles pool
     sizing via the util/delay formula.  Deprioritize + outage are the only
     levers this function pulls.
     """
@@ -1238,7 +1240,7 @@ def _check_error_spikes(r) -> None:
                     r.delete(f"worker:consec_reductions:{platform}")
                     logger.info(
                         "manager: error spike resolved platform=%r "
-                        "(%.1f%% → %.1f%%) — consec_reductions reset",
+                        "(%.1f%% â†’ %.1f%%) â€” consec_reductions reset",
                         platform, before_rate * 100, error_rate * 100,
                     )
                 else:
@@ -1247,7 +1249,7 @@ def _check_error_spikes(r) -> None:
                              WORKER_CONSEC_REDUCTIONS_TTL)
                     logger.warning(
                         "manager: deprioritize INEFFECTIVE platform=%r "
-                        "(%.1f%% → %.1f%%) consec_reductions=%d",
+                        "(%.1f%% â†’ %.1f%%) consec_reductions=%d",
                         platform, before_rate * 100, error_rate * 100, count,
                     )
 
@@ -1273,7 +1275,7 @@ def _check_error_spikes(r) -> None:
                             pass
                         continue
 
-            # 3. Still erroring — act if concurrency feedback loop is exhausted
+            # 3. Still erroring â€” act if concurrency feedback loop is exhausted
             if error_rate <= CONCURRENCY_ERROR_RATE_REDUCE:
                 continue
 
@@ -1284,12 +1286,12 @@ def _check_error_spikes(r) -> None:
             if current > floor:
                 continue  # feedback loop still has room to reduce concurrency
 
-            # Concurrency at floor and errors still high — deprioritize
+            # Concurrency at floor and errors still high â€” deprioritize
             r.set(before_key, str(error_rate), ex=MANAGER_CYCLE_S * 3)
             _send_cmd(r, f"platform:deprioritize:{platform}")
             logger.warning(
                 "manager: platform=%r error=%.1f%% at concurrency floor=%d "
-                "— deprioritized",
+                "â€” deprioritized",
                 platform, error_rate * 100, floor,
             )
 
@@ -1297,9 +1299,9 @@ def _check_error_spikes(r) -> None:
             break
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # ATS pool autoscaling (simple on/off, not Layer 0 formula)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_ats_alive_count(r, hb_prefix: str) -> int:
     """Count alive ATS worker instances by scanning worker:alive:{hb_prefix}* keys."""
@@ -1334,7 +1336,7 @@ def _run_ats_pool_cycle(
         _ats_idle_cycles[pool_label] = _ats_idle_cycles.get(pool_label, 0) + 1
         if _ats_idle_cycles[pool_label] >= ATS_MANAGER_IDLE_CYCLES and alive > 0:
             logger.info(
-                "manager [%s]: idle for %d cycles — stopping workers",
+                "manager [%s]: idle for %d cycles â€” stopping workers",
                 pool_label, _ats_idle_cycles[pool_label],
             )
             stop_workers(*worker_units)
@@ -1345,22 +1347,22 @@ def _run_ats_pool_cycle(
 
     if alive == 0:
         logger.info(
-            "manager [%s]: depth=%d, no workers alive — starting %s",
+            "manager [%s]: depth=%d, no workers alive â€” starting %s",
             pool_label, combined_depth, worker_units[0],
         )
         start_workers(worker_units[0])
 
     if combined_depth >= ATS_MANAGER_SCALE_UP_THRESHOLD and alive < len(worker_units):
         logger.info(
-            "manager [%s]: depth=%d >= threshold=%d — starting %s",
+            "manager [%s]: depth=%d >= threshold=%d â€” starting %s",
             pool_label, combined_depth, ATS_MANAGER_SCALE_UP_THRESHOLD, worker_units[-1],
         )
         start_workers(worker_units[-1])
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Main manager loop
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def run_manager() -> None:
     """
@@ -1375,7 +1377,7 @@ def run_manager() -> None:
       a. Acquire distributed lock (manager:lock NX EX 90)
       b. Read pool sizes from scheduler:health
       c. Read queue metrics (depth + delay) for each pool
-      d. Run Layer 0 formula per pool — log or send commands
+      d. Run Layer 0 formula per pool â€” log or send commands
       e. Update daily_peak:running
       f. Write manager:backpressure:threshold for watchdog (future use)
       g. Check for midnight (trigger Layer 1 recompute once per day)
@@ -1393,14 +1395,14 @@ def run_manager() -> None:
 
     pools = ["detail", "scan", "fullscan"]
 
-    # ── Load scaling params ────────────────────────────────────────────────────
+    # â”€â”€ Load scaling params â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     scaling_params = _load_scaling_params(r)
 
-    # ── Lever 1 startup re-evaluation ─────────────────────────────────────────
+    # â”€â”€ Lever 1 startup re-evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # A prior manager instance may have set Lever 1 and then restarted (e.g.,
     # deploy rollback) before conditions recovered.  The new instance has no
     # in-memory stable-cycle counter, so it will never lift a stale key on its
-    # own — the max-hold check above handles the long-term case, but on startup
+    # own â€” the max-hold check above handles the long-term case, but on startup
     # we can resolve it immediately by re-evaluating current conditions.
     #
     # If delay_s is already below delay_warn_s (conditions resolved while manager
@@ -1419,20 +1421,20 @@ def run_manager() -> None:
             _lift_lever1(r, _pool, reason="startup_conditions_resolved")
             logger.warning(
                 "manager [%s]: startup: cleared stale Lever 1 from prior instance "
-                "(delay=%.0fs <= warn=%.0fs — conditions resolved)",
+                "(delay=%.0fs <= warn=%.0fs â€” conditions resolved)",
                 _pool, _delay, _warn,
             )
         else:
-            # Conditions still warrant Lever 1 — take ownership: reset fired_at
+            # Conditions still warrant Lever 1 â€” take ownership: reset fired_at
             # so the max-hold clock starts from this instance's start time.
             r.set(f"manager:lever1:{_pool}:fired_at", str(int(time.time())), ex=86400)
             logger.warning(
                 "manager [%s]: startup: inherited active Lever 1 from prior instance "
-                "(delay=%.0fs > warn=%.0fs) — maintaining halt, max_hold reset",
+                "(delay=%.0fs > warn=%.0fs) â€” maintaining halt, max_hold reset",
                 _pool, _delay, _warn,
             )
 
-    # ── Bootstrap flag ─────────────────────────────────────────────────────────
+    # â”€â”€ Bootstrap flag â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     any_bootstrap = any(
         _count_daily_peak_records(r, p) < BOOTSTRAP_DAYS_REQUIRED
         for p in pools
@@ -1440,13 +1442,13 @@ def run_manager() -> None:
     if any_bootstrap:
         r.set("manager:bootstrap", "1")
         logger.warning(
-            "manager: bootstrap mode — fewer than %d days of daily_peak data",
+            "manager: bootstrap mode â€” fewer than %d days of daily_peak data",
             BOOTSTRAP_DAYS_REQUIRED,
         )
     else:
         r.delete("manager:bootstrap")
 
-    # ── Midnight recompute tracking ────────────────────────────────────────────
+    # â”€â”€ Midnight recompute tracking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     last_midnight_date: str = ""
     _cycle_count: int = 0
 
@@ -1466,23 +1468,23 @@ def run_manager() -> None:
         _cycle_count += 1
 
         try:
-            # ── Distributed lock — skip cycle if already running ──────────────
+            # â”€â”€ Distributed lock â€” skip cycle if already running â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             lock_acquired = r.set("manager:lock", os.getpid(), nx=True, ex=90)
             if not lock_acquired:
-                logger.debug("manager: lock contention — skipping cycle")
+                logger.debug("manager: lock contention â€” skipping cycle")
                 time.sleep(MANAGER_CYCLE_S)
                 continue
 
             try:
-                # ── Refresh scaling params if TTL expired ─────────────────────
+                # â”€â”€ Refresh scaling params if TTL expired â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if not r.exists("manager:scaling_params"):
                     scaling_params = _load_scaling_params(r)
 
-                # ── Pool sizes + queue metrics ────────────────────────────────
+                # â”€â”€ Pool sizes + queue metrics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 pool_sizes  = _get_pool_sizes(r)
                 queue_data  = _get_queue_metrics(r)
 
-                # ── Per-pool cycle ────────────────────────────────────────────
+                # â”€â”€ Per-pool cycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Collect workers_targets for all pools (needed by _check_layer2
                 # so _attempt_borrow knows each pool's current demand level).
                 all_workers_targets: dict = {}
@@ -1521,7 +1523,7 @@ def run_manager() -> None:
                     except Exception:
                         pass
 
-                # ── Layer 2 check (after all Layer 0 decisions are made) ───────
+                # â”€â”€ Layer 2 check (after all Layer 0 decisions are made) â”€â”€â”€â”€â”€â”€â”€
                 for pool in pools:
                     try:
                         n_workers   = pool_sizes.get(pool, 0)
@@ -1539,7 +1541,7 @@ def run_manager() -> None:
                             exc_info=True,
                         )
 
-                # ── ATS pool autoscaling (simple on/off, not Layer 0) ────────
+                # â”€â”€ ATS pool autoscaling (simple on/off, not Layer 0) â”€â”€â”€â”€â”€â”€â”€â”€
                 try:
                     from workers.worker_control import (
                         ENRICHMENT_WORKERS,
@@ -1576,14 +1578,14 @@ def run_manager() -> None:
                 except Exception as exc:
                     logger.error("manager: ATS pool cycle failed: %s", exc, exc_info=True)
 
-                # ── Update prev_depth for next cycle's inflow_rate snapshot ────
+                # â”€â”€ Update prev_depth for next cycle's inflow_rate snapshot â”€â”€â”€â”€
                 for pool in pools:
                     _prev_depth[pool] = queue_data.get(pool, {}).get("depth", 0)
 
-                # ── Error spike detection (placeholder) ───────────────────────
+                # â”€â”€ Error spike detection (placeholder) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 _check_error_spikes(r)
 
-                # ── Midnight recompute (once per calendar day) ────────────────
+                # â”€â”€ Midnight recompute (once per calendar day) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 current_hour = datetime.now(timezone.utc).hour
                 if today_str != last_midnight_date and current_hour == 0:
@@ -1613,7 +1615,7 @@ def run_manager() -> None:
         except Exception as exc:
             logger.error("manager: cycle error: %s", exc, exc_info=True)
 
-        # Heartbeat — written every cycle (including lock-skip cycles)
+        # Heartbeat â€” written every cycle (including lock-skip cycles)
         try:
             r.set(
                 f"worker:alive:manager:{_HOSTNAME}:{os.getpid()}",
@@ -1629,9 +1631,9 @@ def run_manager() -> None:
         time.sleep(sleep_s)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if __name__ == "__main__":
     init_logging("manager")

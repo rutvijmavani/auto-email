@@ -1,17 +1,17 @@
-"""
-jobs/public_domain.py — Public domain resolution for H1B pipeline enrichment.
+﻿"""
+jobs/public_domain.py â€” Public domain resolution for H1B pipeline enrichment.
 
 Resolves internal/email domains (e.g. fmr.com, jpmchase.com) to the company's
 real public-facing website domain (e.g. fidelity.com, jpmorgan.com).
 
 Three-step algorithm:
-  1. HTTP redirect follow    — jpmchase.com → jpmorgan.com
-  2. Root-domain fallback   — ny.email.gs.com → gs.com → goldmansachs.com
-  3. CT log (certspotter)   — fmr.com → fidelity.com via cert SANs
+  1. HTTP redirect follow    â€” jpmchase.com â†’ jpmorgan.com
+  2. Root-domain fallback   â€” ny.email.gs.com â†’ gs.com â†’ goldmansachs.com
+  3. CT log (certspotter)   â€” fmr.com â†’ fidelity.com via cert SANs
      Fallback: crt.sh if certspotter unavailable.
 
 Returns (public_domain, method, retry_after) where retry_after is non-None
-only on certspotter 429 — caller should re-queue the company with that delay.
+only on certspotter 429 â€” caller should re-queue the company with that delay.
 """
 
 import ipaddress
@@ -21,6 +21,7 @@ import time
 from urllib.parse import urljoin, urlparse
 
 import requests
+from jobs.http_safe import make_safe_session as _make_safe_session
 import tldextract
 _tldextract = tldextract.TLDExtract(suffix_list_urls=())
 import urllib3
@@ -46,7 +47,7 @@ def _is_public_host(host: str) -> bool:
     """Return True if host resolves only to globally-routable addresses.
 
     Blocks loopback, link-local, RFC1918, CGNAT (100.64/10), and cloud metadata
-    (169.254.169.254) — same set as api.py/_is_private_host.  Returns False on
+    (169.254.169.254) â€” same set as api.py/_is_private_host.  Returns False on
     DNS failure (fail-closed).
     """
     if not host:
@@ -68,7 +69,7 @@ def _is_public_host(host: str) -> bool:
     except Exception:
         return False
 
-# Root domains belonging to cloud / email / CDN providers — never a real company domain
+# Root domains belonging to cloud / email / CDN providers â€” never a real company domain
 GENERIC_ROOTS = {
     "outlook.com", "hotmail.com", "gmail.com", "yahoo.com",
     "pphosted.com", "mimecast.com", "proofpoint.com", "messagelabs.com",
@@ -96,10 +97,13 @@ _CHALLENGE_DOMAINS = frozenset({
 # own domain (e.g. Cloudflare JS challenge stays on company.com but sets cf-ray).
 _CHALLENGE_HEADERS = frozenset({
     "cf-ray",              # Cloudflare
-    "x-iinfo",             # Imperva (inline mode — served from company domain)
+    "x-iinfo",             # Imperva (inline mode â€” served from company domain)
     "x-sucuri-id",         # Sucuri (inline mode)
     "x-px-access-denied",  # PerimeterX
 })
+
+
+_safe_session = _make_safe_session()
 
 
 def _is_challenge_response(headers: dict) -> bool:
@@ -111,10 +115,10 @@ _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6
 _CT_TIMEOUT          = 20
 _CRTSH_TIMEOUT       = 30
-_CT_MAX_BYTES        = 20 * 1024 * 1024  # 20 MiB — guard against oversized CT responses
+_CT_MAX_BYTES        = 20 * 1024 * 1024  # 20 MiB â€” guard against oversized CT responses
 _CT_PROBE_BUDGET_S   = 60
 
-# Module-level certspotter backoff — avoid hammering after a 429
+# Module-level certspotter backoff â€” avoid hammering after a 429
 _certspotter_retry_after: float = 0.0
 
 
@@ -146,20 +150,20 @@ def _root(u: str) -> str:
 _REDIRECT_MAX_HOPS   = 8
 _REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
 # Total wall-clock budget per _redirect_domain call across all schemes/hops.
-# Worst case without a budget: _REDIRECT_MAX_HOPS × _REDIRECT_TIMEOUT × 2 schemes = 128 s.
+# Worst case without a budget: _REDIRECT_MAX_HOPS Ã— _REDIRECT_TIMEOUT Ã— 2 schemes = 128 s.
 _REDIRECT_BUDGET_S   = 20
 
 
 def _redirect_domain(host: str) -> "str | None":
     """
     Follow HTTP redirects on host. Returns:
-      str  — root domain of final URL differs from host → redirect found
-      ""   — final URL has same root as host → already public
-      None — connection error / DNS fail / redirect chain leads to a private host
+      str  â€” root domain of final URL differs from host â†’ redirect found
+      ""   â€” final URL has same root as host â†’ already public
+      None â€” connection error / DNS fail / redirect chain leads to a private host
 
     Redirects are followed manually so every intermediate hop is validated as a
     publicly-routable address before connecting (prevents SSRF via redirect chain).
-    verify=False is applied only when the initial HTTPS attempt raises SSLError —
+    verify=False is applied only when the initial HTTPS attempt raises SSLError â€”
     company domains frequently have self-signed or expired certs; we only use the
     final URL's domain name, never the response body.
     """
@@ -170,7 +174,7 @@ def _redirect_domain(host: str) -> "str | None":
             _last_headers: dict = {}
             for _ in range(_REDIRECT_MAX_HOPS):
                 if time.monotonic() > _budget_deadline:
-                    log.debug("_redirect_domain: budget exceeded for %s — aborting", host)
+                    log.debug("_redirect_domain: budget exceeded for %s â€” aborting", host)
                     return None
                 hop_host = urlparse(current).hostname or ""
                 if not hop_host or not _is_public_host(hop_host):
@@ -178,26 +182,26 @@ def _redirect_domain(host: str) -> "str | None":
                     current = None
                     break
                 try:
-                    r = requests.get(current, allow_redirects=False,
-                                     timeout=_REDIRECT_TIMEOUT, stream=True)
+                    r = _safe_session.get(current, allow_redirects=False,
+                                              timeout=_REDIRECT_TIMEOUT, stream=True)
                 except requests.exceptions.SSLError:
                     try:
                         import warnings
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                            r = requests.get(current, allow_redirects=False,
-                                             timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
+                            r = _safe_session.get(current, allow_redirects=False,
+                                                  timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
                     except Exception:
-                        log.debug("_redirect_domain: SSL error for %s — no redirect signal", current)
+                        log.debug("_redirect_domain: SSL error for %s â€” no redirect signal", current)
                         current = None
                         break
-                    # SSL-unverified: cross-root redirects are untrusted — only same-root hops allowed.
+                    # SSL-unverified: cross-root redirects are untrusted â€” only same-root hops allowed.
                     if r.status_code in _REDIRECT_CODES:
                         _loc = r.headers.get("Location", "")
                         if _loc:
                             _next_host = urlparse(urljoin(current, _loc)).hostname or ""
                             if _root(_next_host) != _root(urlparse(current).hostname or ""):
-                                log.debug("_redirect_domain: cross-root redirect via verify=False — aborting")
+                                log.debug("_redirect_domain: cross-root redirect via verify=False â€” aborting")
                                 _last_headers = dict(r.headers)
                                 r.close()
                                 current = None
@@ -211,8 +215,8 @@ def _redirect_domain(host: str) -> "str | None":
                     break
                 current = urljoin(current, loc)
             else:
-                # All hops consumed while still in redirect chain — last Location is unverified.
-                log.debug("_redirect_domain: hop limit reached for %s — rejecting chain", host)
+                # All hops consumed while still in redirect chain â€” last Location is unverified.
+                log.debug("_redirect_domain: hop limit reached for %s â€” rejecting chain", host)
                 current = None
 
             if current is None:
@@ -220,7 +224,7 @@ def _redirect_domain(host: str) -> "str | None":
             final = _root(current)
             # If the chain landed on a bot-protection vendor domain, the origin is the real domain.
             if final in _CHALLENGE_DOMAINS or _is_challenge_response(_last_headers):
-                log.debug("_redirect_domain: challenge page detected (%s) — origin %s is real domain",
+                log.debug("_redirect_domain: challenge page detected (%s) â€” origin %s is real domain",
                           final, host)
                 return ""
             return final if final != _root(host) else ""
@@ -234,7 +238,7 @@ def _has_web(root: str) -> bool:
     """Return True if root domain serves any HTTP response (status < 500).
 
     Validates that root resolves only to public addresses before connecting.
-    Redirects are not followed — a 3xx response (< 500) still means the domain
+    Redirects are not followed â€” a 3xx response (< 500) still means the domain
     is live and serving HTTP, which is all the caller cares about.
     """
     if not _is_public_host(root):
@@ -244,7 +248,7 @@ def _has_web(root: str) -> bool:
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
         try:
-            r = requests.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
+            r = _safe_session.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
             status = r.status_code
             r.close()
             if status < 500:
@@ -260,7 +264,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
     Extracts and ranks root domains found across all certificate SANs.
 
     Returns (candidates, retry_after_seconds_or_None).
-    retry_after is non-None on HTTP 429 — caller re-queues with that delay.
+    retry_after is non-None on HTTP 429 â€” caller re-queues with that delay.
     """
     global _certspotter_retry_after
 
@@ -286,10 +290,10 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             try:
                 retry_after = int(_ra)
             except (ValueError, TypeError):
-                retry_after = 3600  # HTTP-date or unparseable — safe fallback
+                retry_after = 3600  # HTTP-date or unparseable â€” safe fallback
             retry_after = max(1, min(retry_after, 3600))
             _certspotter_retry_after = time.time() + retry_after
-            log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
+            log.warning("certspotter 429 for %s â€” retry after %ds", domain, retry_after)
             r.close()
             return [], retry_after
 
@@ -310,7 +314,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
                     roots[root] = roots.get(root, 0) + 1
 
         top = sorted(roots, key=lambda x: (-roots[x], x))[:10]
-        log.debug("certspotter: %d certs for %s → top roots: %s", len(certs), domain, top)
+        log.debug("certspotter: %d certs for %s â†’ top roots: %s", len(certs), domain, top)
         return top, None
 
     except Exception as e:
@@ -319,7 +323,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
 
 
 def _ct_crtsh(domain: str) -> list[str]:
-    """crt.sh fallback — slower, sometimes unavailable."""
+    """crt.sh fallback â€” slower, sometimes unavailable."""
     try:
         r = requests.get(
             "https://crt.sh/",
@@ -358,7 +362,7 @@ def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
     if candidates:
         return candidates, None, "certspotter"
     if retry_after is not None:
-        # certspotter in backoff — still try crt.sh before propagating quota error
+        # certspotter in backoff â€” still try crt.sh before propagating quota error
         fallback = _ct_crtsh(domain)
         if fallback:
             return fallback, None, "crtsh"
@@ -372,10 +376,10 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     Resolve an internal/email domain to the company's real public domain.
 
     Returns (public_domain, method, retry_after):
-      public_domain — resolved domain string, or None if unresolvable
-      method        — 'http_redirect' | 'root_fallback' | 'certspotter' |
+      public_domain â€” resolved domain string, or None if unresolvable
+      method        â€” 'http_redirect' | 'root_fallback' | 'certspotter' |
                       'crtsh' | 'same_domain' | 'ct_quota' | 'no_signal'
-      retry_after   — seconds before re-queuing (certspotter 429), else None
+      retry_after   â€” seconds before re-queuing (certspotter 429), else None
     """
     domain = (assigned_domain or "").lower().strip()
     if not domain:
@@ -385,27 +389,27 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         log.warning("public_domain: rejecting private address %s", domain)
         return None, "no_signal", None
 
-    # Step 1 — HTTP redirect on full domain
+    # Step 1 â€” HTTP redirect on full domain
     redir = _redirect_domain(domain)
     if redir is None:
-        log.debug("DNS fail for %s — trying root fallback", domain)
+        log.debug("DNS fail for %s â€” trying root fallback", domain)
     elif redir == "":
         # Accept "already public" for root domains and www-prefixed subdomains.
         # A subdomain like ny.email.gs.com resolves within the same root (gs.com),
-        # but the real public site may be at goldmansachs.com — fall through to CT log.
+        # but the real public site may be at goldmansachs.com â€” fall through to CT log.
         # www is a standard public alias, not a meaningful subdomain.
         sub = _tldextract.extract(domain).subdomain
         if not sub or sub == "www":
             log.debug("%s already resolves publicly", domain)
             return domain, "same_domain", None
-        log.debug("%s resolves within its root but has subdomain — continuing", domain)
+        log.debug("%s resolves within its root but has subdomain â€” continuing", domain)
     elif redir not in GENERIC_ROOTS:
-        log.info("public_domain: %s → %s (http_redirect)", domain, redir)
+        log.info("public_domain: %s â†’ %s (http_redirect)", domain, redir)
         return redir, "http_redirect", None
     else:
-        log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
+        log.debug("public_domain: %s â†’ %s (generic root â€” skipping)", domain, redir)
 
-    # Step 2 — Root-domain fallback (strip subdomain prefix via PSL)
+    # Step 2 â€” Root-domain fallback (strip subdomain prefix via PSL)
     ext      = _tldextract.extract(domain)
     root_try = ext.registered_domain
     if root_try and root_try != domain:
@@ -414,15 +418,15 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
             pass
         elif redir == "":
             if root_try not in GENERIC_ROOTS:
-                log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
+                log.info("public_domain: %s â†’ %s (root_fallback)", domain, root_try)
                 return root_try, "root_fallback", None
         elif redir not in GENERIC_ROOTS:
-            log.info("public_domain: %s → %s (root_fallback)", domain, redir)
+            log.info("public_domain: %s â†’ %s (root_fallback)", domain, redir)
             return redir, "root_fallback", None
         else:
-            log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
+            log.debug("public_domain: %s â†’ %s (generic root â€” skipping)", domain, redir)
 
-    # Step 3 — CT log (certspotter → crt.sh fallback)
+    # Step 3 â€” CT log (certspotter â†’ crt.sh fallback)
     log.debug("querying CT logs for %s", domain)
     candidates, retry_after, ct_source = _ct_domains(domain)
 
@@ -432,11 +436,14 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     _ct_budget_start = time.time()
     for candidate in candidates[:10]:
         if time.time() - _ct_budget_start > _CT_PROBE_BUDGET_S:
-            log.debug("CT probe budget exhausted for %s — stopping early", domain)
+            log.debug("CT probe budget exhausted for %s â€” stopping early", domain)
             break
         if _has_web(candidate):
-            log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
+            log.info("public_domain: %s â†’ %s (%s)", domain, candidate, ct_source)
             return candidate, ct_source, None
 
     log.debug("no public domain signal for %s", domain)
     return None, "no_signal", None
+
+
+

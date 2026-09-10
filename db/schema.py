@@ -1,4 +1,4 @@
-# db/schema.py — Database schema creation and cleanup (PostgreSQL)
+﻿# db/schema.py — Database schema creation and cleanup (PostgreSQL)
 #
 # All DDL uses PostgreSQL syntax:
 #   BIGSERIAL PRIMARY KEY   instead of INTEGER PRIMARY KEY AUTOINCREMENT
@@ -1095,11 +1095,11 @@ def init_db():
         SELECT indexdef FROM pg_indexes
         WHERE indexname = 'idx_pc_domain_norm' AND tablename = 'prospective_companies'
     """).fetchone()
-    if _idx_pc_row is None or "https?://" not in (_idx_pc_row["indexdef"] or ""):
+    if _idx_pc_row is None or "LOWER(domain)" not in (_idx_pc_row["indexdef"] or ""):
         c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
         c.execute("""
             CREATE INDEX idx_pc_domain_norm
-            ON prospective_companies (regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', ''))
+            ON prospective_companies (regexp_replace(regexp_replace(LOWER(domain), '^https?://', ''), '^www\\.', ''))
             WHERE domain IS NOT NULL
         """)
 
@@ -1577,7 +1577,16 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS careers_source TEXT
     """)
-    # careers_url moved to fein_domain_map as single source of truth
+    # Backfill: careers_url moved from h1b_ats_discovery to fein_domain_map.
+    # Copy any data that exists in the old column before dropping it.
+    c.execute("""
+        UPDATE fein_domain_map f
+        SET careers_url = d.careers_url
+        FROM h1b_ats_discovery d
+        WHERE d.employer_fein = f.employer_fein
+          AND d.careers_url IS NOT NULL
+          AND f.careers_url IS NULL
+    """)
     c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
 
     # ── KG quality events — low-confidence / no-match companies for review ────

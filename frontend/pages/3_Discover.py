@@ -1,4 +1,4 @@
-"""
+﻿"""
 frontend/pages/3_Discover.py — DOL H-1B employer browser.
 
 Browse aggregated LCA disclosures to find companies worth adding to the pipeline.
@@ -75,9 +75,9 @@ def _careers_head_ok(url: str) -> bool:
 def _trigger_careers_check(url: str, fein: str) -> None:
     """Submit a background HEAD check if one isn't already running for this FEIN."""
     with _DISCOVER_LOCK:
-        if fein in _DISCOVER_INFLIGHT:
+        if (fein, url) in _DISCOVER_INFLIGHT:
             return
-        _DISCOVER_INFLIGHT.add(fein)
+        _DISCOVER_INFLIGHT.add((fein, url))
 
     def _run():
         try:
@@ -92,14 +92,14 @@ def _trigger_careers_check(url: str, fein: str) -> None:
                 log.debug("discover: Redis head_check write failed fein=%s: %s", fein, _re)
         finally:
             with _DISCOVER_LOCK:
-                _DISCOVER_INFLIGHT.discard(fein)
+                _DISCOVER_INFLIGHT.discard((fein, url))
 
     try:
         _DISCOVER_EXECUTOR.submit(_run)
     except Exception as _sub_exc:
         log.warning("discover: failed to submit career check for fein=%s: %s", fein, _sub_exc)
         with _DISCOVER_LOCK:
-            _DISCOVER_INFLIGHT.discard(fein)
+            _DISCOVER_INFLIGHT.discard((fein, url))
 
 
 @st.fragment(run_every=2)
@@ -323,7 +323,7 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None, doma
         if norm:
             cur.execute(
                 "SELECT status FROM prospective_companies "
-                "WHERE regexp_replace(LOWER(regexp_replace(domain, '^https?://', '')), '^www\\.', '') "
+                "WHERE regexp_replace(regexp_replace(LOWER(domain), '^https?://', ''), '^www\\.', '') "
                 "    = %s LIMIT 1",
                 (norm,),
             )
@@ -970,8 +970,13 @@ else:
                     try:
                         if db_col == "careers_url":
                             conn.execute(
-                                "UPDATE fein_domain_map SET careers_url = %s WHERE employer_fein = %s",
-                                (_to_save, fein),
+                                """
+                                INSERT INTO fein_domain_map (employer_fein, careers_url, updated_at)
+                                VALUES (%s, %s, NOW())
+                                ON CONFLICT (employer_fein) DO UPDATE
+                                    SET careers_url = EXCLUDED.careers_url, updated_at = NOW()
+                                """,
+                                (fein, _to_save),
                             )
                         else:
                             conn.execute(
@@ -1236,6 +1241,7 @@ else:
                                 finally:
                                     _dc.close()
                                 load_ats_discovery.clear()
+                                load_company_ats_entries.clear()
                                 st.success("Correction submitted — ATS will be re-detected on next form sync run.")
                                 st.rerun()
                         except Exception as exc:
@@ -1253,6 +1259,7 @@ else:
             try:
                 _run_inline_discovery(fein, name)
                 load_ats_discovery.clear()
+                load_company_ats_entries.clear()
                 st.rerun()
             except Exception as exc:
                 log.exception("Re-run discovery failed for %r", name)

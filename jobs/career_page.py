@@ -1,17 +1,17 @@
-# jobs/career_page.py — Phase 3a: Career page ATS scanner
+﻿# jobs/career_page.py â€” Phase 3a: Career page ATS scanner
 #
 # Three-layer detection per URL:
-#   Layer 1 — HTTP redirect: company.com/careers → ats-domain.com/{slug}
-#   Layer 2 — HTML deep scan: ATS URL found in any attribute (src, href,
+#   Layer 1 â€” HTTP redirect: company.com/careers â†’ ats-domain.com/{slug}
+#   Layer 2 â€” HTML deep scan: ATS URL found in any attribute (src, href,
 #              action, data-*) or in inline <script> content
-#   Layer 3 — Job link follow: individual job pages almost always embed or
+#   Layer 3 â€” Job link follow: individual job pages almost always embed or
 #              link to the ATS directly (e.g. Greenhouse iframe, Workday
 #              apply redirect).  When the top-level career page scan misses,
 #              we extract 2-3 job listing links and re-run Layers 1+2 on each.
 #
 # This completely replaces the need for Serper/Google for most platforms.
-# Greenhouse, Lever, Ashby, SmartRecruiters → caught by Phase 2 API probe.
-# Workday, Oracle HCM, iCIMS, SuccessFactors → caught here.
+# Greenhouse, Lever, Ashby, SmartRecruiters â†’ caught by Phase 2 API probe.
+# Workday, Oracle HCM, iCIMS, SuccessFactors â†’ caught here.
 
 import re
 import json
@@ -75,7 +75,7 @@ CAREER_PATHS = [
     "/opportunities",
 ]
 
-# ATS domains — used to fast-skip script content that can't contain ATS URLs
+# ATS domains â€” used to fast-skip script content that can't contain ATS URLs
 # (avoids parsing every inline script in the page)
 _ATS_SCRIPT_HINTS = (
     "greenhouse.io",
@@ -102,7 +102,7 @@ _ATS_SCRIPT_HINTS = (
 # How many individual job links to follow when top-level scan misses
 _MAX_JOB_LINKS = 3
 
-# Platforms where the slug is opaque (not derived from company name) —
+# Platforms where the slug is opaque (not derived from company name) â€”
 # skip slug-vs-company validation for these
 _OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm"}
 
@@ -110,9 +110,9 @@ _OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm"}
 _RICH_SLUG_PLATFORMS = {"phenom", "talentbrew", "avature"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Public entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def detect_via_career_page(company, domain, *, careers_url=None):
     """
@@ -121,7 +121,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     Args:
         company:     company name  e.g. "Stripe"
         domain:      company domain e.g. "stripe.com"
-        careers_url: if provided, skip path probing — verify this URL and scan it.
+        careers_url: if provided, skip path probing â€” verify this URL and scan it.
                      Falls back to full probing if the URL is not accessible.
 
     Returns:
@@ -129,7 +129,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
         None                                                  if nothing found at all
     """
     if not domain:
-        logger.debug("[P3a] No domain for %r — skipping", company)
+        logger.debug("[P3a] No domain for %r â€” skipping", company)
         return None
 
     domain = domain.lower().strip()
@@ -139,12 +139,12 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     logger.debug("[P3a] Scanning: company=%r domain=%s careers_url=%s",
                  company, domain, careers_url)
 
-    # ── Mode 1: careers_url already known — verify + scan, skip probing ───────
+    # â”€â”€ Mode 1: careers_url already known â€” verify + scan, skip probing â”€â”€â”€â”€â”€â”€â”€
     if careers_url:
         result, html, final_url = _fetch_and_scan(careers_url, company)
         if result and result.get("platform"):
             result["careers_url"] = final_url or careers_url
-            logger.info("[P3a HIT via careers_url] %r → %s / %s",
+            logger.info("[P3a HIT via careers_url] %r â†’ %s / %s",
                         company, result["platform"], result["slug"])
             return result
         if html is not None:
@@ -160,20 +160,20 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             if on_domain and effective_path not in ("", "/"):
                 job_result = _follow_job_links(html, effective_url, company, domain)
                 if job_result:
-                    logger.info("[P3a HIT via job link] %r → %s / %s",
+                    logger.info("[P3a HIT via job link] %r â†’ %s / %s",
                                 company, job_result["platform"], job_result["slug"])
                     job_result["careers_url"] = effective_url
                     return job_result
                 return {"platform": None, "slug": None, "careers_url": effective_url}
             else:
-                logger.debug("[P3a] careers_url redirected off-domain (%s → %s) — skipping job link scan",
+                logger.debug("[P3a] careers_url redirected off-domain (%s â†’ %s) â€” skipping job link scan",
                              careers_url, effective_url)
                 return {"platform": None, "slug": None, "careers_url": careers_url}
-        # careers_url not accessible — fall through to full probing
+        # careers_url not accessible â€” fall through to full probing
         logger.debug("[P3a] careers_url not accessible, falling back to path probe")
 
-    # ── Mode 2: probe standard career paths ───────────────────────────────────
-    # Use www.domain as probe base to avoid apex→www redirect overhead
+    # â”€â”€ Mode 2: probe standard career paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Use www.domain as probe base to avoid apexâ†’www redirect overhead
     probe_base = domain if domain.startswith("www.") else f"www.{domain}"
 
     first_career_html  = None
@@ -187,19 +187,19 @@ def detect_via_career_page(company, domain, *, careers_url=None):
         if result:
             if result["platform"] == "eightfold":
                 if tentative_eightfold is None:
-                    logger.debug("[P3a tentative Eightfold] %r via %s — continuing scan",
+                    logger.debug("[P3a tentative Eightfold] %r via %s â€” continuing scan",
                                  company, url)
                     tentative_eightfold = result
                     tentative_eightfold["_matched_url"] = final_url or url
-                # Always keep scanning past Eightfold — harder ATS may follow.
+                # Always keep scanning past Eightfold â€” harder ATS may follow.
             else:
-                logger.info("[P3a HIT] %r → %s / %s via %s",
+                logger.info("[P3a HIT] %r â†’ %s / %s via %s",
                             company, result["platform"], result["slug"], url)
                 result["careers_url"] = final_url or url
                 return result
         # Track the redirect destination when it stays on the company domain or lands
-        # on a known ATS — SSO/auth redirects to unrelated hosts are not careers evidence.
-        # A redirect to the bare root path (e.g. /careers → /) is a homepage redirect, not a careers hint.
+        # on a known ATS â€” SSO/auth redirects to unrelated hosts are not careers evidence.
+        # A redirect to the bare root path (e.g. /careers â†’ /) is a homepage redirect, not a careers hint.
         # Only use redirects from successful responses (html not None) or ATS pattern hits (result not None);
         # a 404 at the redirected URL is not evidence of a valid careers page.
         if final_url and final_url != url and not first_redirect_url and (result is not None or html is not None):
@@ -216,7 +216,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                 first_career_html = html
                 first_career_url  = final_url
 
-    # ── Apex fallback — retry with bare domain if www. probe produced nothing ───
+    # â”€â”€ Apex fallback â€” retry with bare domain if www. probe produced nothing â”€â”€â”€
     # Some companies serve careers only from the apex (e.g. example.com/careers)
     # and have no www. DNS entry, causing all www.-prefixed probes to fail.
     if first_career_html is None and first_redirect_url is None and tentative_eightfold is None and not domain.startswith("www."):
@@ -230,7 +230,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                         tentative_eightfold = result
                         tentative_eightfold["_matched_url"] = final_url or url
                 else:
-                    logger.info("[P3a HIT apex] %r → %s / %s via %s",
+                    logger.info("[P3a HIT apex] %r â†’ %s / %s via %s",
                                 company, result["platform"], result["slug"], url)
                     result["careers_url"] = final_url or url
                     return result
@@ -248,7 +248,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                     first_career_html = html
                     first_career_url  = final_url
 
-    # ── Layer 3: follow job listing links ─────────────────────────────────
+    # â”€â”€ Layer 3: follow job listing links â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Individual job pages almost always link to or embed the ATS directly
     # (e.g. Greenhouse apply iframe, Workday apply redirect).
     if first_career_html and first_career_url:
@@ -256,33 +256,33 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             first_career_html, first_career_url, company, domain
         )
         if result:
-            logger.info("[P3a HIT via job link] %r → %s / %s",
+            logger.info("[P3a HIT via job link] %r â†’ %s / %s",
                         company, result["platform"], result["slug"])
             result["careers_url"] = first_career_url
             return result
 
-    # ── Eightfold fallback ─────────────────────────────────────────────────
-    # Nothing harder found — accept the tentative Eightfold result.
+    # â”€â”€ Eightfold fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Nothing harder found â€” accept the tentative Eightfold result.
     if tentative_eightfold:
-        logger.info("[P3a HIT Eightfold fallback] %r → %s / %s",
+        logger.info("[P3a HIT Eightfold fallback] %r â†’ %s / %s",
                     company, tentative_eightfold["platform"], tentative_eightfold["slug"])
         tentative_eightfold["careers_url"] = tentative_eightfold.pop("_matched_url", first_career_url or first_redirect_url)
         return tentative_eightfold
 
-    # MISS — no ATS detected, but return the best careers URL hint we found
+    # MISS â€” no ATS detected, but return the best careers URL hint we found
     # so the caller can still save the careers page location.
     careers_hint = first_career_url or first_redirect_url
     if careers_hint:
-        logger.debug("[P3a MISS] %r (domain=%s) — careers_url hint: %s", company, domain, careers_hint)
+        logger.debug("[P3a MISS] %r (domain=%s) â€” careers_url hint: %s", company, domain, careers_hint)
         return {"platform": None, "slug": None, "careers_url": careers_hint}
 
     logger.debug("[P3a MISS] %r (domain=%s)", company, domain)
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Eightfold domain enrichment
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # Common career-page subdomain prefixes to strip when deriving company domain
 _CAREER_PREFIXES = (
@@ -299,13 +299,13 @@ def _enrich_eightfold_domain(result, page_url):
     ({slug}.eightfold.ai) doesn't tell us the company's real domain.
     At detection time we recover it two ways (in priority order):
 
-    1. domain= query param — Eightfold passes it explicitly in the URL:
-         apply.starbucks.com/careers?domain=starbucks.com  → starbucks.com
-    2. Hostname prefix strip — fallback when no query param present:
-         careers.starbucks.com/jobs  → starbucks.com
-         jobs.lamresearch.com/       → lamresearch.com
+    1. domain= query param â€” Eightfold passes it explicitly in the URL:
+         apply.starbucks.com/careers?domain=starbucks.com  â†’ starbucks.com
+    2. Hostname prefix strip â€” fallback when no query param present:
+         careers.starbucks.com/jobs  â†’ starbucks.com
+         jobs.lamresearch.com/       â†’ lamresearch.com
 
-    Hosted tenants (slug.eightfold.ai) are skipped — the slug already
+    Hosted tenants (slug.eightfold.ai) are skipped â€” the slug already
     encodes the subdomain, no separate domain field needed.
 
     Only applied when the result is Eightfold and domain is currently empty.
@@ -329,14 +329,14 @@ def _enrich_eightfold_domain(result, page_url):
     try:
         parsed = urlparse(page_url)
 
-        # Prefer explicit domain= query param — Eightfold embeds it in the URL
+        # Prefer explicit domain= query param â€” Eightfold embeds it in the URL
         # e.g. apply.starbucks.com/careers?domain=starbucks.com
         qs     = parse_qs(parsed.query)
         domain = (qs.get("domain") or [""])[0].strip()
 
         if not domain:
             # Fallback: strip common career-page subdomain prefixes from hostname
-            # e.g. careers.starbucks.com → starbucks.com
+            # e.g. careers.starbucks.com â†’ starbucks.com
             host   = parsed.hostname or ""
             domain = host
             for prefix in _CAREER_PREFIXES:
@@ -344,7 +344,7 @@ def _enrich_eightfold_domain(result, page_url):
                     domain = host[len(prefix):]
                     break
 
-        # Exclude eightfold.ai itself (hosted tenant — slug already IS the domain prefix)
+        # Exclude eightfold.ai itself (hosted tenant â€” slug already IS the domain prefix)
         if domain.endswith(".eightfold.ai"):
             domain = ""
 
@@ -358,9 +358,9 @@ def _enrich_eightfold_domain(result, page_url):
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # HTTP fetch + scan
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _fetch_and_scan(url, company):
     """
@@ -368,9 +368,9 @@ def _fetch_and_scan(url, company):
 
     Returns:
         (result, html, final_url)
-        result   — {platform, slug} if found, else None
-        html     — response text (None on error or non-200)
-        final_url— URL after redirects
+        result   â€” {platform, slug} if found, else None
+        html     â€” response text (None on error or non-200)
+        final_urlâ€” URL after redirects
     """
     try:
         resp = _get_session().get(
@@ -378,11 +378,11 @@ def _fetch_and_scan(url, company):
         )
         final_url = resp.url
 
-        # Layer 1: redirect URL — check ATS pattern before 200 gate
+        # Layer 1: redirect URL â€” check ATS pattern before 200 gate
         if final_url != url:
             r = match_ats_pattern(final_url)
             if r and _slug_ok(r, company):
-                logger.debug("[P3a] ATS redirect: %s → %s", url, final_url)
+                logger.debug("[P3a] ATS redirect: %s â†’ %s", url, final_url)
                 return _enrich_eightfold_domain(r, final_url), None, final_url
 
         if resp.status_code != 200:
@@ -390,7 +390,7 @@ def _fetch_and_scan(url, company):
 
         # Only log redirects that produced usable content (200)
         if final_url != url:
-            logger.debug("[P3a] Redirect: %s → %s", url, final_url)
+            logger.debug("[P3a] Redirect: %s â†’ %s", url, final_url)
 
         # Layer 2: deep HTML scan
         r = _scan_html(resp.text, company)
@@ -426,26 +426,26 @@ def _fetch_and_scan(url, company):
         return None, None, None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Layer 2: deep HTML scan
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _scan_html(html, company):
     """
     Deep HTML scan using BeautifulSoup.
 
     Extracts candidate URLs from:
-      • Every tag attribute that can hold a URL (src, href, action, data-*)
-      • Inline <script> content — only scripts that mention an ATS domain
+      â€¢ Every tag attribute that can hold a URL (src, href, action, data-*)
+      â€¢ Inline <script> content â€” only scripts that mention an ATS domain
         (fast-path skip avoids parsing every analytics/tracking script)
 
-    Runs each candidate through match_ats_pattern() → validate slug.
+    Runs each candidate through match_ats_pattern() â†’ validate slug.
     """
     soup = BeautifulSoup(html, "html.parser")
 
     candidates = set()
 
-    # ── Attribute URLs ─────────────────────────────────────────────────────
+    # â”€â”€ Attribute URLs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     URL_ATTRS = ("src", "href", "action", "data-src", "data-href",
                  "data-url", "data-apply-url", "data-job-url")
     for tag in soup.find_all(True):
@@ -454,34 +454,34 @@ def _scan_html(html, company):
             if isinstance(val, str) and val.startswith("http"):
                 candidates.add(val.rstrip('.,;)"\'><'))
 
-    # ── Inline script content ──────────────────────────────────────────────
+    # â”€â”€ Inline script content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for script in soup.find_all("script"):
         content = script.string or ""
         if not content:
             continue
-        # Skip scripts that don't mention any known ATS domain — fast path
+        # Skip scripts that don't mention any known ATS domain â€” fast path
         content_lower = content.lower()
         if not any(hint in content_lower for hint in _ATS_SCRIPT_HINTS):
             continue
         for raw_url in re.findall(r'https?://[^\s"\'\\<>]+', content):
             candidates.add(raw_url.rstrip('.,;)"\'><'))
 
-    # ── Pattern match ──────────────────────────────────────────────────────
+    # â”€â”€ Pattern match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for url in candidates:
         r = match_ats_pattern(url)
         if r and _slug_ok(r, company):
             return r
 
-    # ── Eightfold footer fingerprint fallback ─────────────────────────────
+    # â”€â”€ Eightfold footer fingerprint fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Every Eightfold career page embeds a "Powered by eightfold.ai" footer
     # containing href="https://eightfold.ai" and an img from static.vscdn.net.
     # These signals confirm Eightfold is in use but don't carry the slug.
     # The {slug}.eightfold.ai URL is always present elsewhere in the page
     # (typically inside a JS config object) but may not surface as a clean
-    # attribute URL — so we do a targeted raw-HTML regex search as a fallback.
+    # attribute URL â€” so we do a targeted raw-HTML regex search as a fallback.
     # Eightfold footer: every Eightfold-powered career page has a
     # "Powered by eightfold.ai" footer with href="https://eightfold.ai".
-    # vscdn.net is their CDN but can appear on non-Eightfold pages —
+    # vscdn.net is their CDN but can appear on non-Eightfold pages â€”
     # only the eightfold.ai href is a reliable confirmation signal.
     if "eightfold.ai" in html.lower():
         m = re.search(
@@ -494,12 +494,12 @@ def _scan_html(html, company):
             if r and _slug_ok(r, company):
                 return r
 
-    # ── SuccessFactors j2w.init() fingerprint ─────────────────────────────
+    # â”€â”€ SuccessFactors j2w.init() fingerprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Companies hosting careers on their own domain (e.g. careers.aflac.com)
     # embed a j2w.init({...}) block with ssoCompanyId (slug) and ssoUrl
     # (datacenter URL).  This fires when no SF-hosted URL appears in the page.
     #
-    # path is intentionally omitted — fetch_jobs() self-heals by trying both
+    # path is intentionally omitted â€” fetch_jobs() self-heals by trying both
     # /career and /careers automatically.
     if "ssocompanyid" in html.lower() or "j2w.init" in html.lower():
         m_slug = re.search(
@@ -525,20 +525,20 @@ def _scan_html(html, company):
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Layer 3: job link following
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _follow_job_links(html, base_url, company, domain):
     """
     Extract individual job listing links from the career page and scan each.
 
     Why this works:
-      • stripe.com/jobs  → lists jobs, no ATS embed
-      • stripe.com/jobs/listing/{title}/{id}/apply
-          → <iframe src="https://job-boards.greenhouse.io/embed/job_app?for=stripe">
-      • jobs.netflix.com → lists jobs
-      • jobs.netflix.com/jobs/{id}  → Apply button links to
+      â€¢ stripe.com/jobs  â†’ lists jobs, no ATS embed
+      â€¢ stripe.com/jobs/listing/{title}/{id}/apply
+          â†’ <iframe src="https://job-boards.greenhouse.io/embed/job_app?for=stripe">
+      â€¢ jobs.netflix.com â†’ lists jobs
+      â€¢ jobs.netflix.com/jobs/{id}  â†’ Apply button links to
           netflix.wd1.myworkdayjobs.com/Netflix_External_Site/...
 
     Individual job pages almost always contain a direct ATS signal.
@@ -562,7 +562,7 @@ def _extract_job_links(html, base_url, domain):
 
     Heuristic: path must contain a job-related segment AND not be one of
     the top-level career paths we already tried.  A numeric or slug-like
-    final segment (len ≥ 4) confirms it's a detail page, not a root listing.
+    final segment (len â‰¥ 4) confirms it's a detail page, not a root listing.
 
     Returns deduplicated list, most-specific paths first.
     """
@@ -600,7 +600,7 @@ def _extract_job_links(html, base_url, domain):
         parsed = urlparse(full_url)
 
         # Must stay on the company domain
-        if domain not in parsed.netloc:
+        if _reg_domain(full_url) != _reg_domain("https://" + domain):
             continue
 
         path = parsed.path
@@ -618,16 +618,16 @@ def _extract_job_links(html, base_url, domain):
     return links
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Slug validation helper
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _slug_ok(result, company):
     """
     Validate that the detected slug belongs to the expected company.
     Skips validation for platforms with opaque or rich slugs.
 
-    Eightfold slugs are JSON-encoded dicts — we parse and validate the inner
+    Eightfold slugs are JSON-encoded dicts â€” we parse and validate the inner
     "slug" field rather than the raw JSON string.  This prevents false positives
     from pages that embed Eightfold RMS/LinkedIn tracking scripts without being
     real Eightfold customers (e.g. a Workday company whose career page loads
@@ -643,7 +643,7 @@ def _slug_ok(result, company):
 
     slug = result.get("slug", "")
 
-    # Eightfold stores slug as JSON — extract the inner slug for comparison
+    # Eightfold stores slug as JSON â€” extract the inner slug for comparison
     if platform == "eightfold":
         try:
             slug = _json.loads(slug).get("slug", "")
@@ -651,3 +651,4 @@ def _slug_ok(result, company):
             pass
 
     return validate_slug_for_company(slug, company)
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 scripts/fuzzy_match_uscis_dol.py — Fuzzy matching for unresolved USCIS → DOL rows.
 
 For each row in uscis_dol_unmatched, this script:
@@ -325,7 +325,7 @@ def _populate_enrichment_queue(conn, r) -> None:
     Score = petition_count (highest priority first).
     Workers are started on demand by manager.py (autoscaled on queue depth).
     """
-    from config import DOMAIN_ENRICHMENT_QUEUE, ENRICH_STALENESS_DAYS
+    from config import ENRICHMENT_BATCH, ENRICH_STALENESS_DAYS
 
     # Named server-side cursor: PostgreSQL streams rows on demand instead of
     # buffering the full result set in memory before the first row arrives.
@@ -343,7 +343,7 @@ def _populate_enrichment_queue(conn, r) -> None:
         """, (f"{ENRICH_STALENESS_DAYS} days",))
         for row in named_cur:
             member = json.dumps({"fein": row["employer_fein"], "trigger": "enrichment", "source": None})
-            pipe.zadd(DOMAIN_ENRICHMENT_QUEUE, {member: row["petition_count"]}, gt=True)
+            pipe.zadd(ENRICHMENT_BATCH, {member: row["petition_count"]}, gt=True)
             i += 1
             if i % _ZADD_PIPELINE_BATCH == 0:
                 pipe.execute()

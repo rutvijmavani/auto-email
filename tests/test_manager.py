@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_manager.py
 ─────────────────────────────────────────────────────────────────────────────
 Comprehensive test suite for workers/manager.py Layer 0 autoscaler.
@@ -630,7 +630,7 @@ class TestQueueMetrics(unittest.TestCase):
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zrange.return_value = []
-        r.zcard.side_effect = lambda k: 42 if k == mgr.DOMAIN_ENRICHMENT_QUEUE else 0
+        r.zcard.side_effect = lambda k: 42 if k == mgr.ENRICHMENT_BATCH else 0
         metrics = mgr._get_queue_metrics(r)
         self.assertEqual(metrics["domain_enrichment"]["depth"], 42)
         self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
@@ -642,40 +642,34 @@ class TestQueueMetrics(unittest.TestCase):
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zrange.return_value = []
-        r.zcard.side_effect = lambda k: 17 if k == mgr.DISCOVERY_QUEUE else 0
+        r.zcard.side_effect = lambda k: 17 if k == mgr.DISCOVERY_BATCH else 0
         metrics = mgr._get_queue_metrics(r)
         self.assertEqual(metrics["discovery"]["depth"], 17)
         self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
 
     def test_enrichment_delay_from_delayed_zset(self):
-        """domain_enrichment delay comes from domain_enrichment:delayed ZSET score."""
-        now = time.time()
-        overdue_by = 120
+        """domain_enrichment delay_s is always 0.0 — batch ZSET score=petition_count, not timestamp."""
         r = MagicMock()
         r.llen.return_value = 0
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zcard.return_value = 0
-        r.zrange.side_effect = lambda key, start, stop, withscores=False: (
-            [(b"item", now - overdue_by)] if key == mgr.DOMAIN_ENRICHMENT_DELAYED else []
-        )
+        r.scan_iter.return_value = []
+        r.zrange.return_value = []
         metrics = mgr._get_queue_metrics(r)
-        self.assertAlmostEqual(metrics["domain_enrichment"]["delay_s"], overdue_by, delta=2)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
 
     def test_discovery_delay_from_delayed_zset(self):
-        """discovery delay comes from discovery:delayed ZSET score."""
-        now = time.time()
-        overdue_by = 240
+        """discovery delay_s is always 0.0 — batch/redetect ZSETs use score=petition_count, not timestamp."""
         r = MagicMock()
         r.llen.return_value = 0
         r.lindex.return_value = None
         r.zcount.return_value = 0
         r.zcard.return_value = 0
-        r.zrange.side_effect = lambda key, start, stop, withscores=False: (
-            [(b"item", now - overdue_by)] if key == mgr.DISCOVERY_DELAYED else []
-        )
+        r.scan_iter.return_value = []
+        r.zrange.return_value = []
         metrics = mgr._get_queue_metrics(r)
-        self.assertAlmostEqual(metrics["discovery"]["delay_s"], overdue_by, delta=2)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
 
     def test_enrichment_discovery_redis_zcard_failure(self):
         """zcard failure in enrichment/discovery block falls back to zero; other pools unaffected."""

@@ -1,4 +1,4 @@
-# logger.py — Centralized logging for the recruiter pipeline
+﻿# logger.py — Centralized logging for the recruiter pipeline
 #
 # Usage in any module:
 #   from logger import get_logger
@@ -68,14 +68,14 @@ _MONTHLY_COMMANDS = frozenset({
 # Log files: scheduler.log, api.log → rotate to scheduler.log.YYYY-MM-DD etc.
 _LONG_RUNNING_COMMANDS = frozenset({
     "scheduler", "api", "email_processor",
-    "domain_enrichment_worker", "discover_h1b_ats_worker",
+    "domain_enrichment_worker", "discover_h1b_ats_worker", "head_check_worker",
 })
 
 # Subset of _LONG_RUNNING_COMMANDS that get extended retention (LOG_RETENTION_WORKER_DAYS).
 # These workers run sporadically in multi-hour batches — 14-day retention is too short
 # to compare runs across the 90-day staleness cycle.
 _WORKER_COMMANDS = frozenset({
-    "domain_enrichment_worker", "discover_h1b_ats_worker",
+    "domain_enrichment_worker", "discover_h1b_ats_worker", "head_check_worker",
 })
 
 # Map CLI flag → log filename prefix

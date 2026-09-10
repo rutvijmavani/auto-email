@@ -1,4 +1,4 @@
-import base64
+﻿import base64
 import hmac
 import json
 import os
@@ -18,6 +18,7 @@ load_dotenv()
 from logger import get_logger, init_logging, cleanup_logs_if_due
 from config import (
     ENRICHMENT_ON_DEMAND,
+    HEAD_CHECK_CACHE_TTL_S,
     HEAD_CHECK_ON_DEMAND,
     REDIS_EMAIL_PUSH,
 )
@@ -430,7 +431,10 @@ def verify_company():
         logger.error("verify-company: DB error for fein=%s: %s", fein, exc)
         return jsonify({'error': 'internal error'}), 500
     finally:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         conn.close()
 
     if row is None:
@@ -468,11 +472,17 @@ def verify_company():
         # careers URL known — delegate liveness check to head_check_worker
         try:
             if _r_client is not None:
-                _r_client.lpush(
-                    HEAD_CHECK_ON_DEMAND,
-                    json.dumps({"fein": fein, "trigger": "on_demand", "source": None}),
-                )
-                logger.info("verify-company: queued head check fein=%s → head_check:on_demand", fein)
+                _cooldown_key = f"verify_company:cooldown:{fein}"
+                if _r_client.set(_cooldown_key, 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S):
+                    try:
+                        _r_client.lpush(
+                            HEAD_CHECK_ON_DEMAND,
+                            json.dumps({"fein": fein, "trigger": "on_demand", "source": None}),
+                        )
+                        logger.info("verify-company: queued head check fein=%s → head_check:on_demand", fein)
+                    except Exception as exc:
+                        logger.error("verify-company: failed to queue head check fein=%s: %s", fein, exc)
+                        _r_client.delete(_cooldown_key)
         except Exception as exc:
             logger.error("verify-company: failed to queue head check fein=%s: %s", fein, exc)
 

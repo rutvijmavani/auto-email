@@ -1,23 +1,23 @@
-"""
-scripts/discover_h1b_ats.py — H-1B sponsor ATS discovery.
+﻿"""
+scripts/discover_h1b_ats.py â€” H-1B sponsor ATS discovery.
 
 For each top H-1B sponsor this script:
   1. Queries Google Knowledge Graph API for canonical name + website + Freebase MID.
-     Caches MID in DB — skips KG call on re-runs.
-  2. Looks up Wikidata P10311 (official jobs URL) via Freebase MID → P646 SPARQL batch.
-     If P10311 found → store as jobs_url and skip career probing.
+     Caches MID in DB â€” skips KG call on re-runs.
+  2. Looks up Wikidata P10311 (official jobs URL) via Freebase MID â†’ P646 SPARQL batch.
+     If P10311 found â†’ store as jobs_url and skip career probing.
   3. Probes 19 career URL patterns (follow redirects, validate final URL).
      Rejects: homepage redirects, SSO/auth redirects, unrelated-domain redirects.
-     Bonus: if redirect lands on known ATS domain → captures ATS directly.
-  4. Falls back to Brave search: "{company} careers" → top 10 results →
+     Bonus: if redirect lands on known ATS domain â†’ captures ATS directly.
+  4. Falls back to Brave search: "{company} careers" â†’ top 10 results â†’
      filter to plausible career URLs (company token in domain / known ATS domain /
-     careers|jobs keyword) → Qwen3-8B picks best when multiple survive.
-  5. Fetches career page HTML → fingerprints embedded ATS.
+     careers|jobs keyword) â†’ Qwen3-8B picks best when multiple survive.
+  5. Fetches career page HTML â†’ fingerprints embedded ATS.
 
 Two-pass architecture (Brave quota = 950/month):
-  Pass 1 — KG + SPARQL + probe, no Brave (run freely, KG is 100k/day):
+  Pass 1 â€” KG + SPARQL + probe, no Brave (run freely, KG is 100k/day):
     python scripts/discover_h1b_ats.py --top 900
-  Pass 2 — Brave only, for companies Pass 1 couldn't resolve:
+  Pass 2 â€” Brave only, for companies Pass 1 couldn't resolve:
     python scripts/discover_h1b_ats.py --brave-pass --top 950
 
 Other usage:
@@ -63,9 +63,9 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Maintenance window
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _is_maintenance(r) -> bool:
     if r is None:
@@ -73,13 +73,13 @@ def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
     except Exception as exc:
-        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        log.warning("Redis maintenance check failed (%s) â€” assuming not in maintenance", exc)
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Config
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _KG_ENDPOINT     = "https://kgsearch.googleapis.com/v1/entities:search"
 _KG_API_KEY      = os.environ.get("KG_API_KEY", "")
@@ -139,7 +139,7 @@ _CAREER_SUBDOMAINS = [
     "https://work.{domain}",
 ]
 
-# Root domains of known ATS platforms — redirect to these is a valid career page
+# Root domains of known ATS platforms â€” redirect to these is a valid career page
 _KNOWN_ATS_DOMAINS = {
     "myworkdayjobs.com", "greenhouse.io", "lever.co", "ashbyhq.com",
     "icims.com", "smartrecruiters.com", "jobvite.com", "taleo.net",
@@ -169,9 +169,9 @@ _DBA_PATTERN = re.compile(
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # SSRF guard
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _is_public_url(url: str) -> bool:
     try:
@@ -196,9 +196,9 @@ def _is_public_url(url: str) -> bool:
         return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Name normalisation
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def strip_legal_suffixes(name: str) -> str:
     name = _DBA_PATTERN.sub("", name).strip()
@@ -210,7 +210,7 @@ def strip_legal_suffixes(name: str) -> str:
 
 
 def _root_domain(url: str) -> str:
-    """'careers.amazon.co.uk' → 'amazon.co.uk' (PSL-aware registrable domain)."""
+    """'careers.amazon.co.uk' â†’ 'amazon.co.uk' (PSL-aware registrable domain)."""
     if "://" not in url:
         url = "https://" + url
     host = urlparse(url).hostname or ""
@@ -224,7 +224,7 @@ def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain
 
     Verification URL priority:
       1. KG entity URL (already fetched, primary)
-      2. SPARQL P856 — fallback only when KG has no URL; same underlying
+      2. SPARQL P856 â€” fallback only when KG has no URL; same underlying
          data source so if KG has no URL, P856 probably won't either, but we try.
 
     Returns True only when a verification URL exists AND its root domain
@@ -237,9 +237,9 @@ def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain
     return host == assigned_domain or host.endswith("." + assigned_domain)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # SPARQL rate limiter (shared, thread-safe sliding window)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 class _RateLimiter:
     def __init__(self, rpm: int) -> None:
@@ -256,20 +256,20 @@ class _RateLimiter:
                 if len(self._window) < self._rpm:
                     self._window.append(now)
                     return
-            log.debug("%s RPM limit (%d/min) — waiting 3s", api_name, self._rpm)
+            log.debug("%s RPM limit (%d/min) â€” waiting 3s", api_name, self._rpm)
             time.sleep(3)
 
 
 _sparql_limiter = _RateLimiter(rpm=30)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Google Knowledge Graph API
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _KG_FETCH_LIMIT      = 3   # candidates fetched per query
 _KG_MIN_OVERLAP      = 30  # minimum score to accept at retry exhaustion
-_KG_HIGH_CONFIDENCE  = 90  # return immediately — no point trying shorter queries
+_KG_HIGH_CONFIDENCE  = 90  # return immediately â€” no point trying shorter queries
 _KG_QUALITY_THRESHOLD = 60  # flag for human review when selected score < this
 
 _KG_SIG_STOP = frozenset({
@@ -286,22 +286,22 @@ def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
     """Return True if EVERY significant token of the KG entity name has a
     plausible match somewhere in the legal name.
 
-    No stripping — both names are tokenized raw and noise words (inc, llc,
+    No stripping â€” both names are tokenized raw and noise words (inc, llc,
     corporation, etc.) are removed via _KG_SIG_STOP.  Descriptive words like
     'Technologies', 'Enterprises', 'Solutions' are preserved so that
-    'Fourth Technologies' ≠ 'Fourth Enterprises'.
+    'Fourth Technologies' â‰  'Fourth Enterprises'.
 
-    Match per token: prefix match OR fuzz.ratio ≥ 65.
+    Match per token: prefix match OR fuzz.ratio â‰¥ 65.
 
     Rejects:
-      'SQUAD SOFTWARE'    → 'San Diego Padres'       (san  ∉ squad/software)
-      'Cruise LLC'        → 'Carnival Cruise Line'   (carnival ∉ cruise)
-      'FOURTH ENTERPRISES'→ 'Fourth Technologies'    (technologies ∉ fourth/enterprises)
+      'SQUAD SOFTWARE'    â†’ 'San Diego Padres'       (san  âˆ‰ squad/software)
+      'Cruise LLC'        â†’ 'Carnival Cruise Line'   (carnival âˆ‰ cruise)
+      'FOURTH ENTERPRISES'â†’ 'Fourth Technologies'    (technologies âˆ‰ fourth/enterprises)
 
     Accepts:
-      'WAL-MART ASSOCIATES' → 'Walmart'   (walmart.startswith('wal'))
-      'HCL AMERICA'         → 'HCLTech'  (hcltech.startswith('hcl'))
-      'ORACLE AMERICA'      → 'Oracle Corporation'  (oracle ✓, corporation filtered)
+      'WAL-MART ASSOCIATES' â†’ 'Walmart'   (walmart.startswith('wal'))
+      'HCL AMERICA'         â†’ 'HCLTech'  (hcltech.startswith('hcl'))
+      'ORACLE AMERICA'      â†’ 'Oracle Corporation'  (oracle âœ“, corporation filtered)
     """
     def _sig(s: str) -> list[str]:
         return [t for t in re.findall(r'\w+', (s or "").lower())
@@ -311,7 +311,7 @@ def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
     e_toks = _sig(entity_name)
 
     if not q_toks or not e_toks:
-        return True  # can't check — don't reject
+        return True  # can't check â€” don't reject
 
     for et in e_toks:
         matched = any(
@@ -334,20 +334,20 @@ def _coverage_weighted_score(legal_name: str, entity_name: str | None) -> float:
 
     This rewards matches where the entity explains a meaningful portion of the
     legal name, while protecting short distinctive brands (Amazon, Google) via
-    entity_coverage — if the entire entity name is matched, coverage is 100%
+    entity_coverage â€” if the entire entity name is matched, coverage is 100%
     regardless of how long the legal name is.
 
     Examples:
-      "AMAZON.COM SERVICES LLC" → "Amazon"                 100 (entity_cov=1/1)
-      "COGNIZANT TECH SOLUTIONS US" → "Cognizant Tech"     100 (entity_cov=2/2)
-      "SQUAD SOFTWARE INC" → "San Diego Padres"             ~20 → below threshold
+      "AMAZON.COM SERVICES LLC" â†’ "Amazon"                 100 (entity_cov=1/1)
+      "COGNIZANT TECH SOLUTIONS US" â†’ "Cognizant Tech"     100 (entity_cov=2/2)
+      "SQUAD SOFTWARE INC" â†’ "San Diego Padres"             ~20 â†’ below threshold
     """
     def _sig(s: str) -> list[str]:
         return [t for t in re.findall(r'\w+', (s or "").lower())
                 if t not in _KG_SIG_STOP and len(t) > 1]
 
     legal_toks  = _sig(legal_name)
-    # Strip legal suffixes from KG entity name so "Oracle Corporation" → ["oracle"]
+    # Strip legal suffixes from KG entity name so "Oracle Corporation" â†’ ["oracle"]
     entity_toks = _sig(strip_legal_suffixes(entity_name or "")) or _sig(entity_name)
 
     if not legal_toks or not entity_toks:
@@ -376,35 +376,35 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
     """Search KG API for legal_name with progressive word-stripping and best-match selection.
 
     Returns (selected, all_candidates) where:
-      selected       — {name, url, kg_mid, _score} or None
-      all_candidates — every /m/ entity seen across all attempts, deduplicated by
+      selected       â€” {name, url, kg_mid, _score} or None
+      all_candidates â€” every /m/ entity seen across all attempts, deduplicated by
                        kg_mid (max score kept), sorted by score descending.
                        Used by the quality-events audit trail.
 
     Strategy:
     - Fetch _KG_FETCH_LIMIT candidates per query.  /g/ shells are always skipped.
     - Within each attempt, iterate candidates in KG relevance order.  Stop at the
-      first /m/ candidate that scores ≥ _KG_MIN_OVERLAP (30) — KG's ranking is more
+      first /m/ candidate that scores â‰¥ _KG_MIN_OVERLAP (30) â€” KG's ranking is more
       reliable than cross-candidate score comparison.  Candidates below 30 are checked
       in order until one passes or the list is exhausted.
-    - Score ≥ _KG_HIGH_CONFIDENCE (90) → return immediately, no need to retry.
-    - 30 ≤ score < 90 → update global best if higher, then always continue to a
+    - Score â‰¥ _KG_HIGH_CONFIDENCE (90) â†’ return immediately, no need to retry.
+    - 30 â‰¤ score < 90 â†’ update global best if higher, then always continue to a
       shorter query (drop last word).  This lets a shorter query surface the correct
-      brand entity — e.g. "Oracle America Inc" → OFS(68) at attempt 0, bare "Oracle"
-      → Oracle Corporation(100) at attempt 2.
-    - After _KG_MAX_RETRIES, return best_candidate if best_score ≥ _KG_MIN_OVERLAP,
+      brand entity â€” e.g. "Oracle America Inc" â†’ OFS(68) at attempt 0, bare "Oracle"
+      â†’ Oracle Corporation(100) at attempt 2.
+    - After _KG_MAX_RETRIES, return best_candidate if best_score â‰¥ _KG_MIN_OVERLAP,
       else None.
     """
     if not _KG_API_KEY:
-        log.warning("KG_API_KEY not set — skipping KG search for %r", legal_name)
+        log.warning("KG_API_KEY not set â€” skipping KG search for %r", legal_name)
         return None, []
 
     if not can_call("kg_api"):
         if not within_rpm("kg_api"):
-            log.info("KG API RPM limit hit — waiting 60s")
+            log.info("KG API RPM limit hit â€” waiting 60s")
             time.sleep(60)
             if not can_call("kg_api"):
-                log.warning("KG API still unavailable after wait — skipping")
+                log.warning("KG API still unavailable after wait â€” skipping")
                 return None, []
         else:
             log.warning("KG API daily limit (100k) reached")
@@ -414,7 +414,7 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
     tokens     = base_query.split()
     best_candidate: dict | None = None
     best_score: int = -1
-    all_seen:   dict[str, dict] = {}  # kg_mid → {name, kg_mid, score} — audit trail
+    all_seen:   dict[str, dict] = {}  # kg_mid â†’ {name, kg_mid, score} â€” audit trail
 
     for attempt in range(min(_KG_MAX_RETRIES + 1, len(tokens))):
         query = " ".join(tokens[:len(tokens) - attempt])
@@ -441,7 +441,7 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
 
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
-                log.debug("KG API rate-limited — waiting %ds", wait)
+                log.debug("KG API rate-limited â€” waiting %ds", wait)
                 time.sleep(wait)
                 break
 
@@ -467,17 +467,17 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
 
                 # Gate 1: entity's leading token must plausibly match the legal name.
                 # Rejects "San Diego Padres" for "SQUAD SOFTWARE", "Carnival Cruise Line"
-                # for "Cruise LLC", etc.  Lead-gate failures are treated like /g/ shells —
+                # for "Cruise LLC", etc.  Lead-gate failures are treated like /g/ shells â€”
                 # found_m stays False so the retry loop tries a shorter query.
                 if not _entity_lead_in_query(legal_name, name):
                     log.debug(
-                        "KG: /m/ candidate %r (mid=%r) — lead mismatch vs %r, skipping",
+                        "KG: /m/ candidate %r (mid=%r) â€” lead mismatch vs %r, skipping",
                         name, kg_mid, legal_name,
                     )
                     continue
 
                 found_m   = True
-                # Gate 3: coverage-weighted score — rewards matches where the entity
+                # Gate 3: coverage-weighted score â€” rewards matches where the entity
                 # explains a meaningful portion of the legal name, and protects
                 # short distinctive brands via entity_coverage.
                 score     = _coverage_weighted_score(legal_name, name)
@@ -489,17 +489,17 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
 
                 if score >= _KG_HIGH_CONFIDENCE:
                     log.debug(
-                        "KG hit: %r → name=%r url=%r mid=%r score=%d",
+                        "KG hit: %r â†’ name=%r url=%r mid=%r score=%d",
                         query, name, url, kg_mid, score,
                     )
                     all_candidates = sorted(all_seen.values(), key=lambda x: x["score"], reverse=True)
                     return candidate, all_candidates
 
                 if score >= _KG_MIN_OVERLAP:
-                    # First /m/ candidate above threshold — trust KG's relevance order,
+                    # First /m/ candidate above threshold â€” trust KG's relevance order,
                     # stop checking remaining candidates in this attempt.
                     log.debug(
-                        "KG: /m/ candidate %r (mid=%r score=%d) — first above threshold%s",
+                        "KG: /m/ candidate %r (mid=%r score=%d) â€” first above threshold%s",
                         name, kg_mid, score,
                         ", new best" if score > best_score else f", not better than best ({best_score})",
                     )
@@ -509,15 +509,15 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                     break
 
                 log.debug(
-                    "KG: /m/ candidate %r (mid=%r score=%d) — below threshold, checking next",
+                    "KG: /m/ candidate %r (mid=%r score=%d) â€” below threshold, checking next",
                     name, kg_mid, score,
                 )
 
             if not found_m:
-                log.debug("KG: no usable /m/ results for %r (all /g/ or lead-rejected) — retrying without last word", query)
+                log.debug("KG: no usable /m/ results for %r (all /g/ or lead-rejected) â€” retrying without last word", query)
             else:
                 log.debug(
-                    "KG: best so far score=%d for %r — trying shorter query",
+                    "KG: best so far score=%d for %r â€” trying shorter query",
                     best_score, query,
                 )
 
@@ -529,13 +529,13 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
 
     if best_candidate and best_score >= _KG_MIN_OVERLAP:
         log.debug(
-            "KG: retries exhausted for %r — best result: name=%r mid=%r score=%d",
+            "KG: retries exhausted for %r â€” best result: name=%r mid=%r score=%d",
             legal_name, best_candidate.get("name"), best_candidate.get("kg_mid"), best_score,
         )
         return best_candidate, all_candidates
 
     log.debug(
-        "KG: no confident match for %r — best score=%d, returning None",
+        "KG: no confident match for %r â€” best score=%d, returning None",
         legal_name, best_score,
     )
     return None, all_candidates
@@ -553,7 +553,7 @@ def upsert_quality_event(
     """Write a KG quality event for human review.
 
     event_type: 'no_kg_match' | 'low_confidence'
-    ON CONFLICT (fein): update only when the existing row is not yet resolved —
+    ON CONFLICT (fein): update only when the existing row is not yet resolved â€”
     resolved rows represent a human override and must not be clobbered.
     """
     if dry_run:
@@ -594,9 +594,9 @@ def upsert_quality_event(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Wikidata SPARQL — P646 (Freebase MID) → QID + P10311 (jobs URL)
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Wikidata SPARQL â€” P646 (Freebase MID) â†’ QID + P10311 (jobs URL)
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
     """
@@ -637,7 +637,7 @@ def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
         r = _do_request()
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
-            log.debug("SPARQL rate-limited — waiting %ds", wait)
+            log.debug("SPARQL rate-limited â€” waiting %ds", wait)
             time.sleep(wait)
             _sparql_limiter.acquire("SPARQL P646+P10311+P856 retry")
             r = _do_request()
@@ -677,18 +677,18 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
     for i in range(0, len(mids), _SPARQL_CHUNK_SIZE):
         chunk = mids[i: i + _SPARQL_CHUNK_SIZE]
         log.info(
-            "SPARQL P646+P10311+P856 batch %d–%d of %d …",
+            "SPARQL P646+P10311+P856 batch %dâ€“%d of %d â€¦",
             i + 1, min(i + _SPARQL_CHUNK_SIZE, len(mids)), len(mids),
         )
         out.update(_sparql_batch_p10311(chunk))
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Career URL disambiguation — Gemini (default) or local Qwen3-8B
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Career URL disambiguation â€” Gemini (default) or local Qwen3-8B
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ── Local (Qwen3-8B via llama_cpp) ────────────────────────────────────────────
+# â”€â”€ Local (Qwen3-8B via llama_cpp) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _llm = None
 _STRIP_THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -703,7 +703,7 @@ def _load_llm() -> bool:
         return False
     try:
         from llama_cpp import Llama
-        log.info("Loading Qwen3-8B from %s …", model_path)
+        log.info("Loading Qwen3-8B from %s â€¦", model_path)
         _llm = Llama(model_path=model_path, n_ctx=512, n_threads=2, verbose=False)
         return True
     except Exception as e:
@@ -739,7 +739,7 @@ def _qwen_pick_career_url(
     return None
 
 
-# ── Gemini backend ─────────────────────────────────────────────────────────────
+# â”€â”€ Gemini backend â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _gemini_client = None
 
@@ -751,10 +751,10 @@ def _get_gemini_client():
         api_key = os.environ.get("GEMINI_API_KEY_USER_1") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "GEMINI_API_KEY_USER_1 (or GOOGLE_API_KEY) not set — required when DISCOVER_ATS_LLM_PROVIDER=gemini"
+                "GEMINI_API_KEY_USER_1 (or GOOGLE_API_KEY) not set â€” required when DISCOVER_ATS_LLM_PROVIDER=gemini"
             )
         _gemini_client = genai.Client(api_key=api_key)
-        log.info("Gemini provider initialised — model=%s", DISCOVER_ATS_GEMINI_MODEL)
+        log.info("Gemini provider initialised â€” model=%s", DISCOVER_ATS_GEMINI_MODEL)
     return _gemini_client
 
 
@@ -775,10 +775,10 @@ def _gemini_pick_career_url(
     )
     while not can_call(DISCOVER_ATS_GEMINI_MODEL, use_case="ats_disambig"):
         if within_rpm(DISCOVER_ATS_GEMINI_MODEL):
-            # RPM is fine → daily quota exhausted; spinning won't help
-            log.debug("ats_disambig: daily quota exhausted — skipping disambiguation")
+            # RPM is fine â†’ daily quota exhausted; spinning won't help
+            log.debug("ats_disambig: daily quota exhausted â€” skipping disambiguation")
             return None
-        log.debug("ats_disambig: RPM limit reached — sleeping 5s")
+        log.debug("ats_disambig: RPM limit reached â€” sleeping 5s")
         time.sleep(5)
 
     estimated = len(prompt) // 4 + 50
@@ -810,7 +810,7 @@ def _gemini_pick_career_url(
     return None
 
 
-# ── Public interface ───────────────────────────────────────────────────────────
+# â”€â”€ Public interface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _pick_career_url(
     candidates: list[str],
@@ -820,20 +820,20 @@ def _pick_career_url(
     """Pick the best career URL from candidates using the configured LLM provider."""
     if DISCOVER_ATS_LLM_PROVIDER == "gemini":
         return _gemini_pick_career_url(candidates, company_name, website_url)
-    # local path — lazy-load Qwen3 on first call
+    # local path â€” lazy-load Qwen3 on first call
     _load_llm()
     return _qwen_pick_career_url(candidates, company_name, website_url)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Brave search helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _company_tokens(name: str) -> set[str]:
     """Extract lowercase searchable tokens from company name for domain matching."""
     stripped = strip_legal_suffixes(name).lower()
     tokens   = {w for w in re.split(r"\W+", stripped) if len(w) >= 3}
-    # also add concatenated form: "capital one" → "capitalone"
+    # also add concatenated form: "capital one" â†’ "capitalone"
     joined = re.sub(r"\W+", "", stripped)
     if len(joined) >= 4:
         tokens.add(joined)
@@ -898,12 +898,12 @@ def brave_career_search(
     Returns the chosen URL or None if quota exhausted / key missing / no match.
     """
     if not _BRAVE_API_KEY:
-        log.debug("BRAVE_API_KEY not set — skipping Brave career search")
+        log.debug("BRAVE_API_KEY not set â€” skipping Brave career search")
         return None
 
     quota = _brave_load_quota()
     if quota.get("calls", 0) >= _BRAVE_QUOTA_LIMIT:
-        log.warning("Brave monthly quota exhausted — skipping search for %r", company_name)
+        log.warning("Brave monthly quota exhausted â€” skipping search for %r", company_name)
         return None
 
     query  = f"{company_name} careers"
@@ -949,15 +949,15 @@ def brave_career_search(
         if not candidates:
             return None
         if len(candidates) == 1:
-            log.debug("Brave: single candidate → %s", candidates[0])
+            log.debug("Brave: single candidate â†’ %s", candidates[0])
             return candidates[0]
 
-        # Multiple candidates — ask LLM to pick
+        # Multiple candidates â€” ask LLM to pick
         chosen = _pick_career_url(candidates[:3], company_name, website_url)
         if chosen:
             return chosen
 
-        # LLM unavailable — return first plausible result
+        # LLM unavailable â€” return first plausible result
         log.debug("Brave: LLM unavailable, using first candidate: %s", candidates[0])
         return candidates[0]
 
@@ -966,9 +966,9 @@ def brave_career_search(
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Career page detection
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _fetch_html(url: str) -> tuple[str | None, str]:
     """
@@ -1026,11 +1026,11 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         )
         data = resp.json()
         if data.get("error") or (data.get("status") or 0) >= 400:
-            log.debug("CF Worker: %s → error=%s status=%s", url, data.get("error"), data.get("status"))
+            log.debug("CF Worker: %s â†’ error=%s status=%s", url, data.get("error"), data.get("status"))
             return None
         final_url = data.get("final_url") or url
         body      = data.get("body") or ""
-        log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
+        log.debug("CF Worker: %s â†’ %s (status=%s)", url, final_url, data.get("status"))
         return body, final_url
     except Exception as exc:
         log.debug("CF Worker request failed for %s: %s", url, exc)
@@ -1077,10 +1077,10 @@ def _resolve_website_redirect(url: str) -> str:
     Fetch the company root URL and follow redirects to detect rebrands/domain changes.
 
     Cases:
-      - Redirect fails / times out         → return original unchanged
-      - Redirect → CDN or generic host     → return original (don't trust it)
-      - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
-      - Redirect → different root domain   → return resolved (genuine rebrand)
+      - Redirect fails / times out         â†’ return original unchanged
+      - Redirect â†’ CDN or generic host     â†’ return original (don't trust it)
+      - Redirect â†’ same root domain        â†’ return resolved (httpâ†’https, wwwâ†’naked are fine)
+      - Redirect â†’ different root domain   â†’ return resolved (genuine rebrand)
     """
     if not _is_public_url(url):
         return url
@@ -1098,7 +1098,7 @@ def _resolve_website_redirect(url: str) -> str:
         if result:
             _, worker_final = result
             final_url = worker_final.rstrip("/")
-            log.debug("_resolve_website_redirect: CF Worker resolved %s → %s", url, final_url)
+            log.debug("_resolve_website_redirect: CF Worker resolved %s â†’ %s", url, final_url)
 
     if final_url is None:
         return url
@@ -1107,7 +1107,7 @@ def _resolve_website_redirect(url: str) -> str:
     orig_root  = _root_domain(url)
 
     if not final_root or final_root in _CDN_DOMAINS:
-        log.debug("_resolve_website_redirect: CDN/generic redirect (%s) — keeping original", final_root)
+        log.debug("_resolve_website_redirect: CDN/generic redirect (%s) â€” keeping original", final_root)
         return url
 
     final_parsed = urlparse(final_url)
@@ -1122,9 +1122,9 @@ def _resolve_website_redirect(url: str) -> str:
     resolved_base = f"{final_parsed.scheme}://{host}"
 
     if final_root == orig_root:
-        log.debug("_resolve_website_redirect: same root domain (%s→%s), using resolved base", url, resolved_base)
+        log.debug("_resolve_website_redirect: same root domain (%sâ†’%s), using resolved base", url, resolved_base)
     else:
-        log.info("_resolve_website_redirect: domain changed %s → %s", orig_root, final_root)
+        log.info("_resolve_website_redirect: domain changed %s â†’ %s", orig_root, final_root)
 
     return resolved_base
 
@@ -1160,7 +1160,7 @@ def discover_careers_url(
     for path in _CAREER_PATHS:
         candidates.append(base + path)
 
-    _fallback = None  # ATS-domain hit with no slug match — returned only if no better result found
+    _fallback = None  # ATS-domain hit with no slug match â€” returned only if no better result found
     for url in candidates:
         html, final_url = _fetch_html(url)
         if html is None:
@@ -1168,12 +1168,12 @@ def discover_careers_url(
 
         # Reject homepage redirects
         if _is_homepage(final_url, company_host):
-            log.debug("  %s → homepage redirect, skipping", url)
+            log.debug("  %s â†’ homepage redirect, skipping", url)
             continue
 
         # Reject SSO/auth walls
         if _is_auth_redirect(final_url):
-            log.debug("  %s → auth redirect (%s), skipping", url, final_url)
+            log.debug("  %s â†’ auth redirect (%s), skipping", url, final_url)
             continue
 
         final_root = _root_domain(final_url)
@@ -1184,27 +1184,27 @@ def discover_careers_url(
             result = match_ats_pattern(final_url)
             if result:
                 log.debug(
-                    "  %s → ATS redirect: %s slug=%s",
+                    "  %s â†’ ATS redirect: %s slug=%s",
                     url, result["platform"], result["slug"],
                 )
                 return final_url, result["platform"], result["slug"]
             # Pattern didn't match (e.g. new ATS subdomain without a known slug format).
-            # Record as fallback hint but keep probing remaining candidates — a later
-            # candidate may yield the slug-bearing URL (e.g. company.com/careers → ATS).
-            log.debug("  %s → ATS domain (%s) but no slug match — keeping as fallback", url, final_root)
+            # Record as fallback hint but keep probing remaining candidates â€” a later
+            # candidate may yield the slug-bearing URL (e.g. company.com/careers â†’ ATS).
+            log.debug("  %s â†’ ATS domain (%s) but no slug match â€” keeping as fallback", url, final_root)
             if _fallback is None:
                 _fallback = (final_url, None, None)
             continue
 
         # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
         if final_root != company_root:
-            log.debug("  %s → jumped to external domain %s, skipping", url, final_root)
+            log.debug("  %s â†’ jumped to external domain %s, skipping", url, final_root)
             continue
 
         # Fingerprint HTML for embedded ATS
         platform, slug = _find_ats_in_html(html)
         log.debug(
-            "  %s → career page found; platform=%s slug=%s",
+            "  %s â†’ career page found; platform=%s slug=%s",
             final_url, platform, slug,
         )
         return final_url, platform, slug
@@ -1212,9 +1212,9 @@ def discover_careers_url(
     return _fallback or (None, None, None)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DB helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def load_top_sponsors(limit: int, conn) -> list[dict]:
     cur = conn.cursor()
@@ -1358,17 +1358,17 @@ def _upsert_company_ats(
     """
     Write a confirmed ATS detection to company_ats for manual review.
 
-    is_monitored stays FALSE — a human must flip it before job monitor picks it up.
+    is_monitored stays FALSE â€” a human must flip it before job monitor picks it up.
     ON CONFLICT (domain, platform): update slug + priority but never touch is_monitored
     or status, so a previously reviewed entry is not reset.
 
     Before inserting, deletes any unreviewed row for the same (employer_fein, platform)
-    with a different domain — handles the case where website_url was rewritten between
-    runs (e.g. gs.com → goldmansachs.com) so dedup on (domain, platform) still works.
+    with a different domain â€” handles the case where website_url was rewritten between
+    runs (e.g. gs.com â†’ goldmansachs.com) so dedup on (domain, platform) still works.
 
     Skips the write if this domain+platform is already actively monitored in
     prospective_companies (ats_platform not null/unknown/unsupported) or in
-    company_ats (is_monitored=TRUE) — prevents duplicate monitoring.
+    company_ats (is_monitored=TRUE) â€” prevents duplicate monitoring.
     """
     cur = conn.cursor()
 
@@ -1381,7 +1381,7 @@ def _upsert_company_ats(
     """, (domain, platform))
     if cur.fetchone():
         log.debug(
-            "_upsert_company_ats: %s/%s already in prospective_companies — skipping",
+            "_upsert_company_ats: %s/%s already in prospective_companies â€” skipping",
             domain, platform,
         )
         return
@@ -1393,7 +1393,7 @@ def _upsert_company_ats(
     """, (domain, platform))
     if cur.fetchone():
         log.debug(
-            "_upsert_company_ats: %s/%s already monitored in company_ats — skipping",
+            "_upsert_company_ats: %s/%s already monitored in company_ats â€” skipping",
             domain, platform,
         )
         return
@@ -1401,7 +1401,7 @@ def _upsert_company_ats(
     # Remove stale rows for the same FEIN+platform whose domain no longer matches
     # the known employer website_url in h1b_ats_discovery.
     # Preserves legitimate brand-domain entries (e.g. lifeatspotify.com alongside
-    # spotify.com) — those still appear in h1b_ats_discovery's known URLs.
+    # spotify.com) â€” those still appear in h1b_ats_discovery's known URLs.
     # Only touches unreviewed, un-monitored rows.
     if fein:
         cur.execute("""
@@ -1437,9 +1437,9 @@ def _upsert_company_ats(
     conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Core processing
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _is_recently_checked(
     fein: str, conn, force: bool, existing: dict | None = None,
@@ -1472,16 +1472,16 @@ def process_employer(
     Enrich one employer through the full pipeline and upsert into h1b_ats_discovery.
 
     prefetched (batch mode): dict with keys canonical_name, website_url,
-    canonical_source, kg_mid, jobs_url — skips KG + SPARQL calls when provided.
+    canonical_source, kg_mid, jobs_url â€” skips KG + SPARQL calls when provided.
     """
     fein = emp["employer_fein"]
     name = emp["employer_name"]
 
-    log.info("── %s  %s", fein, name)
+    log.info("â”€â”€ %s  %s", fein, name)
 
     existing = _is_recently_checked(fein, conn, force)
     if existing:
-        log.info("  Skipping — checked recently")
+        log.info("  Skipping â€” checked recently")
         return existing
 
     if prefetched is not None:
@@ -1514,7 +1514,7 @@ def process_employer(
             canonical_name   = existing_row.get("canonical_name")
             canonical_source = existing_row.get("canonical_source")
         else:
-            log.info("  KG API …")
+            log.info("  KG API â€¦")
             kg, all_candidates = kg_search(name)
             if kg:
                 kg_mid           = kg.get("kg_mid")
@@ -1531,7 +1531,7 @@ def process_employer(
                 upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, dry_run)
 
         if kg_mid:
-            log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
+            log.info("  SPARQL P646+P10311+P856 for MID %s â€¦", kg_mid)
             sparql_res    = _sparql_batch_p10311([kg_mid])
             entry         = sparql_res.get(kg_mid, {})
             sparql_p856   = entry.get("website") or None
@@ -1540,12 +1540,12 @@ def process_employer(
             sparql_gd     = entry.get("glassdoor_id")
             sparql_cb     = entry.get("crunchbase_id")
 
-            # Domain gate — verify KG entity against LCA email-derived domain.
+            # Domain gate â€” verify KG entity against LCA email-derived domain.
             # kg_url is primary verification source; sparql_p856 is fallback.
-            # No verifiable URL OR domain mismatch → discard entire KG entry.
+            # No verifiable URL OR domain mismatch â†’ discard entire KG entry.
             if assigned_domain and not _kg_domain_gate(kg_url, sparql_p856, assigned_domain):
                 log.warning(
-                    "  KG domain mismatch: kg_url=%r p856=%r assigned=%r — discarding KG entry",
+                    "  KG domain mismatch: kg_url=%r p856=%r assigned=%r â€” discarding KG entry",
                     kg_url, sparql_p856, assigned_domain,
                 )
                 upsert_quality_event(conn, fein, name, "kg_domain_mismatch",
@@ -1585,7 +1585,7 @@ def process_employer(
     careers_source    = None   # which phase found the careers URL
 
     if jobs_url:
-        # P10311 found — use it as the careers URL, no further probing needed
+        # P10311 found â€” use it as the careers URL, no further probing needed
         careers_url    = jobs_url
         careers_source = "phase1_kg"
         log.info("  P10311 jobs URL: %s", jobs_url)
@@ -1598,7 +1598,7 @@ def process_employer(
     elif website_url:
         # Phase 3: 19-pattern probe
         website_url = _resolve_website_redirect(website_url)
-        log.info("  Probing 19 career URL patterns on %s …", website_url)
+        log.info("  Probing 19 career URL patterns on %s â€¦", website_url)
         try:
             careers_url, detected_platform, detected_slug = discover_careers_url(
                 website_url
@@ -1613,7 +1613,7 @@ def process_employer(
         # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
         if not careers_url and not skip_brave:
             search_name = canonical_name or strip_legal_suffixes(name) or name
-            log.info("  Brave search fallback for %r …", search_name)
+            log.info("  Brave search fallback for %r â€¦", search_name)
             brave_url = brave_career_search(search_name, website_url=website_url)
             if brave_url:
                 careers_url    = brave_url
@@ -1629,12 +1629,12 @@ def process_employer(
                 except Exception as e:
                     log.warning("  HTML fingerprint failed: %s", e)
 
-    # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
+    # Phase 6: career_page.py â€” 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.
     if not detected_platform and website_url:
         _cp_domain = _root_domain(website_url)
         _cp_name   = canonical_name or name
-        log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
+        log.info("  Phase 6: career_page scan on domain=%s â€¦", _cp_domain)
         try:
             from jobs.career_page import detect_via_career_page
             _phase6_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
@@ -1652,10 +1652,10 @@ def process_employer(
         except Exception as e:
             log.warning("  Phase 6 (career_page) failed: %s", e)
 
-    # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
+    # Phase 7: career_detector.py â€” Chrome-impersonation BFS, last resort
     if not detected_platform and website_url:
         _cd_domain = _root_domain(website_url)
-        log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
+        log.info("  Phase 7: career_detector BFS on domain=%s â€¦", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
             _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
@@ -1679,15 +1679,15 @@ def process_employer(
             log.warning("  Phase 7 (career_detector) failed: %s", e)
 
     # Update website_url when careers discovery reveals a different real domain.
-    # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
+    # e.g. email domain ny.email.gs.com â†’ real site goldmansachs.com via careers redirect.
     # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
-    # Only trust verified sources — Brave search (phase4) URLs are not verified by direct probe.
+    # Only trust verified sources â€” Brave search (phase4) URLs are not verified by direct probe.
     # phase7 (career_detector BFS) intentionally excluded: its careers URL may be
     # off-domain (a job board), and the guard _careers_root != _cd_domain cancelled
     # the outer _careers_root != _website_root condition, making phase7 rewrites
     # always unreachable. phase3 and phase6 are verified probes; their redirects
     # reliably indicate the company's real domain.
-    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6"}
+    _REWRITE_TRUSTED_SOURCES = {"phase6"}
     if careers_url and website_url and careers_source in _REWRITE_TRUSTED_SOURCES:
         from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)
@@ -1696,7 +1696,7 @@ def process_employer(
                 and _careers_root != _website_root
                 and _careers_root not in _KNOWN_ATS_DOMAINS
                 and _careers_root not in _GENERIC_ROOTS):
-            log.info("  Updating website_url: %s → https://%s (via careers domain)",
+            log.info("  Updating website_url: %s â†’ https://%s (via careers domain)",
                      website_url, _careers_root)
             website_url = f"https://{_careers_root}"
 
@@ -1740,14 +1740,14 @@ def process_employer(
                 slug=detected_slug,
                 priority=int(emp.get("total_approvals") or 0),
             )
-            log.info("  → company_ats upserted: %s / %s / %s", domain, detected_platform, detected_slug)
+            log.info("  â†’ company_ats upserted: %s / %s / %s", domain, detected_platform, detected_slug)
 
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Brave pass — separate monthly sweep for companies with website but no careers
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Brave pass â€” separate monthly sweep for companies with website but no careers
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _load_brave_candidates(limit: int, conn) -> list[dict]:
     """Companies enriched by KG+probe but still missing a careers URL."""
@@ -1803,13 +1803,14 @@ def _brave_upsert(fein: str, careers_url: "str | None",
     """, (platform, slug, platform, ats_source, fein))
     if careers_url:
         cur.execute("""
-            UPDATE fein_domain_map
-            SET careers_url    = %s,
-                careers_source = %s,
-                updated_at     = NOW()
-            WHERE employer_fein = %s
-              AND careers_url IS NULL
-        """, (careers_url, careers_source, fein))
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (employer_fein) DO UPDATE
+                SET careers_url    = EXCLUDED.careers_url,
+                    careers_source = EXCLUDED.careers_source,
+                    updated_at     = NOW()
+                WHERE fein_domain_map.careers_url IS NULL
+        """, (fein, careers_url, careers_source))
     conn.commit()
 
 
@@ -1822,7 +1823,7 @@ def _run_brave_pass(conn, r, args) -> None:
 
     for i, row in enumerate(candidates, 1):
         while _is_maintenance(r):
-            log.info("Maintenance window active — pausing for 30s")
+            log.info("Maintenance window active â€” pausing for 30s")
             time.sleep(30)
 
         fein         = row["employer_fein"]
@@ -1835,9 +1836,9 @@ def _run_brave_pass(conn, r, args) -> None:
         careers_url = platform = slug = None
 
         if not args.dry_run:
-            # Check quota before calling — exhaustion must not stamp brave_checked_at
+            # Check quota before calling â€” exhaustion must not stamp brave_checked_at
             if _brave_load_quota().get("calls", 0) >= _BRAVE_QUOTA_LIMIT:
-                log.warning("Brave monthly quota exhausted — stopping brave pass at %d/%d",
+                log.warning("Brave monthly quota exhausted â€” stopping brave pass at %d/%d",
                             i - 1, len(candidates))
                 break
 
@@ -1859,9 +1860,9 @@ def _run_brave_pass(conn, r, args) -> None:
                                 _ats_source = "phase5"
                     except Exception as e:
                         log.warning("  HTML fingerprint failed: %s", e)
-                log.info("  Brave → %s  platform=%s", careers_url, platform)
+                log.info("  Brave â†’ %s  platform=%s", careers_url, platform)
             else:
-                log.info("  Brave found nothing — marking as attempted")
+                log.info("  Brave found nothing â€” marking as attempted")
 
             _careers_source = "phase4" if brave_url else "brave_pass"
             _brave_upsert(fein, careers_url, platform, slug, conn,
@@ -1879,7 +1880,7 @@ def _run_brave_pass(conn, r, args) -> None:
                         slug=slug,
                         priority=int(row.get("total_approvals") or 0),
                     )
-                    log.info("  → company_ats upserted: %s / %s / %s", domain, platform, slug)
+                    log.info("  â†’ company_ats upserted: %s / %s / %s", domain, platform, slug)
         else:
             log.info("  [DRY-RUN] would Brave-search %r on %s", search_name, website_url)
 
@@ -1888,9 +1889,9 @@ def _run_brave_pass(conn, r, args) -> None:
     log.info("Brave pass done. %d candidates processed.", len(candidates))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Main
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _tally(stats: dict, result: dict, force: bool) -> None:
     if result.get("last_checked") and not force:
@@ -1930,7 +1931,7 @@ def main():
 
     if r and not args.dry_run:
         r.set(REDIS_GEMINI_LOCK, "1", ex=3600)
-        log.info("Gemini lock set (TTL=1h, renews per employer) — email_processor will pause during this run")
+        log.info("Gemini lock set (TTL=1h, renews per employer) â€” email_processor will pause during this run")
     conn = None
     try:
         init_db()
@@ -1947,7 +1948,7 @@ def main():
                 sys.exit(1)
             employers = [row]
         else:
-            log.info("Loading top %d H-1B sponsors …", args.top)
+            log.info("Loading top %d H-1B sponsors â€¦", args.top)
             employers = load_top_sponsors(args.top, conn)
             log.info("Loaded %d employers", len(employers))
 
@@ -1962,7 +1963,7 @@ def main():
                 if r and not args.dry_run:
                     r.expire(REDIS_GEMINI_LOCK, 3600)
                 while _is_maintenance(r):
-                    log.info("Maintenance window active — pausing for 30s")
+                    log.info("Maintenance window active â€” pausing for 30s")
                     time.sleep(30)
                 log.info("[%d/%d]", i, len(employers))
                 result = process_employer(
@@ -1971,9 +1972,9 @@ def main():
                 )
                 _tally(stats, result, args.force)
         else:
-            # ── Phase 1: KG API for all employers → collect kg_mids ──────────────
-            log.info("Phase 1: KG API for %d employers …", len(employers))
-            kg_map: dict[str, dict] = {}   # fein → {kg_mid, canonical_name, website_url, ...}
+            # â”€â”€ Phase 1: KG API for all employers â†’ collect kg_mids â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            log.info("Phase 1: KG API for %d employers â€¦", len(employers))
+            kg_map: dict[str, dict] = {}   # fein â†’ {kg_mid, canonical_name, website_url, ...}
             all_mids: list[str]     = []
             seen_mids: set[str]     = set()
 
@@ -2035,8 +2036,8 @@ def main():
                     seen_mids.add(mid)
                     all_mids.append(mid)
 
-            # ── Phase 2: SPARQL P646+P10311 batch for all MIDs ───────────────────
-            log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
+            # â”€â”€ Phase 2: SPARQL P646+P10311 batch for all MIDs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            log.info("Phase 2: SPARQL P10311 batch for %d MIDs â€¦", len(all_mids))
             sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
 
             _fein_to_emp = {e["employer_fein"]: e for e in employers}
@@ -2051,10 +2052,10 @@ def main():
                     sp = sparql_map.get(mid, {})
                     sparql_p856   = sp.get("website") or None
 
-                    # Domain gate — verify KG entity before accepting any of its data.
+                    # Domain gate â€” verify KG entity before accepting any of its data.
                     if assigned_domain and not _kg_domain_gate(entry.get("kg_url"), sparql_p856, assigned_domain):
                         log.warning(
-                            "  [%s] KG domain mismatch: kg_url=%r p856=%r assigned=%r — discarding",
+                            "  [%s] KG domain mismatch: kg_url=%r p856=%r assigned=%r â€” discarding",
                             fein, entry.get("kg_url"), sparql_p856, assigned_domain,
                         )
                         upsert_quality_event(
@@ -2088,8 +2089,8 @@ def main():
                 else:
                     entry["website_url"] = None
 
-            # ── Phase 3: career probe + upsert ───────────────────────────────────
-            log.info("Phase 3: career probe for %d employers …", len(employers))
+            # â”€â”€ Phase 3: career probe + upsert â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            log.info("Phase 3: career probe for %d employers â€¦", len(employers))
             for i, emp in enumerate(employers, 1):
                 if r and not args.dry_run:
                     r.expire(REDIS_GEMINI_LOCK, 3600)
@@ -2098,7 +2099,7 @@ def main():
                 if entry.get("skip"):
                     continue
                 while _is_maintenance(r):
-                    log.info("Maintenance window active — pausing for 30s")
+                    log.info("Maintenance window active â€” pausing for 30s")
                     time.sleep(30)
                 log.info("[%d/%d career] %s  %s", i, len(employers), fein, emp["employer_name"])
                 result = process_employer(
@@ -2121,10 +2122,11 @@ def main():
         if r and not args.dry_run:
             try:
                 r.delete(REDIS_GEMINI_LOCK)
-                log.info("Gemini lock cleared — email_processor resuming")
+                log.info("Gemini lock cleared â€” email_processor resuming")
             except Exception as exc:
                 log.warning("Failed to clear Gemini lock: %s", exc)
 
 
 if __name__ == "__main__":
     main()
+

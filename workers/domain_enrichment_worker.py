@@ -1,15 +1,15 @@
-"""
-workers/domain_enrichment_worker.py — Domain enrichment worker for H1B pipeline.
+﻿"""
+workers/domain_enrichment_worker.py â€” Domain enrichment worker for H1B pipeline.
 
 Reads from Redis ZSET domain_enrichment_queue (score = petition_count, highest first).
 For each company FEIN:
-  1. Resolves assigned_domain → public_domain (HTTP redirect / root fallback / CT log)
-  2. Phase 3: probe career paths → careers_url
+  1. Resolves assigned_domain â†’ public_domain (HTTP redirect / root fallback / CT log)
+  2. Phase 3: probe career paths â†’ careers_url
   3. Phase 6: scan careers_url for ATS platform + slug (bonus)
   4. Writes results to fein_domain_map (and company_ats if ATS found)
   5. Pushes to discovery_queue if petition_count > 0
 
-Worker exits cleanly when queue is empty — not a perpetual daemon.
+Worker exits cleanly when queue is empty â€” not a perpetual daemon.
 Started by:
   - fuzzy_match_uscis_dol.py   (after bulk queue population)
   - staleness_checker cron      (every ENRICH_STALENESS_DAYS days, default 90; also for
@@ -51,21 +51,21 @@ from workers.redis_client import get_redis
 log = get_logger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phase 3 import — discover_careers_url lives in scripts/discover_h1b_ats.py
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Phase 3 import â€” discover_careers_url lives in scripts/discover_h1b_ats.py
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 try:
     from scripts.discover_h1b_ats import discover_careers_url as _discover_careers_url
     _PHASE3_AVAILABLE = True
 except Exception as _e:
-    log.warning("Phase 3 unavailable (import failed): %s — skipping career path probe", _e)
+    log.warning("Phase 3 unavailable (import failed): %s â€” skipping career path probe", _e)
     _PHASE3_AVAILABLE = False
 
 
 def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
     if not _PHASE3_AVAILABLE:
-        log.debug("phase3 unavailable (import-time failure) — skipping for %s", website_url)
+        log.debug("phase3 unavailable (import-time failure) â€” skipping for %s", website_url)
         return None, None, None
     try:
         return _discover_careers_url(website_url)
@@ -74,15 +74,15 @@ def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
         return None, None, None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Maintenance window
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
     except Exception as exc:
-        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
+        log.warning("Redis maintenance check failed (%s) â€” assuming not in maintenance", exc)
         return False
 
 
@@ -104,9 +104,9 @@ redis.call('ZADD', KEYS[2], 0, res)
 return {res, '0'}
 """
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Delayed queue — certspotter 429 re-queue with not_before timestamp
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Delayed queue â€” certspotter 429 re-queue with not_before timestamp
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int,
                      trigger: str = "delayed_retry", source=None) -> None:
@@ -115,7 +115,7 @@ def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int,
                           "trigger": trigger, "source": source})
     not_before = time.time() + delay_s
     r.zadd(ENRICHMENT_DELAYED, {payload: not_before})
-    log.info("re-queued %s to enrichment:delayed — retry in %ds", fein, delay_s)
+    log.info("re-queued %s to enrichment:delayed â€” retry in %ds", fein, delay_s)
 
 
 def _flush_delayed(r) -> int:
@@ -136,22 +136,22 @@ def _flush_delayed(r) -> int:
             r.zrem(ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:
-            log.warning("Failed to flush delayed item %r: %s — sending to DLQ", item, e)
+            log.warning("Failed to flush delayed item %r: %s â€” sending to DLQ", item, e)
             r.lpush(ENRICHMENT_DLQ, json.dumps({
                 "fein": "MALFORMED", "error_reason": "malformed_payload",
                 "last_error": str(e), "raw": repr(item), "failed_at": time.time(),
             }))
             r.zrem(ENRICHMENT_DELAYED, item)
         except Exception as e:
-            log.warning("delayed flush: Redis error for %r — will retry next cycle (%s)", item, e)
+            log.warning("delayed flush: Redis error for %r â€” will retry next cycle (%s)", item, e)
     if moved:
         log.info("Flushed %d delayed items to enrichment:batch", moved)
     return moved
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Retry tracking
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _RETRY_KEY_PREFIX = "enrichment:retry:"
 _RETRY_TTL_S      = 86400 * 7  # 7 days
@@ -172,9 +172,9 @@ def _clear_retry(r, fein: str) -> None:
     r.delete(f"{_RETRY_KEY_PREFIX}{fein}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DLQ
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
     payload = json.dumps({
@@ -187,9 +187,9 @@ def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
     log.error("DLQ: fein=%s reason=%s retries=%d", fein, error_reason, retry_count)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # DB helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _load_company(conn, fein: str) -> "dict | None":
     row = conn.execute("""
@@ -222,7 +222,7 @@ def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> No
             WHERE employer_fein = %s
         """, (public_domain, method, fein))
     else:
-        # Resolution failed — preserve any previously stored domain; only advance the staleness timestamp
+        # Resolution failed â€” preserve any previously stored domain; only advance the staleness timestamp
         conn.execute("""
             UPDATE fein_domain_map
             SET last_enriched_at = NOW(),
@@ -285,9 +285,9 @@ def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" =
                   fein, trigger, petition_count)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Per-company processing
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment",
                      source: "str | None" = None) -> bool:
@@ -302,7 +302,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn = get_conn()
         company = _load_company(conn, fein)
         if not company:
-            log.warning("fein=%s trigger=%s not found in fein_domain_map — permanent skip (LCA not yet ingested?)", fein, trigger)
+            log.warning("fein=%s trigger=%s not found in fein_domain_map â€” permanent skip (LCA not yet ingested?)", fein, trigger)
             try:
                 conn.execute(
                     "INSERT INTO fein_domain_map (employer_fein, last_enriched_at)"
@@ -317,7 +317,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         assigned = company["assigned_domain"]
         if not assigned:
-            log.warning("fein=%s trigger=%s assigned_domain is NULL — permanent skip (no email domain in LCA data)", fein, trigger)
+            log.warning("fein=%s trigger=%s assigned_domain is NULL â€” permanent skip (no email domain in LCA data)", fein, trigger)
             conn.execute(
                 "UPDATE fein_domain_map SET last_enriched_at = NOW() WHERE employer_fein = %s",
                 (fein,),
@@ -332,12 +332,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
-        # ── Step 1: public domain resolution ──────────────────────────────────
+        # â”€â”€ Step 1: public domain resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         public_domain, method, retry_after = discover_public_domain(assigned)
 
         if retry_after is not None:
-            # Certspotter quota exhausted — re-queue with delay, don't count as retry
-            log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
+            # Certspotter quota exhausted â€” re-queue with delay, don't count as retry
+            log.info("fein=%s certspotter quota â€” re-queuing in %ds", fein, retry_after)
             _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source)
             return True
 
@@ -353,7 +353,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
         log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
 
-        # ── Step 2: Phase 3 — career path probe (always runs) ────────────────
+        # â”€â”€ Step 2: Phase 3 â€” career path probe (always runs) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Routing upstream (entry check + head_check) guarantees we only arrive
         # here when careers_url is missing or dead, so no guard needed.
         careers_url = None
@@ -367,13 +367,13 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             conn.commit()
             log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
 
-        # ── Step 3: Phase 6 — career page ATS scan (only if Phase 3 found nothing) ──
+        # â”€â”€ Step 3: Phase 6 â€” career page ATS scan (only if Phase 3 found nothing) â”€â”€
         p6_platform = None
         p6_slug     = None
-        if not careers_url:
+        if not p3_platform:
             try:
                 p6_result = detect_via_career_page(
-                    employer_name, probe_domain, careers_url=None,
+                    employer_name, probe_domain, careers_url=careers_url,
                 )
             except Exception as e:
                 log.warning("Phase 6 error for fein=%s: %s", fein, e)
@@ -403,12 +403,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         conn.commit()
 
-        # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
+        # â”€â”€ Step 4: push to discovery (skip on_demand â€” loop stops here) â”€â”€â”€â”€â”€
         if (trigger != "on_demand"
                 and db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
-        # ── Metrics — reflect only persisted ATS data ─────────────────────────
+        # â”€â”€ Metrics â€” reflect only persisted ATS data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         ats_source   = None
         ats_platform = None
         ats_slug     = None
@@ -455,9 +455,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             conn.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Inflight crash recovery
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _reclaim_inflight(r, inflight_key: str) -> None:
     """Re-queue any FEINs left in the per-instance inflight ZSET from a prior crash."""
@@ -477,12 +477,12 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
             pc   = int(score)
         r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight fein=%s pc=%d → enrichment:batch", fein, pc)
+        log.info("reclaimed inflight fein=%s pc=%d â†’ enrichment:batch", fein, pc)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Main loop
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def run_worker(once: bool = False) -> None:
     r = get_redis()
@@ -509,13 +509,13 @@ def run_worker(once: bool = False) -> None:
                     _maint_start = time.monotonic()
                 elapsed = time.monotonic() - _maint_start
                 if elapsed > _MAINTENANCE_MAX_S:
-                    log.error("Maintenance window exceeded %dh — exiting to allow restart",
+                    log.error("Maintenance window exceeded %dh â€” exiting to allow restart",
                               _MAINTENANCE_MAX_S // 3600)
                     return
-                log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
+                log.info("Maintenance window active â€” pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
-            # Promote any delayed items that are now ready → enrichment:batch
+            # Promote any delayed items that are now ready â†’ enrichment:batch
             _flush_delayed(r)
 
             # Pop on_demand LIST first (priority), fall back to batch ZSET
@@ -531,22 +531,22 @@ def run_worker(once: bool = False) -> None:
                     # Guard against producer-enqueue race: re-flush and re-check once.
                     _flush_delayed(r)
                     if r.llen(ENRICHMENT_ON_DEMAND) == 0 and r.zcard(ENRICHMENT_BATCH) == 0:
-                        log.info("Enrichment queues empty — exiting")
+                        log.info("Enrichment queues empty â€” exiting")
                         break
                     time.sleep(1)
                     continue
                 if once:
-                    log.info("Enrichment queues empty (--once); %d delayed item(s) — exiting",
+                    log.info("Enrichment queues empty (--once); %d delayed item(s) â€” exiting",
                              r.zcard(ENRICHMENT_DELAYED))
                     break
                 _, next_ts = earliest[0]
                 wait_s = min(30.0, max(1.0, next_ts - time.time()))
-                log.info("Enrichment queues empty; %d delayed item(s) — sleeping %.0fs",
+                log.info("Enrichment queues empty; %d delayed item(s) â€” sleeping %.0fs",
                          r.zcard(ENRICHMENT_DELAYED), wait_s)
                 time.sleep(wait_s)
                 continue
 
-            raw_member = _pop_result[0]  # str (decode_responses=True) — already in inflight
+            raw_member = _pop_result[0]  # str (decode_responses=True) â€” already in inflight
 
             # Parse fein + trigger + source + petition_count from JSON payload
             try:
@@ -564,7 +564,7 @@ def run_worker(once: bool = False) -> None:
                     source         = None
                     petition_count = int(float(_pop_result[1]))
                 else:
-                    log.error("malformed queue member %r — sending to DLQ", raw_member)
+                    log.error("malformed queue member %r â€” sending to DLQ", raw_member)
                     r.lpush(ENRICHMENT_DLQ, json.dumps({
                         "fein": "MALFORMED", "error_reason": "malformed_member",
                         "raw": repr(raw_member), "failed_at": time.time(),
@@ -588,7 +588,7 @@ def run_worker(once: bool = False) -> None:
                     _move_to_dlq(r, fein, "processing_error", count)
                     _clear_retry(r, fein)
                 else:
-                    delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
+                    delay_s = 30 * (4 ** (count - 1))  # 30s â†’ 120s â†’ 480s
                     _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
@@ -603,7 +603,7 @@ def run_worker(once: bool = False) -> None:
     finally:
         hb.stop()
 
-    log.info("domain-enrichment-worker stopped — processed %d companies", processed["n"])
+    log.info("domain-enrichment-worker stopped â€” processed %d companies", processed["n"])
 
 
 if __name__ == "__main__":

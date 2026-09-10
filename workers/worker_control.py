@@ -1,4 +1,4 @@
-"""
+﻿"""
 workers/worker_control.py — Shared helper for starting and stopping systemd worker units.
 
 Used by:
@@ -28,8 +28,6 @@ DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 # that pass the template unit don't get silently skipped.
 _KNOWN_UNITS = frozenset(HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS + (
     "head-check-worker",
-    "domain-enrichment-worker",
-    "discover-h1b-ats-worker",
 ))
 
 

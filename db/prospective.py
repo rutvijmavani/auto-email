@@ -1,4 +1,4 @@
-# db/prospective.py — Prospective company DB operations
+﻿# db/prospective.py — Prospective company DB operations
 
 import os
 from datetime import datetime, timezone
@@ -110,38 +110,40 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
     # ats_platform: NULL when unknown (get_detection_queue Priority 1),
     #               set here when already detected by caller.
     # ON CONFLICT(company) DO NOTHING replaces INSERT OR IGNORE (SQLite).
-    c.execute("""
-        INSERT INTO prospective_companies
-            (company, priority, status, domain, ats_detected_at, ats_platform, ats_slug)
-        VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, ?, ?)
-        ON CONFLICT(company) DO NOTHING
-    """, (company, priority, domain, platform, slug))
-    conn.commit()
-    inserted = c.rowcount > 0
-    if not inserted:
-        # Update domain/platform/slug if company already existed and values are provided.
-        # Treat 'unknown'/'unsupported' as sentinels — replace them when a real platform
-        # is supplied, same as NULL.  Slug empty-string is likewise treated as absent.
-        # Each field: keep the existing value when it is already real; otherwise
-        # upgrade to the incoming value — but only when the incoming value is
-        # non-NULL/non-empty.  COALESCE(?, existing) means a NULL incoming arg
-        # falls back to the stored value, so sentinels like "unknown" are
-        # preserved rather than erased.
+    try:
         c.execute("""
-            UPDATE prospective_companies
-            SET domain       = COALESCE(NULLIF(domain, ''),                                     COALESCE(?, domain)),
-                ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), COALESCE(?, ats_platform)),
-                ats_slug     = CASE
-                    WHEN NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported') IS NULL
-                         THEN COALESCE(NULLIF(?, ''), NULLIF(ats_slug, ''), ats_slug)
-                    WHEN ? = ats_platform
-                         THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
-                    ELSE ats_slug
-                END
-            WHERE company = ?
-        """, (domain, platform, slug, platform, slug, company))
+            INSERT INTO prospective_companies
+                (company, priority, status, domain, ats_detected_at, ats_platform, ats_slug)
+            VALUES (?, ?, 'pending', ?, CURRENT_TIMESTAMP, ?, ?)
+            ON CONFLICT(company) DO NOTHING
+        """, (company, priority, domain, platform, slug))
         conn.commit()
-    conn.close()
+        inserted = c.rowcount > 0
+        if not inserted:
+            # Update domain/platform/slug if company already existed and values are provided.
+            # Treat 'unknown'/'unsupported' as sentinels — replace them when a real platform
+            # is supplied, same as NULL.  Slug empty-string is likewise treated as absent.
+            # Each field: keep the existing value when it is already real; otherwise
+            # upgrade to the incoming value — but only when the incoming value is
+            # non-NULL/non-empty.  COALESCE(?, existing) means a NULL incoming arg
+            # falls back to the stored value, so sentinels like "unknown" are
+            # preserved rather than erased.
+            c.execute("""
+                UPDATE prospective_companies
+                SET domain       = COALESCE(NULLIF(domain, ''),                                     COALESCE(?, domain)),
+                    ats_platform = COALESCE(NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported'), COALESCE(?, ats_platform)),
+                    ats_slug     = CASE
+                        WHEN NULLIF(NULLIF(ats_platform, 'unknown'), 'unsupported') IS NULL
+                             THEN COALESCE(NULLIF(?, ''), NULLIF(ats_slug, ''), ats_slug)
+                        WHEN ? = ats_platform
+                             THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
+                        ELSE ats_slug
+                    END
+                WHERE company = ?
+            """, (domain, platform, slug, platform, slug, company))
+            conn.commit()
+    finally:
+        conn.close()
     return inserted
 
 
@@ -187,9 +189,11 @@ def get_pending_prospective(limit=None):
     """
     if limit:
         query += f" LIMIT {int(limit)}"
-    c.execute(query)
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
+    try:
+        c.execute(query)
+        rows = [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
     return rows
 
 
@@ -211,8 +215,10 @@ def get_prospective_companies(status=None):
             SELECT * FROM prospective_companies
             ORDER BY priority DESC, created_at ASC
         """)
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
+    try:
+        rows = [dict(r) for r in c.fetchall()]
+    finally:
+        conn.close()
     return rows
 
 
@@ -236,14 +242,16 @@ def mark_prospective_scraped(company_key):
         return
     company = _normalize_company(company_key)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE prospective_companies
-        SET status = 'scraped', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status = 'pending'
-    """, (company,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE prospective_companies
+            SET status = 'scraped', scraped_at = CURRENT_TIMESTAMP
+            WHERE company = ? AND status = 'pending'
+        """, (company,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def mark_prospective_exhausted(company_key):
@@ -266,14 +274,16 @@ def mark_prospective_exhausted(company_key):
         return
     company = _normalize_company(company_key)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE prospective_companies
-        SET status = 'exhausted', scraped_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status = 'pending'
-    """, (company,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE prospective_companies
+            SET status = 'exhausted', scraped_at = CURRENT_TIMESTAMP
+            WHERE company = ? AND status = 'pending'
+        """, (company,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def mark_prospective_converted(company):
@@ -283,14 +293,16 @@ def mark_prospective_converted(company):
     """
     company = _normalize_company(company)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        UPDATE prospective_companies
-        SET status = 'converted', converted_at = CURRENT_TIMESTAMP
-        WHERE company = ? AND status IN ('pending', 'scraped')
-    """, (company,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            UPDATE prospective_companies
+            SET status = 'converted', converted_at = CURRENT_TIMESTAMP
+            WHERE company = ? AND status IN ('pending', 'scraped')
+        """, (company,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def is_prospective(company):
@@ -301,13 +313,15 @@ def is_prospective(company):
     """
     company = _normalize_company(company)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT id FROM prospective_companies
-        WHERE company = ? AND status = 'scraped'
-    """, (company,))
-    row = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT id FROM prospective_companies
+            WHERE company = ? AND status = 'scraped'
+        """, (company,))
+        row = c.fetchone()
+    finally:
+        conn.close()
     return row is not None
 
 
@@ -316,15 +330,17 @@ def get_prospective_status_summary():
     Return count of companies per status for --prospects-status report.
     """
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT status, COUNT(*) as count
-        FROM prospective_companies
-        GROUP BY status
-        ORDER BY status
-    """)
-    rows = {r["status"]: r["count"] for r in c.fetchall()}
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT status, COUNT(*) as count
+            FROM prospective_companies
+            GROUP BY status
+            ORDER BY status
+        """)
+        rows = {r["status"]: r["count"] for r in c.fetchall()}
+    finally:
+        conn.close()
     return rows
 
 
@@ -332,12 +348,14 @@ def get_prospective_company(company):
     """Return single prospective company record or None."""
     company = _normalize_company(company)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute("""
-        SELECT * FROM prospective_companies WHERE company = ?
-    """, (company,))
-    row = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT * FROM prospective_companies WHERE company = ?
+        """, (company,))
+        row = c.fetchone()
+    finally:
+        conn.close()
     return dict(row) if row else None
 
 def get_domain_for_prospective(company_key):
@@ -360,13 +378,15 @@ def get_domain_for_prospective(company_key):
         return ""
     company = _normalize_company(company_key)
     conn = get_conn()
-    c = conn.cursor()
-    c.execute(
-        "SELECT domain FROM prospective_companies WHERE company = ?",
-        (company,)
-    )
-    row = c.fetchone()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT domain FROM prospective_companies WHERE company = ?",
+            (company,)
+        )
+        row = c.fetchone()
+    finally:
+        conn.close()
     if row and row["domain"]:
         return row["domain"].split(".")[0]
     return ""

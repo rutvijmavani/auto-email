@@ -1,4 +1,4 @@
-"""
+﻿"""
 scripts/startup_failure_alert.py — Startup failure alert for systemd OnFailure=.
 
 Called automatically by recruiter-pipeline-alert@<service>.service when a pipeline
@@ -73,6 +73,7 @@ _ONESHOT_SERVICES = frozenset({
 _VALID_TEMPLATES = frozenset({
     "discover-h1b-ats-worker",
     "domain-enrichment-worker",
+    "head-check-worker",
 })
 
 # Matches "prefix-N" produced by OnFailure=...@%p-%i.service in template worker units.
