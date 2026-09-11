@@ -64,7 +64,6 @@ def _regression_block(conn, col, label, days):
             WHERE run_at > NOW() - %s::interval
             ORDER BY employer_fein, period, run_at DESC
         ) sub
-        WHERE {col} IS NOT NULL
         GROUP BY period, {col}
         ORDER BY period DESC, n DESC
     """, (f"{days} days", f"{days * 2} days"))
@@ -177,12 +176,13 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         cu_rows = conn.execute("""
             SELECT careers_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) careers_source, careers_url
+                SELECT DISTINCT ON (employer_fein) careers_source
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - %s::interval
+                  AND careers_url IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE careers_url IS NOT NULL
+            WHERE careers_source IS NOT NULL
             GROUP BY careers_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -214,12 +214,13 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         ats_rows = conn.execute("""
             SELECT ats_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) ats_source, ats_platform
+                SELECT DISTINCT ON (employer_fein) ats_source
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE ats_platform IS NOT NULL
+            WHERE ats_source IS NOT NULL
             GROUP BY ats_source
             ORDER BY n DESC
         """, (f"{days} days",)).fetchall()
@@ -235,9 +236,9 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 SELECT DISTINCT ON (employer_fein) ats_platform
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE ats_platform IS NOT NULL
         """, (f"{days} days",)).fetchone()
         plat_total = (_plat_total_row["total"] if _plat_total_row else 0) or 0
 
@@ -247,9 +248,9 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 SELECT DISTINCT ON (employer_fein) ats_platform
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE ats_platform IS NOT NULL
             GROUP BY ats_platform
             ORDER BY companies DESC
             LIMIT 15
