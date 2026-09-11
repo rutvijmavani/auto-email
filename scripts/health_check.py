@@ -628,6 +628,117 @@ def run_health_check() -> int:
         _row("WARNING", "coverage", f"DB query failed: {exc}")
         warnings += 1
 
+    # ── H1B PIPELINE METRICS ─────────────────────────────────────────────────
+    _section("H1B PIPELINE METRICS  (last 7 days)")
+    conn = None
+    try:
+        from db.connection import get_conn as _get_conn
+        conn = _get_conn()
+
+        # Public domain breakdown (enrichment worker) — newest run per fein only
+        pd_rows = conn.execute("""
+            SELECT public_domain_method, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) public_domain_method
+                FROM h1b_enrichment_metrics
+                WHERE worker = 'domain_enrichment'
+                  AND run_at > NOW() - INTERVAL '7 days'
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            GROUP BY public_domain_method
+            ORDER BY n DESC
+        """).fetchall()
+
+        # Career URL breakdown (both workers) — newest run per fein only
+        cu_rows = conn.execute("""
+            SELECT careers_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) careers_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND careers_url IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            WHERE careers_source IS NOT NULL
+            GROUP BY careers_source
+            ORDER BY n DESC
+        """).fetchall()
+
+        # ATS detection breakdown (both workers) — newest run per fein only
+        ats_rows = conn.execute("""
+            SELECT ats_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND ats_platform IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            WHERE ats_source IS NOT NULL
+            GROUP BY ats_source
+            ORDER BY n DESC
+        """).fetchall()
+
+        # Totals
+        pd_total  = sum(r["n"] for r in pd_rows)
+        cu_total  = sum(r["n"] for r in cu_rows)
+        ats_total = sum(r["n"] for r in ats_rows)
+
+        if pd_total == 0 and cu_total == 0 and ats_total == 0:
+            _row("WARNING", "h1b metrics", "no data yet — workers haven't run")
+            warnings += 1
+        else:
+            def _breakdown(rows, total):
+                if not total:
+                    return "no data"
+                return "  ".join(
+                    f"{list(r.values())[0] or '?'} {list(r.values())[1] / total * 100:.0f}%"
+                    for r in rows
+                )
+
+            # Public domain — NULL method (worker crashed before writing) counts as unresolved
+            if pd_total == 0:
+                _row("WARNING", "public domain", "no data in last 7 days — enrichment worker may not have run")
+                warnings += 1
+            else:
+                no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
+                null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
+                pd_found    = pd_total - no_signal - null_method
+                pd_detail = _breakdown(pd_rows, pd_total)
+                if (no_signal + null_method) / pd_total > 0.15:
+                    _row("WARNING", "public domain",
+                         f"{pd_found}/{pd_total} resolved  {pd_detail}")
+                    warnings += 1
+                else:
+                    _row("OK", "public domain",
+                         f"{pd_found}/{pd_total} resolved  {pd_detail}")
+
+            # Career URL
+            if cu_total == 0:
+                _row("WARNING", "career URL", "none found in last 7 days")
+                warnings += 1
+            else:
+                _row("OK", "career URL",
+                     f"{cu_total} found  {_breakdown(cu_rows, cu_total)}")
+
+            # ATS detection
+            if ats_total == 0:
+                _row("WARNING", "ATS detected", "none found in last 7 days")
+                warnings += 1
+            else:
+                _row("OK", "ATS detected",
+                     f"{ats_total} found  {_breakdown(ats_rows, ats_total)}")
+
+    except Exception as exc:
+        _row("WARNING", "h1b metrics", f"DB query failed: {exc}")
+        warnings += 1
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     # ── HUNG WORKERS ─────────────────────────────────────────────────────────
     _section("HUNG WORKERS  (heartbeat alive, no progress update)")
     try:

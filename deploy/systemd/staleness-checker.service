@@ -1,0 +1,25 @@
+[Unit]
+Description=H1B enrichment/discovery staleness checker
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+Requires=postgresql.service redis.service
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=oneshot
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+ExecStart=/home/opc/mail/venv/bin/python -m scripts.staleness_checker
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindPaths=/home/opc/mail
+ReadWritePaths=/home/opc/mail
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=staleness-checker

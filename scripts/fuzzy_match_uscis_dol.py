@@ -1,4 +1,4 @@
-"""
+﻿"""
 scripts/fuzzy_match_uscis_dol.py — Fuzzy matching for unresolved USCIS → DOL rows.
 
 For each row in uscis_dol_unmatched, this script:
@@ -44,6 +44,7 @@ _FUZZY_AUTO_THRESHOLD  = 95   # score >= this → auto-match without LLM (match_
 _FUZZY_DOMINANT_SCORE  = 80   # dominant-winner rule: best >= this AND gap >= _FUZZY_DOMINANT_GAP
 _FUZZY_DOMINANT_GAP    = 25   # minimum gap between best and second score to auto-match
 _TOP_N_CANDIDATES      = 3    # max candidates sent to LLM when score < auto threshold
+_ZADD_PIPELINE_BATCH   = 500  # flush Redis pipeline every N items to cap memory per batch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -312,6 +313,47 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
     )
     if not dry_run and queued > 0:
         log.info("%d ambiguous entries queued — h1b-llm-worker will resolve them asynchronously", queued)
+
+    if not dry_run:
+        _populate_enrichment_queue(conn, r)
+
+
+def _populate_enrichment_queue(conn, r) -> None:
+    """
+    After fuzzy matching completes, push all eligible FEINs to domain_enrichment_queue.
+    Eligible = last_enriched_at IS NULL OR last_enriched_at older than ENRICH_STALENESS_DAYS.
+    Score = petition_count (highest priority first).
+    Workers are started on demand by manager.py (autoscaled on queue depth).
+    """
+    from config import ENRICHMENT_BATCH, ENRICH_STALENESS_DAYS
+
+    # Named server-side cursor: PostgreSQL streams rows on demand instead of
+    # buffering the full result set in memory before the first row arrives.
+    pipe = r.pipeline(transaction=False)
+    i = 0
+    with conn.named_cursor("populate_enrichment_queue") as named_cur:
+        named_cur.itersize = 500
+        named_cur.execute("""
+            SELECT f.employer_fein,
+                   COALESCE(u.petition_count, 0) AS petition_count
+            FROM fein_domain_map f
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE f.last_enriched_at IS NULL
+               OR f.last_enriched_at < NOW() - %s::interval
+        """, (f"{ENRICH_STALENESS_DAYS} days",))
+        for row in named_cur:
+            member = json.dumps({"fein": row["employer_fein"], "trigger": "enrichment", "source": None})
+            pipe.zadd(ENRICHMENT_BATCH, {member: row["petition_count"]}, gt=True)
+            i += 1
+            if i % _ZADD_PIPELINE_BATCH == 0:
+                pipe.execute()
+                pipe = r.pipeline(transaction=False)
+    if i == 0:
+        log.info("enrichment queue: no eligible companies — skipping")
+        return
+    if i % _ZADD_PIPELINE_BATCH != 0:
+        pipe.execute()
+    log.info("enrichment queue: pushed %d companies (ZSET scored by petition_count)", i)
 
 
 def _backfill_candidates() -> None:

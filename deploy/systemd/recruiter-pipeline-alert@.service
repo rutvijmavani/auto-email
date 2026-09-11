@@ -1,10 +1,13 @@
 [Unit]
 Description=Recruiter Pipeline startup failure alert for %i
-# This is a template unit — %i is the name of the failed service.
-# Triggered by OnFailure=recruiter-pipeline-alert@%p.service in other units.
-# Use %p (unit prefix, e.g. "recruiter-scheduler"), NOT %n (full unit name with
-# suffix), so the instantiation resolves to "recruiter-pipeline-alert@recruiter-scheduler"
-# rather than "recruiter-pipeline-alert@recruiter-scheduler.service".
+# This is a template unit — %i is passed from the failing unit.
+# Non-template units use:    OnFailure=recruiter-pipeline-alert@%p.service
+#   → %i = "recruiter-scheduler"  (plain service name)
+# Template worker units use: OnFailure=recruiter-pipeline-alert@%p-%i.service
+#   → %i = "domain-enrichment-worker-1"  (prefix-instance, no @)
+# startup_failure_alert.py detects the prefix-N format and translates it to
+# "prefix@N.service" for journalctl — preserving instance-specific log retrieval.
+# Do NOT use %n (full name with .service suffix) — it would produce a double suffix.
 # Sends a single email saying which service hit its StartLimitBurst.
 #
 # Network ordering: the alert script sends email — it must wait for full

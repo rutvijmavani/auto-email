@@ -1,0 +1,322 @@
+﻿"""
+scripts/pipeline_metrics.py â€” H1B enrichment pipeline performance report.
+
+Shows which phase found public_domain / careers_url / ATS for each company,
+phase-level success rates, and regression detection (last 30 days vs prior 30 days).
+
+Usage:
+    python scripts/pipeline_metrics.py
+    python scripts/pipeline_metrics.py --days 14
+    python scripts/pipeline_metrics.py --no-signal-top 20
+"""
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from db.connection import get_conn
+from logger import get_logger, init_logging
+
+log = get_logger(__name__)
+
+_SEP  = "â”€" * 70
+_DSEP = "â•" * 70
+
+
+def _pct(n, total):
+    return f"{n / total * 100:.1f}%" if total else "â€”"
+
+
+def _phase_table(rows, total, label):
+    print(f"\n  {label}  (total: {total})")
+    print(f"  {'Phase':<18} {'Count':>8}  {'%':>7}")
+    print(f"  {_SEP[:40]}")
+    for r in rows:
+        phase_key = next(k for k in r.keys() if k != "n")
+        phase = r[phase_key] or "null/skipped"
+        count = r["n"]
+        print(f"  {phase:<18} {count:>8}  {_pct(count, total):>7}")
+
+
+_REGRESSION_COLS = frozenset({"public_domain_method", "careers_source", "ats_source"})
+
+
+def _regression_block(conn, col, label, days):
+    """Compare phase distribution: last N days vs prior N days."""
+    if col not in _REGRESSION_COLS:
+        raise ValueError(f"Unknown metric column: {col!r}")
+    cur = conn.execute(f"""
+        SELECT
+            period,
+            {col},
+            COUNT(*) AS n
+        FROM (
+            SELECT DISTINCT ON (employer_fein, period)
+                CASE
+                    WHEN run_at > NOW() - %s::interval THEN 'recent'
+                    ELSE 'prior'
+                END AS period,
+                employer_fein,
+                {col}
+            FROM h1b_enrichment_metrics
+            WHERE run_at > NOW() - %s::interval
+            ORDER BY employer_fein, period, run_at DESC
+        ) sub
+        GROUP BY period, {col}
+        ORDER BY period DESC, n DESC
+    """, (f"{days} days", f"{days * 2} days"))
+    rows = cur.fetchall()
+    if not rows:
+        return
+
+    from collections import defaultdict
+    by_period = defaultdict(dict)
+    for r in rows:
+        by_period[r["period"]][r[col] or "null"] = r["n"]
+
+    recent = by_period.get("recent", {})
+    prior  = by_period.get("prior", {})
+    phases = sorted(set(list(recent.keys()) + list(prior.keys())))
+
+    if not recent and not prior:
+        return
+
+    print(f"\n  {label} â€” regression check (recent {days}d vs prior {days}d)")
+    print(f"  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Î”':>8}")
+    print(f"  {_SEP[:52]}")
+
+    r_total = sum(recent.values())
+    p_total = sum(prior.values())
+
+    for phase in phases:
+        r_n = recent.get(phase, 0)
+        p_n = prior.get(phase, 0)
+        r_p = r_n / r_total * 100 if r_total else 0
+        p_p = p_n / p_total * 100 if p_total else 0
+        delta = r_p - p_p
+        delta_str = f"{delta:+.1f}pp"
+        flag = "  âš " if abs(delta) >= 10 else ""
+        print(f"  {phase:<18} {r_n:>5} ({r_p:>4.0f}%)  {p_n:>5} ({p_p:>4.0f}%)  {delta_str:>8}{flag}")
+
+
+def run_report(days: int = 7, no_signal_top: int = 10) -> None:
+    conn = get_conn()
+    try:
+        print(f"\n{_DSEP}")
+        print(f"  H1B ENRICHMENT PIPELINE METRICS  (last {days} days)")
+        print(f"{_DSEP}")
+
+        # â”€â”€ PUBLIC DOMAIN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        print(f"\n  {_SEP}")
+        print("  PUBLIC DOMAIN  (domain_enrichment_worker)")
+        print(f"  {_SEP}")
+
+        pd_rows = conn.execute("""
+            SELECT public_domain_method, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) public_domain_method
+                FROM h1b_enrichment_metrics
+                WHERE worker = 'domain_enrichment'
+                  AND run_at > NOW() - %s::interval
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            GROUP BY public_domain_method
+            ORDER BY n DESC
+        """, (f"{days} days",)).fetchall()
+
+        pd_total = sum(r["n"] for r in pd_rows)
+        _phase_table(pd_rows, pd_total, "Resolution method")
+
+        no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
+        null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
+        unresolved  = no_signal + null_method
+        if pd_total:
+            print(f"\n  Coverage: {pd_total - unresolved}/{pd_total} resolved "
+                  f"({_pct(pd_total - unresolved, pd_total)})  "
+                  f"no_signal: {no_signal} ({_pct(no_signal, pd_total)})")
+
+        # Top unresolved companies (high petition_count, no public domain)
+        # Use the latest metrics row per employer so resolved companies are excluded.
+        if no_signal_top > 0:
+            unresolved_rows = conn.execute("""
+                SELECT m.employer_fein, e.employer_name,
+                       COALESCE(u.petition_count, 0) AS petition_count,
+                       f.assigned_domain
+                FROM (
+                    SELECT DISTINCT ON (employer_fein)
+                        employer_fein, public_domain_method
+                    FROM h1b_enrichment_metrics
+                    WHERE worker = 'domain_enrichment'
+                      AND run_at > NOW() - %s::interval
+                    ORDER BY employer_fein, run_at DESC
+                ) m
+                JOIN dol_h1b_employers e ON e.employer_fein = m.employer_fein
+                JOIN fein_domain_map f   ON f.employer_fein = m.employer_fein
+                LEFT JOIN uscis_petition_counts u ON u.employer_fein = m.employer_fein
+                WHERE m.public_domain_method = 'no_signal'
+                ORDER BY petition_count DESC
+                LIMIT %s
+            """, (f"{days} days", no_signal_top)).fetchall()
+
+            if unresolved_rows:
+                print(f"\n  Top {no_signal_top} unresolved (no_signal) â€” high priority targets:")
+                print(f"  {'FEIN':<14} {'Petitions':>10}  {'Domain':<25}  Name")
+                print(f"  {_SEP}")
+                for r in unresolved_rows:
+                    print(f"  {r['employer_fein']:<14} {r['petition_count']:>10}  "
+                          f"{r['assigned_domain'] or 'â€”':<25}  {r['employer_name']}")
+
+        # â”€â”€ CAREER URL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        print(f"\n  {_SEP}")
+        print("  CAREER URL  (both workers)")
+        print(f"  {_SEP}")
+
+        cu_rows = conn.execute("""
+            SELECT careers_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) careers_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - %s::interval
+                  AND careers_url IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            WHERE careers_source IS NOT NULL
+            GROUP BY careers_source
+            ORDER BY n DESC
+        """, (f"{days} days",)).fetchall()
+
+        cu_total = sum(r["n"] for r in cu_rows)
+        _phase_table(cu_rows, cu_total, "Source phase")
+
+        # Companies where the latest metrics row has a careers_url but no ATS
+        no_ats_careers = conn.execute("""
+            SELECT COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein)
+                    employer_fein, careers_url, ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - %s::interval
+                ORDER BY employer_fein, run_at DESC
+            ) latest
+            WHERE careers_url IS NOT NULL AND ats_platform IS NULL
+        """, (f"{days} days",)).fetchone()["n"]
+        if no_ats_careers:
+            print(f"\n  âš   {no_ats_careers} companies have careers_url but no ATS detected "
+                  f"â€” discovery worker may need another pass")
+
+        # â”€â”€ ATS DETECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        print(f"\n  {_SEP}")
+        print("  ATS DETECTION  (both workers)")
+        print(f"  {_SEP}")
+
+        ats_rows = conn.execute("""
+            SELECT ats_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            WHERE ats_source IS NOT NULL
+            GROUP BY ats_source
+            ORDER BY n DESC
+        """, (f"{days} days",)).fetchall()
+
+        ats_total = sum(r["n"] for r in ats_rows)
+        _phase_table(ats_rows, ats_total, "Detection phase")
+
+        # ATS platform breakdown â€” latest run per employer only
+        # Compute total across ALL platforms first so percentages use the real denominator.
+        _plat_total_row = conn.execute("""
+            SELECT COUNT(*) AS total
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+        """, (f"{days} days",)).fetchone()
+        plat_total = (_plat_total_row["total"] if _plat_total_row else 0) or 0
+
+        plat_rows = conn.execute("""
+            SELECT ats_platform, COUNT(*) AS companies
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_platform
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - %s::interval
+                  AND ats_platform IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
+            GROUP BY ats_platform
+            ORDER BY companies DESC
+            LIMIT 15
+        """, (f"{days} days",)).fetchall()
+
+        if plat_rows:
+            print("\n  Platform breakdown  (top 15 by company count):")
+            print(f"  {'Platform':<25} {'Companies':>10}  {'%':>7}")
+            print(f"  {_SEP[:46]}")
+            for r in plat_rows:
+                print(f"  {r['ats_platform']:<25} {r['companies']:>10}  "
+                      f"{_pct(r['companies'], plat_total):>7}")
+
+        # â”€â”€ REGRESSION DETECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        print(f"\n  {_SEP}")
+        print("  REGRESSION DETECTION")
+        print(f"  {_SEP}")
+
+        _regression_block(conn, "public_domain_method", "Public domain", days)
+        _regression_block(conn, "careers_source",       "Career URL",    days)
+        _regression_block(conn, "ats_source",           "ATS detection", days)
+
+        # â”€â”€ PERFORMANCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        print(f"\n  {_SEP}")
+        print("  PROCESSING PERFORMANCE")
+        print(f"  {_SEP}")
+
+        perf = conn.execute("""
+            SELECT
+                worker,
+                COUNT(*)                              AS runs,
+                ROUND(AVG(duration_ms))               AS avg_ms,
+                ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY duration_ms)) AS p50_ms,
+                ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)) AS p95_ms,
+                MAX(duration_ms)                      AS max_ms
+            FROM h1b_enrichment_metrics
+            WHERE run_at > NOW() - %s::interval
+              AND duration_ms IS NOT NULL
+            GROUP BY worker
+            ORDER BY worker
+        """, (f"{days} days",)).fetchall()
+
+        if perf:
+            print(f"\n  {'Worker':<25} {'Runs':>8}  {'Avg':>8}  {'p50':>8}  {'p95':>8}  {'Max':>8}")
+            print(f"  {_SEP[:70]}")
+            for r in perf:
+                print(f"  {r['worker']:<25} {r['runs']:>8}  "
+                      f"{r['avg_ms']:>6}ms  {r['p50_ms']:>6}ms  "
+                      f"{r['p95_ms']:>6}ms  {r['max_ms']:>6}ms")
+
+        print(f"\n{_DSEP}\n")
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    init_logging("pipeline_metrics")
+    parser = argparse.ArgumentParser(description="H1B enrichment pipeline metrics report")
+    parser.add_argument("--days",           type=int, default=7,
+                        help="Report window in days (default: 7)")
+    parser.add_argument("--no-signal-top",  type=int, default=10,
+                        help="Top N unresolved companies to show (default: 10)")
+    args = parser.parse_args()
+    if args.days < 1:
+        parser.error("--days must be at least 1")
+    if args.no_signal_top < 0:
+        parser.error("--no-signal-top must be 0 or greater")
+    run_report(days=args.days, no_signal_top=args.no_signal_top)

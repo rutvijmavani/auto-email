@@ -1,8 +1,9 @@
-import base64
+﻿import base64
 import hmac
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timezone
 
 import requests as _requests
@@ -15,8 +16,14 @@ from googleapiclient.discovery import build
 load_dotenv()
 
 from logger import get_logger, init_logging, cleanup_logs_if_due
-from config import REDIS_EMAIL_PUSH
+from config import (
+    ENRICHMENT_ON_DEMAND,
+    HEAD_CHECK_CACHE_TTL_S,
+    HEAD_CHECK_ON_DEMAND,
+    REDIS_EMAIL_PUSH,
+)
 from db.applications import add_application
+from db.connection import get_conn
 from db.gmail_tokens import upsert_token, update_watch
 from workers.redis_client import get_redis
 
@@ -30,6 +37,14 @@ _GIST_CONFIG_URL    = os.environ.get("GIST_CONFIG_URL", "")  # same Gist used by
 init_logging('api')
 logger = get_logger(__name__)
 
+try:
+    from workers.startup import validate_startup
+    validate_startup("api", check_db=False, check_config=False)
+except SystemExit as _startup_exc:
+    raise RuntimeError(
+        "api: Redis startup check failed — see stderr above"
+    ) from _startup_exc
+
 app = Flask(__name__)
 
 _API_KEY = os.environ.get('EXTENSION_API_KEY', '')
@@ -40,6 +55,10 @@ def _cors(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-API-Key'
     response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
     return response
+
+
+def _cors_preflight():
+    return _cors(make_response('', 204))
 
 
 @app.before_request
@@ -346,6 +365,128 @@ def oauth_callback():
         return jsonify({"error": "token stored but watch failed — retry /oauth/start"}), 500
 
     return jsonify({"status": "authorized", "email": gmail_email})
+
+
+_VERIFY_STALE_DAYS = 30  # re-verify after this many days
+
+
+def _trigger_enrichment(fein: str, r=None) -> None:
+    """LPUSH fein to enrichment:on_demand for immediate re-enrichment. Fire-and-forget."""
+    try:
+        _r = r if r is not None else get_redis()
+        member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None})
+        _r.lpush(ENRICHMENT_ON_DEMAND, member)
+        logger.info("verify-company: queued re-enrichment fein=%s → enrichment:on_demand", fein)
+    except Exception as exc:
+        logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
+
+
+@app.route('/verify-company', methods=['POST', 'OPTIONS'])
+def verify_company():
+    """
+    On-demand career URL verification. Called by the UI/extension when a user
+    visits a company page. Always returns immediately with cached data.
+    If the careers_url fails a HEAD check, re-enrichment is triggered silently.
+
+    POST body: {"fein": "123456789", "user_id": 1}   (user_id optional)
+    Response:  {"careers_url": "...", "ats_platform": "...", "stale": bool}
+    """
+    if request.method == 'OPTIONS':
+        return _cors_preflight()
+
+    if not _API_KEY:
+        return jsonify({'error': 'API key not configured'}), 503
+    if not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
+        return jsonify({'error': 'unauthorized'}), 401
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'request body must be a JSON object'}), 400
+    fein = data.get('fein')
+    if not isinstance(fein, str) or not fein.strip():
+        return jsonify({'error': 'fein is required'}), 400
+    fein = fein.strip()
+    if not fein.isdigit() or len(fein) != 9:
+        return jsonify({'error': 'fein must be a 9-digit number'}), 400
+
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT
+                f.employer_fein,
+                f.public_domain,
+                f.careers_url,
+                f.careers_url_verified_at,
+                ca.platform AS ats_platform,
+                ca.slug     AS ats_slug
+            FROM fein_domain_map f
+            LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
+            WHERE f.employer_fein = %s
+            ORDER BY ca.priority DESC NULLS LAST,
+                     ca.detected_at DESC NULLS LAST,
+                     ca.slug NULLS LAST
+            LIMIT 1
+        """, (fein,)).fetchone()
+    except Exception as exc:
+        logger.error("verify-company: DB error for fein=%s: %s", fein, exc)
+        return jsonify({'error': 'internal error'}), 500
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+
+    if row is None:
+        return jsonify({'error': 'company not found'}), 404
+
+    careers_url = row['careers_url']
+    # Determine staleness synchronously from DB timestamp; the background HEAD
+    # check will trigger re-enrichment if needed but can't update this response.
+    _verified_at = row.get('careers_url_verified_at')
+    if not careers_url:
+        _is_stale = True
+    elif _verified_at is None:
+        _is_stale = True  # never verified
+    else:
+        if _verified_at.tzinfo is None:  # guard: psycopg2 returns aware for TIMESTAMPTZ, but be safe
+            _verified_at = _verified_at.replace(tzinfo=timezone.utc)
+        _age_days = (datetime.now(timezone.utc) - _verified_at).days
+        _is_stale = _age_days > _VERIFY_STALE_DAYS
+    payload = {
+        'careers_url':  careers_url,
+        'ats_platform': row['ats_platform'],
+        'ats_slug':     row['ats_slug'],
+        'stale':        _is_stale,
+    }
+
+    try:
+        _r_client = get_redis()
+    except Exception:
+        _r_client = None
+
+    if not careers_url:
+        # No careers URL — queue full enrichment to find one
+        _trigger_enrichment(fein, _r_client)
+    else:
+        # careers URL known — delegate liveness check to head_check_worker
+        try:
+            if _r_client is not None:
+                _cooldown_key = f"verify_company:cooldown:{fein}"
+                if _r_client.set(_cooldown_key, 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S):
+                    try:
+                        _r_client.lpush(
+                            HEAD_CHECK_ON_DEMAND,
+                            json.dumps({"fein": fein, "trigger": "on_demand", "source": None}),
+                        )
+                        logger.info("verify-company: queued head check fein=%s → head_check:on_demand", fein)
+                    except Exception as exc:
+                        logger.error("verify-company: failed to queue head check fein=%s: %s", fein, exc)
+                        _r_client.delete(_cooldown_key)
+        except Exception as exc:
+            logger.error("verify-company: failed to queue head check fein=%s: %s", fein, exc)
+
+    return jsonify(payload), 200
 
 
 if __name__ == '__main__':

@@ -366,13 +366,13 @@ def populate_unmatched() -> None:
             )
         """).rowcount
 
-        # Step 3: insert truly new rows — queued_for_llm defaults to FALSE
+        # Step 3: insert truly new rows — set queued_for_llm = FALSE explicitly
         inserted = conn.execute("""
             INSERT INTO uscis_dol_unmatched
                 (employer_name, employer_name_norm, employer_legal_norm,
-                 tax_id, fiscal_year, state, total_approvals)
+                 tax_id, fiscal_year, state, total_approvals, queued_for_llm)
             SELECT n.employer_name, n.employer_name_norm, n.employer_legal_norm,
-                   n.tax_id, n.fiscal_year, n.state, n.total_approvals
+                   n.tax_id, n.fiscal_year, n.state, n.total_approvals, FALSE
             FROM _new_unmatched n
             WHERE NOT EXISTS (
                 SELECT 1 FROM uscis_dol_unmatched u

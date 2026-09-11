@@ -1,4 +1,4 @@
-# db/schema.py — Database schema creation and cleanup (PostgreSQL)
+﻿# db/schema.py — Database schema creation and cleanup (PostgreSQL)
 #
 # All DDL uses PostgreSQL syntax:
 #   BIGSERIAL PRIMARY KEY   instead of INTEGER PRIMARY KEY AUTOINCREMENT
@@ -36,6 +36,7 @@ from config import (
     RETENTION_PIPELINE_ALERTS,
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
+    RETENTION_ENRICHMENT_METRICS_DAYS,
 )
 
 
@@ -220,6 +221,11 @@ def _cleanup_custom_ats_inspection(c):
             SELECT company FROM prospective_companies
         )
     """)
+
+
+def _cleanup_h1b_enrichment_metrics(c):
+    cutoff = (datetime.now() - timedelta(days=RETENTION_ENRICHMENT_METRICS_DAYS)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM h1b_enrichment_metrics WHERE run_at < %s", (cutoff,))
 
 
 def _cleanup_unmatched_emails(c):
@@ -953,10 +959,11 @@ def init_db():
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
 
-    # monitor_stats: new per-run metrics (in_flight, fallback_scanned)
+    # monitor_stats: new per-run metrics (in_flight, fallback_scanned, enrichment_queued)
     for col, defn in [
-        ("in_flight",        "INTEGER DEFAULT 0"),
-        ("fallback_scanned", "INTEGER DEFAULT 0"),
+        ("in_flight",          "INTEGER DEFAULT 0"),
+        ("fallback_scanned",   "INTEGER DEFAULT 0"),
+        ("enrichment_queued",  "INTEGER DEFAULT 0"),
     ]:
         c.execute(
             f"ALTER TABLE monitor_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
@@ -1079,6 +1086,22 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_prospective_company_nocase
         ON prospective_companies(company)
     """)
+    # Expression index: supports the NOT EXISTS anti-join in job_monitor.py and
+    # the domain-lookup in 3_Discover.py _pipeline_status. The expression strips
+    # the URL scheme (https?://) then the www. prefix, matching the query predicate.
+    # Only dropped and recreated when the stored expression differs — avoids an index
+    # rebuild on every init_db() call; IF NOT EXISTS would silently retain the old expression.
+    _idx_pc_row = c.execute("""
+        SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'idx_pc_domain_norm' AND tablename = 'prospective_companies'
+    """).fetchone()
+    if _idx_pc_row is None or "LOWER(domain)" not in (_idx_pc_row["indexdef"] or ""):
+        c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
+        c.execute("""
+            CREATE INDEX idx_pc_domain_norm
+            ON prospective_companies (regexp_replace(regexp_replace(LOWER(domain), '^https?://', ''), '^www\\.', ''))
+            WHERE domain IS NOT NULL
+        """)
 
     # ── Multi-user migrations (2026-07-15) ───────────────────────────────────
     # All statements are idempotent (IF NOT EXISTS / ON CONFLICT / IF EXISTS).
@@ -1546,7 +1569,14 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS sample_apply_url TEXT
     """)
-
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS ats_source TEXT
+    """)
+    c.execute("""
+        ALTER TABLE h1b_ats_discovery
+        ADD COLUMN IF NOT EXISTS careers_source TEXT
+    """)
     # ── KG quality events — low-confidence / no-match companies for review ────
     c.execute("""
         CREATE TABLE IF NOT EXISTS h1b_ats_quality_events (
@@ -1593,6 +1623,74 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_fein_domain_low_conf
         ON fein_domain_map (low_confidence)
+    """)
+    # Enrichment worker columns — safe no-op on fresh installs
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain TEXT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_method TEXT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_enriched_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_source TEXT")
+    # Expression index: supports the LATERAL join in job_monitor.py that matches
+    # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
+    # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.
+    # Only dropped and recreated when the stored expression is stale (lacks https?://).
+    _idx_fdm_row = c.execute("""
+        SELECT indexdef FROM pg_indexes
+        WHERE indexname = 'idx_fdm_assigned_domain_norm' AND tablename = 'fein_domain_map'
+    """).fetchone()
+    if _idx_fdm_row is None or "https?://" not in (_idx_fdm_row["indexdef"] or ""):
+        c.execute("DROP INDEX IF EXISTS idx_fdm_assigned_domain_norm")
+        c.execute("""
+            CREATE INDEX idx_fdm_assigned_domain_norm
+            ON fein_domain_map (regexp_replace(regexp_replace(LOWER(assigned_domain), '^https?://', ''), '^www\\.', ''))
+            WHERE assigned_domain IS NOT NULL
+        """)
+
+    # Backfill: careers_url moved from h1b_ats_discovery to fein_domain_map.
+    # Copy any data that exists in the old column before dropping it.
+    c.execute("""
+        UPDATE fein_domain_map f
+        SET careers_url = d.careers_url
+        FROM h1b_ats_discovery d
+        WHERE d.employer_fein = f.employer_fein
+          AND d.careers_url IS NOT NULL
+          AND f.careers_url IS NULL
+    """)
+    c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
+
+    # Pipeline performance metrics — one row per company per worker run.
+    # Tracks which phase found public_domain / careers_url / ATS so regressions
+    # are visible without log diving.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS h1b_enrichment_metrics (
+            id                   BIGSERIAL    PRIMARY KEY,
+            employer_fein        TEXT         NOT NULL,
+            run_at               TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            worker               TEXT         NOT NULL,
+            trigger              TEXT,
+            public_domain_method TEXT,
+            public_domain        TEXT,
+            careers_source       TEXT,
+            careers_url          TEXT,
+            ats_source           TEXT,
+            ats_platform         TEXT,
+            ats_slug             TEXT,
+            duration_ms          INT
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_fein
+        ON h1b_enrichment_metrics (employer_fein)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_run_at
+        ON h1b_enrichment_metrics (run_at DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_h1b_enrichment_metrics_worker
+        ON h1b_enrichment_metrics (worker, run_at DESC)
     """)
 
     # lca_contacts: one row per unique POC email — deduplicated across all quarterly files.
@@ -1656,6 +1754,7 @@ def init_db():
             platform                TEXT        NOT NULL,
             slug                    TEXT        NOT NULL,
             source                  TEXT        NOT NULL,
+            trigger_source          TEXT,
             is_monitored            BOOLEAN     NOT NULL DEFAULT FALSE,
             status                  TEXT        NOT NULL DEFAULT 'pending',
             priority                INTEGER     NOT NULL DEFAULT 0,
@@ -1686,6 +1785,17 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_company_ats_fein
         ON company_ats (employer_fein)
         WHERE employer_fein IS NOT NULL
+    """)
+    # Safe no-op on fresh installs (column already in CREATE TABLE above)
+    c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS trigger_source TEXT")
+    c.execute("ALTER TABLE company_ats ADD COLUMN IF NOT EXISTS stale_since TIMESTAMPTZ")
+    # Expression index on company_ats.domain: strips the www. prefix so bare-domain
+    # lookups match www-prefixed stored values. company_ats.domain stores bare domains
+    # (no scheme), so no scheme-stripping is needed here.
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ca_domain_norm
+        ON company_ats (regexp_replace(LOWER(domain), '^www\\.', ''))
+        WHERE domain IS NOT NULL
     """)
 
     # ── Wage aggregates on existing tables (2026-08-10) ───────────────────────
@@ -1741,6 +1851,60 @@ def init_db():
     _cleanup_custom_ats_inspection(c)
     _cleanup_seen_job_ids(c)
     _cleanup_unmatched_emails(c)
+    _cleanup_h1b_enrichment_metrics(c)
+
+    # Two disjoint sets of USCIS petitions contribute to each DOL FEIN:
+    #   1. Fuzzy/LLM-matched rows (in uscis_dol_fuzzy_map)
+    #   2. Direct-matched rows (employer_legal_norm = employer_name_norm + last-4 FEIN match)
+    #      — populate_unmatched() excludes these from uscis_dol_unmatched, so they never
+    #        enter uscis_dol_fuzzy_map. Without the UNION they contribute 0 to the view.
+    # The two sets are mutually exclusive by construction (populate_unmatched filters both),
+    # so UNION ALL is safe — no (employer_legal_norm, tax_id) pair can appear in both.
+    c.execute("""
+        CREATE OR REPLACE VIEW uscis_petition_counts AS
+            SELECT employer_fein, SUM(petition_count)::bigint AS petition_count FROM (
+                -- Fuzzy/LLM matched USCIS → DOL (via uscis_dol_fuzzy_map)
+                -- NOT EXISTS guard: if DOL data was re-ingested after fuzzy matching ran,
+                -- a fuzzy_map entry might now satisfy the direct-match criteria too.
+                -- Exclude those petitions from this branch so they're only counted once (below).
+                SELECT um.dol_fein AS employer_fein,
+                       COALESCE(SUM(
+                           p.new_employment_approval + p.continuation_approval +
+                           p.change_same_employer_approval + p.new_concurrent_approval +
+                           p.change_of_employer_approval + p.amended_approval
+                       ), 0) AS petition_count
+                FROM uscis_dol_fuzzy_map um
+                LEFT JOIN uscis_h1b_petitions p
+                    ON p.employer_legal_norm = um.employer_legal_norm
+                    AND p.tax_id = um.tax_id
+                    AND NOT EXISTS (
+                        SELECT 1 FROM dol_h1b_employers d2
+                        WHERE (um.employer_legal_norm = d2.employer_name_norm
+                            OR p.employer_name_norm   = d2.trade_name_dba_norm)
+                          AND right(d2.employer_fein, 4) = um.tax_id
+                    )
+                GROUP BY um.dol_fein
+
+                UNION ALL
+
+                -- Direct matches (norm name + last-4 FEIN) — never inserted into fuzzy_map
+                SELECT d.employer_fein,
+                       COALESCE(SUM(
+                           p.new_employment_approval + p.continuation_approval +
+                           p.change_same_employer_approval + p.new_concurrent_approval +
+                           p.change_of_employer_approval + p.amended_approval
+                       ), 0) AS petition_count
+                FROM dol_h1b_employers d
+                JOIN uscis_h1b_petitions p
+                    ON (
+                        p.employer_legal_norm = d.employer_name_norm
+                     OR p.employer_name_norm  = d.trade_name_dba_norm
+                    )
+                   AND right(d.employer_fein, 4) = p.tax_id
+                GROUP BY d.employer_fein
+            ) sub
+            GROUP BY employer_fein
+    """)
 
     conn.commit()
     conn.close()

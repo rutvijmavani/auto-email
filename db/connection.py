@@ -192,6 +192,30 @@ class _Connection:
             self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         )
 
+    def named_cursor(self, name: str, itersize: int = 500):
+        """Return a context manager yielding a server-side streaming cursor.
+
+        Use for large result sets — PostgreSQL streams rows on demand instead
+        of buffering the full result in memory before the first row arrives.
+
+        IMPORTANT: the returned cursor is a raw psycopg2 cursor and does NOT
+        go through _adapt_sql. Callers must use %s placeholders (PostgreSQL
+        style), not ? (SQLite style).
+
+        Example:
+            with conn.named_cursor("my_cursor") as cur:
+                cur.execute("SELECT * FROM t WHERE id = %s", (id,))
+                for row in cur:
+                    ...
+        """
+        cur = self._conn.cursor(
+            name=name,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+            withhold=False,
+        )
+        cur.itersize = itersize
+        return cur
+
     # ── Shorthand execute ────────────────
 
     def execute(self, sql: str, params=None) -> _Cursor:

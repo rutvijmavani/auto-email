@@ -283,7 +283,7 @@ def get_all_monitored_companies():
     """
     conn = get_conn()
     try:
-        rows = conn.execute("""
+        rows = conn.execute(r"""
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
                    last_checked_at, consecutive_empty_days,
@@ -303,6 +303,18 @@ def get_all_monitored_companies():
                 domain
             FROM company_ats
             WHERE is_monitored = TRUE
+              AND stale_since IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM prospective_companies pc
+                  WHERE regexp_replace(LOWER(regexp_replace(pc.domain, '^https?://', '')), '^www\.', '') =
+                        regexp_replace(LOWER(regexp_replace(company_ats.domain, '^https?://', '')), '^www\.', '')
+                    AND pc.ats_platform IS NOT NULL
+                    AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+                    AND pc.ats_slug IS NOT NULL
+                    AND (pc.ats_platform != 'custom'
+                         OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                             AND json_extract_text(pc.ats_slug, '$.url') <> ''))
+              )
 
             ORDER BY company ASC
         """).fetchall()
@@ -330,43 +342,70 @@ def get_monitorable_companies():
     try:
         # json_extract_text() is a safe PL/pgSQL helper defined in init_db()
         # that returns NULL for non-JSON input (catches cast exceptions).
-        rows = conn.execute("""
-            SELECT company, ats_platform, ats_slug,
-                   ats_detected_at, first_scanned_at,
-                   last_checked_at, consecutive_empty_days
-            FROM prospective_companies
-            WHERE ats_platform IS NOT NULL
-              AND ats_platform NOT IN ('unknown', 'unsupported')
-              AND ats_slug IS NOT NULL
+        rows = conn.execute(r"""
+            SELECT pc.company, pc.ats_platform, pc.ats_slug,
+                   pc.ats_detected_at, pc.first_scanned_at,
+                   pc.last_checked_at, pc.consecutive_empty_days,
+                   pc.domain,
+                   f.employer_fein,
+                   COALESCE(u.petition_count, 0)::int AS petition_count
+            FROM prospective_companies pc
+            LEFT JOIN LATERAL (
+                SELECT employer_fein
+                FROM fein_domain_map
+                WHERE regexp_replace(regexp_replace(LOWER(assigned_domain), '^https?://', ''), '^www\.', '') = regexp_replace(regexp_replace(LOWER(pc.domain), '^https?://', ''), '^www\.', '')
+                ORDER BY confidence DESC NULLS LAST, employer_fein
+                LIMIT 1
+            ) f ON true
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+            WHERE pc.ats_platform IS NOT NULL
+              AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+              AND pc.ats_slug IS NOT NULL
               AND (
-                  ats_platform != 'custom'
+                  pc.ats_platform != 'custom'
                   OR
-                  (ats_platform = 'custom'
-                   AND json_extract_text(ats_slug, '$.url') IS NOT NULL
-                   AND json_extract_text(ats_slug, '$.url') <> '')
+                  (pc.ats_platform = 'custom'
+                   AND json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                   AND json_extract_text(pc.ats_slug, '$.url') <> '')
               )
 
             UNION ALL
 
             SELECT
-                'ca:' || id::text          AS company,
-                platform                   AS ats_platform,
-                slug                       AS ats_slug,
+                'ca:' || ca.id::text       AS company,
+                ca.platform                AS ats_platform,
+                ca.slug                    AS ats_slug,
                 NULL                       AS ats_detected_at,
-                first_scanned_at,
-                last_checked_at,
-                consecutive_empty_days
-            FROM company_ats
-            WHERE is_monitored = TRUE
-              AND platform IS NOT NULL
-              AND platform NOT IN ('unknown', 'unsupported')
-              AND slug IS NOT NULL
+                ca.first_scanned_at,
+                ca.last_checked_at,
+                ca.consecutive_empty_days,
+                ca.domain,
+                ca.employer_fein,
+                COALESCE(u.petition_count, 0)::int AS petition_count
+            FROM company_ats ca
+            LEFT JOIN uscis_petition_counts u ON u.employer_fein = ca.employer_fein
+            WHERE ca.is_monitored = TRUE
+              AND ca.stale_since IS NULL
+              AND ca.platform IS NOT NULL
+              AND ca.platform NOT IN ('unknown', 'unsupported')
+              AND ca.slug IS NOT NULL
               AND (
-                  platform != 'custom'
+                  ca.platform != 'custom'
                   OR (
-                      json_extract_text(slug, '$.url') IS NOT NULL
-                      AND json_extract_text(slug, '$.url') <> ''
+                      json_extract_text(ca.slug, '$.url') IS NOT NULL
+                      AND json_extract_text(ca.slug, '$.url') <> ''
                   )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM prospective_companies pc
+                  WHERE regexp_replace(LOWER(regexp_replace(pc.domain, '^https?://', '')), '^www\.', '') =
+                        regexp_replace(LOWER(regexp_replace(ca.domain, '^https?://', '')), '^www\.', '')
+                    AND pc.ats_platform IS NOT NULL
+                    AND pc.ats_platform NOT IN ('unknown', 'unsupported')
+                    AND pc.ats_slug IS NOT NULL
+                    AND (pc.ats_platform != 'custom'
+                         OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
+                             AND json_extract_text(pc.ats_slug, '$.url') <> ''))
               )
 
             ORDER BY company ASC
@@ -487,8 +526,8 @@ def save_monitor_stats(stats):
                total_jobs_fetched, new_jobs_found,
                jobs_matched_filters, run_duration_seconds,
                pdf_generated, email_sent,
-               in_flight, fallback_scanned)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               in_flight, fallback_scanned, enrichment_queued)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
                 companies_monitored    = EXCLUDED.companies_monitored,
                 companies_with_results = EXCLUDED.companies_with_results,
@@ -501,7 +540,8 @@ def save_monitor_stats(stats):
                 pdf_generated          = EXCLUDED.pdf_generated,
                 email_sent             = EXCLUDED.email_sent,
                 in_flight              = EXCLUDED.in_flight,
-                fallback_scanned       = EXCLUDED.fallback_scanned
+                fallback_scanned       = EXCLUDED.fallback_scanned,
+                enrichment_queued      = EXCLUDED.enrichment_queued
         """, (
             today,
             stats.get("companies_monitored",    0),
@@ -516,6 +556,7 @@ def save_monitor_stats(stats):
             stats.get("email_sent",              0),
             stats.get("in_flight",               0),
             stats.get("fallback_scanned",        0),
+            stats.get("enrichment_queued",       0),
         ))
         conn.commit()
     finally:

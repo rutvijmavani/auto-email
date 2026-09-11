@@ -1,4 +1,4 @@
-"""
+﻿"""
 tests/test_manager.py
 ─────────────────────────────────────────────────────────────────────────────
 Comprehensive test suite for workers/manager.py Layer 0 autoscaler.
@@ -623,6 +623,72 @@ class TestQueueMetrics(unittest.TestCase):
         # scan and fullscan should still compute
         self.assertEqual(metrics["scan"]["depth"], 5)
 
+    def test_enrichment_depth_from_zcard(self):
+        """domain_enrichment depth = ZCARD(domain_enrichment_queue)."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zrange.return_value = []
+        r.zcard.side_effect = lambda k: 42 if k == mgr.ENRICHMENT_BATCH else 0
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["domain_enrichment"]["depth"], 42)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
+
+    def test_discovery_depth_from_zcard(self):
+        """discovery depth = ZCARD(discovery_queue)."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zrange.return_value = []
+        r.zcard.side_effect = lambda k: 17 if k == mgr.DISCOVERY_BATCH else 0
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["discovery"]["depth"], 17)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
+
+    def test_enrichment_delay_from_delayed_zset(self):
+        """domain_enrichment delay_s is always 0.0 — batch ZSET score=petition_count, not timestamp."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zcard.return_value = 0
+        r.scan_iter.return_value = []
+        r.zrange.return_value = []
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
+
+    def test_discovery_delay_from_delayed_zset(self):
+        """discovery delay_s is always 0.0 — batch/redetect ZSETs use score=petition_count, not timestamp."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 0
+        r.zcard.return_value = 0
+        r.scan_iter.return_value = []
+        r.zrange.return_value = []
+        metrics = mgr._get_queue_metrics(r)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
+
+    def test_enrichment_discovery_redis_zcard_failure(self):
+        """zcard failure in enrichment/discovery block falls back to zero; other pools unaffected."""
+        r = MagicMock()
+        r.llen.return_value = 0
+        r.lindex.return_value = None
+        r.zcount.return_value = 5   # scan/fullscan have overdue items
+        r.zrange.return_value = []  # no delayed items
+        r.zcard.side_effect = Exception("Redis connection refused")
+        metrics = mgr._get_queue_metrics(r)
+        # enrichment + discovery fall back to zeros on zcard failure
+        self.assertEqual(metrics["domain_enrichment"]["depth"], 0)
+        self.assertEqual(metrics["domain_enrichment"]["delay_s"], 0.0)
+        self.assertEqual(metrics["discovery"]["depth"], 0)
+        self.assertEqual(metrics["discovery"]["delay_s"], 0.0)
+        # scan and fullscan are in separate try blocks — still report normally
+        self.assertEqual(metrics["scan"]["depth"], 5)
+        self.assertEqual(metrics["fullscan"]["depth"], 5)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # § 7 — busy_ms: SCAN+sum, missing keys, utilization computation
@@ -984,7 +1050,7 @@ class TestBootstrapMode(unittest.TestCase):
     def test_bootstrap_ceil_values_match_production_fleet(self):
         """Bootstrap ceilings should match current production defaults."""
         self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     10)
-        self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],    6)
+        self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],   10)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["fullscan"],  5)
 
     def test_bootstrap_days_required_is_28(self):
@@ -1049,8 +1115,8 @@ class TestScalingParams(unittest.TestCase):
             self.assertIn("delay_warn_s", mgr._FALLBACK_PARAMS[pool])
 
     def test_delay_warn_values_are_sensible(self):
-        """DELAY_WARN_S values: detail=60, scan=1800, fullscan=7200 (fallbacks)."""
-        self.assertEqual(mgr._FALLBACK_PARAMS["detail"]["delay_warn_s"],   60)
+        """DELAY_WARN_S values: detail=300, scan=1800, fullscan=7200 (fallbacks)."""
+        self.assertEqual(mgr._FALLBACK_PARAMS["detail"]["delay_warn_s"],  300)
         self.assertEqual(mgr._FALLBACK_PARAMS["scan"]["delay_warn_s"],   1800)
         self.assertEqual(mgr._FALLBACK_PARAMS["fullscan"]["delay_warn_s"], 7200)
 

@@ -27,6 +27,8 @@ Design decisions (see docs/dol_h1b_pipeline.md, docs/email-pattern-inference.md)
 
 import argparse
 import json
+import tldextract
+_tldextract = tldextract.TLDExtract(suffix_list_urls=())
 import os
 import re
 import sys
@@ -41,6 +43,10 @@ from logger import get_logger, init_logging
 log = get_logger(__name__)
 
 CERTIFIED_STATUSES = {"Certified", "Certified-Withdrawn"}
+
+# Stable lock ID for pg_advisory_xact_lock — prevents two concurrent upsert()
+# calls from interleaving their read-merge-write cycles on the same FEINs.
+_UPSERT_LOCK_ID = 0x70726F63_6573734C  # hex for "processL"
 
 _GENERIC_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
@@ -291,9 +297,17 @@ def aggregate(df: pd.DataFrame) -> dict:
                 continue
             domain_counts[domain_part] = domain_counts.get(domain_part, 0) + 1
         total_emails = sum(domain_counts.values())
+        root_totals: dict[str, int] = {}
         if domain_counts:
-            assigned_domain = max(domain_counts, key=domain_counts.get)
-            confidence      = domain_counts[assigned_domain] / total_emails
+            # Group subdomains by PSL-aware registrable domain and sum counts.
+            # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030).
+            # tldextract handles multi-label TLDs: acme.co.uk → acme.co.uk, not co.uk.
+            for _d, _cnt in domain_counts.items():
+                _ext  = _tldextract.extract(_d)
+                _root = _ext.registered_domain or _d
+                root_totals[_root] = root_totals.get(_root, 0) + _cnt
+            assigned_domain = min(root_totals, key=lambda k: (-root_totals[k], k))
+            confidence      = root_totals[assigned_domain] / total_emails
             low_confidence  = confidence < 0.70
         else:
             assigned_domain = None
@@ -371,7 +385,7 @@ def aggregate(df: pd.DataFrame) -> dict:
             "soc":          soc_data,
             "yearly":       yearly_data,
             "domain_map":   {
-                "domain_counts":  domain_counts,
+                "domain_counts":  root_totals,   # PSL-aware root → count (not raw emails)
                 "total_emails":   total_emails,
                 "assigned_domain": assigned_domain,
                 "confidence":      confidence,
@@ -429,6 +443,12 @@ def _merge_job_titles(new_titles: list, existing_json) -> list:
 def upsert(aggregated: dict, quarter: str) -> None:
     conn = get_conn()
     try:
+        # Serialize concurrent upsert calls — two parallel runs processing
+        # different LCA files can overlap on the same FEIN; without this lock
+        # the read-merge-write cycle is not atomic and one run's counts can
+        # silently overwrite the other's.
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_UPSERT_LOCK_ID,))
+
         # Check which FEINs already have this quarter processed
         feins = list(aggregated.keys())
         existing        = {}
@@ -446,6 +466,19 @@ def upsert(aggregated: dict, quarter: str) -> None:
         skipped = sum(1 for fein in feins if quarter in existing.get(fein, []))
         if skipped:
             log.warning("%d employers already have quarter %s — will skip their rows", skipped, quarter)
+
+        # Pre-fetch existing domain counts so the merge can be done in Python (once per fein)
+        existing_domain_counts: dict = {}
+        existing_email_totals:  dict = {}
+        if feins:
+            fdm_rows = conn.execute("""
+                SELECT employer_fein, domain_counts, total_emails
+                FROM fein_domain_map
+                WHERE employer_fein = ANY(%s)
+            """, (feins,)).fetchall()
+            for _r in fdm_rows:
+                existing_domain_counts[_r["employer_fein"]] = _r["domain_counts"] or {}
+                existing_email_totals[_r["employer_fein"]]  = _r["total_emails"]  or 0
 
         emp_count = soc_count = year_count = poc_count = 0
 
@@ -585,79 +618,55 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 """, (fein, year, y["filed"], y["certified"], y["denied"], y["withdrawn"], y["positions"]))
                 year_count += 1
 
-            # fein_domain_map — merge domain count JSON with existing row
+            # fein_domain_map — merge domain count JSON with existing row.
+            # Legacy rows with raw subdomain keys (e.g. email.gs.com) are re-rooted
+            # to their registrable domain only when a later quarter re-processes that
+            # FEIN; FEINs that never reappear retain raw subdomain keys indefinitely.
             dm = data["domain_map"]
             if dm["total_emails"] > 0:
+                # Merge new domain counts with existing DB row in Python, then plain-upsert.
+                # domain_counts stores PSL-aware registrable_domain → count (not raw emails).
+                # No regex needed — keys are already roots (tldextract applied in Python).
+                # Normalize keys from DB — rows written before PSL migration may have
+                # raw subdomain keys (e.g. email.gs.com); re-root them so merging is correct.
+                _raw_prev    = existing_domain_counts.get(fein, {})
+                _prev_counts: dict = {}
+                for _pk, _pv in _raw_prev.items():
+                    _pext = _tldextract.extract(_pk)
+                    _proot = _pext.registered_domain or _pk
+                    _prev_counts[_proot] = _prev_counts.get(_proot, 0) + _pv
+                _prev_total  = existing_email_totals.get(fein, 0)
+                _merged: dict = dict(_prev_counts)
+                for _dom, _cnt in dm["domain_counts"].items():
+                    _merged[_dom] = _merged.get(_dom, 0) + _cnt
+                _merged_total = max(_prev_total + dm["total_emails"], sum(_merged.values()))
+                if _merged:
+                    _assigned = min(_merged, key=lambda k: (-_merged[k], k))
+                    _conf     = _merged[_assigned] / _merged_total
+                    _low_conf = _conf < 0.70
+                else:
+                    _assigned = None
+                    _conf     = None
+                    _low_conf = False
                 conn.execute("""
                     INSERT INTO fein_domain_map
                         (employer_fein, domain_counts, total_emails,
                          assigned_domain, confidence, low_confidence, updated_at)
                     VALUES (%s, %s::jsonb, %s, %s, %s, %s, NOW())
                     ON CONFLICT (employer_fein) DO UPDATE SET
-                        domain_counts   = (
-                            SELECT jsonb_object_agg(
-                                key,
-                                COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                            )
-                            FROM jsonb_object_keys(
-                                fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                            ) AS key
-                        ),
-                        total_emails    = fein_domain_map.total_emails + EXCLUDED.total_emails,
-                        assigned_domain = (
-                            SELECT key FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
-                                )
-                            )
-                            ORDER BY value::int DESC LIMIT 1
-                        ),
-                        confidence      = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0)
-                            FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
-                                )
-                            )
-                        ),
-                        low_confidence  = (
-                            SELECT MAX(value::int)::float / NULLIF(SUM(value::int), 0) < 0.70
-                            FROM jsonb_each_text(
-                                (
-                                    SELECT jsonb_object_agg(
-                                        key,
-                                        COALESCE((fein_domain_map.domain_counts->>key)::int, 0)
-                                        + COALESCE((EXCLUDED.domain_counts->>key)::int, 0)
-                                    )
-                                    FROM jsonb_object_keys(
-                                        fein_domain_map.domain_counts || EXCLUDED.domain_counts
-                                    ) AS key
-                                )
-                            )
-                        ),
+                        domain_counts   = EXCLUDED.domain_counts,
+                        total_emails    = EXCLUDED.total_emails,
+                        assigned_domain = EXCLUDED.assigned_domain,
+                        confidence      = EXCLUDED.confidence,
+                        low_confidence  = EXCLUDED.low_confidence,
                         updated_at      = NOW()
                 """, (
                     fein,
-                    json.dumps(dm["domain_counts"]),
-                    dm["total_emails"],
-                    dm["assigned_domain"],
-                    dm["confidence"],
-                    dm["low_confidence"],
+                    json.dumps(_merged),
+                    _merged_total,
+                    _assigned,
+                    _conf,
+                    _low_conf,
                 ))
 
             # lca_contacts — one row per unique email, last filing wins on conflict

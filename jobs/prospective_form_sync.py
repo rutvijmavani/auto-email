@@ -37,6 +37,8 @@ from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import tldextract as _tldextract_mod
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
@@ -572,7 +574,7 @@ def _resolve_ats(company, job_url, career_page_url, domain, xml_url,
     if domain:
         from jobs.career_page import detect_via_career_page
         result = detect_via_career_page(company, domain)
-        if result and result.get("platform") not in {
+        if result and result.get("platform") and result.get("platform") not in {
             "eightfold", "taleo", "successfactors"
         }:
             logger.info("[sync] %r: ATS from domain — %s",
@@ -878,6 +880,19 @@ def run():
                 domain = _domain_from_url(job_url)
             elif career_page and _is_valid_url(career_page):
                 domain = _domain_from_url(career_page)
+
+            # Normalize to PSL registered domain so the dedup guard in
+            # _upsert_company_ats (which checks prospective_companies WHERE
+            # domain = <psl_root>) matches correctly. Subdomains entered in
+            # the form (e.g. "careers.company.com") would otherwise never
+            # match the discovery pipeline's PSL-computed domain ("company.com").
+            if domain:
+                # Extract hostname first so URL-like values (e.g. "https://careers.company.com/jobs")
+                # are handled correctly — _tldextract treats scheme as a label otherwise.
+                from urllib.parse import urlparse as _urlparse
+                _parsed_host = _urlparse(domain).hostname if "://" in domain else domain
+                _ext = _tldextract.extract(_parsed_host or domain)
+                domain = _ext.registered_domain or _parsed_host or domain
 
             # ── Store raw curls BEFORE any parsing ───────────────
             # This ensures we always have the original curl for

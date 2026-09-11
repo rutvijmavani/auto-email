@@ -1,4 +1,4 @@
-"""
+﻿"""
 frontend/pages/3_Discover.py — DOL H-1B employer browser.
 
 Browse aggregated LCA disclosures to find companies worth adding to the pipeline.
@@ -11,7 +11,8 @@ import logging
 import re
 import sys
 import os
-from urllib.parse import quote_plus
+import threading
+from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
 import streamlit as st
@@ -20,11 +21,114 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from db.connection import get_conn
 from db.prospective import add_prospective_company, submit_to_prospective_sheet
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
+from workers.redis_client import get_redis as _get_redis
+from jobs.http_safe import make_safe_session as _make_safe_session, is_private_host as _is_private_host
 
 _URL_RE = re.compile(r'https?://[^\s"\'<>]+', re.IGNORECASE)
 _INLINE_PROBE_TIMEOUT = 30  # seconds; caps career-page probe in inline discovery
 
 log = logging.getLogger(__name__)
+
+# ── Background careers-URL verification ──────────────────────────────────────
+# One thread per FEIN; result written to Redis so st.fragment can poll it.
+
+_HEAD_CHECK_KEY_PREFIX  = "enrichment:head_check:"
+_HEAD_CHECK_TTL         = 120          # seconds
+_HEAD_CHECK_GOOD_CODES  = {200, 201, 204, 206, 403}
+_HEAD_CHECK_TIMEOUT     = 10           # seconds per attempt
+_discover_session_local = threading.local()
+_DISCOVER_INFLIGHT: set = set()
+_DISCOVER_LOCK          = threading.Lock()
+_DISCOVER_EXECUTOR      = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def _careers_head_ok(url: str) -> bool:
+    """Lightweight HEAD check for the Discover page. Returns True on 2xx/403."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname or ""
+        if not host or _is_private_host(host):
+            return False
+        if not getattr(_discover_session_local, "session", None):
+            _discover_session_local.session = _make_safe_session()
+        _sess = _discover_session_local.session
+        resp = _sess.head(
+            url, allow_redirects=True, timeout=_HEAD_CHECK_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        if resp.status_code in _HEAD_CHECK_GOOD_CODES:
+            return True
+        if resp.status_code == 405:
+            resp = _sess.get(
+                url, allow_redirects=True, stream=True, timeout=_HEAD_CHECK_TIMEOUT,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.close()
+            return resp.status_code in _HEAD_CHECK_GOOD_CODES
+        return False
+    except Exception:
+        return False
+
+
+def _trigger_careers_check(url: str, fein: str) -> None:
+    """Submit a background HEAD check if one isn't already running for this FEIN."""
+    with _DISCOVER_LOCK:
+        if (fein, url) in _DISCOVER_INFLIGHT:
+            return
+        _DISCOVER_INFLIGHT.add((fein, url))
+
+    def _run():
+        try:
+            ok = _careers_head_ok(url)
+            try:
+                _get_redis().set(
+                    f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{url.rstrip('/')}",
+                    "ok" if ok else "failed",
+                    ex=_HEAD_CHECK_TTL,
+                )
+            except Exception as _re:
+                log.debug("discover: Redis head_check write failed fein=%s: %s", fein, _re)
+        finally:
+            with _DISCOVER_LOCK:
+                _DISCOVER_INFLIGHT.discard((fein, url))
+
+    try:
+        _DISCOVER_EXECUTOR.submit(_run)
+    except Exception as _sub_exc:
+        log.warning("discover: failed to submit career check for fein=%s: %s", fein, _sub_exc)
+        with _DISCOVER_LOCK:
+            _DISCOVER_INFLIGHT.discard((fein, url))
+
+
+@st.fragment(run_every=2)
+def _careers_verify_badge(fein: str, careers: str) -> None:
+    """Polls Redis every 2 s and updates the careers-URL verification badge in place.
+    Once a terminal result (ok/failed) is seen it is cached in session_state so
+    subsequent fragment reruns skip the Redis call entirely."""
+    _cache_key = f"_hc_result_{fein}_{careers}"
+    _cached = st.session_state.get(_cache_key)
+    if _cached is not None:
+        if _cached == "ok":
+            st.caption("✅ Careers page verified")
+        else:
+            st.warning("⚠️ Careers page may have moved — check back soon")
+        return
+
+    try:
+        result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{careers.rstrip('/')}")
+    except Exception:
+        result = None
+
+    if result is None:
+        st.caption("⏳ Verifying careers page…")
+    elif result in (b"ok", "ok"):
+        st.session_state[_cache_key] = "ok"
+        st.caption("✅ Careers page verified")
+    else:
+        st.session_state[_cache_key] = "failed"
+        st.warning("⚠️ Careers page may have moved — check back soon")
 
 st.set_page_config(page_title="Discover", page_icon="🔎", layout="wide")
 
@@ -186,9 +290,20 @@ def load_uscis_petitions(fein: str, employer_name: str) -> pd.DataFrame:
     """, (fein, fein))
 
 
-def _pipeline_status(employer_name: str, canonical_name: str | None = None) -> str | None:
+def _norm_domain(url: str | None) -> str | None:
+    """Strip scheme, path, query, and www. prefix from a URL or bare hostname."""
+    if not url:
+        return None
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = (parsed.hostname or url).lower()
+    return re.sub(r'^www\.', '', host)
+
+
+def _pipeline_status(employer_name: str, canonical_name: str | None = None, domain: str | None = None) -> str | None:
     """Return existing pipeline status string, or None if not in pipeline.
-    Checks both the raw DOL name and canonical_name (added via ATS panel).
+    Checks both the raw DOL name and canonical_name first, then falls back to
+    domain match — needed because company names differ across tables
+    (e.g. "Amazon" in prospective_companies vs "Amazon.com LLC" in company_ats).
     """
     names = [employer_name.strip()]
     if canonical_name and canonical_name not in ("—", employer_name.strip()):
@@ -202,16 +317,34 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None) -> s
             names,
         )
         row = cur.fetchone()
-        return dict(row)["status"] if row else None
+        if row:
+            return dict(row)["status"]
+        norm = _norm_domain(domain)
+        if norm:
+            cur.execute(
+                "SELECT status FROM prospective_companies "
+                "WHERE regexp_replace(regexp_replace(LOWER(domain), '^https?://', ''), '^www\\.', '') "
+                "    = %s LIMIT 1",
+                (norm,),
+            )
+            row = cur.fetchone()
+            return dict(row)["status"] if row else None
+        return None
     finally:
         conn.close()
 
 
 @st.cache_data(ttl=120)
 def load_ats_discovery(fein: str) -> dict | None:
-    """Load ATS discovery row for a given employer FEIN."""
+    """Load ATS discovery row for a given employer FEIN, with careers_url from fein_domain_map."""
     df = _query(
-        "SELECT * FROM h1b_ats_discovery WHERE employer_fein = %s", (fein,)
+        """
+        SELECT d.*, f.careers_url
+        FROM h1b_ats_discovery d
+        LEFT JOIN fein_domain_map f ON f.employer_fein = d.employer_fein
+        WHERE d.employer_fein = %s
+        """,
+        (fein,),
     )
     return df.to_dict("records")[0] if not df.empty else None
 
@@ -224,6 +357,64 @@ def load_company_ats_entries(fein: str) -> list[dict]:
         (fein,),
     )
     return df.to_dict("records") if not df.empty else []
+
+
+@st.cache_data(ttl=300)
+def load_email_data(fein: str) -> dict | None:
+    """Load email domain map + patterns for a FEIN. Returns None if no data."""
+    df = _query(
+        """
+        SELECT
+            f.domain_counts,
+            f.assigned_domain,
+            f.confidence,
+            f.low_confidence,
+            f.total_emails,
+            ep.patterns,
+            ep.total_unique_personal
+        FROM fein_domain_map f
+        LEFT JOIN email_patterns ep ON ep.domain = f.assigned_domain
+        WHERE f.employer_fein = %s
+        """,
+        (fein,),
+    )
+    if df.empty:
+        return None
+    row = df.iloc[0]
+    return {
+        "domain_counts":        row.get("domain_counts") if isinstance(row.get("domain_counts"), dict) else {},
+        "assigned_domain":      row.get("assigned_domain"),
+        "confidence":           row.get("confidence"),
+        "low_confidence":       bool(row.get("low_confidence")),
+        "total_emails":         0 if pd.isna(row.get("total_emails")) else int(row.get("total_emails")),
+        "patterns":             row.get("patterns") if isinstance(row.get("patterns"), list) else [],
+        "total_unique_personal": 0 if pd.isna(row.get("total_unique_personal")) else int(row.get("total_unique_personal")),
+    }
+
+
+_TOKEN_LABELS = {
+    "fn": "{first}", "fi": "{f}", "ln": "{last}", "li": "{l}",
+    "mn": "{middle}", "mi": "{m}",
+}
+
+
+def _fmt_pattern(pattern_id: str, domain: str) -> str:
+    """Convert a pattern_id like 'fn.ln' to '{first}.{last}@domain.com'."""
+    # Split on sep while preserving it
+    parts = re.split(r'([.\-_])', pattern_id)
+    out = []
+    for p in parts:
+        if p in (".", "-", "_"):
+            out.append(p)
+        else:
+            # Handle fn[:2] style truncations
+            m = re.match(r'^(\w+)\[:\d+\]$', p)
+            base = m.group(1) if m else p
+            label = _TOKEN_LABELS.get(base, f"{{{p}}}")
+            if m:
+                label = label.rstrip("}") + "[:N]}"
+            out.append(label)
+    return "".join(out) + f"@{domain}"
 
 
 def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
@@ -646,6 +837,69 @@ else:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Email Patterns panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.divider()
+st.markdown("#### Email Patterns")
+
+email_data = load_email_data(fein)
+
+if email_data is None:
+    st.info("No email data yet for this employer. Run `process_dol_lca.py` to populate.")
+else:
+    domain_counts: dict = email_data["domain_counts"]
+    assigned      = email_data["assigned_domain"]
+    confidence    = email_data["confidence"]
+    low_conf      = email_data["low_confidence"]
+    total_emails  = email_data["total_emails"]
+    patterns      = email_data["patterns"]
+    total_personal = email_data["total_unique_personal"]
+
+    em1, em2 = st.columns([1, 2])
+
+    with em1:
+        if assigned:
+            conf_str = f"{confidence * 100:.0f}%" if confidence is not None and not pd.isna(confidence) else "—"
+            conf_help = "Fraction of LCA emails that match the assigned domain. Low confidence = ambiguous."
+            st.metric("Assigned email domain", assigned,
+                      delta="⚠ low confidence" if low_conf else None,
+                      delta_color="off" if low_conf else "normal",
+                      help=conf_help)
+            st.caption(f"Confidence: {conf_str}  ·  {total_emails:,} total LCA emails")
+        else:
+            st.info("No email domain assigned yet.")
+
+        # Domain distribution
+        if domain_counts:
+            sorted_domains = sorted(domain_counts.items(), key=lambda x: -x[1])[:8]
+            st.markdown("**Email domain distribution**")
+            for dom, cnt in sorted_domains:
+                pct = cnt / total_emails * 100 if total_emails else 0
+                marker = " ✓" if dom == assigned else ""
+                st.progress(min(pct / 100, 1.0), text=f"`{dom}`{marker}  {cnt:,} ({pct:.0f}%)")
+
+    with em2:
+        if patterns and assigned:
+            st.markdown(f"**Email format patterns** — `@{assigned}`")
+            st.caption(f"Detected from {total_personal:,} unique personal LCA contacts (≥5% threshold)")
+            for p in sorted(patterns, key=lambda x: -x.get("probability", 0)):
+                prob     = p.get("probability", 0)
+                example  = p.get("example_local", "")
+                pid      = p.get("pattern_id", "")
+                fmt      = _fmt_pattern(pid, assigned)
+                has_digit = p.get("has_digit", False)
+                digit_note = "  `+digit`" if has_digit else ""
+                st.progress(
+                    min(prob, 1.0),
+                    text=f"`{fmt}`{digit_note}  —  **{prob*100:.0f}%**  *(e.g. `{example}@{assigned}`)*",
+                )
+        elif assigned:
+            st.info(f"No patterns yet for `{assigned}`. Run `build_email_patterns.py` to populate.")
+        else:
+            st.info("Assign an email domain first to see format patterns.")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ATS Discovery panel
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -714,10 +968,21 @@ else:
                 else:
                     conn = get_conn()
                     try:
-                        conn.execute(
-                            f"UPDATE h1b_ats_discovery SET {db_col} = %s WHERE employer_fein = %s",
-                            (_to_save, fein),
-                        )
+                        if db_col == "careers_url":
+                            conn.execute(
+                                """
+                                INSERT INTO fein_domain_map (employer_fein, careers_url, updated_at)
+                                VALUES (%s, %s, NOW())
+                                ON CONFLICT (employer_fein) DO UPDATE
+                                    SET careers_url = EXCLUDED.careers_url, updated_at = NOW()
+                                """,
+                                (fein, _to_save),
+                            )
+                        else:
+                            conn.execute(
+                                f"UPDATE h1b_ats_discovery SET {db_col} = %s WHERE employer_fein = %s",
+                                (_to_save, fein),
+                            )
                         conn.commit()
                     finally:
                         conn.close()
@@ -736,8 +1001,12 @@ else:
                 st.session_state[_sk] = True
                 st.rerun()
 
-    # ── Careers page (editable) ───────────────────────────────────────────────
+    # ── Careers page (editable) + live verification badge ────────────────────
     _url_editor(d3, "Careers page", "careers_url", "edit_careers", careers)
+    if careers:
+        _trigger_careers_check(careers, fein)  # no-op if already in-flight
+        with d3:
+            _careers_verify_badge(fein, careers)
 
     # ── Official jobs URL (editable) ──────────────────────────────────────────
     if jobs_url and jobs_url != careers:
@@ -793,16 +1062,25 @@ else:
     slug     = disc.get("detected_slug")
     monitored = disc.get("is_monitored", False)
 
+    # Load company_ats entries here so both the ATS badge and the review panel
+    # below can share the same data without a second query.
+    ca_entries = load_company_ats_entries(fein)
+    ca_any_monitored = any(ca.get("is_monitored") for ca in (ca_entries or []))
+
     st.markdown("")  # spacing
 
+    _domain_hint = next((ca.get("domain") for ca in (ca_entries or []) if ca.get("domain")), None)
+    pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint or website)
     if platform:
         badge_col, action_col = st.columns([2, 3])
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None)
-            if monitored or pipeline_st:
-                st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
+            if monitored or pipeline_st or ca_any_monitored:
+                if ca_any_monitored and not monitored and not pipeline_st:
+                    st.info("Already monitored via ATS detection — see entries below")
+                else:
+                    st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
             else:
                 if st.button("Add to monitoring", key=f"add_mon_{fein}", type="primary"):
                     try:
@@ -810,7 +1088,9 @@ else:
                         inserted = add_prospective_company(
                             pipeline_name,
                             priority=1,
-                            domain=website,
+                            domain=_norm_domain(website),
+                            platform=platform,
+                            slug=slug,
                         )
                         # Feed URLs to the sheet only for new inserts.
                         if inserted:
@@ -823,7 +1103,6 @@ else:
                                 )
                             except Exception as _se:
                                 log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
-                                st.warning("ATS detection queuing failed — company was added to pipeline.")
                         # Mark is_monitored only after pipeline insert succeeds
                         conn = get_conn()
                         try:
@@ -838,7 +1117,7 @@ else:
                             conn.close()
                         load_ats_discovery.clear()
                         if inserted:
-                            st.success("Added to pipeline! Queued for ATS detection.")
+                            st.success(f"Added to monitoring! ({platform} · ready to scan)")
                         else:
                             st.info("Already in pipeline.")
                         st.rerun()
@@ -846,67 +1125,128 @@ else:
                         log.exception("Failed to add %r to pipeline", name)
                         st.error(f"Error: {exc}")
     else:
-        # No ATS detected — let user paste apply URL
-        st.warning("ATS not detected from careers page. If you find the apply URL, paste it below.")
+        # No ATS detected — let user paste a real job listing URL for form sync to process
+        st.warning("ATS not detected from careers page. Paste a real job listing URL below — "
+                   "the pipeline will detect the ATS automatically.")
 
         paste_url = st.text_input(
-            "Apply / job listing URL",
+            "Job listing URL",
             placeholder="https://boards.greenhouse.io/stripe  or  https://stripe.wd1.myworkdayjobs.com/…",
             key=f"paste_ats_url_{fein}",
         )
 
         if paste_url:
-            matched = _match_ats_from_url(paste_url)
-            if matched:
-                p2 = matched["platform"]
-                s2 = matched.get("slug")
-                st.success(f"Detected: **{p2}**" + (f"  ·  slug: `{s2}`" if s2 else ""))
-
-                if st.button("Confirm and add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
+            if not paste_url.startswith(("http://", "https://")):
+                st.error("Please paste a full URL starting with https://")
+            else:
+                if st.button("Add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
                     try:
                         pipeline_name = canonical if canonical != "—" else name
-                        # Insert into pipeline first; only mark is_monitored on success
                         inserted = add_prospective_company(
                             pipeline_name,
                             priority=1,
-                            domain=website,
+                            domain=_norm_domain(website),
+                            # platform/slug intentionally omitted — form sync will detect
                         )
-                        if inserted:
-                            try:
-                                submit_to_prospective_sheet(
-                                    company        = pipeline_name,
-                                    career_page_url= disc.get("careers_url"),
-                                    job_url        = paste_url,
-                                    domain         = website,
-                                )
-                            except Exception as _se:
-                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
-                                st.warning("ATS detection queuing failed — company was added to pipeline.")
+                        sheet_ok = submit_to_prospective_sheet(
+                            company        = pipeline_name,
+                            career_page_url= disc.get("careers_url"),
+                            job_url        = paste_url,
+                            domain         = _norm_domain(website),
+                        )
+                        if not sheet_ok:
+                            log.warning("Sheet queue failed for %r", pipeline_name)
+                            st.warning("Could not queue for detection — run form sync manually to trigger ATS detection.")
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
                             cur.execute("""
                                 UPDATE h1b_ats_discovery
-                                SET detected_platform = %s,
-                                    detected_slug     = %s,
-                                    careers_url       = COALESCE(careers_url, %s),
-                                    is_monitored      = TRUE
+                                SET sample_apply_url = COALESCE(sample_apply_url, %s),
+                                    is_monitored     = CASE WHEN %s THEN TRUE ELSE is_monitored END
                                 WHERE employer_fein = %s
-                            """, (p2, s2, paste_url, fein))
+                            """, (paste_url, sheet_ok, fein))
                             conn.commit()
                         finally:
                             conn.close()
                         load_ats_discovery.clear()
-                        if inserted:
-                            st.success("Added to pipeline! Queued for ATS detection.")
+                        if sheet_ok and inserted:
+                            st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
+                            st.rerun()
+                        elif sheet_ok:
+                            st.success("Re-queued for ATS detection — will be re-scanned after form sync runs.")
+                            st.rerun()
+                        elif inserted:
+                            st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
+                            st.rerun()
                         else:
                             st.info("Already in pipeline.")
-                        st.rerun()
+                            st.rerun()
                     except Exception as exc:
-                        log.exception("Failed to confirm ATS for %r", name)
+                        log.exception("Failed to add %r to pipeline", name)
                         st.error(f"Error: {exc}")
-            else:
-                st.error("Could not detect ATS from that URL. Check the URL and try again.")
+
+    # ── Wrong ATS override ───────────────────────────────────────────────────
+    if platform:
+        with st.expander("Wrong ATS? Fix it"):
+            st.caption("Paste a real job listing URL — the pipeline will re-detect the correct ATS.")
+            override_url = st.text_input(
+                "Job listing URL",
+                placeholder="https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/…",
+                key=f"override_url_{fein}",
+            )
+            if override_url:
+                if not override_url.startswith(("http://", "https://")):
+                    st.error("Please paste a full URL starting with https://")
+                else:
+                    if st.button("Submit correction", key=f"override_btn_{fein}", type="primary"):
+                        try:
+                            pipeline_name = canonical if canonical != "—" else name
+                            inserted = add_prospective_company(pipeline_name, priority=1, domain=_norm_domain(website))
+                            _sheet_ok = submit_to_prospective_sheet(
+                                company         = pipeline_name,
+                                career_page_url = disc.get("careers_url"),
+                                job_url         = override_url,
+                                domain          = _norm_domain(website),
+                            )
+                            if not _sheet_ok:
+                                log.warning("Sheet queue failed for %r", pipeline_name)
+                                st.warning("Could not queue for re-detection — run form sync manually.")
+                            else:
+                                _dc = get_conn()
+                                try:
+                                    _cur = _dc.cursor()
+                                    if not inserted:
+                                        # Company already in pipeline — reset platform so form sync can re-detect
+                                        _cur.execute(
+                                            "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
+                                            (pipeline_name.strip(),),
+                                        )
+                                    _cur.execute(
+                                        """UPDATE h1b_ats_discovery
+                                           SET is_monitored = TRUE,
+                                               detected_platform = NULL,
+                                               detected_slug = NULL
+                                           WHERE employer_fein = %s""",
+                                        (fein,),
+                                    )
+                                    _cur.execute(
+                                        """UPDATE company_ats
+                                           SET is_monitored = FALSE
+                                           WHERE employer_fein = %s
+                                             AND platform = %s""",
+                                        (fein, platform),
+                                    )
+                                    _dc.commit()
+                                finally:
+                                    _dc.close()
+                                load_ats_discovery.clear()
+                                load_company_ats_entries.clear()
+                                st.success("Correction submitted — ATS will be re-detected on next form sync run.")
+                                st.rerun()
+                        except Exception as exc:
+                            log.exception("ATS override failed for %r", name)
+                            st.error(f"Error: {exc}")
 
     # ── Re-run discovery ──────────────────────────────────────────────────────
     checked = disc.get("last_checked")
@@ -919,6 +1259,7 @@ else:
             try:
                 _run_inline_discovery(fein, name)
                 load_ats_discovery.clear()
+                load_company_ats_entries.clear()
                 st.rerun()
             except Exception as exc:
                 log.exception("Re-run discovery failed for %r", name)
@@ -928,7 +1269,6 @@ else:
 # company_ats review panel — flip is_monitored after manual review
 # ─────────────────────────────────────────────────────────────────────────────
 
-ca_entries = load_company_ats_entries(fein)
 if ca_entries:
     st.divider()
     st.markdown("#### Detected ATS entries (pending review)")
@@ -963,7 +1303,10 @@ if ca_entries:
             st.markdown("")
             btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
             btn_type  = "secondary" if ca_monitored else "primary"
-            btn_disabled = not ca_monitored and not ca_slug
+            already_in_pipeline = bool(pipeline_st) and not ca_monitored
+            btn_disabled = (not ca_monitored and not ca_slug) or already_in_pipeline
+            if already_in_pipeline:
+                st.caption(f"Already monitored via pipeline ({pipeline_st}) — disable that first")
             if st.button(btn_label, key=f"ca_toggle_{ca_id}", type=btn_type,
                          disabled=btn_disabled):
                 new_val = not ca_monitored
@@ -1018,12 +1361,11 @@ def _resolve_quality_event(fein: str, careers_url: str | None, selected_kg_mid: 
             {"fein": fein, "url": careers_url},
         )
         if careers_url and selected_kg_mid:
-            # Backfill the resolved URL into h1b_ats_discovery if the row exists
+            # Backfill the resolved URL into fein_domain_map (single source of truth for careers_url)
             conn.execute(
                 """
-                UPDATE h1b_ats_discovery
-                   SET careers_url  = :url,
-                       last_checked = NOW()
+                UPDATE fein_domain_map
+                   SET careers_url = :url
                  WHERE employer_fein = :fein
                    AND (careers_url IS NULL OR careers_url != :url)
                 """,
