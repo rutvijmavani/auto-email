@@ -1353,11 +1353,12 @@ def _run_ats_pool_cycle(
         start_workers(worker_units[0])
 
     if combined_depth >= ATS_MANAGER_SCALE_UP_THRESHOLD and alive < len(worker_units):
+        to_start = worker_units[alive] if alive < len(worker_units) else worker_units[-1]
         logger.info(
-            "manager [%s]: depth=%d >= threshold=%d â€” starting %s",
-            pool_label, combined_depth, ATS_MANAGER_SCALE_UP_THRESHOLD, worker_units[-1],
+            “manager [%s]: depth=%d >= threshold=%d â€” starting %s”,
+            pool_label, combined_depth, ATS_MANAGER_SCALE_UP_THRESHOLD, to_start,
         )
-        start_workers(worker_units[-1])
+        start_workers(to_start)
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

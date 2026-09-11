@@ -695,17 +695,21 @@ def run_health_check() -> int:
                 )
 
             # Public domain — NULL method (worker crashed before writing) counts as unresolved
-            no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
-            null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
-            pd_found    = pd_total - no_signal - null_method
-            pd_detail = _breakdown(pd_rows, pd_total)
-            if pd_total and (no_signal + null_method) / pd_total > 0.15:
-                _row("WARNING", "public domain",
-                     f"{pd_found}/{pd_total} resolved  {pd_detail}")
+            if pd_total == 0:
+                _row("WARNING", "public domain", "no data in last 7 days — enrichment worker may not have run")
                 warnings += 1
             else:
-                _row("OK", "public domain",
-                     f"{pd_found}/{pd_total} resolved  {pd_detail}")
+                no_signal   = next((r["n"] for r in pd_rows if r["public_domain_method"] == "no_signal"), 0)
+                null_method = next((r["n"] for r in pd_rows if r["public_domain_method"] is None), 0)
+                pd_found    = pd_total - no_signal - null_method
+                pd_detail = _breakdown(pd_rows, pd_total)
+                if (no_signal + null_method) / pd_total > 0.15:
+                    _row("WARNING", "public domain",
+                         f"{pd_found}/{pd_total} resolved  {pd_detail}")
+                    warnings += 1
+                else:
+                    _row("OK", "public domain",
+                         f"{pd_found}/{pd_total} resolved  {pd_detail}")
 
             # Career URL
             if cu_total == 0:

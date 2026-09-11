@@ -1577,18 +1577,6 @@ def init_db():
         ALTER TABLE h1b_ats_discovery
         ADD COLUMN IF NOT EXISTS careers_source TEXT
     """)
-    # Backfill: careers_url moved from h1b_ats_discovery to fein_domain_map.
-    # Copy any data that exists in the old column before dropping it.
-    c.execute("""
-        UPDATE fein_domain_map f
-        SET careers_url = d.careers_url
-        FROM h1b_ats_discovery d
-        WHERE d.employer_fein = f.employer_fein
-          AND d.careers_url IS NOT NULL
-          AND f.careers_url IS NULL
-    """)
-    c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
-
     # ── KG quality events — low-confidence / no-match companies for review ────
     c.execute("""
         CREATE TABLE IF NOT EXISTS h1b_ats_quality_events (
@@ -1659,6 +1647,18 @@ def init_db():
             ON fein_domain_map (regexp_replace(regexp_replace(LOWER(assigned_domain), '^https?://', ''), '^www\\.', ''))
             WHERE assigned_domain IS NOT NULL
         """)
+
+    # Backfill: careers_url moved from h1b_ats_discovery to fein_domain_map.
+    # Copy any data that exists in the old column before dropping it.
+    c.execute("""
+        UPDATE fein_domain_map f
+        SET careers_url = d.careers_url
+        FROM h1b_ats_discovery d
+        WHERE d.employer_fein = f.employer_fein
+          AND d.careers_url IS NOT NULL
+          AND f.careers_url IS NULL
+    """)
+    c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
 
     # Pipeline performance metrics — one row per company per worker run.
     # Tracks which phase found public_domain / careers_url / ATS so regressions
