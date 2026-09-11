@@ -1728,6 +1728,19 @@ def process_employer(
 
     upsert_discovery(result, conn, dry_run=dry_run)
 
+    if not dry_run and careers_url:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (employer_fein) DO UPDATE
+                SET careers_url    = EXCLUDED.careers_url,
+                    careers_source = EXCLUDED.careers_source,
+                    updated_at     = NOW()
+                WHERE fein_domain_map.careers_url IS NULL
+        """, (fein, careers_url, careers_source))
+        conn.commit()
+
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
         domain = _root_domain(result["website_url"])
         if domain:

@@ -653,12 +653,13 @@ def run_health_check() -> int:
         cu_rows = conn.execute("""
             SELECT careers_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) careers_source, careers_url
+                SELECT DISTINCT ON (employer_fein) careers_source
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND careers_url IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE careers_source IS NOT NULL AND careers_url IS NOT NULL
+            WHERE careers_source IS NOT NULL
             GROUP BY careers_source
             ORDER BY n DESC
         """).fetchall()
@@ -667,12 +668,13 @@ def run_health_check() -> int:
         ats_rows = conn.execute("""
             SELECT ats_source, COUNT(*) AS n
             FROM (
-                SELECT DISTINCT ON (employer_fein) ats_source, ats_platform
+                SELECT DISTINCT ON (employer_fein) ats_source
                 FROM h1b_enrichment_metrics
                 WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND ats_platform IS NOT NULL
                 ORDER BY employer_fein, run_at DESC
             ) sub
-            WHERE ats_source IS NOT NULL AND ats_platform IS NOT NULL
+            WHERE ats_source IS NOT NULL
             GROUP BY ats_source
             ORDER BY n DESC
         """).fetchall()

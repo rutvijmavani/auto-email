@@ -33,6 +33,7 @@ Usage:
 
 import json
 import os
+import socket
 import sys
 import time
 from urllib.parse import urlparse, urljoin
@@ -401,6 +402,23 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
 # Main loop
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+def _reclaim_inflight(r, inflight_key: str) -> None:
+    """On startup, push any items left in this instance's inflight list back to their source queues."""
+    reclaimed = 0
+    while True:
+        raw = r.rpop(inflight_key)
+        if raw is None:
+            break
+        try:
+            item = json.loads(raw)
+            r.rpush(item["queue"], item["member"])
+            reclaimed += 1
+        except Exception as exc:
+            log.error("head_check: failed to reclaim inflight item: %s", exc)
+    if reclaimed:
+        log.info("head_check: reclaimed %d inflight items on startup from %s", reclaimed, inflight_key)
+
+
 def run_worker(once: bool = False) -> None:
     r = get_redis()
     processed = {"n": 0}
@@ -408,6 +426,10 @@ def run_worker(once: bool = False) -> None:
     _hb_name  = f"head_check_worker@{_instance}" if _instance else "head_check_worker"
     hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=HEAD_CHECK_HEARTBEAT_S).start()
+
+    _inflight_suffix  = _instance if _instance else f"{socket.gethostname()}:{os.getpid()}"
+    _own_inflight_key = f"head_check:inflight:instance:{_inflight_suffix}"
+    _reclaim_inflight(r, _own_inflight_key)
 
     log.info("head-check-worker started (instance=%r)", _instance)
 
@@ -440,11 +462,9 @@ def run_worker(once: bool = False) -> None:
                 continue
 
             queue_key, raw_member = result
-            tier = "on_demand" if queue_key in (
-                HEAD_CHECK_INFLIGHT,
-    HEAD_CHECK_ON_DEMAND,
-                HEAD_CHECK_ON_DEMAND.encode(),
-            ) else "batch"
+            _queue_str  = queue_key.decode()  if isinstance(queue_key,  bytes) else queue_key
+            _member_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
+            tier = "on_demand" if _queue_str in (HEAD_CHECK_INFLIGHT, HEAD_CHECK_ON_DEMAND) else "batch"
 
             # Parse payload
             try:
@@ -454,25 +474,25 @@ def run_worker(once: bool = False) -> None:
                 source         = data.get("source")
                 petition_count = int(data.get("petition_count", 0))
             except (json.JSONDecodeError, KeyError, TypeError):
-                raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
-                log.error("head_check: malformed member %r â€” sending to DLQ", raw_str)
+                log.error(“head_check: malformed member %r â€” sending to DLQ”, _member_str)
                 r.lpush(HEAD_CHECK_DLQ, json.dumps({
-                    "fein": "MALFORMED", "error_reason": "malformed_member",
-                    "raw": repr(raw_str), "failed_at": time.time(),
+                    “fein”: “MALFORMED”, “error_reason”: “malformed_member”,
+                    “raw”: repr(_member_str), “failed_at”: time.time(),
                 }))
                 continue
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= HEAD_CHECK_MAX_RETRIES:
-                _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
+                _move_to_dlq(r, fein, “max_retries_exceeded”, retry_count)
                 _clear_retry(r, fein)
                 continue
 
-            r.incr(HEAD_CHECK_INFLIGHT)
+            _inflight_entry = json.dumps({“queue”: _queue_str, “member”: _member_str})
+            r.lpush(_own_inflight_key, _inflight_entry)
             try:
                 success = _process_company(r, fein, petition_count, trigger, source, tier)
             finally:
-                r.decr(HEAD_CHECK_INFLIGHT)
+                r.lrem(_own_inflight_key, 1, _inflight_entry)
             processed["n"] += 1
 
             if not success:
