@@ -269,7 +269,7 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
             employer_fein = COALESCE(company_ats.employer_fein, EXCLUDED.employer_fein),
             source        = EXCLUDED.source,
             detected_at   = NOW()
-        WHERE company_ats.reviewed_at IS NULL
+        WHERE company_ats.reviewed_at IS NULL AND company_ats.is_monitored = FALSE
     """, (fein, domain, company_name, platform, slug, petition_count))
 
 

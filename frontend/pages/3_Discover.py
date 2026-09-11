@@ -1220,7 +1220,7 @@ else:
                                         # Company already in pipeline — reset platform so form sync can re-detect
                                         _cur.execute(
                                             "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
-                                            (pipeline_name,),
+                                            (pipeline_name.strip(),),
                                         )
                                     _cur.execute(
                                         """UPDATE h1b_ats_discovery

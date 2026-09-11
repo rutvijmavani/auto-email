@@ -35,7 +35,7 @@ import json
 import os
 import sys
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -182,14 +182,28 @@ def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
 # HTTP HEAD + classification
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+_MAX_REDIRECTS = 10
+
 def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None]":
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; H1BPipeline/1.0)"}
+    current_url = url
     try:
-        resp = requests.head(
-            url,
-            allow_redirects=True,
-            timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT),
-            headers={"User-Agent": "Mozilla/5.0 (compatible; H1BPipeline/1.0)"},
-        )
+        for _ in range(_MAX_REDIRECTS):
+            resp = requests.head(
+                current_url,
+                allow_redirects=False,
+                timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT),
+                headers=headers,
+            )
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                return resp, None
+            location = resp.headers.get("Location", "")
+            if not location:
+                return resp, None
+            next_url = urljoin(current_url, location)
+            if not _is_safe_url(next_url):
+                return resp, None
+            current_url = next_url
         return resp, None
     except Exception as exc:
         return None, exc

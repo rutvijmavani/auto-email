@@ -204,18 +204,18 @@ def get_prospective_companies(status=None):
     """
     conn = get_conn()
     c = conn.cursor()
-    if status:
-        c.execute("""
-            SELECT * FROM prospective_companies
-            WHERE status = ?
-            ORDER BY priority DESC, created_at ASC
-        """, (status,))
-    else:
-        c.execute("""
-            SELECT * FROM prospective_companies
-            ORDER BY priority DESC, created_at ASC
-        """)
     try:
+        if status:
+            c.execute("""
+                SELECT * FROM prospective_companies
+                WHERE status = ?
+                ORDER BY priority DESC, created_at ASC
+            """, (status,))
+        else:
+            c.execute("""
+                SELECT * FROM prospective_companies
+                ORDER BY priority DESC, created_at ASC
+            """)
         rows = [dict(r) for r in c.fetchall()]
     finally:
         conn.close()
