@@ -1687,7 +1687,7 @@ def process_employer(
     # the outer _careers_root != _website_root condition, making phase7 rewrites
     # always unreachable. phase3 and phase6 are verified probes; their redirects
     # reliably indicate the company's real domain.
-    _REWRITE_TRUSTED_SOURCES = {"phase6"}
+    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6"}
     if careers_url and website_url and careers_source in _REWRITE_TRUSTED_SOURCES:
         from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
         _careers_root = _root_domain(careers_url)

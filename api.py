@@ -396,7 +396,12 @@ def verify_company():
 
     if not _API_KEY:
         return jsonify({'error': 'API key not configured'}), 503
-    if not hmac.compare_digest(request.headers.get('X-API-Key', ''), _API_KEY):
+    _received_key = request.headers.get('X-API-Key', '')
+    try:
+        _authorized = hmac.compare_digest(_received_key.encode(), _API_KEY.encode())
+    except (UnicodeEncodeError, AttributeError):
+        _authorized = False
+    if not _authorized:
         return jsonify({'error': 'unauthorized'}), 401
 
     data = request.get_json(silent=True)

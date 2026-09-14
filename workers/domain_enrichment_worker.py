@@ -475,9 +475,13 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         except Exception:
             fein = member.strip()
             pc   = int(score)
-        r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
+        if score == 0:
+            r.lpush(ENRICHMENT_ON_DEMAND, member)
+            log.info("reclaimed inflight fein=%s â†’ enrichment:on_demand", fein)
+        else:
+            r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
+            log.info("reclaimed inflight fein=%s pc=%d â†’ enrichment:batch", fein, pc)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight fein=%s pc=%d â†’ enrichment:batch", fein, pc)
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

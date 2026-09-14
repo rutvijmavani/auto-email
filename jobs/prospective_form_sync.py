@@ -890,7 +890,7 @@ def run():
                 # Extract hostname first so URL-like values (e.g. "https://careers.company.com/jobs")
                 # are handled correctly — _tldextract treats scheme as a label otherwise.
                 from urllib.parse import urlparse as _urlparse
-                _parsed_host = _urlparse(domain).hostname if "://" in domain else domain
+                _parsed_host = _urlparse(domain if "://" in domain else f"//{domain}").hostname
                 _ext = _tldextract.extract(_parsed_host or domain)
                 domain = _ext.registered_domain or _parsed_host or domain
 

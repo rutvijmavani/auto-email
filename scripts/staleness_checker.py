@@ -227,7 +227,7 @@ def run_discovery_staleness(conn, r, dry_run: bool = False) -> int:
         """,
         params=(
             STALENESS_DISCOVERY_MIN_PETITIONS,
-            f"{JOB_MONITOR_REDETECT_DAYS} days",
+            f"{DISCOVER_REDETECT_EMPTY_DAYS} days",
         ),
         queue_key=DISCOVERY_BATCH,
         cursor_name="discovery_staleness",

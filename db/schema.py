@@ -1095,7 +1095,7 @@ def init_db():
         SELECT indexdef FROM pg_indexes
         WHERE indexname = 'idx_pc_domain_norm' AND tablename = 'prospective_companies'
     """).fetchone()
-    if _idx_pc_row is None or "LOWER(domain)" not in (_idx_pc_row["indexdef"] or ""):
+    if _idx_pc_row is None or "https?://" not in (_idx_pc_row["indexdef"] or ""):
         c.execute("DROP INDEX IF EXISTS idx_pc_domain_norm")
         c.execute("""
             CREATE INDEX idx_pc_domain_norm
