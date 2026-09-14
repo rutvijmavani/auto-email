@@ -131,7 +131,7 @@ def _flush_delayed(r) -> int:
             fein    = data["fein"]
             trigger = data.get("trigger", "delayed_retry")
             pc      = data["petition_count"]
-            member  = json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source")})
+            member  = json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source"), "tier": "batch"})
             r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
             r.zrem(ENRICHMENT_DELAYED, item)
             moved += 1
@@ -479,12 +479,13 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         except Exception:
             fein = member.strip()
             pc   = int(score)
-        if score == 0:
+        tier = parsed.get("tier") if isinstance(parsed, dict) else None
+        if tier == "on_demand" or (tier is None and score == 0):
             r.lpush(ENRICHMENT_ON_DEMAND, member)
-            log.info("reclaimed inflight fein=%s â†’ enrichment:on_demand", fein)
+            log.info("reclaimed inflight fein=%s -> enrichment:on_demand", fein)
         else:
             r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
-            log.info("reclaimed inflight fein=%s pc=%d â†’ enrichment:batch", fein, pc)
+            log.info("reclaimed inflight fein=%s pc=%d -> enrichment:batch", fein, pc)
         r.zrem(inflight_key, raw_member)
 
 

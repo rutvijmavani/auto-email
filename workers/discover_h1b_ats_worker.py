@@ -379,6 +379,9 @@ def _process_company(fein: str, petition_count: int, trigger: str,
                 if updated:
                     log.info("fein=%s redetect: updated prospective_companies "
                              "platform=%s slug=%s", fein, det_platform, det_slug)
+                else:
+                    log.debug("fein=%s redetect: no prospective_companies row matched domain=%s",
+                              fein, probe_domain)
 
         # ── Metrics ───────────────────────────────────────────────────────────
         res_careers  = result.get("careers_url")

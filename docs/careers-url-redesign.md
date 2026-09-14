@@ -169,7 +169,7 @@ head_check_worker — both lanes are LISTs:
 ```python
 while True:
     flush_delayed()  # not applicable for head_check but kept for consistency
-    item = r.blpop("head_check:on_demand", "head_check:batch", timeout=1)
+    item = r.blpop(["head_check:on_demand", "head_check:batch"], timeout=1)
     if not item:
         break
     process(item)
@@ -378,7 +378,7 @@ careers_url = SELECT careers_url FROM fein_domain_map WHERE employer_fein = fein
 
 # Step 3: KG / Wikidata P10311
 #   Only runs if careers_url is NULL or trigger forces re-detection
-if not careers_url or trigger in ("redetect", "manual"):
+if not careers_url:
     if not kg_checked:
         kg_result = lookup_wikidata_p10311(fein)
         mark kg_checked = True
@@ -1028,6 +1028,9 @@ Step 1  config.py
 
 Step 2  db/schema.py
         — add careers_source to fein_domain_map
+        — (expand phase: old h1b_ats_discovery.careers_url column stays until code is deployed)
+
+Step 2b db/schema.py  [after code deploy]
         — DROP h1b_ats_discovery.careers_url
 
 Step 3  workers/head_check_worker.py  [NEW]

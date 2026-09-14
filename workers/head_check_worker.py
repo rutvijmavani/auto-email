@@ -292,7 +292,7 @@ def _write_careers(conn, fein: str, careers_url: str) -> None:
 
 def _push_enrichment(r, fein: str, petition_count: int, trigger: str,
                      source: "str | None", tier: str) -> None:
-    member = json.dumps({"fein": fein, "trigger": trigger, "source": source})
+    member = json.dumps({"fein": fein, "trigger": trigger, "source": source, "tier": tier})
     if tier == "on_demand":
         r.lpush(ENRICHMENT_ON_DEMAND, member)
         log.debug("head_check: fein=%s â†’ enrichment:on_demand trigger=%s", fein, trigger)
