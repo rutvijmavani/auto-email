@@ -514,6 +514,10 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         _max = 10
         while _max > 0:
             headers["Sec-Fetch-Site"] = _sec_fetch_site(target, _prev if _prev != target else referer)
+            # curl_cffi makes its own DNS call at connect time — a TOCTOU gap exists
+            # between the _is_private_host() check above and this connect. Acceptable:
+            # all URLs in the BFS originate from our DB (company domains from LCA filings
+            # + links discovered on those domains). No untrusted user input enters here.
             r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False)
             if r.status_code not in (301, 302, 303, 307, 308):
                 return r
@@ -994,8 +998,11 @@ def detect_company(company_domain, session=None, *, seed_url=None):
     if seed_url:
         _seed_parsed = urlparse(seed_url)
         if _seed_parsed.scheme in ("http", "https") and _seed_parsed.hostname:
-            queue.append((seed_url, None))
-            seen_seeds.add(seed_url)
+            if not _is_private_host(_seed_parsed.hostname):
+                queue.append((seed_url, None))
+                seen_seeds.add(seed_url)
+            else:
+                logger.debug("career_detector: ignoring seed_url with private host: %r", seed_url)
         else:
             logger.debug("career_detector: ignoring seed_url with invalid scheme/host: %r", seed_url)
     for path in CAREER_PATHS:
