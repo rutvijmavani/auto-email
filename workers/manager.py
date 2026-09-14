@@ -52,7 +52,6 @@ from config import (
     CONCURRENCY_FLOOR,
     CONCURRENCY_FLOOR_DEFAULT,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
-    HEAD_CHECK_INFLIGHT,
     HEAD_CHECK_ON_DEMAND,
     HEAD_CHECK_BATCH,
     ENRICHMENT_ON_DEMAND,
@@ -375,8 +374,14 @@ def _get_queue_metrics(r) -> dict:
 
     # â”€â”€ head_check + enrichment + discovery (autoscaled by _run_ats_pool_cycle) â”€
     try:
-        # head_check: two LISTs (on_demand + batch) + in-flight counter
-        _hc_inflight = int(r.get(HEAD_CHECK_INFLIGHT) or 0)
+        # head_check: two LISTs (on_demand + batch) + per-instance inflight LISTs.
+        # Scan all head_check:inflight:instance:* keys so that items from a crashed worker
+        # (which were already BLPOPed from the source queues) still count toward depth and
+        # keep the manager from incorrectly treating the pool as idle.
+        _hc_inflight = sum(
+            r.llen(k)
+            for k in set(r.scan_iter("head_check:inflight:instance:*", count=50))
+        )
         head_check_depth = r.llen(HEAD_CHECK_ON_DEMAND) + r.llen(HEAD_CHECK_BATCH) + _hc_inflight
         metrics["head_check"] = {"depth": head_check_depth, "delay_s": 0.0, "depth_known": True}
     except Exception as exc:

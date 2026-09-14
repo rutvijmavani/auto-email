@@ -57,7 +57,6 @@ from config import (
     HEAD_CHECK_DLQ,
     HEAD_CHECK_HEARTBEAT_S,
     HEAD_CHECK_MAX_RETRIES,
-    HEAD_CHECK_INFLIGHT,
     HEAD_CHECK_ON_DEMAND,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
@@ -402,21 +401,37 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
 # Main loop
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _reclaim_inflight(r, inflight_key: str) -> None:
-    """On startup, push any items left in this instance's inflight list back to their source queues."""
-    reclaimed = 0
+def _reclaim_inflight(r, own_inflight_key: str) -> None:
+    """On startup, push any items left in ANY prior instance's inflight list back to their source queues.
+
+    Scans all head_check:inflight:instance:* keys so that items from a crashed instance
+    (different PID → different key) are recovered even when WORKER_INSTANCE is not set.
+    """
+    cursor = 0
+    all_keys: list = []
     while True:
-        raw = r.rpop(inflight_key)
-        if raw is None:
+        cursor, keys = r.scan(cursor, match="head_check:inflight:instance:*", count=50)
+        all_keys.extend(k.decode() if isinstance(k, bytes) else k for k in keys)
+        if cursor == 0:
             break
-        try:
-            item = json.loads(raw)
-            r.rpush(item["queue"], item["member"])
-            reclaimed += 1
-        except Exception as exc:
-            log.error("head_check: failed to reclaim inflight item: %s", exc)
-    if reclaimed:
-        log.info("head_check: reclaimed %d inflight items on startup from %s", reclaimed, inflight_key)
+
+    for key in all_keys:
+        if key == own_inflight_key:
+            continue
+        reclaimed = 0
+        while True:
+            raw = r.rpop(key)
+            if raw is None:
+                break
+            try:
+                item = json.loads(raw)
+                r.rpush(item["queue"], item["member"])
+                reclaimed += 1
+            except Exception as exc:
+                log.error("head_check: failed to reclaim inflight item from %s: %s", key, exc)
+        if reclaimed:
+            log.warning("head_check: reclaimed %d inflight items from orphaned key %s", reclaimed, key)
+        r.delete(key)
 
 
 def run_worker(once: bool = False) -> None:
@@ -464,7 +479,7 @@ def run_worker(once: bool = False) -> None:
             queue_key, raw_member = result
             _queue_str  = queue_key.decode()  if isinstance(queue_key,  bytes) else queue_key
             _member_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
-            tier = "on_demand" if _queue_str in (HEAD_CHECK_INFLIGHT, HEAD_CHECK_ON_DEMAND) else "batch"
+            tier = "on_demand" if _queue_str == HEAD_CHECK_ON_DEMAND else "batch"
 
             # Parse payload
             try:
