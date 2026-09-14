@@ -74,7 +74,15 @@ def _careers_head_ok(url: str) -> bool:
 
 
 def _trigger_careers_check(url: str, fein: str) -> None:
-    """Submit a background HEAD check if one isn't already running for this FEIN."""
+    """Submit a background HEAD check if one isn't already running for this FEIN.
+
+    No-ops when Redis already holds a non-expired result for this URL.
+    """
+    try:
+        if _get_redis().exists(f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{url.rstrip('/')}"):
+            return
+    except Exception:
+        pass  # Redis down — fall through and let the background check run
     with _DISCOVER_LOCK:
         if (fein, url) in _DISCOVER_INFLIGHT:
             return

@@ -1649,15 +1649,21 @@ def init_db():
         """)
 
     # Backfill: careers_url moved from h1b_ats_discovery to fein_domain_map.
-    # Copy any data that exists in the old column before dropping it.
-    c.execute("""
-        UPDATE fein_domain_map f
-        SET careers_url = d.careers_url
-        FROM h1b_ats_discovery d
-        WHERE d.employer_fein = f.employer_fein
-          AND d.careers_url IS NOT NULL
-          AND f.careers_url IS NULL
-    """)
+    # Guard with column-existence check: if the column was already dropped by a
+    # previous migration run the UPDATE would fail; ALTER has IF EXISTS so is safe.
+    _had_careers_col = c.execute("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'h1b_ats_discovery' AND column_name = 'careers_url'
+    """).fetchone()
+    if _had_careers_col:
+        c.execute("""
+            UPDATE fein_domain_map f
+            SET careers_url = d.careers_url
+            FROM h1b_ats_discovery d
+            WHERE d.employer_fein = f.employer_fein
+              AND d.careers_url IS NOT NULL
+              AND f.careers_url IS NULL
+        """)
     c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
 
     # Pipeline performance metrics — one row per company per worker run.

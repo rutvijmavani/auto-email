@@ -459,6 +459,7 @@ def _extract_location(ld):
         locations = ld.get("jobLocation", [])
         if isinstance(locations, dict):
             locations = [locations]
+        locations = [loc for loc in locations if isinstance(loc, dict)]
         if not locations:
             return "", ""
         # Prefer a US location when multiple are listed; fall back to first.

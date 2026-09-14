@@ -259,8 +259,9 @@ def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
 
 
 def _write_ats(conn, fein: str, domain: str, company_name: str,
-               platform: str, slug: str, petition_count: int) -> None:
-    conn.execute("""
+               platform: str, slug: str, petition_count: int) -> int:
+    """Insert or update a company_ats row. Returns rowcount (0 if blocked by review guard)."""
+    cur = conn.execute("""
         INSERT INTO company_ats
             (employer_fein, domain, company_name, platform, slug, source, priority)
         VALUES (%s, %s, %s, %s, %s, 'enrichment', %s)
@@ -271,6 +272,7 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
             detected_at   = NOW()
         WHERE company_ats.reviewed_at IS NULL AND company_ats.is_monitored = FALSE
     """, (fein, domain, company_name, platform, slug, petition_count))
+    return cur.rowcount
 
 
 def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None,
@@ -370,6 +372,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         # â”€â”€ Step 3: Phase 6 â€” career page ATS scan (only if Phase 3 found nothing) â”€â”€
         p6_platform = None
         p6_slug     = None
+        p6_written  = False
         if not p3_platform:
             try:
                 p6_result = detect_via_career_page(
@@ -391,33 +394,34 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                     log.info("fein=%s careers_url=%s (phase6)", fein, p6_careers)
 
                 if p6_platform and p6_slug:
-                    _write_ats(conn, fein, probe_domain, employer_name,
-                               p6_platform, p6_slug, db_petition_count)
-                    log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
+                    p6_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
+                                                  p6_platform, p6_slug, db_petition_count))
+                    log.info(“fein=%s ATS detected: %s slug=%s (phase6)”, fein, p6_platform, p6_slug)
 
         # Use Phase 3 ATS whenever Phase 6 found no platform
+        p3_written = False
         if not p6_platform and p3_platform and p3_slug:
-            _write_ats(conn, fein, probe_domain, employer_name,
-                       p3_platform, p3_slug, db_petition_count)
-            log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
+            p3_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
+                                          p3_platform, p3_slug, db_petition_count))
+            log.info(“fein=%s ATS detected: %s slug=%s (phase3)”, fein, p3_platform, p3_slug)
 
         conn.commit()
 
-        # â”€â”€ Step 4: push to discovery (skip on_demand â€” loop stops here) â”€â”€â”€â”€â”€
-        if (trigger != "on_demand"
+        # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
+        if (trigger != “on_demand”
                 and db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
-        # â”€â”€ Metrics â€” reflect only persisted ATS data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Metrics — reflect only persisted ATS data ─────────────────────────
         ats_source   = None
         ats_platform = None
         ats_slug     = None
-        if p6_platform and p6_slug:
-            ats_source   = "phase6"
+        if p6_written:
+            ats_source   = “phase6”
             ats_platform = p6_platform
             ats_slug     = p6_slug
-        elif p3_platform and p3_slug:
-            ats_source   = "phase3"
+        elif p3_written:
+            ats_source   = “phase3”
             ats_platform = p3_platform
             ats_slug     = p3_slug
 

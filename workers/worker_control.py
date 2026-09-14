@@ -26,9 +26,10 @@ DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 
 # Allowlist also includes plain unit names (no instance suffix) so callers
 # that pass the template unit don't get silently skipped.
-_KNOWN_UNITS = frozenset(HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS + (
-    "head-check-worker",
-))
+_KNOWN_UNITS = frozenset(
+    HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS
+    + tuple({u.rsplit("@", 1)[0] for u in HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS})
+)
 
 
 def stop_workers(*units: str, dry_run: bool = False) -> None:

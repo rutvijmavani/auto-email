@@ -426,6 +426,7 @@ def verify_company():
                 ca.slug     AS ats_slug
             FROM fein_domain_map f
             LEFT JOIN company_ats ca ON ca.employer_fein = f.employer_fein
+                                    AND ca.stale_since IS NULL
             WHERE f.employer_fein = %s
             ORDER BY ca.priority DESC NULLS LAST,
                      ca.detected_at DESC NULLS LAST,
@@ -457,7 +458,7 @@ def verify_company():
         if _verified_at.tzinfo is None:  # guard: psycopg2 returns aware for TIMESTAMPTZ, but be safe
             _verified_at = _verified_at.replace(tzinfo=timezone.utc)
         _age_days = (datetime.now(timezone.utc) - _verified_at).days
-        _is_stale = _age_days > _VERIFY_STALE_DAYS
+        _is_stale = _age_days >= _VERIFY_STALE_DAYS
     payload = {
         'careers_url':  careers_url,
         'ats_platform': row['ats_platform'],

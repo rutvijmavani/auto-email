@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import requests
 
-from jobs.http_safe import is_private_host as _is_private_host
+from jobs.http_safe import is_private_host as _is_private_host, make_safe_session as _make_safe_session
 
 from config import (
     CONNECT_TIMEOUT,
@@ -187,9 +187,10 @@ _MAX_REDIRECTS = 10
 def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None]":
     headers = {"User-Agent": "Mozilla/5.0 (compatible; H1BPipeline/1.0)"}
     current_url = url
+    _sess = _make_safe_session()
     try:
         for _ in range(_MAX_REDIRECTS):
-            resp = requests.head(
+            resp = _sess.head(
                 current_url,
                 allow_redirects=False,
                 timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT),
@@ -418,6 +419,20 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
     for key in all_keys:
         if key == own_inflight_key:
             continue
+        # Skip keys whose worker is still alive (heartbeat present).
+        # suffix is "{hostname}:{pid}" (no-instance mode) or a bare instance number.
+        suffix = key[len("head_check:inflight:instance:"):]
+        if ":" in suffix:
+            # No-instance mode: suffix == "hostname:pid" → direct heartbeat key.
+            if r.exists(f"worker:alive:head_check_worker:{suffix}"):
+                log.debug("head_check: skipping inflight key %s — worker still alive", key)
+                continue
+        else:
+            # Instance mode: scan for any alive heartbeat for this instance number.
+            _, hb_keys = r.scan(0, match=f"worker:alive:head_check_worker@{suffix}:*", count=10)
+            if hb_keys:
+                log.debug("head_check: skipping inflight key %s — worker still alive", key)
+                continue
         reclaimed = 0
         while True:
             raw = r.rpop(key)
