@@ -12,6 +12,7 @@ import re
 import sys
 import os
 import threading
+import time
 from urllib.parse import quote_plus, urlparse
 
 import pandas as pd
@@ -110,11 +111,13 @@ def _careers_verify_badge(fein: str, careers: str) -> None:
     _cache_key = f"_hc_result_{fein}_{careers}"
     _cached = st.session_state.get(_cache_key)
     if _cached is not None:
-        if _cached == "ok":
-            st.caption("✅ Careers page verified")
-        else:
-            st.warning("⚠️ Careers page may have moved — check back soon")
-        return
+        if _cached.get("expires_at", 0) > time.time():
+            if _cached["value"] == "ok":
+                st.caption("✅ Careers page verified")
+            else:
+                st.warning("⚠️ Careers page may have moved — check back soon")
+            return
+        del st.session_state[_cache_key]
 
     try:
         result = _get_redis().get(f"{_HEAD_CHECK_KEY_PREFIX}{fein}:{careers.rstrip('/')}")
@@ -124,10 +127,10 @@ def _careers_verify_badge(fein: str, careers: str) -> None:
     if result is None:
         st.caption("⏳ Verifying careers page…")
     elif result in (b"ok", "ok"):
-        st.session_state[_cache_key] = "ok"
+        st.session_state[_cache_key] = {"value": "ok", "expires_at": time.time() + _HEAD_CHECK_TTL}
         st.caption("✅ Careers page verified")
     else:
-        st.session_state[_cache_key] = "failed"
+        st.session_state[_cache_key] = {"value": "failed", "expires_at": time.time() + _HEAD_CHECK_TTL}
         st.warning("⚠️ Careers page may have moved — check back soon")
 
 st.set_page_config(page_title="Discover", page_icon="🔎", layout="wide")

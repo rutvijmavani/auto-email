@@ -1417,6 +1417,8 @@ def _upsert_company_ats(
                     AND (
                         regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
                      OR regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
+                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
                     )
               )
         """, (fein, platform, domain))
@@ -1737,7 +1739,6 @@ def process_employer(
                 SET careers_url    = EXCLUDED.careers_url,
                     careers_source = EXCLUDED.careers_source,
                     updated_at     = NOW()
-                WHERE fein_domain_map.careers_url IS NULL
         """, (fein, careers_url, careers_source))
         conn.commit()
 
@@ -1822,7 +1823,6 @@ def _brave_upsert(fein: str, careers_url: "str | None",
                 SET careers_url    = EXCLUDED.careers_url,
                     careers_source = EXCLUDED.careers_source,
                     updated_at     = NOW()
-                WHERE fein_domain_map.careers_url IS NULL
         """, (fein, careers_url, careers_source))
     conn.commit()
 

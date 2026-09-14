@@ -461,7 +461,12 @@ def _extract_location(ld):
             locations = [locations]
         if not locations:
             return "", ""
-        addr         = locations[0].get("address", {})
+        # Prefer a US location when multiple are listed; fall back to first.
+        addr = next(
+            (loc.get("address", {}) for loc in locations
+             if country_to_alpha2((loc.get("address", {}).get("addressCountry") or "").strip()) == "US"),
+            locations[0].get("address", {}),
+        )
         country_raw  = (addr.get("addressCountry") or "").strip()
         alpha2       = country_to_alpha2(country_raw)
 
