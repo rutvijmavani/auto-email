@@ -39,53 +39,54 @@ No career page liveness check — `consecutive_empty_days` alone is the trigger.
 
 ---
 
-## New Redis Queue
+## Queue Routing (implemented)
 
-```
-REDETECT_QUEUE = "redetect_queue"   # Redis ZSET, score = petition_count
-```
-
-Payload:
-```json
-{"fein": "12-3456789", "source": "company_ats"}
-{"fein": "12-3456789", "source": "prospective"}
-```
-
-`source` travels through the entire pipeline so `discover_h1b_ats_worker` knows which table to flag stale after re-detection completes.
-
----
-
-## Pipeline Flow
+No separate REDETECT_QUEUE exists. The redetect path uses the existing six-lane
+architecture:
 
 ```
 staleness_checker.py (3rd pass)
-    company_ats rows: consecutive_empty_days >= 14, is_monitored=TRUE
-    prospective_companies rows: same condition, platform NOT IN ('unknown','unsupported')
-        ↓  ZADD REDETECT_QUEUE score=petition_count {"fein": ..., "source": ...}
+    company_ats rows: consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS,
+                      is_monitored=TRUE, stale_since IS NULL,
+                      platform NOT IN ('unknown','unsupported')
+    prospective_companies rows: same empty-days condition,
+                      ats_platform NOT IN ('unknown','unsupported','custom')
+        ↓  RPUSH head_check:batch {"fein": ..., "trigger": "redetect", "source": "company_ats"|"prospective"}
 
-domain_enrichment_worker.py
-    Polls REDETECT_QUEUE FIRST (priority), then DOMAIN_ENRICHMENT_QUEUE (fallback)
-    Re-runs full domain enrichment for the FEIN:
-        → resolves fresh public_domain + careers_url
-        → writes back to fein_domain_map
-        → pushes to DISCOVERY_QUEUE with source field preserved in payload
+head_check_worker.py
+    Sees trigger="redetect" → performs liveness check on careers_url
+    Cases 1/2/5 (URL alive or redirected):
+        → ZADD discovery:redetect score=petition_count {"fein": ..., "trigger": "redetect", "source": ...}
+    Cases 3/4/6 (URL dead / homepage):
+        → push to enrichment lane (tier-aware: on_demand or batch)
 
-discover_h1b_ats_worker.py
-    Reads DISCOVERY_QUEUE as before (no queue change)
+discover_h1b_ats.py (via discover worker consuming discovery:redetect)
     Runs ATS detection from fresh domain/careers_url
-    
-    If source = "redetect":
-        For each newly detected (domain, platform):
-            INSERT new company_ats row (is_monitored=FALSE, pending human review)
-        After inserts complete:
-            SET stale_since = NOW() on old rows for this FEIN
-            WHERE consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
-            AND stale_since IS NULL
-        
-        For prospective_companies (source = "prospective"):
-            UPDATE prospective_companies SET ats_platform=new, ats_slug=new, is_monitored=FALSE
-            WHERE company = ... AND ats_platform != new_platform
+
+    If trigger = "redetect":
+        First: SET stale_since = NOW() on existing rows for this FEIN
+               WHERE (is_monitored=TRUE OR is_monitored=FALSE) AND stale_since IS NULL
+               AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
+        Then:  INSERT new company_ats row (is_monitored=FALSE, pending human review)
+               for each newly detected (domain, platform)
+        Note:  mark stale BEFORE inserting so _upsert_company_ats's
+               DO UPDATE WHERE is_monitored=FALSE does not accidentally update
+               a stale row instead of writing a clean new one.
+
+        For prospective_companies rows (source = "prospective"):
+            Lookup: JOIN fein_domain_map ON employer_fein = %s to get assigned_domain,
+                    then match prospective_companies WHERE domain = assigned_domain (unique).
+            UPDATE prospective_companies
+               SET ats_platform = new_platform,
+                   ats_slug     = new_slug,
+                   is_monitored = FALSE
+             WHERE domain = %s
+               AND ats_platform != new_platform
+               AND ats_platform NOT IN ('unknown', 'unsupported', 'custom')
 ```
+
+`source` ("company_ats" | "prospective") travels in the payload so the discover worker
+knows which table to flag stale and update after re-detection.
 
 ---
 
