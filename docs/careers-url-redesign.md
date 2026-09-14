@@ -460,11 +460,10 @@ Update `install-systemd.sh`:
    - Systemd unit file: `head-check-worker@.service`
 
 **4. `workers/domain_enrichment_worker.py`**
-   - `_write_careers()`: add `trigger` param; conditional overwrite vs fill-NULL
-   - Write `careers_source` alongside `careers_url`
-   - After write: `r.delete(f"head_check:{fein}")` to invalidate cache
-   - Pass trigger through from queue payload
-   - After enrichment: push to `discovery:batch` (not old DISCOVERY_QUEUE) if threshold met
+   - `_write_careers()` is unconditional — no `trigger` param, no `WHERE careers_url IS NULL` guard; always overwrites
+   - Writes `careers_source` alongside `careers_url`
+   - Head-check cache invalidation (`r.delete(f"head_check:{fein}")`) is `head_check_worker`'s responsibility after Cases 1/2, not enrichment worker's
+   - After enrichment: trigger="redetect" → push to `discovery:redetect`; others → push to `discovery:batch`
 
 **5. `scripts/discover_h1b_ats.py`** (nightly batch script)
    - Remove `careers_url`, `careers_source` from `upsert_discovery()`

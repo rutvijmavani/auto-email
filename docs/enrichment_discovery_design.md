@@ -99,9 +99,9 @@ STEP 2 — Phase 3: path probe (CF Worker quota if direct blocked)
     → writes: careers_url (if found)
 
 STEP 3 — Phase 6: career_page (CF Worker quota)
-    ALWAYS runs regardless of Phase 3 result:
-    - Phase 3 found careers_url → use as seed (fast path, ATS scan only)
-    - Phase 3 missed            → probe www.{domain} across CAREER_PATHS independently
+    Runs ONLY when Phase 3 found no ATS platform (if not p3_platform):
+    - Phase 3 found careers_url but no platform → use as seed (fast path, ATS scan only)
+    - Phase 3 missed entirely    → probe www.{domain} across CAREER_PATHS independently
     → writes: careers_url (if found or improved)
              ats_platform + ats_slug (if Phase 6 detects — bonus)
 
@@ -202,32 +202,24 @@ When triggered by job_fetcher or admin script:
 
 ## 5. Queue Design
 
-### domain_enrichment_queue
+### Six-lane queue architecture (implemented 2026-08-24)
+
 ```text
-Type:  Redis ZSET
-Key:   domain_enrichment_queue
-Score: petition_count  (higher = processed first)
-Member: company_fein
+head_check:on_demand   LIST  — on-demand HEAD checks (API-triggered)
+head_check:batch       LIST  — batch HEAD checks (staleness cron + redetect)
 
-Population:
-    After fuzzy_match_uscis_dol.py completes:
-    ZADD domain_enrichment_queue petition_count fein
-    WHERE public_domain IS NULL
-       OR last_enriched_at < NOW() - INTERVAL '90 days'
+enrichment:on_demand   LIST  — high-priority domain enrichment
+enrichment:batch       ZSET  — batch domain enrichment, score=petition_count
+enrichment:delayed     ZSET  — CT log 429 backoff, score=retry_at timestamp
 
-Consumption:
-    ZPOPMAX domain_enrichment_queue  (highest petition_count first)
-```
+discovery:redetect     ZSET  — redetect path, score=petition_count (priority lane)
+discovery:batch        ZSET  — normal discovery, score=petition_count
+discovery:delayed      ZSET  — discovery backoff, score=retry_at timestamp
 
-### discovery_queue
-```text
-Type:  Redis ZSET
-Key:   discovery_queue
-Score: petition_count
-Member: company_fein + trigger_source (json blob)
-
-Consumption:
-    ZPOPMAX discovery_queue
+Payload (JSON):
+    {"fein": "12-3456789", "trigger": "staleness"|"on_demand"|"redetect"|
+     "fuzzy_match"|"delayed_retry"|"reclaimed", "source": "company_ats"|"prospective"|null,
+     "petition_count": 1234}
 ```
 
 ### DLQ (Dead Letter Queue)
@@ -427,7 +419,7 @@ CREATE TABLE IF NOT EXISTS h1b_enrichment_metrics (
     employer_fein       TEXT        NOT NULL,
     run_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     worker              TEXT        NOT NULL,   -- 'domain_enrichment' | 'discovery'
-    trigger             TEXT,                   -- 'enrichment' | 're_detection' | 'staleness' | 'manual'
+    trigger             TEXT,                   -- 'staleness' | 'on_demand' | 'redetect' | 'fuzzy_match' | 'delayed_retry' | 'reclaimed'
 
     -- public domain (enrichment worker only)
     public_domain_method TEXT,   -- 'http_redirect' | 'root_fallback' | 'certspotter' |
