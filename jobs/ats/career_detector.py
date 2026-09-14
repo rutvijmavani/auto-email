@@ -774,30 +774,32 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
                          source_label, len(visited), result["platform"])
             best[0] = result
 
-    # Always scan raw HTML â€” catches ATS slug even on external pages
-    hits_before = len(hits)
-    _handle(scan(html), "HTML")
-
-    # Rule 1: new complete ATS hit in HTML â†’ leaf
-    if len(hits) > hits_before:
-        logger.debug("[detector] rule1 (HTML): new hit â€” leaf %s", final_url)
-        return []
-
     # â”€â”€ Signal 1: company territory check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    # Company territory = brand name appears in the page's domain
+    # Company territory = brand name appears in the page’s domain
     #                  OR company root domain is referenced anywhere in the HTML.
-    # Both signals are derived from the email/company domain (e.g. "nomura.com"):
-    #   brand      = "nomura"   â€” first segment, appears in brand-family domains
-    #   company_root = "nomura.com" â€” full root, appears in cross-links and hrefs
+    # Both signals are derived from the email/company domain (e.g. “nomura.com”):
+    #   brand      = “nomura”   â€” first segment, appears in brand-family domains
+    #   company_root = “nomura.com” â€” full root, appears in cross-links and hrefs
     # Neither uses the legal entity name which never matches website content.
+    # Must run BEFORE scanning HTML so off-domain seeds (e.g. indeed.com) never
+    # record a false hit before territory is confirmed.
     if company_root:
-        company_brand = company_root.split('.')[0]
+        company_brand = company_root.split(‘.’)[0]
         page_netloc   = urlparse(final_url).netloc.lower()
         in_domain     = company_brand in page_netloc
         in_html       = company_root in html.lower()
         if not in_domain and not in_html:
-            logger.debug("[detector] signal1: not company territory â€” leaf %s", final_url)
+            logger.debug(“[detector] signal1: not company territory â€” leaf %s”, final_url)
             return []
+
+    # Scan raw HTML â€” catches ATS slug on ATS-hosted subdomains in company territory
+    hits_before = len(hits)
+    _handle(scan(html), “HTML”)
+
+    # Rule 1: new complete ATS hit in HTML â†’ leaf
+    if len(hits) > hits_before:
+        logger.debug(“[detector] rule1 (HTML): new hit â€” leaf %s”, final_url)
+        return []
 
     # Company territory confirmed â€” record this as the first successful company-territory URL.
     # Exclude root-path redirects landing on the main company domain (homepage redirects);
