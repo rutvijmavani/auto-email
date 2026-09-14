@@ -883,8 +883,8 @@ else:
         if patterns and assigned:
             st.markdown(f"**Email format patterns** — `@{assigned}`")
             st.caption(f"Detected from {total_personal:,} unique personal LCA contacts (≥5% threshold)")
-            for p in sorted(patterns, key=lambda x: -x.get("probability", 0)):
-                prob     = p.get("probability", 0)
+            for p in sorted(patterns, key=lambda x: -(x.get("probability") or 0)):
+                prob     = p.get("probability") or 0
                 example  = p.get("example_local", "")
                 pid      = p.get("pattern_id", "")
                 fmt      = _fmt_pattern(pid, assigned)
@@ -1354,9 +1354,9 @@ def _resolve_quality_event(fein: str, careers_url: str | None, selected_kg_mid: 
             """
             UPDATE h1b_ats_quality_events
                SET resolved     = TRUE,
-                   resolved_url = :url,
+                   resolved_url = %(url)s,
                    resolved_at  = NOW()
-             WHERE fein = :fein
+             WHERE fein = %(fein)s
             """,
             {"fein": fein, "url": careers_url},
         )
@@ -1365,9 +1365,9 @@ def _resolve_quality_event(fein: str, careers_url: str | None, selected_kg_mid: 
             conn.execute(
                 """
                 UPDATE fein_domain_map
-                   SET careers_url = :url
-                 WHERE employer_fein = :fein
-                   AND (careers_url IS NULL OR careers_url != :url)
+                   SET careers_url = %(url)s
+                 WHERE employer_fein = %(fein)s
+                   AND (careers_url IS NULL OR careers_url != %(url)s)
                 """,
                 {"fein": fein, "url": careers_url},
             )

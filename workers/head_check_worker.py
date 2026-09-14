@@ -245,7 +245,7 @@ def _classify(original_url: str, resp: "requests.Response | None") -> "tuple[str
     if status not in (200, 301, 302, 303, 307, 308):
         return "dead", None
 
-    redirected = bool(resp.history)
+    redirected = bool(resp.history) or (final_url != original_url)
     if not redirected and status == 200:
         return "ok", final_url
 
