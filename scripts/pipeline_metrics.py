@@ -1,5 +1,5 @@
 ﻿"""
-scripts/pipeline_metrics.py â€” H1B enrichment pipeline performance report.
+scripts/pipeline_metrics.py — H1B enrichment pipeline performance report.
 
 Shows which phase found public_domain / careers_url / ATS for each company,
 phase-level success rates, and regression detection (last 30 days vs prior 30 days).
@@ -21,12 +21,12 @@ from logger import get_logger, init_logging
 
 log = get_logger(__name__)
 
-_SEP  = "â”€" * 70
-_DSEP = "â•" * 70
+_SEP  = "─" * 70
+_DSEP = "═" * 70
 
 
 def _pct(n, total):
-    return f"{n / total * 100:.1f}%" if total else "â€”"
+    return f"{n / total * 100:.1f}%" if total else "—"
 
 
 def _phase_table(rows, total, label):
@@ -83,7 +83,7 @@ def _regression_block(conn, col, label, days):
     if not recent and not prior:
         return
 
-    print(f"\n  {label} â€” regression check (recent {days}d vs prior {days}d)")
+    print(f"\n  {label} — regression check (recent {days}d vs prior {days}d)")
     print(f"  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Î”':>8}")
     print(f"  {_SEP[:52]}")
 
@@ -108,7 +108,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         print(f"  H1B ENRICHMENT PIPELINE METRICS  (last {days} days)")
         print(f"{_DSEP}")
 
-        # â”€â”€ PUBLIC DOMAIN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── PUBLIC DOMAIN ────────────────────────────────────────────────────
         print(f"\n  {_SEP}")
         print("  PUBLIC DOMAIN  (domain_enrichment_worker)")
         print(f"  {_SEP}")
@@ -161,14 +161,14 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             """, (f"{days} days", no_signal_top)).fetchall()
 
             if unresolved_rows:
-                print(f"\n  Top {no_signal_top} unresolved (no_signal) â€” high priority targets:")
+                print(f"\n  Top {no_signal_top} unresolved (no_signal) — high priority targets:")
                 print(f"  {'FEIN':<14} {'Petitions':>10}  {'Domain':<25}  Name")
                 print(f"  {_SEP}")
                 for r in unresolved_rows:
                     print(f"  {r['employer_fein']:<14} {r['petition_count']:>10}  "
-                          f"{r['assigned_domain'] or 'â€”':<25}  {r['employer_name']}")
+                          f"{r['assigned_domain'] or '—':<25}  {r['employer_name']}")
 
-        # â”€â”€ CAREER URL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── CAREER URL ───────────────────────────────────────────────────────
         print(f"\n  {_SEP}")
         print("  CAREER URL  (both workers)")
         print(f"  {_SEP}")
@@ -204,9 +204,9 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         """, (f"{days} days",)).fetchone()["n"]
         if no_ats_careers:
             print(f"\n  âš   {no_ats_careers} companies have careers_url but no ATS detected "
-                  f"â€” discovery worker may need another pass")
+                  f"— discovery worker may need another pass")
 
-        # â”€â”€ ATS DETECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── ATS DETECTION ────────────────────────────────────────────────────
         print(f"\n  {_SEP}")
         print("  ATS DETECTION  (both workers)")
         print(f"  {_SEP}")
@@ -228,7 +228,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         ats_total = sum(r["n"] for r in ats_rows)
         _phase_table(ats_rows, ats_total, "Detection phase")
 
-        # ATS platform breakdown â€” latest run per employer only
+        # ATS platform breakdown — latest run per employer only
         # Compute total across ALL platforms first so percentages use the real denominator.
         _plat_total_row = conn.execute("""
             SELECT COUNT(*) AS total
@@ -264,7 +264,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
                 print(f"  {r['ats_platform']:<25} {r['companies']:>10}  "
                       f"{_pct(r['companies'], plat_total):>7}")
 
-        # â”€â”€ REGRESSION DETECTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── REGRESSION DETECTION ─────────────────────────────────────────────
         print(f"\n  {_SEP}")
         print("  REGRESSION DETECTION")
         print(f"  {_SEP}")
@@ -273,7 +273,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         _regression_block(conn, "careers_source",       "Career URL",    days)
         _regression_block(conn, "ats_source",           "ATS detection", days)
 
-        # â”€â”€ PERFORMANCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── PERFORMANCE ──────────────────────────────────────────────────────
         print(f"\n  {_SEP}")
         print("  PROCESSING PERFORMANCE")
         print(f"  {_SEP}")

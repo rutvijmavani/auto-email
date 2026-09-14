@@ -1,12 +1,12 @@
 ﻿"""
-workers/head_check_worker.py â€” HEAD check worker for H1B pipeline.
+workers/head_check_worker.py — HEAD check worker for H1B pipeline.
 
 Sits between producers (api.py, staleness_checker, job_monitor) and the
 enrichment/discovery workers. Verifies whether a known careers_url is still
 alive before deciding where to route the company next.
 
 Pop order (priority): HEAD_CHECK_ON_DEMAND (api.py) first, HEAD_CHECK_BATCH second.
-Both are Redis LISTs â€” BLPOP handles strict priority ordering natively.
+Both are Redis LISTs — BLPOP handles strict priority ordering natively.
 
 For each company:
   1. Check Redis cache head_check:{fein} (TTL = HEAD_CHECK_CACHE_TTL_S / 6h default).
@@ -69,12 +69,12 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
-# Registered domains of known ATS platforms â€” imported from discover_h1b_ats to stay in sync.
+# Registered domains of known ATS platforms — imported from discover_h1b_ats to stay in sync.
 try:
     from scripts.discover_h1b_ats import _KNOWN_ATS_DOMAINS, _root_domain
     _tldextract_available = True
 except Exception as _import_err:
-    log.warning("discover_h1b_ats import failed (%s) â€” using fallback ATS domain set", _import_err)
+    log.warning("discover_h1b_ats import failed (%s) — using fallback ATS domain set", _import_err)
     _KNOWN_ATS_DOMAINS = {
         "myworkdayjobs.com", "greenhouse.io", "lever.co", "ashbyhq.com",
         "icims.com", "smartrecruiters.com", "jobvite.com", "taleo.net",
@@ -97,21 +97,21 @@ except Exception as _import_err:
 _CAREERS_PATH_KEYWORDS = ("/career", "/job", "/work", "/hiring", "/talent", "/recruit")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Maintenance window
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
     except Exception as exc:
-        log.warning("Redis maintenance check failed (%s) â€” assuming not in maintenance", exc)
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Redis cache helpers  (head_check:{fein})
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 _CACHE_PREFIX = "head_check:"
 
@@ -140,9 +140,9 @@ def _cache_delete(r, fein: str) -> None:
         log.warning("head_check cache delete failed fein=%s: %s", fein, exc)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Retry tracking
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 _RETRY_KEY_PREFIX = "head_check:retry:"
 _RETRY_TTL_S      = 86400 * 3  # 3 days
@@ -163,9 +163,9 @@ def _clear_retry(r, fein: str) -> None:
     r.delete(f"{_RETRY_KEY_PREFIX}{fein}")
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # DLQ
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
     payload = json.dumps({
@@ -178,9 +178,9 @@ def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
     log.error("DLQ: fein=%s reason=%s retries=%d", fein, error_reason, retry_count)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP HEAD + classification
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 _MAX_REDIRECTS = 10
 
@@ -264,9 +264,9 @@ def _classify(original_url: str, resp: "requests.Response | None") -> "tuple[str
     return "unknown_redirect", None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # DB helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_careers_url(conn, fein: str) -> "str | None":
     row = conn.execute(
@@ -286,9 +286,9 @@ def _write_careers(conn, fein: str, careers_url: str) -> None:
     """, (careers_url, fein))
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Routing helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _push_enrichment(r, fein: str, petition_count: int, trigger: str,
                      source: "str | None", tier: str) -> None:
@@ -313,24 +313,24 @@ def _push_discovery(r, fein: str, petition_count: int, trigger: str,
                   fein, trigger, petition_count)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-company processing
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _process_company(r, fein: str, petition_count: int, trigger: str,
                      source: "str | None", tier: str) -> bool:
     """
     Run HEAD check for one company. Returns True on success, False on transient error.
 
-    tier: "on_demand" | "batch" â€” determines which enrichment lane to use for Cases 3,4,6.
+    tier: "on_demand" | "batch" — determines which enrichment lane to use for Cases 3,4,6.
     """
     conn = None
     try:
         conn = get_conn()
         careers_url = _load_careers_url(conn, fein)
         if not careers_url:
-            # careers_url vanished since the producer pushed this item â€” push to enrichment.
-            log.info("head_check: fein=%s careers_url NULL in DB â€” routing to enrichment", fein)
+            # careers_url vanished since the producer pushed this item — push to enrichment.
+            log.info("head_check: fein=%s careers_url NULL in DB — routing to enrichment", fein)
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
             return True
 
@@ -347,7 +347,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             final_url  = cached.get("final_url")
             log.debug("head_check: fein=%s cache HIT case=%s", fein, case_label)
         else:
-            # Cache miss or URL changed â€” do HTTP HEAD
+            # Cache miss or URL changed — do HTTP HEAD
             resp, exc = _http_head(careers_url)
             if exc:
                 log.info("head_check: fein=%s HEAD failed: %s", fein, exc)
@@ -360,9 +360,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             log.info("head_check: fein=%s case=%s final_url=%s trigger=%s",
                      fein, case_label, final_url, trigger)
 
-        # â”€â”€ Route based on case â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Route based on case ───────────────────────────────────────────────
         if case_label in ("careers_redirect", "ats_redirect"):
-            # Case 1 / 2 â€” redirect found a valid URL; update DB and invalidate cache
+            # Case 1 / 2 — redirect found a valid URL; update DB and invalidate cache
             _write_careers(conn, fein, final_url)
             conn.commit()
             _cache_delete(r, fein)
@@ -372,14 +372,14 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
                 _push_discovery(r, fein, petition_count, trigger, source)
 
         elif case_label == "ok":
-            # Case 5 â€” URL still healthy; no DB write needed
+            # Case 5 — URL still healthy; no DB write needed
             if trigger == "on_demand":
                 log.info("head_check: fein=%s Case 5 on_demand â†’ STOP", fein)
             else:
                 _push_discovery(r, fein, petition_count, trigger, source)
 
         else:
-            # Cases 3, 4, 6 â€” URL dead or homepage; send to enrichment
+            # Cases 3, 4, 6 — URL dead or homepage; send to enrichment
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
 
         _clear_retry(r, fein)
@@ -398,9 +398,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             conn.close()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Main loop
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _reclaim_inflight(r, own_inflight_key: str) -> None:
     """On startup, push any items left in ANY prior instance's inflight list back to their source queues.
@@ -473,10 +473,10 @@ def run_worker(once: bool = False) -> None:
                     _maint_start = time.monotonic()
                 elapsed = time.monotonic() - _maint_start
                 if elapsed > _MAINTENANCE_MAX_S:
-                    log.error("Maintenance window exceeded %dh â€” exiting to allow restart",
+                    log.error("Maintenance window exceeded %dh — exiting to allow restart",
                               _MAINTENANCE_MAX_S // 3600)
                     return
-                log.info("Maintenance window active â€” pausing 30s (%.0fm elapsed)", elapsed / 60)
+                log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
             # BLPOP checks on_demand first (priority), falls back to batch.
@@ -485,9 +485,9 @@ def run_worker(once: bool = False) -> None:
                              timeout=WORKER_BLOCK_SECS)
 
             if result is None:
-                # Timeout â€” check if both queues are genuinely empty.
+                # Timeout — check if both queues are genuinely empty.
                 if r.llen(HEAD_CHECK_ON_DEMAND) == 0 and r.llen(HEAD_CHECK_BATCH) == 0:
-                    log.info("head_check: both queues empty â€” exiting")
+                    log.info("head_check: both queues empty — exiting")
                     break
                 continue
 
@@ -504,7 +504,7 @@ def run_worker(once: bool = False) -> None:
                 source         = data.get("source")
                 petition_count = int(data.get("petition_count", 0))
             except (json.JSONDecodeError, KeyError, TypeError):
-                log.error(“head_check: malformed member %r â€” sending to DLQ”, _member_str)
+                log.error(“head_check: malformed member %r — sending to DLQ”, _member_str)
                 r.lpush(HEAD_CHECK_DLQ, json.dumps({
                     “fein”: “MALFORMED”, “error_reason”: “malformed_member”,
                     “raw”: repr(_member_str), “failed_at”: time.time(),
@@ -548,7 +548,7 @@ def run_worker(once: bool = False) -> None:
     finally:
         hb.stop()
 
-    log.info("head-check-worker stopped â€” processed %d companies", processed["n"])
+    log.info("head-check-worker stopped — processed %d companies", processed["n"])
 
 
 if __name__ == "__main__":
