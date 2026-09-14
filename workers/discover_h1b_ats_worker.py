@@ -264,8 +264,8 @@ def _update_prospective_ats(conn, probe_domain: str, new_platform: str, new_slug
             ats_slug        = %s,
             is_monitored    = FALSE,
             ats_detected_at = NOW()
-        WHERE LOWER(regexp_replace(domain, '^www\\.', '')) =
-              LOWER(regexp_replace(%s, '^www\\.', ''))
+        WHERE LOWER(regexp_replace(regexp_replace(domain, '^https?://', ''), '^www\\.', '')) =
+              LOWER(regexp_replace(regexp_replace(%s, '^https?://', ''), '^www\\.', ''))
           AND (%s IS DISTINCT FROM ats_platform OR %s IS DISTINCT FROM ats_slug)
     """, (new_platform, new_slug, probe_domain, new_platform, new_slug))
     return cur.rowcount
