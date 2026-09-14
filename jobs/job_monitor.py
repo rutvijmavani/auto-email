@@ -55,6 +55,7 @@ from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
 )
+from db.job_monitor import parse_company_ats_key
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
     MONITOR_COVERAGE_ALERT,
@@ -859,7 +860,8 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
-        r.lpush(HEAD_CHECK_BATCH, json.dumps({"fein": fein, "trigger": "redetect", "source": None, "petition_count": petition_count}))
+        _source = "company_ats" if parse_company_ats_key(company) is not None else "prospective"
+        r.lpush(HEAD_CHECK_BATCH, json.dumps({"fein": fein, "trigger": "redetect", "source": _source, "petition_count": petition_count}))
         result["queued_enrichment"] = 1
         tag = f" ({log_label})" if log_label else ""
         _reason = _redetect_reason(company_row)

@@ -133,6 +133,7 @@ def _careers_verify_badge(fein: str, careers: str) -> None:
         result = None
 
     if result is None:
+        _trigger_careers_check(careers, fein)
         st.caption("⏳ Verifying careers page…")
     elif result in (b"ok", "ok"):
         st.session_state[_cache_key] = {"value": "ok", "expires_at": time.time() + _HEAD_CHECK_TTL}

@@ -475,11 +475,12 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
             parsed = json.loads(member)
             fein = parsed["fein"]
             # petition_count from payload (on_demand items have score=0 in inflight).
-            pc = parsed.get("petition_count", int(score)) or int(score)
+            pc   = parsed.get("petition_count", int(score)) or int(score)
+            tier = parsed.get("tier")
         except Exception:
             fein = member.strip()
             pc   = int(score)
-        tier = parsed.get("tier") if isinstance(parsed, dict) else None
+            tier = None
         if tier == "on_demand" or (tier is None and score == 0):
             r.lpush(ENRICHMENT_ON_DEMAND, member)
             log.info("reclaimed inflight fein=%s -> enrichment:on_demand", fein)

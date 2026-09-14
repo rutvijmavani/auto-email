@@ -184,12 +184,19 @@ def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
 
 _MAX_REDIRECTS = 10
 
-def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None]":
+def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None, str]":
+    """Return (response, exception, logical_url).
+
+    logical_url is the last URL we requested before the SSRFAdapter may have
+    rewritten the host to an IP literal — _classify must use it, not resp.url,
+    so that HTTP→IP rewrites are not misidentified as redirects.
+    """
     headers = {"User-Agent": "Mozilla/5.0 (compatible; H1BPipeline/1.0)"}
     current_url = url
     _sess = _make_safe_session()
     try:
         for _ in range(_MAX_REDIRECTS):
+            logical_url = current_url
             resp = _sess.head(
                 current_url,
                 allow_redirects=False,
@@ -197,17 +204,17 @@ def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None]":
                 headers=headers,
             )
             if resp.status_code not in (301, 302, 303, 307, 308):
-                return resp, None
+                return resp, None, logical_url
             location = resp.headers.get("Location", "")
             if not location:
-                return resp, None
+                return resp, None, logical_url
             next_url = urljoin(current_url, location)
             if not _is_safe_url(next_url):
-                return resp, None
+                return resp, None, logical_url
             current_url = next_url
-        return resp, None
+        return resp, None, logical_url
     except Exception as exc:
-        return None, exc
+        return None, exc, url
 
 
 def _is_safe_url(url: str) -> bool:
@@ -348,10 +355,10 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             log.debug("head_check: fein=%s cache HIT case=%s", fein, case_label)
         else:
             # Cache miss or URL changed — do HTTP HEAD
-            resp, exc = _http_head(careers_url)
+            resp, exc, logical_url = _http_head(careers_url)
             if exc:
                 log.info("head_check: fein=%s HEAD failed: %s", fein, exc)
-            case_label, final_url = _classify(careers_url, resp)
+            case_label, final_url = _classify(logical_url, resp)
             _cache_set(r, fein, {
                 "case":       case_label,
                 "final_url":  final_url,
