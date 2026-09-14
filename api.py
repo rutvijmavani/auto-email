@@ -374,7 +374,7 @@ def _trigger_enrichment(fein: str, r=None) -> None:
     """LPUSH fein to enrichment:on_demand for immediate re-enrichment. Fire-and-forget."""
     try:
         _r = r if r is not None else get_redis()
-        member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None})
+        member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None, "tier": "on_demand"})
         _r.lpush(ENRICHMENT_ON_DEMAND, member)
         logger.info("verify-company: queued re-enrichment fein=%s → enrichment:on_demand", fein)
     except Exception as exc:

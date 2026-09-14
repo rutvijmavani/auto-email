@@ -114,7 +114,7 @@ Existing `is_monitored` equivalent + `ats_platform`/`ats_slug` columns are suffi
 
 ```python
 # config.py
-REDETECT_QUEUE      = "redetect_queue"   # Redis ZSET — silent monitored companies awaiting re-detection
+DISCOVERY_REDETECT  = "discovery:redetect"  # Redis ZSET — silent monitored companies awaiting re-detection
 ATS_STALE_TTL_DAYS  = 30                 # days before stale company_ats rows are purged
 ```
 

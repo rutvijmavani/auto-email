@@ -2,7 +2,7 @@
 scripts/staleness_checker.py â€” Daily cron: push stale companies to enrichment/discovery/redetect queues.
 
 Pass 1a â€” Enrichment staleness (no careers URL):
-    fein_domain_map WHERE careers_url IS NULL AND last_enriched_at stale
+    fein_domain_map WHERE careers_url IS NULL AND public_domain IS NULL AND last_enriched_at stale
     â†’ ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
 
 Pass 1b â€” Head-check staleness (careers URL known):
@@ -71,7 +71,7 @@ def _is_maintenance(r) -> bool:
 
 
 def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, dry_run,
-                     trigger="enrichment", source=None, use_list=False):
+                     trigger="enrichment", source=None, use_list=False, tier=None):
     """Stream a SELECT query via named cursor and push each row to queue_key.
 
     use_list=False (default): ZADD to a ZSET with score=petition_count.
@@ -95,7 +95,10 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                     dry_run_sample.append(row)
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": trigger, "source": source})
+            payload: dict = {"fein": row["employer_fein"], "trigger": trigger, "source": source}
+            if tier is not None:
+                payload["tier"] = tier
+            member = json.dumps(payload)
             if use_list:
                 pipe.rpush(queue_key, member)
             else:
@@ -191,6 +194,7 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         log_prefix="enrichment staleness (no careers URL)",
         dry_run=dry_run,
         trigger="staleness",
+        tier="batch",
     )
 
     # Pass 1b: careers URL known â€” just verify it's still alive

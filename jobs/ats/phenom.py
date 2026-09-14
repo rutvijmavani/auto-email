@@ -412,10 +412,10 @@ def _extract_location(ld):
         # that include the US are not incorrectly classified as non-US.
         us_loc = next(
             (loc for loc in locations
-             if country_to_alpha2((loc.get("address", {}).get("addressCountry") or "").strip()) == "US"),
+             if country_to_alpha2(((loc.get("address") or {}).get("addressCountry") or "").strip()) == "US"),
             None,
         )
-        addr         = (us_loc or locations[0]).get("address", {})
+        addr         = (us_loc or locations[0]).get("address") or {}
         country_raw  = (addr.get("addressCountry") or "").strip()
         alpha2       = country_to_alpha2(country_raw)
 

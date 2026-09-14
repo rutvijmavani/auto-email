@@ -14,14 +14,14 @@ fein_domain_map                        petition_count per employer
 (assigned_domain, root-grouped)                ↓
     └──────────────────────────────────────→
                         ↓
-            populate domain_enrichment_queue
-            (Redis ZSET, score = petition_count)
+            populate enrichment:batch / enrichment:on_demand
+            (ZSET scored by petition_count / LIST for on-demand priority)
                         ↓
             domain_enrichment_worker        ← EVENT-DRIVEN BATCH
             (on-demand, terminates when queue empty)
                         ↓
             writes: public_domain, careers_url, ats_platform/slug (bonus)
-            pushes: petition_count >= threshold → discovery_queue
+            pushes: petition_count >= threshold → discovery:batch / discovery:redetect
                         ↓
             discover_h1b_ats_worker         ← EVENT-DRIVEN BATCH
             (on-demand, terminates when queue empty)
