@@ -226,24 +226,35 @@ def _is_safe_url(url: str) -> bool:
     host = parsed.hostname or ""
     return bool(host) and not _is_private_host(host)
 
-def _classify(original_url: str, resp: "requests.Response | None") -> "tuple[str, str | None]":
+def _classify(
+    original_url: str,
+    resp: "requests.Response | None",
+    logical_url: "str | None" = None,
+) -> "tuple[str, str | None]":
     """
     Classify the HEAD response into one of 6 cases.
     Returns (case_label, final_url_or_None).
 
+    logical_url: the pre-SSRFAdapter hostname URL captured by _http_head before
+    the request is sent.  SSRFAdapter rewrites resp.url to an IP literal for
+    HTTP requests, so resp.url cannot be compared against original_url directly.
+    Pass logical_url to use the hostname URL as final_url instead.
+
     case_label values:
-      "careers_redirect"  â†’ Case 1: same domain, careers path
-      "ats_redirect"      â†’ Case 2: known ATS domain
-      "homepage_redirect" â†’ Case 3: same domain, homepage/unknown path
-      "unknown_redirect"  â†’ Case 4: unrelated 3rd party
-      "ok"                â†’ Case 5: clean 200, URL healthy
-      "dead"              â†’ Case 6: error / non-2xx / timeout
+      "careers_redirect"  -> Case 1: same domain, careers path
+      "ats_redirect"      -> Case 2: known ATS domain
+      "homepage_redirect" -> Case 3: same domain, homepage/unknown path
+      "unknown_redirect"  -> Case 4: unrelated 3rd party
+      "ok"                -> Case 5: clean 200, URL healthy
+      "dead"              -> Case 6: error / non-2xx / timeout
     """
     if resp is None:
         return "dead", None
 
     status = resp.status_code
-    final_url = resp.url
+    # Use the caller-supplied logical URL (hostname) to avoid comparing against
+    # the IP-literal URL that SSRFAdapter writes into resp.url for HTTP requests.
+    final_url = logical_url if logical_url is not None else resp.url
 
     if status in (403, 405):
         # 403 Forbidden / 405 Method Not Allowed — server is alive but blocks HEAD.
@@ -358,7 +369,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             resp, exc, logical_url = _http_head(careers_url)
             if exc:
                 log.info("head_check: fein=%s HEAD failed: %s", fein, exc)
-            case_label, final_url = _classify(logical_url, resp)
+            case_label, final_url = _classify(careers_url, resp, logical_url)
             _cache_set(r, fein, {
                 "case":       case_label,
                 "final_url":  final_url,

@@ -1309,15 +1309,31 @@ def _check_error_spikes(r) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_ats_alive_count(r, hb_prefix: str) -> int:
-    """Count alive ATS worker instances by scanning worker:alive:{hb_prefix}* keys."""
+    """Count alive ATS worker instances by scanning worker:alive:{hb_prefix}* keys.
+
+    Keys have the form worker:alive:{hb_prefix}@{instance}:{pid}.  A single
+    instance that restarts quickly can leave a stale PID key alongside a fresh
+    one before the old TTL expires, so we deduplicate by instance, not by key.
+    """
     cursor = 0
-    seen: set = set()
+    keys_seen: set = set()
     while True:
         cursor, keys = r.scan(cursor, match=f"worker:alive:{hb_prefix}*", count=50)
-        seen.update(keys)
+        keys_seen.update(keys)
         if cursor == 0:
             break
-    return len(seen)
+    instances: set = set()
+    for key in keys_seen:
+        key_str = key.decode() if isinstance(key, bytes) else key
+        at_idx = key_str.rfind("@")
+        if at_idx != -1:
+            after_at = key_str[at_idx + 1:]          # "{instance}:{pid}"
+            colon_idx = after_at.rfind(":")
+            inst = after_at[:colon_idx] if colon_idx != -1 else after_at
+            instances.add(inst)
+        else:
+            instances.add(key_str)
+    return len(instances)
 
 
 def _run_ats_pool_cycle(

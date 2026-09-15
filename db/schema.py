@@ -910,6 +910,7 @@ def init_db():
         ("domain",                 "TEXT"),
         ("listing_curl_raw",       "TEXT"),
         ("detail_curl_raw",        "TEXT"),
+        ("is_monitored",           "BOOLEAN NOT NULL DEFAULT TRUE"),
     ]:
         c.execute(
             f"ALTER TABLE prospective_companies ADD COLUMN IF NOT EXISTS {col} {defn}"
