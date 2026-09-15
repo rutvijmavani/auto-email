@@ -396,19 +396,19 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                 if p6_platform and p6_slug:
                     p6_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                                   p6_platform, p6_slug, db_petition_count))
-                    log.info(“fein=%s ATS detected: %s slug=%s (phase6)”, fein, p6_platform, p6_slug)
+                    log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
 
         # Use Phase 3 ATS whenever Phase 6 found no platform
         p3_written = False
         if not p6_platform and p3_platform and p3_slug:
             p3_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                           p3_platform, p3_slug, db_petition_count))
-            log.info(“fein=%s ATS detected: %s slug=%s (phase3)”, fein, p3_platform, p3_slug)
+            log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
 
         conn.commit()
 
         # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
-        if (trigger != “on_demand”
+        if (trigger != "on_demand"
                 and db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
@@ -417,11 +417,11 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         ats_platform = None
         ats_slug     = None
         if p6_written:
-            ats_source   = “phase6”
+            ats_source   = "phase6"
             ats_platform = p6_platform
             ats_slug     = p6_slug
         elif p3_written:
-            ats_source   = “phase3”
+            ats_source   = "phase3"
             ats_platform = p3_platform
             ats_slug     = p3_slug
 

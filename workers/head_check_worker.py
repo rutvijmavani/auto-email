@@ -522,20 +522,20 @@ def run_worker(once: bool = False) -> None:
                 source         = data.get("source")
                 petition_count = int(data.get("petition_count", 0))
             except (json.JSONDecodeError, KeyError, TypeError):
-                log.error(“head_check: malformed member %r — sending to DLQ”, _member_str)
+                log.error("head_check: malformed member %r — sending to DLQ", _member_str)
                 r.lpush(HEAD_CHECK_DLQ, json.dumps({
-                    “fein”: “MALFORMED”, “error_reason”: “malformed_member”,
-                    “raw”: repr(_member_str), “failed_at”: time.time(),
+                    "fein": "MALFORMED", "error_reason": "malformed_member",
+                    "raw": repr(_member_str), "failed_at": time.time(),
                 }))
                 continue
 
             retry_count = _get_retry_count(r, fein)
             if retry_count >= HEAD_CHECK_MAX_RETRIES:
-                _move_to_dlq(r, fein, “max_retries_exceeded”, retry_count)
+                _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein)
                 continue
 
-            _inflight_entry = json.dumps({“queue”: _queue_str, “member”: _member_str})
+            _inflight_entry = json.dumps({"queue": _queue_str, "member": _member_str})
             r.lpush(_own_inflight_key, _inflight_entry)
             try:
                 success = _process_company(r, fein, petition_count, trigger, source, tier)

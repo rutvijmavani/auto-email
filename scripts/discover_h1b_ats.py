@@ -1416,9 +1416,9 @@ def _upsert_company_ats(
                   WHERE had.employer_fein = ca_del.employer_fein
                     AND (
                         regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
-                     OR regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
+                     OR regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
                      OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
-                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
+                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
                     )
               )
               AND NOT EXISTS (
@@ -1427,7 +1427,7 @@ def _upsert_company_ats(
                     AND fdm.careers_url IS NOT NULL
                     AND (
                         regexp_replace(regexp_replace(LOWER(fdm.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
-                     OR regexp_replace(regexp_replace(LOWER(fdm.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%.' || ca_del.domain)
+                     OR regexp_replace(regexp_replace(LOWER(fdm.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
                     )
               )
         """, (fein, platform, domain))
