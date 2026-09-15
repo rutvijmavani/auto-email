@@ -311,6 +311,7 @@ def get_all_monitored_companies():
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
                     AND pc.ats_slug IS NOT NULL
+                    AND pc.is_monitored = TRUE
                     AND (pc.ats_platform != 'custom'
                          OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
                              AND json_extract_text(pc.ats_slug, '$.url') <> ''))
@@ -404,6 +405,7 @@ def get_monitorable_companies():
                     AND pc.ats_platform IS NOT NULL
                     AND pc.ats_platform NOT IN ('unknown', 'unsupported')
                     AND pc.ats_slug IS NOT NULL
+                    AND pc.is_monitored = TRUE
                     AND (pc.ats_platform != 'custom'
                          OR (json_extract_text(pc.ats_slug, '$.url') IS NOT NULL
                              AND json_extract_text(pc.ats_slug, '$.url') <> ''))

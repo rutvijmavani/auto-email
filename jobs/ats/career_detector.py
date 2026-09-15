@@ -784,21 +784,21 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
     # Must run BEFORE scanning HTML so off-domain seeds (e.g. indeed.com) never
     # record a false hit before territory is confirmed.
     if company_root:
-        company_brand = company_root.split(‘.’)[0]
+        company_brand = company_root.split('.')[0]
         page_netloc   = urlparse(final_url).netloc.lower()
         in_domain     = company_brand in page_netloc
         in_html       = company_root in html.lower()
         if not in_domain and not in_html:
-            logger.debug(“[detector] signal1: not company territory â€” leaf %s”, final_url)
+            logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
             return []
 
     # Scan raw HTML â€” catches ATS slug on ATS-hosted subdomains in company territory
     hits_before = len(hits)
-    _handle(scan(html), “HTML”)
+    _handle(scan(html), "HTML")
 
     # Rule 1: new complete ATS hit in HTML â†’ leaf
     if len(hits) > hits_before:
-        logger.debug(“[detector] rule1 (HTML): new hit â€” leaf %s”, final_url)
+        logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
         return []
 
     # Company territory confirmed â€” record this as the first successful company-territory URL.

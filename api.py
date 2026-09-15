@@ -472,8 +472,9 @@ def verify_company():
         _r_client = None
 
     if not careers_url:
-        # No careers URL — queue full enrichment to find one
-        _trigger_enrichment(fein, _r_client)
+        # No careers URL — queue full enrichment to find one (cooldown: same TTL as head-check)
+        if _r_client is None or _r_client.set(f"verify_company:cooldown:{fein}", 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S):
+            _trigger_enrichment(fein, _r_client)
     else:
         # careers URL known — delegate liveness check to head_check_worker
         try:
