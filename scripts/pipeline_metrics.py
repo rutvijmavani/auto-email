@@ -84,7 +84,7 @@ def _regression_block(conn, col, label, days):
         return
 
     print(f"\n  {label} — regression check (recent {days}d vs prior {days}d)")
-    print(f"  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Î”':>8}")
+    print(f”  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Δ':>8}”)
     print(f"  {_SEP[:52]}")
 
     r_total = sum(recent.values())
@@ -97,7 +97,7 @@ def _regression_block(conn, col, label, days):
         p_p = p_n / p_total * 100 if p_total else 0
         delta = r_p - p_p
         delta_str = f"{delta:+.1f}pp"
-        flag = "  âš " if abs(delta) >= 10 else ""
+        flag = "  ⚠" if abs(delta) >= 10 else ""
         print(f"  {phase:<18} {r_n:>5} ({r_p:>4.0f}%)  {p_n:>5} ({p_p:>4.0f}%)  {delta_str:>8}{flag}")
 
 
@@ -203,7 +203,7 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
             WHERE careers_url IS NOT NULL AND ats_platform IS NULL
         """, (f"{days} days",)).fetchone()["n"]
         if no_ats_careers:
-            print(f"\n  âš   {no_ats_careers} companies have careers_url but no ATS detected "
+            print(f"\n  ⚠  {no_ats_careers} companies have careers_url but no ATS detected "
                   f"— discovery worker may need another pass")
 
         # ── ATS DETECTION ────────────────────────────────────────────────────
