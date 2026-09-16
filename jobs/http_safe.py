@@ -116,6 +116,9 @@ class SSRFAdapter(HTTPAdapter):
             _default_port = 80
             host_header = f"{host}:{explicit_port}" if explicit_port and explicit_port != _default_port else host
             request.headers["Host"] = host_header
+        else:
+            # HTTPS: do not carry over a Host header from a previous HTTP hop.
+            request.headers.pop("Host", None)
 
         return super().send(request, *args, **kwargs)
 

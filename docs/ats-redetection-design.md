@@ -144,7 +144,7 @@ The old stale row (platform that went silent) is no longer scraped immediately (
 
 ## What Stays the Same
 
-- `discover_h1b_ats_worker.py` queue consumption loop unchanged — still reads `DISCOVERY_QUEUE`
+- `discover_h1b_ats_worker.py` queue consumption loop unchanged — reads `discovery:batch` and `discovery:redetect` ZSETs (via `DISCOVERY_BATCH` and `DISCOVERY_REDETECT` constants)
 - `domain_enrichment_worker.py` re-detection logic is identical to normal enrichment — just priority-ordered differently
 - `_upsert_company_ats` dedup guard (`is_monitored=TRUE` early return) stays — but does NOT fire during redetect path because old row gets `stale_since` set first, and job monitor query excludes `stale_since IS NOT NULL` rows
 - Multi-ATS companies: only the silent path is affected; other `(domain, platform)` rows for the same FEIN are untouched

@@ -526,7 +526,7 @@ def run_worker(once: bool = False) -> None:
                 trigger        = data.get("trigger", "staleness")
                 source         = data.get("source")
                 petition_count = int(data.get("petition_count", 0))
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 log.error("head_check: malformed member %r — sending to DLQ", _member_str)
                 r.lpush(HEAD_CHECK_DLQ, json.dumps({
                     "fein": "MALFORMED", "error_reason": "malformed_member",

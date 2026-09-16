@@ -224,8 +224,9 @@ Payload (JSON):
 
 ### DLQ (Dead Letter Queue)
 ```text
-domain_enrichment:dlq
+enrichment:dlq
 discovery:dlq
+head_check:dlq
 
 Per entry — max-retry failures (_move_to_dlq):
     fein              company FEIN that exhausted retries
@@ -324,11 +325,11 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 
 ## 9. Refresh / Staleness
 
-### Enrichment triggers (3 ways workers start)
+### Enrichment triggers (populating scripts enqueue work; manager.py autoscaler starts workers)
 ```text
 1. fuzzy_match_uscis_dol.py completes
-       → bulk populate domain_enrichment_queue (all null/stale public_domain rows)
-       → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
+       → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "fuzzy_match"}
+         (all null/stale public_domain rows)
 
 2. staleness_checker (daily cron)
        WHERE (
@@ -340,32 +341,21 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
          (last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days')
          AND employer_fein IN (monitored_feins from get_monitorable_companies())
        )
-       → ZADD domain_enrichment_queue petition_count {"fein": ..., "trigger": "staleness"}
-       → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
+       → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
 
 3. User visits company page (on-demand verification — see below)
-       → may push to domain_enrichment_queue with HIGH priority
-       → systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
+       → RPUSH enrichment:on_demand {"fein": ..., "trigger": "on_demand"}
 ```
 
 ### Discovery triggers
 ```text
-job_fetcher_worker:
-    consecutive_zero_jobs > JOB_MONITOR_REDETECT_DAYS (14)
-        → ZADD discovery_queue petition_count fein
-        → trigger_source = 'job_fetcher'
-        → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
-
 staleness_checker (daily cron):
     WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
       AND petition_count >= threshold
-        → ZADD discovery_queue petition_count fein
-        → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
+        → ZADD discovery:batch petition_count fein
 
-Admin script (new ATS platform added):
-    → ZADD discovery_queue petition_count fein FOR ALL monitored companies
-    → trigger_source = 'admin'
-    → systemctl start discover-h1b-ats-worker@1 discover-h1b-ats-worker@2
+head_check_worker (trigger="redetect" path):
+        → ZADD discovery:redetect petition_count fein
 ```
 
 ### On-demand verification (stale-while-revalidate)
@@ -378,8 +368,8 @@ Background: HEAD/GET careers_url (cheap, no quota cost)
     YES → mark careers_url_verified_at = NOW(), show cached data (fast path)
     NO  (non-200 / redirects to wrong domain) →
             show cached data immediately  (never block the user)
-            ZADD domain_enrichment_queue ENRICHMENT_HIGH_PRIORITY_SCORE {"fein": ..., "trigger": "on_demand"}
-            systemctl start domain-enrichment-worker@1 domain-enrichment-worker@2
+            RPUSH enrichment:on_demand {"fein": ..., "trigger": "on_demand"}
+            manager.py autoscaler detects queue depth and starts worker(s)
             worker re-detects careers_url in background
             UI updates when fresh result written back
 ```
@@ -427,7 +417,7 @@ CREATE TABLE IF NOT EXISTS h1b_enrichment_metrics (
     public_domain        TEXT,   -- resolved value, or NULL
 
     -- career URL (whichever worker found it first)
-    careers_source       TEXT,   -- 'phase3' | 'phase6' | 'p10311' | NULL
+    careers_source       TEXT,   -- 'phase1_kg' | 'phase3' | 'phase4' | 'phase6' | 'phase7' | NULL
     careers_url          TEXT,   -- resolved value, or NULL
 
     -- ATS detection
@@ -499,8 +489,9 @@ because pipeline debugging benefits from a full quarter of phase-by-phase histor
 
 1. **N workers** — 2 enrichment + 2 discovery (redundancy, not throughput)
 2. **petition_count threshold** — top 2000 by rank (not a fixed count value)
-3. **Queue-watcher** — no separate watcher; the script that populates the queue
-   directly calls `systemctl start {worker}@1 {worker}@2`.
+3. **Queue-watcher** — no separate watcher; populating scripts (staleness_checker,
+   fuzzy_match_uscis_dol, api.py) only enqueue work. manager.py autoscaler polls
+   queue depths every cycle and starts/stops worker instances accordingly.
    `systemctl start` on an already-running worker is a no-op — safe from multiple triggers.
 4. **Certspotter** — API key required (free tier, $0/month)
    - Unauthenticated: 429 after 1-2 requests, Retry-After ~352s — unusable
