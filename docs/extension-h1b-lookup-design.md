@@ -83,8 +83,8 @@ Field sources and null behaviour:
 
 | Field | Source | Null / false when |
 |---|---|---|
-| `company_name` | `fein_domain_map.employer_name` (or `prospective_companies.name`) | `null` if no name stored |
-| `petition_count` | `uscis_h1b_petitions.petition_count` joined via FEIN | `0` if USCIS row missing |
+| `company_name` | `dol_h1b_employers.employer_name` (or `prospective_companies.company`) | `null` if no name stored |
+| `petition_count` | `uscis_petition_counts.petition_count` joined via FEIN | `0` if USCIS row missing |
 | `lca_count_last_year` | COUNT of `dol_lca` rows WHERE `decision_date >= NOW() - INTERVAL '1 year'` | `0` if no recent LCAs |
 | `approval_rate` | `approved / total` from `uscis_h1b_petitions` | `null` if no petition data |
 | `sponsors_h1b` | `true` when `petition_count > 0` | `false` when petition_count is 0 or missing |

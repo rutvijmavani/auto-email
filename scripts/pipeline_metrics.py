@@ -84,7 +84,7 @@ def _regression_block(conn, col, label, days):
         return
 
     print(f"\n  {label} — regression check (recent {days}d vs prior {days}d)")
-    print(f”  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Δ':>8}”)
+    print(f"  {'Phase':<18} {'Recent':>10}  {'Prior':>10}  {'Δ':>8}")
     print(f"  {_SEP[:52]}")
 
     r_total = sum(recent.values())

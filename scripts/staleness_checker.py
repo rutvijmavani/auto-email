@@ -304,6 +304,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                    regexp_replace(regexp_replace(LOWER(pc.domain), '^https?://', ''), '^www\\.', '')
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE pc.consecutive_empty_days >= %s
+              AND pc.is_monitored = TRUE
               AND pc.ats_platform IS NOT NULL
               AND pc.ats_platform NOT IN ('unknown', 'unsupported', 'custom')
             ORDER BY petition_count DESC

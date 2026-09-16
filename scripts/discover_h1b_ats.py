@@ -214,7 +214,7 @@ def _root_domain(url: str) -> str:
     if "://" not in url:
         url = "https://" + url
     host = urlparse(url).hostname or ""
-    ext  = _tldextract.extract(host)
+    ext  = _tldextract(host)
     return ext.registered_domain or host
 
 
