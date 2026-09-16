@@ -1362,9 +1362,9 @@ def _send_no_jobs_email(alerts=None):
           {rows}
         </table>"""
 
-    alert_subject = " âš ï¸" if alerts else ""
+    alert_subject = " ⚠️" if alerts else ""
     subject = (
-        f"[Digest] Job Digest Â· {date_str} Â· "
+        f"[Digest] Job Digest · {date_str} · "
         f"No new jobs today{alert_subject}"
     )
     html = f"""
@@ -1374,7 +1374,7 @@ def _send_no_jobs_email(alerts=None):
         No new job postings matched your profile on {date_str}.
       </p>
       <p style="color:#64748b;">
-        This is normal â€” check again tomorrow.
+        This is normal — check again tomorrow.
       </p>
       {alerts_html}
     </body></html>
@@ -1391,8 +1391,8 @@ def _send_text_fallback(postings):
     except ValueError:
         date_str = datetime.now().strftime("%B %d, %Y")
 
-    subject  = f"[Digest] Job Digest Â· {date_str} Â· {len(postings)} new jobs (text)"
-    lines    = [f"<h2>Job Digest â€” {date_str}</h2>",
+    subject  = f"[Digest] Job Digest · {date_str} · {len(postings)} new jobs (text)"
+    lines    = [f"<h2>Job Digest — {date_str}</h2>",
                 f"<p>{len(postings)} new jobs matching your profile:</p>",
                 "<ul>"]
     for job in postings:

@@ -145,11 +145,11 @@ head_check:batch      (LIST — LPUSH/RPOP, FIFO)  ─┘→ head_check_worker
 enrichment:on_demand  (LIST — LPUSH/RPOP, FIFO)  ─┐
 enrichment:batch      (ZSET — petition_count)     ─┘→ domain_enrichment_worker
 
-discovery:on_demand   (LIST — LPUSH/RPOP, FIFO)  ─┐
+discovery:redetect    (ZSET — petition_count)     ─┐
 discovery:batch       (ZSET — petition_count)     ─┘→ discover_h1b_ats_worker
 ```
 
-**REDETECT_QUEUE is eliminated.** It was a separate queue for the discover worker, but `discovery:batch` / `discovery:on_demand` with `trigger="redetect"` carries the same semantics. The `trigger` field drives worker behaviour; a separate queue name added no value.
+**discovery:redetect** is the ATS re-detection lane (replaces the old REDETECT_QUEUE). Head-check workers route to it when `trigger="redetect"`; the discover worker drains it at higher priority than `discovery:batch`. The `trigger` field in the payload still controls worker behaviour.
 
 ### Why LIST for on_demand, ZSET for batch — and why head_check is all LISTs
 

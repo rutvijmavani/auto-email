@@ -79,7 +79,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
 
 def _host_root(hostname: str) -> str:
     """Return the registrable domain using the PSL-aware offline tldextract instance."""
-    return _tldextract.extract(hostname).registered_domain or hostname
+    return _tldextract(hostname).registered_domain or hostname
 
 def _make_session():
     if _CURL_AVAILABLE:
@@ -660,7 +660,7 @@ def find_next_pages(html, current_url, visited=None):
     base_domain = parsed_base.netloc
     # Use hostname (no port/userinfo) so tldextract doesn't misparse "host:port" as a label.
     # Fall back to netloc so brand matching still works when hostname is unavailable.
-    brand = _tldextract.extract(parsed_base.hostname or base_domain).domain or base_domain
+    brand = _tldextract(parsed_base.hostname or base_domain).domain or base_domain
 
     pairs = re.findall(
         r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -687,7 +687,7 @@ def find_next_pages(html, current_url, visited=None):
 
         # Allow same domain OR brand-family domain (bidirectional).
         # e.g. nomura.com â†” nomuraholdings.com: "nomura" appears in both.
-        target_brand = _tldextract.extract(parsed.hostname or parsed.netloc).domain or parsed.netloc
+        target_brand = _tldextract(parsed.hostname or parsed.netloc).domain or parsed.netloc
         if parsed.netloc != base_domain and brand not in parsed.netloc and target_brand not in base_domain:
             continue
 

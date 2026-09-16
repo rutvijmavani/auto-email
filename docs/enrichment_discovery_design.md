@@ -41,8 +41,8 @@ fein_domain_map                        petition_count per employer
 | `fuzzy_match_uscis_dol.py` | sync | petition_count joined to employers |
 
 After `fuzzy_match_uscis_dol.py` completes:
-- Populate `domain_enrichment_queue` (Redis ZSET)
-- Score = petition_count for each company
+- Populate `enrichment:batch` (Redis ZSET, score = petition_count) for new/stale companies
+- Populate `enrichment:on_demand` (Redis LIST, FIFO) for API-triggered single-company refreshes
 - Only rows WHERE `public_domain IS NULL` OR `last_enriched_at < NOW() - INTERVAL '90 days'`
 
 **Why USCIS must complete before enrichment queue is populated:**
@@ -59,8 +59,8 @@ Find the correct public domain and careers URL for all 25k target companies.
 Light ATS detection as a bonus (Phase 6 may return platform+slug for free).
 
 ### Trigger / Lifecycle
-- **Start**: staleness_checker or api.py calls `systemctl start domain-enrichment-worker@{1,2}` directly
-- **Stop**: worker exits cleanly when `ZPOPMAX` returns empty (queue drained)
+- **Queue population**: `staleness_checker.py` and `api.py` push to `enrichment:batch` / `enrichment:on_demand` — they never start workers directly
+- **Start/Stop**: the autoscaler (`manager.py`) starts and stops worker instances based on queue depth; workers exit cleanly when both queues drain
 - **Not always-on**: terminates between batches, unlike job monitor
 
 ### Fixed Worker Count

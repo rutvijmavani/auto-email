@@ -447,7 +447,12 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
                 continue
         else:
             # Instance mode: scan for any alive heartbeat for this instance number.
-            _, hb_keys = r.scan(0, match=f"worker:alive:head_check_worker@{suffix}:*", count=10)
+            _cursor, hb_keys = 0, []
+            while True:
+                _cursor, _batch = r.scan(_cursor, match=f"worker:alive:head_check_worker@{suffix}:*", count=10)
+                hb_keys.extend(_batch)
+                if _cursor == 0:
+                    break
             if hb_keys:
                 log.debug("head_check: skipping inflight key %s — worker still alive", key)
                 continue
