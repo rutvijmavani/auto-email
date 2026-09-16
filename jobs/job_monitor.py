@@ -1350,7 +1350,7 @@ def _send_no_jobs_email(alerts=None):
             colour  = ("#dc2626" if level == "error"
                        else "#d97706" if level == "warning"
                        else "#2563eb")
-            icon    = "ðŸ”´" if level == "error" else "âš ï¸" if level == "warning" else "â„¹ï¸"
+            icon    = "🔴" if level == "error" else "⚠️" if level == "warning" else "ℹ️"
             rows += (
                 f"<tr><td style='padding:6px 12px;color:{colour};'>"
                 f"{icon} {escaped_msg}</td></tr>"
