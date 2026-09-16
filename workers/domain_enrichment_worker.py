@@ -131,8 +131,12 @@ def _flush_delayed(r) -> int:
             fein    = data["fein"]
             trigger = data.get("trigger", "delayed_retry")
             pc      = data["petition_count"]
-            member  = json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source"), "tier": "batch"})
-            r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
+            tier    = data.get("tier", "batch")
+            member  = json.dumps({"fein": fein, "trigger": trigger, "source": data.get("source"), "tier": tier})
+            if tier == "on_demand":
+                r.lpush(ENRICHMENT_ON_DEMAND, member)
+            else:
+                r.zadd(ENRICHMENT_BATCH, {member: pc}, gt=True)
             r.zrem(ENRICHMENT_DELAYED, item)
             moved += 1
         except (json.JSONDecodeError, KeyError, TypeError) as e:

@@ -79,6 +79,17 @@ WHERE regexp_replace(regexp_replace(LOWER(f.public_domain), '^https?://', ''), '
 }
 ```
 
+Field sources and null behaviour:
+
+| Field | Source | Null / false when |
+|---|---|---|
+| `company_name` | `fein_domain_map.employer_name` (or `prospective_companies.name`) | `null` if no name stored |
+| `petition_count` | `uscis_h1b_petitions.petition_count` joined via FEIN | `0` if USCIS row missing |
+| `lca_count_last_year` | COUNT of `dol_lca` rows WHERE `decision_date >= NOW() - INTERVAL '1 year'` | `0` if no recent LCAs |
+| `approval_rate` | `approved / total` from `uscis_h1b_petitions` | `null` if no petition data |
+| `sponsors_h1b` | `true` when `petition_count > 0` | `false` when petition_count is 0 or missing |
+| `not_tracked` | `true` when company has H1B data but `is_monitored = FALSE` in `prospective_companies` | `false` when monitored or not found |
+
 `not_tracked: true` = company sponsors H1B (LCA data confirms) but we don't monitor
 their job board (below petition threshold). Extension still shows H1B data.
 

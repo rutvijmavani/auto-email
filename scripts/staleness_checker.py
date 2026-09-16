@@ -95,7 +95,10 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                     dry_run_sample.append(row)
                 added += 1
                 continue
-            payload: dict = {"fein": row["employer_fein"], "trigger": trigger, "source": source}
+            payload: dict = {
+                "fein": row["employer_fein"], "trigger": trigger, "source": source,
+                "petition_count": row["petition_count"],
+            }
             if tier is not None:
                 payload["tier"] = tier
             member = json.dumps(payload)
