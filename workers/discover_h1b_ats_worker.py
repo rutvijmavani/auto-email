@@ -103,19 +103,25 @@ _RETRY_KEY_PREFIX = "discovery:retry:"
 _RETRY_TTL_S      = 86400 * 7  # 7 days
 
 
-def _get_retry_count(r, fein: str) -> int:
-    return int(r.get(f"{_RETRY_KEY_PREFIX}{fein}") or 0)
+def _retry_key(fein: str, trigger: str, source) -> str:
+    # fein alone is not a unique queue-item identity — different trigger/source
+    # combinations for the same company are independent retry sequences.
+    return f"{_RETRY_KEY_PREFIX}{fein}:{trigger}:{source or ''}"
 
 
-def _incr_retry(r, fein: str) -> int:
-    key = f"{_RETRY_KEY_PREFIX}{fein}"
+def _get_retry_count(r, fein: str, trigger: str, source=None) -> int:
+    return int(r.get(_retry_key(fein, trigger, source)) or 0)
+
+
+def _incr_retry(r, fein: str, trigger: str, source=None) -> int:
+    key = _retry_key(fein, trigger, source)
     count = r.incr(key)
     r.expire(key, _RETRY_TTL_S)
     return count
 
 
-def _clear_retry(r, fein: str) -> None:
-    r.delete(f"{_RETRY_KEY_PREFIX}{fein}")
+def _clear_retry(r, fein: str, trigger: str, source=None) -> None:
+    r.delete(_retry_key(fein, trigger, source))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,14 +380,18 @@ def _process_company(fein: str, petition_count: int, trigger: str,
                     log.info("fein=%s redetect: marked %d old row(s) stale (new_platform=%s)",
                              fein, stale_count, det_platform)
             elif source == "prospective" and det_slug:
-                updated = _update_prospective_ats(conn, probe_domain, det_platform, det_slug)
+                # prospective_companies.domain is matched against fein_domain_map.assigned_domain
+                # (see staleness_checker.py pass 3b) — not public_domain, which probe_domain
+                # prefers when set. Using probe_domain here silently matches 0 rows whenever
+                # public_domain has diverged from the assigned_domain the row was keyed on.
+                updated = _update_prospective_ats(conn, company["assigned_domain"], det_platform, det_slug)
                 conn.commit()
                 if updated:
                     log.info("fein=%s redetect: updated prospective_companies "
                              "platform=%s slug=%s", fein, det_platform, det_slug)
                 else:
                     log.debug("fein=%s redetect: no prospective_companies row matched domain=%s",
-                              fein, probe_domain)
+                              fein, company["assigned_domain"])
 
         # ── Metrics ───────────────────────────────────────────────────────────
         res_careers  = result.get("careers_url")
@@ -557,10 +567,10 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            retry_count = _get_retry_count(r, fein)
+            retry_count = _get_retry_count(r, fein, trigger, source=source)
             if retry_count >= DISCOVERY_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
-                _clear_retry(r, fein)
+                _clear_retry(r, fein, trigger, source=source)
                 r.zrem(_inflight_key, raw_member)
                 continue
 
@@ -568,10 +578,10 @@ def run_worker(once: bool = False) -> None:
             processed["n"] += 1
 
             if not success:
-                count = _incr_retry(r, fein)
+                count = _incr_retry(r, fein, trigger, source=source)
                 if count >= DISCOVERY_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
-                    _clear_retry(r, fein)
+                    _clear_retry(r, fein, trigger, source=source)
                 else:
                     # Exponential backoff: 30s → 120s → 480s
                     delay_s = 30 * (4 ** (count - 1))
@@ -579,7 +589,7 @@ def run_worker(once: bool = False) -> None:
                     log.warning("fein=%s retry %d/%d — delayed %.0fs",
                                 fein, count, DISCOVERY_MAX_RETRIES, delay_s)
             else:
-                _clear_retry(r, fein)
+                _clear_retry(r, fein, trigger, source=source)
 
             r.zrem(_inflight_key, raw_member)
 

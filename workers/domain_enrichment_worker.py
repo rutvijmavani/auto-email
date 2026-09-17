@@ -161,19 +161,25 @@ _RETRY_KEY_PREFIX = "enrichment:retry:"
 _RETRY_TTL_S      = 86400 * 7  # 7 days
 
 
-def _get_retry_count(r, fein: str) -> int:
-    return int(r.get(f"{_RETRY_KEY_PREFIX}{fein}") or 0)
+def _retry_key(fein: str, trigger: str, source, tier=None) -> str:
+    # fein alone is not a unique queue-item identity — different trigger/source/tier
+    # combinations for the same company are independent retry sequences.
+    return f"{_RETRY_KEY_PREFIX}{fein}:{trigger}:{source or ''}:{tier or ''}"
 
 
-def _incr_retry(r, fein: str) -> int:
-    key = f"{_RETRY_KEY_PREFIX}{fein}"
+def _get_retry_count(r, fein: str, trigger: str, source=None, tier=None) -> int:
+    return int(r.get(_retry_key(fein, trigger, source, tier)) or 0)
+
+
+def _incr_retry(r, fein: str, trigger: str, source=None, tier=None) -> int:
+    key = _retry_key(fein, trigger, source, tier)
     count = r.incr(key)
     r.expire(key, _RETRY_TTL_S)
     return count
 
 
-def _clear_retry(r, fein: str) -> None:
-    r.delete(f"{_RETRY_KEY_PREFIX}{fein}")
+def _clear_retry(r, fein: str, trigger: str, source=None, tier=None) -> None:
+    r.delete(_retry_key(fein, trigger, source, tier))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,8 +419,11 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
-        if (trigger != "on_demand"
-                and db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
+        # redetect items are already-monitored companies whose ATS went silent —
+        # they already cleared a monitoring bar once, so the min-petition floor
+        # (meant to keep low-value new companies out of discovery) doesn't apply.
+        if trigger != "on_demand" and (
+                trigger == "redetect" or db_petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS):
             _push_to_discovery(r, fein, db_petition_count, source=source, trigger=trigger)
 
         # ── Metrics — reflect only persisted ATS data ─────────────────────────
@@ -448,7 +457,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             except Exception:
                 pass
 
-        _clear_retry(r, fein)
+        _clear_retry(r, fein, trigger, source=source, tier=tier)
         return True
 
     except Exception as exc:
@@ -587,10 +596,10 @@ def run_worker(once: bool = False) -> None:
                     r.zrem(_inflight_key, raw_member)
                     continue
 
-            retry_count = _get_retry_count(r, fein)
+            retry_count = _get_retry_count(r, fein, trigger, source=source, tier=_tier)
             if retry_count >= ENRICHMENT_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
-                _clear_retry(r, fein)
+                _clear_retry(r, fein, trigger, source=source, tier=_tier)
                 r.zrem(_inflight_key, raw_member)
                 continue
 
@@ -598,17 +607,17 @@ def run_worker(once: bool = False) -> None:
             processed["n"] += 1
 
             if not success:
-                count = _incr_retry(r, fein)
+                count = _incr_retry(r, fein, trigger, source=source, tier=_tier)
                 if count >= ENRICHMENT_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
-                    _clear_retry(r, fein)
+                    _clear_retry(r, fein, trigger, source=source, tier=_tier)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
                     _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source, tier=_tier)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:
-                _clear_retry(r, fein)
+                _clear_retry(r, fein, trigger, source=source, tier=_tier)
 
             r.zrem(_inflight_key, raw_member)
 

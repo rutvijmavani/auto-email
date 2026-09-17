@@ -434,28 +434,34 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
         if cursor == 0:
             break
 
+    if own_inflight_key not in all_keys:
+        all_keys.append(own_inflight_key)
+
     for key in all_keys:
-        if key == own_inflight_key:
-            continue
-        # Skip keys whose worker is still alive (heartbeat present).
-        # suffix is "{hostname}:{pid}" (no-instance mode) or a bare instance number.
-        suffix = key[len("head_check:inflight:instance:"):]
-        if ":" in suffix:
-            # No-instance mode: suffix == "hostname:pid" → direct heartbeat key.
-            if r.exists(f"worker:alive:head_check_worker:{suffix}"):
-                log.debug("head_check: skipping inflight key %s — worker still alive", key)
-                continue
-        else:
-            # Instance mode: scan for any alive heartbeat for this instance number.
-            _cursor, hb_keys = 0, []
-            while True:
-                _cursor, _batch = r.scan(_cursor, match=f"worker:alive:head_check_worker@{suffix}:*", count=10)
-                hb_keys.extend(_batch)
-                if _cursor == 0:
-                    break
-            if hb_keys:
-                log.debug("head_check: skipping inflight key %s — worker still alive", key)
-                continue
+        is_own = key == own_inflight_key
+        if not is_own:
+            # Skip keys whose worker is still alive (heartbeat present).
+            # suffix is "{hostname}:{pid}" (no-instance mode) or a bare instance number.
+            suffix = key[len("head_check:inflight:instance:"):]
+            if ":" in suffix:
+                # No-instance mode: suffix == "hostname:pid" → direct heartbeat key.
+                if r.exists(f"worker:alive:head_check_worker:{suffix}"):
+                    log.debug("head_check: skipping inflight key %s — worker still alive", key)
+                    continue
+            else:
+                # Instance mode: scan for any alive heartbeat for this instance number.
+                _cursor, hb_keys = 0, []
+                while True:
+                    _cursor, _batch = r.scan(_cursor, match=f"worker:alive:head_check_worker@{suffix}:*", count=10)
+                    hb_keys.extend(_batch)
+                    if _cursor == 0:
+                        break
+                if hb_keys:
+                    log.debug("head_check: skipping inflight key %s — worker still alive", key)
+                    continue
+        # own_inflight_key always reclaims (this process's own heartbeat is already
+        # alive at this point, so the alive-check above would otherwise skip it forever,
+        # stranding any items left over from a prior crash that reused the same key).
         reclaimed = 0
         while True:
             raw = r.rpop(key)

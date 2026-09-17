@@ -166,11 +166,11 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                     return job_result
                 return {"platform": None, "slug": None, "careers_url": effective_url}
             else:
-                logger.debug("[P3a] careers_url redirected off-domain (%s → %s) — skipping job link scan",
+                logger.debug("[P3a] careers_url redirected off-domain (%s → %s) — falling back to path probe",
                              careers_url, effective_url)
-                return {"platform": None, "slug": None, "careers_url": careers_url}
-        # careers_url not accessible — fall through to full probing
-        logger.debug("[P3a] careers_url not accessible, falling back to path probe")
+        # careers_url not accessible, or redirected off-domain — fall through to full probing
+        else:
+            logger.debug("[P3a] careers_url not accessible, falling back to path probe")
 
     # ── Mode 2: probe standard career paths ───────────────────────────────────
     # Use www.domain as probe base to avoid apex→www redirect overhead

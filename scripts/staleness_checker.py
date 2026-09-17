@@ -97,8 +97,13 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                 continue
             payload: dict = {
                 "fein": row["employer_fein"], "trigger": trigger, "source": source,
-                "petition_count": row["petition_count"],
             }
+            if use_list:
+                # LIST items carry no score — petition_count must travel in the payload.
+                # ZSET items already carry it as the score; embedding it here too would
+                # make the member identity drift whenever petition_count changes between
+                # runs, producing duplicate ZSET entries for the same fein/trigger/source.
+                payload["petition_count"] = row["petition_count"]
             if tier is not None:
                 payload["tier"] = tier
             member = json.dumps(payload)

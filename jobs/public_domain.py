@@ -94,9 +94,10 @@ _CHALLENGE_DOMAINS = frozenset({
 })
 
 # Response headers that identify a bot-protection challenge page served from the company's
-# own domain (e.g. Cloudflare JS challenge stays on company.com but sets cf-ray).
+# own domain (e.g. an Imperva inline challenge stays on company.com but sets x-iinfo).
+# Cloudflare is NOT included here: cf-ray is present on every Cloudflare-proxied response
+# (challenge or not), so its mere presence isn't a challenge signal — see cf-mitigated below.
 _CHALLENGE_HEADERS = frozenset({
-    "cf-ray",              # Cloudflare
     "x-iinfo",             # Imperva (inline mode — served from company domain)
     "x-sucuri-id",         # Sucuri (inline mode)
     "x-px-access-denied",  # PerimeterX
@@ -108,8 +109,12 @@ _safe_session = _make_safe_session()
 
 def _is_challenge_response(headers: dict) -> bool:
     """Return True if response headers indicate a bot-protection challenge page."""
-    lower_keys = {k.lower() for k in headers}
-    return bool(_CHALLENGE_HEADERS & lower_keys)
+    lower_headers = {k.lower(): v for k, v in headers.items()}
+    if _CHALLENGE_HEADERS & lower_headers.keys():
+        return True
+    # Cloudflare only sets cf-mitigated: challenge when it actually served a challenge —
+    # cf-ray alone just means the response passed through Cloudflare's proxy.
+    return (lower_headers.get("cf-mitigated", "") or "").strip().lower() == "challenge"
 
 _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6
