@@ -1656,7 +1656,7 @@ def process_employer(
                     detected_slug     = _cp_result.get("slug")
                     ats_source        = "phase6"
                     log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
-                if not careers_url and _cp_result.get("careers_url"):
+                if _cp_result.get("careers_url"):
                     careers_url    = _cp_result["careers_url"]
                     careers_source = "phase6"
                     log.info("  Phase 6 careers_url: %s", careers_url)
