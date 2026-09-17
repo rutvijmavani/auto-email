@@ -95,6 +95,7 @@ def _make_redis(data=None):
         pp.ltrim  = lambda k, s, e: ltrim_calls.append((k, s, e)) or pp
         pp.lrange = lambda k, s, e: lrange_calls.append((k, s, e)) or pp
         pp.set    = lambda k, v, **kw: _set(k, v) or pp
+        pp.delete = lambda *keys: _delete(*keys) or pp
 
         def _exec():
             for k, v in rpush_calls:

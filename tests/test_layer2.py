@@ -116,6 +116,10 @@ def _make_redis(data: dict | None = None):
             _set(k, v)
             return pp
 
+        def _pp_delete(*keys):
+            _delete(*keys)
+            return pp
+
         def _pp_execute():
             for k, v in rpush_calls:
                 _rpush(k, v)
@@ -130,6 +134,7 @@ def _make_redis(data: dict | None = None):
         pp.ltrim = _pp_ltrim
         pp.lrange = _pp_lrange
         pp.set = _pp_set
+        pp.delete = _pp_delete
         pp.execute = _pp_execute
         return pp
 
