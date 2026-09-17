@@ -3,7 +3,7 @@ workers/manager.py — Autoscaler (Layer 0 + Layer 2)
 
 Design doc: docs/scaling-redesign.md Â§4, Â§7, Â§16
 
-Layer 0 (every 60s): delay + utilization formula â†’ scale up/down/urgent per pool.
+Layer 0 (every 60s): delay + utilization formula → scale up/down/urgent per pool.
 Layer 1 (midnight):  midnight recompute of worker_ceil from 28-day daily_peak history.
 Layer 2 (event):     Lever 1 backpressure + deadlock detection + worker borrowing.
 
@@ -391,7 +391,7 @@ def _get_queue_metrics(r) -> dict:
     try:
         # enrichment: on_demand LIST + batch ZSET + inflight ZSET(s)
         # Include inflight so workers are not stopped while actively processing items
-        # (items move from queue â†’ inflight atomically, leaving queues temporarily empty).
+        # (items move from queue → inflight atomically, leaving queues temporarily empty).
         _enrich_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{ENRICHMENT_INFLIGHT}*", count=10)))
         enrich_depth = r.llen(ENRICHMENT_ON_DEMAND) + r.zcard(ENRICHMENT_BATCH) + _enrich_inflight
         metrics["domain_enrichment"] = {"depth": enrich_depth, "delay_s": 0.0, "depth_known": True}
@@ -542,7 +542,7 @@ def _midnight_recompute(r, pools: list[str]) -> None:
 
             logger.info(
                 "manager: midnight recompute [%s] "
-                "peak_28d=%d growth_buf=%d vol_buf=%d â†’ ceil=%d",
+                "peak_28d=%d growth_buf=%d vol_buf=%d → ceil=%d",
                 pool, peak_nd, growth_buffer, volatility_buffer, new_ceil,
             )
 
@@ -654,7 +654,7 @@ def _run_pool_cycle(
     Decision modes:
       urgent        — delay >= WARNÃ—0.75; spawn to workers_target in 1 cycle
       urgent_release— workers confirmed online after urgent; lift throttle
-      urgent_hold   — urgent active but still understaffed (at ceiling â†’ Layer 2)
+      urgent_hold   — urgent active but still understaffed (at ceiling → Layer 2)
       scale_up      — util > 0.80 AND delay > WARNÃ—0.5, 2 consecutive cycles
       scale_down    — util < 0.50 AND delay < WARNÃ—0.25, 5 consecutive cycles
       hold          — stable band (50â€“80% util, delay in bounds)
@@ -767,7 +767,7 @@ def _run_pool_cycle(
 
     logger.debug(
         "manager [%s]: n=%d target=%d eff=%d depth=%d delay=%.0fs warn=%.0fs "
-        "util=%.0f%% up=%d down=%d â†’ %s",
+        "util=%.0f%% up=%d down=%d → %s",
         pool, n_workers, workers_target, effective_target,
         depth, delay_s, delay_warn_s,
         pool_utilization * 100,
@@ -784,7 +784,7 @@ def _run_pool_cycle(
 def _push_delay_history(r, pool: str, delay_s: float) -> list:
     """
     Maintain a Redis list of the last DEADLOCK_HISTORY_CYCLES delay readings.
-    Returns the list (oldest â†’ newest) after the push.
+    Returns the list (oldest → newest) after the push.
     """
     key = f"manager:layer2:{pool}:delay_history"
     pipe = r.pipeline()
@@ -837,7 +837,7 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
     if inflow_rate == 0.0 and depth < prev_depth:
         logger.debug(
             "manager [%s]: Lever 1 skipped — queue draining "
-            "(depth %dâ†’%d, inflow=0). URGENT workers handling it.",
+            "(depth %d→%d, inflow=0). URGENT workers handling it.",
             pool, prev_depth, depth,
         )
         return
@@ -871,8 +871,8 @@ def _get_effective_target(r, pool: str, workers_target: int) -> int:
     effective_target = workers_target - borrowed_out + borrowed_in
 
     Example — scan lent 2 workers to fullscan:
-      effective_target(scan)     = 8 - 2 + 0 = 6  â†’ deficit=0, no re-spawn
-      effective_target(fullscan) = 5 - 0 + 2 = 7  â†’ deficit=0, don't remove
+      effective_target(scan)     = 8 - 2 + 0 = 6  → deficit=0, no re-spawn
+      effective_target(fullscan) = 5 - 0 + 2 = 7  → deficit=0, don't remove
     """
     borrowed_out = 0
     cursor = 0
@@ -947,7 +947,7 @@ def _record_borrow(r, source_pool: str, target_pool: str, count: int) -> None:
     existing = int(r.get(key) or 0)
     r.set(key, existing + count)
     logger.warning(
-        "manager: BORROW %d workers %s â†’ %s (running total: %d)",
+        "manager: BORROW %d workers %s → %s (running total: %d)",
         count, source_pool, target_pool, existing + count,
     )
 
@@ -1104,7 +1104,7 @@ def _check_layer2(
          WARN Ã— RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
          update today's daily_peak (learning loop).  Clear all borrow state.
       4. Deadlock detection: if Lever 1 active + pool at ceiling + delay
-         rising for 3 of last 4 cycles â†’ attempt worker borrowing.
+         rising for 3 of last 4 cycles → attempt worker borrowing.
     """
     delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
 
@@ -1197,9 +1197,9 @@ def _check_error_spikes(r) -> None:
       For each platform with an active spike flag:
         1. Skip if already in outage mode.
         2. If a before_rate snapshot exists from a previous action:
-             - error resolved   â†’ reset consec_reductions counter
-             - still erroring   â†’ increment consec_reductions; if >= threshold
-                                  â†’ declare outage via manager:cmds
+             - error resolved   → reset consec_reductions counter
+             - still erroring   → increment consec_reductions; if >= threshold
+                                  → declare outage via manager:cmds
         3. If error_rate still above threshold AND concurrency is at floor:
              - Snapshot current error_rate as before_rate (effectiveness check
                next cycle).
@@ -1245,7 +1245,7 @@ def _check_error_spikes(r) -> None:
                     r.delete(f"worker:consec_reductions:{platform}")
                     logger.info(
                         "manager: error spike resolved platform=%r "
-                        "(%.1f%% â†’ %.1f%%) — consec_reductions reset",
+                        "(%.1f%% → %.1f%%) — consec_reductions reset",
                         platform, before_rate * 100, error_rate * 100,
                     )
                 else:
@@ -1254,7 +1254,7 @@ def _check_error_spikes(r) -> None:
                              WORKER_CONSEC_REDUCTIONS_TTL)
                     logger.warning(
                         "manager: deprioritize INEFFECTIVE platform=%r "
-                        "(%.1f%% â†’ %.1f%%) consec_reductions=%d",
+                        "(%.1f%% → %.1f%%) consec_reductions=%d",
                         platform, before_rate * 100, error_rate * 100, count,
                     )
 

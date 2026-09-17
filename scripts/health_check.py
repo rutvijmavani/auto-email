@@ -649,32 +649,24 @@ def run_health_check() -> int:
             ORDER BY n DESC
         """).fetchall()
 
-        # Career URL breakdown (both workers) — newest run per fein only.
-        # ORDER BY (careers_url IS NOT NULL) DESC prefers runs that found a URL without
-        # filtering them in the inner WHERE — keeps DISTINCT ON semantics correct.
+        # Career URL breakdown — count distinct companies that had any run with a
+        # known careers_source in the last 7 days.  COUNT(DISTINCT employer_fein)
+        # avoids DISTINCT ON ordering ambiguity while counting every company once.
         cu_rows = conn.execute("""
-            SELECT careers_source, COUNT(*) AS n
-            FROM (
-                SELECT DISTINCT ON (employer_fein) careers_source
-                FROM h1b_enrichment_metrics
-                WHERE run_at > NOW() - INTERVAL '7 days'
-                ORDER BY employer_fein, (careers_url IS NOT NULL) DESC, run_at DESC
-            ) sub
-            WHERE careers_source IS NOT NULL
+            SELECT careers_source, COUNT(DISTINCT employer_fein) AS n
+            FROM h1b_enrichment_metrics
+            WHERE run_at > NOW() - INTERVAL '7 days'
+              AND careers_source IS NOT NULL
             GROUP BY careers_source
             ORDER BY n DESC
         """).fetchall()
 
-        # ATS detection breakdown (both workers) — newest run per fein only.
+        # ATS detection breakdown — same approach.
         ats_rows = conn.execute("""
-            SELECT ats_source, COUNT(*) AS n
-            FROM (
-                SELECT DISTINCT ON (employer_fein) ats_source
-                FROM h1b_enrichment_metrics
-                WHERE run_at > NOW() - INTERVAL '7 days'
-                ORDER BY employer_fein, (ats_platform IS NOT NULL) DESC, run_at DESC
-            ) sub
-            WHERE ats_source IS NOT NULL
+            SELECT ats_source, COUNT(DISTINCT employer_fein) AS n
+            FROM h1b_enrichment_metrics
+            WHERE run_at > NOW() - INTERVAL '7 days'
+              AND ats_source IS NOT NULL
             GROUP BY ats_source
             ORDER BY n DESC
         """).fetchall()

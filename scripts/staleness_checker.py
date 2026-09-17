@@ -1,29 +1,29 @@
 ﻿"""
-scripts/staleness_checker.py â€” Daily cron: push stale companies to enrichment/discovery/redetect queues.
+scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery/redetect queues.
 
-Pass 1a â€” Enrichment staleness (no careers URL):
+Pass 1a — Enrichment staleness (no careers URL):
     fein_domain_map WHERE careers_url IS NULL AND public_domain IS NULL AND last_enriched_at stale
-    â†’ ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
+    → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
 
-Pass 1b â€” Head-check staleness (careers URL known):
+Pass 1b — Head-check staleness (careers URL known):
     fein_domain_map WHERE careers_url IS NOT NULL AND last_enriched_at stale
-    â†’ RPUSH head_check:batch {"fein": ..., "trigger": "staleness"}
+    → RPUSH head_check:batch {"fein": ..., "trigger": "staleness"}
 
-Pass 2 â€” Discovery staleness:
+Pass 2 — Discovery staleness:
     fein_domain_map WHERE last_discovered_at stale AND petition_count >= min
-    â†’ ZADD discovery:batch petition_count {"fein": ..., "trigger": "staleness"}
+    → ZADD discovery:batch petition_count {"fein": ..., "trigger": "staleness"}
 
-Pass 3 â€” ATS re-detection staleness:
+Pass 3 — ATS re-detection staleness:
     company_ats WHERE is_monitored=TRUE AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
         AND platform NOT IN ('unknown','unsupported') AND stale_since IS NULL
     prospective_companies WHERE consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
         AND ats_platform NOT IN ('unknown','unsupported','custom')
-    â†’ RPUSH head_check:batch {"fein": ..., "trigger": "redetect", "source": "company_ats"|"prospective"}
+    → RPUSH head_check:batch {"fein": ..., "trigger": "redetect", "source": "company_ats"|"prospective"}
 
-Pass 4 â€” Stale row purge:
+Pass 4 — Stale row purge:
     DELETE FROM company_ats WHERE stale_since IS NOT NULL AND stale_since < NOW() - ATS_STALE_TTL_DAYS days
 
-Worker lifecycle is managed by manager.py (autoscaled on queue depth) â€” this script
+Worker lifecycle is managed by manager.py (autoscaled on queue depth) — this script
 only populates the queues and never starts workers directly.
 
 Usage:
@@ -66,7 +66,7 @@ def _is_maintenance(r) -> bool:
     try:
         return bool(r.exists(REDIS_DB_MAINTENANCE))
     except Exception as exc:
-        log.warning("Redis maintenance check failed (%s) â€” assuming not in maintenance", exc)
+        log.warning("Redis maintenance check failed (%s) — assuming not in maintenance", exc)
         return False
 
 
@@ -79,7 +79,7 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
 
     Returns count of rows processed. Handles dry-run logging (first 5 rows),
     pipeline batching (STALENESS_ZADD_BATCH), and final flush.
-    Worker lifecycle is managed by manager.py â€” this function never starts workers.
+    Worker lifecycle is managed by manager.py — this function never starts workers.
     trigger/source are embedded in every member for consistent queue format across all producers.
     """
     added = 0
@@ -134,15 +134,15 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
         pipe.execute()
 
     op = "RPUSH" if use_list else "ZADD"
-    log.info("%s: %s %d feins â†’ %s", log_prefix, op, added, queue_key)
+    log.info("%s: %s %d feins → %s", log_prefix, op, added, queue_key)
     return added
 
 
 def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     """Push stale companies to the right queue based on whether careers_url is known.
 
-    Pass 1a â€” careers_url IS NULL â†’ ENRICHMENT_BATCH (ZADD, needs full URL discovery)
-    Pass 1b â€” careers_url IS NOT NULL â†’ HEAD_CHECK_BATCH (RPUSH, URL known, just verify liveness)
+    Pass 1a — careers_url IS NULL → ENRICHMENT_BATCH (ZADD, needs full URL discovery)
+    Pass 1b — careers_url IS NOT NULL → HEAD_CHECK_BATCH (RPUSH, URL known, just verify liveness)
 
     Returns total count added across both sub-passes.
     """
@@ -188,7 +188,7 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
             params = (_stale_interval,)
         return sql, params
 
-    # Pass 1a: no careers URL â€” needs full enrichment
+    # Pass 1a: no careers URL — needs full enrichment
     sql_a, params_a = _build_sql_params("f.careers_url IS NULL")
     added_a = _stream_and_zadd(
         conn, r, sql_a, params_a,
@@ -200,7 +200,7 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
         tier="batch",
     )
 
-    # Pass 1b: careers URL known â€” just verify it's still alive
+    # Pass 1b: careers URL known — just verify it's still alive
     sql_b, params_b = _build_sql_params("f.careers_url IS NOT NULL")
     added_b = _stream_and_zadd(
         conn, r, sql_b, params_b,
@@ -254,7 +254,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
       3a. company_ats: is_monitored=TRUE, consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS,
           platform not unknown/unsupported, stale_since IS NULL
       3b. prospective_companies: same empty-days condition, platform not unknown/unsupported/custom
-          â€” joined to fein_domain_map via domain to get FEIN.
+          — joined to fein_domain_map via domain to get FEIN.
 
     Returns total count queued.
     """
@@ -262,7 +262,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
     added = 0
     pipe = None if dry_run else r.pipeline(transaction=False)
 
-    # 3a â€” company_ats silent rows
+    # 3a — company_ats silent rows
     with conn.named_cursor("redetect_company_ats") as cur:
         cur.itersize = 500
         cur.execute("""
@@ -291,7 +291,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                 pipe.execute()
                 pipe = r.pipeline(transaction=False)
 
-    # 3b â€” prospective_companies silent rows
+    # 3b — prospective_companies silent rows
     with conn.named_cursor("redetect_prospective") as cur:
         cur.itersize = 500
         cur.execute("""
@@ -328,7 +328,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
     if not added:
         log.info("redetect staleness: no companies need re-detection")
     else:
-        log.info("redetect staleness: %d companies queued â†’ %s (trigger=redetect)", added, HEAD_CHECK_BATCH)
+        log.info("redetect staleness: %d companies queued → %s (trigger=redetect)", added, HEAD_CHECK_BATCH)
     return added
 
 
@@ -365,7 +365,7 @@ def main(args: argparse.Namespace) -> None:
     r = get_redis()
 
     if _is_maintenance(r):
-        log.info("maintenance window active â€” skipping staleness check")
+        log.info("maintenance window active — skipping staleness check")
         return
 
     conn = get_conn()
@@ -389,7 +389,7 @@ def main(args: argparse.Namespace) -> None:
 
         elapsed = time.time() - t0
         log.info(
-            "staleness_checker done in %.1fs â€” enrichment: %d, discovery: %d, "
+            "staleness_checker done in %.1fs — enrichment: %d, discovery: %d, "
             "redetect: %d, purged: %d%s",
             elapsed, enrich_added, discovery_added, redetect_added, purged,
             " [dry-run]" if args.dry_run else "",

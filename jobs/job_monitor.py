@@ -1,5 +1,5 @@
 ﻿"""
-jobs/job_monitor.py â€” Job monitoring pipeline orchestrator.
+jobs/job_monitor.py — Job monitoring pipeline orchestrator.
 
 Phase 1 change: run() uses ThreadPoolExecutor for parallel company processing.
 All other functions are identical to the original.
@@ -80,7 +80,7 @@ def _record_cycle_start() -> None:
 
     Called immediately after mark_postings_digested() so the adaptive
     scheduler knows the daily cycle has officially begun. Imported lazily
-    to avoid import loops â€” workers.scheduler is not loaded unless the
+    to avoid import loops — workers.scheduler is not loaded unless the
     scheduler is running.
     """
     try:
@@ -88,10 +88,10 @@ def _record_cycle_start() -> None:
         ts = record_cycle_start()
         logger.info("cycle:start written (unix=%.0f)", ts)
     except Exception as exc:
-        # Non-fatal â€” scheduler may not be running (e.g. daily batch mode)
+        # Non-fatal — scheduler may not be running (e.g. daily batch mode)
         logger.warning(
             "Could not write cycle:start to Redis: %s "
-            "(scheduler may not be running â€” this is OK in batch mode)",
+            "(scheduler may not be running — this is OK in batch mode)",
             exc,
         )
 
@@ -130,8 +130,8 @@ def _parse_slug(platform, slug, config):
     Parse the raw DB slug into the form each ATS module expects.
 
     Registry slug_type:
-      "string" â†’ pass slug as-is (str)
-      "json"   â†’ json.loads(slug); platform-specific defaults if parse fails
+      "string" → pass slug as-is (str)
+      "json"   → json.loads(slug); platform-specific defaults if parse fails
 
     Returns either a string (slug_type="string") or a dict (slug_type="json").
     """
@@ -167,7 +167,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     in_flight_names: companies currently being scanned by a fullscan_worker.
                      They are excluded from `missed` (don't double-fetch) but
-                     are also NOT considered "covered" yet â€” the scan is still
+                     are also NOT considered "covered" yet — the scan is still
                      running.  Callers must track these separately so they are
                      not counted in the covered_by_workers coverage metric.
 
@@ -197,7 +197,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     company_names = [c["company"] for c in companies]
 
-    # Take two Redis inflight snapshots â€” before and after the DB query â€” then
+    # Take two Redis inflight snapshots — before and after the DB query — then
     # union them so companies that start a scan during the DB read window are
     # not misclassified as missed.  Only entries within the last 2 h are
     # considered (older entries come from killed workers without cleanup).
@@ -220,7 +220,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
     except Exception as exc:
         logger.warning(
             "_get_worker_missed_companies: Redis unavailable for inflight exclusion "
-            "(%s) â€” proceeding without exclusion (may do extra work)",
+            "(%s) — proceeding without exclusion (may do extra work)",
             exc,
         )
         if _r_inflight is not None:
@@ -247,7 +247,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 pass
             conn.close()
 
-        # Second inflight snapshot after DB query â€” union narrows the race window.
+        # Second inflight snapshot after DB query — union narrows the race window.
         if _r_inflight is not None:
             try:
                 raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
@@ -256,7 +256,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
                 pass
     except Exception as _db_exc:
         logger.warning(
-            "_get_worker_missed_companies: DB unavailable (%s) â€” "
+            "_get_worker_missed_companies: DB unavailable (%s) — "
             "treating all %d companies as missed (conservative fallback)",
             _db_exc, len(companies),
         )
@@ -268,7 +268,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
             except Exception:
                 pass
 
-    # last_full_scan_at: written by on_fullscan_complete() â€” exhaustive all-pages scan.
+    # last_full_scan_at: written by on_fullscan_complete() — exhaustive all-pages scan.
     # We do NOT use last_poll_at (adaptive scan) here because the adaptive worker uses
     # smart early exit and may not have seen every page.  Only a completed fullscan
     # guarantees the DB is comprehensive for this company's current board.
@@ -281,7 +281,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
         last_scan = scan_map.get(name, 0)
         if last_scan < cycle_start_ts:
             if name in inflight:
-                # Active scan in progress â€” don't double-fetch, but also NOT
+                # Active scan in progress — don't double-fetch, but also NOT
                 # confirmed done yet.  Track separately for coverage accounting.
                 in_flight_names.add(name)
             else:
@@ -325,7 +325,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
             finally:
                 conn.close()
     except Exception as exc:
-        logger.warning("_queue_fullscans_for_missed: DB query failed (%s) â€” skipping fullscan queuing", exc)
+        logger.warning("_queue_fullscans_for_missed: DB query failed (%s) — skipping fullscan queuing", exc)
         return
 
     scan_map = {r["company"]: r for r in rows}
@@ -333,7 +333,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
     try:
         r = _redis_lib.from_url(REDIS_URL, socket_timeout=5, socket_connect_timeout=3)
     except Exception as exc:
-        logger.warning("_queue_fullscans_for_missed: Redis connect failed (%s) â€” skipping fullscan queuing", exc)
+        logger.warning("_queue_fullscans_for_missed: Redis connect failed (%s) — skipping fullscan queuing", exc)
         return
 
     try:
@@ -357,7 +357,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
 
                 avg_duration = float(stats_row["avg_fullscan_duration_s"] or 1800.0)
                 # skip_if_future=True atomically checks the ZSET under the
-                # scheduling lock â€” eliminates the race between a pre-lock zscore
+                # scheduling lock — eliminates the race between a pre-lock zscore
                 # check and the eventual ZADD. Returns None when skipped.
                 _sched_ts = _atomic_schedule(
                     r, REDIS_POLL_FULLSCAN, company,
@@ -369,7 +369,7 @@ def _queue_fullscans_for_missed(missed: list) -> None:
                 )
                 if _sched_ts is None:
                     logger.debug(
-                        "monitor: %r already in poll:fullscan â€” skipping",
+                        "monitor: %r already in poll:fullscan — skipping",
                         company,
                     )
                     continue
@@ -397,15 +397,15 @@ def run():
 
     Smart hybrid mode:
       - Companies already scanned by background workers (scan_worker /
-        fullscan_worker) within the last 24 h are skipped â€” their results
+        fullscan_worker) within the last 24 h are skipped — their results
         are already in the DB as status='new'.
       - Companies workers missed (crashed, backlog, never started) get a
         fallback re-fetch so the digest is never incomplete.
       - Digest is always generated from DB at the end regardless.
 
-    Normal day (workers healthy):   0 re-fetches â†’ email at ~7:02 AM
-    Workers partially failed:       only missed companies re-fetched â†’ still fast
-    Workers completely down:        all companies re-fetched â†’ email at ~7:30 AM
+    Normal day (workers healthy):   0 re-fetches → email at ~7:02 AM
+    Workers partially failed:       only missed companies re-fetched → still fast
+    Workers completely down:        all companies re-fetched → email at ~7:30 AM
     """
     init_logging("monitor")
     start_time = time.time()
@@ -428,7 +428,7 @@ def run():
     if skipped > 0:
         logger.warning("%d companies skipped (unknown/unverified ATS)", skipped)
         print(f"[INFO] Skipping {skipped} company/companies with "
-              f"unknown/unverified ATS â€” run --detect-ats to fix")
+              f"unknown/unverified ATS — run --detect-ats to fix")
 
     # Capture scan horizon before the DB classification so any inflight scan
     # completing during _get_worker_missed_companies() is still credited below.
@@ -438,7 +438,7 @@ def run():
     missed, in_flight_names = _get_worker_missed_companies(companies)
     missed_names = {c["company"] for c in missed}   # O(1) lookups
     # covered = confirmed done (last_full_scan_at within 24 h)
-    # in-flight companies are NOT in missed and NOT in covered â€” they are
+    # in-flight companies are NOT in missed and NOT in covered — they are
     # actively scanning and not yet confirmed complete.  Counting them in
     # covered_by_workers inflates the metric and can suppress the coverage alert.
     covered = [
@@ -455,7 +455,7 @@ def run():
     )
 
     print(f"\n{'='*55}")
-    print(f"[INFO] Job Monitor â€” {datetime.now().strftime('%B %d, %Y')}")
+    print(f"[INFO] Job Monitor — {datetime.now().strftime('%B %d, %Y')}")
     print(f"[INFO] {len(companies)} companies total | "
           f"{len(covered)} covered by workers | "
           f"{len(in_flight_names)} in-flight | "
@@ -466,11 +466,11 @@ def run():
               f"{'...' if len(missed) > 5 else ''}")
     print(f"{'='*55}\n")
 
-    # â”€â”€ Shared stats â€” accumulated thread-safely via Lock â”€â”€
+    # â”€â”€ Shared stats — accumulated thread-safely via Lock â”€â”€
     stats = {
         "companies_monitored":    len(companies),      # fixed total denominator (covered + in_flight + missed)
         "covered_by_workers":     len(covered),        # confirmed-done by workers
-        "in_flight":              len(in_flight_names),# scanning now â€” not confirmed yet
+        "in_flight":              len(in_flight_names),# scanning now — not confirmed yet
         "fallback_scanned":       0,              # fallback companies whose ATS was successfully queried
                                                   # (regardless of whether jobs were found)
         "companies_with_results": 0,              # subset of fallback_scanned that returned â‰¥1 job
@@ -483,7 +483,7 @@ def run():
         "enrichment_queued":      0,
     }
     stats_lock = threading.Lock()
-    # Shared event set on first successful ZADD â€” survives even if _process_company
+    # Shared event set on first successful ZADD — survives even if _process_company
     # later raises (the dict-return path would lose the signal in that case).
 
 
@@ -492,7 +492,7 @@ def run():
     try:
         _shared_r = _get_redis()
     except Exception as _redis_exc:
-        logger.warning("Redis unavailable â€” enrichment queueing disabled: %s", _redis_exc)
+        logger.warning("Redis unavailable — enrichment queueing disabled: %s", _redis_exc)
         _shared_r = None
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
@@ -522,12 +522,12 @@ def run():
                 _merge_company_stats(stats, stats_lock, company_stats)
 
         # Queue a fullscan for each missed company whose next_full_scan_at
-        # is NULL or already past â€” the listing fallback only covers new job
+        # is NULL or already past — the listing fallback only covers new job
         # discovery; the fullscan handles expiration tracking and updates
         # last_full_scan_at so the company isn't "missed" indefinitely.
         _queue_fullscans_for_missed(missed)
     else:
-        logger.info("All %d companies covered by workers â€” skipping re-fetch",
+        logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
 
     # â”€â”€ Bounded wait for in-flight scans â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -564,7 +564,7 @@ def run():
                     )
                 except Exception as _redis_poll_err:
                     logger.warning(
-                        "In-flight wait: Redis poll failed (%s) â€” retrying next cycle",
+                        "In-flight wait: Redis poll failed (%s) — retrying next cycle",
                         _redis_poll_err,
                     )
                     time.sleep(_IN_FLIGHT_POLL_S)
@@ -605,7 +605,7 @@ def run():
                                 _vconn.close()
                     except Exception as _db_ver_err:  # noqa: BLE001
                         logger.warning(
-                            "In-flight wait: DB verification failed (%s) â€” "
+                            "In-flight wait: DB verification failed (%s) — "
                             "keeping %d companies pending for retry",
                             _db_ver_err, len(_newly_done),
                         )
@@ -641,7 +641,7 @@ def run():
 
         except Exception as _wait_exc:
             logger.warning(
-                "In-flight wait: Redis unavailable (%s) â€” proceeding with "
+                "In-flight wait: Redis unavailable (%s) — proceeding with "
                 "%d companies still counted as in-flight",
                 _wait_exc, len(_remaining_inflight),
             )
@@ -654,12 +654,12 @@ def run():
 
         if _remaining_inflight:
             logger.info(
-                "In-flight wait expired: %d scan(s) still active â€” "
+                "In-flight wait expired: %d scan(s) still active — "
                 "their results may miss this digest",
                 len(_remaining_inflight),
             )
             print(f"[INFO] {len(_remaining_inflight)} scan(s) still running "
-                  f"after {int(time.time() - _wait_start)}s wait â€” may miss digest.")
+                  f"after {int(time.time() - _wait_start)}s wait — may miss digest.")
         else:
             _elapsed = int(time.time() - _wait_start)
             logger.info("All in-flight scans completed within %ds.", _elapsed)
@@ -727,7 +727,7 @@ def run():
                     with stats_lock:
                         stats["enrichment_queued"] += 1
 
-    # â”€â”€ Generate PDF digest (sequential â€” happens once) â”€â”€â”€â”€
+    # â”€â”€ Generate PDF digest (sequential — happens once) â”€â”€â”€â”€
     new_postings  = get_new_postings_for_digest()
     pdf_generated = False
     email_sent    = False
@@ -782,7 +782,7 @@ def run():
                 mark_postings_digested()
                 _record_cycle_start()
     else:
-        logger.info("No new jobs â€” sending no-jobs email")
+        logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")
         alerts     = _build_alerts(stats, len(companies))
         email_sent = _send_no_jobs_email(alerts=alerts)
@@ -801,7 +801,7 @@ def run():
         from db.api_health import flush as flush_api_health
         flush_api_health()
     except Exception:
-        logger.error("flush_api_health failed â€” some health records may be lost",
+        logger.error("flush_api_health failed — some health records may be lost",
                      exc_info=True)
 
     logger.info("â•â•â•â• --monitor-jobs finished â•â•â•â•")
@@ -844,19 +844,19 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
     if not fein:
         logger.warning(
             "Re-detection needed for %r (domain=%s empty_days=%d) "
-            "â€” no employer_fein, cannot queue enrichment",
+            "— no employer_fein, cannot queue enrichment",
             company, domain, empty_days,
         )
         return
     if _r is None:
-        logger.debug("Redis unavailable â€” skipping re-enrichment for %r (fein=%s)", company, fein)
+        logger.debug("Redis unavailable — skipping re-enrichment for %r (fein=%s)", company, fein)
         return
     _cooldown_acquired = False
     try:
         r = _r
         _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
         if not r.set(_cooldown_key, 1, nx=True, ex=JOB_MONITOR_REDETECT_DAYS * 86400):
-            logger.debug("Re-enrichment cooldown active for %r (fein=%s) â€” skipping", company, fein)
+            logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
             return
         _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
@@ -879,17 +879,17 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
 
 
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# WORKER â€” one company per thread call
+# WORKER — one company per thread call
 # Logic is identical to the original sequential loop body.
 # Only difference: uses semaphore instead of between_companies_delay().
 # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _process_company(company_row, position, total, _r=None):
     """
     Process one company: fetch jobs, filter, save new ones.
-    Called by ThreadPoolExecutor â€” one call per company.
+    Called by ThreadPoolExecutor — one call per company.
 
     Returns dict of per-company stats for aggregation in run().
-    Never raises â€” all exceptions caught and returned as failure.
+    Never raises — all exceptions caught and returned as failure.
     """
     company  = company_row["company"]
     platform = company_row.get("ats_platform", "unknown")
@@ -923,10 +923,10 @@ def _process_company(company_row, position, total, _r=None):
         )
 
     if platform == "unknown" or not slug:
-        logger.warning("Skipping %r â€” unknown ATS", company)
+        logger.warning("Skipping %r — unknown ATS", company)
         result["unknown_ats"] = 1
         result["monitored"]   = 1
-        print(f"  [{position}/{total}] {company} â€” [SKIP] Unknown ATS")
+        print(f"  [{position}/{total}] {company} — [SKIP] Unknown ATS")
         return result
 
     # â”€â”€ Get ATS module + registry config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -959,18 +959,18 @@ def _process_company(company_row, position, total, _r=None):
             raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except IncompleteSearchError as exc:
             # Avature SearchJobs pagination cut short (deadline or fetch failure).
-            # Empty stubs means the very first page fetch failed â€” treat as a hard
+            # Empty stubs means the very first page fetch failed — treat as a hard
             # fetch failure rather than a zero-job scan so last_checked_at is not
             # updated and the company remains eligible for the next scan cycle.
             if not exc.stubs:
                 logger.error(
-                    "avature [%s]: IncompleteSearchError with 0 stubs â€” treating as fetch failure",
+                    "avature [%s]: IncompleteSearchError with 0 stubs — treating as fetch failure",
                     company,
                 )
                 result["failed"]       = 1
                 result["failure_name"] = company
                 return result
-            # Partial stubs: use what was collected but skip absence tracking â€”
+            # Partial stubs: use what was collected but skip absence tracking —
             # the result set is incomplete and marking unseen jobs as missing
             # would be incorrect.  Mark failed for alerting so the pipeline
             # knows the scan did not complete, while still processing the stubs.
@@ -979,14 +979,14 @@ def _process_company(company_row, position, total, _r=None):
             result["failed"]         = 1
             result["failure_name"]   = company
             logger.warning(
-                "avature [%s]: incomplete SearchJobs scan (%d stub(s)) â€” "
+                "avature [%s]: incomplete SearchJobs scan (%d stub(s)) — "
                 "absence tracking skipped",
                 company, len(raw_jobs),
             )
         except Exception as e:
             logger.error("API fetch failed for %r (platform=%s): %s",
                          company, platform, e, exc_info=True)
-            print(f"  [{position}/{total}] {company} â€” [ERROR] {e}")
+            print(f"  [{position}/{total}] {company} — [ERROR] {e}")
             result["failed"]       = 1
             result["failure_name"] = company
             return result
@@ -1005,9 +1005,9 @@ def _process_company(company_row, position, total, _r=None):
                       dropped_count, company)
 
     result["fetched"]          = len(raw_jobs)
-    result["fallback_scanned"] = 1  # ATS responded â€” counts as scanned even if 0 jobs
+    result["fallback_scanned"] = 1  # ATS responded — counts as scanned even if 0 jobs
 
-    # URL presence tracking (DB reads â€” fast, no HTTP)
+    # URL presence tracking (DB reads — fast, no HTTP)
     fetched_urls = {job["job_url"] for job in raw_jobs}
     tracked      = get_tracked_urls_for_company(company)
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
@@ -1023,7 +1023,7 @@ def _process_company(company_row, position, total, _r=None):
     if not raw_jobs:
         logger.info("No jobs returned for %r", company)
         update_company_check(company, found_jobs=False)
-        # Re-check threshold with the just-incremented count â€” the pre-run check at the
+        # Re-check threshold with the just-incremented count — the pre-run check at the
         # top of this function used the old value, so a company that crossed the threshold
         # during this run would be missed for a full day without this second check.
         if not result.get("queued_enrichment"):
@@ -1034,7 +1034,7 @@ def _process_company(company_row, position, total, _r=None):
                     company, company_row, result, _r,
                     _new_empty, log_label="threshold just crossed",
                 )
-        print(f"  [{position}/{total}] {company} â€” 0 jobs")
+        print(f"  [{position}/{total}] {company} — 0 jobs")
         return result
 
     result["with_results"] = 1
@@ -1042,24 +1042,24 @@ def _process_company(company_row, position, total, _r=None):
 
     # â”€â”€ Filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Registry listing_filter drives which filter to apply:
-    #   "full"       â†’ filter_jobs()             (title + location at listing)
-    #   "title_only" â†’ filter_jobs_title_only()  (location deferred to detail)
+    #   "full"       → filter_jobs()             (title + location at listing)
+    #   "title_only" → filter_jobs_title_only()  (location deferred to detail)
     if config.get("listing_filter") == "title_only":
         matched = filter_jobs_title_only(raw_jobs)
     else:
         matched = filter_jobs(raw_jobs)
-    logger.debug("Filter: %d raw â†’ %d matched for %r",
+    logger.debug("Filter: %d raw → %d matched for %r",
                  len(raw_jobs), len(matched), company)
     result["matched"] = len(matched)
 
     is_first_scan = company_row.get("first_scanned_at") is None
     if is_first_scan:
-        logger.info("First scan for %r â€” all jobs marked pre_existing",
+        logger.info("First scan for %r — all jobs marked pre_existing",
                     company)
 
     # â”€â”€ Save new jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     new_count = 0
-    # slug_info is already parsed above â€” used by custom detail fetcher
+    # slug_info is already parsed above — used by custom detail fetcher
     # and any other platform that needs it inside the per-job loop.
     slug_info_cached = slug_info if isinstance(slug_info, dict) else None
 
@@ -1086,11 +1086,11 @@ def _process_company(company_row, position, total, _r=None):
         # never written to the DB at all (even as pre_existing).
         # All other has_detail platforms fetch detail for new jobs only (below).
         #
-        # Location waterfall (most â†’ least reliable):
+        # Location waterfall (most → least reliable):
         #   Tier 1: jobRequisitionLocation.country.alpha2Code ("US", "IN", "DE")
-        #           â†’ stored as _country_code by fetch_job_detail(); definitive.
+        #           → stored as _country_code by fetch_job_detail(); definitive.
         #   Tier 3: is_us_location() on descriptor-embedded location string
-        #           â†’ fallback when alpha2Code absent (older/custom tenants).
+        #           → fallback when alpha2Code absent (older/custom tenants).
         if platform == "workday" and should_fetch_detail(job, platform, config, slug_info):
             _snap_cc  = job.get("_country_code", "")
             _snap_loc = job.get("location", "")
@@ -1099,13 +1099,13 @@ def _process_company(company_row, position, total, _r=None):
                     job = ats_module.fetch_job_detail(job)
                 except Exception as e:
                     logger.error(
-                        "Workday fetch_job_detail failed %s/%s: %s â€” skipping",
+                        "Workday fetch_job_detail failed %s/%s: %s — skipping",
                         company, job.get("job_id"), e, exc_info=True,
                     )
                     continue
             alpha2 = (job.get("_country_code") or "").upper()
             if alpha2:
-                # Tier 1: structured alpha-2 code â€” no text parsing needed
+                # Tier 1: structured alpha-2 code — no text parsing needed
                 if alpha2 != "US":
                     logger.debug(
                         "Workday non-US dropped (alpha2): %r | %s | country=%s",
@@ -1113,7 +1113,7 @@ def _process_company(company_row, position, total, _r=None):
                     )
                     continue
             elif not is_us_location(job.get("location", "")):
-                # Tier 3: alpha2Code absent â†’ fall back to descriptor-embedded text
+                # Tier 3: alpha2Code absent → fall back to descriptor-embedded text
                 logger.debug(
                     "Workday non-US dropped (text): %r | %s | %s",
                     company, job.get("title"), job.get("location"),
@@ -1122,7 +1122,7 @@ def _process_company(company_row, position, total, _r=None):
             else:
                 # is_us_location returned True but alpha2 is absent.
                 # If detail fetch produced no new data (guard fired or API blank),
-                # the listing-level location alone is not trustworthy â€” skip rather
+                # the listing-level location alone is not trustworthy — skip rather
                 # than risk leaking a non-US job (e.g. empty locationsText or an
                 # ambiguous city name like "Glasgow Campus" matching Glasgow, KY).
                 _enriched = (
@@ -1132,13 +1132,13 @@ def _process_company(company_row, position, total, _r=None):
                 if not _enriched:
                     logger.warning(
                         "Workday detail returned no enrichment and no alpha2 for "
-                        "%s/%s (location=%r) â€” skipping to avoid leaking non-US job",
+                        "%s/%s (location=%r) — skipping to avoid leaking non-US job",
                         company, job.get("job_id"), job.get("location"),
                     )
                     continue
 
         elif platform == "workday":
-            # should_fetch_detail returned False â€” required detail keys (_external_path,
+            # should_fetch_detail returned False — required detail keys (_external_path,
             # _slug, _wd, _path) are missing.
             if config.get("listing_filter") == "title_only":
                 # Without detail we cannot determine location for title_only
@@ -1154,7 +1154,7 @@ def _process_company(company_row, position, total, _r=None):
         # â”€â”€ Alpha-2 listing-level gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
         # alpha-2 code in every listing.  Drop non-US jobs before the detail
-        # fetch â€” saves one HTTP call per non-US job.
+        # fetch — saves one HTTP call per non-US job.
         if config.get("country_source") == "alpha2":
             code = (job.get("_country_code") or "").lower()
             if code and code != "us":
@@ -1177,7 +1177,7 @@ def _process_company(company_row, position, total, _r=None):
         # â”€â”€ Detail fetch for new jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Registry has_detail + should_fetch_detail() drive when to fetch.
         # Each call re-acquires the semaphore to throttle detail HTTP requests.
-        # Workday excluded â€” detail was fetched in the early-fetch path above.
+        # Workday excluded — detail was fetched in the early-fetch path above.
         # Custom uses a different signature (passes slug_info_cached).
         if platform == "custom":
             if should_fetch_detail(job, platform, config, slug_info_cached):
@@ -1208,10 +1208,10 @@ def _process_company(company_row, position, total, _r=None):
         # Applies to all platforms where detail fills/refines location
         # (registry has_detail=True), except Workday (gated above).
         #
-        # country_source="alpha2"     â†’ _country_code set by detail parse (iCIMS
+        # country_source="alpha2"     → _country_code set by detail parse (iCIMS
         #                               JSON-LD); listing gate caught SmartRecruiters
-        # country_source="text"       â†’ location string via is_us_location()
-        # country_source="descriptor" â†’ full country name embedded by detail
+        # country_source="text"       → location string via is_us_location()
+        # country_source="descriptor" → full country name embedded by detail
         #                               normaliser; is_us_location() Signal 4 fires
         if config.get("has_detail") and platform != "workday":
             code = (job.get("_country_code") or "").upper()
@@ -1238,14 +1238,14 @@ def _process_company(company_row, position, total, _r=None):
 
     logger.info("Done %r: fetched=%d matched=%d new=%d",
                 company, len(raw_jobs), len(matched), new_count)
-    print(f"  [{position}/{total}] {company} â€” "
-          f"{len(raw_jobs)} fetched â†’ {len(matched)} matched â†’ {new_count} new")
+    print(f"  [{position}/{total}] {company} — "
+          f"{len(raw_jobs)} fetched → {len(matched)} matched → {new_count} new")
 
     if is_first_scan:
         # first_scanned_at was already set atomically in update_company_check()
-        # above â€” no separate DB call needed.
+        # above — no separate DB call needed.
         logger.info("First scan complete for %r", company)
-        print(f"  [{position}/{total}] {company} â€” "
+        print(f"  [{position}/{total}] {company} — "
               f"first scan complete (existing jobs pre_existing)")
 
     return result
@@ -1263,8 +1263,8 @@ def _build_alerts(stats, total_companies):
         # covered_by_workers: confirmed done by background workers (data in DB).
         # fallback_scanned: of the missed companies, those whose ATS fetch
         #   completed (0 or more jobs).  Use this (not companies_with_results)
-        #   for coverage â€” a 0-job result is still a successful scan.
-        # in_flight companies are NOT included here â€” they are still scanning
+        #   for coverage — a 0-job result is still a successful scan.
+        # in_flight companies are NOT included here — they are still scanning
         # and cannot be credited until confirmed in the DB.
         covered_count = stats.get("covered_by_workers", 0)
         companies_with_data = covered_count + stats.get("fallback_scanned", 0)
@@ -1274,7 +1274,7 @@ def _build_alerts(stats, total_companies):
             logger.warning("Coverage alert: %d%%", pct)
             alerts.append({
                 "level":   "warning",
-                "message": f"Coverage {pct}% â€” only "
+                "message": f"Coverage {pct}% — only "
                            f"{companies_with_data}/"
                            f"{total_companies} companies have data",
             })
@@ -1286,7 +1286,7 @@ def _build_alerts(stats, total_companies):
             alerts.append({
                 "level":   "warning",
                 "message": f"{stats['companies_unknown_ats']} companies "
-                           f"have unknown ATS â€” run --detect-ats",
+                           f"have unknown ATS — run --detect-ats",
             })
 
     if stats["api_failures"] > 0:
@@ -1307,14 +1307,14 @@ def _build_alerts(stats, total_companies):
             alerts.append({
                 "level":   "warning",
                 "message": f"Filter match rate {int(match_rate*100)}% "
-                           f"â€” filters may be too strict",
+                           f"— filters may be too strict",
             })
         elif match_rate > MONITOR_MATCH_RATE_HIGH_ALERT:
             logger.info("Match rate high: %.1f%%", match_rate * 100)
             alerts.append({
                 "level":   "info",
                 "message": f"Filter match rate {int(match_rate*100)}% "
-                           f"â€” consider tightening filters",
+                           f"— consider tightening filters",
             })
 
     return alerts
@@ -1404,7 +1404,7 @@ def _send_text_fallback(postings):
         parsed   = urlparse(raw_url)
         safe_url = html_lib.escape(raw_url) if parsed.scheme in ("http", "https") else "#"
         lines.append(
-            f"<li><strong>{company}</strong> â€” "
+            f"<li><strong>{company}</strong> — "
             f"{title} ({location})<br>"
             f"<a href='{safe_url}'>{html_lib.escape(raw_url)}</a></li>"
         )
@@ -1568,7 +1568,7 @@ def run_monitor_status():
     print(f"{'='*55}")
 
 
-# Diagnostics functions â€” identical to original
+# Diagnostics functions — identical to original
 def run_diagnostics():
     """Print open custom ATS diagnostics."""
     init_logging("diagnostics")
@@ -1593,7 +1593,7 @@ def run_diagnostics():
     print(f"  {total} open issue(s):\n")
     for row in summary:
         print(f"  [{row['severity'].upper()}] "
-              f"{row['count']} issue(s) â€” "
+              f"{row['count']} issue(s) — "
               f"{row['companies']} company/companies")
 
     issues = get_open_diagnostics(limit=50)

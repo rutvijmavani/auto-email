@@ -10,19 +10,19 @@ Both are Redis LISTs — BLPOP handles strict priority ordering natively.
 
 For each company:
   1. Check Redis cache head_check:{fein} (TTL = HEAD_CHECK_CACHE_TTL_S / 6h default).
-     Cache hit â†’ use stored result, skip HTTP. Prevents redundant HEAD requests when
+     Cache hit → use stored result, skip HTTP. Prevents redundant HEAD requests when
      the same FEIN is pushed twice within the TTL window.
-  2. Cache miss â†’ HTTP HEAD on careers_url, follow redirects.
+  2. Cache miss → HTTP HEAD on careers_url, follow redirects.
   3. Classify result into 6 cases and route:
-       Case 1: redirect to same domain, careers path â†’ write new URL, â†’ discovery
-       Case 2: redirect to known ATS domain         â†’ write new URL, â†’ discovery
-       Case 3: redirect to same domain, homepage    â†’ â†’ enrichment
-       Case 4: redirect to unrelated 3rd party      â†’ â†’ enrichment
-       Case 5: clean 200 (URL healthy)              â†’ â†’ discovery (redetect/staleness only)
-       Case 6: timeout / connection error           â†’ â†’ enrichment
+       Case 1: redirect to same domain, careers path → write new URL, → discovery
+       Case 2: redirect to known ATS domain         → write new URL, → discovery
+       Case 3: redirect to same domain, homepage    → → enrichment
+       Case 4: redirect to unrelated 3rd party      → → enrichment
+       Case 5: clean 200 (URL healthy)              → → discovery (redetect/staleness only)
+       Case 6: timeout / connection error           → → enrichment
   4. on_demand trigger: STOP at Cases 1, 2, 5 (no discovery push).
-     redetect trigger:  Cases 1, 2, 5 â†’ discovery:redetect.
-     staleness trigger: Cases 1, 2, 5 â†’ discovery:batch.
+     redetect trigger:  Cases 1, 2, 5 → discovery:redetect.
+     staleness trigger: Cases 1, 2, 5 → discovery:batch.
 
 Worker exits cleanly when both queues are empty.
 
@@ -313,10 +313,10 @@ def _push_enrichment(r, fein: str, petition_count: int, trigger: str,
     member = json.dumps({"fein": fein, "trigger": trigger, "source": source, "tier": tier})
     if tier == "on_demand":
         r.lpush(ENRICHMENT_ON_DEMAND, member)
-        log.debug("head_check: fein=%s â†’ enrichment:on_demand trigger=%s", fein, trigger)
+        log.debug("head_check: fein=%s → enrichment:on_demand trigger=%s", fein, trigger)
     else:
         r.zadd(ENRICHMENT_BATCH, {member: petition_count}, gt=True)
-        log.debug("head_check: fein=%s â†’ enrichment:batch trigger=%s", fein, trigger)
+        log.debug("head_check: fein=%s → enrichment:batch trigger=%s", fein, trigger)
 
 
 def _push_discovery(r, fein: str, petition_count: int, trigger: str,
@@ -324,10 +324,10 @@ def _push_discovery(r, fein: str, petition_count: int, trigger: str,
     member = json.dumps({"fein": fein, "trigger": trigger, "source": source})
     if trigger == "redetect":
         r.zadd(DISCOVERY_REDETECT, {member: petition_count}, gt=True)
-        log.debug("head_check: fein=%s â†’ discovery:redetect petition_count=%d", fein, petition_count)
+        log.debug("head_check: fein=%s → discovery:redetect petition_count=%d", fein, petition_count)
     else:
         r.zadd(DISCOVERY_BATCH, {member: petition_count}, gt=True)
-        log.debug("head_check: fein=%s â†’ discovery:batch trigger=%s petition_count=%d",
+        log.debug("head_check: fein=%s → discovery:batch trigger=%s petition_count=%d",
                   fein, trigger, petition_count)
 
 
@@ -385,14 +385,14 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             conn.commit()
             _cache_delete(r, fein)
             if trigger == "on_demand":
-                log.info("head_check: fein=%s Case 1/2 on_demand â†’ STOP", fein)
+                log.info("head_check: fein=%s Case 1/2 on_demand → STOP", fein)
             else:
                 _push_discovery(r, fein, petition_count, trigger, source)
 
         elif case_label == "ok":
             # Case 5 — URL still healthy; no DB write needed
             if trigger == "on_demand":
-                log.info("head_check: fein=%s Case 5 on_demand â†’ STOP", fein)
+                log.info("head_check: fein=%s Case 5 on_demand → STOP", fein)
             else:
                 _push_discovery(r, fein, petition_count, trigger, source)
 

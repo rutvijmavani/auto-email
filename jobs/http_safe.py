@@ -1,5 +1,5 @@
 ﻿"""
-jobs/http_safe.py â€” SSRF-safe HTTP session for pipeline outbound requests.
+jobs/http_safe.py — SSRF-safe HTTP session for pipeline outbound requests.
 
 Provides make_safe_session() which returns a requests.Session with SSRFAdapter
 mounted on both http:// and https://, closing the DNS-rebinding TOCTOU gap.
@@ -60,11 +60,11 @@ class SSRFAdapter(HTTPAdapter):
     calling getaddrinfo again at connect time. A DNS server with TTL=0 can
     return different IPs on successive queries, slipping a private IP through.
 
-    Fix â€” HTTP: resolve once, validate ALL returned IPs, rewrite the URL hostname
-    to the resolved IP so urllib3 re-resolves IPâ†’IP (no-op), eliminating the race.
-    Fix â€” HTTPS: resolve + validate all IPs, keep the original hostname so TLS SNI
+    Fix — HTTP: resolve once, validate ALL returned IPs, rewrite the URL hostname
+    to the resolved IP so urllib3 re-resolves IP→IP (no-op), eliminating the race.
+    Fix — HTTPS: resolve + validate all IPs, keep the original hostname so TLS SNI
     and certificate validation are unaffected. DNS-rebinding on HTTPS requires the
-    attacker to also hold a valid cert for the public domain â€” practically infeasible.
+    attacker to also hold a valid cert for the public domain — practically infeasible.
 
     Raises requests.exceptions.ConnectionError on any SSRF risk.
     """
