@@ -43,7 +43,7 @@ fein_domain_map                        petition_count per employer
 After `fuzzy_match_uscis_dol.py` completes:
 - Populate `enrichment:batch` (Redis ZSET, score = petition_count) for new/stale companies
 - Populate `enrichment:on_demand` (Redis LIST, FIFO) for API-triggered single-company refreshes
-- Only rows WHERE `public_domain IS NULL` OR `last_enriched_at < NOW() - INTERVAL '90 days'`
+- Only rows WHERE `(public_domain IS NULL OR last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '90 days')`
 
 **Why USCIS must complete before enrichment queue is populated:**
 petition_count is the priority score. Without it, all companies get score=0
@@ -146,7 +146,7 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Discovery Queue Sources (4)
 1. `domain_enrichment_worker` — after enrichment completes for a company above threshold
-2. `staleness_checker` cron — `last_discovered_at > DISCOVER_REDETECT_EMPTY_DAYS (30d) AND petition_count >= threshold`
+2. `staleness_checker` cron — `(last_discovered_at IS NULL OR last_discovered_at < NOW() - DISCOVER_REDETECT_EMPTY_DAYS interval (30d)) AND petition_count >= threshold`
 3. `job_fetcher_worker` — `consecutive_zero_jobs > threshold` (re-detection trigger)
 4. Admin script — new ATS platform added → push all monitored companies
 

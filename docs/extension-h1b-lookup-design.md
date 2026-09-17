@@ -47,6 +47,7 @@ JOIN fein_domain_map f ON ca.employer_fein = f.employer_fein
 LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
 WHERE ca.platform = %s AND ca.slug = %s
   AND ca.stale_since IS NULL
+  AND ca.is_monitored = TRUE
 ```
 
 Company must already be in `company_ats` (detected by our pipeline). Companies not

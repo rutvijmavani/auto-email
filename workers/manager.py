@@ -57,9 +57,11 @@ from config import (
     ENRICHMENT_ON_DEMAND,
     ENRICHMENT_BATCH,
     ENRICHMENT_INFLIGHT,
+    ENRICHMENT_DELAYED,
     DISCOVERY_BATCH,
     DISCOVERY_REDETECT,
     DISCOVERY_INFLIGHT,
+    DISCOVERY_DELAYED,
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
 )
@@ -389,20 +391,28 @@ def _get_queue_metrics(r) -> dict:
         metrics["head_check"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
 
     try:
-        # enrichment: on_demand LIST + batch ZSET + inflight ZSET(s)
+        # enrichment: on_demand LIST + batch ZSET + inflight ZSET(s) + delayed ZSET
         # Include inflight so workers are not stopped while actively processing items
         # (items move from queue → inflight atomically, leaving queues temporarily empty).
+        # Include delayed so the pool isn't scaled to zero while certspotter-429 /
+        # processing-error retries are waiting on their not_before timestamp — the
+        # worker loop itself blocks on ENRICHMENT_DELAYED rather than exiting, so the
+        # autoscaler must see it too or it will shut down the only worker left to drain it.
         _enrich_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{ENRICHMENT_INFLIGHT}*", count=10)))
-        enrich_depth = r.llen(ENRICHMENT_ON_DEMAND) + r.zcard(ENRICHMENT_BATCH) + _enrich_inflight
+        enrich_depth = (r.llen(ENRICHMENT_ON_DEMAND) + r.zcard(ENRICHMENT_BATCH)
+                        + _enrich_inflight + r.zcard(ENRICHMENT_DELAYED))
         metrics["domain_enrichment"] = {"depth": enrich_depth, "delay_s": 0.0, "depth_known": True}
     except Exception as exc:
         logger.warning("manager: enrichment queue metrics failed: %s", exc)
         metrics["domain_enrichment"] = {"depth": 0, "delay_s": 0.0, "depth_known": False}
 
     try:
-        # discovery: redetect ZSET + batch ZSET + inflight ZSET(s)
+        # discovery: redetect ZSET + batch ZSET + inflight ZSET(s) + delayed ZSET
+        # (delayed included for the same reason as enrichment above — KG quota
+        # exhaustion retries must not let the pool scale to zero.)
         _discov_inflight = sum(r.zcard(k) for k in set(r.scan_iter(f"{DISCOVERY_INFLIGHT}*", count=10)))
-        discovery_depth = r.zcard(DISCOVERY_REDETECT) + r.zcard(DISCOVERY_BATCH) + _discov_inflight
+        discovery_depth = (r.zcard(DISCOVERY_REDETECT) + r.zcard(DISCOVERY_BATCH)
+                           + _discov_inflight + r.zcard(DISCOVERY_DELAYED))
         metrics["discovery"] = {"depth": discovery_depth, "delay_s": 0.0, "depth_known": True}
     except Exception as exc:
         logger.warning("manager: discovery queue metrics failed: %s", exc)

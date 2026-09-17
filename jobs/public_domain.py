@@ -143,7 +143,7 @@ def _root(u: str) -> str:
     if "://" not in u:
         u = "https://" + u
     h = urlparse(u).hostname or ""
-    ext = _tldextract.extract(h)
+    ext = _tldextract(h)
     return ext.registered_domain or h
 
 
@@ -398,7 +398,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         # A subdomain like ny.email.gs.com resolves within the same root (gs.com),
         # but the real public site may be at goldmansachs.com — fall through to CT log.
         # www is a standard public alias, not a meaningful subdomain.
-        sub = _tldextract.extract(domain).subdomain
+        sub = _tldextract(domain).subdomain
         if not sub or sub == "www":
             log.debug("%s already resolves publicly", domain)
             return domain, "same_domain", None
@@ -410,7 +410,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
     # Step 2 — Root-domain fallback (strip subdomain prefix via PSL)
-    ext      = _tldextract.extract(domain)
+    ext      = _tldextract(domain)
     root_try = ext.registered_domain
     if root_try and root_try != domain:
         redir = _redirect_domain(root_try)

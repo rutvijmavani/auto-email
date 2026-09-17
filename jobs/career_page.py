@@ -43,7 +43,7 @@ def _get_session():
 def _reg_domain(u: str) -> str:
     if "://" not in u:
         u = "https://" + u
-    ext = _tldextract.extract(urlparse(u).hostname or "")
+    ext = _tldextract(urlparse(u).hostname or "")
     return ext.registered_domain or urlparse(u).hostname or ""
 
 HEADERS = {

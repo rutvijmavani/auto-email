@@ -187,13 +187,25 @@ while True:
     process(item)
 ```
 
-### Universal queue member schema
+### Queue member schema (per producer)
 
-Every producer, every queue, same three keys. Missing values are `null`, never omitted.
+Schemas are not identical across queues — each producer writes only the keys its
+consumer needs. `fein` and `trigger` are always present; `source`, `tier`, and
+`petition_count` are producer-specific.
 
-```json
-{"fein": "123456789", "trigger": "enrichment|staleness|on_demand|redetect|manual", "source": "company_ats|prospective|job_monitor|staleness_checker|api|null"}
-```
+| Producer | Queue | Keys written |
+|---|---|---|
+| `scripts/fuzzy_match_uscis_dol.py` | `enrichment:batch` | `fein`, `trigger="enrichment"`, `source=null`, `tier="batch"` |
+| `scripts/staleness_checker.py` | `discovery:redetect` (company_ats / prospective) | `fein`, `petition_count`, `trigger="redetect"`, `source="company_ats"\|"prospective"` (no `tier`) |
+| `api.py` (`/verify-company`, career URL unknown) | `enrichment:on_demand` | `fein`, `trigger="on_demand"`, `source=null`, `tier="on_demand"` |
+| `api.py` (`/verify-company`, career URL known) | `head_check:on_demand` | `fein`, `trigger="on_demand"`, `source=null` (no `tier`, no `petition_count`) |
+
+`petition_count` is a queue member field only for `discovery:redetect` (used by
+`head_check_worker.py` to prioritize/deprioritize redetect candidates); everywhere
+else petition volume is only a ZSET score, not a member field. `tier` is present only
+on enrichment-bound payloads (`enrichment:on_demand`/`enrichment:batch` and any
+`tier`-carrying delayed-retry payload) — `head_check` and `discovery:redetect`
+payloads have no `tier` concept.
 
 ### Tier propagation through hops
 
@@ -367,7 +379,7 @@ Special case — `careers_url IS NULL` and `last_enriched_at IS NULL` (never enr
 
 ```python
 # Step 1: check company_ats — is ATS already known?
-existing_ats = query company_ats WHERE employer_fein = fein AND is_monitored = TRUE
+existing_ats = query company_ats WHERE employer_fein = fein AND is_monitored = TRUE AND stale_since IS NULL
 
 if existing_ats and trigger not in ("redetect", "manual"):
     update last_discovered_at = NOW()
@@ -462,7 +474,7 @@ Update `install-systemd.sh`:
 **4. `workers/domain_enrichment_worker.py`**
    - `_write_careers()` is unconditional — no `trigger` param, no `WHERE careers_url IS NULL` guard; always overwrites
    - Writes `careers_source` alongside `careers_url`
-   - Head-check cache invalidation (`r.delete(f"head_check:{fein}")`) is `head_check_worker`'s responsibility after Cases 1/2, not enrichment worker's
+   - `_write_careers()` must also invalidate the head-check cache (`r.delete(f"head_check:{fein}")`) — every `careers_url` write, whether from `head_check_worker`'s Cases 1/2 self-heal or from enrichment worker's Phase 3/6 probes, must delete the stale cache entry so a subsequent head-check re-probes the new URL instead of serving the pre-write cached result
    - After enrichment: trigger="redetect" → push to `discovery:redetect`; others → push to `discovery:batch`
 
 **5. `scripts/discover_h1b_ats.py`** (nightly batch script)

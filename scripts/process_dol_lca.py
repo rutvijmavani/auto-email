@@ -303,7 +303,7 @@ def aggregate(df: pd.DataFrame) -> dict:
             # ny.email.gs.com(3027) + gs.com(3) → gs.com(3030).
             # tldextract handles multi-label TLDs: acme.co.uk → acme.co.uk, not co.uk.
             for _d, _cnt in domain_counts.items():
-                _ext  = _tldextract.extract(_d)
+                _ext  = _tldextract(_d)
                 _root = _ext.registered_domain or _d
                 root_totals[_root] = root_totals.get(_root, 0) + _cnt
             assigned_domain = min(root_totals, key=lambda k: (-root_totals[k], k))
@@ -632,7 +632,7 @@ def upsert(aggregated: dict, quarter: str) -> None:
                 _raw_prev    = existing_domain_counts.get(fein, {})
                 _prev_counts: dict = {}
                 for _pk, _pv in _raw_prev.items():
-                    _pext = _tldextract.extract(_pk)
+                    _pext = _tldextract(_pk)
                     _proot = _pext.registered_domain or _pk
                     _prev_counts[_proot] = _prev_counts.get(_proot, 0) + _pv
                 _prev_total  = existing_email_totals.get(fein, 0)

@@ -90,7 +90,7 @@ except Exception as _import_err:
         if "://" not in url:
             url = "https://" + url
         host = urlparse(url).hostname or ""
-        ext = _tldextract_inst.extract(host)
+        ext = _tldextract_inst(host)
         return ext.registered_domain or host
 
 # Path keywords that indicate a careers/jobs page (not a homepage).
@@ -207,10 +207,10 @@ def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None, s
                 return resp, None, logical_url
             location = resp.headers.get("Location", "")
             if not location:
-                return resp, None, logical_url
+                return None, None, logical_url
             next_url = urljoin(current_url, location)
             if not _is_safe_url(next_url):
-                return resp, None, logical_url
+                return None, None, logical_url
             current_url = next_url
         return resp, None, logical_url
     except Exception as exc:

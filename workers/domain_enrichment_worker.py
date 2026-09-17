@@ -109,10 +109,10 @@ return {res, '0'}
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _requeue_delayed(r, fein: str, petition_count: int, delay_s: int,
-                     trigger: str = "delayed_retry", source=None) -> None:
+                     trigger: str = "delayed_retry", source=None, tier: str = "batch") -> None:
     """Push company to enrichment:delayed ZSET scored by not_before timestamp."""
     payload = json.dumps({"fein": fein, "petition_count": petition_count,
-                          "trigger": trigger, "source": source})
+                          "trigger": trigger, "source": source, "tier": tier})
     not_before = time.time() + delay_s
     r.zadd(ENRICHMENT_DELAYED, {payload: not_before})
     log.info("re-queued %s to enrichment:delayed — retry in %ds", fein, delay_s)
@@ -296,11 +296,12 @@ def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" =
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichment",
-                     source: "str | None" = None) -> bool:
+                     source: "str | None" = None, tier: str = "batch") -> bool:
     """
     Run full enrichment for one company.
     Returns True on success (or permanent skip), False on transient error.
     source: forwarded from queue payload ("company_ats"|"prospective"|None).
+    tier: forwarded from queue payload ("on_demand"|"batch") — preserved across delayed retries.
     """
     conn = None
     t_start = time.time()
@@ -344,7 +345,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
             log.info("fein=%s certspotter quota — re-queuing in %ds", fein, retry_after)
-            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source)
+            _requeue_delayed(r, fein, petition_count, retry_after, trigger, source=source, tier=tier)
             return True
 
         # When resolution fails, fall back to the previously stored public_domain so
@@ -593,7 +594,7 @@ def run_worker(once: bool = False) -> None:
                 r.zrem(_inflight_key, raw_member)
                 continue
 
-            success = _process_company(r, fein, petition_count, trigger=trigger, source=source)
+            success = _process_company(r, fein, petition_count, trigger=trigger, source=source, tier=_tier)
             processed["n"] += 1
 
             if not success:
@@ -603,7 +604,7 @@ def run_worker(once: bool = False) -> None:
                     _clear_retry(r, fein)
                 else:
                     delay_s = 30 * (4 ** (count - 1))  # 30s → 120s → 480s
-                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source)
+                    _requeue_delayed(r, fein, petition_count, delay_s, trigger, source=source, tier=_tier)
                     log.warning("fein=%s retry %d/%d in %ds",
                                 fein, count, ENRICHMENT_MAX_RETRIES, delay_s)
             else:

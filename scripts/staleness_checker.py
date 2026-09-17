@@ -284,7 +284,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                          HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "redetect", "source": "company_ats"})
+            member = json.dumps({"fein": row["employer_fein"], "petition_count": row["petition_count"], "trigger": "redetect", "source": "company_ats"})
             pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
@@ -315,7 +315,7 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                          HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "trigger": "redetect", "source": "prospective"})
+            member = json.dumps({"fein": row["employer_fein"], "petition_count": row["petition_count"], "trigger": "redetect", "source": "prospective"})
             pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
