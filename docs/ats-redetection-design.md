@@ -64,9 +64,11 @@ discover_h1b_ats.py (via discover worker consuming discovery:redetect)
     Runs ATS detection from fresh domain/careers_url
 
     If trigger = "redetect":
-        First: SET stale_since = NOW() on existing rows for this FEIN
-               WHERE (is_monitored=TRUE OR is_monitored=FALSE) AND stale_since IS NULL
+        First: (workers/discover_h1b_ats_worker.py _mark_old_rows_stale)
+               SET stale_since = NOW() on existing company_ats rows for this FEIN
+               WHERE stale_since IS NULL
                AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
+               AND platform IS DISTINCT FROM new_platform
         Then:  INSERT new company_ats row (is_monitored=FALSE, pending human review)
                for each newly detected (domain, platform)
         Note:  mark stale BEFORE inserting so _upsert_company_ats's

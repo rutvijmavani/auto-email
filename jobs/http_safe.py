@@ -109,6 +109,7 @@ class SSRFAdapter(HTTPAdapter):
         if parsed.scheme == "http":
             # Rewrite URL to the resolved IP so urllib3 won't re-resolve.
             # Host header preserves virtual-hosting / HTTP/1.1 semantics.
+            logical_url = request.url
             ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
             netloc  = f"{ip_host}:{explicit_port}" if explicit_port else ip_host
             request.url = urlunparse(parsed._replace(netloc=netloc))
@@ -116,6 +117,13 @@ class SSRFAdapter(HTTPAdapter):
             _default_port = 80
             host_header = f"{host}:{explicit_port}" if explicit_port and explicit_port != _default_port else host
             request.headers["Host"] = host_header
+            response = super().send(request, *args, **kwargs)
+            # requests sets Response.url from the (IP-rewritten) request.url —
+            # restore the logical hostname so downstream consumers (e.g.
+            # career_page._fetch_and_scan's final_url) persist/compare domains,
+            # not connection IPs.
+            response.url = logical_url
+            return response
         else:
             # HTTPS: do not carry over a Host header from a previous HTTP hop.
             request.headers.pop("Host", None)

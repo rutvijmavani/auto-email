@@ -63,6 +63,18 @@ WHERE regexp_replace(regexp_replace(LOWER(f.public_domain), '^https?://', ''), '
     = regexp_replace(regexp_replace(LOWER(%s), '^https?://', ''), '^www\.', '')
 ```
 
+**Cardinality:** a normalized `public_domain` is not guaranteed unique in
+`fein_domain_map` (e.g. shared-FEIN state university systems — see
+`project_shared_fein_university_systems` memory — or two legal entities
+resolving to the same root domain) — this query can return more than one
+`employer_fein` row for a single input domain. The endpoint must not silently
+pick `rows[0]`: either disambiguate deterministically (e.g. highest
+`petition_count`) or return an explicit ambiguous-match response
+(`{"found": true, "ambiguous": true, "candidates": [...]}`) instead of
+assuming a single company. Whichever contract is chosen, the response schema
+above and endpoint behavior must stay consistent with it — not yet decided
+as of this doc revision.
+
 ---
 
 ## Response Schema
@@ -87,7 +99,7 @@ Field sources and null behaviour:
 | `company_name` | `dol_h1b_employers.employer_name` (or `prospective_companies.company`) | `null` if no name stored |
 | `petition_count` | `uscis_petition_counts.petition_count` joined via FEIN | `0` if USCIS row missing |
 | `lca_count_last_year` | COUNT of `dol_lca` rows WHERE `decision_date >= NOW() - INTERVAL '1 year'` | `0` if no recent LCAs |
-| `approval_rate` | `approved / total` from `uscis_h1b_petitions` | `null` if no petition data |
+| `approval_rate` | `approved / NULLIF(total, 0)` from `uscis_h1b_petitions` | `null` if no petition data, or if petition data exists but `total = 0` (zero-safe denominator) |
 | `sponsors_h1b` | `true` when `petition_count > 0` | `false` when petition_count is 0 or missing |
 | `not_tracked` | `true` when company has H1B data but `is_monitored = FALSE` in `prospective_companies` | `false` when monitored or not found |
 

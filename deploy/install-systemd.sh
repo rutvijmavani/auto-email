@@ -263,6 +263,19 @@ echo ""
 echo "► Enabling services (daemon-reload + enable)..."
 systemctl daemon-reload
 
+# Deprecated singleton units (domain-enrichment-worker, discover-h1b-ats-worker)
+# had [Install] sections before the manager.py-managed redesign. An upgrade on
+# a host still running them as always-on services must stop+disable the old
+# instance here — otherwise it keeps running (never re-enabled, but never
+# stopped either) alongside the new dynamically-started @instances, causing
+# duplicate workers on the same queue.
+for _legacy_unit in domain-enrichment-worker.service discover-h1b-ats-worker.service; do
+    if systemctl is-enabled --quiet "$_legacy_unit" 2>/dev/null || systemctl is-active --quiet "$_legacy_unit" 2>/dev/null; then
+        echo "  Disabling legacy singleton unit: $_legacy_unit"
+        systemctl disable --now "$_legacy_unit" || true
+    fi
+done
+
 for _unit_file in "$UNIT_STAGING_DIR"/*.service; do
     _unit="$(basename "$_unit_file")"
     [[ "$_unit" == "cloudflare-tunnel.service" ]] && continue

@@ -1386,7 +1386,12 @@ def _run_ats_pool_cycle(
     if combined_depth >= ATS_MANAGER_SCALE_UP_THRESHOLD and alive < len(worker_units):
         for _unit in worker_units:
             _inst = _unit.rsplit("@", 1)[-1]
-            _, _hb_keys = r.scan(0, match=f"worker:alive:{hb_prefix}@{_inst}:*", count=10)
+            _hb_cursor, _hb_keys = 0, []
+            while True:
+                _hb_cursor, _batch = r.scan(_hb_cursor, match=f"worker:alive:{hb_prefix}@{_inst}:*", count=10)
+                _hb_keys.extend(_batch)
+                if _hb_keys or _hb_cursor == 0:
+                    break
             if not _hb_keys:
                 logger.info(
                     "manager [%s]: depth=%d >= threshold=%d — starting %s",

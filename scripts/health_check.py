@@ -649,24 +649,35 @@ def run_health_check() -> int:
             ORDER BY n DESC
         """).fetchall()
 
-        # Career URL breakdown — count distinct companies that had any run with a
-        # known careers_source in the last 7 days.  COUNT(DISTINCT employer_fein)
-        # avoids DISTINCT ON ordering ambiguity while counting every company once.
+        # Career URL breakdown — newest run per fein that has a non-null
+        # careers_source (NOT NULL filtered *inside* the subquery so the
+        # DISTINCT ON pick isn't a null-source row from a later run; same fix
+        # shape as pd_rows above). Each company counted exactly once, under
+        # its most recent known source — avoids double-counting a company
+        # under two sources when careers_source changed within the window.
         cu_rows = conn.execute("""
-            SELECT careers_source, COUNT(DISTINCT employer_fein) AS n
-            FROM h1b_enrichment_metrics
-            WHERE run_at > NOW() - INTERVAL '7 days'
-              AND careers_source IS NOT NULL
+            SELECT careers_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) careers_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND careers_source IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY careers_source
             ORDER BY n DESC
         """).fetchall()
 
         # ATS detection breakdown — same approach.
         ats_rows = conn.execute("""
-            SELECT ats_source, COUNT(DISTINCT employer_fein) AS n
-            FROM h1b_enrichment_metrics
-            WHERE run_at > NOW() - INTERVAL '7 days'
-              AND ats_source IS NOT NULL
+            SELECT ats_source, COUNT(*) AS n
+            FROM (
+                SELECT DISTINCT ON (employer_fein) ats_source
+                FROM h1b_enrichment_metrics
+                WHERE run_at > NOW() - INTERVAL '7 days'
+                  AND ats_source IS NOT NULL
+                ORDER BY employer_fein, run_at DESC
+            ) sub
             GROUP BY ats_source
             ORDER BY n DESC
         """).fetchall()
