@@ -1,4 +1,4 @@
-﻿"""
+"""
 jobs/job_monitor.py — Job monitoring pipeline orchestrator.
 
 Phase 1 change: run() uses ThreadPoolExecutor for parallel company processing.
@@ -96,12 +96,12 @@ def _record_cycle_start() -> None:
         )
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # PER-ATS SEMAPHORES
 # Built once at module load from config.
 # Each semaphore limits how many threads can fetch from
 # the same ATS domain simultaneously.
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # Bounded wait for in-flight fullscans before building the digest.
 # Companies actively scanning when --monitor-jobs starts may finish soon;
 # waiting for them avoids missing their results in the digest.
@@ -121,9 +121,9 @@ def _get_semaphore(platform):
     return _PLATFORM_SEMAPHORES.get(platform, _DEFAULT_SEMAPHORE)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # PER-COMPANY HELPERS (registry-driven)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 
 def _parse_slug(platform, slug, config):
     """
@@ -153,9 +153,9 @@ def _parse_slug(platform, slug, config):
 
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # MAIN ENTRY POINT
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 
 def _get_worker_missed_companies(companies: list) -> tuple:
     """
@@ -434,7 +434,7 @@ def run():
     # completing during _get_worker_missed_companies() is still credited below.
     _scan_horizon = time.time()
 
-    # â”€â”€ Split: covered by workers vs missed vs in-flight â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Split: covered by workers vs missed vs in-flight ─────────────────────
     missed, in_flight_names = _get_worker_missed_companies(companies)
     missed_names = {c["company"] for c in missed}   # O(1) lookups
     # covered = confirmed done (last_full_scan_at within 24 h)
@@ -466,14 +466,14 @@ def run():
               f"{'...' if len(missed) > 5 else ''}")
     print(f"{'='*55}\n")
 
-    # â”€â”€ Shared stats — accumulated thread-safely via Lock â”€â”€
+    # ── Shared stats — accumulated thread-safely via Lock ──
     stats = {
         "companies_monitored":    len(companies),      # fixed total denominator (covered + in_flight + missed)
         "covered_by_workers":     len(covered),        # confirmed-done by workers
         "in_flight":              len(in_flight_names),# scanning now — not confirmed yet
         "fallback_scanned":       0,              # fallback companies whose ATS was successfully queried
                                                   # (regardless of whether jobs were found)
-        "companies_with_results": 0,              # subset of fallback_scanned that returned â‰¥1 job
+        "companies_with_results": 0,              # subset of fallback_scanned that returned ≥1 job
         "companies_unknown_ats":  0,
         "api_failures":           0,
         "total_jobs_fetched":     0,
@@ -487,7 +487,7 @@ def run():
     # later raises (the dict-return path would lose the signal in that case).
 
 
-    # â”€â”€ Fallback re-fetch (only for companies workers missed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Fallback re-fetch (only for companies workers missed) ─────────────────
     from workers.redis_client import get_redis as _get_redis
     try:
         _shared_r = _get_redis()
@@ -530,7 +530,7 @@ def run():
         logger.info("All %d companies covered by workers — skipping re-fetch",
                     len(covered))
 
-    # â”€â”€ Bounded wait for in-flight scans â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Bounded wait for in-flight scans ─────────────────────────────────────
     # Companies that were mid-scan when --monitor-jobs started may finish before
     # the digest is built.  Poll inflight:fullscan for up to _IN_FLIGHT_WAIT_S
     # seconds so their results are included rather than silently skipped.
@@ -711,7 +711,7 @@ def run():
                             }
                         _merge_company_stats(stats, stats_lock, _uc_stats)
 
-    # â”€â”€ Re-enrichment check for covered companies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Re-enrichment check for covered companies ─────────────────────────────
     # Background workers scan covered companies but never call _process_company,
     # so needs_redetection is never evaluated for them here.
     if covered and _shared_r is not None:
@@ -727,7 +727,7 @@ def run():
                     with stats_lock:
                         stats["enrichment_queued"] += 1
 
-    # â”€â”€ Generate PDF digest (sequential — happens once) â”€â”€â”€â”€
+    # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
     pdf_generated = False
     email_sent    = False
@@ -878,11 +878,11 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
         logger.warning("Failed to queue re-enrichment for %r (fein=%s): %s", company, fein, exc)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # WORKER — one company per thread call
 # Logic is identical to the original sequential loop body.
 # Only difference: uses semaphore instead of between_companies_delay().
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 def _process_company(company_row, position, total, _r=None):
     """
     Process one company: fetch jobs, filter, save new ones.
@@ -898,7 +898,7 @@ def _process_company(company_row, position, total, _r=None):
     result = {
         "monitored":        1,
         "fallback_scanned": 0,   # set to 1 when ATS fetch succeeds (0 or more jobs)
-        "with_results":     0,   # set to 1 when fetch returns â‰¥1 job
+        "with_results":     0,   # set to 1 when fetch returns ≥1 job
         "unknown_ats":      0,
         "failed":           0,
         "fetched":          0,
@@ -907,10 +907,10 @@ def _process_company(company_row, position, total, _r=None):
         "failure_name":     None,
     }
 
-    logger.info("â”€â”€ [%d/%d] %r  platform=%s",
+    logger.info("── [%d/%d] %r  platform=%s",
                 position, total, company, platform)
 
-    # â”€â”€ Re-enrichment trigger (consecutive empty days) â”€â”€â”€â”€
+    # ── Re-enrichment trigger (consecutive empty days) ────
     # When a company returns zero jobs for JOB_MONITOR_REDETECT_DAYS consecutive
     # days, its careers_url or ATS slug may have changed. Push to the enrichment
     # queue so domain_enrichment_worker re-verifies public_domain + careers_url,
@@ -929,7 +929,7 @@ def _process_company(company_row, position, total, _r=None):
         print(f"  [{position}/{total}] {company} — [SKIP] Unknown ATS")
         return result
 
-    # â”€â”€ Get ATS module + registry config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Get ATS module + registry config ─────────────────
     config     = get_config(platform)
     ats_module = get_ats_module(platform)
     if not ats_module:
@@ -939,13 +939,13 @@ def _process_company(company_row, position, total, _r=None):
         result["failure_name"] = company
         return result
 
-    # â”€â”€ Acquire per-ATS semaphore â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Acquire per-ATS semaphore ─────────────────────────
     # Limits concurrent requests to the same ATS domain.
     # Replaces between_companies_delay() from the sequential version.
     sem = _get_semaphore(platform)
 
     with sem:
-        # â”€â”€ Fetch jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Fetch jobs ────────────────────────────────────
         _scan_complete = True
         try:
             slug_info = _parse_slug(platform, slug, config)
@@ -991,7 +991,7 @@ def _process_company(company_row, position, total, _r=None):
             result["failure_name"] = company
             return result
 
-    # â”€â”€ Post-fetch processing (outside listing semaphore) â”€â”€
+    # ── Post-fetch processing (outside listing semaphore) ──
     # NOTE: fetch_job_detail calls below re-acquire the semaphore individually
     # to throttle detail HTTP requests with the same per-platform limit.
     logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
@@ -1040,7 +1040,7 @@ def _process_company(company_row, position, total, _r=None):
     result["with_results"] = 1
     update_company_check(company, found_jobs=True)
 
-    # â”€â”€ Filter â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Filter ────────────────────────────────────────────
     # Registry listing_filter drives which filter to apply:
     #   "full"       → filter_jobs()             (title + location at listing)
     #   "title_only" → filter_jobs_title_only()  (location deferred to detail)
@@ -1057,7 +1057,7 @@ def _process_company(company_row, position, total, _r=None):
         logger.info("First scan for %r — all jobs marked pre_existing",
                     company)
 
-    # â”€â”€ Save new jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Save new jobs ─────────────────────────────────────
     new_count = 0
     # slug_info is already parsed above — used by custom detail fetcher
     # and any other platform that needs it inside the per-job loop.
@@ -1080,7 +1080,7 @@ def _process_company(company_row, position, total, _r=None):
             logger.debug("Duplicate content_hash for %r", company)
             continue
 
-        # â”€â”€ Workday: early detail fetch + location gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Workday: early detail fetch + location gate ───────────────────────
         # Workday listing locations are too vague ("2 Locations", bare "London").
         # Fetch detail BEFORE freshness/pre_existing checks so non-US jobs are
         # never written to the DB at all (even as pre_existing).
@@ -1151,7 +1151,7 @@ def _process_company(company_row, position, total, _r=None):
             # listing_filter="full": location reliable at listing level; fall through
             # to the normal alpha-2 / text location gates below.
 
-        # â”€â”€ Alpha-2 listing-level gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Alpha-2 listing-level gate ────────────────────────────────────────
         # Platforms with country_source="alpha2" (SmartRecruiters) embed an ISO
         # alpha-2 code in every listing.  Drop non-US jobs before the detail
         # fetch — saves one HTTP call per non-US job.
@@ -1174,7 +1174,7 @@ def _process_company(company_row, position, total, _r=None):
             save_job_posting(job, status="pre_existing")
             continue
 
-        # â”€â”€ Detail fetch for new jobs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Detail fetch for new jobs ─────────────────────────────────────────
         # Registry has_detail + should_fetch_detail() drive when to fetch.
         # Each call re-acquires the semaphore to throttle detail HTTP requests.
         # Workday excluded — detail was fetched in the early-fetch path above.
@@ -1204,7 +1204,7 @@ def _process_company(company_row, position, total, _r=None):
                         platform, company, job.get("job_id"), e, exc_info=True,
                     )
 
-        # â”€â”€ Post-detail location gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # ── Post-detail location gate ─────────────────────────────────────────
         # Applies to all platforms where detail fills/refines location
         # (registry has_detail=True), except Workday (gated above).
         #
@@ -1251,9 +1251,9 @@ def _process_company(company_row, position, total, _r=None):
     return result
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # ALL FUNCTIONS BELOW ARE IDENTICAL TO ORIGINAL
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 
 def _build_alerts(stats, total_companies):
     """Build list of alert messages based on metric thresholds."""
@@ -1601,7 +1601,7 @@ def run_diagnostics():
     for issue in issues:
         if issue["severity"] != current_severity:
             current_severity = issue["severity"]
-            print(f"\nâ”€â”€ {current_severity.upper()} â”€â”€")
+            print(f"\n── {current_severity.upper()} ──")
         print(f"\n  [{issue['id']}] {issue['company']}")
         print(f"       Step:  {issue['step']}")
         print(f"       Since: {issue['created_at'][:10]}")

@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/discover_h1b_ats.py — H-1B sponsor ATS discovery.
 
 For each top H-1B sponsor this script:
@@ -63,9 +63,9 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Maintenance window
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_maintenance(r) -> bool:
     if r is None:
@@ -77,9 +77,9 @@ def _is_maintenance(r) -> bool:
         return False
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Config
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 _KG_ENDPOINT     = "https://kgsearch.googleapis.com/v1/entities:search"
 _KG_API_KEY      = os.environ.get("KG_API_KEY", "")
@@ -169,9 +169,9 @@ _DBA_PATTERN = re.compile(
 )
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # SSRF guard
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_public_url(url: str) -> bool:
     try:
@@ -196,9 +196,9 @@ def _is_public_url(url: str) -> bool:
         return False
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Name normalisation
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def strip_legal_suffixes(name: str) -> str:
     name = _DBA_PATTERN.sub("", name).strip()
@@ -237,9 +237,9 @@ def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain
     return host == assigned_domain or host.endswith("." + assigned_domain)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # SPARQL rate limiter (shared, thread-safe sliding window)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 class _RateLimiter:
     def __init__(self, rpm: int) -> None:
@@ -263,9 +263,9 @@ class _RateLimiter:
 _sparql_limiter = _RateLimiter(rpm=30)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Google Knowledge Graph API
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 _KG_FETCH_LIMIT      = 3   # candidates fetched per query
 _KG_MIN_OVERLAP      = 30  # minimum score to accept at retry exhaustion
@@ -289,19 +289,19 @@ def _entity_lead_in_query(legal_name: str, entity_name: str | None) -> bool:
     No stripping — both names are tokenized raw and noise words (inc, llc,
     corporation, etc.) are removed via _KG_SIG_STOP.  Descriptive words like
     'Technologies', 'Enterprises', 'Solutions' are preserved so that
-    'Fourth Technologies' â‰  'Fourth Enterprises'.
+    'Fourth Technologies' ≠ 'Fourth Enterprises'.
 
-    Match per token: prefix match OR fuzz.ratio â‰¥ 65.
+    Match per token: prefix match OR fuzz.ratio ≥ 65.
 
     Rejects:
-      'SQUAD SOFTWARE'    → 'San Diego Padres'       (san  âˆ‰ squad/software)
-      'Cruise LLC'        → 'Carnival Cruise Line'   (carnival âˆ‰ cruise)
-      'FOURTH ENTERPRISES'→ 'Fourth Technologies'    (technologies âˆ‰ fourth/enterprises)
+      'SQUAD SOFTWARE'    → 'San Diego Padres'       (san  ∉ squad/software)
+      'Cruise LLC'        → 'Carnival Cruise Line'   (carnival ∉ cruise)
+      'FOURTH ENTERPRISES'→ 'Fourth Technologies'    (technologies ∉ fourth/enterprises)
 
     Accepts:
       'WAL-MART ASSOCIATES' → 'Walmart'   (walmart.startswith('wal'))
       'HCL AMERICA'         → 'HCLTech'  (hcltech.startswith('hcl'))
-      'ORACLE AMERICA'      → 'Oracle Corporation'  (oracle âœ“, corporation filtered)
+      'ORACLE AMERICA'      → 'Oracle Corporation'  (oracle ✓, corporation filtered)
     """
     def _sig(s: str) -> list[str]:
         return [t for t in re.findall(r'\w+', (s or "").lower())
@@ -384,15 +384,15 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
     Strategy:
     - Fetch _KG_FETCH_LIMIT candidates per query.  /g/ shells are always skipped.
     - Within each attempt, iterate candidates in KG relevance order.  Stop at the
-      first /m/ candidate that scores â‰¥ _KG_MIN_OVERLAP (30) — KG's ranking is more
+      first /m/ candidate that scores ≥ _KG_MIN_OVERLAP (30) — KG's ranking is more
       reliable than cross-candidate score comparison.  Candidates below 30 are checked
       in order until one passes or the list is exhausted.
-    - Score â‰¥ _KG_HIGH_CONFIDENCE (90) → return immediately, no need to retry.
-    - 30 â‰¤ score < 90 → update global best if higher, then always continue to a
+    - Score ≥ _KG_HIGH_CONFIDENCE (90) → return immediately, no need to retry.
+    - 30 ≤ score < 90 → update global best if higher, then always continue to a
       shorter query (drop last word).  This lets a shorter query surface the correct
       brand entity — e.g. "Oracle America Inc" → OFS(68) at attempt 0, bare "Oracle"
       → Oracle Corporation(100) at attempt 2.
-    - After _KG_MAX_RETRIES, return best_candidate if best_score â‰¥ _KG_MIN_OVERLAP,
+    - After _KG_MAX_RETRIES, return best_candidate if best_score ≥ _KG_MIN_OVERLAP,
       else None.
     """
     if not _KG_API_KEY:
@@ -594,9 +594,9 @@ def upsert_quality_event(
     )
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Wikidata SPARQL — P646 (Freebase MID) → QID + P10311 (jobs URL)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _sparql_batch_p10311(mids: list[str]) -> dict[str, dict]:
     """
@@ -677,18 +677,18 @@ def _sparql_batch_p10311_all(mids: list[str]) -> dict[str, dict]:
     for i in range(0, len(mids), _SPARQL_CHUNK_SIZE):
         chunk = mids[i: i + _SPARQL_CHUNK_SIZE]
         log.info(
-            "SPARQL P646+P10311+P856 batch %dâ€“%d of %d â€¦",
+            "SPARQL P646+P10311+P856 batch %d–%d of %d …",
             i + 1, min(i + _SPARQL_CHUNK_SIZE, len(mids)), len(mids),
         )
         out.update(_sparql_batch_p10311(chunk))
     return out
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Career URL disambiguation — Gemini (default) or local Qwen3-8B
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
-# â”€â”€ Local (Qwen3-8B via llama_cpp) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Local (Qwen3-8B via llama_cpp) ────────────────────────────────────────────
 
 _llm = None
 _STRIP_THINK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -703,7 +703,7 @@ def _load_llm() -> bool:
         return False
     try:
         from llama_cpp import Llama
-        log.info("Loading Qwen3-8B from %s â€¦", model_path)
+        log.info("Loading Qwen3-8B from %s …", model_path)
         _llm = Llama(model_path=model_path, n_ctx=512, n_threads=2, verbose=False)
         return True
     except Exception as e:
@@ -739,7 +739,7 @@ def _qwen_pick_career_url(
     return None
 
 
-# â”€â”€ Gemini backend â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Gemini backend ─────────────────────────────────────────────────────────────
 
 _gemini_client = None
 
@@ -810,7 +810,7 @@ def _gemini_pick_career_url(
     return None
 
 
-# â”€â”€ Public interface â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Public interface ───────────────────────────────────────────────────────────
 
 def _pick_career_url(
     candidates: list[str],
@@ -825,9 +825,9 @@ def _pick_career_url(
     return _qwen_pick_career_url(candidates, company_name, website_url)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Brave search helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _company_tokens(name: str) -> set[str]:
     """Extract lowercase searchable tokens from company name for domain matching."""
@@ -966,9 +966,9 @@ def brave_career_search(
         return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Career page detection
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_html(url: str) -> tuple[str | None, str]:
     """
@@ -1212,9 +1212,9 @@ def discover_careers_url(
     return _fallback or (None, None, None)
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # DB helpers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_top_sponsors(limit: int, conn) -> list[dict]:
     cur = conn.cursor()
@@ -1448,9 +1448,9 @@ def _upsert_company_ats(
     conn.commit()
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Core processing
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_recently_checked(
     fein: str, conn, force: bool, existing: dict | None = None,
@@ -1488,7 +1488,7 @@ def process_employer(
     fein = emp["employer_fein"]
     name = emp["employer_name"]
 
-    log.info("â”€â”€ %s  %s", fein, name)
+    log.info("── %s  %s", fein, name)
 
     existing = _is_recently_checked(fein, conn, force)
     if existing:
@@ -1525,7 +1525,7 @@ def process_employer(
             canonical_name   = existing_row.get("canonical_name")
             canonical_source = existing_row.get("canonical_source")
         else:
-            log.info("  KG API â€¦")
+            log.info("  KG API …")
             kg, all_candidates = kg_search(name)
             if kg:
                 kg_mid           = kg.get("kg_mid")
@@ -1542,7 +1542,7 @@ def process_employer(
                 upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, dry_run)
 
         if kg_mid:
-            log.info("  SPARQL P646+P10311+P856 for MID %s â€¦", kg_mid)
+            log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
             sparql_res    = _sparql_batch_p10311([kg_mid])
             entry         = sparql_res.get(kg_mid, {})
             sparql_p856   = entry.get("website") or None
@@ -1609,7 +1609,7 @@ def process_employer(
     elif website_url:
         # Phase 3: 19-pattern probe
         website_url = _resolve_website_redirect(website_url)
-        log.info("  Probing 19 career URL patterns on %s â€¦", website_url)
+        log.info("  Probing 19 career URL patterns on %s …", website_url)
         try:
             careers_url, detected_platform, detected_slug = discover_careers_url(
                 website_url
@@ -1624,7 +1624,7 @@ def process_employer(
         # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
         if not careers_url and not skip_brave:
             search_name = canonical_name or strip_legal_suffixes(name) or name
-            log.info("  Brave search fallback for %r â€¦", search_name)
+            log.info("  Brave search fallback for %r …", search_name)
             brave_url = brave_career_search(search_name, website_url=website_url)
             if brave_url:
                 careers_url    = brave_url
@@ -1645,7 +1645,7 @@ def process_employer(
     if not detected_platform and website_url:
         _cp_domain = _root_domain(website_url)
         _cp_name   = canonical_name or name
-        log.info("  Phase 6: career_page scan on domain=%s â€¦", _cp_domain)
+        log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
         try:
             from jobs.career_page import detect_via_career_page
             _phase6_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
@@ -1666,7 +1666,7 @@ def process_employer(
     # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
     if not detected_platform and website_url:
         _cd_domain = _root_domain(website_url)
-        log.info("  Phase 7: career_detector BFS on domain=%s â€¦", _cd_domain)
+        log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
             _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
@@ -1768,9 +1768,9 @@ def process_employer(
     return result
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Brave pass — separate monthly sweep for companies with website but no careers
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _load_brave_candidates(limit: int, conn) -> list[dict]:
     """Companies enriched by KG+probe but still missing a careers URL."""
@@ -1911,9 +1911,9 @@ def _run_brave_pass(conn, r, args) -> None:
     log.info("Brave pass done. %d candidates processed.", len(candidates))
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _tally(stats: dict, result: dict, force: bool) -> None:
     if result.get("last_checked") and not force:
@@ -1970,7 +1970,7 @@ def main():
                 sys.exit(1)
             employers = [row]
         else:
-            log.info("Loading top %d H-1B sponsors â€¦", args.top)
+            log.info("Loading top %d H-1B sponsors …", args.top)
             employers = load_top_sponsors(args.top, conn)
             log.info("Loaded %d employers", len(employers))
 
@@ -1994,8 +1994,8 @@ def main():
                 )
                 _tally(stats, result, args.force)
         else:
-            # â”€â”€ Phase 1: KG API for all employers → collect kg_mids â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            log.info("Phase 1: KG API for %d employers â€¦", len(employers))
+            # ── Phase 1: KG API for all employers → collect kg_mids ──────────────
+            log.info("Phase 1: KG API for %d employers …", len(employers))
             kg_map: dict[str, dict] = {}   # fein → {kg_mid, canonical_name, website_url, ...}
             all_mids: list[str]     = []
             seen_mids: set[str]     = set()
@@ -2058,8 +2058,8 @@ def main():
                     seen_mids.add(mid)
                     all_mids.append(mid)
 
-            # â”€â”€ Phase 2: SPARQL P646+P10311 batch for all MIDs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            log.info("Phase 2: SPARQL P10311 batch for %d MIDs â€¦", len(all_mids))
+            # ── Phase 2: SPARQL P646+P10311 batch for all MIDs ───────────────────
+            log.info("Phase 2: SPARQL P10311 batch for %d MIDs …", len(all_mids))
             sparql_map = _sparql_batch_p10311_all(all_mids)   # {mid: {qid, jobs_url}}
 
             _fein_to_emp = {e["employer_fein"]: e for e in employers}
@@ -2111,8 +2111,8 @@ def main():
                 else:
                     entry["website_url"] = None
 
-            # â”€â”€ Phase 3: career probe + upsert â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            log.info("Phase 3: career probe for %d employers â€¦", len(employers))
+            # ── Phase 3: career probe + upsert ───────────────────────────────────
+            log.info("Phase 3: career probe for %d employers …", len(employers))
             for i, emp in enumerate(employers, 1):
                 if r and not args.dry_run:
                     r.expire(REDIS_GEMINI_LOCK, 3600)

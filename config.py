@@ -1,4 +1,4 @@
-﻿import os
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,23 +18,23 @@ GRACE_PERIOD_HOURS   = 1     # hard cutoff at 12:00 PM
 SEND_TIMEZONE        = "America/New_York"
 SEND_INTERVAL_DAYS   = 7
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # CAREERSHIFT QUOTA SETTINGS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 MAX_CONTACTS_HARD_CAP = 3    # maximum recruiters to find per company
 MAX_RECRUITERS_PER_APPLICATION = 3  # max recruiters linked per application
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # QUOTA HEALTH MONITOR SETTINGS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 QUOTA_UNDERUTILIZED_THRESHOLD = 0.40   # alert if using < 40% of daily limit
 QUOTA_EXHAUSTED_THRESHOLD     = 0      # alert if remaining = 0
 QUOTA_ALERT_CONSECUTIVE_DAYS  = 3      # consecutive days to trigger alert
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # LOG FILE RETENTION (days)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Daily command logs (monitor, outreach, sync, verify_filled â€¦)
+# ─────────────────────────────────────────
+# Daily command logs (monitor, outreach, sync, verify_filled …)
 LOG_RETENTION_DAILY_DAYS   = 14
 
 # Monthly command logs (monthly, enrich, build_ats_slug_list)
@@ -47,9 +47,9 @@ LOG_RETENTION_MONTHLY_DAYS = 35
 # comparisons need a few weeks of history across sporadic runs.
 LOG_RETENTION_WORKER_DAYS  = 30
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 RETENTION_OUTREACH_SENT        = 30
 RETENTION_OUTREACH_PENDING     = 30
 RETENTION_OUTREACH_FAILED      = 30
@@ -69,7 +69,7 @@ RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
 RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
 VERIFY_TASK_QUEUE_CAP          = 200    # max concurrent+queued background verify/enrich tasks
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
 # These will never appear on Workday/Oracle/Greenhouse/Lever/Ashby
 KNOWN_CUSTOM_ATS = {
@@ -96,12 +96,12 @@ DETECT_ATS_BATCH_SIZE = 10    # companies per --detect-ats --batch run
 GOOGLE_CX             = os.getenv("GOOGLE_CX", "")
 
 # GOOGLE SHEETS INTEGRATION
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # RECRUITER VALIDATION SETTINGS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 CAREERSHIFT_SAMPLE_SIZE       = 10   # cards per batch
 CAREERSHIFT_HIGH_CONFIDENCE   = 90   # skip remaining HR terms
 CAREERSHIFT_MEDIUM_CONFIDENCE = 70   # continue to next HR term
@@ -112,9 +112,9 @@ MIN_RECRUITERS_PER_COMPANY    = 1    # minimum active recruiters to start outrea
 GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # PARALLEL JOB MONITORING (Phase 1)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
  
 # Number of companies processed in parallel (thread pool size).
 # Real throttling is done by MONITOR_PLATFORM_CONCURRENCY semaphores below —
@@ -152,18 +152,18 @@ MONITOR_PLATFORM_CONCURRENCY = {
 MONITOR_PLATFORM_CONCURRENCY_DEFAULT = 5
  
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # PIPELINE PERFORMANCE THRESHOLDS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 METRIC1_ALERT_THRESHOLD       = 50   # find-only performance % (Red)
 METRIC2_ALERT_THRESHOLD       = 60   # outreach coverage % (Red)
 METRIC_ALERT_CONSECUTIVE_DAYS = 3    # days before alert fires
 API_FAILURE_RATE_THRESHOLD     = 0.10 # api_failures / requests_made
 API_FAILURE_CONSECUTIVE_DAYS   = 3
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # JOB MONITORING SETTINGS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 
 # Priority 1 — Job title keywords (broad match)
 TARGET_JOB_TITLES = [
@@ -226,19 +226,19 @@ ATS_SAMPLE_SIZE         = 20    # max jobs to sample when scoring response
 
 # Tie-break order by date field reliability (best → worst)
 ATS_DATE_RELIABILITY = [
-    "ashby",           # publishedAt  — exact original date âœ“âœ“âœ“
-    "lever",           # createdAt    — Unix ms, never changes âœ“âœ“âœ“
-    "oracle_hcm",      # PostedDate   — original date âœ“âœ“âœ“
-    "workday",         # postedOn     — original date âœ“âœ“
-    "smartrecruiters", # releasedDate — original date âœ“âœ“
-    "greenhouse",      # updated_at   — changes on edit âœ— (last resort)
+    "ashby",           # publishedAt  — exact original date ✓✓✓
+    "lever",           # createdAt    — Unix ms, never changes ✓✓✓
+    "oracle_hcm",      # PostedDate   — original date ✓✓✓
+    "workday",         # postedOn     — original date ✓✓
+    "smartrecruiters", # releasedDate — original date ✓✓
+    "greenhouse",      # updated_at   — changes on edit ✗ (last resort)
 ]
 
 # ATS platforms that require Google detection (can't be slug-guessed)
 ATS_GOOGLE_ONLY = ["oracle_hcm", "successfactors"]  # icims now supported
 
 # ATS detection status values
-ATS_STATUS_DETECTED       = "detected"     # found via Google, supported âœ“
+ATS_STATUS_DETECTED       = "detected"     # found via Google, supported ✓
 ATS_STATUS_UNSUPPORTED    = "unsupported"  # found via Google, not yet supported
 ATS_STATUS_CLOSE_CALL     = "close_call"   # API buffer close call (legacy)
 ATS_STATUS_UNKNOWN        = "unknown"      # not found anywhere
@@ -261,9 +261,9 @@ MONITOR_RELIABILITY_ALERT     = 0.90  # alert if < 90% runs succeed (7 days)
 MONITOR_MATCH_RATE_LOW_ALERT  = 0.05  # alert if < 5% fetched jobs match filters
 MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% fetched jobs match filters
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # RATE LIMITING & API HEALTH
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 
 # Alert thresholds
 RATE_LIMIT_CRITICAL_THRESHOLD = 10   # % 429s in one run → immediate email
@@ -303,9 +303,9 @@ ENRICH_WINDOW_HOURS = 18   # spread requests over this many hours
 # Alert deduplication window
 ALERT_DEDUP_HOURS = 24     # don't re-send same alert within N hours
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # LLM INFERENCE SERVER (llama-server)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 LLM_BASE_URL          = os.getenv("LLM_BASE_URL", "")           # e.g. http://127.0.0.1:8080/v1
 LLM_MODEL             = os.getenv("LLM_MODEL", "qwen3")         # model name passed to API
 LLM_SERVER_BIN        = os.getenv("LLM_SERVER_BIN", "")         # path to llama-server binary
@@ -317,9 +317,9 @@ LLM_HEALTH_URL        = os.getenv("LLM_HEALTH_URL", "http://127.0.0.1:8080/healt
 LLM_SLOTS_URL         = os.getenv("LLM_SLOTS_URL",  LLM_HEALTH_URL.replace("/health", "/slots"))
 LLM_REQUEST_TIMEOUT   = int(os.getenv("LLM_REQUEST_TIMEOUT", "60"))   # HTTP timeout for inference calls
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # H1B DISAMBIGUATION STREAM
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 H1B_DISAMBIG_STREAM        = os.getenv("H1B_DISAMBIG_STREAM", "llm:h1b:disambiguate")
 H1B_DISAMBIG_GROUP         = os.getenv("H1B_DISAMBIG_GROUP", "h1b-llm-workers")
 H1B_DISAMBIG_CONSUMER      = os.getenv("H1B_DISAMBIG_CONSUMER", "h1b-llm-worker-1")
@@ -348,9 +348,9 @@ CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler s
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # head_check worker — both lanes are LISTs (FIFO, no score needed)
 HEAD_CHECK_ON_DEMAND   = "head_check:on_demand"   # LIST — api.py (careers_url known)
 HEAD_CHECK_BATCH       = "head_check:batch"        # LIST — staleness_checker, job_monitor
@@ -396,20 +396,20 @@ CAREER_DETECTOR_MAX_API_PROBES = int(os.getenv("CAREER_DETECTOR_MAX_API_PROBES",
 CAREER_DETECTOR_LISTING_PAGES  = int(os.getenv("CAREER_DETECTOR_LISTING_PAGES",     "2"))
 CAREER_DETECTOR_DETAIL_SAMPLE  = int(os.getenv("CAREER_DETECTOR_DETAIL_SAMPLE",     "3"))
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────
 REDIS_URL         = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 WORKER_BLOCK_SECS = 5      # BLPOP timeout — keeps workers responsive to Ctrl+C
 
-# â”€â”€ Redis key names (Section 15) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Redis key names (Section 15) ──────────────────────────────────────────────
 REDIS_POLL_ADAPTIVE    = "poll:adaptive"          # ZSET — next adaptive poll time per company
 REDIS_POLL_FULLSCAN    = "poll:fullscan"           # ZSET — next full scan time per company
 REDIS_DETAIL_ADAPTIVE  = "queue:detail:adaptive"  # LIST — high priority detail fetches
 REDIS_DETAIL_FULLSCAN  = "queue:detail:fullscan"  # LIST — low priority detail fetches
-REDIS_DETAIL_DLQ       = "queue:detail:dlq"       # LIST — dead-letter queue for dropped payloads (â‰¤200)
+REDIS_DETAIL_DLQ       = "queue:detail:dlq"       # LIST — dead-letter queue for dropped payloads (≤200)
 REDIS_EMAIL_PUSH       = "queue:email:push"        # LIST — incoming Pub/Sub email notifications
-REDIS_EMAIL_DLQ        = "queue:email:dlq"         # LIST — dead-letter queue for failed email jobs (â‰¤200)
+REDIS_EMAIL_DLQ        = "queue:email:dlq"         # LIST — dead-letter queue for failed email jobs (≤200)
 REDIS_CYCLE_START      = "cycle:start"             # STRING — Unix ts of today's cycle start
 REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintenance pause
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume
@@ -433,7 +433,7 @@ WORKER_CURRENT_JOB_FULLSCAN_TTL    = 3600                          # 1 h backsto
 SCAN_QUEUE        = "scan:queue"
 RESULT_CHANNEL    = "scan:results"
 
-# â”€â”€ Adaptive interval engine (Section 6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Adaptive interval engine (Section 6) ──────────────────────────────────────
 # Recency-biased weights for the 5-poll rolling window (oldest → newest)
 ADAPTIVE_WEIGHTS       = [0.10, 0.15, 0.20, 0.25, 0.30]
 ADAPTIVE_MIN_POLLS     = 3      # minimum polls before score is trusted
@@ -459,7 +459,7 @@ ADAPTIVE_DEFAULT_INTERVAL = 12 * 3600  # 12h — before 3 polls of history
 ADAPTIVE_MAX_INTERVAL_ACTIVE   = 6 * 3600   # moderate+ companies → 6h cap
 ADAPTIVE_MAX_INTERVAL_DORMANT  = 12 * 3600  # dormant/low companies → 12h cap
 
-# â”€â”€ Rank-based band calibration (Section 6 — dynamic thresholds) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Rank-based band calibration (Section 6 — dynamic thresholds) ─────────────
 # Instead of comparing a company's score against hardcoded absolute values,
 # we rank active companies against each other.  Daily,
 # recalibrate_band_thresholds() queries all active scores, Winsorizes the top
@@ -487,7 +487,7 @@ ADAPTIVE_CALIBRATION_LOOKBACK_DAYS = 30   # ignore scores older than N days
 # Redis key where live band thresholds are stored (hash: low/moderate/active)
 REDIS_BAND_THRESHOLDS = "adaptive:band_thresholds"
 
-# â”€â”€ Scheduler (Section 5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Scheduler (Section 5) ─────────────────────────────────────────────────────
 # Estimated average scan time per company (seconds).
 # Used by rebuild_poll_queues() to compute a dynamic startup/recovery spread
 # window that matches actual worker throughput:
@@ -505,20 +505,20 @@ SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
 SCHEDULER_FULL_SCAN_LOCK_TTL   = 3600       # full scan exclusive lock TTL
 SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 
-# â”€â”€ Detail queue backpressure (Section 15) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Detail queue backpressure (Section 15) ────────────────────────────────────
 DETAIL_QUEUE_MAX_ADAPTIVE      = 5000       # pause listing scan if adaptive queue > this
 DETAIL_QUEUE_MAX_FULLSCAN      = 2000       # pause full scan if fullscan queue > this
 
-# â”€â”€ Smart early exit (Section 11) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Smart early exit (Section 11) ─────────────────────────────────────────────
 PAGINATOR_OVERLAP_THRESHOLD    = 0.80       # 80% of page already seen → overlap
 PAGINATOR_CONFIRM_PAGES        = 2          # consecutive overlap pages to stop
 PAGINATOR_UNSORTED_CUTOFF_DAYS = 3          # time-based cutoff for non-sorted ATS
 
-# â”€â”€ Dynamic concurrency (Section 19) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Dynamic concurrency (Section 19) ──────────────────────────────────────────
 CONCURRENCY_ERROR_RATE_REDUCE   = 0.10      # > 10% errors → reduce concurrency
 CONCURRENCY_ERROR_RATE_INCREASE = 0.02      # < 2% errors → increase concurrency
 CONCURRENCY_WINDOW_MINUTES      = 10        # sliding window bucket size (minutes)
-CONCURRENCY_WINDOW_TTL          = 1200      # errwin key TTL (2 Ã— 600s buckets)
+CONCURRENCY_WINDOW_TTL          = 1200      # errwin key TTL (2 × 600s buckets)
 CONCURRENCY_BACKOFF_BASE        = 0.5       # initial back-off before retry (seconds)
 CONCURRENCY_BACKOFF_MAX         = 5.0       # max back-off jitter ceiling (seconds)
 CONCURRENCY_MAX_RETRIES         = 4         # max semaphore-acquire retries before giving up
@@ -564,7 +564,7 @@ CONCURRENCY_CEIL = {
 }
 CONCURRENCY_CEIL_DEFAULT = 6
 
-# â”€â”€ Baseline error-rate cache (Section 20 — Fix 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Baseline error-rate cache (Section 20 — Fix 2) ────────────────────────────
 # 30-day historical error rate per platform cached in Redis for real-time use.
 REDIS_BASELINE_PREFIX             = "baseline:error_rate"  # key: {prefix}:{platform}
 BASELINE_CACHE_TTL                = 3600    # 1h — refresh from api_health on miss
@@ -573,9 +573,9 @@ CONCURRENCY_BASELINE_MIN_DAYS     = 7       # min days of api_health history bef
                                             # raw error_rate threshold applies
 CONCURRENCY_SPIKE_FACTOR_THRESHOLD = 5.0   # spike_factor > this → concurrency-induced
                                             # → aggressive reduction (drop limit by 2)
-                                            # â‰¤ this → normal variance → cautious (by 1)
+                                            # ≤ this → normal variance → cautious (by 1)
 
-# â”€â”€ Dynamic worker pools (Section 9) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Dynamic worker pools (Section 9) ──────────────────────────────────────────
 # Scheduler manages scan + detail worker processes via multiprocessing.Process.
 # Both pool sizes are calculated at 7 AM from historical api_health averages.
 # MONITOR_MAX_WORKERS is the cold-start fallback ceiling only (day 1, no history).
@@ -592,7 +592,7 @@ DETAIL_QUEUE_HIGH_WATERMARK       = 1000   # cascade trigger — detail queue ab
                                            # → stop adding scan workers, drain first
                                            # (hard emergency brake is DETAIL_QUEUE_MAX_ADAPTIVE=5000)
 
-# â”€â”€ Phase 11 — Monitoring and alerting thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Phase 11 — Monitoring and alerting thresholds ────────────────────────────
 
 # Error streak: fire a WARNING alert when a company's adaptive scan has failed
 # this many times in a row without a single success.  Individual company, not
@@ -620,13 +620,13 @@ REDIS_MEMORY_ALERT_PCT            = 80
 
 # DB connection pool size (must match maxconn in db/connection.py).
 # Used by scheduler.py to compute the combined worker ceiling:
-#   scan_ceil + detail_ceil â‰¤ DB_POOL_MAXCONN - 3 (3 reserved for scheduler)
+#   scan_ceil + detail_ceil ≤ DB_POOL_MAXCONN - 3 (3 reserved for scheduler)
 DB_POOL_MAXCONN                   = 25
 
-# â”€â”€ Phase 10 — Adaptive protection + resilience hardening (Section 18) â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Phase 10 — Adaptive protection + resilience hardening (Section 18) ────────
 #
 # Exponential backoff per-company per-operation (scan / detail / fullscan).
-# Formula: min(BASE * 2**retry_count, CAP).  After CAP is exceeded (retry â‰¥ 5)
+# Formula: min(BASE * 2**retry_count, CAP).  After CAP is exceeded (retry ≥ 5)
 # the company is pushed 24h forward — effectively skipped for the rest of today.
 # All backoff counters expire automatically at 86400s (next cycle, no reset needed).
 WORKER_BACKOFF_BASE_S              = 300     # 5 min  — delay after 1st failure
@@ -654,20 +654,20 @@ WORKER_SCALING_LOCK_TTL            = 1800    # 30 min = WORKER_SLOW_CHECK_INTERV
 # Score = dispatch timestamp.  Entries older than INFLIGHT_STALE_WINDOW_S are
 # removed before ZCARD to prevent drift from crashed workers.
 REDIS_INFLIGHT_PREFIX              = "inflight:scans"  # key: {prefix}:{dc_key}
-INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2Ã— max scan timeout
+INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2× max scan timeout
 
-# â”€â”€ Full scan (Section 9) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Full scan (Section 9) ─────────────────────────────────────────────────────
 FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
 FULLSCAN_BLOOM_ERROR_RATE      = 0.001      # 0.1% false positive rate
 
-# â”€â”€ Adaptive seen cache (Section 12 / 13) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Adaptive seen cache (Section 12 / 13) ────────────────────────────────────
 # Per-company Redis SET tracking all job IDs touched by adaptive scan today.
 # Prevents redundant DB lookups across multiple adaptive scans within a day.
 # Cleared explicitly at the start of each full scan; TTL is a safety net.
 REDIS_ADAPTIVE_SEEN_PREFIX     = "adaptive_seen"
 ADAPTIVE_SEEN_TTL              = 24 * 3600  # 24h fixed TTL
 
-# â”€â”€ Redis Streams — two-layer scheduler (Section 5 / 9 redesign) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Redis Streams — two-layer scheduler (Section 5 / 9 redesign) ──────────────
 # Architecture: ZSET (scheduling ledger, when is each company due?) +
 #               Stream (crash-safe delivery queue, PEL holds in-flight work).
 #
@@ -686,7 +686,7 @@ MAX_STREAM_REDELIVERIES = 5                     # XAUTOCLAIM: after this many
                                                 # redeliveries → dead-letter to ZSET
                                                 # with exponential backoff
 
-# â”€â”€ WARMING lifecycle — new company onboarding (Section 25) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
 # NEW companies do their first full scan, then WARMING: 3 adaptive polls at a
 # fixed 2h interval so the adaptive engine has enough data before going STABLE.
 # Tracked by company_poll_stats.warming_polls_remaining (NULL = STABLE).

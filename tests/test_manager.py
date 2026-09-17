@@ -1,4 +1,4 @@
-﻿"""
+"""
 tests/test_manager.py
 ─────────────────────────────────────────────────────────────────────────────
 Comprehensive test suite for workers/manager.py Layer 0 autoscaler.

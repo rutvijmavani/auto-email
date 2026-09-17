@@ -1,4 +1,4 @@
-﻿# db/schema.py — Database schema creation and cleanup (PostgreSQL)
+# db/schema.py — Database schema creation and cleanup (PostgreSQL)
 #
 # All DDL uses PostgreSQL syntax:
 #   BIGSERIAL PRIMARY KEY   instead of INTEGER PRIMARY KEY AUTOINCREMENT

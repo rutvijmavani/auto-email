@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/staleness_checker.py — Daily cron: push stale companies to enrichment/discovery/redetect queues.
 
 Pass 1a — Enrichment staleness (no careers URL):

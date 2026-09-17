@@ -1,7 +1,7 @@
-﻿"""
+"""
 workers/manager.py — Autoscaler (Layer 0 + Layer 2)
 
-Design doc: docs/scaling-redesign.md Â§4, Â§7, Â§16
+Design doc: docs/scaling-redesign.md §4, §7, §16
 
 Layer 0 (every 60s): delay + utilization formula → scale up/down/urgent per pool.
 Layer 1 (midnight):  midnight recompute of worker_ceil from 28-day daily_peak history.
@@ -9,9 +9,9 @@ Layer 2 (event):     Lever 1 backpressure + deadlock detection + worker borrowin
 
 Worker busy_ms signal:
   Each worker publishes worker:{type}:busy_ms:{pid} after every job.
-  Scale-up:   util > 0.80 AND delay > WARNÃ—0.5 (2 consecutive cycles).
-  Scale-down: util < 0.50 AND delay < WARNÃ—0.25 (5 consecutive cycles).
-  Urgent:     delay >= WARNÃ—0.75 regardless of utilization (1 cycle).
+  Scale-up:   util > 0.80 AND delay > WARN×0.5 (2 consecutive cycles).
+  Scale-down: util < 0.50 AND delay < WARN×0.25 (5 consecutive cycles).
+  Urgent:     delay >= WARN×0.75 regardless of utilization (1 cycle).
 
 Layer 2 signals:
   manager:lever1:{pool}:active  — set by manager when delay > DELAY_WARN_S;
@@ -31,7 +31,7 @@ import time
 from datetime import datetime, timezone
 
 _HOSTNAME = socket.gethostname()
-_MANAGER_HB_TTL = 180  # 3Ã— cycle length; stale after 3 missed cycles
+_MANAGER_HB_TTL = 180  # 3× cycle length; stale after 3 missed cycles
 
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -100,7 +100,7 @@ _urgent_active:     dict = {"scan": False, "detail": False, "fullscan": False}
 _ats_idle_cycles:   dict = {"domain_enrichment": 0, "discovery": 0, "head_check": 0}
 
 # ── Layer 2 constants ──────────────────────────────────────────────────────────
-RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN Ã— this = stable during recovery
+RECOVERY_STABILITY_RATIO = 0.25   # delay < WARN × this = stable during recovery
 DEADLOCK_HISTORY_CYCLES  = 4      # rolling window for 3-of-4 check
 DEADLOCK_RISING_MIN      = 3      # min cycles above WARN in window
 LEVER1_STABLE_REQUIRED   = 3      # consecutive stable cycles to lift Lever 1
@@ -184,7 +184,7 @@ def _compute_scaling_params() -> dict:
             if row and row["value"] is not None:
                 params["fullscan"]["fetch_p75"] = float(row["value"])
 
-            # scan DELAY_WARN_S: p10 of current_interval_s Ã— 0.10
+            # scan DELAY_WARN_S: p10 of current_interval_s × 0.10
             cur.execute("""
                 SELECT PERCENTILE_CONT(0.1) WITHIN GROUP (
                     ORDER BY current_interval_s
@@ -196,7 +196,7 @@ def _compute_scaling_params() -> dict:
             if row and row["value"] is not None:
                 params["scan"]["delay_warn_s"] = max(300, int(row["value"]))
 
-            # fullscan DELAY_WARN_S: avg(full_scan_interval_s) Ã— 0.10
+            # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
             cur.execute("""
                 SELECT AVG(full_scan_interval_s) * 0.10 AS value
                 FROM company_poll_stats
@@ -279,7 +279,7 @@ def _get_pool_busy_ms(r, pool: str) -> int:
     Each worker writes its accumulated busy ms in the current 60s window
     (detail_worker, scan_worker, fullscan each publish after every job,
     TTL = 120s so a worker mid-long-job still counts).  SCAN + GET is a
-    fast O(keys) operation — typically 2â€“10 keys per pool.
+    fast O(keys) operation — typically 2–10 keys per pool.
 
     Returns 0 if no keys found (workers not yet publishing or all idle).
     """
@@ -529,7 +529,7 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             else:
                 growth_buffer = 0
 
-            # volatility_buffer: std_dev of last 28 days Ã— 0.25
+            # volatility_buffer: std_dev of last 28 days × 0.25
             if len(peaks) >= 3:
                 std = statistics.stdev(peaks)
                 volatility_buffer = math.ceil(std * 0.25)
@@ -652,12 +652,12 @@ def _run_pool_cycle(
     Run one Layer 0 cycle for a single pool.  Returns a decision string.
 
     Decision modes:
-      urgent        — delay >= WARNÃ—0.75; spawn to workers_target in 1 cycle
+      urgent        — delay >= WARN×0.75; spawn to workers_target in 1 cycle
       urgent_release— workers confirmed online after urgent; lift throttle
       urgent_hold   — urgent active but still understaffed (at ceiling → Layer 2)
-      scale_up      — util > 0.80 AND delay > WARNÃ—0.5, 2 consecutive cycles
-      scale_down    — util < 0.50 AND delay < WARNÃ—0.25, 5 consecutive cycles
-      hold          — stable band (50â€“80% util, delay in bounds)
+      scale_up      — util > 0.80 AND delay > WARN×0.5, 2 consecutive cycles
+      scale_down    — util < 0.50 AND delay < WARN×0.25, 5 consecutive cycles
+      hold          — stable band (50–80% util, delay in bounds)
       *_pending     — streak accumulating, not fired yet
 
     Returns (decision, workers_target) so the caller can pass workers_target
@@ -825,7 +825,7 @@ def _fire_lever1(r, pool: str, depth: int, prev_depth: int) -> None:
 
     Also snapshots D (depth) and R (inflow rate) at the trigger moment.
     These must be captured BEFORE Lever 1 acts, because by cycle 3 the queue
-    is already draining and R â‰ˆ 0 — severely understating true demand.
+    is already draining and R ≈ 0 — severely understating true demand.
 
     Inflow guard: skip if the queue is already draining (depth falling and no
     new inflow). URGENT scale-up is already handling it; halting inflow when
@@ -979,7 +979,7 @@ def _return_all_borrows(r, pool: str) -> None:
 
 def _compute_true_required(r, pool: str, params: dict) -> int:
     """
-    true_required = ceil((D Ã— F / W) + (R Ã— F))
+    true_required = ceil((D × F / W) + (R × F))
 
     Uses the snapshot taken at Lever 1 trigger cycle 1 (before Lever 1 acts).
     D = queue_depth at snapshot, R = inflow_rate at snapshot.
@@ -1101,7 +1101,7 @@ def _check_layer2(
       2. Fire Lever 1 if delay crosses DELAY_WARN_S (first crossing only).
          Snapshots D and R before Lever 1 acts (learning loop input).
       3. Check Lever 1 lift: LEVER1_STABLE_REQUIRED consecutive cycles below
-         WARN Ã— RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
+         WARN × RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
          update today's daily_peak (learning loop).  Clear all borrow state.
       4. Deadlock detection: if Lever 1 active + pool at ceiling + delay
          rising for 3 of last 4 cycles → attempt worker borrowing.

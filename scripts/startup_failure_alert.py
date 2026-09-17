@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/startup_failure_alert.py — Startup failure alert for systemd OnFailure=.
 
 Called automatically by recruiter-pipeline-alert@<service>.service when a pipeline

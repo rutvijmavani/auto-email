@@ -1,4 +1,4 @@
-﻿"""
+"""
 workers/head_check_worker.py — HEAD check worker for H1B pipeline.
 
 Sits between producers (api.py, staleness_checker, job_monitor) and the

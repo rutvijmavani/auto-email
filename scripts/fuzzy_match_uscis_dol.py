@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/fuzzy_match_uscis_dol.py — Fuzzy matching for unresolved USCIS → DOL rows.
 
 For each row in uscis_dol_unmatched, this script:

@@ -1,4 +1,4 @@
-﻿# jobs/career_page.py — Phase 3a: Career page ATS scanner
+# jobs/career_page.py — Phase 3a: Career page ATS scanner
 #
 # Three-layer detection per URL:
 #   Layer 1 — HTTP redirect: company.com/careers → ats-domain.com/{slug}
@@ -110,9 +110,9 @@ _OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm"}
 _RICH_SLUG_PLATFORMS = {"phenom", "talentbrew", "avature"}
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def detect_via_career_page(company, domain, *, careers_url=None):
     """
@@ -139,7 +139,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     logger.debug("[P3a] Scanning: company=%r domain=%s careers_url=%s",
                  company, domain, careers_url)
 
-    # â”€â”€ Mode 1: careers_url already known — verify + scan, skip probing â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode 1: careers_url already known — verify + scan, skip probing ───────
     if careers_url:
         result, html, final_url = _fetch_and_scan(careers_url, company)
         if result and result.get("platform"):
@@ -172,7 +172,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
         # careers_url not accessible — fall through to full probing
         logger.debug("[P3a] careers_url not accessible, falling back to path probe")
 
-    # â”€â”€ Mode 2: probe standard career paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Mode 2: probe standard career paths ───────────────────────────────────
     # Use www.domain as probe base to avoid apex→www redirect overhead
     probe_base = domain if domain.startswith("www.") else f"www.{domain}"
 
@@ -216,7 +216,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                 first_career_html = html
                 first_career_url  = final_url
 
-    # â”€â”€ Apex fallback — retry with bare domain if www. probe produced nothing â”€â”€â”€
+    # ── Apex fallback — retry with bare domain if www. probe produced nothing ───
     # Some companies serve careers only from the apex (e.g. example.com/careers)
     # and have no www. DNS entry, causing all www.-prefixed probes to fail.
     if first_career_html is None and first_redirect_url is None and tentative_eightfold is None and not domain.startswith("www."):
@@ -248,7 +248,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                     first_career_html = html
                     first_career_url  = final_url
 
-    # â”€â”€ Layer 3: follow job listing links â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Layer 3: follow job listing links ─────────────────────────────────
     # Individual job pages almost always link to or embed the ATS directly
     # (e.g. Greenhouse apply iframe, Workday apply redirect).
     if first_career_html and first_career_url:
@@ -261,7 +261,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             result["careers_url"] = first_career_url
             return result
 
-    # â”€â”€ Eightfold fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Eightfold fallback ─────────────────────────────────────────────────
     # Nothing harder found — accept the tentative Eightfold result.
     if tentative_eightfold:
         logger.info("[P3a HIT Eightfold fallback] %r → %s / %s",
@@ -280,9 +280,9 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Eightfold domain enrichment
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Common career-page subdomain prefixes to strip when deriving company domain
 _CAREER_PREFIXES = (
@@ -358,9 +358,9 @@ def _enrich_eightfold_domain(result, page_url):
     return result
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # HTTP fetch + scan
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _fetch_and_scan(url, company):
     """
@@ -426,17 +426,17 @@ def _fetch_and_scan(url, company):
         return None, None, None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Layer 2: deep HTML scan
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _scan_html(html, company):
     """
     Deep HTML scan using BeautifulSoup.
 
     Extracts candidate URLs from:
-      â€¢ Every tag attribute that can hold a URL (src, href, action, data-*)
-      â€¢ Inline <script> content — only scripts that mention an ATS domain
+      • Every tag attribute that can hold a URL (src, href, action, data-*)
+      • Inline <script> content — only scripts that mention an ATS domain
         (fast-path skip avoids parsing every analytics/tracking script)
 
     Runs each candidate through match_ats_pattern() → validate slug.
@@ -445,7 +445,7 @@ def _scan_html(html, company):
 
     candidates = set()
 
-    # â”€â”€ Attribute URLs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Attribute URLs ─────────────────────────────────────────────────────
     URL_ATTRS = ("src", "href", "action", "data-src", "data-href",
                  "data-url", "data-apply-url", "data-job-url")
     for tag in soup.find_all(True):
@@ -454,7 +454,7 @@ def _scan_html(html, company):
             if isinstance(val, str) and val.startswith("http"):
                 candidates.add(val.rstrip('.,;)"\'><'))
 
-    # â”€â”€ Inline script content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Inline script content ──────────────────────────────────────────────
     for script in soup.find_all("script"):
         content = script.string or ""
         if not content:
@@ -466,13 +466,13 @@ def _scan_html(html, company):
         for raw_url in re.findall(r'https?://[^\s"\'\\<>]+', content):
             candidates.add(raw_url.rstrip('.,;)"\'><'))
 
-    # â”€â”€ Pattern match â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Pattern match ──────────────────────────────────────────────────────
     for url in candidates:
         r = match_ats_pattern(url)
         if r and _slug_ok(r, company):
             return r
 
-    # â”€â”€ Eightfold footer fingerprint fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Eightfold footer fingerprint fallback ─────────────────────────────
     # Every Eightfold career page embeds a "Powered by eightfold.ai" footer
     # containing href="https://eightfold.ai" and an img from static.vscdn.net.
     # These signals confirm Eightfold is in use but don't carry the slug.
@@ -494,7 +494,7 @@ def _scan_html(html, company):
             if r and _slug_ok(r, company):
                 return r
 
-    # â”€â”€ SuccessFactors j2w.init() fingerprint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── SuccessFactors j2w.init() fingerprint ─────────────────────────────
     # Companies hosting careers on their own domain (e.g. careers.aflac.com)
     # embed a j2w.init({...}) block with ssoCompanyId (slug) and ssoUrl
     # (datacenter URL).  This fires when no SF-hosted URL appears in the page.
@@ -525,20 +525,20 @@ def _scan_html(html, company):
     return None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Layer 3: job link following
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _follow_job_links(html, base_url, company, domain):
     """
     Extract individual job listing links from the career page and scan each.
 
     Why this works:
-      â€¢ stripe.com/jobs  → lists jobs, no ATS embed
-      â€¢ stripe.com/jobs/listing/{title}/{id}/apply
+      • stripe.com/jobs  → lists jobs, no ATS embed
+      • stripe.com/jobs/listing/{title}/{id}/apply
           → <iframe src="https://job-boards.greenhouse.io/embed/job_app?for=stripe">
-      â€¢ jobs.netflix.com → lists jobs
-      â€¢ jobs.netflix.com/jobs/{id}  → Apply button links to
+      • jobs.netflix.com → lists jobs
+      • jobs.netflix.com/jobs/{id}  → Apply button links to
           netflix.wd1.myworkdayjobs.com/Netflix_External_Site/...
 
     Individual job pages almost always contain a direct ATS signal.
@@ -562,7 +562,7 @@ def _extract_job_links(html, base_url, domain):
 
     Heuristic: path must contain a job-related segment AND not be one of
     the top-level career paths we already tried.  A numeric or slug-like
-    final segment (len â‰¥ 4) confirms it's a detail page, not a root listing.
+    final segment (len ≥ 4) confirms it's a detail page, not a root listing.
 
     Returns deduplicated list, most-specific paths first.
     """
@@ -618,9 +618,9 @@ def _extract_job_links(html, base_url, domain):
     return links
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 # Slug validation helper
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _slug_ok(result, company):
     """

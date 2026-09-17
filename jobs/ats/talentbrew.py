@@ -9,7 +9,7 @@
 #
 # Sitemap:
 #   jobs.intuit.com/sitemap.xml → 1803 URLs including 709 job URLs
-#   IMPORTANT: sitemap has BOM (ï»¿) prefix — must use html.parser not xml parser
+#   IMPORTANT: sitemap has BOM (﻿) prefix — must use html.parser not xml parser
 #
 # Option C freshness strategy:
 #   1. Fetch sitemap.xml → extract all /job/{city}/{slug}/{tenant}/{id} URLs

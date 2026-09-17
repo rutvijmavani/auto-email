@@ -1,4 +1,4 @@
-﻿"""
+"""
 jobs/public_domain.py — Public domain resolution for H1B pipeline enrichment.
 
 Resolves internal/email domains (e.g. fmr.com, jpmchase.com) to the company's
@@ -150,7 +150,7 @@ def _root(u: str) -> str:
 _REDIRECT_MAX_HOPS   = 8
 _REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
 # Total wall-clock budget per _redirect_domain call across all schemes/hops.
-# Worst case without a budget: _REDIRECT_MAX_HOPS Ã— _REDIRECT_TIMEOUT Ã— 2 schemes = 128 s.
+# Worst case without a budget: _REDIRECT_MAX_HOPS × _REDIRECT_TIMEOUT × 2 schemes = 128 s.
 _REDIRECT_BUDGET_S   = 20
 
 

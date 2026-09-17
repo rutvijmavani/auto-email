@@ -1,4 +1,4 @@
-﻿"""
+"""
 jobs/http_safe.py — SSRF-safe HTTP session for pipeline outbound requests.
 
 Provides make_safe_session() which returns a requests.Session with SSRFAdapter
@@ -112,7 +112,7 @@ class SSRFAdapter(HTTPAdapter):
             ip_host = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
             netloc  = f"{ip_host}:{explicit_port}" if explicit_port else ip_host
             request.url = urlunparse(parsed._replace(netloc=netloc))
-            # Include port in Host header only when non-default (RFC 7230 Â§5.4).
+            # Include port in Host header only when non-default (RFC 7230 §5.4).
             _default_port = 80
             host_header = f"{host}:{explicit_port}" if explicit_port and explicit_port != _default_port else host
             request.headers["Host"] = host_header

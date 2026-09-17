@@ -1,4 +1,4 @@
-﻿# db/prospective.py — Prospective company DB operations
+# db/prospective.py — Prospective company DB operations
 
 import os
 from datetime import datetime, timezone

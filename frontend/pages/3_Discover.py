@@ -1,4 +1,4 @@
-﻿"""
+"""
 frontend/pages/3_Discover.py — DOL H-1B employer browser.
 
 Browse aggregated LCA disclosures to find companies worth adding to the pipeline.

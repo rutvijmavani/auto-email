@@ -1,4 +1,4 @@
-﻿# logger.py — Centralized logging for the recruiter pipeline
+# logger.py — Centralized logging for the recruiter pipeline
 #
 # Usage in any module:
 #   from logger import get_logger

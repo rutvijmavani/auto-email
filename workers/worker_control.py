@@ -1,4 +1,4 @@
-﻿"""
+"""
 workers/worker_control.py — Shared helper for starting and stopping systemd worker units.
 
 Used by:

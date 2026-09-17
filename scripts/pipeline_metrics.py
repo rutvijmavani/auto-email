@@ -1,4 +1,4 @@
-﻿"""
+"""
 scripts/pipeline_metrics.py — H1B enrichment pipeline performance report.
 
 Shows which phase found public_domain / careers_url / ATS for each company,
