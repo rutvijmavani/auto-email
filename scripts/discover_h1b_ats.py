@@ -1395,22 +1395,41 @@ def _upsert_company_ats(
         return
 
     # Only skip when the actively-monitored row already has this exact slug —
-    # nothing to do. A same-platform slug change (tenant move) must still fall
-    # through to the INSERT...ON CONFLICT below, which updates slug in place
-    # (respecting reviewed_at) without touching is_monitored — otherwise the
-    # new slug is silently discarded and the old row keeps watching the wrong
-    # tenant forever.
+    # nothing to do.
+    #
+    # A same-platform slug change (tenant move) cannot be handled by falling
+    # through to the INSERT...ON CONFLICT below: is_monitored is only ever set
+    # TRUE alongside reviewed_at (see frontend/pages/3_Discover.py's toggle),
+    # so every row reaching this point is reviewed, and the ON CONFLICT clause
+    # always preserves company_ats.slug for reviewed rows — the fall-through
+    # never actually updates it. Instead, explicitly correct the row here:
+    # write the new slug and drop it back into "pending review" (is_monitored
+    # FALSE, reviewed_at NULL) so the job monitor stops scraping the stale
+    # tenant immediately and a human re-confirms before it resumes.
     cur.execute("""
         SELECT slug FROM company_ats
         WHERE domain = %s AND platform = %s AND is_monitored = TRUE
         LIMIT 1
     """, (domain, platform))
     _existing_monitored = cur.fetchone()
-    if _existing_monitored and _existing_monitored["slug"] == slug:
-        log.debug(
-            "_upsert_company_ats: %s/%s already monitored in company_ats with same slug — skipping",
-            domain, platform,
+    if _existing_monitored:
+        if _existing_monitored["slug"] == slug:
+            log.debug(
+                "_upsert_company_ats: %s/%s already monitored in company_ats with same slug — skipping",
+                domain, platform,
+            )
+            return
+        cur.execute("""
+            UPDATE company_ats
+            SET slug = %s, is_monitored = FALSE, reviewed_at = NULL
+            WHERE domain = %s AND platform = %s AND is_monitored = TRUE
+        """, (slug, domain, platform))
+        log.info(
+            "_upsert_company_ats: %s/%s monitored slug changed %r -> %r — "
+            "unmonitored and returned to pending review",
+            domain, platform, _existing_monitored["slug"], slug,
         )
+        conn.commit()
         return
 
     # Remove stale rows for the same FEIN+platform whose domain no longer matches

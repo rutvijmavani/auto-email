@@ -33,7 +33,7 @@ AND is_monitored = TRUE
 AND platform NOT IN ('unknown', 'unsupported')   -- prospective_companies only
 ```
 
-`staleness_checker.py` gains a **3rd pass** (after enrichment staleness + discovery staleness) that queries both tables for silent rows and pushes them to `REDETECT_QUEUE`.
+`staleness_checker.py` gains a **3rd pass** (after enrichment staleness + discovery staleness) that queries both tables for silent rows and pushes them to `head_check:batch` with `trigger="redetect"` — see "Queue Routing (implemented)" below; there is no separate `REDETECT_QUEUE`.
 
 No career page liveness check — `consecutive_empty_days` alone is the trigger. The job monitor already knows no jobs are coming from that ATS/slug.
 
@@ -170,7 +170,7 @@ The watchdog monitors **persistent stream consumers** (scan_workers, detail_work
 
 ### Locked solution: manager autoscaling
 
-The manager (`workers/manager.py`) already reads `DOMAIN_ENRICHMENT_QUEUE` and `DISCOVERY_QUEUE` depths but marks them `# informational — not autoscaled`. This gap gets closed as part of this implementation.
+**Implemented:** the manager (`workers/manager.py`) reads combined depth per pool — `ENRICHMENT_ON_DEMAND` + `ENRICHMENT_BATCH` for enrichment, `DISCOVERY_REDETECT` + `DISCOVERY_BATCH` for discovery — and autoscales both via `_run_ats_pool_cycle`; this is no longer informational-only.
 
 **Behaviour per worker pool (enrichment + discovery + redetect):**
 

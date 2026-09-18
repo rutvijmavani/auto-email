@@ -105,9 +105,11 @@ STEP 3 — Phase 6: career_page (CF Worker quota)
     → writes: careers_url (if found or improved)
              ats_platform + ats_slug (if Phase 6 detects — bonus)
 
-STEP 4 — Push to discovery_queue
+STEP 4 — Push to discovery:redetect or discovery:batch (Section 5 queue keys)
     IF petition_count >= threshold:
-        ZADD discovery_queue petition_count {"fein": company_fein, "trigger": "fuzzy_match"|"staleness"|"on_demand"|...}
+        trigger == "redetect" → ZADD discovery:redetect petition_count {...}
+        else                  → ZADD discovery:batch    petition_count {...}
+        {"fein": company_fein, "trigger": "fuzzy_match"|"staleness"|"redetect"|...}
 ```
 
 ### Failure Handling
@@ -136,8 +138,8 @@ Full ATS detection (platform + slug) for top 2k companies by petition count.
 Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Trigger / Lifecycle
-- **Start**: queue-watcher detects `ZCARD discovery_queue > 0` → starts worker(s)
-- **Stop**: worker exits cleanly when queue drained
+- **Start**: manager.py autoscaler polls `discovery:redetect` + `discovery:batch` depth every cycle → starts worker(s) (see §12 Decision 3)
+- **Stop**: worker exits cleanly when queue drained; manager stops the pool after N idle cycles
 - **Not always-on**: same event-driven batch model as enrichment worker
 
 ### Fixed Worker Count
@@ -271,7 +273,7 @@ Event occurs (LCA upload / USCIS upload / staleness cron / re-detection trigger)
     ↓
 Queue populated
     ↓
-Queue-watcher detects ZCARD > 0
+manager.py autoscaler polls queue depth on its next cycle (see §12 Decision 3)
     ↓
 Starts N workers (systemd or direct invocation)
     ↓
@@ -457,7 +459,7 @@ One row appended per company per worker run. Allows trend analysis over time
 | `public_domain_method` / `public_domain` | `jobs/public_domain.py` |
 | `careers_source = 'phase3'` / `careers_url` | `scripts/discover_h1b_ats.py` → `discover_careers_url()` |
 | `careers_source = 'phase6'` / `careers_url` | `jobs/career_page.py` → `detect_via_career_page()` |
-| `careers_source = 'p10311'` | `scripts/discover_h1b_ats.py` → Wikidata P10311 |
+| `careers_source = 'phase1_kg'` | `scripts/discover_h1b_ats.py` → Wikidata P10311 |
 | `ats_source = 'phase3'` | `scripts/discover_h1b_ats.py` → `discover_careers_url()` ATS redirect |
 | `ats_source = 'phase6'` | `jobs/career_page.py` → `detect_via_career_page()` |
 | `ats_source = 'phase7'` | `jobs/ats/career_detector.py` → `detect_company()` |
@@ -477,7 +479,7 @@ One row appended per company per worker run. Allows trend analysis over time
   ──────────────────────────────────────────────────────────
   Public domain    18,421 processed  http_redirect 68%  root_fallback 18%
                                      certspotter 9%     no_signal 5%
-  Career URL       14,302 found      phase3 52%  phase6 41%  p10311 7%
+  Career URL       14,302 found      phase3 52%  phase6 41%  phase1_kg 7%
   ATS detected      9,841 found      phase3 28%  phase6 45%  phase7 27%
   No ATS found      4,461            (top companies without ATS logged separately)
 ```

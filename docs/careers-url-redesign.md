@@ -494,7 +494,7 @@ Update `install-systemd.sh`:
    - Consume from `discovery:redetect` + `discovery:batch` (no `discovery:on_demand` lane — on_demand stops at enrichment)
    - Remove Phase 3 re-probe, Phase 6 re-run
    - Implement new decision tree (§7 above)
-   - `write_careers()` with trigger-aware logic
+   - `_write_careers()` remains unconditional and accepts no `trigger` param, matching item 4 above — trigger-based routing decisions (which lane to push to next, whether this call happened at all) stay outside `_write_careers()`; do not add trigger-aware logic to the write function itself
    - No writes to `h1b_ats_discovery.careers_url`
 
 **7. `scripts/staleness_checker.py`**

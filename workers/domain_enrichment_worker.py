@@ -226,21 +226,24 @@ def _load_company(conn, fein: str) -> "dict | None":
 
 
 def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> None:
+    # Does NOT touch last_enriched_at — Phase 3/6 haven't run yet at this point,
+    # and if either later raises, the attempt is a failure that must not look
+    # like a completed enrichment cycle to staleness-based re-detection.
+    # last_enriched_at is advanced once, in _process_company, only after both
+    # phases have completed without raising.
     if public_domain is not None:
         conn.execute("""
             UPDATE fein_domain_map
             SET public_domain        = %s,
                 public_domain_method = %s,
-                last_enriched_at     = NOW(),
                 updated_at           = NOW()
             WHERE employer_fein = %s
         """, (public_domain, method, fein))
     else:
-        # Resolution failed — preserve any previously stored domain; only advance the staleness timestamp
+        # Resolution failed — preserve any previously stored domain.
         conn.execute("""
             UPDATE fein_domain_map
-            SET last_enriched_at = NOW(),
-                updated_at       = NOW()
+            SET updated_at = NOW()
             WHERE employer_fein = %s
         """, (fein,))
 
@@ -364,8 +367,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         probe_domain     = effective_public or assigned
         website_url      = f"https://{probe_domain}"
 
-        # _write_domain only persists public_domain/method when resolution succeeded;
-        # on failure it advances last_enriched_at only (preserves existing stored domain).
+        # _write_domain persists public_domain/method when resolution succeeded, or just
+        # touches updated_at on failure (preserves existing stored domain). It does not
+        # advance last_enriched_at — see its docstring comment.
         _write_domain(conn, fein, public_domain, method)
         conn.commit()
         log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
@@ -422,6 +426,13 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                                           p3_platform, p3_slug, db_petition_count))
             log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
 
+        # Phase 3 and Phase 6 both completed without raising — this is a genuinely
+        # completed enrichment cycle, so advance the staleness timestamp now (not
+        # earlier in _write_domain, which runs before either phase).
+        conn.execute(
+            "UPDATE fein_domain_map SET last_enriched_at = NOW() WHERE employer_fein = %s",
+            (fein,),
+        )
         conn.commit()
 
         # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────

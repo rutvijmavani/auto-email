@@ -22,7 +22,7 @@ from logger import get_logger, init_logging
 log = get_logger(__name__)
 
 _SEP  = "─" * 70
-_DSEP = "═" * 70
+_DSEP = "═" * 70
 
 
 def _pct(n, total):
