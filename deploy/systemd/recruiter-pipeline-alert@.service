@@ -31,8 +31,10 @@ Restart=no
 # ── Sandboxing ───────────────────────────────────────────────────────────────
 # startup_failure_alert.py only reads journal logs and sends email — no writes
 # outside the project directory are needed.
+# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely — the
+# service sees an empty /home except where ReadWritePaths re-opens it below.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=read-only
+ProtectHome=tmpfs
 ReadWritePaths=/home/opc/mail

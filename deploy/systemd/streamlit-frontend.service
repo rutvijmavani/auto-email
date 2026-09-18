@@ -26,7 +26,9 @@ LimitNOFILE=4096
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ProtectHome=read-only
+# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely — the
+# service sees an empty /home except where ReadWritePaths re-opens it below.
+ProtectHome=tmpfs
 ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal

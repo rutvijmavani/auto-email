@@ -66,10 +66,11 @@ MemoryMax=4G
 # ── Sandboxing ───────────────────────────────────────────────────────────────
 NoNewPrivileges=true
 PrivateTmp=true
-# full makes /usr, /boot, /etc read-only; ProtectHome restricts /home to
-# read-only except for the project directory explicitly re-opened below.
+# full makes /usr, /boot, /etc read-only; ProtectHome=tmpfs hides the rest of
+# /home/opc (e.g. ~/.ssh) entirely except for the project directory explicitly
+# re-opened below via ReadWritePaths.
 ProtectSystem=full
-ProtectHome=read-only
+ProtectHome=tmpfs
 ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────
