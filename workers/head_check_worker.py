@@ -317,9 +317,18 @@ def _write_careers(conn, fein: str, careers_url: str) -> None:
         UPDATE fein_domain_map
         SET careers_url    = %s,
             careers_source = 'head_check',
+            careers_url_verified_at = NOW(),
             updated_at     = NOW()
         WHERE employer_fein = %s
     """, (careers_url, fein))
+
+
+def _mark_verified(conn, fein: str) -> None:
+    conn.execute("""
+        UPDATE fein_domain_map
+        SET careers_url_verified_at = NOW()
+        WHERE employer_fein = %s
+    """, (fein,))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -412,7 +421,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
                 _push_discovery(r, fein, petition_count, trigger, source)
 
         elif case_label == "ok":
-            # Case 5 — URL still healthy; no DB write needed
+            # Case 5 — URL still healthy; record verification timestamp
+            _mark_verified(conn, fein)
+            conn.commit()
             if trigger == "on_demand":
                 log.info("head_check: fein=%s Case 5 on_demand → STOP", fein)
             else:

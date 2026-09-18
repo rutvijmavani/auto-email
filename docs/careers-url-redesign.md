@@ -466,7 +466,7 @@ Update `install-systemd.sh`:
    - Add migration in `_run_migrations()`
 
 **2. `config.py`**
-   - Add queue name constants: `HEAD_CHECK_ON_DEMAND`, `HEAD_CHECK_BATCH`, `ENRICHMENT_ON_DEMAND`, `ENRICHMENT_BATCH`, `DISCOVERY_ON_DEMAND`, `DISCOVERY_BATCH`
+   - Add queue name constants: `HEAD_CHECK_ON_DEMAND`, `HEAD_CHECK_BATCH`, `ENRICHMENT_ON_DEMAND`, `ENRICHMENT_BATCH`, `DISCOVERY_REDETECT`, `DISCOVERY_BATCH` (no `discovery:on_demand` lane — `trigger="redetect"` routes to `DISCOVERY_REDETECT`, everything else routes to `DISCOVERY_BATCH`)
    - Remove `REDETECT_QUEUE` constant
    - Add `HEAD_CHECK_CACHE_TTL`, `HEAD_CHECK_TIMEOUT_S`, `HEAD_CHECK_MAX_REDIRECTS`
 
@@ -489,7 +489,7 @@ Update `install-systemd.sh`:
    - Phase 7 writes careers_url to `fein_domain_map` if currently NULL
 
 **6. `workers/discover_h1b_ats_worker.py`**
-   - Consume from `discovery:on_demand` + `discovery:batch` (new lanes)
+   - Consume from `discovery:redetect` + `discovery:batch` (no `discovery:on_demand` lane — on_demand stops at enrichment)
    - Remove Phase 3 re-probe, Phase 6 re-run
    - Implement new decision tree (§7 above)
    - `write_careers()` with trigger-aware logic
@@ -559,7 +559,7 @@ ON regexp_replace(regexp_replace(LOWER(f.assigned_domain), '^https?://', ''), '^
 
 ## 11. What NOT to Do
 
-- **Do NOT use `REDETECT_QUEUE`.** It is eliminated. Use `discovery:on_demand` or `discovery:batch` with `trigger="redetect"`.
+- **Do NOT use `REDETECT_QUEUE`.** It is eliminated. Use `discovery:redetect` (or `discovery:batch` if not a redetect trigger).
 - **Do NOT use a single ZSET with a magic ceiling score for on_demand priority.** Use the two-lane design (LIST for on_demand, ZSET for batch).
 - **Do NOT push to `head_check:*` when careers_url is NULL and last_enriched_at is NULL.** Nothing to HEAD check — push directly to `enrichment:on_demand`.
 - **Do NOT do the HEAD check inline in api.py** (daemon thread, no retry, no observability). Push to `head_check:on_demand` instead.

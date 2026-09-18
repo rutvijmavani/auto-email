@@ -387,6 +387,8 @@ DISCOVERY_HEARTBEAT_S           = int(os.getenv("DISCOVERY_HEARTBEAT_S",        
 ENRICH_STALENESS_DAYS             = int(os.getenv("ENRICH_STALENESS_DAYS",             "90"))   # re-enrich after N days
 STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))    # min petition_count for discovery re-run
 STALENESS_ZADD_BATCH              = int(os.getenv("STALENESS_ZADD_BATCH",              "500"))  # Redis pipeline batch size for staleness queue pushes
+if STALENESS_ZADD_BATCH <= 0:
+    raise ValueError(f"STALENESS_ZADD_BATCH must be > 0, got {STALENESS_ZADD_BATCH}")
 
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))

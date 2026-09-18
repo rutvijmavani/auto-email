@@ -1747,6 +1747,11 @@ def process_employer(
             ON CONFLICT (employer_fein) DO UPDATE
                 SET careers_url    = EXCLUDED.careers_url,
                     careers_source = EXCLUDED.careers_source,
+                    careers_url_verified_at = CASE
+                        WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
+                        THEN NULL
+                        ELSE fein_domain_map.careers_url_verified_at
+                    END,
                     updated_at     = NOW()
         """, (fein, careers_url, careers_source))
         conn.commit()
@@ -1831,6 +1836,11 @@ def _brave_upsert(fein: str, careers_url: "str | None",
             ON CONFLICT (employer_fein) DO UPDATE
                 SET careers_url    = EXCLUDED.careers_url,
                     careers_source = EXCLUDED.careers_source,
+                    careers_url_verified_at = CASE
+                        WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
+                        THEN NULL
+                        ELSE fein_domain_map.careers_url_verified_at
+                    END,
                     updated_at     = NOW()
         """, (fein, careers_url, careers_source))
     conn.commit()

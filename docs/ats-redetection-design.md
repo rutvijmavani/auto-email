@@ -202,6 +202,6 @@ ATS_MANAGER_IDLE_CYCLES         = 3    # consecutive empty poll cycles → stop 
 1. `db/schema.py` — add `stale_since` column to `company_ats`
 2. `config.py` — add `DISCOVERY_REDETECT`, `ATS_STALE_TTL_DAYS`, `ATS_MANAGER_SCALE_UP_THRESHOLD`, `ATS_MANAGER_IDLE_CYCLES`
 3. `scripts/staleness_checker.py` — 3rd pass (redetect) + 4th pass (stale purge); remove `start_workers()` calls after ZADD
-4. `workers/discover_h1b_ats_worker.py` — poll `discovery:redetect` first (higher priority than `discovery:batch`), handle `source=redetect`: set `stale_since` on old rows, update `prospective_companies` for `source=prospective`
+4. `workers/discover_h1b_ats_worker.py` — poll `discovery:redetect` first (higher priority than `discovery:batch`), handle `trigger="redetect"`: set `stale_since` on old rows; `source` selects between `company_ats` and `prospective` table handling
 5. `db/job_monitor.py` — exclude `stale_since IS NOT NULL` rows from monitored company queries
 6. `workers/manager.py` — promote enrichment + discovery + redetect pools from informational to autoscaled; remove `start_workers()` from `api.py` `_trigger_enrichment`
