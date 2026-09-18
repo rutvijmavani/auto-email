@@ -772,7 +772,7 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         elif best[0] is None:
             logger.debug("[detector] PARTIAL (%s) page=%d platform=%s — continuing for slug",
                          source_label, len(visited), result["platform"])
-            best[0] = result
+            best[0] = {**result, "source_url": final_url}
 
     # ── Signal 1: company territory check ────────────────────────────────────
     # Company territory = brand name appears in the page’s domain

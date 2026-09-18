@@ -97,20 +97,60 @@ def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
 # SQL ADAPTER — ? → %s
 # ─────────────────────────────────────────
 
-_PLACEHOLDER_RE = re.compile(r'\?')
+_DOLLAR_TAG_RE = re.compile(r'\$[A-Za-z_]*\$')
 
 
 def _adapt_sql(sql: str) -> str:
     """
     Convert SQLite ? placeholders to psycopg2 %s placeholders.
 
-    Safe because:
-    - All SQL in this codebase uses only ? as a parameter marker
-    - No SQL strings contain bare % characters
+    Skips ? characters inside single-quoted string literals ('' escaping
+    handled) and dollar-quoted strings ($$...$$ / $tag$...$tag$), since those
+    are literal SQL text — e.g. regex patterns like '^https?://' — not
+    parameter markers. A prior version did a blind global replace, which
+    corrupted any such literal ? into %s: silently broke the regex (matched
+    nothing) where a query had no real params, and raised "not enough
+    arguments for format string" where the query already used native %s
+    placeholders alongside the literal ? (e.g. discover_h1b_ats.py's
+    stale-row DELETE, staleness_checker.py's consecutive_empty_days query).
+
     If you add LIKE '%%foo%%' patterns in future, double the %% as required
     by psycopg2 when params are present.
     """
-    return _PLACEHOLDER_RE.sub('%s', sql)
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+            continue
+        if ch == '$':
+            m = _DOLLAR_TAG_RE.match(sql, i)
+            if m:
+                tag = m.group(0)
+                end = sql.find(tag, m.end())
+                if end != -1:
+                    end += len(tag)
+                    out.append(sql[i:end])
+                    i = end
+                    continue
+        if ch == '?':
+            out.append('%s')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
 
 
 # ─────────────────────────────────────────

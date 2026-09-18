@@ -70,8 +70,12 @@ def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
     try:
         return _discover_careers_url(website_url)
     except Exception as e:
+        # Re-raise (after logging) rather than returning an empty-success shape:
+        # a transient failure here must propagate to the outer except Exception
+        # in _process_company() so last_enriched_at is not advanced and retry
+        # state is not cleared. Empty results are reserved for confirmed misses.
         log.warning("Phase 3 error for %s: %s", website_url, e)
-        return None, None, None
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,8 +394,10 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                     employer_name, probe_domain, careers_url=careers_url,
                 )
             except Exception as e:
+                # Re-raise (after logging) rather than treating this as a
+                # confirmed miss — see _phase3()'s comment for the rationale.
                 log.warning("Phase 6 error for fein=%s: %s", fein, e)
-                p6_result = None
+                raise
 
             if p6_result:
                 p6_careers  = p6_result.get("careers_url")

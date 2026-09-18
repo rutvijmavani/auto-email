@@ -1323,7 +1323,15 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             website_url       = COALESCE(EXCLUDED.website_url,      h1b_ats_discovery.website_url),
             jobs_url          = COALESCE(EXCLUDED.jobs_url,         h1b_ats_discovery.jobs_url),
             detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
-            detected_slug     = COALESCE(EXCLUDED.detected_slug,    h1b_ats_discovery.detected_slug),
+            -- A platform change must not inherit the old platform's slug: if this
+            -- detection round set a new platform, take its slug as-is (even NULL —
+            -- a genuine partial hit), never fall back to the stale slug on record.
+            detected_slug     = CASE
+                WHEN EXCLUDED.detected_platform IS NOT NULL
+                     AND EXCLUDED.detected_platform IS DISTINCT FROM h1b_ats_discovery.detected_platform
+                THEN EXCLUDED.detected_slug
+                ELSE COALESCE(EXCLUDED.detected_slug, h1b_ats_discovery.detected_slug)
+            END,
             ats_source        = COALESCE(EXCLUDED.ats_source,       h1b_ats_discovery.ats_source),
             glassdoor_id      = COALESCE(EXCLUDED.glassdoor_id,     h1b_ats_discovery.glassdoor_id),
             crunchbase_id     = COALESCE(EXCLUDED.crunchbase_id,    h1b_ats_discovery.crunchbase_id),
@@ -1386,14 +1394,21 @@ def _upsert_company_ats(
         )
         return
 
+    # Only skip when the actively-monitored row already has this exact slug —
+    # nothing to do. A same-platform slug change (tenant move) must still fall
+    # through to the INSERT...ON CONFLICT below, which updates slug in place
+    # (respecting reviewed_at) without touching is_monitored — otherwise the
+    # new slug is silently discarded and the old row keeps watching the wrong
+    # tenant forever.
     cur.execute("""
-        SELECT 1 FROM company_ats
+        SELECT slug FROM company_ats
         WHERE domain = %s AND platform = %s AND is_monitored = TRUE
         LIMIT 1
     """, (domain, platform))
-    if cur.fetchone():
+    _existing_monitored = cur.fetchone()
+    if _existing_monitored and _existing_monitored["slug"] == slug:
         log.debug(
-            "_upsert_company_ats: %s/%s already monitored in company_ats — skipping",
+            "_upsert_company_ats: %s/%s already monitored in company_ats with same slug — skipping",
             domain, platform,
         )
         return
@@ -1825,10 +1840,16 @@ def _brave_upsert(fein: str, careers_url: "str | None",
         UPDATE h1b_ats_discovery
         SET brave_checked_at  = NOW(),
             detected_platform = COALESCE(%s, detected_platform),
-            detected_slug     = COALESCE(%s, detected_slug),
+            -- Same guard as upsert_discovery(): don't pair a newly-detected
+            -- platform with a stale slug left over from a different platform.
+            detected_slug     = CASE
+                WHEN %s IS NOT NULL AND %s IS DISTINCT FROM detected_platform
+                THEN %s
+                ELSE COALESCE(%s, detected_slug)
+            END,
             ats_source        = CASE WHEN %s IS NOT NULL THEN %s ELSE ats_source END
         WHERE employer_fein = %s
-    """, (platform, slug, platform, ats_source, fein))
+    """, (platform, platform, platform, slug, slug, platform, ats_source, fein))
     if careers_url:
         cur.execute("""
             INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)

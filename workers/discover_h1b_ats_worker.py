@@ -237,13 +237,19 @@ def _write_last_discovered(conn, fein: str) -> None:
     """, (fein,))
 
 
-def _mark_old_rows_stale(conn, fein: str, new_platform: str) -> int:
-    """Set stale_since on silent company_ats rows for this FEIN whose platform changed.
+def _mark_old_rows_stale(conn, fein: str, new_platform: str, new_slug: "str | None" = None) -> int:
+    """Set stale_since on silent company_ats rows for this FEIN whose ATS identity changed.
 
     Only marks rows where:
       - consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS (they triggered redetect)
       - stale_since IS NULL (not already marked)
-      - platform != new_platform (the newly confirmed/changed ATS)
+      - platform != new_platform, OR (same platform, new_slug known) slug != new_slug —
+        a same-platform tenant move (e.g. Greenhouse org renamed) must also
+        count as a change, not just a platform switch, or the old row is
+        never flagged and _upsert_company_ats's is_monitored guard leaves it
+        silently watching the wrong tenant slug forever. Slug is only compared
+        when new_slug is known — a partial redetect (platform, no slug yet)
+        must not mark existing rows stale on the strength of a NULL.
     Returns count updated.
     """
     cur = conn.execute("""
@@ -252,8 +258,11 @@ def _mark_old_rows_stale(conn, fein: str, new_platform: str) -> int:
         WHERE employer_fein = %s
           AND consecutive_empty_days >= %s
           AND stale_since IS NULL
-          AND platform IS DISTINCT FROM %s
-    """, (fein, JOB_MONITOR_REDETECT_DAYS, new_platform))
+          AND (
+              platform IS DISTINCT FROM %s
+              OR (%s IS NOT NULL AND slug IS DISTINCT FROM %s)
+          )
+    """, (fein, JOB_MONITOR_REDETECT_DAYS, new_platform, new_slug, new_slug))
     return cur.rowcount
 
 
@@ -374,7 +383,7 @@ def _process_company(fein: str, petition_count: int, trigger: str,
 
         if source in ("company_ats", "prospective") and det_platform:
             if source == "company_ats":
-                stale_count = _mark_old_rows_stale(conn, fein, det_platform)
+                stale_count = _mark_old_rows_stale(conn, fein, det_platform, det_slug)
                 conn.commit()
                 if stale_count:
                     log.info("fein=%s redetect: marked %d old row(s) stale (new_platform=%s)",

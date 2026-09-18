@@ -823,6 +823,22 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
         stats["enrichment_queued"] += company_stats.get("queued_enrichment", 0)
 
 
+# Atomically claim the re-detect cooldown and enqueue the HEAD_CHECK_BATCH
+# item in one round-trip, so a process crash between the two can never leave
+# the cooldown set with nothing queued (which would silently block
+# re-detection for the whole cooldown window with no recovery path).
+# KEYS[1] = cooldown_key   KEYS[2] = queue_key
+# ARGV[1] = cooldown_ttl_seconds   ARGV[2] = queue_payload
+# Returns 1 if claimed+queued, 0 if cooldown was already active.
+_COOLDOWN_ENQUEUE_LUA = """
+if redis.call('SET', KEYS[1], 1, 'NX', 'EX', ARGV[1]) then
+    redis.call('LPUSH', KEYS[2], ARGV[2])
+    return 1
+end
+return 0
+"""
+
+
 def _redetect_reason(company_row) -> str:
     """Return a short description of why this company needs re-detection."""
     platform   = company_row.get("ats_platform", "unknown")
@@ -851,17 +867,19 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
     if _r is None:
         logger.debug("Redis unavailable — skipping re-enrichment for %r (fein=%s)", company, fein)
         return
-    _cooldown_acquired = False
     try:
         r = _r
         _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
-        if not r.set(_cooldown_key, 1, nx=True, ex=JOB_MONITOR_REDETECT_DAYS * 86400):
-            logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
-            return
-        _cooldown_acquired = True
         petition_count = company_row.get("petition_count") or 1
         _source = "company_ats" if parse_company_ats_key(company) is not None else "prospective"
-        r.lpush(HEAD_CHECK_BATCH, json.dumps({"fein": fein, "trigger": "redetect", "source": _source, "petition_count": petition_count}))
+        _payload = json.dumps({"fein": fein, "trigger": "redetect", "source": _source, "petition_count": petition_count})
+        _claimed = r.eval(
+            _COOLDOWN_ENQUEUE_LUA, 2, _cooldown_key, HEAD_CHECK_BATCH,
+            JOB_MONITOR_REDETECT_DAYS * 86400, _payload,
+        )
+        if not _claimed:
+            logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
+            return
         result["queued_enrichment"] = 1
         tag = f" ({log_label})" if log_label else ""
         _reason = _redetect_reason(company_row)
@@ -870,11 +888,6 @@ def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_
             tag, company, fein, domain, _reason,
         )
     except Exception as exc:
-        if _cooldown_acquired:
-            try:
-                r.delete(_cooldown_key)
-            except Exception:
-                pass
         logger.warning("Failed to queue re-enrichment for %r (fein=%s): %s", company, fein, exc)
 
 
