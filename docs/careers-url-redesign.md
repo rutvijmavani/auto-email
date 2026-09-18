@@ -37,7 +37,7 @@ Add `careers_source` to `fein_domain_map` (already has `careers_url`).
 -- fein_domain_map: add careers_source column
 ALTER TABLE fein_domain_map
     ADD COLUMN IF NOT EXISTS careers_source TEXT;
--- 'phase3' | 'phase6' | 'phase1_kg' | 'phase4_brave' | 'phase7' | 'head_check'
+-- 'phase3' | 'phase6' | 'phase1_kg' | 'phase4' | 'phase7' | 'head_check' | 'brave_pass'
 
 -- h1b_ats_discovery: drop the duplicate columns
 ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url;
@@ -116,7 +116,7 @@ Step 3: KG / Wikidata P10311 fallback
 Step 4: Brave search (950/month quota — LAST RESORT before Phase 7)
         ONLY runs if Step 2 AND Step 3 both found nothing
         → write to fein_domain_map.careers_url if NULL
-        → set careers_source = 'phase4_brave'
+        → set careers_source = 'phase4' (found) or 'brave_pass' (no result — attempt recorded)
 
 Step 5: Phase 7 — full ATS detector (career_detector.py detect_company())
         Runs with seed_url = fein_domain_map.careers_url (if set from any step above)
@@ -412,7 +412,9 @@ if not careers_url:
     if not careers_url:
         careers_url = brave_search_careers(company_name)
         if careers_url:
-            _write_careers(conn, fein, careers_url, source="phase4_brave")
+            _write_careers(conn, fein, careers_url, source="phase4")
+        else:
+            _write_careers(conn, fein, careers_url, source="brave_pass")  # no-result sentinel — attempt still recorded
 
 # Step 5: Phase 7 ATS detection — always runs
 run_phase7(seed_url=careers_url)  # seed_url may be None
