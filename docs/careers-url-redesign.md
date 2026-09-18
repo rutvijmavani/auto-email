@@ -793,11 +793,13 @@ QUEUE LANES (universal member schema on all: {fein, trigger, source}):
           │       here only when URL is missing or dead)     │
           │    → if found:                                   │
           │        _write_careers(url, source='phase3')      │
-          │        skip Phase 6                              │
-          │    → if not found: continue to Phase 6           │
+          │        (does NOT skip Phase 6 by itself)         │
+          │    → always continue to Step 3                   │
           │                                                  │
           │  Step 3: Phase 6 — career page ATS scan          │
-          │    → only if Phase 3 found nothing               │
+          │    → runs whenever Phase 3 found no ATS platform, │
+          │      even if Phase 3 found a careers_url          │
+          │      (gate is `if not p3_platform`, not on URL)   │
           │    → if finds careers_url:                       │
           │        _write_careers(url, source='phase6')      │
           │    → if finds ATS platform/slug:                 │
@@ -827,12 +829,15 @@ QUEUE LANES (universal member schema on all: {fein, trigger, source}):
           │    → kg_quota.json 85K/day                       │
           │    → exhausted: push discovery:delayed           │
           │      (score = now + 86400), return               │
-          │    → if found: _write_careers(url, source='kg')  │
+          │    → if found: careers_source='phase1_kg'        │
           │                                                  │
           │  Step 3: Brave (only if KG found nothing)        │
           │    → brave_quota.json 950/month                  │
           │    → exhausted: skip, go Phase 7, log WARNING    │
-          │    → if found: _write_careers(url, source='brave'│
+          │    → if found: careers_source='phase4'           │
+          │    → if no result: careers_source='brave_pass'   │
+          │      (_brave_upsert's no-result sentinel —       │
+          │       still written so the attempt is recorded)  │
           │                                                  │
           │  Step 4: Phase 7 — career_detector (always runs) │
           │  write company_ats                               │

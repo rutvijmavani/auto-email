@@ -1657,13 +1657,23 @@ def init_db():
         WHERE table_name = 'h1b_ats_discovery' AND column_name = 'careers_url'
     """).fetchone()
     if _had_careers_col:
+        # INSERT...SELECT (not plain UPDATE) so feins present in h1b_ats_discovery
+        # but missing from fein_domain_map still get their careers_url carried
+        # over instead of being silently dropped when the column is removed below.
+        # EXISTS guard satisfies fein_domain_map's FK to dol_h1b_employers, since
+        # h1b_ats_discovery.employer_fein has no such FK itself.
         c.execute("""
-            UPDATE fein_domain_map f
-            SET careers_url = d.careers_url
+            INSERT INTO fein_domain_map (employer_fein, careers_url, updated_at)
+            SELECT d.employer_fein, d.careers_url, NOW()
             FROM h1b_ats_discovery d
-            WHERE d.employer_fein = f.employer_fein
-              AND d.careers_url IS NOT NULL
-              AND f.careers_url IS NULL
+            WHERE d.careers_url IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM dol_h1b_employers e WHERE e.employer_fein = d.employer_fein
+              )
+            ON CONFLICT (employer_fein) DO UPDATE
+            SET careers_url = EXCLUDED.careers_url,
+                updated_at  = NOW()
+            WHERE fein_domain_map.careers_url IS NULL
         """)
     c.execute("ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url")
 

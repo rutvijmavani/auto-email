@@ -67,10 +67,12 @@ MemoryMax=4G
 NoNewPrivileges=true
 PrivateTmp=true
 # full makes /usr, /boot, /etc read-only; ProtectHome=tmpfs hides the rest of
-# /home/opc (e.g. ~/.ssh) entirely except for the project directory explicitly
-# re-opened below via ReadWritePaths.
+# /home/opc (e.g. ~/.ssh) entirely. Under tmpfs mode ReadWritePaths= alone
+# cannot re-expose a path — only BindPaths=/BindReadOnlyPaths= can bind the
+# project directory back into the empty tmpfs.
 ProtectSystem=full
 ProtectHome=tmpfs
+BindPaths=/home/opc/mail
 ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────

@@ -48,9 +48,11 @@ ProtectSystem=full
 # tmpfs (not strict) — WorkingDirectory is under /home
 ProtectHome=tmpfs
 # Allow the watchdog to write its log files and state under the project dir.
-# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely;
-# ReadWritePaths re-opens just this directory, so logging to
-# /home/opc/mail/logs/ still works.
+# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely. Under
+# tmpfs mode ReadWritePaths= alone cannot re-expose a path — only BindPaths=/
+# BindReadOnlyPaths= can bind a directory back into the empty tmpfs, so logging
+# to /home/opc/mail/logs/ still works.
+BindPaths=/home/opc/mail
 ReadWritePaths=/home/opc/mail
 
 # ── Logging ──────────────────────────────────────────────────────────────────

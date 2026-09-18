@@ -289,6 +289,7 @@ def get_all_monitored_companies():
                    last_checked_at, consecutive_empty_days,
                    domain
             FROM prospective_companies
+            WHERE is_monitored = TRUE
 
             UNION ALL
 

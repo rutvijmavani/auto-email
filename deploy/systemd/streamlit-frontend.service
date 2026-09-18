@@ -26,9 +26,12 @@ LimitNOFILE=4096
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely — the
-# service sees an empty /home except where ReadWritePaths re-opens it below.
+# ProtectHome=tmpfs hides the rest of /home/opc (e.g. ~/.ssh) entirely. Under
+# tmpfs mode ReadWritePaths= alone cannot re-expose a path — only BindPaths=/
+# BindReadOnlyPaths= can bind a directory back into the empty tmpfs, keeping
+# WorkingDirectory and ExecStart paths visible.
 ProtectHome=tmpfs
+BindPaths=/home/opc/mail
 ReadWritePaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal

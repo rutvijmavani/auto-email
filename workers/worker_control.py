@@ -24,12 +24,10 @@ HEAD_CHECK_WORKERS = ("head-check-worker@1",          "head-check-worker@2")
 ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
 DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
 
-# Allowlist also includes plain unit names (no instance suffix) so callers
-# that pass the template unit don't get silently skipped.
-_KNOWN_UNITS = frozenset(
-    HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS
-    + tuple({u.rsplit("@", 1)[0] for u in HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS})
-)
+# Explicit instance names only — every caller (workers/manager.py) always
+# passes a fully-qualified "unit@N" instance, never the bare template name,
+# and a bare template name isn't a startable/stoppable systemd unit anyway.
+_KNOWN_UNITS = frozenset(HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
 
 
 def stop_workers(*units: str, dry_run: bool = False) -> None:
