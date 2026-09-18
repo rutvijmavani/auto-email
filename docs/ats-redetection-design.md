@@ -183,7 +183,7 @@ The watchdog monitors **persistent stream consumers** (scan_workers, detail_work
 
 **Consequence for `staleness_checker.py`:** it stops calling `start_workers()` after ZADD. Its only job is to populate queues. The manager handles worker lifecycle.
 
-**Consequence for `api.py`:** `_trigger_enrichment` just does ZADD — no `start_workers()` call needed. Manager sees the queue depth immediately on next poll cycle and starts a worker.
+**Consequence for `api.py`:** `_trigger_enrichment` just does an LPUSH onto the `enrichment:on_demand` LIST (not a ZADD) — no `start_workers()` call needed. The manager sees the queue depth on its next poll cycle and starts a worker. It returns `True`/`False` so `/verify-company` can release its `verify_company:cooldown:{fein}` key when the enqueue fails.
 
 **Consequence for `OnFailure=` / `%p-%i`:** the `%p-%i` fix already implemented stays correct. The alert still fires on genuine repeated-crash scenarios (`StartLimitBurst=5` in 5 minutes). But the manager's restart loop means a single crash no longer leaves the queue stranded — the manager restarts the worker before alerting is even needed.
 

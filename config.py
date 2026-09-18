@@ -398,6 +398,10 @@ CAREER_DETECTOR_MAX_JS_BUNDLES = int(os.getenv("CAREER_DETECTOR_MAX_JS_BUNDLES",
 CAREER_DETECTOR_MAX_API_PROBES = int(os.getenv("CAREER_DETECTOR_MAX_API_PROBES",   "10"))
 CAREER_DETECTOR_LISTING_PAGES  = int(os.getenv("CAREER_DETECTOR_LISTING_PAGES",     "2"))
 CAREER_DETECTOR_DETAIL_SAMPLE  = int(os.getenv("CAREER_DETECTOR_DETAIL_SAMPLE",     "3"))
+# Max bytes read from any single career-page / JS-bundle / API response (career_detector, career_page)
+HTTP_FETCH_MAX_BYTES           = int(os.getenv("HTTP_FETCH_MAX_BYTES",   str(10 * 1024 * 1024)))
+if HTTP_FETCH_MAX_BYTES <= 0:
+    raise ValueError(f"HTTP_FETCH_MAX_BYTES must be > 0, got {HTTP_FETCH_MAX_BYTES}")
 
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING

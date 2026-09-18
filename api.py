@@ -370,15 +370,17 @@ def oauth_callback():
 _VERIFY_STALE_DAYS = 30  # re-verify after this many days
 
 
-def _trigger_enrichment(fein: str, r=None) -> None:
-    """LPUSH fein to enrichment:on_demand for immediate re-enrichment. Fire-and-forget."""
+def _trigger_enrichment(fein: str, r=None) -> bool:
+    """LPUSH fein to enrichment:on_demand for immediate re-enrichment. Returns True iff enqueued."""
     try:
         _r = r if r is not None else get_redis()
         member = json.dumps({"fein": fein, "trigger": "on_demand", "source": None, "tier": "on_demand"})
         _r.lpush(ENRICHMENT_ON_DEMAND, member)
         logger.info("verify-company: queued re-enrichment fein=%s → enrichment:on_demand", fein)
+        return True
     except Exception as exc:
         logger.error("verify-company: failed to queue re-enrichment fein=%s: %s", fein, exc)
+        return False
 
 
 @app.route('/verify-company', methods=['POST', 'OPTIONS'])
@@ -473,15 +475,22 @@ def verify_company():
 
     if not careers_url:
         # No careers URL — queue full enrichment to find one (cooldown: same TTL as head-check)
+        _cooldown_key = f"verify_company:cooldown:{fein}"
+        _claimed = False
         try:
             _set_ok = _r_client is None or _r_client.set(
-                f"verify_company:cooldown:{fein}", 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S
+                _cooldown_key, 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S
             )
+            _claimed = _r_client is not None and bool(_set_ok)
         except Exception as exc:
             logger.warning("verify-company: Redis SET cooldown failed fein=%s — triggering anyway: %s", fein, exc)
             _set_ok = True
-        if _set_ok:
-            _trigger_enrichment(fein, _r_client)
+        if _set_ok and not _trigger_enrichment(fein, _r_client) and _claimed:
+            # Enqueue failed — release cooldown so the next request can retry
+            try:
+                _r_client.delete(_cooldown_key)
+            except Exception as exc:
+                logger.error("verify-company: failed to release cooldown fein=%s: %s", fein, exc)
     else:
         # careers URL known — delegate liveness check to head_check_worker
         try:

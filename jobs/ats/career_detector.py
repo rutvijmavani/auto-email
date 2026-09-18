@@ -25,7 +25,11 @@ import tldextract as _tldextract_mod
 _tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 
 from jobs.career_page import CAREER_PATHS
-from jobs.http_safe import is_private_host as _is_private_host
+from jobs.http_safe import (
+    is_private_host as _is_private_host,
+    read_bounded_text as _read_bounded_text,
+    ResponseTooLarge as _ResponseTooLarge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -518,12 +522,14 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             # between the _is_private_host() check above and this connect. Acceptable:
             # all URLs in the BFS originate from our DB (company domains from LCA filings
             # + links discovered on those domains). No untrusted user input enters here.
-            r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False)
+            # stream=True: body is only read via _read_bounded_text (byte-capped)
+            r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False, stream=True)
             if r.status_code not in (301, 302, 303, 307, 308):
                 return r
             location = r.headers.get("Location") or ""
             if not location:
                 return r
+            r.close()
             next_url = urljoin(target, location)
             _parsed_next = urlparse(next_url)
             if _parsed_next.scheme not in ("http", "https"):
@@ -543,12 +549,16 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         if resp is None:
             return None, url
         if resp.status_code == 200:
-            return resp.text, resp.url
+            return _read_bounded_text(resp), resp.url
+        resp.close()
         logger.debug("[detector] %s → HTTP %s", url, resp.status_code)
         if resp.status_code in (429, 403):
             result = _fetch_via_worker(url)
             if result:
                 return result
+        return None, url
+    except _ResponseTooLarge as e:
+        logger.debug("[detector] oversized response skipped %s: %s", url, e)
         return None, url
     except Exception as e:
         # SSL fallback to HTTP
@@ -556,7 +566,9 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
             try:
                 resp = _get(url.replace("https://", "http://", 1))
                 if resp is not None and resp.status_code == 200:
-                    return resp.text, resp.url
+                    return _read_bounded_text(resp), resp.url
+                if resp is not None:
+                    resp.close()
             except Exception:
                 pass
         logger.debug("[detector] fetch error %s: %s", url, e)

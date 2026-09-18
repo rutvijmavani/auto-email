@@ -138,3 +138,39 @@ def make_safe_session() -> requests.Session:
     session.mount("https://", SSRFAdapter())
     return session
 
+
+class ResponseTooLarge(Exception):
+    """Raised by read_bounded_text when a response body exceeds the byte limit."""
+
+
+def read_bounded_text(resp, max_bytes=None) -> str:
+    """
+    Read a streamed response (requests or curl_cffi, fetched with stream=True) and
+    return its decoded text, raising ResponseTooLarge as soon as the body exceeds
+    max_bytes (declared Content-Length is checked first). Always closes resp.
+    """
+    limit = max_bytes if max_bytes is not None else _default_max_bytes()
+    try:
+        declared = resp.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > limit:
+            raise ResponseTooLarge(f"Content-Length {declared} > {limit}")
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=65536):
+            buf.extend(chunk)
+            if len(buf) > limit:
+                raise ResponseTooLarge(f"body exceeds {limit} bytes")
+    finally:
+        resp.close()
+    try:
+        return bytes(buf).decode(getattr(resp, "encoding", None) or "utf-8", errors="replace")
+    except LookupError:
+        return bytes(buf).decode("utf-8", errors="replace")
+
+
+def _default_max_bytes() -> int:
+    try:
+        from config import HTTP_FETCH_MAX_BYTES
+        return HTTP_FETCH_MAX_BYTES
+    except Exception:
+        return 10 * 1024 * 1024
+

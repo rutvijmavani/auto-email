@@ -20,7 +20,11 @@ import requests
 import tldextract as _tldextract_mod
 from urllib.parse import urljoin, urlparse, parse_qs
 
-from jobs.http_safe import make_safe_session as _make_safe_session
+from jobs.http_safe import (
+    make_safe_session as _make_safe_session,
+    read_bounded_text as _read_bounded_text,
+    ResponseTooLarge as _ResponseTooLarge,
+)
 
 _tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
 from bs4 import BeautifulSoup
@@ -374,7 +378,7 @@ def _fetch_and_scan(url, company):
     """
     try:
         resp = _get_session().get(
-            url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
+            url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True, stream=True
         )
         final_url = resp.url
 
@@ -382,38 +386,48 @@ def _fetch_and_scan(url, company):
         if final_url != url:
             r = match_ats_pattern(final_url)
             if r and _slug_ok(r, company):
+                resp.close()
                 logger.debug("[P3a] ATS redirect: %s → %s", url, final_url)
                 return _enrich_eightfold_domain(r, final_url), None, final_url
 
         if resp.status_code != 200:
+            resp.close()
             return None, None, final_url
 
         # Only log redirects that produced usable content (200)
         if final_url != url:
             logger.debug("[P3a] Redirect: %s → %s", url, final_url)
 
-        # Layer 2: deep HTML scan
-        r = _scan_html(resp.text, company)
+        # Layer 2: deep HTML scan (body read is byte-capped before parsing)
+        text = _read_bounded_text(resp)
+        r = _scan_html(text, company)
         if r:
             r = _enrich_eightfold_domain(r, final_url)
-        return r, resp.text, final_url
+        return r, text, final_url
+
+    except _ResponseTooLarge as e:
+        logger.debug("[P3a] Oversized response skipped %s: %s", url, e)
+        return None, None, None
 
     except requests.exceptions.SSLError:
         # Retry on HTTP
         try:
             http_url = url.replace("https://", "http://", 1)
             resp     = _get_session().get(
-                http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True
+                http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True, stream=True
             )
             if resp.url != http_url:
                 r = match_ats_pattern(resp.url)
                 if r and _slug_ok(r, company):
+                    resp.close()
                     return _enrich_eightfold_domain(r, resp.url), None, resp.url
             if resp.status_code == 200:
-                r = _scan_html(resp.text, company)
+                text = _read_bounded_text(resp)
+                r = _scan_html(text, company)
                 if r:
                     r = _enrich_eightfold_domain(r, resp.url)
-                return r, resp.text, resp.url
+                return r, text, resp.url
+            resp.close()
         except Exception:
             pass
         return None, None, None
