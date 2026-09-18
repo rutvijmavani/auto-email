@@ -99,8 +99,9 @@ def _make_redis(data: dict | None = None):
         rpush_calls = []
         ltrim_calls = []
         lrange_calls = []
-        delete_calls = []
-        set_calls = []
+        # set/delete recorded in a single ordered list so _pp_execute replays them in
+        # the same relative order they were queued, matching real Redis pipeline semantics.
+        write_calls = []
 
         def _pp_rpush(k, v):
             rpush_calls.append((k, v))
@@ -115,18 +116,21 @@ def _make_redis(data: dict | None = None):
             return pp
 
         def _pp_set(k, v, **kwargs):
-            set_calls.append((k, v))
+            write_calls.append(("set", k, v))
             return pp
 
         def _pp_delete(*keys):
-            delete_calls.append(keys)
+            write_calls.append(("delete", keys))
             return pp
 
         def _pp_execute():
-            for keys in delete_calls:
-                _delete(*keys)
-            for k, v in set_calls:
-                _set(k, v)
+            for op in write_calls:
+                if op[0] == "set":
+                    _, k, v = op
+                    _set(k, v)
+                else:
+                    _, keys = op
+                    _delete(*keys)
             for k, v in rpush_calls:
                 _rpush(k, v)
             for k, s, e in ltrim_calls:

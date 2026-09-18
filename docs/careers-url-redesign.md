@@ -294,7 +294,8 @@ CASE 1: Redirect → same root domain, careers-like path
   → UPDATE fein_domain_map SET careers_url = final_url, careers_source = 'head_check'
   → r.delete(head_check:{fein})   ← invalidate cache so next check uses new URL
   → on_demand trigger: STOP (URL updated, user is served)
-  → redetect/other: push discovery  trigger="redetect"
+  → non-on_demand: push discovery, trigger preserved from original message
+    (routes to discovery:redetect if trigger=="redetect", else discovery:batch)
 
 CASE 2: Redirect → known ATS domain (greenhouse.io, lever.co, workday, etc.)
   careers.stripe.com → boards.greenhouse.io/stripe
@@ -302,7 +303,8 @@ CASE 2: Redirect → known ATS domain (greenhouse.io, lever.co, workday, etc.)
   → UPDATE fein_domain_map SET careers_url = final_url, careers_source = 'head_check'
   → r.delete(head_check:{fein})
   → on_demand trigger: STOP
-  → redetect/other: push discovery  trigger="redetect"
+  → non-on_demand: push discovery, trigger preserved from original message
+    (routes to discovery:redetect if trigger=="redetect", else discovery:batch)
 
 CASE 3: Redirect → same domain, homepage / non-careers path
   careers.stripe.com → stripe.com   (no career path)
@@ -317,7 +319,8 @@ CASE 4: Redirect → unrelated 3rd party / unknown domain
 CASE 5: No redirect, clean 200
   → URL is healthy
   → on_demand trigger: STOP (URL is alive, nothing to do)
-  → redetect/other: push discovery  trigger="redetect"
+  → non-on_demand: push discovery, trigger preserved from original message
+    (routes to discovery:redetect if trigger=="redetect", else discovery:batch)
 
 CASE 6: Timeout / connection error
   → Treat conservatively as dead

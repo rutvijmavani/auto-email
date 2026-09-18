@@ -220,6 +220,13 @@ Payload (JSON):
     {"fein": "12-3456789", "trigger": "staleness"|"on_demand"|"redetect"|
      "fuzzy_match"|"delayed_retry"|"reclaimed", "source": "company_ats"|"prospective"|null,
      "petition_count": 1234}
+
+`petition_count` is omitted for on_demand-triggered payloads (api.py's `/verify-company`
+producers push to enrichment:on_demand and head_check:on_demand without it — there is no
+petition count context for a single user-initiated lookup). It is required wherever the
+target queue is a ZSET scored by petition_count (discovery:redetect, discovery:batch,
+enrichment:batch) or wherever a downstream consumer reads it for tier propagation
+(head_check:batch redetect items).
 ```
 
 ### DLQ (Dead Letter Queue)
@@ -247,7 +254,13 @@ Admin script: review + manual retry
 
 ### Queue Depth Monitoring
 - Manager reads `ZCARD` for enrichment and discovery ZSET queues; `LLEN` for detail/fullscan LIST queues
-- `_get_queue_metrics` returns `domain_enrichment` and `discovery` keys alongside `detail`, `scan`, `fullscan`
+- head_check depth = `LLEN(head_check:on_demand) + LLEN(head_check:batch)` plus the summed
+  `LLEN` of every `head_check:inflight:instance:*` key (so in-flight items from a crashed
+  worker still count toward pool sizing until reclaimed)
+- `_get_queue_metrics` (`workers/manager.py`) returns `domain_enrichment`, `discovery`, and
+  `head_check` keys alongside `detail`, `scan`, `fullscan`
+- `HEAD_CHECK_WORKERS` is the autoscaled pool size for head_check, driven by `queue_data["head_check"]`
+  in the same `_run_ats_pool_cycle` autoscale loop used for domain_enrichment and discovery
 
 ---
 

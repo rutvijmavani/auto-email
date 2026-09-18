@@ -169,6 +169,18 @@ def _clear_retry(r, fein: str, trigger: str, source=None, tier=None) -> None:
     r.delete(_retry_key(fein, trigger, source, tier))
 
 
+# Release the staleness_checker enqueue-dedup guard (scripts/staleness_checker.py) once
+# an item reaches a terminal outcome. Only staleness_checker's HEAD_CHECK_BATCH producer
+# ever sets this key — deleting it for items that came from elsewhere (api.py on_demand,
+# job_monitor.py) is a harmless no-op. Kept until here (not cleared on transient retry)
+# so a repeated staleness_checker run can't re-enqueue a company that's still pending.
+_ENQUEUE_GUARD_PREFIX = "head_check:enqueue_guard:"
+
+
+def _clear_enqueue_guard(r, fein: str, trigger: str, source=None) -> None:
+    r.delete(f"{_ENQUEUE_GUARD_PREFIX}{HEAD_CHECK_BATCH}:{fein}:{trigger}:{source or ''}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DLQ
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,12 +368,16 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             # careers_url vanished since the producer pushed this item — push to enrichment.
             log.info("head_check: fein=%s careers_url NULL in DB — routing to enrichment", fein)
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
+            _clear_retry(r, fein, trigger, source=source, tier=tier)
+            _clear_enqueue_guard(r, fein, trigger, source=source)
             return True
 
         # Validate careers_url is a public URL before requesting
         if not _is_safe_url(careers_url):
             log.warning("head_check: fein=%s careers_url %r is not a safe public URL -- routing to enrichment", fein, careers_url)
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
+            _clear_retry(r, fein, trigger, source=source, tier=tier)
+            _clear_enqueue_guard(r, fein, trigger, source=source)
             return True
 
         # Check Redis cache first
@@ -407,6 +423,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
 
         _clear_retry(r, fein, trigger, source=source, tier=tier)
+        _clear_enqueue_guard(r, fein, trigger, source=source)
         return True
 
     except Exception as exc:
@@ -426,11 +443,13 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
 # Main loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _reclaim_inflight(r, own_inflight_key: str) -> None:
-    """On startup, push any items left in ANY prior instance's inflight list back to their source queues.
+def _reclaim_inflight(r, own_ondemand_key: str, own_batch_key: str) -> None:
+    """On startup, push any items left in ANY prior instance's inflight lists back to their source queues.
 
-    Scans all head_check:inflight:instance:* keys so that items from a crashed instance
-    (different PID → different key) are recovered even when WORKER_INSTANCE is not set.
+    Scans all head_check:inflight:instance:*:{on_demand,batch} keys so that items from a crashed
+    instance (different PID → different key) are recovered even when WORKER_INSTANCE is not set.
+    Each key's tier suffix (":on_demand" / ":batch") determines which source queue to restore to —
+    items are raw payload strings (no wrapper), matching what LMOVE/BLMOVE write into these lists.
     """
     cursor = 0
     all_keys: list = []
@@ -440,15 +459,24 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
         if cursor == 0:
             break
 
-    if own_inflight_key not in all_keys:
-        all_keys.append(own_inflight_key)
+    for own_key in (own_ondemand_key, own_batch_key):
+        if own_key not in all_keys:
+            all_keys.append(own_key)
 
     for key in all_keys:
-        is_own = key == own_inflight_key
+        if key.endswith(":on_demand"):
+            tier_suffix, target_queue = "on_demand", HEAD_CHECK_ON_DEMAND
+        elif key.endswith(":batch"):
+            tier_suffix, target_queue = "batch", HEAD_CHECK_BATCH
+        else:
+            log.warning("head_check: skipping inflight key %s — unrecognized tier suffix", key)
+            continue
+
+        is_own = key in (own_ondemand_key, own_batch_key)
         if not is_own:
             # Skip keys whose worker is still alive (heartbeat present).
             # suffix is "{hostname}:{pid}" (no-instance mode) or a bare instance number.
-            suffix = key[len("head_check:inflight:instance:"):]
+            suffix = key[len("head_check:inflight:instance:"):-len(f":{tier_suffix}")]
             if ":" in suffix:
                 # No-instance mode: suffix == "hostname:pid" → direct heartbeat key.
                 if r.exists(f"worker:alive:head_check_worker:{suffix}"):
@@ -465,7 +493,7 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
                 if hb_keys:
                     log.debug("head_check: skipping inflight key %s — worker still alive", key)
                     continue
-        # own_inflight_key always reclaims (this process's own heartbeat is already
+        # own_inflight keys always reclaim (this process's own heartbeat is already
         # alive at this point, so the alive-check above would otherwise skip it forever,
         # stranding any items left over from a prior crash that reused the same key).
         reclaimed = 0
@@ -473,15 +501,44 @@ def _reclaim_inflight(r, own_inflight_key: str) -> None:
             raw = r.rpop(key)
             if raw is None:
                 break
-            try:
-                item = json.loads(raw)
-                r.rpush(item["queue"], item["member"])
-                reclaimed += 1
-            except Exception as exc:
-                log.error("head_check: failed to reclaim inflight item from %s: %s", key, exc)
+            r.rpush(target_queue, raw)
+            reclaimed += 1
         if reclaimed:
             log.warning("head_check: reclaimed %d inflight items from orphaned key %s", reclaimed, key)
         r.delete(key)
+
+
+def _pop_with_inflight(r, own_ondemand_key: str, own_batch_key: str, timeout: float):
+    """
+    Priority-aware atomic pop with at-least-once guarantee via inflight lists.
+
+    1. Try non-blocking LMOVE from on_demand first (priority).
+    2. If on_demand is empty, block on BLMOVE from batch for up to 1s, then
+       re-check on_demand. Avoids a busy-poll loop while still picking up
+       on_demand items within ~1s of enqueue.
+
+    Returns (queue_key, tier, raw_member) or None on timeout.
+
+    LMOVE/BLMOVE are atomic — the item is either in the source queue or the
+    inflight list, never in neither (unlike the prior BLPOP + separate LPUSH,
+    which had a gap where a crash between the two calls silently dropped the
+    item). Direction LEFT→LEFT replicates the original BLPOP (left-pop) +
+    LPUSH (left-insert) ordering.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        raw = r.lmove(HEAD_CHECK_ON_DEMAND, own_ondemand_key, "LEFT", "LEFT")
+        if raw is not None:
+            return (HEAD_CHECK_ON_DEMAND, "on_demand", raw)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait_s = min(1.0, remaining)
+        raw = r.blmove(HEAD_CHECK_BATCH, own_batch_key, wait_s, "LEFT", "LEFT")
+        if raw is not None:
+            return (HEAD_CHECK_BATCH, "batch", raw)
+    return None
 
 
 def run_worker(once: bool = False) -> None:
@@ -492,9 +549,10 @@ def run_worker(once: bool = False) -> None:
     hb = Heartbeat(r, _hb_name,
                    lambda: processed["n"], interval_s=HEAD_CHECK_HEARTBEAT_S).start()
 
-    _inflight_suffix  = _instance if _instance else f"{socket.gethostname()}:{os.getpid()}"
-    _own_inflight_key = f"head_check:inflight:instance:{_inflight_suffix}"
-    _reclaim_inflight(r, _own_inflight_key)
+    _inflight_suffix       = _instance if _instance else f"{socket.gethostname()}:{os.getpid()}"
+    _own_inflight_ondemand = f"head_check:inflight:instance:{_inflight_suffix}:on_demand"
+    _own_inflight_batch    = f"head_check:inflight:instance:{_inflight_suffix}:batch"
+    _reclaim_inflight(r, _own_inflight_ondemand, _own_inflight_batch)
 
     log.info("head-check-worker started (instance=%r)", _instance)
 
@@ -514,10 +572,10 @@ def run_worker(once: bool = False) -> None:
                 log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
-            # BLPOP checks on_demand first (priority), falls back to batch.
-            # Returns (list_key, value) or None on timeout.
-            result = r.blpop([HEAD_CHECK_ON_DEMAND, HEAD_CHECK_BATCH],
-                             timeout=WORKER_BLOCK_SECS)
+            # Atomic pop: item lands in the tier's own inflight list the instant it
+            # leaves its source queue — never in neither (see _pop_with_inflight).
+            result = _pop_with_inflight(r, _own_inflight_ondemand, _own_inflight_batch,
+                                        timeout=WORKER_BLOCK_SECS)
 
             if result is None:
                 # Timeout — check if both queues are genuinely empty.
@@ -526,10 +584,9 @@ def run_worker(once: bool = False) -> None:
                     break
                 continue
 
-            queue_key, raw_member = result
-            _queue_str  = queue_key.decode()  if isinstance(queue_key,  bytes) else queue_key
+            _, tier, raw_member = result
             _member_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
-            tier = "on_demand" if _queue_str == HEAD_CHECK_ON_DEMAND else "batch"
+            _own_inflight_key = _own_inflight_ondemand if tier == "on_demand" else _own_inflight_batch
 
             # Parse payload
             try:
@@ -544,20 +601,21 @@ def run_worker(once: bool = False) -> None:
                     "fein": "MALFORMED", "error_reason": "malformed_member",
                     "raw": repr(_member_str), "failed_at": time.time(),
                 }))
+                r.lrem(_own_inflight_key, 1, _member_str)
                 continue
 
             retry_count = _get_retry_count(r, fein, trigger, source=source, tier=tier)
             if retry_count >= HEAD_CHECK_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
                 _clear_retry(r, fein, trigger, source=source, tier=tier)
+                _clear_enqueue_guard(r, fein, trigger, source=source)
+                r.lrem(_own_inflight_key, 1, _member_str)
                 continue
 
-            _inflight_entry = json.dumps({"queue": _queue_str, "member": _member_str})
-            r.lpush(_own_inflight_key, _inflight_entry)
             try:
                 success = _process_company(r, fein, petition_count, trigger, source, tier)
             finally:
-                r.lrem(_own_inflight_key, 1, _inflight_entry)
+                r.lrem(_own_inflight_key, 1, _member_str)
             processed["n"] += 1
 
             if not success:
@@ -565,6 +623,7 @@ def run_worker(once: bool = False) -> None:
                 if count >= HEAD_CHECK_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
                     _clear_retry(r, fein, trigger, source=source, tier=tier)
+                    _clear_enqueue_guard(r, fein, trigger, source=source)
                 else:
                     # Re-push to same queue tier for retry (RPUSH so it goes to back of LINE)
                     member = json.dumps({

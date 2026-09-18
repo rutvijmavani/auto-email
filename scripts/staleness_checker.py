@@ -49,6 +49,7 @@ from config import (
     ENRICHMENT_BATCH,
     ENRICH_STALENESS_DAYS,
     HEAD_CHECK_BATCH,
+    HEAD_CHECK_ENQUEUE_GUARD_TTL_S,
     JOB_MONITOR_REDETECT_DAYS,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
@@ -60,6 +61,20 @@ from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 
 log = get_logger(__name__)
+
+# Dedup guard for HEAD_CHECK_BATCH (a plain LIST — unlike the ZSET queues, RPUSH has no
+# built-in member-identity dedup). Repeated staleness_checker runs before a previous item
+# has drained (still queued or being processed by head_check_worker) would otherwise push
+# duplicate entries for the same company every run. Keyed by queue+fein+trigger+source
+# (matches head_check_worker._retry_key's identity scheme) so unrelated trigger/source
+# combinations for the same fein remain independent. head_check_worker clears the guard
+# once the item reaches a terminal outcome (success or DLQ); HEAD_CHECK_ENQUEUE_GUARD_TTL_S
+# is only a crash-safety fallback expiry.
+_ENQUEUE_GUARD_PREFIX = "head_check:enqueue_guard:"
+
+
+def _enqueue_guard_key(queue: str, fein: str, trigger: str, source) -> str:
+    return f"{_ENQUEUE_GUARD_PREFIX}{queue}:{fein}:{trigger}:{source or ''}"
 
 
 def _is_maintenance(r) -> bool:
@@ -95,8 +110,16 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                     dry_run_sample.append(row)
                 added += 1
                 continue
+            fein = row["employer_fein"]
+            if use_list:
+                # A plain LIST has no member-identity dedup like ZADD — guard against
+                # re-enqueuing a company that's already queued or being processed from
+                # a prior (still-draining) staleness_checker run.
+                guard_key = _enqueue_guard_key(queue_key, fein, trigger, source)
+                if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
+                    continue
             payload: dict = {
-                "fein": row["employer_fein"], "trigger": trigger, "source": source,
+                "fein": fein, "trigger": trigger, "source": source,
             }
             if use_list:
                 # LIST items carry no score — petition_count must travel in the payload.
@@ -289,7 +312,11 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                          HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "petition_count": row["petition_count"], "trigger": "redetect", "source": "company_ats"})
+            fein = row["employer_fein"]
+            guard_key = _enqueue_guard_key(HEAD_CHECK_BATCH, fein, "redetect", "company_ats")
+            if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
+                continue
+            member = json.dumps({"fein": fein, "petition_count": row["petition_count"], "trigger": "redetect", "source": "company_ats"})
             pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
@@ -320,7 +347,11 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                          HEAD_CHECK_BATCH, row["employer_fein"])
                 added += 1
                 continue
-            member = json.dumps({"fein": row["employer_fein"], "petition_count": row["petition_count"], "trigger": "redetect", "source": "prospective"})
+            fein = row["employer_fein"]
+            guard_key = _enqueue_guard_key(HEAD_CHECK_BATCH, fein, "redetect", "prospective")
+            if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
+                continue
+            member = json.dumps({"fein": fein, "petition_count": row["petition_count"], "trigger": "redetect", "source": "prospective"})
             pipe.rpush(HEAD_CHECK_BATCH, member)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
