@@ -90,16 +90,18 @@ def _make_redis(data=None):
 
     def _pipeline():
         pp = MagicMock()
-        rpush_calls, ltrim_calls, lrange_calls, delete_calls = [], [], [], []
+        rpush_calls, ltrim_calls, lrange_calls, delete_calls, set_calls = [], [], [], [], []
         pp.rpush  = lambda k, v:    rpush_calls.append((k, v)) or pp
         pp.ltrim  = lambda k, s, e: ltrim_calls.append((k, s, e)) or pp
         pp.lrange = lambda k, s, e: lrange_calls.append((k, s, e)) or pp
-        pp.set    = lambda k, v, **kw: _set(k, v) or pp
+        pp.set    = lambda k, v, **kw: set_calls.append((k, v)) or pp
         pp.delete = lambda *keys: delete_calls.append(keys) or pp
 
         def _exec():
             for keys in delete_calls:
                 _delete(*keys)
+            for k, v in set_calls:
+                _set(k, v)
             for k, v in rpush_calls:
                 _rpush(k, v)
             for k, s, e in ltrim_calls:

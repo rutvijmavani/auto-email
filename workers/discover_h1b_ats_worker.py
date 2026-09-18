@@ -492,7 +492,7 @@ def run_worker(once: bool = False) -> None:
                 if elapsed > _MAINTENANCE_MAX_S:
                     log.error("Maintenance window exceeded %dh — exiting to allow restart",
                               _MAINTENANCE_MAX_S // 3600)
-                    return
+                    sys.exit(1)
                 log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 

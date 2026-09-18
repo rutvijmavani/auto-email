@@ -535,7 +535,7 @@ def run_worker(once: bool = False) -> None:
                 if elapsed > _MAINTENANCE_MAX_S:
                     log.error("Maintenance window exceeded %dh — exiting to allow restart",
                               _MAINTENANCE_MAX_S // 3600)
-                    return
+                    sys.exit(1)
                 log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
@@ -580,7 +580,7 @@ def run_worker(once: bool = False) -> None:
                 source         = data.get("source")
                 # ZSET items carry score; LIST items carry petition_count in payload
                 petition_count = int(data.get("petition_count", 0)) or int(float(_pop_result[1]))
-            except (json.JSONDecodeError, KeyError, TypeError):
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 raw_str = raw_member.decode() if isinstance(raw_member, bytes) else raw_member
                 if raw_str.strip().lstrip("-").isdigit():
                     fein           = raw_str.strip()

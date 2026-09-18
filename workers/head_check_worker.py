@@ -148,19 +148,25 @@ _RETRY_KEY_PREFIX = "head_check:retry:"
 _RETRY_TTL_S      = 86400 * 3  # 3 days
 
 
-def _get_retry_count(r, fein: str) -> int:
-    return int(r.get(f"{_RETRY_KEY_PREFIX}{fein}") or 0)
+def _retry_key(fein: str, trigger: str, source, tier=None) -> str:
+    # fein alone is not a unique queue-item identity — different trigger/source/tier
+    # combinations for the same company are independent retry sequences.
+    return f"{_RETRY_KEY_PREFIX}{fein}:{trigger}:{source or ''}:{tier or ''}"
 
 
-def _incr_retry(r, fein: str) -> int:
-    key = f"{_RETRY_KEY_PREFIX}{fein}"
+def _get_retry_count(r, fein: str, trigger: str, source=None, tier=None) -> int:
+    return int(r.get(_retry_key(fein, trigger, source, tier)) or 0)
+
+
+def _incr_retry(r, fein: str, trigger: str, source=None, tier=None) -> int:
+    key = _retry_key(fein, trigger, source, tier)
     count = r.incr(key)
     r.expire(key, _RETRY_TTL_S)
     return count
 
 
-def _clear_retry(r, fein: str) -> None:
-    r.delete(f"{_RETRY_KEY_PREFIX}{fein}")
+def _clear_retry(r, fein: str, trigger: str, source=None, tier=None) -> None:
+    r.delete(_retry_key(fein, trigger, source, tier))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,7 +406,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
             # Cases 3, 4, 6 — URL dead or homepage; send to enrichment
             _push_enrichment(r, fein, petition_count, trigger, source, tier)
 
-        _clear_retry(r, fein)
+        _clear_retry(r, fein, trigger, source=source, tier=tier)
         return True
 
     except Exception as exc:
@@ -504,7 +510,7 @@ def run_worker(once: bool = False) -> None:
                 if elapsed > _MAINTENANCE_MAX_S:
                     log.error("Maintenance window exceeded %dh — exiting to allow restart",
                               _MAINTENANCE_MAX_S // 3600)
-                    return
+                    sys.exit(1)
                 log.info("Maintenance window active — pausing 30s (%.0fm elapsed)", elapsed / 60)
                 time.sleep(30)
 
@@ -540,10 +546,10 @@ def run_worker(once: bool = False) -> None:
                 }))
                 continue
 
-            retry_count = _get_retry_count(r, fein)
+            retry_count = _get_retry_count(r, fein, trigger, source=source, tier=tier)
             if retry_count >= HEAD_CHECK_MAX_RETRIES:
                 _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
-                _clear_retry(r, fein)
+                _clear_retry(r, fein, trigger, source=source, tier=tier)
                 continue
 
             _inflight_entry = json.dumps({"queue": _queue_str, "member": _member_str})
@@ -555,10 +561,10 @@ def run_worker(once: bool = False) -> None:
             processed["n"] += 1
 
             if not success:
-                count = _incr_retry(r, fein)
+                count = _incr_retry(r, fein, trigger, source=source, tier=tier)
                 if count >= HEAD_CHECK_MAX_RETRIES:
                     _move_to_dlq(r, fein, "processing_error", count)
-                    _clear_retry(r, fein)
+                    _clear_retry(r, fein, trigger, source=source, tier=tier)
                 else:
                     # Re-push to same queue tier for retry (RPUSH so it goes to back of LINE)
                     member = json.dumps({

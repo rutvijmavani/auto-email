@@ -209,11 +209,14 @@ payloads have no `tier` concept.
 
 ### Tier propagation through hops
 
-The `tier` of an item (on_demand vs batch) travels with it through every worker hop:
-- on_demand item routed by head_check_worker → pushed to `enrichment:on_demand` or `discovery:on_demand`
-- batch item routed by head_check_worker → pushed to `enrichment:batch` or `discovery:batch`
+The `tier` of an item (on_demand vs batch) travels with it through every worker hop when routed to enrichment:
+- on_demand item routed by head_check_worker → pushed to `enrichment:on_demand`
+- batch item routed by head_check_worker → pushed to `enrichment:batch`
 
 An on_demand item never gets demoted to batch mid-chain.
+
+Discovery has no `tier`/on_demand concept — head_check_worker routes by `trigger` instead:
+`trigger="redetect"` → `discovery:redetect`; any other trigger → `discovery:batch`.
 
 ### Who pushes where
 
@@ -226,8 +229,8 @@ An on_demand item never gets demoted to batch mid-chain.
 | `job_monitor` (zero-jobs streak) | `"redetect"` | `head_check:batch` |
 | `fuzzy_match_uscis_dol` (bulk after USCIS load) | `"enrichment"` | `enrichment:batch` |
 | `domain_enrichment_worker` (after enrichment, petition_count ≥ threshold) | `"enrichment"` | `discovery:batch` |
-| head_check_worker (HEAD=200 or valid redirect, source was on_demand) | `"redetect"` | `discovery:on_demand` |
-| head_check_worker (HEAD=200 or valid redirect, source was batch) | `"redetect"` | `discovery:batch` |
+| head_check_worker (HEAD=200 or valid redirect, trigger="redetect") | `"redetect"` | `discovery:redetect` |
+| head_check_worker (HEAD=200 or valid redirect, trigger="staleness"/other) | original trigger | `discovery:batch` |
 | head_check_worker (non-200, source was on_demand) | original trigger | `enrichment:on_demand` |
 | head_check_worker (non-200, source was batch) | original trigger | `enrichment:batch` |
 
@@ -256,7 +259,7 @@ The gate (only companies above threshold go to discovery) lives at push time, no
 Manager.py must watch all six lanes:
 - `LLEN head_check:on_demand` + `LLEN head_check:batch` → start/stop head_check_worker instances
 - `LLEN enrichment:on_demand` + `ZCARD enrichment:batch` → start/stop domain_enrichment_worker instances
-- `LLEN discovery:on_demand` + `ZCARD discovery:batch` → start/stop discover_h1b_ats_worker instances
+- `ZCARD discovery:redetect` + `ZCARD discovery:batch` → start/stop discover_h1b_ats_worker instances
 
 ---
 

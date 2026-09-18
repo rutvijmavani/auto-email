@@ -4,14 +4,14 @@
 #
 #   for each level (career → listing → JD → apply):
 #       page_text = fetch(url)
-#       result = scan(page_text)          â† full raw-text keyword search
+#       result = scan(page_text)          ← full raw-text keyword search
 #       if result: return result
 #
 #       for src in script_srcs(page_text):
-#           result = scan(fetch(src))     â† JS bundle scan (catches Lever/Spotify)
+#           result = scan(fetch(src))     ← JS bundle scan (catches Lever/Spotify)
 #           if result: return result
 #
-#       next_url = find_next_page(page_text, current_url)   â† scoring-based
+#       next_url = find_next_page(page_text, current_url)   ← scoring-based
 #
 # No BeautifulSoup. No Playwright. Pure requests + re.
 

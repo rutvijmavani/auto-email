@@ -409,7 +409,7 @@ def run():
     """
     init_logging("monitor")
     start_time = time.time()
-    logger.info("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+    logger.info("════════════════════════════════════════")
     logger.info("--monitor-jobs starting (smart hybrid mode, max_workers=%d)",
                 MONITOR_MAX_WORKERS)
 
@@ -804,7 +804,7 @@ def run():
         logger.error("flush_api_health failed — some health records may be lost",
                      exc_info=True)
 
-    logger.info("â•â•â•â• --monitor-jobs finished â•â•â•â•")
+    logger.info("════ --monitor-jobs finished ════")
     return final_stats
 
 
@@ -1419,7 +1419,7 @@ def run_detect_ats(company=None, override_platform=None,
     Run ATS detection. Identical to original.
     """
     init_logging("detect")
-    logger.info("â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•")
+    logger.info("════════════════════════════════════════")
     logger.info("--detect-ats starting: company=%r batch=%s",
                 company, batch)
 
@@ -1482,7 +1482,7 @@ def run_detect_ats(company=None, override_platform=None,
         _print_detection_queue_status()
         if results:
             build_detection_report(results, date_str)
-        logger.info("â•â•â•â• --detect-ats (batch) finished â•â•â•â•")
+        logger.info("════ --detect-ats (batch) finished ════")
         return
 
     to_detect = [c for c in companies if needs_redetection(c)]
@@ -1504,7 +1504,7 @@ def run_detect_ats(company=None, override_platform=None,
     _print_detection_queue_status()
     if results:
         build_detection_report(results, date_str)
-    logger.info("â•â•â•â• --detect-ats finished â•â•â•â•")
+    logger.info("════ --detect-ats finished ════")
 
 
 def _print_detection_queue_status():

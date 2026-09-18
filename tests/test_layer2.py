@@ -100,6 +100,7 @@ def _make_redis(data: dict | None = None):
         ltrim_calls = []
         lrange_calls = []
         delete_calls = []
+        set_calls = []
 
         def _pp_rpush(k, v):
             rpush_calls.append((k, v))
@@ -114,7 +115,7 @@ def _make_redis(data: dict | None = None):
             return pp
 
         def _pp_set(k, v, **kwargs):
-            _set(k, v)
+            set_calls.append((k, v))
             return pp
 
         def _pp_delete(*keys):
@@ -124,6 +125,8 @@ def _make_redis(data: dict | None = None):
         def _pp_execute():
             for keys in delete_calls:
                 _delete(*keys)
+            for k, v in set_calls:
+                _set(k, v)
             for k, v in rpush_calls:
                 _rpush(k, v)
             for k, s, e in ltrim_calls:
