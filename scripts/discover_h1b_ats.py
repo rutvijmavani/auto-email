@@ -38,7 +38,10 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+import tldextract
 from urllib.parse import urljoin, urlparse
+
+_tldextract = tldextract.TLDExtract(suffix_list_urls=())
 
 from rapidfuzz import process as fuzz_process, utils as fuzz_utils
 from rapidfuzz.fuzz import ratio as fuzz_ratio, WRatio
@@ -55,6 +58,7 @@ from config import (
 from db.connection import get_conn
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
+from jobs.http_safe import make_safe_session as _make_safe_session
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 
@@ -207,10 +211,12 @@ def strip_legal_suffixes(name: str) -> str:
 
 
 def _root_domain(url: str) -> str:
-    """'careers.amazon.com' → 'amazon.com'"""
-    host  = urlparse(url).hostname or ""
-    parts = host.split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    """'careers.amazon.co.uk' → 'amazon.co.uk' (PSL-aware registrable domain)."""
+    if "://" not in url:
+        url = "https://" + url
+    host = urlparse(url).hostname or ""
+    ext  = _tldextract(host)
+    return ext.registered_domain or host
 
 
 def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain: str) -> bool:
@@ -965,17 +971,23 @@ def brave_career_search(
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_html(url: str) -> tuple[str | None, str]:
+def _fetch_html(url: str, session=None) -> tuple[str | None, str]:
     """
     GET url following redirects manually (SSRF-validates every hop).
     Returns (html_text, final_url) or (None, url) on failure.
+
+    session: optional caller-owned safe session, reused across probes and left open.
+    When omitted, a private session is created and closed before returning.
     """
     if not _is_public_url(url):
         return None, url
     current = url
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
     try:
         for _ in range(_MAX_REDIRECTS):
-            r = requests.get(
+            r = session.get(
                 current, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
                 allow_redirects=False,
             )
@@ -1001,6 +1013,9 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
         result = _fetch_via_worker(url)
         if result:
             return result
+    finally:
+        if owns_session:
+            session.close()
     return None, url
 
 
@@ -1067,9 +1082,12 @@ _CDN_DOMAINS = frozenset({
 })
 
 
-def _resolve_website_redirect(url: str) -> str:
+def _resolve_website_redirect(url: str, session=None) -> str:
     """
     Fetch the company root URL and follow redirects to detect rebrands/domain changes.
+
+    session: optional caller-owned safe session (left open); a private one is created
+    and closed when omitted.
 
     Cases:
       - Redirect fails / times out         → return original unchanged
@@ -1082,11 +1100,31 @@ def _resolve_website_redirect(url: str) -> str:
     parsed   = urlparse(url)
     root_url = f"{parsed.scheme}://{parsed.netloc}/"
     final_url = None
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
 
     try:
-        r = requests.get(root_url, timeout=8, allow_redirects=True,
-                         headers=_API_HEADERS)
-        final_url = r.url.rstrip("/")
+        # Manual redirect loop: every hop is SSRF-validated (allow_redirects=True
+        # would let a public host bounce us to an internal address unchecked).
+        # The safe session's SSRFAdapter re-validates the resolved IPs at connect
+        # time and pins the connection to the validated address for HTTP hops.
+        current = root_url
+        for _ in range(_MAX_REDIRECTS):
+            r = session.get(current, timeout=8, allow_redirects=False,
+                            headers=_API_HEADERS)
+            if r.is_redirect:
+                next_url = urljoin(current, r.headers.get("Location", ""))
+                if not _is_public_url(next_url):
+                    log.debug("_resolve_website_redirect: redirect to non-public URL blocked: %s", next_url)
+                    return url
+                current = next_url
+                continue
+            final_url = current.rstrip("/")
+            break
+        else:
+            log.debug("_resolve_website_redirect: too many redirects for %s — keeping original", url)
+            return url
     except Exception as exc:
         log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
         result = _fetch_via_worker(root_url)
@@ -1094,6 +1132,9 @@ def _resolve_website_redirect(url: str) -> str:
             _, worker_final = result
             final_url = worker_final.rstrip("/")
             log.debug("_resolve_website_redirect: CF Worker resolved %s → %s", url, final_url)
+    finally:
+        if owns_session:
+            session.close()
 
     if final_url is None:
         return url
@@ -1126,6 +1167,7 @@ def _resolve_website_redirect(url: str) -> str:
 
 def discover_careers_url(
     website_url: str,
+    session=None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Probe 19 career URL patterns for company website.
@@ -1137,7 +1179,26 @@ def discover_careers_url(
       - Final URL jumped to unrelated domain (not company domain or known ATS)
 
     Bonus: if redirect lands on known ATS domain, captures ATS from URL directly.
+
+    session: optional caller-owned safe session, reused for every probe and left open.
+    When omitted, ONE session is created for the whole probe run and closed on exit
+    (including failures). Sessions are never shared across threads or held module-wide.
     """
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
+    try:
+        return _probe_career_urls(website_url, session)
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _probe_career_urls(
+    website_url: str,
+    session,
+) -> tuple[str | None, str | None, str | None]:
+    """Body of discover_careers_url: probe candidates with the caller's session."""
     if not _is_public_url(website_url):
         log.warning("Skipping non-public URL: %s", website_url)
         return None, None, None
@@ -1155,8 +1216,9 @@ def discover_careers_url(
     for path in _CAREER_PATHS:
         candidates.append(base + path)
 
+    _fallback = None  # ATS-domain hit with no slug match — returned only if no better result found
     for url in candidates:
-        html, final_url = _fetch_html(url)
+        html, final_url = _fetch_html(url, session)
         if html is None:
             continue
 
@@ -1182,6 +1244,18 @@ def discover_careers_url(
                     url, result["platform"], result["slug"],
                 )
                 return final_url, result["platform"], result["slug"]
+            # Pattern didn't match (e.g. new ATS subdomain without a known slug format).
+            # Record as fallback hint but keep probing remaining candidates — a later
+            # candidate may yield the slug-bearing URL (e.g. company.com/careers → ATS).
+            log.debug("  %s → ATS domain (%s) but no slug match — keeping as fallback", url, final_root)
+            if _fallback is None:
+                _fallback = (final_url, None, None)
+            continue
+
+        # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
+        if final_root != company_root:
+            log.debug("  %s → jumped to external domain %s, skipping", url, final_root)
+            continue
 
         # Fingerprint HTML for embedded ATS
         platform, slug = _find_ats_in_html(html)
@@ -1191,7 +1265,7 @@ def discover_careers_url(
         )
         return final_url, platform, slug
 
-    return None, None, None
+    return _fallback or (None, None, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1280,11 +1354,11 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
     if dry_run:
         log.info(
             "[DRY-RUN] fein=%s name=%r canonical=%r website=%r kg_mid=%r "
-            "jobs_url=%r careers=%r platform=%s slug=%s",
+            "jobs_url=%r platform=%s slug=%s",
             data["employer_fein"], data["employer_name"],
             data.get("canonical_name"), data.get("website_url"),
             data.get("kg_mid"), data.get("jobs_url"),
-            data.get("careers_url"), data.get("detected_platform"),
+            data.get("detected_platform"),
             data.get("detected_slug"),
         )
         return
@@ -1293,7 +1367,7 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         INSERT INTO h1b_ats_discovery
             (employer_fein, employer_name, canonical_name, canonical_source,
              wikidata_qid, kg_mid, website_url, jobs_url,
-             careers_url, detected_platform, detected_slug,
+             detected_platform, detected_slug, ats_source,
              glassdoor_id, crunchbase_id, last_checked)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         ON CONFLICT (employer_fein) DO UPDATE SET
@@ -1304,9 +1378,17 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
             kg_mid            = COALESCE(EXCLUDED.kg_mid,           h1b_ats_discovery.kg_mid),
             website_url       = COALESCE(EXCLUDED.website_url,      h1b_ats_discovery.website_url),
             jobs_url          = COALESCE(EXCLUDED.jobs_url,         h1b_ats_discovery.jobs_url),
-            careers_url       = COALESCE(EXCLUDED.careers_url,      h1b_ats_discovery.careers_url),
             detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
-            detected_slug     = COALESCE(EXCLUDED.detected_slug,    h1b_ats_discovery.detected_slug),
+            -- A platform change must not inherit the old platform's slug: if this
+            -- detection round set a new platform, take its slug as-is (even NULL —
+            -- a genuine partial hit), never fall back to the stale slug on record.
+            detected_slug     = CASE
+                WHEN EXCLUDED.detected_platform IS NOT NULL
+                     AND EXCLUDED.detected_platform IS DISTINCT FROM h1b_ats_discovery.detected_platform
+                THEN EXCLUDED.detected_slug
+                ELSE COALESCE(EXCLUDED.detected_slug, h1b_ats_discovery.detected_slug)
+            END,
+            ats_source        = COALESCE(EXCLUDED.ats_source,       h1b_ats_discovery.ats_source),
             glassdoor_id      = COALESCE(EXCLUDED.glassdoor_id,     h1b_ats_discovery.glassdoor_id),
             crunchbase_id     = COALESCE(EXCLUDED.crunchbase_id,    h1b_ats_discovery.crunchbase_id),
             last_checked      = NOW()
@@ -1319,9 +1401,9 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
         data.get("kg_mid"),
         data.get("website_url"),
         data.get("jobs_url"),
-        data.get("careers_url"),
         data.get("detected_platform"),
         data.get("detected_slug"),
+        data.get("ats_source"),
         data.get("glassdoor_id"),
         data.get("crunchbase_id"),
     ))
@@ -1344,6 +1426,10 @@ def _upsert_company_ats(
     ON CONFLICT (domain, platform): update slug + priority but never touch is_monitored
     or status, so a previously reviewed entry is not reset.
 
+    Before inserting, deletes any unreviewed row for the same (employer_fein, platform)
+    with a different domain — handles the case where website_url was rewritten between
+    runs (e.g. gs.com → goldmansachs.com) so dedup on (domain, platform) still works.
+
     Skips the write if this domain+platform is already actively monitored in
     prospective_companies (ats_platform not null/unknown/unsupported) or in
     company_ats (is_monitored=TRUE) — prevents duplicate monitoring.
@@ -1364,17 +1450,77 @@ def _upsert_company_ats(
         )
         return
 
+    # Only skip when the actively-monitored row already has this exact slug —
+    # nothing to do.
+    #
+    # A same-platform slug change (tenant move) cannot be handled by falling
+    # through to the INSERT...ON CONFLICT below: is_monitored is only ever set
+    # TRUE alongside reviewed_at (see frontend/pages/3_Discover.py's toggle),
+    # so every row reaching this point is reviewed, and the ON CONFLICT clause
+    # always preserves company_ats.slug for reviewed rows — the fall-through
+    # never actually updates it. Instead, explicitly correct the row here:
+    # write the new slug and drop it back into "pending review" (is_monitored
+    # FALSE, reviewed_at NULL) so the job monitor stops scraping the stale
+    # tenant immediately and a human re-confirms before it resumes.
     cur.execute("""
-        SELECT 1 FROM company_ats
+        SELECT slug FROM company_ats
         WHERE domain = %s AND platform = %s AND is_monitored = TRUE
         LIMIT 1
     """, (domain, platform))
-    if cur.fetchone():
-        log.debug(
-            "_upsert_company_ats: %s/%s already monitored in company_ats — skipping",
-            domain, platform,
+    _existing_monitored = cur.fetchone()
+    if _existing_monitored:
+        if _existing_monitored["slug"] == slug:
+            log.debug(
+                "_upsert_company_ats: %s/%s already monitored in company_ats with same slug — skipping",
+                domain, platform,
+            )
+            return
+        cur.execute("""
+            UPDATE company_ats
+            SET slug = %s, is_monitored = FALSE, reviewed_at = NULL
+            WHERE domain = %s AND platform = %s AND is_monitored = TRUE
+        """, (slug, domain, platform))
+        log.info(
+            "_upsert_company_ats: %s/%s monitored slug changed %r -> %r — "
+            "unmonitored and returned to pending review",
+            domain, platform, _existing_monitored["slug"], slug,
         )
+        conn.commit()
         return
+
+    # Remove stale rows for the same FEIN+platform whose domain no longer matches
+    # the known employer website_url in h1b_ats_discovery.
+    # Preserves legitimate brand-domain entries (e.g. lifeatspotify.com alongside
+    # spotify.com) — those still appear in h1b_ats_discovery's known URLs.
+    # Only touches unreviewed, un-monitored rows.
+    if fein:
+        cur.execute("""
+            DELETE FROM company_ats ca_del
+            WHERE ca_del.employer_fein = %s
+              AND ca_del.platform = %s
+              AND ca_del.domain != %s
+              AND ca_del.reviewed_at IS NULL
+              AND ca_del.is_monitored = FALSE
+              AND NOT EXISTS (
+                  SELECT 1 FROM h1b_ats_discovery had
+                  WHERE had.employer_fein = ca_del.employer_fein
+                    AND (
+                        regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.website_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
+                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(had.jobs_url),    '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM fein_domain_map fdm
+                  WHERE fdm.employer_fein = ca_del.employer_fein
+                    AND fdm.careers_url IS NOT NULL
+                    AND (
+                        regexp_replace(regexp_replace(LOWER(fdm.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') = ca_del.domain
+                     OR regexp_replace(regexp_replace(LOWER(fdm.careers_url), '^https?://(www\\.)?', ''), '/.*$', '') LIKE ('%%.' || ca_del.domain)
+                    )
+              )
+        """, (fein, platform, domain))
 
     cur.execute("""
         INSERT INTO company_ats
@@ -1536,42 +1682,56 @@ def process_employer(
     careers_url       = None
     detected_platform = None
     detected_slug     = None
+    ats_source        = None   # which phase found the ATS platform
+    careers_source    = None   # which phase found the careers URL
 
     if jobs_url:
         # P10311 found — use it as the careers URL, no further probing needed
-        careers_url = jobs_url
+        careers_url    = jobs_url
+        careers_source = "phase1_kg"
         log.info("  P10311 jobs URL: %s", jobs_url)
         from jobs.ats.patterns import match_ats_pattern as _map
         _hit = _map(jobs_url)
         if _hit:
             detected_platform = _hit["platform"]
             detected_slug     = _hit.get("slug")
+            ats_source        = "phase1_kg"
     elif website_url:
-        # Phase 3: 19-pattern probe
-        website_url = _resolve_website_redirect(website_url)
-        log.info("  Probing 19 career URL patterns on %s …", website_url)
-        try:
-            careers_url, detected_platform, detected_slug = discover_careers_url(
-                website_url
-            )
-        except Exception as e:
-            log.warning("  Career probe failed: %s", e)
+        # One safe session for this employer's whole Phase 3-5 fetch run (redirect
+        # resolution, 19 probes, Brave-page fingerprint); closed on every exit path.
+        with _make_safe_session() as _fetch_session:
+            # Phase 3: 19-pattern probe
+            website_url = _resolve_website_redirect(website_url, _fetch_session)
+            log.info("  Probing 19 career URL patterns on %s …", website_url)
+            try:
+                careers_url, detected_platform, detected_slug = discover_careers_url(
+                    website_url, _fetch_session
+                )
+                if careers_url:
+                    careers_source = "phase3"
+                if detected_platform:
+                    ats_source = "phase3"
+            except Exception as e:
+                log.warning("  Career probe failed: %s", e)
 
-        # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
-        if not careers_url and not skip_brave:
-            search_name = canonical_name or strip_legal_suffixes(name) or name
-            log.info("  Brave search fallback for %r …", search_name)
-            brave_url = brave_career_search(search_name, website_url=website_url)
-            if brave_url:
-                careers_url = brave_url
-                log.info("  Brave found: %s", brave_url)
-                # Phase 5: fingerprint the Brave result page
-                try:
-                    html, _ = _fetch_html(brave_url)
-                    if html:
-                        detected_platform, detected_slug = _find_ats_in_html(html)
-                except Exception as e:
-                    log.warning("  HTML fingerprint failed: %s", e)
+            # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
+            if not careers_url and not skip_brave:
+                search_name = canonical_name or strip_legal_suffixes(name) or name
+                log.info("  Brave search fallback for %r …", search_name)
+                brave_url = brave_career_search(search_name, website_url=website_url)
+                if brave_url:
+                    careers_url    = brave_url
+                    careers_source = "phase4"
+                    log.info("  Brave found: %s", brave_url)
+                    # Phase 5: fingerprint the Brave result page
+                    try:
+                        html, _ = _fetch_html(brave_url, _fetch_session)
+                        if html:
+                            detected_platform, detected_slug = _find_ats_in_html(html)
+                            if detected_platform:
+                                ats_source = "phase5"
+                    except Exception as e:
+                        log.warning("  HTML fingerprint failed: %s", e)
 
     # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.
@@ -1581,11 +1741,18 @@ def process_employer(
         log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
         try:
             from jobs.career_page import detect_via_career_page
-            _cp_result = detect_via_career_page(_cp_name, _cp_domain)
+            _phase6_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
+            _cp_result = detect_via_career_page(_cp_name, _cp_domain, careers_url=_phase6_seed)
             if _cp_result:
-                detected_platform = _cp_result["platform"]
-                detected_slug     = _cp_result.get("slug")
-                log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+                if _cp_result.get("platform"):
+                    detected_platform = _cp_result["platform"]
+                    detected_slug     = _cp_result.get("slug")
+                    ats_source        = "phase6"
+                    log.info("  Phase 6 HIT: %s / %s", detected_platform, detected_slug)
+                if _cp_result.get("careers_url"):
+                    careers_url    = _cp_result["careers_url"]
+                    careers_source = "phase6"
+                    log.info("  Phase 6 careers_url: %s", careers_url)
         except Exception as e:
             log.warning("  Phase 6 (career_page) failed: %s", e)
 
@@ -1595,7 +1762,8 @@ def process_employer(
         log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
-            _cd_results = detect_company(_cd_domain)
+            _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg", "phase6"} else None
+            _cd_results = detect_company(_cd_domain, seed_url=_cd_seed)
             if _cd_results:
                 # Prefer a result with a non-empty slug; fall back to partial detection
                 _best = next((r for r in _cd_results if r.get("slug")), _cd_results[0])
@@ -1604,10 +1772,37 @@ def process_employer(
                 if _best_slug:
                     detected_slug = _best_slug
                 if not careers_url:
-                    careers_url = _best.get("source_url")
-                log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
+                    _src_url = _best.get("source_url")
+                    if _src_url:
+                        careers_url    = _src_url
+                        careers_source = "phase7"
+                if detected_platform:
+                    ats_source = "phase7"
+                    log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
+
+    # Update website_url when careers discovery reveals a different real domain.
+    # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
+    # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
+    # Only trust verified sources — Brave search (phase4) URLs are not verified by direct probe.
+    # phase7 (career_detector BFS) intentionally excluded: its careers URL may be
+    # off-domain (a job board), and the guard _careers_root != _cd_domain cancelled
+    # the outer _careers_root != _website_root condition, making phase7 rewrites
+    # always unreachable. phase3 and phase6 are verified probes; their redirects
+    # reliably indicate the company's real domain.
+    _REWRITE_TRUSTED_SOURCES = {"phase3", "phase6"}
+    if careers_url and website_url and careers_source in _REWRITE_TRUSTED_SOURCES:
+        from jobs.public_domain import GENERIC_ROOTS as _GENERIC_ROOTS
+        _careers_root = _root_domain(careers_url)
+        _website_root = _root_domain(website_url)
+        if (_careers_root and _website_root
+                and _careers_root != _website_root
+                and _careers_root not in _KNOWN_ATS_DOMAINS
+                and _careers_root not in _GENERIC_ROOTS):
+            log.info("  Updating website_url: %s → https://%s (via careers domain)",
+                     website_url, _careers_root)
+            website_url = f"https://{_careers_root}"
 
     if careers_url:
         log.info(
@@ -1631,9 +1826,28 @@ def process_employer(
         "detected_slug":    detected_slug,
         "glassdoor_id":     glassdoor_id,
         "crunchbase_id":    crunchbase_id,
+        "ats_source":       ats_source,
+        "careers_source":   careers_source,
     }
 
     upsert_discovery(result, conn, dry_run=dry_run)
+
+    if not dry_run and careers_url:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (employer_fein) DO UPDATE
+                SET careers_url    = EXCLUDED.careers_url,
+                    careers_source = EXCLUDED.careers_source,
+                    careers_url_verified_at = CASE
+                        WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
+                        THEN NULL
+                        ELSE fein_domain_map.careers_url_verified_at
+                    END,
+                    updated_at     = NOW()
+        """, (fein, careers_url, careers_source))
+        conn.commit()
 
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
         domain = _root_domain(result["website_url"])
@@ -1681,9 +1895,10 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
                   u.employer_legal_norm = d.employer_name_norm
                OR u.employer_name_norm  = d.trade_name_dba_norm
               )
+        LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = h.employer_fein
         WHERE h.last_checked IS NOT NULL
           AND h.brave_checked_at IS NULL
-          AND h.careers_url IS NULL
+          AND fdm.careers_url IS NULL
           AND h.website_url IS NOT NULL
         GROUP BY h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
                  d.total_certified
@@ -1694,16 +1909,39 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
 
 
 def _brave_upsert(fein: str, careers_url: "str | None",
-                  platform: "str | None", slug: "str | None", conn) -> None:
-    """Mark brave_checked_at and persist any career URL found."""
-    conn.cursor().execute("""
+                  platform: "str | None", slug: "str | None", conn,
+                  ats_source: str = "brave_pass",
+                  careers_source: str = "brave_pass") -> None:
+    """Mark brave_checked_at, persist ATS platform, and write careers_url to fein_domain_map."""
+    cur = conn.cursor()
+    cur.execute("""
         UPDATE h1b_ats_discovery
         SET brave_checked_at  = NOW(),
-            careers_url       = COALESCE(%s, careers_url),
             detected_platform = COALESCE(%s, detected_platform),
-            detected_slug     = COALESCE(%s, detected_slug)
+            -- Same guard as upsert_discovery(): don't pair a newly-detected
+            -- platform with a stale slug left over from a different platform.
+            detected_slug     = CASE
+                WHEN %s IS NOT NULL AND %s IS DISTINCT FROM detected_platform
+                THEN %s
+                ELSE COALESCE(%s, detected_slug)
+            END,
+            ats_source        = CASE WHEN %s IS NOT NULL THEN %s ELSE ats_source END
         WHERE employer_fein = %s
-    """, (careers_url, platform, slug, fein))
+    """, (platform, platform, platform, slug, slug, platform, ats_source, fein))
+    if careers_url:
+        cur.execute("""
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (employer_fein) DO UPDATE
+                SET careers_url    = EXCLUDED.careers_url,
+                    careers_source = EXCLUDED.careers_source,
+                    careers_url_verified_at = CASE
+                        WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
+                        THEN NULL
+                        ELSE fein_domain_map.careers_url_verified_at
+                    END,
+                    updated_at     = NOW()
+        """, (fein, careers_url, careers_source))
     conn.commit()
 
 
@@ -1735,25 +1973,32 @@ def _run_brave_pass(conn, r, args) -> None:
                             i - 1, len(candidates))
                 break
 
-            brave_url = brave_career_search(search_name, website_url=website_url)
+            brave_url   = brave_career_search(search_name, website_url=website_url)
+            _ats_source = "brave_pass"
             if brave_url:
                 careers_url = brave_url
                 hit = _map(brave_url)
                 if hit:
-                    platform = hit["platform"]
-                    slug     = hit.get("slug")
+                    platform    = hit["platform"]
+                    slug        = hit.get("slug")
+                    _ats_source = "phase4"
                 else:
                     try:
                         html_content, _ = _fetch_html(brave_url)
                         if html_content:
                             platform, slug = _find_ats_in_html(html_content)
+                            if platform:
+                                _ats_source = "phase5"
                     except Exception as e:
                         log.warning("  HTML fingerprint failed: %s", e)
                 log.info("  Brave → %s  platform=%s", careers_url, platform)
             else:
                 log.info("  Brave found nothing — marking as attempted")
 
-            _brave_upsert(fein, careers_url, platform, slug, conn)
+            _careers_source = "phase4" if brave_url else "brave_pass"
+            _brave_upsert(fein, careers_url, platform, slug, conn,
+                          ats_source=_ats_source,
+                          careers_source=_careers_source if careers_url else "brave_pass")
             if platform and slug and website_url:
                 domain = _root_domain(website_url)
                 if domain:
@@ -2015,3 +2260,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

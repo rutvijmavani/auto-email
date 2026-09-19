@@ -42,6 +42,11 @@ LOG_RETENTION_DAILY_DAYS   = 14
 # written before the previous month's is deleted.
 LOG_RETENTION_MONTHLY_DAYS = 35
 
+# Worker process logs (domain_enrichment_worker, discover_h1b_ats_worker)
+# 30 days — longer than daily because staleness cycle is 90 days and regression
+# comparisons need a few weeks of history across sporadic runs.
+LOG_RETENTION_WORKER_DAYS  = 30
+
 # ─────────────────────────────────────────
 # DATA RETENTION SETTINGS (days)
 # ─────────────────────────────────────────
@@ -61,6 +66,8 @@ RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
 DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
 RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
+RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
+VERIFY_TASK_QUEUE_CAP          = 200    # max concurrent+queued background verify/enrich tasks
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
@@ -339,6 +346,51 @@ DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b
 CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
 CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
 
+CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
+# ─────────────────────────────────────────────────────────────────────────────
+# head_check worker — both lanes are LISTs (FIFO, no score needed)
+HEAD_CHECK_ON_DEMAND   = "head_check:on_demand"   # LIST — api.py (careers_url known)
+HEAD_CHECK_BATCH       = "head_check:batch"        # LIST — staleness_checker, job_monitor
+HEAD_CHECK_DLQ         = "head_check:dlq"          # LIST — failed head checks
+HEAD_CHECK_INFLIGHT    = "head_check:inflight"     # COUNTER -- items currently being processed
+
+# enrichment worker — on_demand is LIST (priority), batch is ZSET (score=petition_count)
+ENRICHMENT_ON_DEMAND   = "enrichment:on_demand"   # LIST — api.py (careers_url NULL), head_check Cases 3,4,6
+ENRICHMENT_BATCH       = "enrichment:batch"        # ZSET — fuzzy_match, staleness, head_check Cases 3,4,6
+ENRICHMENT_DELAYED     = "enrichment:delayed"      # ZSET — score=not_before (Certspotter 429)
+ENRICHMENT_INFLIGHT    = "domain_enrichment:inflight"  # ZSET — crash recovery (key kept stable)
+ENRICHMENT_DLQ         = "enrichment:dlq"          # LIST — failed enrichment
+
+# discovery worker — redetect drains before batch (ZPOPMAX redetect first)
+DISCOVERY_REDETECT     = "discovery:redetect"      # ZSET — score=petition_count (jobs went silent)
+DISCOVERY_BATCH        = "discovery:batch"          # ZSET — score=petition_count (staleness, passthrough)
+DISCOVERY_DELAYED      = "discovery:delayed"        # ZSET — score=not_before (KG quota exhaustion)
+DISCOVERY_INFLIGHT     = "discovery:inflight"       # ZSET — crash recovery
+DISCOVERY_DLQ          = "discovery:dlq"            # LIST — failed discovery
+
+ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
+ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker
+ATS_MANAGER_IDLE_CYCLES         = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",         "3"))    # consecutive empty poll cycles → stop workers
+HEAD_CHECK_MAX_RETRIES          = int(os.getenv("HEAD_CHECK_MAX_RETRIES",           "3"))
+HEAD_CHECK_HEARTBEAT_S          = int(os.getenv("HEAD_CHECK_HEARTBEAT_S",           "30"))
+HEAD_CHECK_CACHE_PREFIX         = "head_check:"  # Redis key prefix for the per-FEIN HEAD-result cache (head_check:{fein}); shared so enrichment can invalidate it
+HEAD_CHECK_CACHE_TTL_S          = int(os.getenv("HEAD_CHECK_CACHE_TTL_S",           str(6 * 3600)))  # Redis TTL for head_check:{fein} cache
+HEAD_CHECK_ENQUEUE_GUARD_TTL_S  = int(os.getenv("HEAD_CHECK_ENQUEUE_GUARD_TTL_S",   str(24 * 3600)))  # fallback expiry for staleness_checker's HEAD_CHECK_BATCH dedup guard (crash safety; normally released explicitly by head_check_worker)
+ENRICHMENT_MAX_RETRIES          = int(os.getenv("ENRICHMENT_MAX_RETRIES",           "3"))
+ENRICHMENT_HEARTBEAT_S          = int(os.getenv("ENRICHMENT_HEARTBEAT_S",           "30"))
+DISCOVERY_MAX_RETRIES           = int(os.getenv("DISCOVERY_MAX_RETRIES",            "3"))
+DISCOVERY_HEARTBEAT_S           = int(os.getenv("DISCOVERY_HEARTBEAT_S",            "30"))
+
+# Staleness checker thresholds
+ENRICH_STALENESS_DAYS             = int(os.getenv("ENRICH_STALENESS_DAYS",             "90"))   # re-enrich after N days
+STALENESS_DISCOVERY_MIN_PETITIONS = int(os.getenv("STALENESS_DISCOVERY_MIN_PETITIONS", "5"))    # min petition_count for discovery re-run
+STALENESS_ZADD_BATCH              = int(os.getenv("STALENESS_ZADD_BATCH",              "500"))  # Redis pipeline batch size for staleness queue pushes
+if STALENESS_ZADD_BATCH <= 0:
+    raise ValueError(f"STALENESS_ZADD_BATCH must be > 0, got {STALENESS_ZADD_BATCH}")
+
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))
 CONNECT_TIMEOUT                = int(os.getenv("CAREER_DETECTOR_CONNECT_TIMEOUT",   "5"))
@@ -347,6 +399,10 @@ CAREER_DETECTOR_MAX_JS_BUNDLES = int(os.getenv("CAREER_DETECTOR_MAX_JS_BUNDLES",
 CAREER_DETECTOR_MAX_API_PROBES = int(os.getenv("CAREER_DETECTOR_MAX_API_PROBES",   "10"))
 CAREER_DETECTOR_LISTING_PAGES  = int(os.getenv("CAREER_DETECTOR_LISTING_PAGES",     "2"))
 CAREER_DETECTOR_DETAIL_SAMPLE  = int(os.getenv("CAREER_DETECTOR_DETAIL_SAMPLE",     "3"))
+# Max bytes read from any single career-page / JS-bundle / API response (career_detector, career_page)
+HTTP_FETCH_MAX_BYTES           = int(os.getenv("HTTP_FETCH_MAX_BYTES",   str(10 * 1024 * 1024)))
+if HTTP_FETCH_MAX_BYTES <= 0:
+    raise ValueError(f"HTTP_FETCH_MAX_BYTES must be > 0, got {HTTP_FETCH_MAX_BYTES}")
 
 # ─────────────────────────────────────────
 # REDIS / ADAPTIVE POLLING

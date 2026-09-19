@@ -21,7 +21,15 @@ import logging
 from html import unescape as _html_unescape
 from urllib.parse import urljoin, urlparse
 
+import tldextract as _tldextract_mod
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
+
 from jobs.career_page import CAREER_PATHS
+from jobs.http_safe import (
+    is_private_host as _is_private_host,
+    read_bounded_text as _read_bounded_text,
+    ResponseTooLarge as _ResponseTooLarge,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,19 +81,15 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
         return None
 
-_MULTI_LABEL_SLDS = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "gen", "ne", "me"}
-
 def _host_root(hostname: str) -> str:
-    """Return the registrable domain, handling multi-label TLDs like .co.uk."""
-    parts = hostname.split(".")
-    if len(parts) >= 3 and parts[-2] in _MULTI_LABEL_SLDS:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:]) if len(parts) >= 2 else hostname
+    """Return the registrable domain using the PSL-aware offline tldextract instance."""
+    return _tldextract(hostname).registered_domain or hostname
 
 def _make_session():
     if _CURL_AVAILABLE:
         return _CurlSession(impersonate="chrome124")
-    return _requests.Session()
+    from jobs.http_safe import make_safe_session as _make_safe_session_fn
+    return _make_safe_session_fn()
 
 # Headers for HTML page navigation — mirrors what Chrome sends on a user click
 _NAV_HEADERS = {
@@ -497,28 +501,71 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
     if referer:
         headers["Referer"] = referer
 
+    _parsed_entry = urlparse(url)
+    if _parsed_entry.scheme not in ("http", "https"):
+        logger.debug("[detector] blocked: non-HTTP(S) scheme %r in %s", _parsed_entry.scheme, url)
+        return None, url
+    _host = _parsed_entry.hostname or ""
+    if not _host:
+        logger.debug("[detector] blocked: empty hostname in %s", url)
+        return None, url
+    if _is_private_host(_host):
+        logger.debug("[detector] SSRF: blocked private host %r in %s", _host, url)
+        return None, url
+
     def _get(target):
-        return session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=True)
+        _prev = target
+        _max = 10
+        while _max > 0:
+            headers["Sec-Fetch-Site"] = _sec_fetch_site(target, _prev if _prev != target else referer)
+            # curl_cffi makes its own DNS call at connect time — a TOCTOU gap exists
+            # between the _is_private_host() check above and this connect. Acceptable:
+            # all URLs in the BFS originate from our DB (company domains from LCA filings
+            # + links discovered on those domains). No untrusted user input enters here.
+            # stream=True: body is only read via _read_bounded_text (byte-capped)
+            r = session.get(target, headers=headers, timeout=(CONNECT_TIMEOUT, FETCH_TIMEOUT), allow_redirects=False, stream=True)
+            if r.status_code not in (301, 302, 303, 307, 308):
+                return r
+            location = r.headers.get("Location") or ""
+            if not location:
+                return r
+            r.close()
+            next_url = urljoin(target, location)
+            _parsed_next = urlparse(next_url)
+            if _parsed_next.scheme not in ("http", "https"):
+                logger.debug("[detector] redirect blocked: non-HTTP(S) scheme %r in %s", _parsed_next.scheme, next_url)
+                return None
+            _nh = _parsed_next.hostname or ""
+            if _nh and _is_private_host(_nh):
+                logger.debug("[detector] SSRF redirect blocked: private host %r in %s", _nh, next_url)
+                return None
+            _prev   = target
+            target  = next_url
+            _max -= 1
+        return r
 
     try:
         resp = _get(url)
+        if resp is None:
+            return None, url
         if resp.status_code == 200:
-            return resp.text, resp.url
+            return _read_bounded_text(resp), resp.url
+        resp.close()
         logger.debug("[detector] %s → HTTP %s", url, resp.status_code)
         if resp.status_code in (429, 403):
             result = _fetch_via_worker(url)
             if result:
                 return result
         return None, url
+    except _ResponseTooLarge as e:
+        logger.debug("[detector] oversized response skipped %s: %s", url, e)
+        return None, url
     except Exception as e:
-        # SSL fallback to HTTP
+        # TLS failure: never retry over cleartext http:// (MITM/spoof vector — the
+        # fetched page's links feed persisted careers_url/ATS detection).
         if "ssl" in str(e).lower() or "SSL" in type(e).__name__:
-            try:
-                resp = _get(url.replace("https://", "http://", 1))
-                if resp.status_code == 200:
-                    return resp.text, resp.url
-            except Exception:
-                pass
+            logger.debug("[detector] TLS error %s: %s — not retrying over http", url, e)
+            return None, url
         logger.debug("[detector] fetch error %s: %s", url, e)
         # Network-level failure — try CF Worker (handles IP blocks, DNS fails)
         result = _fetch_via_worker(url)
@@ -618,8 +665,9 @@ def find_next_pages(html, current_url, visited=None):
     """
     parsed_base = urlparse(current_url)
     base_domain = parsed_base.netloc
-    base_parts  = base_domain.split(".")
-    brand       = base_parts[-2] if len(base_parts) >= 2 else base_domain
+    # Use hostname (no port/userinfo) so tldextract doesn't misparse "host:port" as a label.
+    # Fall back to netloc so brand matching still works when hostname is unavailable.
+    brand = _tldextract(parsed_base.hostname or base_domain).domain or base_domain
 
     pairs = re.findall(
         r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
@@ -646,7 +694,7 @@ def find_next_pages(html, current_url, visited=None):
 
         # Allow same domain OR brand-family domain (bidirectional).
         # e.g. nomura.com ↔ nomuraholdings.com: "nomura" appears in both.
-        target_brand = parsed.netloc.split(".")[-2] if "." in parsed.netloc else parsed.netloc
+        target_brand = _tldextract(parsed.hostname or parsed.netloc).domain or parsed.netloc
         if parsed.netloc != base_domain and brand not in parsed.netloc and target_brand not in base_domain:
             continue
 
@@ -684,11 +732,16 @@ def find_next_pages(html, current_url, visited=None):
 # Single-page processor — fetch one URL, scan, return next candidates
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_page(url, session, visited, hits, best, referer=None, company_root=None):
+def _process_page(url, session, visited, hits, best, referer=None, company_root=None,
+                  first_200_url=None):
     """
     Fetch url, scan HTML + JS bundles + API endpoints for ATS signals.
     Records hits into shared dicts. Returns scored next-page candidates.
     Does NOT recurse — BFS queue in detect_company drives traversal.
+
+    first_200_url: mutable [None] container — set to the final URL of the first
+                   page that returns HTML (200), so callers can capture career URL
+                   even on a complete ATS miss.
 
     Leaf conditions (return [] immediately):
       Rule 1  — new complete ATS hit found → children share the same ATS, useless.
@@ -726,24 +779,17 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
         elif best[0] is None:
             logger.debug("[detector] PARTIAL (%s) page=%d platform=%s — continuing for slug",
                          source_label, len(visited), result["platform"])
-            best[0] = result
-
-    # Always scan raw HTML — catches ATS slug even on external pages
-    hits_before = len(hits)
-    _handle(scan(html), "HTML")
-
-    # Rule 1: new complete ATS hit in HTML → leaf
-    if len(hits) > hits_before:
-        logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
-        return []
+            best[0] = {**result, "source_url": final_url}
 
     # ── Signal 1: company territory check ────────────────────────────────────
-    # Company territory = brand name appears in the page's domain
+    # Company territory = brand name appears in the page’s domain
     #                  OR company root domain is referenced anywhere in the HTML.
-    # Both signals are derived from the email/company domain (e.g. "nomura.com"):
-    #   brand      = "nomura"   — first segment, appears in brand-family domains
-    #   company_root = "nomura.com" — full root, appears in cross-links and hrefs
+    # Both signals are derived from the email/company domain (e.g. “nomura.com”):
+    #   brand      = “nomura”   — first segment, appears in brand-family domains
+    #   company_root = “nomura.com” — full root, appears in cross-links and hrefs
     # Neither uses the legal entity name which never matches website content.
+    # Must run BEFORE scanning HTML so off-domain seeds (e.g. indeed.com) never
+    # record a false hit before territory is confirmed.
     if company_root:
         company_brand = company_root.split('.')[0]
         page_netloc   = urlparse(final_url).netloc.lower()
@@ -753,7 +799,28 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
             logger.debug("[detector] signal1: not company territory — leaf %s", final_url)
             return []
 
-    # Company territory confirmed — full scan: JS bundles + API probes
+    # Scan raw HTML — catches ATS slug on ATS-hosted subdomains in company territory
+    hits_before = len(hits)
+    _handle(scan(html), "HTML")
+
+    # Rule 1: new complete ATS hit in HTML → leaf
+    if len(hits) > hits_before:
+        logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
+        return []
+
+    # Company territory confirmed — record this as the first successful company-territory URL.
+    # Exclude root-path redirects landing on the main company domain (homepage redirects);
+    # career subdomains (careers.company.com/) have a different netloc and are kept.
+    if first_200_url is not None and first_200_url[0] is None:
+        _fp    = urlparse(final_url)
+        _fhost = (_fp.hostname or "").removeprefix("www.")
+        # Use hostname (not registrable domain) so career subdomains like
+        # careers.company.com are kept even when their path is root "/".
+        # Only reject root-path URLs on the bare company domain (homepage redirects).
+        if _fp.path.rstrip("/") or _fhost != company_root:
+            first_200_url[0] = final_url
+
+    # Full scan: JS bundles + API probes
     api_paths = []
     for src in _script_srcs(html, final_url):
         bundle, _ = _fetch(src, session, referer=final_url, is_script=True)
@@ -894,9 +961,13 @@ def _filter_listing_candidates(candidates, pagination_roots, sampled_patterns, c
 # BFS driver — breadth-first so sibling branches share the page budget
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_company(company_domain, session=None):
+def detect_company(company_domain, session=None, *, seed_url=None):
     """
     Detect all ATS platforms for a company given only its domain.
+
+    seed_url: if provided, prioritize this URL at the front of the BFS queue;
+              standard CAREER_PATHS and subdomain fallbacks are still enqueued
+              after it. Use when careers_url is already known from Phase 6.
 
     Uses BFS so all candidates at depth N are explored before any at depth N+1.
     This guarantees siblings (e.g. nomura.com early-careers AND nomuraholdings.com)
@@ -910,7 +981,10 @@ def detect_company(company_domain, session=None):
         List of {"platform": ..., "slug": ..., "source_url": ...}
         — one entry per unique (platform, slug) pair found across the full crawl.
         — slug="" if platform detected but tenant URL not found (partial).
-        — empty list if nothing found.
+        — [{"platform": None, "slug": None, "source_url": url}] if no ATS found
+          but a 200-OK career URL was discovered; callers must check platform is
+          None before reading platform/slug.
+        — [] if no ATS and no career URL found.
     """
     from collections import deque
 
@@ -927,14 +1001,32 @@ def detect_company(company_domain, session=None):
     sampled_patterns   = {}     # url template  → detail pages sampled
     confirmed_patterns = set()  # templates fully sampled — drop all further matches
 
-    # Seed the BFS queue: (url, referer)
+    # Seed the BFS queue: seed_url first (if provided), then CAREER_PATHS + subdomain fallbacks
     queue = deque()
+    seen_seeds: set = set()
+    if seed_url:
+        _seed_parsed = urlparse(seed_url)
+        if _seed_parsed.scheme in ("http", "https") and _seed_parsed.hostname:
+            if not _is_private_host(_seed_parsed.hostname):
+                queue.append((seed_url, None))
+                seen_seeds.add(seed_url)
+            else:
+                logger.debug("career_detector: ignoring seed_url with private host: %r", seed_url)
+        else:
+            logger.debug("career_detector: ignoring seed_url with invalid scheme/host: %r", seed_url)
     for path in CAREER_PATHS:
-        queue.append((f"https://{domain}{path}", None))
-    root = _host_root(domain)
+        candidate = f"https://{domain}{path}"
+        if candidate not in seen_seeds:
+            queue.append((candidate, None))
+            seen_seeds.add(candidate)
     if len(domain.split(".")) > 1:
         for subdomain in ("careers", "jobs", "talent", "apply", "hiring"):
-            queue.append((f"https://{subdomain}.{root}", None))
+            candidate = f"https://{subdomain}.{company_root}"
+            if candidate not in seen_seeds:
+                queue.append((candidate, None))
+                seen_seeds.add(candidate)
+
+    first_200_url = [None]  # mutable — _process_page sets this on first successful fetch
 
     # BFS until queue drains. Two leaf conditions bound the crawl:
     #   Rule 1  — page yields a new ATS hit → don't enqueue its children
@@ -949,6 +1041,7 @@ def detect_company(company_domain, session=None):
         next_candidates = _process_page(
             url, session, visited, hits, best, referer,
             company_root=company_root,
+            first_200_url=first_200_url,
         )
         filtered = _filter_listing_candidates(
             next_candidates, pagination_roots, sampled_patterns, confirmed_patterns
@@ -963,5 +1056,10 @@ def detect_company(company_domain, session=None):
         logger.info("[detector] DONE domain=%s partial platform=%s (no slug)",
                     domain, best[0]["platform"])
         return [best[0]]
+    if first_200_url[0]:
+        logger.info("[detector] DONE domain=%s — no ATS found, career URL: %s",
+                    domain, first_200_url[0])
+        return [{"platform": None, "slug": None, "source_url": first_200_url[0]}]
     logger.info("[detector] DONE domain=%s — no ATS found", domain)
     return []
+

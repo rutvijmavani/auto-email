@@ -181,25 +181,29 @@ ATS_REGISTRY = {
     },
 
     "phenom": {
-        # JSON-LD addressCountry gives full country name embedded in location
-        # string → is_us_location() handles via Signal 4.
+        # JSON-LD addressCountry uses full official names ("United States of America").
+        # fetch_job_detail() normalises via country_to_alpha2() → _country_code.
+        # Post-detail alpha-2 gate in job_monitor drops non-US before text scan.
         "module":          phenom,
         "slug_type":       "json",
         "detect_phases":   ["api"],
         "site_search":     None,
         "listing_filter":  "title_only",
         "has_detail":      True,
-        "country_source":  "descriptor",
+        "country_source":  "alpha2",
     },
 
     "talentbrew": {
+        # JSON-LD addressCountry is inconsistent across tenants: alpha-2 ("IN"),
+        # alpha-3 ("USA"), or full name. fetch_job_detail() normalises all formats
+        # via country_to_alpha2() → _country_code for the post-detail alpha-2 gate.
         "module":          talentbrew,
         "slug_type":       "json",
         "detect_phases":   ["career_page"],
         "site_search":     None,
         "listing_filter":  "title_only",
         "has_detail":      True,
-        "country_source":  "descriptor",
+        "country_source":  "alpha2",
     },
 
     "sitemap": {

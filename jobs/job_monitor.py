@@ -55,6 +55,7 @@ from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
 )
+from db.job_monitor import parse_company_ats_key
 from config import (
     JOB_MONITOR_REDETECT_DAYS,
     MONITOR_COVERAGE_ALERT,
@@ -68,6 +69,7 @@ from config import (
     REDIS_POLL_FULLSCAN,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
+    HEAD_CHECK_BATCH,
 )
 logger = get_logger(__name__)
 
@@ -478,16 +480,27 @@ def run():
         "new_jobs_found":         0,
         "jobs_matched_filters":   0,
         "api_failure_list":       [],
+        "enrichment_queued":      0,
     }
     stats_lock = threading.Lock()
+    # Shared event set on first successful ZADD — survives even if _process_company
+    # later raises (the dict-return path would lose the signal in that case).
+
 
     # ── Fallback re-fetch (only for companies workers missed) ─────────────────
+    from workers.redis_client import get_redis as _get_redis
+    try:
+        _shared_r = _get_redis()
+    except Exception as _redis_exc:
+        logger.warning("Redis unavailable — enrichment queueing disabled: %s", _redis_exc)
+        _shared_r = None
     if missed:
         logger.info("Fallback re-fetching %d companies workers missed", len(missed))
         with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
-                    _process_company, company_row, i + 1, len(missed)
+                    _process_company, company_row, i + 1, len(missed),
+                    _shared_r,
                 ): company_row["company"]
                 for i, company_row in enumerate(missed)
             }
@@ -676,7 +689,8 @@ def run():
                 with ThreadPoolExecutor(max_workers=MONITOR_MAX_WORKERS) as _uc_exec:
                     _uc_futures = {
                         _uc_exec.submit(
-                            _process_company, company_row, i + 1, len(_retry_rows)
+                            _process_company, company_row, i + 1, len(_retry_rows),
+                            _shared_r,
                         ): company_row["company"]
                         for i, company_row in enumerate(_retry_rows)
                     }
@@ -696,6 +710,22 @@ def run():
                                 "failure_name": _uc_company,
                             }
                         _merge_company_stats(stats, stats_lock, _uc_stats)
+
+    # ── Re-enrichment check for covered companies ─────────────────────────────
+    # Background workers scan covered companies but never call _process_company,
+    # so needs_redetection is never evaluated for them here.
+    if covered and _shared_r is not None:
+        for _cov_row in covered:
+            if needs_redetection(_cov_row, JOB_MONITOR_REDETECT_DAYS):
+                _cov_result: dict = {"queued_enrichment": 0}
+                _enqueue_re_enrichment(
+                    _cov_row["company"], _cov_row, _cov_result,
+                    _shared_r,
+                    empty_days=_cov_row.get("consecutive_empty_days", 0),
+                )
+                if _cov_result.get("queued_enrichment"):
+                    with stats_lock:
+                        stats["enrichment_queued"] += 1
 
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
@@ -790,6 +820,75 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
         stats["new_jobs_found"]         += company_stats.get("new",            0)
         if company_stats.get("failure_name"):
             stats["api_failure_list"].append(company_stats["failure_name"])
+        stats["enrichment_queued"] += company_stats.get("queued_enrichment", 0)
+
+
+# Atomically claim the re-detect cooldown and enqueue the HEAD_CHECK_BATCH
+# item in one round-trip, so a process crash between the two can never leave
+# the cooldown set with nothing queued (which would silently block
+# re-detection for the whole cooldown window with no recovery path).
+# KEYS[1] = cooldown_key   KEYS[2] = queue_key
+# ARGV[1] = cooldown_ttl_seconds   ARGV[2] = queue_payload
+# Returns 1 if claimed+queued, 0 if cooldown was already active.
+_COOLDOWN_ENQUEUE_LUA = """
+if redis.call('SET', KEYS[1], 1, 'NX', 'EX', ARGV[1]) then
+    redis.call('LPUSH', KEYS[2], ARGV[2])
+    return 1
+end
+return 0
+"""
+
+
+def _redetect_reason(company_row) -> str:
+    """Return a short description of why this company needs re-detection."""
+    platform   = company_row.get("ats_platform", "unknown")
+    slug       = company_row.get("ats_slug")
+    empty_days = company_row.get("consecutive_empty_days", 0) or 0
+    if not platform or platform == "unknown":
+        return "unknown_platform"
+    if platform == "custom":
+        return "custom_no_curl"
+    if not slug:
+        return "no_slug"
+    return f"empty_days={empty_days}"
+
+
+def _enqueue_re_enrichment(company, company_row, result, _r, empty_days, *, log_label=""):
+    """Queue fein for domain re-enrichment. Sets result['queued_enrichment']=1 on success."""
+    fein   = company_row.get("employer_fein")
+    domain = company_row.get("domain")
+    if not fein:
+        logger.warning(
+            "Re-detection needed for %r (domain=%s empty_days=%d) "
+            "— no employer_fein, cannot queue enrichment",
+            company, domain, empty_days,
+        )
+        return
+    if _r is None:
+        logger.debug("Redis unavailable — skipping re-enrichment for %r (fein=%s)", company, fein)
+        return
+    try:
+        r = _r
+        _cooldown_key = f"job_monitor:redetect_cooldown:{fein}"
+        petition_count = company_row.get("petition_count") or 1
+        _source = "company_ats" if parse_company_ats_key(company) is not None else "prospective"
+        _payload = json.dumps({"fein": fein, "trigger": "redetect", "source": _source, "petition_count": petition_count})
+        _claimed = r.eval(
+            _COOLDOWN_ENQUEUE_LUA, 2, _cooldown_key, HEAD_CHECK_BATCH,
+            JOB_MONITOR_REDETECT_DAYS * 86400, _payload,
+        )
+        if not _claimed:
+            logger.debug("Re-enrichment cooldown active for %r (fein=%s) — skipping", company, fein)
+            return
+        result["queued_enrichment"] = 1
+        tag = f" ({log_label})" if log_label else ""
+        _reason = _redetect_reason(company_row)
+        logger.info(
+            "Re-enrichment queued%s for %r (fein=%s domain=%s trigger=%s)",
+            tag, company, fein, domain, _reason,
+        )
+    except Exception as exc:
+        logger.warning("Failed to queue re-enrichment for %r (fein=%s): %s", company, fein, exc)
 
 
 # ─────────────────────────────────────────
@@ -797,9 +896,7 @@ def _merge_company_stats(stats: dict, stats_lock: threading.Lock, company_stats:
 # Logic is identical to the original sequential loop body.
 # Only difference: uses semaphore instead of between_companies_delay().
 # ─────────────────────────────────────────
-_REDETECT_SEMAPHORE = threading.Semaphore(1)
-
-def _process_company(company_row, position, total):
+def _process_company(company_row, position, total, _r=None):
     """
     Process one company: fetch jobs, filter, save new ones.
     Called by ThreadPoolExecutor — one call per company.
@@ -826,19 +923,16 @@ def _process_company(company_row, position, total):
     logger.info("── [%d/%d] %r  platform=%s",
                 position, total, company, platform)
 
-    # ── ATS re-detection intentionally disabled ───────────
-    # detect_ats() is unreliable and overwrites working configs with wrong
-    # results when it misidentifies a company's ATS tenant (e.g. assigned
-    # Gartner's Workday slug to SAP America after SF timeouts pushed
-    # consecutive_empty_days to 14+). Run --detect-ats manually only.
-    # Logging still fires so stale companies are visible in logs.
+    # ── Re-enrichment trigger (consecutive empty days) ────
+    # When a company returns zero jobs for JOB_MONITOR_REDETECT_DAYS consecutive
+    # days, its careers_url or ATS slug may have changed. Push to the enrichment
+    # queue so domain_enrichment_worker re-verifies public_domain + careers_url,
+    # then automatically pushes to discovery_queue for ATS re-detection.
+    # Only fires when employer_fein is known (H1B-tracked companies).
     if needs_redetection(company_row, JOB_MONITOR_REDETECT_DAYS):
-        domain = company_row.get("domain")
-        logger.warning(
-            "Re-detection needed for %r (domain=%s, empty_days=%d) "
-            "— skipped (inline re-detection disabled, run --detect-ats manually)",
-            company, domain,
-            company_row.get("consecutive_empty_days", 0),
+        _enqueue_re_enrichment(
+            company, company_row, result, _r,
+            empty_days=company_row.get("consecutive_empty_days", 0),
         )
 
     if platform == "unknown" or not slug:
@@ -942,6 +1036,17 @@ def _process_company(company_row, position, total):
     if not raw_jobs:
         logger.info("No jobs returned for %r", company)
         update_company_check(company, found_jobs=False)
+        # Re-check threshold with the just-incremented count — the pre-run check at the
+        # top of this function used the old value, so a company that crossed the threshold
+        # during this run would be missed for a full day without this second check.
+        if not result.get("queued_enrichment"):
+            _new_empty = (company_row.get("consecutive_empty_days") or 0) + 1
+            if needs_redetection({**company_row, "consecutive_empty_days": _new_empty},
+                                  JOB_MONITOR_REDETECT_DAYS):
+                _enqueue_re_enrichment(
+                    company, company_row, result, _r,
+                    _new_empty, log_label="threshold just crossed",
+                )
         print(f"  [{position}/{total}] {company} — 0 jobs")
         return result
 
@@ -1543,3 +1648,6 @@ def run_resolve_diagnostic(diagnostic_id=None, company=None):
             print(f"[ERROR] Could not resolve #{diagnostic_id}")
     else:
         print("[ERROR] Provide --resolve-diagnostic <id> or --company <name>")
+
+
+

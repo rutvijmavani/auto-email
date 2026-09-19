@@ -1,4 +1,4 @@
-﻿# Adaptive Job Monitoring Architecture
+# Adaptive Job Monitoring Architecture
 
 ## Table of Contents
 
