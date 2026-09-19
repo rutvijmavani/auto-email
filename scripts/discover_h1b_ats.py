@@ -971,15 +971,20 @@ def brave_career_search(
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_html(url: str) -> tuple[str | None, str]:
+def _fetch_html(url: str, session=None) -> tuple[str | None, str]:
     """
     GET url following redirects manually (SSRF-validates every hop).
     Returns (html_text, final_url) or (None, url) on failure.
+
+    session: optional caller-owned safe session, reused across probes and left open.
+    When omitted, a private session is created and closed before returning.
     """
     if not _is_public_url(url):
         return None, url
     current = url
-    session = _make_safe_session()
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
     try:
         for _ in range(_MAX_REDIRECTS):
             r = session.get(
@@ -1008,6 +1013,9 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
         result = _fetch_via_worker(url)
         if result:
             return result
+    finally:
+        if owns_session:
+            session.close()
     return None, url
 
 
@@ -1074,9 +1082,12 @@ _CDN_DOMAINS = frozenset({
 })
 
 
-def _resolve_website_redirect(url: str) -> str:
+def _resolve_website_redirect(url: str, session=None) -> str:
     """
     Fetch the company root URL and follow redirects to detect rebrands/domain changes.
+
+    session: optional caller-owned safe session (left open); a private one is created
+    and closed when omitted.
 
     Cases:
       - Redirect fails / times out         → return original unchanged
@@ -1089,13 +1100,15 @@ def _resolve_website_redirect(url: str) -> str:
     parsed   = urlparse(url)
     root_url = f"{parsed.scheme}://{parsed.netloc}/"
     final_url = None
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
 
     try:
         # Manual redirect loop: every hop is SSRF-validated (allow_redirects=True
         # would let a public host bounce us to an internal address unchecked).
         # The safe session's SSRFAdapter re-validates the resolved IPs at connect
         # time and pins the connection to the validated address for HTTP hops.
-        session = _make_safe_session()
         current = root_url
         for _ in range(_MAX_REDIRECTS):
             r = session.get(current, timeout=8, allow_redirects=False,
@@ -1119,6 +1132,9 @@ def _resolve_website_redirect(url: str) -> str:
             _, worker_final = result
             final_url = worker_final.rstrip("/")
             log.debug("_resolve_website_redirect: CF Worker resolved %s → %s", url, final_url)
+    finally:
+        if owns_session:
+            session.close()
 
     if final_url is None:
         return url
@@ -1151,6 +1167,7 @@ def _resolve_website_redirect(url: str) -> str:
 
 def discover_careers_url(
     website_url: str,
+    session=None,
 ) -> tuple[str | None, str | None, str | None]:
     """
     Probe 19 career URL patterns for company website.
@@ -1162,7 +1179,26 @@ def discover_careers_url(
       - Final URL jumped to unrelated domain (not company domain or known ATS)
 
     Bonus: if redirect lands on known ATS domain, captures ATS from URL directly.
+
+    session: optional caller-owned safe session, reused for every probe and left open.
+    When omitted, ONE session is created for the whole probe run and closed on exit
+    (including failures). Sessions are never shared across threads or held module-wide.
     """
+    owns_session = session is None
+    if owns_session:
+        session = _make_safe_session()
+    try:
+        return _probe_career_urls(website_url, session)
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _probe_career_urls(
+    website_url: str,
+    session,
+) -> tuple[str | None, str | None, str | None]:
+    """Body of discover_careers_url: probe candidates with the caller's session."""
     if not _is_public_url(website_url):
         log.warning("Skipping non-public URL: %s", website_url)
         return None, None, None
@@ -1182,7 +1218,7 @@ def discover_careers_url(
 
     _fallback = None  # ATS-domain hit with no slug match — returned only if no better result found
     for url in candidates:
-        html, final_url = _fetch_html(url)
+        html, final_url = _fetch_html(url, session)
         if html is None:
             continue
 
@@ -1661,38 +1697,41 @@ def process_employer(
             detected_slug     = _hit.get("slug")
             ats_source        = "phase1_kg"
     elif website_url:
-        # Phase 3: 19-pattern probe
-        website_url = _resolve_website_redirect(website_url)
-        log.info("  Probing 19 career URL patterns on %s …", website_url)
-        try:
-            careers_url, detected_platform, detected_slug = discover_careers_url(
-                website_url
-            )
-            if careers_url:
-                careers_source = "phase3"
-            if detected_platform:
-                ats_source = "phase3"
-        except Exception as e:
-            log.warning("  Career probe failed: %s", e)
+        # One safe session for this employer's whole Phase 3-5 fetch run (redirect
+        # resolution, 19 probes, Brave-page fingerprint); closed on every exit path.
+        with _make_safe_session() as _fetch_session:
+            # Phase 3: 19-pattern probe
+            website_url = _resolve_website_redirect(website_url, _fetch_session)
+            log.info("  Probing 19 career URL patterns on %s …", website_url)
+            try:
+                careers_url, detected_platform, detected_slug = discover_careers_url(
+                    website_url, _fetch_session
+                )
+                if careers_url:
+                    careers_source = "phase3"
+                if detected_platform:
+                    ats_source = "phase3"
+            except Exception as e:
+                log.warning("  Career probe failed: %s", e)
 
-        # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
-        if not careers_url and not skip_brave:
-            search_name = canonical_name or strip_legal_suffixes(name) or name
-            log.info("  Brave search fallback for %r …", search_name)
-            brave_url = brave_career_search(search_name, website_url=website_url)
-            if brave_url:
-                careers_url    = brave_url
-                careers_source = "phase4"
-                log.info("  Brave found: %s", brave_url)
-                # Phase 5: fingerprint the Brave result page
-                try:
-                    html, _ = _fetch_html(brave_url)
-                    if html:
-                        detected_platform, detected_slug = _find_ats_in_html(html)
-                        if detected_platform:
-                            ats_source = "phase5"
-                except Exception as e:
-                    log.warning("  HTML fingerprint failed: %s", e)
+            # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
+            if not careers_url and not skip_brave:
+                search_name = canonical_name or strip_legal_suffixes(name) or name
+                log.info("  Brave search fallback for %r …", search_name)
+                brave_url = brave_career_search(search_name, website_url=website_url)
+                if brave_url:
+                    careers_url    = brave_url
+                    careers_source = "phase4"
+                    log.info("  Brave found: %s", brave_url)
+                    # Phase 5: fingerprint the Brave result page
+                    try:
+                        html, _ = _fetch_html(brave_url, _fetch_session)
+                        if html:
+                            detected_platform, detected_slug = _find_ats_in_html(html)
+                            if detected_platform:
+                                ats_source = "phase5"
+                    except Exception as e:
+                        log.warning("  HTML fingerprint failed: %s", e)
 
     # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.

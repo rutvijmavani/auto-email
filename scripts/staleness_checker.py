@@ -72,9 +72,28 @@ log = get_logger(__name__)
 # is only a crash-safety fallback expiry.
 _ENQUEUE_GUARD_PREFIX = "head_check:enqueue_guard:"
 
+# Guard SET NX EX and RPUSH in one atomic step: with a separate SET followed by a buffered
+# pipeline RPUSH, a crash (or failed pipeline flush) between them leaves the guard held with
+# nothing queued, suppressing the company until the guard TTL expires.
+# KEYS[1]=guard key, KEYS[2]=LIST queue; ARGV[1]=guard TTL seconds, ARGV[2]=member.
+_GUARDED_RPUSH_LUA = """
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[1]) then
+    redis.call('RPUSH', KEYS[2], ARGV[2])
+    return 1
+end
+return 0
+"""
+
 
 def _enqueue_guard_key(queue: str, fein: str, trigger: str, source) -> str:
     return f"{_ENQUEUE_GUARD_PREFIX}{queue}:{fein}:{trigger}:{source or ''}"
+
+
+def _guarded_rpush(r, queue_key: str, fein: str, trigger: str, source, member: str) -> bool:
+    """Atomically take the enqueue guard and RPUSH member. True if pushed, False if guarded."""
+    guard_key = _enqueue_guard_key(queue_key, fein, trigger, source)
+    return bool(r.eval(_GUARDED_RPUSH_LUA, 2, guard_key, queue_key,
+                       HEAD_CHECK_ENQUEUE_GUARD_TTL_S, member))
 
 
 def _is_maintenance(r) -> bool:
@@ -99,7 +118,9 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
     """
     added = 0
     dry_run_sample: list = []
-    pipe = None if dry_run else r.pipeline(transaction=False)
+    # The LIST path pushes atomically per item (guard + RPUSH in one Lua call), so the
+    # pipeline is only used for the ZSET path.
+    pipe = None if dry_run or use_list else r.pipeline(transaction=False)
 
     with conn.named_cursor(cursor_name) as cur:
         cur.itersize = 500
@@ -111,13 +132,6 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                 added += 1
                 continue
             fein = row["employer_fein"]
-            if use_list:
-                # A plain LIST has no member-identity dedup like ZADD — guard against
-                # re-enqueuing a company that's already queued or being processed from
-                # a prior (still-draining) staleness_checker run.
-                guard_key = _enqueue_guard_key(queue_key, fein, trigger, source)
-                if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
-                    continue
             payload: dict = {
                 "fein": fein, "trigger": trigger, "source": source,
             }
@@ -131,9 +145,14 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
                 payload["tier"] = tier
             member = json.dumps(payload)
             if use_list:
-                pipe.rpush(queue_key, member)
-            else:
-                pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
+                # A plain LIST has no member-identity dedup like ZADD — the guard stops
+                # re-enqueuing a company already queued or being processed from a prior
+                # (still-draining) staleness_checker run.
+                if not _guarded_rpush(r, queue_key, fein, trigger, source, member):
+                    continue
+                added += 1
+                continue
+            pipe.zadd(queue_key, {member: row["petition_count"]}, gt=True)
             added += 1
             if added % STALENESS_ZADD_BATCH == 0:
                 pipe.execute()
@@ -158,7 +177,7 @@ def _stream_and_zadd(conn, r, sql, params, queue_key, cursor_name, log_prefix, d
             log.info("[dry-run] ... and %d more", added - 5)
         return added
 
-    if added % STALENESS_ZADD_BATCH != 0:
+    if not use_list and added % STALENESS_ZADD_BATCH != 0:
         pipe.execute()
 
     op = "RPUSH" if use_list else "ZADD"
@@ -288,7 +307,6 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
     """
     redetect_days = JOB_MONITOR_REDETECT_DAYS
     added = 0
-    pipe = None if dry_run else r.pipeline(transaction=False)
 
     # 3a — company_ats silent rows
     with conn.named_cursor("redetect_company_ats") as cur:
@@ -313,15 +331,9 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                 added += 1
                 continue
             fein = row["employer_fein"]
-            guard_key = _enqueue_guard_key(HEAD_CHECK_BATCH, fein, "redetect", "company_ats")
-            if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
-                continue
             member = json.dumps({"fein": fein, "petition_count": row["petition_count"], "trigger": "redetect", "source": "company_ats"})
-            pipe.rpush(HEAD_CHECK_BATCH, member)
-            added += 1
-            if added % STALENESS_ZADD_BATCH == 0:
-                pipe.execute()
-                pipe = r.pipeline(transaction=False)
+            if _guarded_rpush(r, HEAD_CHECK_BATCH, fein, "redetect", "company_ats", member):
+                added += 1
 
     # 3b — prospective_companies silent rows
     with conn.named_cursor("redetect_prospective") as cur:
@@ -348,18 +360,9 @@ def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
                 added += 1
                 continue
             fein = row["employer_fein"]
-            guard_key = _enqueue_guard_key(HEAD_CHECK_BATCH, fein, "redetect", "prospective")
-            if not r.set(guard_key, "1", nx=True, ex=HEAD_CHECK_ENQUEUE_GUARD_TTL_S):
-                continue
             member = json.dumps({"fein": fein, "petition_count": row["petition_count"], "trigger": "redetect", "source": "prospective"})
-            pipe.rpush(HEAD_CHECK_BATCH, member)
-            added += 1
-            if added % STALENESS_ZADD_BATCH == 0:
-                pipe.execute()
-                pipe = r.pipeline(transaction=False)
-
-    if not dry_run and pipe is not None and added % STALENESS_ZADD_BATCH != 0:
-        pipe.execute()
+            if _guarded_rpush(r, HEAD_CHECK_BATCH, fein, "redetect", "prospective", member):
+                added += 1
 
     if not added:
         log.info("redetect staleness: no companies need re-detection")
