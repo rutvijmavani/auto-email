@@ -1089,9 +1089,24 @@ def _resolve_website_redirect(url: str) -> str:
     final_url = None
 
     try:
-        r = requests.get(root_url, timeout=8, allow_redirects=True,
-                         headers=_API_HEADERS)
-        final_url = r.url.rstrip("/")
+        # Manual redirect loop: every hop is SSRF-validated (allow_redirects=True
+        # would let a public host bounce us to an internal address unchecked).
+        current = root_url
+        for _ in range(_MAX_REDIRECTS):
+            r = requests.get(current, timeout=8, allow_redirects=False,
+                             headers=_API_HEADERS)
+            if r.is_redirect:
+                next_url = urljoin(current, r.headers.get("Location", ""))
+                if not _is_public_url(next_url):
+                    log.debug("_resolve_website_redirect: redirect to non-public URL blocked: %s", next_url)
+                    return url
+                current = next_url
+                continue
+            final_url = current.rstrip("/")
+            break
+        else:
+            log.debug("_resolve_website_redirect: too many redirects for %s — keeping original", url)
+            return url
     except Exception as exc:
         log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
         result = _fetch_via_worker(root_url)

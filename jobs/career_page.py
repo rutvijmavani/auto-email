@@ -106,6 +106,16 @@ _ATS_SCRIPT_HINTS = (
 # How many individual job links to follow when top-level scan misses
 _MAX_JOB_LINKS = 3
 
+# Career-content phrases: a page returning HTTP 200 is only promoted to the
+# "best careers page" hint if it shows ATS / job-link / one of these phrases.
+# Generic soft-404 pages (200 + "page not found") match none of them.
+_CAREER_CONTENT_RE = re.compile(
+    r"open\s+(?:positions|roles|jobs)|current\s+(?:openings|opportunities|vacancies)"
+    r"|job\s+openings|join\s+our\s+team|career\s+opportunities|search\s+(?:jobs|openings)"
+    r"|view\s+(?:all\s+)?(?:jobs|openings|positions)|apply\s+now|explore\s+(?:careers|jobs|roles)",
+    re.IGNORECASE,
+)
+
 # Platforms where the slug is opaque (not derived from company name) —
 # skip slug-vs-company validation for these
 _OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm"}
@@ -212,13 +222,9 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             _final_path  = urlparse(final_url).path
             if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
                 first_redirect_url = final_url
-        if html is not None and first_career_html is None:
-            _page_root  = _reg_domain(final_url)
-            _probe_root = _reg_domain(domain)
-            _page_path  = urlparse(final_url).path
-            if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
-                first_career_html = html
-                first_career_url  = final_url
+        if html is not None and first_career_html is None and _is_career_page(result, html, final_url, domain):
+            first_career_html = html
+            first_career_url  = final_url
 
     # ── Apex fallback — retry with bare domain if www. probe produced nothing ───
     # Some companies serve careers only from the apex (e.g. example.com/careers)
@@ -244,13 +250,9 @@ def detect_via_career_page(company, domain, *, careers_url=None):
                 _final_path  = urlparse(final_url).path
                 if (_final_root == _domain_root or match_ats_pattern(final_url)) and _final_path not in ("", "/"):
                     first_redirect_url = final_url
-            if html is not None and first_career_html is None:
-                _page_root  = _reg_domain(final_url)
-                _probe_root = _reg_domain(domain)
-                _page_path  = urlparse(final_url).path
-                if (_page_root == _probe_root or match_ats_pattern(final_url)) and _page_path not in ("", "/"):
-                    first_career_html = html
-                    first_career_url  = final_url
+            if html is not None and first_career_html is None and _is_career_page(result, html, final_url, domain):
+                first_career_html = html
+                first_career_url  = final_url
 
     # ── Layer 3: follow job listing links ─────────────────────────────────
     # Individual job pages almost always link to or embed the ATS directly
@@ -282,6 +284,27 @@ def detect_via_career_page(company, domain, *, careers_url=None):
 
     logger.debug("[P3a MISS] %r (domain=%s)", company, domain)
     return None
+
+
+def _is_career_page(result, html, final_url, domain):
+    """Return True if a 200 page may be promoted to the best careers-page hint.
+
+    Location filter (unchanged): same registered domain as the probed company
+    (or an ATS-pattern URL), and not the bare root path.  New evidence filter:
+    an ATS hit, an extractable job link, or a career-content phrase must be
+    present, so a generic HTTP 200 soft-404 page is never promoted.
+    """
+    if not final_url:
+        return False
+    if urlparse(final_url).path in ("", "/"):
+        return False
+    if not (_reg_domain(final_url) == _reg_domain(domain) or match_ats_pattern(final_url)):
+        return False
+    if result is not None:
+        return True
+    if _extract_job_links(html, final_url, domain):
+        return True
+    return bool(_CAREER_CONTENT_RE.search(html))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
