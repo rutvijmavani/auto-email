@@ -376,6 +376,7 @@ ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD"
 ATS_MANAGER_IDLE_CYCLES         = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",         "3"))    # consecutive empty poll cycles → stop workers
 HEAD_CHECK_MAX_RETRIES          = int(os.getenv("HEAD_CHECK_MAX_RETRIES",           "3"))
 HEAD_CHECK_HEARTBEAT_S          = int(os.getenv("HEAD_CHECK_HEARTBEAT_S",           "30"))
+HEAD_CHECK_CACHE_PREFIX         = "head_check:"  # Redis key prefix for the per-FEIN HEAD-result cache (head_check:{fein}); shared so enrichment can invalidate it
 HEAD_CHECK_CACHE_TTL_S          = int(os.getenv("HEAD_CHECK_CACHE_TTL_S",           str(6 * 3600)))  # Redis TTL for head_check:{fein} cache
 HEAD_CHECK_ENQUEUE_GUARD_TTL_S  = int(os.getenv("HEAD_CHECK_ENQUEUE_GUARD_TTL_S",   str(24 * 3600)))  # fallback expiry for staleness_checker's HEAD_CHECK_BATCH dedup guard (crash safety; normally released explicitly by head_check_worker)
 ENRICHMENT_MAX_RETRIES          = int(os.getenv("ENRICHMENT_MAX_RETRIES",           "3"))

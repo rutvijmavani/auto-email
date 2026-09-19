@@ -58,6 +58,7 @@ from config import (
 from db.connection import get_conn
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
+from jobs.http_safe import make_safe_session as _make_safe_session
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 
@@ -978,9 +979,10 @@ def _fetch_html(url: str) -> tuple[str | None, str]:
     if not _is_public_url(url):
         return None, url
     current = url
+    session = _make_safe_session()
     try:
         for _ in range(_MAX_REDIRECTS):
-            r = requests.get(
+            r = session.get(
                 current, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
                 allow_redirects=False,
             )
@@ -1091,10 +1093,13 @@ def _resolve_website_redirect(url: str) -> str:
     try:
         # Manual redirect loop: every hop is SSRF-validated (allow_redirects=True
         # would let a public host bounce us to an internal address unchecked).
+        # The safe session's SSRFAdapter re-validates the resolved IPs at connect
+        # time and pins the connection to the validated address for HTTP hops.
+        session = _make_safe_session()
         current = root_url
         for _ in range(_MAX_REDIRECTS):
-            r = requests.get(current, timeout=8, allow_redirects=False,
-                             headers=_API_HEADERS)
+            r = session.get(current, timeout=8, allow_redirects=False,
+                            headers=_API_HEADERS)
             if r.is_redirect:
                 next_url = urljoin(current, r.headers.get("Location", ""))
                 if not _is_public_url(next_url):

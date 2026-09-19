@@ -38,6 +38,7 @@ from config import (
     ENRICHMENT_INFLIGHT,
     ENRICHMENT_MAX_RETRIES,
     ENRICHMENT_ON_DEMAND,
+    HEAD_CHECK_CACHE_PREFIX,
     REDIS_DB_MAINTENANCE,
     STALENESS_DISCOVERY_MIN_PETITIONS,
 )
@@ -266,6 +267,8 @@ def _write_metric(conn, fein: str, trigger: str,
 
 
 def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
+    """UPDATE fein_domain_map.careers_url (no commit). Callers must call
+    _invalidate_head_check_cache(r, fein) after the commit."""
     conn.execute("""
         UPDATE fein_domain_map
         SET careers_url    = %s,
@@ -273,6 +276,16 @@ def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
             updated_at     = NOW()
         WHERE employer_fein = %s
     """, (careers_url, source, fein))
+
+
+def _invalidate_head_check_cache(r, fein: str) -> None:
+    """Drop head_check:{fein} so the next HEAD check probes the freshly written
+    careers_url instead of replaying a cached verdict for the old (dead) one.
+    Best-effort: the DB write is already committed and the cache TTL bounds staleness."""
+    try:
+        r.delete(f"{HEAD_CHECK_CACHE_PREFIX}{fein}")
+    except Exception as exc:
+        log.warning("head_check cache invalidation failed fein=%s: %s", fein, exc)
 
 
 def _write_ats(conn, fein: str, domain: str, company_name: str,
@@ -386,6 +399,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             _careers_source_this_run = "phase3"
             _write_careers(conn, fein, careers_url, source="phase3")
             conn.commit()
+            _invalidate_head_check_cache(r, fein)
             log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
 
         # ── Step 3: Phase 6 — career page ATS scan (only if Phase 3 found nothing) ──
@@ -434,6 +448,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
             (fein,),
         )
         conn.commit()
+        if _careers_source_this_run == "phase6":
+            _invalidate_head_check_cache(r, fein)
 
         # ── Step 4: push to discovery (skip on_demand — loop stops here) ─────
         # redetect items are already-monitored companies whose ATS went silent —

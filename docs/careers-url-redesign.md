@@ -91,7 +91,7 @@ Trigger is not used inside write functions. It controls two routing decisions:
 | `"redetect"` | Yes, always (gate bypassed) | → discovery (ATS re-detection needed) |
 | `"manual"` | Yes, always (gate bypassed) | → discovery |
 
-**Note:** api.py pushes with trigger=`"enrichment"` when `careers_url IS NULL` (never enriched) — goes directly to `enrichment:on_demand`, bypassing head_check. The `"on_demand"` trigger only reaches the enrichment worker after head_check confirmed the URL is dead (Cases 3, 4, 6).
+**Note:** `/verify-company` in api.py pushes with trigger=`"on_demand"` (`tier="on_demand"`) to `enrichment:on_demand` when the careers URL is unknown (`careers_url IS NULL`), bypassing head_check. The `"on_demand"` trigger also reaches the enrichment worker from head_check when the URL is confirmed dead (Cases 3, 4, 6). Either way the enrichment worker stops this trigger before discovery (see the `"on_demand"` row above).
 
 ---
 
@@ -225,7 +225,7 @@ Discovery has no `tier`/on_demand concept — head_check_worker routes by `trigg
 
 | Producer | Trigger | Lane |
 |---|---|---|
-| `api.py` / Discover page (user visit, careers_url NULL, never enriched) | `"enrichment"` | `enrichment:on_demand` |
+| `api.py` / Discover page (user visit, careers_url NULL, never enriched) | `"on_demand"` | `enrichment:on_demand` |
 | `api.py` / Discover page (user visit, any other case) | `"on_demand"` | `head_check:on_demand` |
 | `staleness_checker` enrichment pass | `"staleness"` | `enrichment:batch` |
 | `staleness_checker` redetect pass | `"redetect"` | `head_check:batch` |
@@ -373,7 +373,7 @@ User visits company X:
 
 Special case — `careers_url IS NULL` and `last_enriched_at IS NULL` (never enriched):
 - Skip HEAD_CHECK entirely (nothing to check)
-- Push directly to `enrichment:on_demand` with trigger=`"enrichment"`
+- Push directly to `enrichment:on_demand` with trigger=`"on_demand"`
 
 ---
 
@@ -512,7 +512,7 @@ Update `install-systemd.sh`:
 
 **9. `api.py`**
    - On-visit: push to `head_check:on_demand` (not inline HEAD check, not daemon thread)
-   - Special case NULL + never enriched: push to `enrichment:on_demand` trigger="enrichment"
+   - Special case NULL + never enriched: push to `enrichment:on_demand` trigger="on_demand"
    - `_background_verify()`: HEAD-check Redis key uses `fein_domain_map.careers_url`
    - `verify_company()` DB query: read from `fein_domain_map` not `h1b_ats_discovery`
    - `finally` block: guard `conn.rollback()` so `conn.close()` always runs

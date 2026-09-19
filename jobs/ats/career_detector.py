@@ -561,16 +561,11 @@ def _fetch(url, session, referer=None, is_script=False, is_api=False):
         logger.debug("[detector] oversized response skipped %s: %s", url, e)
         return None, url
     except Exception as e:
-        # SSL fallback to HTTP
+        # TLS failure: never retry over cleartext http:// (MITM/spoof vector — the
+        # fetched page's links feed persisted careers_url/ATS detection).
         if "ssl" in str(e).lower() or "SSL" in type(e).__name__:
-            try:
-                resp = _get(url.replace("https://", "http://", 1))
-                if resp is not None and resp.status_code == 200:
-                    return _read_bounded_text(resp), resp.url
-                if resp is not None:
-                    resp.close()
-            except Exception:
-                pass
+            logger.debug("[detector] TLS error %s: %s — not retrying over http", url, e)
+            return None, url
         logger.debug("[detector] fetch error %s: %s", url, e)
         # Network-level failure — try CF Worker (handles IP blocks, DNS fails)
         result = _fetch_via_worker(url)

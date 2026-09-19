@@ -53,6 +53,7 @@ from config import (
     ENRICHMENT_ON_DEMAND,
     FETCH_TIMEOUT,
     HEAD_CHECK_BATCH,
+    HEAD_CHECK_CACHE_PREFIX,
     HEAD_CHECK_CACHE_TTL_S,
     HEAD_CHECK_DLQ,
     HEAD_CHECK_HEARTBEAT_S,
@@ -113,7 +114,7 @@ def _is_maintenance(r) -> bool:
 # Redis cache helpers  (head_check:{fein})
 # ─────────────────────────────────────────────────────────────────────────────
 
-_CACHE_PREFIX = "head_check:"
+_CACHE_PREFIX = HEAD_CHECK_CACHE_PREFIX
 
 
 def _cache_get(r, fein: str) -> "dict | None":
