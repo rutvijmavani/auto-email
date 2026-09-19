@@ -30,9 +30,12 @@ ProtectSystem=full
 # tmpfs mode ReadWritePaths= alone cannot re-expose a path — only BindPaths=/
 # BindReadOnlyPaths= can bind a directory back into the empty tmpfs, keeping
 # WorkingDirectory and ExecStart paths visible.
+# The UI never writes to the repo: DB/Redis writes go over network sockets, the
+# UI process never calls init_logging (no logs/ files), and the inline-discovery
+# path never reaches the Brave quota file (data/brave_quota.json). So the repo is
+# bound read-only — least privilege, unlike the workers that need logs/ and data/.
 ProtectHome=tmpfs
-BindPaths=/home/opc/mail
-ReadWritePaths=/home/opc/mail
+BindReadOnlyPaths=/home/opc/mail
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=streamlit-frontend
