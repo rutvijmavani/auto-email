@@ -230,7 +230,9 @@ def _http_head(url: str) -> "tuple[requests.Response | None, Exception | None, s
             if not _is_safe_url(next_url):
                 return None, None, logical_url
             current_url = next_url
-        return resp, None, logical_url
+        # Redirect chain exhausted without reaching a terminal response — dead, not
+        # a 3xx that _classify() could mistake for a completed redirect.
+        return None, None, logical_url
     except Exception as exc:
         return None, exc, url
 
@@ -509,10 +511,10 @@ def _reclaim_inflight(r, own_ondemand_key: str, own_batch_key: str) -> None:
         # stranding any items left over from a prior crash that reused the same key).
         reclaimed = 0
         while True:
-            raw = r.rpop(key)
+            # Atomic move: a crash between separate RPOP + RPUSH would drop the item.
+            raw = r.lmove(key, target_queue, "RIGHT", "RIGHT")
             if raw is None:
                 break
-            r.rpush(target_queue, raw)
             reclaimed += 1
         if reclaimed:
             log.warning("head_check: reclaimed %d inflight items from orphaned key %s", reclaimed, key)

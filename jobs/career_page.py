@@ -409,27 +409,10 @@ def _fetch_and_scan(url, company):
         logger.debug("[P3a] Oversized response skipped %s: %s", url, e)
         return None, None, None
 
-    except requests.exceptions.SSLError:
-        # Retry on HTTP
-        try:
-            http_url = url.replace("https://", "http://", 1)
-            resp     = _get_session().get(
-                http_url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True, stream=True
-            )
-            if resp.url != http_url:
-                r = match_ats_pattern(resp.url)
-                if r and _slug_ok(r, company):
-                    resp.close()
-                    return _enrich_eightfold_domain(r, resp.url), None, resp.url
-            if resp.status_code == 200:
-                text = _read_bounded_text(resp)
-                r = _scan_html(text, company)
-                if r:
-                    r = _enrich_eightfold_domain(r, resp.url)
-                return r, text, resp.url
-            resp.close()
-        except Exception:
-            pass
+    except requests.exceptions.SSLError as e:
+        # Fail closed: a TLS failure is never retried over cleartext HTTP, where an
+        # on-path attacker could inject ATS links/markers that we would then persist.
+        logger.debug("[P3a] TLS failure, not retrying over HTTP %s: %s", url, e)
         return None, None, None
 
     except requests.exceptions.Timeout:

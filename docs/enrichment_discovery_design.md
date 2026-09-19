@@ -377,16 +377,21 @@ head_check_worker (trigger="redetect" path):
 ```text
 User visits company X in UI
     ↓
-Background: HEAD/GET careers_url (cheap, no quota cost)
+api.py /verify-company always returns cached data immediately (never blocks the user),
+then routes in the background (per-FEIN cooldown key gates duplicate enqueues):
     ↓
-200 returned?
-    YES → mark careers_url_verified_at = NOW(), show cached data (fast path)
-    NO  (non-200 / redirects to wrong domain) →
-            show cached data immediately  (never block the user)
-            RPUSH enrichment:on_demand {"fein": ..., "trigger": "on_demand"}
-            manager.py autoscaler detects queue depth and starts worker(s)
-            worker re-detects careers_url in background
-            UI updates when fresh result written back
+careers_url known?
+    YES → LPUSH head_check:on_demand {"fein": ..., "trigger": "on_demand", "source": null}
+          head_check_worker applies the shared HEAD-check cache, redirect
+          classification and routing (Cases 1–6):
+            200 / clean → careers_url_verified_at = NOW()
+            dead / redirect to wrong domain → re-enrichment or discovery routing
+    NO  → LPUSH enrichment:on_demand
+          {"fein": ..., "trigger": "on_demand", "source": null, "tier": "on_demand"}
+    ↓
+manager.py autoscaler detects queue depth and starts worker(s)
+worker re-detects careers_url in background
+UI updates when fresh result written back
 ```
 
 Key principle: user always sees something immediately (cached).

@@ -97,7 +97,7 @@ def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
 # SQL ADAPTER — ? → %s
 # ─────────────────────────────────────────
 
-_DOLLAR_TAG_RE = re.compile(r'\$[A-Za-z_]*\$')
+_DOLLAR_TAG_RE = re.compile(r'\$(?:[^\W\d]\w*)?\$')
 
 
 def _adapt_sql(sql: str) -> str:

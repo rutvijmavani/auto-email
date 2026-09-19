@@ -159,7 +159,7 @@ The old stale row (platform that went silent) is no longer scraped immediately (
 
 `domain_enrichment_worker` and `discover_h1b_ats_worker` are oneshot queue consumers — they start when `staleness_checker.py` pushes work, drain the ZSET, and exit. Two gaps result:
 
-1. **`api.py` blind spot:** `_trigger_enrichment` pushes a FEIN to `DOMAIN_ENRICHMENT_QUEUE` but no worker is guaranteed to be running. If no worker is alive, the job sits until the next `staleness_checker` cron fires — up to 90 days later.
+1. **`api.py` blind spot:** `_trigger_enrichment` pushes a FEIN to `DOMAIN_ENRICHMENT_QUEUE` but no worker is guaranteed to be running. If no worker is alive, the job sits until the next daily `staleness_checker` run (05:00 timer) — at most about one day later. (The 90-day figure is the enrichment *staleness threshold*, not the timer frequency.)
 2. **`REDETECT_QUEUE` same problem:** pushing to a new queue doesn't help if no worker is listening.
 
 `startup_failure_alert.py` (the `OnFailure=` handler) only sends an email — it does **not** restart the worker. It grabs the last 30 journal lines, composes an HTML email ("Manual intervention required"), and exits. A human must SSH in and restart.

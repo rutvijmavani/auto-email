@@ -37,7 +37,8 @@ Add `careers_source` to `fein_domain_map` (already has `careers_url`).
 -- fein_domain_map: add careers_source column
 ALTER TABLE fein_domain_map
     ADD COLUMN IF NOT EXISTS careers_source TEXT;
--- 'phase3' | 'phase6' | 'phase1_kg' | 'phase4' | 'phase7' | 'head_check' | 'brave_pass'
+-- 'phase3' | 'phase6' | 'phase1_kg' | 'phase4' | 'phase7' | 'head_check'
+-- ('brave_pass' is only an h1b_ats_discovery.ats_source value, never a careers_source)
 
 -- h1b_ats_discovery: drop the duplicate columns
 ALTER TABLE h1b_ats_discovery DROP COLUMN IF EXISTS careers_url;
@@ -116,7 +117,9 @@ Step 3: KG / Wikidata P10311 fallback
 Step 4: Brave search (950/month quota — LAST RESORT before Phase 7)
         ONLY runs if Step 2 AND Step 3 both found nothing
         → write to fein_domain_map.careers_url if NULL
-        → set careers_source = 'phase4' (found) or 'brave_pass' (no result — attempt recorded)
+        → found: set careers_source = 'phase4'
+        → no result: fein_domain_map is left unchanged; the attempt is recorded in
+          h1b_ats_discovery.brave_checked_at only
 
 Step 5: Phase 7 — full ATS detector (career_detector.py detect_company())
         Runs with seed_url = fein_domain_map.careers_url (if set from any step above)
@@ -414,7 +417,9 @@ if not careers_url:
         if careers_url:
             _write_careers(conn, fein, careers_url, source="phase4")
         else:
-            _write_careers(conn, fein, careers_url, source="brave_pass")  # no-result sentinel — attempt still recorded
+            # No result: leave fein_domain_map untouched. The attempt is recorded via
+            # h1b_ats_discovery.brave_checked_at (see _brave_upsert), not a careers_source value.
+            pass
 
 # Step 5: Phase 7 ATS detection — always runs
 run_phase7(seed_url=careers_url)  # seed_url may be None
@@ -837,9 +842,9 @@ QUEUE LANES (universal member schema on all: {fein, trigger, source}):
           │    → brave_quota.json 950/month                  │
           │    → exhausted: skip, go Phase 7, log WARNING    │
           │    → if found: careers_source='phase4'           │
-          │    → if no result: careers_source='brave_pass'   │
-          │      (_brave_upsert's no-result sentinel —       │
-          │       still written so the attempt is recorded)  │
+          │    → if no result: fein_domain_map unchanged;    │
+          │      attempt recorded via brave_checked_at in    │
+          │      h1b_ats_discovery only (_brave_upsert)      │
           │                                                  │
           │  Step 4: Phase 7 — career_detector (always runs) │
           │  write company_ats                               │

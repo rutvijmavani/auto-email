@@ -1703,7 +1703,7 @@ def process_employer(
         log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
-            _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg"} else None
+            _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg", "phase6"} else None
             _cd_results = detect_company(_cd_domain, seed_url=_cd_seed)
             if _cd_results:
                 # Prefer a result with a non-empty slug; fall back to partial detection
