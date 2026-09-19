@@ -399,6 +399,9 @@ def run_stale_purge(conn, dry_run: bool = False) -> int:
 
 def main(args: argparse.Namespace) -> None:
     r = get_redis()
+    # Fail fast (non-zero exit -> OnFailure alert) if Redis is down: the unit uses
+    # Wants= not Requires=, so this ping is what refuses to run against a dead Redis.
+    r.ping()
 
     if _is_maintenance(r):
         log.info("maintenance window active — skipping staleness check")

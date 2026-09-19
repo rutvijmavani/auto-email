@@ -3,6 +3,10 @@ Description=H1B enrichment/discovery staleness checker
 Documentation=https://github.com/rutvijmavani/auto-email
 After=network-online.target postgresql.service redis.service
 Wants=network-online.target
+# Wants= (not Requires=): Requires= would propagate a postgres/redis stop or restart
+# into this oneshot mid-run. "Never run against a dead DB" is enforced by the script
+# instead: get_conn() and r.ping() in staleness_checker.main() exit non-zero, which
+# fires OnFailure= below.
 Wants=postgresql.service redis.service
 OnFailure=recruiter-pipeline-alert@%p.service
 
