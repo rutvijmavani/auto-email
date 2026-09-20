@@ -365,6 +365,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
+        # End the read transaction opened by _load_company before the DNS/HTTP/Certspotter
+        # work in discover_public_domain — otherwise it holds AccessShare locks on
+        # fein_domain_map/dol_h1b_employers for the whole resolution and queues init_db's
+        # ALTER (and every later reader) behind it.
+        conn.commit()
+
         # ── Step 1: public domain resolution ──────────────────────────────────
         public_domain, method, retry_after = discover_public_domain(assigned)
 

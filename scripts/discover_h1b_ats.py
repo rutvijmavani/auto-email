@@ -1605,6 +1605,15 @@ def process_employer(
         existing_row = get_discovery_row(fein, conn)
         cached_mid   = existing_row.get("kg_mid") if existing_row else None
 
+        # End the read transaction opened by the caller's _load_company/get_discovery_row
+        # and _is_recently_checked before any network work. Left open, it keeps AccessShare
+        # locks on fein_domain_map/dol_h1b_employers/uscis_petition_counts for the whole
+        # KG/SPARQL/probe run, so init_db's ALTER queues behind it. kg_search's can_call()/
+        # increment_usage() then wait on model_usage (init_db locks it first) on a second
+        # pool connection while this one never commits — a cross-connection cycle Postgres
+        # cannot detect, so the pair hangs until a session is killed.
+        conn.commit()
+
         assigned_domain = emp.get("assigned_domain")
         all_candidates  = []
         kg_url          = None
@@ -1631,6 +1640,12 @@ def process_employer(
                 kg_url         = None
                 upsert_quality_event(conn, fein, name, "no_kg_match", None, all_candidates, dry_run)
 
+        # Commit the quality-event upsert now: it holds a row/unique-key lock on
+        # h1b_ats_quality_events (uq_quality_event_fein) that would otherwise stay open
+        # through SPARQL and Phases 3-7 — a second worker upserting the same FEIN, and
+        # init_db, wait behind it. The upsert is idempotent (ON CONFLICT ... WHERE NOT resolved).
+        conn.commit()
+
         if kg_mid:
             log.info("  SPARQL P646+P10311+P856 for MID %s …", kg_mid)
             sparql_res    = _sparql_batch_p10311([kg_mid])
@@ -1653,6 +1668,7 @@ def process_employer(
                                      {"name": canonical_name, "kg_mid": kg_mid, "_score": 0},
                                      all_candidates if not (cached_mid and not force) else [],
                                      dry_run)
+                conn.commit()  # same reason as above — do not hold it across Phases 3-7
                 kg_mid = wikidata_qid = jobs_url = glassdoor_id = crunchbase_id = None
                 canonical_name   = strip_legal_suffixes(name) or None
                 canonical_source = "regex" if canonical_name else None
