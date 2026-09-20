@@ -672,7 +672,12 @@ def _decode_google_redirect(url):
     if not url:
         return url
     from urllib.parse import urlparse, parse_qs, unquote
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Scraped HTML can contain "http://[..." — urlparse rejects the bracketed
+        # netlocs; treat as "not a Google redirect" and let the ATS regexes decide.
+        return url
     if parsed.path == "/url":
         qs = parse_qs(parsed.query)
         if "q" in qs:
