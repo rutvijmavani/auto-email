@@ -918,6 +918,16 @@ else:
 st.divider()
 st.markdown("#### ATS Discovery")
 
+# ca_entries / pipeline_st are computed before the disc branch: the review panel
+# further down renders even when there is no h1b_ats_discovery row for this employer.
+ca_entries = load_company_ats_entries(fein)
+_domain_hint = next((ca.get("domain") for ca in ca_entries if ca.get("domain")), None)
+pipeline_st = _pipeline_status(
+    name,
+    (disc or {}).get("canonical_name") or None,
+    domain=_domain_hint or (disc or {}).get("website_url"),
+)
+
 if disc is None:
     st.info("No discovery data yet for this employer.")
     if st.button("Run ATS discovery", key=f"run_disc_{fein}"):
@@ -1074,15 +1084,10 @@ else:
     slug     = disc.get("detected_slug")
     monitored = disc.get("is_monitored", False)
 
-    # Load company_ats entries here so both the ATS badge and the review panel
-    # below can share the same data without a second query.
-    ca_entries = load_company_ats_entries(fein)
     ca_any_monitored = any(ca.get("is_monitored") for ca in (ca_entries or []))
 
     st.markdown("")  # spacing
 
-    _domain_hint = next((ca.get("domain") for ca in (ca_entries or []) if ca.get("domain")), None)
-    pipeline_st = _pipeline_status(name, canonical if canonical != "—" else None, domain=_domain_hint or website)
     if platform:
         badge_col, action_col = st.columns([2, 3])
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
