@@ -28,7 +28,7 @@ Design decisions (see docs/dol_h1b_pipeline.md, docs/email-pattern-inference.md)
 import argparse
 import json
 import tldextract
-_tldextract = tldextract.TLDExtract(suffix_list_urls=())
+_tldextract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 import os
 import re
 import sys

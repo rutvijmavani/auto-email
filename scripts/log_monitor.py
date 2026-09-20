@@ -145,6 +145,14 @@ SUPPRESS_WARNING_PATTERNS: list[tuple[str, re.Pattern]] = [
     # company falls through to re-queue / no_signal handling — nothing to act on per line.
     ("Certspotter/crt.sh network error or crt.sh non-200 (external CT services, transient)",
      re.compile(r'certspotter error for |crt\.sh (HTTP \d{3}|error) for ')),
+    # domain_enrichment_worker / discover_h1b_ats_worker _reclaim_inflight: on every worker start
+    # (incl. each deploy, which stops the autoscaled workers) items left in that worker's own
+    # inflight ZSET are put back on the queue — the recovery path working as designed. The line
+    # carries the per-instance key and a count, so it never dedups. head_check_worker's
+    # "reclaimed N inflight items from orphaned key" (a dead PEER) is a different message and
+    # is deliberately still alerting.
+    ("Worker inflight reclaim on startup (crash/deploy recovery working as designed)",
+     re.compile(r'reclaiming \d+ inflight FEINs from')),
 ]
 
 

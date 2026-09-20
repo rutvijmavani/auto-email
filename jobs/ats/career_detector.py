@@ -22,7 +22,7 @@ from html import unescape as _html_unescape
 from urllib.parse import urljoin, urlparse
 
 import tldextract as _tldextract_mod
-_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
 from jobs.career_page import CAREER_PATHS
 from jobs.http_safe import (

@@ -23,7 +23,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from jobs.http_safe import make_safe_session as _make_safe_session
 import tldextract
-_tldextract = tldextract.TLDExtract(suffix_list_urls=())
+_tldextract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 import urllib3
 
 _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning

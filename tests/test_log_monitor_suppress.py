@@ -74,6 +74,20 @@ class TestLogMonitorSuppress(unittest.TestCase):
             for line in self._both("WARNING", msg):
                 self.assertTrue(_is_suppressed(line), msg)
 
+    def test_worker_inflight_reclaim_on_startup_suppressed(self):
+        for msg in ("reclaiming 1 inflight FEINs from domain_enrichment:inflight:1",
+                    "reclaiming 3 inflight FEINs from prior run (key=discover:inflight:2)"):
+            for line in self._both("WARNING", msg):
+                self.assertTrue(_is_suppressed(line), msg)
+
+    def test_orphaned_peer_reclaim_and_error_level_still_alert(self):
+        peer = "head_check: reclaimed 2 inflight items from orphaned key head_check:inflight:3"
+        for line in self._both("WARNING", peer):
+            self.assertFalse(_is_suppressed(line))
+            self.assertTrue(_is_flagged(line))
+        for line in self._both("ERROR", "reclaiming 1 inflight FEINs from x"):
+            self.assertFalse(_is_suppressed(line))
+
     def test_unrelated_warnings_still_alert(self):
         for msg in ("public_domain: rejecting private address 10.0.0.1",
                     "KG API daily limit (100k) reached"):

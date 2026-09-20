@@ -41,7 +41,10 @@ from datetime import datetime, timezone
 import tldextract
 from urllib.parse import urljoin, urlparse
 
-_tldextract = tldextract.TLDExtract(suffix_list_urls=())
+# cache_dir=None: worker units run with ProtectHome=tmpfs, so ~/.cache is unwritable and
+# tldextract would log "unable to cache ..." (a WARNING that alerts) on every process start.
+# Offline-only (no suffix_list_urls) → it uses the bundled snapshot, nothing to cache.
+_tldextract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
 from rapidfuzz import process as fuzz_process, utils as fuzz_utils
 from rapidfuzz.fuzz import ratio as fuzz_ratio, WRatio
