@@ -351,7 +351,7 @@ def load_ats_discovery(fein: str) -> dict | None:
     """Load ATS discovery row for a given employer FEIN, with careers_url from fein_domain_map."""
     df = _query(
         """
-        SELECT d.*, COALESCE(f.careers_url, d.careers_url) AS careers_url
+        SELECT d.*, f.careers_url AS careers_url
         FROM h1b_ats_discovery d
         LEFT JOIN fein_domain_map f ON f.employer_fein = d.employer_fein
         WHERE d.employer_fein = %s

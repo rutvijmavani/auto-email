@@ -23,6 +23,10 @@ What is checked:
                       queue:detail:adaptive (LIST), queue:detail:fullscan (LIST)
                       stream:adaptive PEL, stream:fullscan PEL
                       queue:email:push (LIST depth), llm:h1b:disambiguate (stream depth)
+  ─ ATS pipeline    : head_check / domain_enrichment / discover_h1b_ats workers
+                      (live instances, processed total, oldest heartbeat) and
+                      their queues (queued, delayed, in-flight, DLQ); WARN on
+                      DLQ > ATS_HEALTH_DLQ_WARN or pending work with no workers
   ─ Bloom filters   : bloom:fullscan:* key count
   ─ Coverage        : companies not scanned in last 26h
   ─ Stuck jobs      : pending_detail records > 1h old
@@ -104,6 +108,109 @@ def _row(level: str, label: str, detail: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _INFLIGHT_STALE_S = INFLIGHT_FULLSCAN_STALE_S   # imported from config; matches job_monitor.py
+
+
+def _ats_lanes() -> list:
+    """ATS pipeline lanes: worker type + the Redis structures each lane drains.
+
+    Queue tuples are (label, key, kind) with kind "list" (LLEN) or "zset" (ZCARD).
+    inflight is (glob pattern, kind); zero workers with items queued/in-flight/delayed
+    means the manager has not (yet) scaled the pool up.
+    """
+    import config as _cfg
+    return [
+        {
+            "name": "head-check", "worker": "head_check_worker",
+            "heartbeat_s": _cfg.HEAD_CHECK_HEARTBEAT_S,
+            "queues": [("on_demand", _cfg.HEAD_CHECK_ON_DEMAND, "list"),
+                       ("batch", _cfg.HEAD_CHECK_BATCH, "list")],
+            "delayed": None,
+            "inflight": ("head_check:inflight:instance:*", "list"),
+            "dlq": _cfg.HEAD_CHECK_DLQ,
+        },
+        {
+            "name": "enrichment", "worker": "domain_enrichment_worker",
+            "heartbeat_s": _cfg.ENRICHMENT_HEARTBEAT_S,
+            "queues": [("on_demand", _cfg.ENRICHMENT_ON_DEMAND, "list"),
+                       ("batch", _cfg.ENRICHMENT_BATCH, "zset")],
+            "delayed": _cfg.ENRICHMENT_DELAYED,
+            "inflight": (f"{_cfg.ENRICHMENT_INFLIGHT}*", "zset"),
+            "dlq": _cfg.ENRICHMENT_DLQ,
+        },
+        {
+            "name": "discovery", "worker": "discover_h1b_ats_worker",
+            "heartbeat_s": _cfg.DISCOVERY_HEARTBEAT_S,
+            "queues": [("redetect", _cfg.DISCOVERY_REDETECT, "zset"),
+                       ("batch", _cfg.DISCOVERY_BATCH, "zset")],
+            "delayed": _cfg.DISCOVERY_DELAYED,
+            "inflight": (f"{_cfg.DISCOVERY_INFLIGHT}*", "zset"),
+            "dlq": _cfg.DISCOVERY_DLQ,
+        },
+    ]
+
+
+def _depth(r, key: str, kind: str) -> int:
+    return int((r.llen(key) if kind == "list" else r.zcard(key)) or 0)
+
+
+def check_ats_lane(r, lane: dict, now: float, dlq_warn: int) -> list:
+    """Return [(level, label, detail), ...] for one ATS lane: a worker row and a queue row.
+
+    Rules: idle (zero workers, everything empty) is normal -> OK. WARNING when the DLQ exceeds
+    dlq_warn, when work is queued/delayed/in-flight but no worker is alive, or when a heartbeat
+    key is present but older than 2x the heartbeat interval.
+    """
+    wtype = lane["worker"]
+    stale_after = 2 * lane["heartbeat_s"]
+
+    ages, processed, stale = [], 0, 0
+    seen = set()
+    for pattern in (f"worker:alive:{wtype}:*", f"worker:alive:{wtype}@*"):
+        for key in r.scan_iter(pattern, count=50):
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                d = json.loads(r.get(key) or "{}")
+                age = now - float(d.get("ts", now))
+                processed += int(d.get("processed", 0) or 0)
+            except Exception:
+                continue
+            ages.append(age)
+            if age > stale_after:
+                stale += 1
+    live = len(ages) - stale
+
+    tiers = [(lbl, _depth(r, key, kind)) for lbl, key, kind in lane["queues"]]
+    queued = sum(n for _, n in tiers)
+    delayed = _depth(r, lane["delayed"], "zset") if lane["delayed"] else 0
+    pattern, ikind = lane["inflight"]
+    inflight = sum(_depth(r, k, ikind) for k in set(r.scan_iter(pattern, count=50)))
+    dlq = _depth(r, lane["dlq"], "list")
+
+    rows = []
+    oldest = f"  oldest heartbeat {max(ages):.0f}s ago" if ages else ""
+    w_detail = f"{live} live  processed={processed}{oldest}"
+    backlog = queued + delayed + inflight
+    if stale:
+        rows.append(("WARNING", wtype, f"{w_detail}  ({stale} STALE)"))
+    elif live == 0 and backlog > 0:
+        rows.append(("WARNING", wtype,
+                     f"{w_detail}  no live workers but {backlog} item(s) pending "
+                     f"— manager not scaling up?"))
+    elif live == 0:
+        rows.append(("OK", wtype, f"{w_detail}  idle (manager scales on demand)"))
+    else:
+        rows.append(("OK", wtype, w_detail))
+
+    q_detail = (f"queued={queued} ({', '.join(f'{l}={n}' for l, n in tiers)})  "
+                f"delayed={delayed}  in-flight={inflight}  dlq={dlq}")
+    if dlq > dlq_warn:
+        rows.append(("WARNING", f"{lane['name']} queue",
+                     f"{q_detail}  DLQ above {dlq_warn}"))
+    else:
+        rows.append(("OK", f"{lane['name']} queue", q_detail))
+    return rows
 
 
 def run_health_check() -> int:
@@ -511,6 +618,25 @@ def run_health_check() -> int:
             _row("OK", "llm:h1b:disambiguate", _h1b_msg)
     except Exception as _qdepth_err:
         _row("WARNING", "queue depths", f"Could not read ancillary queue depths: {_qdepth_err}")
+        warnings += 1
+
+    # ── ATS PIPELINE (head-check / enrichment / discovery) ────────────────────
+    _section("ATS PIPELINE  (workers + queues)")
+    try:
+        from config import ATS_HEALTH_DLQ_WARN
+        for _lane in _ats_lanes():
+            try:
+                for _lvl, _lbl, _msg in check_ats_lane(r, _lane, now, ATS_HEALTH_DLQ_WARN):
+                    _row(_lvl, _lbl, _msg)
+                    if _lvl in ("ERROR", "CRITICAL"):
+                        errors += 1
+                    elif _lvl == "WARNING":
+                        warnings += 1
+            except Exception as _lane_err:
+                _row("WARNING", _lane["name"], f"check failed: {_lane_err}")
+                warnings += 1
+    except Exception as _ats_err:
+        _row("WARNING", "ats pipeline", f"Could not run ATS pipeline checks: {_ats_err}")
         warnings += 1
 
     # ── BLOOM FILTERS ─────────────────────────────────────────────────────────
