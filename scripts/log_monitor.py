@@ -140,6 +140,11 @@ SUPPRESS_WARNING_PATTERNS: list[tuple[str, re.Pattern]] = [
     # every domain resolution.
     ("Certspotter 429 / non-200 (rate limit or transient; fallbacks handle it)",
      re.compile(r'certspotter 429\b|certspotter HTTP (?!401\b|403\b)\d{3}\b')),
+    # Same module: certspotter network exceptions and the crt.sh fallback (frequent 502s and
+    # 30s read timeouts on the free public service). Failure just yields no CT signal and the
+    # company falls through to re-queue / no_signal handling — nothing to act on per line.
+    ("Certspotter/crt.sh network error or crt.sh non-200 (external CT services, transient)",
+     re.compile(r'certspotter error for |crt\.sh (HTTP \d{3}|error) for ')),
 ]
 
 

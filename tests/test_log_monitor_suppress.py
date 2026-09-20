@@ -66,9 +66,16 @@ class TestLogMonitorSuppress(unittest.TestCase):
                 self.assertFalse(_is_suppressed(line))
                 self.assertTrue(_is_flagged(line))
 
+    def test_crtsh_and_certspotter_network_errors_suppressed(self):
+        for msg in ("crt.sh HTTP 502 for windycitytechnologies.com",
+                    "crt.sh error for collabriumsystems.com: HTTPSConnectionPool(host='crt.sh', "
+                    "port=443): Read timed out. (read timeout=30)",
+                    "certspotter error for acme.com: timeout"):
+            for line in self._both("WARNING", msg):
+                self.assertTrue(_is_suppressed(line), msg)
+
     def test_unrelated_warnings_still_alert(self):
-        for msg in ("certspotter error for acme.com: timeout",
-                    "crt.sh HTTP 503 for acme.com",
+        for msg in ("public_domain: rejecting private address 10.0.0.1",
                     "KG API daily limit (100k) reached"):
             for line in self._both("WARNING", msg):
                 self.assertFalse(_is_suppressed(line), msg)
