@@ -391,6 +391,23 @@ STALENESS_ZADD_BATCH              = int(os.getenv("STALENESS_ZADD_BATCH",       
 if STALENESS_ZADD_BATCH <= 0:
     raise ValueError(f"STALENESS_ZADD_BATCH must be > 0, got {STALENESS_ZADD_BATCH}")
 
+# Tables whose planner statistics staleness_checker refreshes (ANALYZE) before its passes.
+# Autovacuum's analyze threshold (~50 rows + 10% of the table) never fires on small changes that
+# shift selectivity (e.g. ~660 careers_url rows filled in), and the stale estimates turned an 8s
+# pass into 505s. Comma-separated plain identifiers; validated because they are interpolated into SQL.
+STALENESS_ANALYZE_TABLES = tuple(
+    t.strip() for t in os.getenv(
+        "STALENESS_ANALYZE_TABLES",
+        "fein_domain_map,uscis_h1b_petitions,dol_h1b_employers,uscis_dol_fuzzy_map",
+    ).split(",") if t.strip()
+)
+for _t in STALENESS_ANALYZE_TABLES:
+    if not (_t.replace("_", "").isalnum() and _t.isascii() and not _t[0].isdigit()):
+        raise ValueError(f"STALENESS_ANALYZE_TABLES: invalid table identifier {_t!r}")
+
+# health_check ATS-pipeline rules
+ATS_HEALTH_DLQ_WARN = int(os.getenv("ATS_HEALTH_DLQ_WARN", "50"))  # WARN when a lane's DLQ depth exceeds this
+
 # career_detector.py tuning — all adjustable via env vars, no hardcoded values
 FETCH_TIMEOUT                  = int(os.getenv("CAREER_DETECTOR_FETCH_TIMEOUT",    "15"))
 CONNECT_TIMEOUT                = int(os.getenv("CAREER_DETECTOR_CONNECT_TIMEOUT",   "5"))

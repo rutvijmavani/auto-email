@@ -23,6 +23,9 @@ Pass 3 — ATS re-detection staleness:
 Pass 4 — Stale row purge:
     DELETE FROM company_ats WHERE stale_since IS NOT NULL AND stale_since < NOW() - ATS_STALE_TTL_DAYS days
 
+Before the passes, ANALYZE runs on STALENESS_ANALYZE_TABLES (stale planner stats once made the
+passes take 505s instead of ~8s).
+
 Worker lifecycle is managed by manager.py (autoscaled on queue depth) — this script
 only populates the queues and never starts workers directly.
 
@@ -52,6 +55,7 @@ from config import (
     HEAD_CHECK_ENQUEUE_GUARD_TTL_S,
     JOB_MONITOR_REDETECT_DAYS,
     REDIS_DB_MAINTENANCE,
+    STALENESS_ANALYZE_TABLES,
     STALENESS_DISCOVERY_MIN_PETITIONS,
     STALENESS_ZADD_BATCH,
 )
@@ -400,6 +404,24 @@ def run_stale_purge(conn, dry_run: bool = False) -> int:
     return count
 
 
+def refresh_planner_stats(conn) -> None:
+    """ANALYZE the tables the staleness queries join, so plans reflect current row counts.
+
+    Runs even under --dry-run (it only rewrites pg_statistic, no user data). Failure is
+    logged and swallowed: stale stats make the pass slow, not wrong.
+    """
+    t0 = time.time()
+    try:
+        for table in STALENESS_ANALYZE_TABLES:
+            conn.execute(f"ANALYZE {table}")
+        conn.commit()
+        log.info("planner stats refreshed for %d tables in %.1fs",
+                 len(STALENESS_ANALYZE_TABLES), time.time() - t0)
+    except Exception as exc:
+        conn.rollback()
+        log.warning("planner stats refresh failed (%s) — continuing with existing stats", exc)
+
+
 def main(args: argparse.Namespace) -> None:
     r = get_redis()
     # Fail fast (non-zero exit -> OnFailure alert) if Redis is down: the unit uses
@@ -412,6 +434,7 @@ def main(args: argparse.Namespace) -> None:
 
     conn = get_conn()
     try:
+        refresh_planner_stats(conn)
         t0 = time.time()
 
         enrich_added = 0
