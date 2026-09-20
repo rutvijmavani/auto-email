@@ -157,6 +157,22 @@ jobs:
             echo "  systemd daemon reloaded"
 
             echo "[7/8] Restarting services..."
+            # Stop the manager-autoscaled workers (discover / enrichment / head-check @N) before
+            # the scheduler and manager restart below: both run init_db() on startup, whose ALTER
+            # TABLEs queue behind any transaction a worker holds open, and a worker left running
+            # keeps executing the old code anyway. The restarted manager starts them again on the
+            # new code as soon as their queues have depth (SIGTERM is safe: each worker reclaims
+            # its own inflight ZSET on start). Units are taken from live systemd state, not a
+            # hardcoded list, and `|| true` keeps a stop failure from tripping the ERR-trap rollback.
+            _worker_units=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating \
+              'discover-h1b-ats-worker@*' 'domain-enrichment-worker@*' 'head-check-worker@*' \
+              | awk '{print $1}') || true
+            if [ -n "$_worker_units" ]; then
+              echo "  Pre-restart: stopping workers: $(echo $_worker_units | tr '\n' ' ')"
+              sudo systemctl stop $_worker_units || echo "  [WARN] worker stop returned non-zero — continuing"
+            else
+              echo "  Pre-restart: no autoscaled workers running"
+            fi
             # llama-server and h1b-llm-worker are intentionally excluded from this loop:
             #   llama-server: model load takes minutes; TimeoutStartSec=infinity; systemd
             #                 restarts it on failure; h1b-llm-worker depends on it via Requires=.
