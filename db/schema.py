@@ -15,6 +15,7 @@
 #   adaptive_poll_metrics — daily observability metrics (Phase 8)
 
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -258,9 +259,65 @@ def _cleanup_seen_job_ids(c):
 # SCHEMA INIT
 # ─────────────────────────────────────────
 
+# ── No-op column DDL without the table lock ───────────────────────────────────
+# ALTER TABLE ... ADD COLUMN IF NOT EXISTS / DROP COLUMN IF EXISTS takes an
+# AccessExclusiveLock on the table BEFORE it checks whether the column exists,
+# so a no-op ALTER still blocks every reader — and init_db() holds that lock
+# until its single commit.  A reader that joins two tables in the opposite
+# order to init_db()'s ALTERs (e.g. fein_domain_map then dol_h1b_employers)
+# deadlocks against it.  Checking the catalog first (no table lock) and
+# skipping the statement when it would be a no-op removes the lock in steady
+# state; a genuinely missing/present column still runs the original ALTER.
+_COLUMN_DDL_RE = re.compile(
+    r"^\s*ALTER\s+TABLE\s+(?P<table>\w+)\s+"
+    r"(?:(?P<add>ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS)|(?P<drop>DROP\s+COLUMN\s+IF\s+EXISTS))\s+"
+    r"(?P<column>\w+)\b",
+    re.IGNORECASE,
+)
+# Multi-action ALTERs (", ADD COLUMN ...") are left to run unchanged.
+_MULTI_ACTION_RE = re.compile(r",\s*(?:ADD|DROP|ALTER|RENAME|SET|OWNER)\b", re.IGNORECASE)
+
+
+class _SkipNoopColumnDDL:
+    """Cursor wrapper for init_db(): skips single-column ADD/DROP COLUMN IF [NOT]
+    EXISTS statements that the catalog shows would be no-ops. Everything else
+    is delegated to the wrapped cursor unchanged."""
+    __slots__ = ("_c",)
+
+    def __init__(self, cur):
+        self._c = cur
+
+    def _column_state(self, table: str, column: str) -> "tuple[bool, bool]":
+        """Return (table_exists, column_exists) from information_schema — takes no table lock."""
+        self._c.execute(
+            """
+            SELECT COUNT(*) AS n_cols,
+                   COUNT(*) FILTER (WHERE column_name = %s) AS has_col
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            """,
+            (column.lower(), table.lower()),
+        )
+        row = self._c.fetchone()
+        return row["n_cols"] > 0, row["has_col"] > 0
+
+    def execute(self, sql, params=None):
+        m = _COLUMN_DDL_RE.match(sql) if params is None else None
+        if m and not _MULTI_ACTION_RE.search(sql):
+            table_exists, has_col = self._column_state(m["table"], m["column"])
+            if m["add"] and has_col:
+                return self
+            if m["drop"] and table_exists and not has_col:
+                return self
+        return self._c.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
 def init_db():
     conn = get_conn()
-    c = conn.cursor()
+    c = _SkipNoopColumnDDL(conn.cursor())
 
     # ── Serialize concurrent DDL ──────────────────────────────────────────────
     # Worker processes are spawned via multiprocessing.Process and all call
