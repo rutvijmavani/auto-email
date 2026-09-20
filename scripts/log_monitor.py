@@ -128,6 +128,23 @@ SUPPRESS_WARNING_PATTERNS: list[tuple[str, re.Pattern]] = [
      re.compile(r'missing company name')),
     ("Sentry not initialised (expected in dev/test environments)",
      re.compile(r'Sentry\b.*not\s+initiali[zs]ed|sentry_sdk.*not.*init', re.I)),
+    # Both call sites in scripts/discover_h1b_ats.py discard the KG entry and record a
+    # kg_domain_mismatch quality event in the DB; the fallback path then continues. The
+    # line carries per-company URLs, so it never dedups and mailed on every scan.
+    ("KG domain mismatch (entry discarded, quality event recorded in DB)",
+     re.compile(r'KG domain mismatch')),
+    # jobs/public_domain.py: certspotter 429 is the free-tier rate limit (10/hr) — the
+    # company is re-queued with the Retry-After delay — and other non-200s fall through
+    # to the crt.sh / probe fallbacks. 401/403 are deliberately NOT suppressed: they mean
+    # the API key is revoked/invalid, which is a real problem that silently degrades
+    # every domain resolution.
+    ("Certspotter 429 / non-200 (rate limit or transient; fallbacks handle it)",
+     re.compile(r'certspotter 429\b|certspotter HTTP (?!401\b|403\b)\d{3}\b')),
+    # Same module: certspotter network exceptions and the crt.sh fallback (frequent 502s and
+    # 30s read timeouts on the free public service). Failure just yields no CT signal and the
+    # company falls through to re-queue / no_signal handling — nothing to act on per line.
+    ("Certspotter/crt.sh network error or crt.sh non-200 (external CT services, transient)",
+     re.compile(r'certspotter error for |crt\.sh (HTTP \d{3}|error) for ')),
 ]
 
 

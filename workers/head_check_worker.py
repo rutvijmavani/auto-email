@@ -376,6 +376,10 @@ def _process_company(r, fein: str, petition_count: int, trigger: str,
     try:
         conn = get_conn()
         careers_url = _load_careers_url(conn, fein)
+        # End the read transaction opened by _load_careers_url before the HTTP HEAD —
+        # otherwise it stays idle-in-transaction (holding AccessShare on fein_domain_map)
+        # for the whole request and queues init_db's ALTER behind it.
+        conn.commit()
         if not careers_url:
             # careers_url vanished since the producer pushed this item — push to enrichment.
             log.info("head_check: fein=%s careers_url NULL in DB — routing to enrichment", fein)
