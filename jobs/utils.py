@@ -17,6 +17,7 @@ Constants:
   REQUEST_TIMEOUT   — default timeout for all outbound requests
 """
 
+import functools
 import re
 import json
 from datetime import datetime, timezone
@@ -72,6 +73,18 @@ def is_valid_url(url):
     return urlparse(url.strip()).scheme.lower() in {"http", "https"}
 
 
+@functools.lru_cache(maxsize=1)
+def _offline_tldextract():
+    """
+    Lazily built, process-wide tldextract instance that never touches the network or disk.
+    The default tldextract.extract() downloads the Public Suffix List and caches it under
+    ~/.cache, which is unwritable under ProtectHome=tmpfs — so it would re-download on every
+    process start and log a WARNING. The bundled snapshot is enough here.
+    """
+    import tldextract
+    return tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
+
+
 def domain_from_url(url):
     """
     Extract registrable domain from any URL.
@@ -84,8 +97,7 @@ def domain_from_url(url):
     if not url:
         return None
     try:
-        import tldextract
-        extracted = tldextract.extract(urlparse(url).hostname or "")
+        extracted = _offline_tldextract()(urlparse(url).hostname or "")
         return extracted.registered_domain or urlparse(url).hostname
     except Exception:
         return urlparse(url).hostname

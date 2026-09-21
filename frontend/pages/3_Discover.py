@@ -160,6 +160,19 @@ def load_filter_options() -> dict:
     }
 
 
+SOC_SORT_FILED     = "Filed for SOC ↓"
+SOC_SORT_CERTIFIED = "Certified for SOC ↓"
+
+
+def _normalize_soc_prefix(raw: str) -> str:
+    """'15-1252.00' -> '15-1252'. DOL stores the same occupation with and without the
+    '.00' O*NET suffix, and the filter is a prefix match, so dropping it matches both."""
+    v = (raw or "").strip()
+    if v.endswith(".00"):
+        v = v[:-3]
+    return v
+
+
 @st.cache_data(ttl=300)
 def load_employers(
     search: str,
@@ -198,28 +211,48 @@ def load_employers(
         clauses.append("e.total_certified >= %s")
         params.append(min_certified)
 
+    # SOC mode: per-employer petition counts for the matching SOC code(s) ONLY, summed
+    # across every matching soc_code row (a prefix like "15-1" spans many codes, and DOL
+    # stores the same occupation as both "15-1252" and "15-1252.00" across quarters).
+    # The join param sits before the WHERE params in the SQL text, so it is kept apart.
+    soc_prefix = _normalize_soc_prefix(soc_prefix)
+    soc_join = ""
+    join_params: list = []
+    soc_cols = ""
     if soc_prefix:
-        clauses.append("""
-            EXISTS (
-                SELECT 1 FROM dol_h1b_soc_breakdown s
-                WHERE s.employer_fein = e.employer_fein
-                  AND s.soc_code LIKE %s
-                  AND s.total_certified > 0
-            )
-        """)
-        params.append(f"{soc_prefix}%")
+        soc_join = """
+            JOIN (
+                SELECT employer_fein,
+                       SUM(total_filed)::bigint     AS soc_filed,
+                       SUM(total_certified)::bigint AS soc_certified,
+                       SUM(total_positions)::bigint AS soc_positions
+                FROM dol_h1b_soc_breakdown
+                WHERE soc_code LIKE %s
+                GROUP BY employer_fein
+            ) sp ON sp.employer_fein = e.employer_fein
+        """
+        join_params.append(f"{soc_prefix}%")
+        soc_cols = "sp.soc_filed, sp.soc_certified, sp.soc_positions,"
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    order = {
-        "Total certified ↓":  "e.total_certified DESC",
-        "Approval rate ↓":    "e.approval_rate DESC NULLS LAST",
-        "Total filed ↓":      "e.total_filed DESC",
-        "Name A→Z":           "e.employer_name ASC",
-    }.get(sort_by, "e.total_certified DESC")
+    if soc_prefix:
+        order = {
+            SOC_SORT_FILED:      "sp.soc_filed DESC, sp.soc_certified DESC",
+            SOC_SORT_CERTIFIED:  "sp.soc_certified DESC, sp.soc_filed DESC",
+            "Name A→Z":          "e.employer_name ASC",
+        }.get(sort_by, "sp.soc_filed DESC, sp.soc_certified DESC")
+    else:
+        order = {
+            "Total certified ↓":  "e.total_certified DESC",
+            "Approval rate ↓":    "e.approval_rate DESC NULLS LAST",
+            "Total filed ↓":      "e.total_filed DESC",
+            "Name A→Z":           "e.employer_name ASC",
+        }.get(sort_by, "e.total_certified DESC")
 
     sql = f"""
         SELECT
+            {soc_cols}
             e.employer_fein,
             e.employer_name,
             e.employer_city,
@@ -235,12 +268,12 @@ def load_employers(
             e.top_job_titles,
             array_length(e.quarters_processed, 1) AS quarters_count
         FROM dol_h1b_employers e
+        {soc_join}
         {where}
         ORDER BY {order}
         LIMIT %s
     """
-    params.append(limit)
-    return _query(sql, params)
+    return _query(sql, join_params + params + [limit])
 
 
 @st.cache_data(ttl=120)
@@ -546,10 +579,12 @@ with st.sidebar:
 
     st.divider()
 
-    sort_by = st.selectbox(
-        "Sort by",
-        ["Total certified ↓", "Approval rate ↓", "Total filed ↓", "Name A→Z"],
-    )
+    if _normalize_soc_prefix(soc_prefix):
+        # SOC mode: ranking is by petitions for that SOC only, not the employer's all-time totals.
+        _sort_options = [SOC_SORT_FILED, SOC_SORT_CERTIFIED, "Name A→Z"]
+    else:
+        _sort_options = ["Total certified ↓", "Approval rate ↓", "Total filed ↓", "Name A→Z"]
+    sort_by = st.selectbox("Sort by", _sort_options)
     limit = st.selectbox("Max results", [100, 500, 1000, 2000], index=1)
 
     st.divider()
@@ -588,10 +623,13 @@ m3.metric(
     if not df.empty and df["approval_rate"].notna().any()
     else "—",
 )
-m4.metric(
-    "Total certified",
-    f"{int(df['total_certified'].sum()):,}" if not df.empty else "0",
-)
+if "soc_filed" in df.columns:
+    m4.metric("Filed (this SOC)", f"{int(df['soc_filed'].sum()):,}" if not df.empty else "0")
+else:
+    m4.metric(
+        "Total certified",
+        f"{int(df['total_certified'].sum()):,}" if not df.empty else "0",
+    )
 
 st.divider()
 
@@ -604,15 +642,25 @@ if df.empty:
     st.info("No employers match the current filters.")
     st.stop()
 
-display = df[[
-    "employer_name", "employer_city", "employer_state", "naics_code",
-    "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
-]].copy()
+_soc_mode = "soc_filed" in df.columns
+if _soc_mode:
+    st.caption(
+        f"SOC {_normalize_soc_prefix(soc_prefix)}: ranked by petitions filed for this SOC only. "
+        "'Filed'/'Certified' are the employer's all-time totals across every occupation."
+    )
+display = df[
+    (["soc_filed", "soc_certified"] if _soc_mode else []) + [
+        "employer_name", "employer_city", "employer_state", "naics_code",
+        "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
+    ]
+].copy()
 
 display["approval_rate"] = (display["approval_rate"] * 100).round(1)
 display["h1b_dependent"] = display["h1b_dependent"].map({True: "✓", False: "", None: ""}).fillna("")
 
 display.rename(columns={
+    "soc_filed":       "SOC Filed",
+    "soc_certified":   "SOC Certified",
     "employer_name":   "Employer",
     "employer_city":   "City",
     "employer_state":  "State",
@@ -632,6 +680,8 @@ selected = st.dataframe(
     selection_mode="single-row",
     column_config={
         "Approval %": st.column_config.NumberColumn("Approval %", format="%.1f%%"),
+        "SOC Filed":     st.column_config.NumberColumn("SOC Filed",     format="%d"),
+        "SOC Certified": st.column_config.NumberColumn("SOC Certified", format="%d"),
         "Filed":      st.column_config.NumberColumn("Filed",      format="%d"),
         "Certified":  st.column_config.NumberColumn("Certified",  format="%d"),
         "Qtrs":       st.column_config.NumberColumn("Qtrs",       format="%d"),

@@ -85,7 +85,7 @@ except Exception as _import_err:
     _tldextract_available = False
 
     import tldextract as _tldextract_mod
-    _tldextract_inst = _tldextract_mod.TLDExtract(suffix_list_urls=())
+    _tldextract_inst = _tldextract_mod.TLDExtract(suffix_list_urls=(), cache_dir=None)
 
     def _root_domain(url: str) -> str:
         if "://" not in url:

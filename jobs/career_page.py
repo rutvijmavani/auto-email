@@ -26,7 +26,7 @@ from jobs.http_safe import (
     ResponseTooLarge as _ResponseTooLarge,
 )
 
-_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=())
+_tldextract = _tldextract_mod.TLDExtract(suffix_list_urls=(), cache_dir=None)
 from bs4 import BeautifulSoup
 
 from logger import get_logger
