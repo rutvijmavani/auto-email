@@ -88,6 +88,13 @@ class TestLogMonitorSuppress(unittest.TestCase):
         for line in self._both("ERROR", "reclaiming 1 inflight FEINs from x"):
             self.assertFalse(_is_suppressed(line))
 
+    def test_non_public_url_skip_suppressed_at_warning_only(self):
+        msg = "Skipping non-public URL: https://na.denso.com"
+        for line in self._both("WARNING", msg):
+            self.assertTrue(_is_suppressed(line))
+        for line in self._both("ERROR", msg):
+            self.assertFalse(_is_suppressed(line))
+
     def test_unrelated_warnings_still_alert(self):
         for msg in ("public_domain: rejecting private address 10.0.0.1",
                     "KG API daily limit (100k) reached"):

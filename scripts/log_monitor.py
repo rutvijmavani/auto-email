@@ -153,6 +153,12 @@ SUPPRESS_WARNING_PATTERNS: list[tuple[str, re.Pattern]] = [
     # is deliberately still alerting.
     ("Worker inflight reclaim on startup (crash/deploy recovery working as designed)",
      re.compile(r'reclaiming \d+ inflight FEINs from')),
+    # scripts/discover_h1b_ats.py::_probe_career_urls: the SSRF guard _is_public_url() rejected a
+    # website (private/reserved IP, or a hostname that does not resolve - it returns False on any
+    # exception) and the function returns (None, None, None), i.e. "no careers URL found" for that
+    # company. Working as designed; the line carries the per-company URL so it never dedups.
+    ("Non-public / unresolvable website skipped by the SSRF guard (handled: no careers URL)",
+     re.compile(r'Skipping non-public URL:')),
 ]
 
 
