@@ -320,12 +320,14 @@ def _run_body(conn, r, limit: "int | None", dry_run: bool) -> None:
 
 def _populate_enrichment_queue(conn, r) -> None:
     """
-    After fuzzy matching completes, push all eligible FEINs to domain_enrichment_queue.
-    Eligible = last_enriched_at IS NULL OR last_enriched_at older than ENRICH_STALENESS_DAYS.
+    After fuzzy matching completes, push all never-enriched FEINs to the enrichment queue.
+    Eligible = last_enriched_at IS NULL ONLY. Companies enriched more than ENRICH_STALENESS_DAYS
+    ago belong to staleness_checker Pass 1 (trigger "staleness"); keeping the two selection sets
+    disjoint is what stops the same FEIN being queued twice under two different member JSONs.
     Score = petition_count (highest priority first).
     Workers are started on demand by manager.py (autoscaled on queue depth).
     """
-    from config import ENRICHMENT_BATCH, ENRICH_STALENESS_DAYS
+    from config import ENRICHMENT_BATCH
 
     # Named server-side cursor: PostgreSQL streams rows on demand instead of
     # buffering the full result set in memory before the first row arrives.
@@ -339,8 +341,7 @@ def _populate_enrichment_queue(conn, r) -> None:
             FROM fein_domain_map f
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE f.last_enriched_at IS NULL
-               OR f.last_enriched_at < NOW() - %s::interval
-        """, (f"{ENRICH_STALENESS_DAYS} days",))
+        """)
         for row in named_cur:
             member = json.dumps({"fein": row["employer_fein"], "trigger": "enrichment", "source": None, "tier": "batch"})
             pipe.zadd(ENRICHMENT_BATCH, {member: row["petition_count"]}, gt=True)
