@@ -195,7 +195,7 @@ def get_external_health_summary(days=7):
                 END AS error_pct,
                 CASE
                     WHEN SUM(requests_made) > 0
-                    THEN SUM(total_ms) / SUM(requests_made)
+                    THEN ROUND(SUM(total_ms) / SUM(requests_made))::int
                     ELSE 0
                 END AS avg_response_ms,
                 MAX(max_response_ms) AS max_response_ms,
