@@ -305,11 +305,14 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         _regression_block(conn, "ats_source",           "ATS detection", days)
 
         # ── EXTERNAL API HEALTH ──────────────────────────────────────────────
-        # certspotter/crtsh/brave/kg — the 4 third-party APIs enrichment/discovery
-        # depend on (docs/enrichment_discovery_design.md §11, agreed 2026-09-22).
+        # certspotter/crtsh/brave/kg/cf_worker — the third-party APIs
+        # enrichment/discovery depend on (docs/enrichment_discovery_design.md
+        # §11, agreed 2026-09-22; cf_worker added 2026-09-22). Query is generic
+        # (GROUP BY service) so any service recorded via record_external_request
+        # shows up automatically — no per-service code here.
         # Uses `days` window like every other section above, not a fixed lookback.
         print(f"\n  {_SEP}")
-        print("  EXTERNAL API HEALTH  (certspotter / crtsh / brave / kg)")
+        print("  EXTERNAL API HEALTH  (certspotter / crtsh / brave / kg / cf_worker)")
         print(f"  {_SEP}")
 
         ext_rows = get_external_health_summary(days=days)

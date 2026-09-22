@@ -261,6 +261,34 @@ def get_month_request_count(service, year_month=None):
         conn.close()
 
 
+def get_day_request_count(service, for_date=None):
+    """
+    Atomic today's (or a given day's) request count for a service — backs the
+    CF probe Worker's daily quota gate (scripts/discover_h1b_ats.py and
+    jobs/ats/career_detector.py, both call sites of _fetch_via_worker()).
+
+    Sibling to get_month_request_count() above, windowed to a single day
+    instead of a calendar month — the Workers free-tier plan resets daily
+    (see config.CF_WORKER_DAILY_LIMIT), unlike Brave's monthly cap. Reads the
+    same requests_made column that record_external_request() increments
+    atomically on every call, so this is race-proof the same way.
+
+    for_date: date object, defaults to today.
+    """
+    day = (for_date or date.today()).isoformat()
+
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(requests_made), 0) AS total
+            FROM external_api_health
+            WHERE service = ? AND date = ?
+        """, (service, day)).fetchone()
+        return row["total"] if row else 0
+    finally:
+        conn.close()
+
+
 def get_todays_external_stats():
     """Get all service stats for today."""
     today = date.today().isoformat()

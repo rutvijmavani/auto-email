@@ -296,6 +296,80 @@ class TestMonthRequestCountSumShape(unittest.TestCase):
         )
 
 
+class TestDayRequestCountSumShape(unittest.TestCase):
+    """
+    Sqlite mirror of get_day_request_count's SQL shape: SUM(requests_made)
+    for one (date, service) — backs the CF probe Worker's daily quota gate
+    (config.CF_WORKER_DAILY_LIMIT), sibling to TestMonthRequestCountSumShape
+    above but windowed to a single day since the Workers free-tier resets
+    daily instead of monthly.
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("""
+            CREATE TABLE external_api_health (
+                date DATE NOT NULL, service TEXT NOT NULL,
+                requests_made INTEGER DEFAULT 0,
+                UNIQUE(date, service)
+            )
+        """)
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _insert(self, service, for_date, made):
+        self.conn.execute(
+            "INSERT INTO external_api_health (date, service, requests_made) VALUES (?, ?, ?)",
+            (for_date, service, made),
+        )
+        self.conn.commit()
+
+    def _sum(self, service, day):
+        row = self.conn.execute("""
+            SELECT COALESCE(SUM(requests_made), 0) AS total
+            FROM external_api_health
+            WHERE service = ? AND date = ?
+        """, (service, day)).fetchone()
+        return row["total"]
+
+    def test_returns_todays_count(self):
+        self._insert("cf_worker", "2026-09-22", 40000)
+        self.assertEqual(self._sum("cf_worker", "2026-09-22"), 40000)
+
+    def test_excludes_other_days(self):
+        self._insert("cf_worker", "2026-09-21", 85000)
+        self._insert("cf_worker", "2026-09-22", 10)
+        self.assertEqual(self._sum("cf_worker", "2026-09-22"), 10)
+
+    def test_excludes_other_services(self):
+        self._insert("cf_worker", "2026-09-22", 5)
+        self._insert("brave", "2026-09-22", 999)
+        self.assertEqual(self._sum("cf_worker", "2026-09-22"), 5)
+
+    def test_no_data_returns_zero_not_null(self):
+        self.assertEqual(self._sum("cf_worker", "2026-09-22"), 0)
+
+    def test_two_implementations_same_day_accumulate(self):
+        """
+        Mirrors scripts/discover_h1b_ats.py and jobs/ats/career_detector.py
+        both calling record_external_request('cf_worker', ...) on the same
+        day against the same shared Cloudflare Worker/account — each is its
+        own atomic UPDATE ... SET requests_made = requests_made + 1, so both
+        contribute to one true daily total instead of racing.
+        """
+        for _ in range(3):
+            self.conn.execute("""
+                INSERT INTO external_api_health (date, service, requests_made)
+                VALUES ('2026-09-22', 'cf_worker', 1)
+                ON CONFLICT(date, service) DO UPDATE SET requests_made = requests_made + 1
+            """)
+        self.conn.commit()
+        self.assertEqual(self._sum("cf_worker", "2026-09-22"), 3)
+
+
 class TestRetentionConstant(unittest.TestCase):
 
     def test_retention_matches_api_health(self):
