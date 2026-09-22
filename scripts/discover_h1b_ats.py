@@ -59,7 +59,7 @@ from config import (
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
-from db.external_api_health import record_external_request
+from db.external_api_health import get_month_request_count, record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
 from jobs.http_safe import make_safe_session as _make_safe_session
@@ -880,22 +880,37 @@ def _is_plausible_career_url(url: str, company_tokens: set[str]) -> bool:
 
 
 def _brave_load_quota() -> dict:
-    current_month = datetime.now().strftime("%Y-%m")
-    try:
-        with open(_BRAVE_QUOTA_FILE) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"calls": 0, "month": current_month}
-    if data.get("month") != current_month:
-        return {"calls": 0, "month": current_month}
-    return data
+    """
+    Month-to-date Brave call count, same shape callers already expect
+    ({"calls": N, "month": "YYYY-MM"}) but now backed by the atomic
+    external_api_health total (db.external_api_health.get_month_request_count)
+    instead of an unlocked local JSON file.
+
+    Same db-backed pattern as KG's can_call() (db/quota.py) — read the live
+    count, no separate "save" needed, since record_external_request() already
+    increments requests_made atomically as a side effect of every Brave call
+    this file makes (see brave_career_search below), the same way KG's
+    increment_usage() bumps model_usage.count on every call it records.
+
+    This file and build_ats_slug_list.py both call record_external_request
+    for every real Brave HTTP attempt they make, so this total reflects BOTH
+    scripts' usage against the one shared Brave account/key — closing the
+    race + blind-spot that the old shared brave_quota.json file had.
+    """
+    return {
+        "calls": get_month_request_count("brave"),
+        "month": datetime.now().strftime("%Y-%m"),
+    }
 
 
 def _brave_save_quota(data: dict) -> None:
-    data.setdefault("month", datetime.now().strftime("%Y-%m"))
-    os.makedirs("data", exist_ok=True)
-    with open(_BRAVE_QUOTA_FILE, "w") as f:
-        json.dump(data, f)
+    """
+    No-op — kept in place (same name/call site) for backward compatibility.
+    Brave usage is now recorded atomically inside record_external_request()
+    at every call site in brave_career_search(), the moment the HTTP request
+    is made, so there is nothing left for a separate "save" step to do.
+    """
+    pass
 
 
 def brave_career_search(
@@ -947,8 +962,6 @@ def brave_career_search(
             return None
 
         record_external_request("brave", 200, _brave_response_ms)
-        quota["calls"] = quota.get("calls", 0) + 1
-        _brave_save_quota(quota)
 
         organics   = resp.json().get("web", {}).get("results", [])
         candidates = [

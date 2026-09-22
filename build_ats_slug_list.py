@@ -610,23 +610,33 @@ def process_dataframe(df, crawl_id):
 # ─────────────────────────────────────────
 
 def _load_brave_quota():
-    """Load Brave quota. Auto-resets on new month."""
+    """
+    Month-to-date Brave call count — same {"month", "calls"} shape callers
+    already expect, but now backed by the atomic external_api_health total
+    (db.external_api_health.get_month_request_count) instead of the old
+    unlocked local JSON file.
+
+    scripts/discover_h1b_ats.py shares this same Brave account/key and has
+    its own _brave_load_quota()/_brave_save_quota() pair with the identical
+    fix applied — both now read/increment the one shared atomic total
+    instead of racing on data/brave_quota.json, which is what let real
+    Brave usage (per the account dashboard) run ahead of what either
+    script's local counter showed.
+    """
+    from db.external_api_health import get_month_request_count
     current_month = datetime.now().strftime("%Y-%m")
-    try:
-        with open(BRAVE_QUOTA_FILE) as f:
-            data = json.load(f)
-        if data.get("month") != current_month:
-            data = {"month": current_month, "calls": 0}
-            _save_brave_quota(data)
-    except (FileNotFoundError, json.JSONDecodeError):
-        data = {"month": current_month, "calls": 0}
-    return data
+    return {"month": current_month, "calls": get_month_request_count("brave")}
 
 
 def _save_brave_quota(data):
-    os.makedirs("data", exist_ok=True)
-    with open(BRAVE_QUOTA_FILE, "w") as f:
-        json.dump(data, f)
+    """
+    No-op — kept in place (same name/call site) for backward compatibility.
+    brave_search() below now calls record_external_request() on every
+    attempt, which atomically increments the shared total as a side effect
+    of the HTTP call itself, so there is nothing left for a separate "save"
+    step to do.
+    """
+    pass
 
 
 def _brave_remaining():
@@ -643,6 +653,9 @@ def brave_search(query, offset=0):
     if not BRAVE_API_KEY or _brave_remaining() <= 0:
         return []
 
+    from db.external_api_health import record_external_request
+
+    _t0 = time.time()
     try:
         resp = requests.get(
             BRAVE_ENDPOINT,
@@ -658,32 +671,34 @@ def brave_search(query, offset=0):
             },
             timeout=30,
         )
+        _response_ms = int((time.time() - _t0) * 1000)
 
         if resp.status_code == 401:
             logger.error("Brave API: invalid API key")
             print("  [BRAVE] Invalid API key — "
                   "check BRAVE_API_KEY in .env")
+            record_external_request("brave", 401, _response_ms)
             return []
         if resp.status_code == 429:
             logger.warning("Brave API: rate limited — waiting 60s")
             print("  [BRAVE] Rate limited — "
                   "waiting 60s")
+            record_external_request("brave", 429, _response_ms)
             time.sleep(60)
             return []
         if resp.status_code == 422:
             logger.debug("Brave API: invalid query=%r", query)
             print(f"  [BRAVE] Invalid query: {query}")
+            record_external_request("brave", 422, _response_ms)
             return []
         if resp.status_code != 200:
             logger.warning("Brave API: HTTP %d for query=%r",
                            resp.status_code, query)
             print(f"  [BRAVE] HTTP {resp.status_code}")
+            record_external_request("brave", resp.status_code, _response_ms)
             return []
 
-        # Increment quota on success only
-        data = _load_brave_quota()
-        data["calls"] += 1
-        _save_brave_quota(data)
+        record_external_request("brave", 200, _response_ms)
 
         # Brave response: results.web.results[].url
         web     = resp.json().get("web", {})
@@ -696,6 +711,7 @@ def brave_search(query, offset=0):
         logger.warning("Brave search exception: query=%r error=%s",
                        query, e)
         print(f"  [BRAVE] Error: {e}")
+        record_external_request("brave", 0, int((time.time() - _t0) * 1000))
         return []
 
 

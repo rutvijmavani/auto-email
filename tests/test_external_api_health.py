@@ -15,7 +15,7 @@ from datetime import date, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from db.external_api_health import _classify_status
+from db.external_api_health import _classify_status, _month_bounds
 
 
 class TestClassifyStatus(unittest.TestCase):
@@ -167,6 +167,133 @@ class TestExternalApiHealthAggregates(unittest.TestCase):
             FROM external_api_health WHERE service = 'certspotter'
         """).fetchone()
         self.assertEqual(row["total_backoff"], 3600)
+
+
+class TestMonthBounds(unittest.TestCase):
+    """
+    _month_bounds — pure [start, end) date-window helper backing
+    get_month_request_count, the atomic replacement for the old
+    data/brave_quota.json race (see project memory: 998 real Brave calls
+    this month vs. 719 tracked by the unlocked-file counter).
+    """
+
+    def test_explicit_month_mid_year(self):
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(start, date(2026, 9, 1))
+        self.assertEqual(end, date(2026, 10, 1))
+
+    def test_december_rolls_into_next_year(self):
+        start, end = _month_bounds("2026-12")
+        self.assertEqual(start, date(2026, 12, 1))
+        self.assertEqual(end, date(2027, 1, 1))
+
+    def test_january_start_of_year(self):
+        start, end = _month_bounds("2027-01")
+        self.assertEqual(start, date(2027, 1, 1))
+        self.assertEqual(end, date(2027, 2, 1))
+
+    def test_defaults_to_current_month(self):
+        today = date.today()
+        start, end = _month_bounds()
+        self.assertEqual(start, today.replace(day=1))
+        self.assertGreater(end, today)
+
+    def test_end_is_exclusive_of_next_month(self):
+        """A row dated the 1st of the following month must NOT be in [start, end)."""
+        start, end = _month_bounds("2026-02")
+        self.assertLess(date(2026, 2, 28), end)
+        self.assertGreaterEqual(date(2026, 3, 1), end)
+
+
+class TestMonthRequestCountSumShape(unittest.TestCase):
+    """
+    Sqlite mirror of get_month_request_count's SQL shape: SUM(requests_made)
+    over [start, end) for one service, spanning multiple days and correctly
+    excluding days outside the window (e.g. last month, next month) and
+    other services — the exact scenario that used to race across two
+    processes/scripts sharing one unlocked JSON file.
+    """
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("""
+            CREATE TABLE external_api_health (
+                date DATE NOT NULL, service TEXT NOT NULL,
+                requests_made INTEGER DEFAULT 0,
+                UNIQUE(date, service)
+            )
+        """)
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _insert(self, service, for_date, made):
+        self.conn.execute(
+            "INSERT INTO external_api_health (date, service, requests_made) VALUES (?, ?, ?)",
+            (for_date, service, made),
+        )
+        self.conn.commit()
+
+    def _sum(self, service, start, end):
+        row = self.conn.execute("""
+            SELECT COALESCE(SUM(requests_made), 0) AS total
+            FROM external_api_health
+            WHERE service = ? AND date >= ? AND date < ?
+        """, (service, start, end)).fetchone()
+        return row["total"]
+
+    def test_sums_across_days_within_month(self):
+        self._insert("brave", "2026-09-18", 316)
+        self._insert("brave", "2026-09-20", 682)
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(
+            self._sum("brave", start.isoformat(), end.isoformat()), 998
+        )
+
+    def test_excludes_prior_and_next_month(self):
+        self._insert("brave", "2026-08-31", 50)   # last day of prior month
+        self._insert("brave", "2026-09-15", 10)
+        self._insert("brave", "2026-10-01", 999)  # first day of next month
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(
+            self._sum("brave", start.isoformat(), end.isoformat()), 10
+        )
+
+    def test_excludes_other_services(self):
+        self._insert("brave", "2026-09-10", 5)
+        self._insert("kg", "2026-09-10", 500)
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(
+            self._sum("brave", start.isoformat(), end.isoformat()), 5
+        )
+
+    def test_no_data_returns_zero_not_null(self):
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(
+            self._sum("brave", start.isoformat(), end.isoformat()), 0
+        )
+
+    def test_two_writers_same_day_same_service_accumulate(self):
+        """
+        Mirrors discover_h1b_ats.py and build_ats_slug_list.py both calling
+        record_external_request('brave', ...) on the same day — each is its
+        own atomic UPDATE ... SET requests_made = requests_made + 1 against
+        the same (date, service) row, so both contribute to one true total
+        instead of two scripts each keeping a separate, divergent count.
+        """
+        for _ in range(3):
+            self.conn.execute("""
+                INSERT INTO external_api_health (date, service, requests_made)
+                VALUES ('2026-09-10', 'brave', 1)
+                ON CONFLICT(date, service) DO UPDATE SET requests_made = requests_made + 1
+            """)
+        self.conn.commit()
+        start, end = _month_bounds("2026-09")
+        self.assertEqual(
+            self._sum("brave", start.isoformat(), end.isoformat()), 3
+        )
 
 
 class TestRetentionConstant(unittest.TestCase):

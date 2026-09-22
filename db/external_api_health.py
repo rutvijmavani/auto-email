@@ -212,6 +212,55 @@ def get_external_health_summary(days=7):
         conn.close()
 
 
+def _month_bounds(year_month=None):
+    """
+    [start, end) calendar-month date bounds as (date, date), end exclusive.
+    Pure — split out from get_month_request_count so the month-rollover /
+    year-rollover arithmetic (esp. December → January) is directly unit
+    testable without a DB.
+
+    year_month: "YYYY-MM" string, defaults to the current calendar month.
+    """
+    if year_month:
+        year, month = (int(x) for x in year_month.split("-"))
+        start = date(year, month, 1)
+    else:
+        start = date.today().replace(day=1)
+    end = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
+    return start, end
+
+
+def get_month_request_count(service, year_month=None):
+    """
+    Atomic month-to-date request count for a service — backs Brave's
+    1000/month quota gate (scripts/discover_h1b_ats.py::_brave_load_quota,
+    build_ats_slug_list.py::_load_brave_quota).
+
+    Mirrors db/quota.py's can_call()/model_usage date-window pattern, summed
+    across external_api_health's per-day rows (this table buckets by day for
+    the health report, not by month) instead of a single per-month row.
+    Every requests_made increment behind this sum comes from
+    record_external_request()'s atomic `requests_made = requests_made + 1`
+    UPDATE, so — unlike the local-JSON-file counter this replaced — no
+    concurrent caller (multiple worker processes, multiple scripts sharing
+    the same Brave key) can lose an increment to a race.
+
+    year_month: "YYYY-MM" string, defaults to the current calendar month.
+    """
+    start, end = _month_bounds(year_month)
+
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(requests_made), 0) AS total
+            FROM external_api_health
+            WHERE service = ? AND date >= ? AND date < ?
+        """, (service, start.isoformat(), end.isoformat())).fetchone()
+        return row["total"] if row else 0
+    finally:
+        conn.close()
+
+
 def get_todays_external_stats():
     """Get all service stats for today."""
     today = date.today().isoformat()
