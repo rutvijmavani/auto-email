@@ -45,11 +45,21 @@ except ImportError:
 
 try:
     import requests as _requests_plain
-    from config import CF_WORKER_URL as _CF_WORKER_URL, CF_WORKER_SECRET as _CF_WORKER_SECRET
+    import time as _time
+    from config import (
+        CF_WORKER_URL as _CF_WORKER_URL,
+        CF_WORKER_SECRET as _CF_WORKER_SECRET,
+        CF_WORKER_DAILY_LIMIT as _CF_WORKER_DAILY_LIMIT,
+    )
+    from db.external_api_health import get_day_request_count as _get_day_request_count
+    from db.external_api_health import record_external_request as _record_external_request
 except Exception:
     _requests_plain = None
     _CF_WORKER_URL = ""
     _CF_WORKER_SECRET = ""
+    _CF_WORKER_DAILY_LIMIT = 0
+    _get_day_request_count = None
+    _record_external_request = None
 
 
 def _fetch_via_worker(url: str) -> tuple[str, str] | None:
@@ -57,9 +67,19 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
 
     Used as fallback when career site IP-blocks the OCI/local IP (429/403).
     Returns (html_text, final_url) or None.
+
+    Quota: shares the same daily cap and atomic external_api_health tracking
+    (service="cf_worker") as scripts/discover_h1b_ats.py::_fetch_via_worker —
+    both implementations hit the same Cloudflare Worker/account, so their
+    calls are counted together against one shared daily total.
     """
     if not _CF_WORKER_URL or not _CF_WORKER_SECRET or not _requests_plain:
         return None
+    if _get_day_request_count("cf_worker") >= _CF_WORKER_DAILY_LIMIT:
+        logger.debug("[detector] CF Worker: daily quota (%d) reached, skipping %s",
+                     _CF_WORKER_DAILY_LIMIT, url)
+        return None
+    _t0 = _time.time()
     try:
         resp = _requests_plain.post(
             _CF_WORKER_URL,
@@ -67,17 +87,21 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
             headers={"Authorization": f"Bearer {_CF_WORKER_SECRET}"},
             timeout=30,
         )
+        _ms = int((_time.time() - _t0) * 1000)
         data = resp.json()
         if data.get("error") or (data.get("status") or 0) >= 400:
+            _record_external_request("cf_worker", data.get("status") or 502, _ms)
             logger.debug("[detector] CF Worker: %s → error=%s status=%s",
                          url, data.get("error"), data.get("status"))
             return None
         body = data.get("body") or ""
         final_url = data.get("final_url") or url
+        _record_external_request("cf_worker", data.get("status") or 200, _ms)
         logger.debug("[detector] CF Worker: %s → %s (status=%s)",
                      url, final_url, data.get("status"))
         return body, final_url
     except Exception as exc:
+        _record_external_request("cf_worker", 0, int((_time.time() - _t0) * 1000))
         logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
         return None
 

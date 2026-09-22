@@ -346,6 +346,11 @@ DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b
 
 CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
 CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
+# Free-tier Workers plan resets daily (100K req/day); stop calling the worker
+# before the account gets throttled/suspended for the day. Tracked atomically
+# via db/external_api_health.py (service="cf_worker"), same pattern as Brave's
+# monthly quota — see _BRAVE_QUOTA_LIMIT in scripts/discover_h1b_ats.py.
+CF_WORKER_DAILY_LIMIT = int(os.getenv("CF_WORKER_DAILY_LIMIT", "85000"))
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 

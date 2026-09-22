@@ -54,12 +54,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import requests
 
 from config import (
-    CF_WORKER_SECRET, CF_WORKER_URL,
+    CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
     DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
-from db.external_api_health import record_external_request
+from db.external_api_health import get_day_request_count, get_month_request_count, record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
 from jobs.http_safe import make_safe_session as _make_safe_session
@@ -880,22 +880,37 @@ def _is_plausible_career_url(url: str, company_tokens: set[str]) -> bool:
 
 
 def _brave_load_quota() -> dict:
-    current_month = datetime.now().strftime("%Y-%m")
-    try:
-        with open(_BRAVE_QUOTA_FILE) as f:
-            data = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"calls": 0, "month": current_month}
-    if data.get("month") != current_month:
-        return {"calls": 0, "month": current_month}
-    return data
+    """
+    Month-to-date Brave call count, same shape callers already expect
+    ({"calls": N, "month": "YYYY-MM"}) but now backed by the atomic
+    external_api_health total (db.external_api_health.get_month_request_count)
+    instead of an unlocked local JSON file.
+
+    Same db-backed pattern as KG's can_call() (db/quota.py) — read the live
+    count, no separate "save" needed, since record_external_request() already
+    increments requests_made atomically as a side effect of every Brave call
+    this file makes (see brave_career_search below), the same way KG's
+    increment_usage() bumps model_usage.count on every call it records.
+
+    This file and build_ats_slug_list.py both call record_external_request
+    for every real Brave HTTP attempt they make, so this total reflects BOTH
+    scripts' usage against the one shared Brave account/key — closing the
+    race + blind-spot that the old shared brave_quota.json file had.
+    """
+    return {
+        "calls": get_month_request_count("brave"),
+        "month": datetime.now().strftime("%Y-%m"),
+    }
 
 
 def _brave_save_quota(data: dict) -> None:
-    data.setdefault("month", datetime.now().strftime("%Y-%m"))
-    os.makedirs("data", exist_ok=True)
-    with open(_BRAVE_QUOTA_FILE, "w") as f:
-        json.dump(data, f)
+    """
+    No-op — kept in place (same name/call site) for backward compatibility.
+    Brave usage is now recorded atomically inside record_external_request()
+    at every call site in brave_career_search(), the moment the HTTP request
+    is made, so there is nothing left for a separate "save" step to do.
+    """
+    pass
 
 
 def brave_career_search(
@@ -947,8 +962,6 @@ def brave_career_search(
             return None
 
         record_external_request("brave", 200, _brave_response_ms)
-        quota["calls"] = quota.get("calls", 0) + 1
-        _brave_save_quota(quota)
 
         organics   = resp.json().get("web", {}).get("results", [])
         candidates = [
@@ -1042,9 +1055,18 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
 
     Used as fallback when the direct fetch times out or is connection-refused
     (OCI datacenter IP blocked). Returns (html_text, final_url) or None.
+
+    Quota: the Workers free-tier plan resets daily (CF_WORKER_DAILY_LIMIT),
+    tracked atomically via db/external_api_health.py (service="cf_worker") —
+    same record_external_request()/get_day_request_count() pattern used for
+    Brave's monthly quota, just windowed to a day instead of a month.
     """
     if not CF_WORKER_URL or not CF_WORKER_SECRET:
         return None
+    if get_day_request_count("cf_worker") >= CF_WORKER_DAILY_LIMIT:
+        log.debug("CF Worker: daily quota (%d) reached, skipping %s", CF_WORKER_DAILY_LIMIT, url)
+        return None
+    _t0 = time.time()
     try:
         resp = requests.post(
             CF_WORKER_URL,
@@ -1052,15 +1074,19 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
             headers={"Authorization": f"Bearer {CF_WORKER_SECRET}"},
             timeout=30,
         )
+        _ms = int((time.time() - _t0) * 1000)
         data = resp.json()
         if data.get("error") or (data.get("status") or 0) >= 400:
+            record_external_request("cf_worker", data.get("status") or 502, _ms)
             log.debug("CF Worker: %s → error=%s status=%s", url, data.get("error"), data.get("status"))
             return None
         final_url = data.get("final_url") or url
         body      = data.get("body") or ""
+        record_external_request("cf_worker", data.get("status") or 200, _ms)
         log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
         return body, final_url
     except Exception as exc:
+        record_external_request("cf_worker", 0, int((time.time() - _t0) * 1000))
         log.debug("CF Worker request failed for %s: %s", url, exc)
         return None
 
