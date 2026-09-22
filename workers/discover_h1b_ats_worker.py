@@ -20,8 +20,10 @@ Re-detection triggers (from job_fetcher / admin):
 
 Worker exits cleanly when queue is empty — not a perpetual daemon.
 Started by:
-  - domain_enrichment_worker (pushes top petition_count companies after enrichment)
-  - staleness_checker cron   (>30 days since last_discovered_at)
+  - domain_enrichment_worker (forwards every company after a completed enrichment run,
+                              including the ENRICH_STALENESS_DAYS re-enrichment; the only
+                              producer of trigger "enrichment"/"staleness" members)
+  - head_check_worker        (trigger "redetect" after a silent monitored ATS)
   - API endpoint             (on-demand re-detection)
 
 Usage:
