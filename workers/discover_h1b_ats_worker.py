@@ -195,6 +195,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.assigned_domain,
             f.public_domain,
             f.careers_url,
+            f.careers_source,
             f.kg_checked,
             e.employer_name,
             COALESCE(u.petition_count, 0) AS petition_count
@@ -310,9 +311,10 @@ def _process_company(fein: str, petition_count: int, trigger: str,
             log.warning("fein=%s not found in fein_domain_map — skipping", fein)
             return True
 
-        employer_name = company["employer_name"]
-        kg_checked    = company["kg_checked"]
-        careers_url   = company["careers_url"]
+        employer_name  = company["employer_name"]
+        kg_checked     = company["kg_checked"]
+        careers_url    = company["careers_url"]
+        careers_source = company["careers_source"]
 
         # Use public_domain if available; fall back to assigned_domain
         probe_domain = company["public_domain"] or company["assigned_domain"]
@@ -335,6 +337,14 @@ def _process_company(fein: str, petition_count: int, trigger: str,
             "assigned_domain": probe_domain,
             "total_approvals": petition_count,
         }
+
+        # Normal first-pass path (enrichment forwards here, or staleness re-checks): trust
+        # domain_enrichment_worker's already-probed careers_url and skip the guaranteed-
+        # redundant Phase 3/6 re-probe — see docs/enrichment_discovery_design.md §4
+        # "Processing Steps" for the full agreed flow. Re-detection paths (re_detection/
+        # manual/redetect/company_ats/prospective) keep the full, unchanged re-probe since
+        # the whole point there is that the site may have changed since last detection.
+        _trust_enrichment = trigger in ("enrichment", "staleness")
 
         # Check existing discovery row — needed for KG MID cache + re-detection guard
         existing_row = m.get_discovery_row(fein, conn)
@@ -365,6 +375,9 @@ def _process_company(fein: str, petition_count: int, trigger: str,
         result = m.process_employer(
             emp, conn, dry_run=False, force=_force,
             prefetched=None, skip_brave=False,
+            known_careers_url=careers_url if _trust_enrichment else None,
+            known_careers_source=careers_source if _trust_enrichment else None,
+            skip_phase6=_trust_enrichment,
         )
         if not kg_checked:
             _mark_kg_checked(conn, fein)

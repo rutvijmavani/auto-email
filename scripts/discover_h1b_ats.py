@@ -59,6 +59,7 @@ from config import (
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
+from db.external_api_health import record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
 from jobs.http_safe import make_safe_session as _make_safe_session
@@ -427,6 +428,7 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
             log.debug("KG API quota exhausted mid-retry for %r", legal_name)
             break
 
+        _kg_t0 = time.time()
         try:
             resp = requests.get(
                 _KG_ENDPOINT,
@@ -442,14 +444,17 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
                 timeout=_HTTP_TIMEOUT,
             )
             increment_usage("kg_api")
+            _kg_response_ms = int((time.time() - _kg_t0) * 1000)
 
             if resp.status_code == 429:
                 wait = int(resp.headers.get("Retry-After", _RATE_LIMIT_BACKOFF))
                 log.debug("KG API rate-limited — waiting %ds", wait)
+                record_external_request("kg", 429, _kg_response_ms, backoff_s=wait)
                 time.sleep(wait)
                 break
 
             resp.raise_for_status()
+            record_external_request("kg", resp.status_code, _kg_response_ms)
             items = resp.json().get("itemListElement", [])
 
             if not items:
@@ -527,6 +532,8 @@ def kg_search(legal_name: str) -> tuple[dict | None, list[dict]]:
 
         except requests.exceptions.RequestException as e:
             log.debug("KG API error for %r: %s", legal_name, e)
+            _kg_status = getattr(getattr(e, "response", None), "status_code", None) or 0
+            record_external_request("kg", _kg_status, int((time.time() - _kg_t0) * 1000))
             break
 
     all_candidates = sorted(all_seen.values(), key=lambda x: x["score"], reverse=True)
@@ -913,6 +920,7 @@ def brave_career_search(
     query  = f"{company_name} careers"
     tokens = _company_tokens(company_name)
 
+    _brave_t0 = time.time()
     try:
         resp = requests.get(
             _BRAVE_ENDPOINT,
@@ -923,17 +931,22 @@ def brave_career_search(
             params={"q": query, "count": 10},
             timeout=_HTTP_TIMEOUT,
         )
+        _brave_response_ms = int((time.time() - _brave_t0) * 1000)
 
         if resp.status_code == 401:
             log.error("Brave API: invalid API key")
+            record_external_request("brave", 401, _brave_response_ms)
             return None
         if resp.status_code == 429:
             log.warning("Brave API: rate limited for %r", company_name)
+            record_external_request("brave", 429, _brave_response_ms)
             return None
         if resp.status_code != 200:
             log.debug("Brave API: HTTP %d for %r", resp.status_code, company_name)
+            record_external_request("brave", resp.status_code, _brave_response_ms)
             return None
 
+        record_external_request("brave", 200, _brave_response_ms)
         quota["calls"] = quota.get("calls", 0) + 1
         _brave_save_quota(quota)
 
@@ -967,6 +980,8 @@ def brave_career_search(
 
     except requests.exceptions.RequestException as e:
         log.debug("Brave search error for %r: %s", company_name, e)
+        _brave_status = getattr(getattr(e, "response", None), "status_code", None) or 0
+        record_external_request("brave", _brave_status, int((time.time() - _brave_t0) * 1000))
         return None
 
 
@@ -1571,12 +1586,25 @@ def process_employer(
     force: bool,
     prefetched: dict | None = None,
     skip_brave: bool = True,
+    known_careers_url: str | None = None,
+    known_careers_source: str | None = None,
+    skip_phase6: bool = False,
 ) -> dict:
     """
     Enrich one employer through the full pipeline and upsert into h1b_ats_discovery.
 
     prefetched (batch mode): dict with keys canonical_name, website_url,
     canonical_source, kg_mid, jobs_url — skips KG + SPARQL calls when provided.
+
+    known_careers_url / known_careers_source (discover_h1b_ats_worker, normal first-pass
+    path only — see docs/enrichment_discovery_design.md §4): domain_enrichment_worker's
+    already-probed careers_url, if any. When set, Phase 3/4 (probe + Brave) are skipped
+    entirely and this value is used as-is — a direct probe of the company's own site
+    outranks anything KG or Brave could offer, and re-probing the identical domain
+    enrichment just failed against moments earlier is guaranteed to reproduce "not found."
+    KG's jobs_url is NEVER allowed to overwrite it. skip_phase6 additionally skips Phase 6
+    (career_page scan) unconditionally, since enrichment always ran it already whenever
+    known_careers_url's caller is reached with already_has_ats False.
     """
     fein = emp["employer_fein"]
     name = emp["employer_name"]
@@ -1704,7 +1732,22 @@ def process_employer(
     ats_source        = None   # which phase found the ATS platform
     careers_source    = None   # which phase found the careers URL
 
-    if jobs_url:
+    if known_careers_url:
+        # Normal first-pass path (discover_h1b_ats_worker, trigger ∈ {enrichment, staleness}):
+        # trust domain_enrichment_worker's already-probed value. Highest priority — KG's
+        # jobs_url is NEVER allowed to overwrite it (see docstring). Skips Phase 3 (probe)
+        # and Phase 4 (Brave) entirely; only a free pattern-match against the known URL runs.
+        careers_url    = known_careers_url
+        careers_source = known_careers_source or "enrichment"
+        log.info("  Trusting enrichment's careers_url: %s (source=%s)",
+                 careers_url, careers_source)
+        from jobs.ats.patterns import match_ats_pattern as _map
+        _hit = _map(known_careers_url)
+        if _hit:
+            detected_platform = _hit["platform"]
+            detected_slug     = _hit.get("slug")
+            ats_source        = careers_source
+    elif jobs_url:
         # P10311 found — use it as the careers URL, no further probing needed
         careers_url    = jobs_url
         careers_source = "phase1_kg"
@@ -1754,7 +1797,10 @@ def process_employer(
 
     # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.
-    if not detected_platform and website_url:
+    # skip_phase6=True on the normal first-pass path: domain_enrichment_worker always ran
+    # this phase already (unless its own Phase 3 found the ATS) — reaching here at all means
+    # it ran and failed against this identical domain, so redoing it is guaranteed-redundant.
+    if not detected_platform and website_url and not skip_phase6:
         _cp_domain = _root_domain(website_url)
         _cp_name   = canonical_name or name
         log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
@@ -1781,7 +1827,7 @@ def process_employer(
         log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
-            _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg", "phase6"} else None
+            _cd_seed = careers_url if careers_source in {"phase3", "phase1_kg", "phase6", "enrichment"} else None
             _cd_results = detect_company(_cd_domain, seed_url=_cd_seed)
             if _cd_results:
                 # Prefer a result with a non-empty slug; fall back to partial detection

@@ -809,11 +809,36 @@ def run_health_check() -> int:
         """).fetchall()
 
         # Totals
-        pd_total  = sum(r["n"] for r in pd_rows)
-        cu_total  = sum(r["n"] for r in cu_rows)
-        ats_total = sum(r["n"] for r in ats_rows)
+        pd_total = sum(r["n"] for r in pd_rows)
 
-        if pd_total == 0 and cu_total == 0 and ats_total == 0:
+        # Attempted / Found / Missed denominator model (docs/enrichment_discovery_design.md
+        # §11 "Attempted / Found / Missed", agreed 2026-09-22). "attempted" is identical for
+        # all three metrics — it's pd_total's population (every FEIN that entered the pipeline
+        # via a domain_enrichment run this window), since a FEIN that doesn't resolve in
+        # enrichment's Phase 3/6 is guaranteed to get a discovery Phase 1/7 pass too (§9
+        # enrichment→discovery forward). "found" is current live state, read once — not an
+        # incrementally-tracked counter — so it doesn't matter whether enrichment or discovery
+        # (or which of ATS's two attempt phases, 6 or 7) ultimately resolved it.
+        cu_total = ats_total = 0
+        if pd_total:
+            live_rows = conn.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM fein_domain_map f
+                      WHERE f.careers_url IS NOT NULL
+                        AND f.employer_fein IN (
+                            SELECT DISTINCT employer_fein FROM h1b_enrichment_metrics
+                            WHERE worker = 'domain_enrichment' AND run_at > NOW() - INTERVAL '7 days'
+                        )) AS cu_found,
+                    (SELECT COUNT(DISTINCT c.employer_fein) FROM company_ats c
+                      WHERE c.employer_fein IN (
+                            SELECT DISTINCT employer_fein FROM h1b_enrichment_metrics
+                            WHERE worker = 'domain_enrichment' AND run_at > NOW() - INTERVAL '7 days'
+                        )) AS ats_found
+            """).fetchone()
+            cu_total  = live_rows["cu_found"]
+            ats_total = live_rows["ats_found"]
+
+        if pd_total == 0 and not cu_rows and not ats_rows:
             _row("WARNING", "h1b metrics", "no data yet — workers haven't run")
             warnings += 1
         else:
@@ -842,21 +867,29 @@ def run_health_check() -> int:
                     _row("OK", "public domain",
                          f"{pd_found}/{pd_total} resolved  {pd_detail}")
 
-            # Career URL
-            if cu_total == 0:
-                _row("WARNING", "career URL", "none found in last 7 days")
+            # Career URL — attempted population = pd_total; found = live fein_domain_map state
+            if pd_total == 0:
+                _row("WARNING", "career URL", "no data in last 7 days")
+                warnings += 1
+            elif cu_total == 0:
+                _row("WARNING", "career URL", f"0/{pd_total} found in last 7 days")
                 warnings += 1
             else:
+                cu_detail = _breakdown(cu_rows, sum(r["n"] for r in cu_rows))
                 _row("OK", "career URL",
-                     f"{cu_total} found  {_breakdown(cu_rows, cu_total)}")
+                     f"{cu_total}/{pd_total} found  {cu_detail}")
 
-            # ATS detection
-            if ats_total == 0:
-                _row("WARNING", "ATS detected", "none found in last 7 days")
+            # ATS detection — attempted population = pd_total; found = live company_ats state
+            if pd_total == 0:
+                _row("WARNING", "ATS detected", "no data in last 7 days")
+                warnings += 1
+            elif ats_total == 0:
+                _row("WARNING", "ATS detected", f"0/{pd_total} found in last 7 days")
                 warnings += 1
             else:
+                ats_detail = _breakdown(ats_rows, sum(r["n"] for r in ats_rows))
                 _row("OK", "ATS detected",
-                     f"{ats_total} found  {_breakdown(ats_rows, ats_total)}")
+                     f"{ats_total}/{pd_total} found  {ats_detail}")
 
     except Exception as exc:
         _row("WARNING", "h1b metrics", f"DB query failed: {exc}")

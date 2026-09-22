@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from db.connection import get_conn
+from db.external_api_health import get_external_health_summary
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
@@ -190,6 +191,23 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         cu_total = sum(r["n"] for r in cu_rows)
         _phase_table(cu_rows, cu_total, "Source phase")
 
+        # Attempted/Found/Missed denominator (docs/enrichment_discovery_design.md §11,
+        # agreed 2026-09-22): attempted = pd_total's population (every FEIN that entered
+        # the pipeline via a domain_enrichment run this window); found = current live
+        # fein_domain_map state, read once — not an incrementally-tracked counter, so it
+        # doesn't matter whether enrichment's Phase 3/6 or discovery's Phase 1/7 resolved it.
+        if pd_total:
+            cu_found = conn.execute("""
+                SELECT COUNT(*) AS n FROM fein_domain_map f
+                WHERE f.careers_url IS NOT NULL
+                  AND f.employer_fein IN (
+                      SELECT DISTINCT employer_fein FROM h1b_enrichment_metrics
+                      WHERE worker = 'domain_enrichment' AND run_at > NOW() - %s::interval
+                  )
+            """, (f"{days} days",)).fetchone()["n"]
+            print(f"\n  Coverage: {cu_found}/{pd_total} found "
+                  f"({_pct(cu_found, pd_total)})")
+
         # Companies where the latest metrics row has a careers_url but no ATS
         no_ats_careers = conn.execute("""
             SELECT COUNT(*) AS n
@@ -227,6 +245,19 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
 
         ats_total = sum(r["n"] for r in ats_rows)
         _phase_table(ats_rows, ats_total, "Detection phase")
+
+        # Attempted/Found/Missed denominator — same model as career URL above.
+        # company_ats has platform+slug NOT NULL at the schema level, so any row = found.
+        if pd_total:
+            ats_found = conn.execute("""
+                SELECT COUNT(DISTINCT c.employer_fein) AS n FROM company_ats c
+                WHERE c.employer_fein IN (
+                    SELECT DISTINCT employer_fein FROM h1b_enrichment_metrics
+                    WHERE worker = 'domain_enrichment' AND run_at > NOW() - %s::interval
+                )
+            """, (f"{days} days",)).fetchone()["n"]
+            print(f"\n  Coverage: {ats_found}/{pd_total} found "
+                  f"({_pct(ats_found, pd_total)})")
 
         # ATS platform breakdown — latest run per employer only
         # Compute total across ALL platforms first so percentages use the real denominator.
@@ -272,6 +303,32 @@ def run_report(days: int = 7, no_signal_top: int = 10) -> None:
         _regression_block(conn, "public_domain_method", "Public domain", days)
         _regression_block(conn, "careers_source",       "Career URL",    days)
         _regression_block(conn, "ats_source",           "ATS detection", days)
+
+        # ── EXTERNAL API HEALTH ──────────────────────────────────────────────
+        # certspotter/crtsh/brave/kg — the 4 third-party APIs enrichment/discovery
+        # depend on (docs/enrichment_discovery_design.md §11, agreed 2026-09-22).
+        # Uses `days` window like every other section above, not a fixed lookback.
+        print(f"\n  {_SEP}")
+        print("  EXTERNAL API HEALTH  (certspotter / crtsh / brave / kg)")
+        print(f"  {_SEP}")
+
+        ext_rows = get_external_health_summary(days=days)
+        if ext_rows:
+            print(f"\n  {'Service':<14} {'Requests':>9}  {'429%':>6}  {'Err%':>6}  "
+                  f"{'Avg':>7}  {'Max':>7}  {'Backoff':>8}")
+            print(f"  {_SEP[:64]}")
+            for r in ext_rows:
+                print(f"  {r['service']:<14} {r['total_requests']:>9}  "
+                      f"{r['rate_429_pct']:>5.1f}%  {r['error_pct']:>5.1f}%  "
+                      f"{r['avg_response_ms']:>5}ms  {r['max_response_ms']:>5}ms  "
+                      f"{r['total_backoff_s']:>6}s")
+                if r["total_403s"]:
+                    print(f"    ⚠  {r['total_403s']} × 401/403 (key rejected/revoked) "
+                          f"for {r['service']}")
+                if r["earliest_429_at"]:
+                    print(f"    first 429 at {r['earliest_429_at']}")
+        else:
+            print("\n  No external API activity in this window.")
 
         # ── PERFORMANCE ──────────────────────────────────────────────────────
         print(f"\n  {_SEP}")
