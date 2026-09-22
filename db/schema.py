@@ -38,6 +38,7 @@ from config import (
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
     RETENTION_ENRICHMENT_METRICS_DAYS,
+    RETENTION_EXTERNAL_API_HEALTH,
 )
 
 
@@ -192,6 +193,12 @@ def _cleanup_coverage_stats(c):
 def _cleanup_api_health(c):
     cutoff = (datetime.now() - timedelta(days=RETENTION_API_HEALTH)).strftime("%Y-%m-%d")
     c.execute("DELETE FROM api_health WHERE date < %s", (cutoff,))
+
+
+def _cleanup_external_api_health(c):
+    """external_api_health — same retention cadence as api_health (docs/enrichment_discovery_design.md §11)."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_EXTERNAL_API_HEALTH)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM external_api_health WHERE date < %s", (cutoff,))
 
 
 def _cleanup_worker_scaling_events(c):
@@ -674,6 +681,41 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_api_health_date_platform
         ON api_health(date, platform)
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS external_api_health (
+            id              BIGSERIAL PRIMARY KEY,
+            date            DATE    NOT NULL,
+            service         TEXT    NOT NULL,   -- 'certspotter' | 'crtsh' | 'brave' | 'kg'
+
+            -- Request counts
+            requests_made       INTEGER DEFAULT 0,
+            requests_ok         INTEGER DEFAULT 0,
+            requests_429        INTEGER DEFAULT 0,
+            requests_403        INTEGER DEFAULT 0,
+            requests_404        INTEGER DEFAULT 0,
+            requests_5xx        INTEGER DEFAULT 0,
+            requests_other_err  INTEGER DEFAULT 0,
+
+            -- Timing (milliseconds)
+            avg_response_ms INTEGER DEFAULT 0,
+            max_response_ms INTEGER DEFAULT 0,
+            total_ms        BIGINT  DEFAULT 0,
+
+            -- Rate limit details
+            first_429_at    TIMESTAMP,
+            backoff_total_s INTEGER DEFAULT 0,
+
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+            UNIQUE(date, service)
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_external_api_health_date_service
+        ON external_api_health(date, service)
     """)
 
     # worker_scaling_events: append-only audit log for every worker pool
@@ -1918,6 +1960,7 @@ def init_db():
     _cleanup_verify_filled_stats(c)
     _cleanup_coverage_stats(c)
     _cleanup_api_health(c)
+    _cleanup_external_api_health(c)
     _cleanup_worker_scaling_events(c)
     _cleanup_pipeline_alerts(c)
     _cleanup_mark_resolved_diagnostics(c)

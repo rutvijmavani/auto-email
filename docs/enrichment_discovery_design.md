@@ -154,31 +154,67 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Processing Steps (per company)
 
+**⚠️ Design/code drift, identified 2026-09-22:** this section documents intended behavior
+that `process_employer()` / `discover_h1b_ats_worker.py` never actually implemented — the
+code runs the full Phase 3→4→5→6→7 chain unconditionally on every company reaching this
+worker, even though `domain_enrichment_worker` (§3) already ran Phase 3 and Phase 6 against
+the exact same domain moments earlier and is guaranteed to have failed at both (see the
+"Guaranteed redundancy" note below). The flow below is the corrected version, refined from
+the original flat "careers_url set → skip 3+4+5+6" rule to account for KG priority and the
+domain-gate check. **Not yet implemented in code as of 2026-09-22** — this section is the
+target for that fix.
+
+**Guaranteed redundancy this fixes:** `domain_enrichment_worker` (§3, Steps 2-3) always runs
+Phase 3, and always runs Phase 6 unless Phase 3 already found the ATS. A FEIN only reaches
+`discover_h1b_ats_worker` with `already_has_ats = False`, which (by that same logic) means
+Phase 3 AND Phase 6 already ran against this domain and found no ATS. Redoing either phase
+here is guaranteed to reproduce "not found" — it cannot discover something a moment-earlier,
+identical probe against the same domain missed.
+
 ```text
-ats_platform already set (from enrichment)?
-    YES → skip entirely UNLESS re-detection trigger (source = job_fetcher or admin)
+already_has_ats (existing_row.detected_platform + detected_slug both set)?
+    YES → skip entirely UNLESS trigger ∈ {re_detection, manual, redetect}
+          or source ∈ {company_ats, prospective}  (re-detection paths — see below)
 
-    NO →
-        kg_checked = False (never run KG for this company)?
-            → Phase 1: KG lookup (85K/day quota)
-              ALWAYS runs on first pass, even if careers_url already set
-              (KG may return a direct ATS URL more authoritative than HTTP probing)
-            → Phase 2: domain gate (compare KG domain vs public_domain)
-            → mark kg_checked = True
+    NO → trigger ∈ {enrichment, staleness}?   (normal first-pass path)
+        │
+        NO (re_detection / manual / redetect / company_ats / prospective)
+            → FULL re-probe, unchanged: Phase 1 KG → Phase 3 → Phase 4 Brave →
+              Phase 5 → Phase 6 → Phase 7. Nothing skipped — the site may have
+              changed since the last detection, which is the entire point of a
+              re-detection trigger.
+        │
+        YES (normal path)
+            → Phase 1: KG lookup — ALWAYS runs regardless of the branches below
+                        (wikidata_qid, glassdoor_id, crunchbase_id + jobs_url
+                        as a *candidate* careers_url only)
+              → KG domain (kg_url / P856) matches our public_domain?
+                    NO  → discard the entire KG entry (no ids, no jobs_url candidate)
+                    YES → keep wikidata_qid / glassdoor_id / crunchbase_id
+                          unconditionally (pure metadata, no conflict)
 
-        KG returned ATS directly?
-            YES → write ats_platform, ats_slug → done
+              → careers_url already found by enrichment (Phase 3/6, from fein_domain_map)?
+                    YES → careers_url = enrichment's value.
+                          KG's jobs_url is NEVER used to overwrite it — a direct
+                          probe of the company's own site outranks a Wikidata
+                          fact, which can be stale.
+                          SKIP Phase 4 Brave (careers_url already known)
 
-        careers_url set (from enrichment Phase 3/6)?
-            YES → Phase 7 (seed_url=careers_url)
-                  skip Phase 3+4+5+6 — enrichment already did this work
+                    NO  → KG gave a domain-matched jobs_url?
+                              YES → careers_url = KG's jobs_url; SKIP Phase 4 Brave
+                              NO  → Phase 4: Brave search fallback
+                                    careers_url = Brave result (or still none)
 
-            NO →
-                Phase 3: path probe
-                Phase 4: Brave search (quota)
-                Phase 5: redirect
-                Phase 6: career_page
-                Phase 7: full ATS detector (seed_url=None, probes all paths)
+              → SKIP Phase 6 unconditionally (enrichment already ran it for every
+                normal-trigger FEIN — it always runs unless Phase 3 found the ATS,
+                and we're only in this branch because it didn't)
+
+              → Phase 7: career_detector BFS — only genuinely new work left;
+                runs regardless of whether careers_url came from enrichment,
+                KG, or Brave
+
+Priority order for careers_url, strictly enforced on the normal path:
+    enrichment's probed value (Phase 3/6)  >  KG's jobs_url  >  Brave  >  Phase 7
 ```
 
 ### Re-detection Trigger Behaviour
@@ -493,12 +529,145 @@ One row appended per company per worker run. Allows trend analysis over time
 - Phase regression table: last 30 days vs prior 30 days (did a fix help?)
 - Per-platform ATS breakdown (how many companies on Workday vs Greenhouse vs etc.)
 
+### Attempted / Found / Missed — denominator model (agreed 2026-09-22)
+
+**Problem:** the `health_check.py` summary block above shows `public domain` as
+`"X/Y resolved"` but `career URL`/`ATS detected` as a bare `"N found"` with no denominator —
+so a raw found-count alone invites guessing at the missing ratio. Fixing this needs a real
+"attempted" population for all three metrics, not just public domain.
+
+**Key insight — count attempts per company-cycle, not per phase/worker.** A FEIN that gets a
+`domain_enrichment` run in the window is committed to the *entire* pipeline: if enrichment's
+Phase 3/6 doesn't resolve career URL or ATS, that FEIN is guaranteed to eventually get
+discovery's Phase 1/Phase 7 pass too (that's the whole point of the enrichment→discovery
+forward, §9). So "attempted" is not "did phase X run this window" (which would need separate,
+harder-to-define denominators per phase, and breaks down for ATS since it's genuinely
+attempted in both Phase 6 *and* Phase 7) — it's "did this company enter the pipeline this
+window." That number is identical for all three metrics:
+
+```sql
+attempted (public domain) = attempted (career URL) = attempted (ATS)
+    = COUNT(DISTINCT employer_fein) FROM h1b_enrichment_metrics
+      WHERE worker = 'domain_enrichment' AND run_at > NOW() - INTERVAL '<days>'
+      -- i.e. exactly pd_total's existing population
+```
+
+**Found is current live state, read once — not an incrementally-tracked counter:**
+```sql
+-- public domain: fein_domain_map.public_domain IS NOT NULL, for the attempted population
+-- career URL:    fein_domain_map.careers_url   IS NOT NULL, for the attempted population
+-- ATS:           company_ats has a row with platform + slug set, for the attempted population
+```
+`missed = attempted - found`. This automatically reflects whichever phase ultimately resolved
+it — enrichment's Phase 3/6 immediately, or discovery's Phase 1 (KG jobs_url/direct ATS) or
+Phase 7 (career_detector BFS) later — without needing to increment/decrement a counter
+per phase or care which worker's row is newest. It is also what makes the ATS case tractable:
+ATS being attempted in both Phase 6 (enrichment) and Phase 7 (discovery) stops being a
+counting problem, because "was phase 6 attempted" / "was phase 7 attempted" are never counted
+separately — only "is this company, cycle-wide, resolved yet."
+
+The phase-mix breakdown (`phase6 57%  phase3 32%  phase4 10%  phase7 1%  phase1_kg 0%`) is a
+separate question — "of the ones found, which phase gets credit" — answered from the current
+`careers_source`/`ats_source` value on the same attempted population; it is unaffected by this
+model and needs no change.
+
+Display becomes, matching public domain's existing format:
+```
+[✓] public domain    6648/6958 resolved  same_domain 86%  http_redirect 6%  ...
+[✓] career URL       5566/6958 found     phase6 57%  phase3 32%  phase4 10%  ...
+[✓] ATS detected     2093/6958 found     phase3 65%  phase7 19%  phase6 10%  ...
+```
+Applies to both `scripts/health_check.py` (live dashboard) and `scripts/pipeline_metrics.py`
+(on-demand report) — both have the same found-only-count gap today. **Not yet implemented in
+code as of 2026-09-22.**
+
 ### Retention
 
 `RETENTION_ENRICHMENT_METRICS_DAYS = 90` (config.py) — rows older than 90 days are deleted
 automatically. `db/schema.py`'s `_cleanup_h1b_enrichment_metrics` runs this DELETE and is
 invoked by `init_db()` on every startup. Kept longer than `RETENTION_MONITOR_STATS` (60 days)
 because pipeline debugging benefits from a full quarter of phase-by-phase history.
+
+### External API Health Tracking — `external_api_health` table (agreed 2026-09-22)
+
+**Goal:** track the 4 third-party APIs the enrichment/discovery pipeline depends on
+(certspotter, crt.sh, Brave, KG/Wikidata) so degradation (elevated error rates, slow
+responses, rate-limit exhaustion) shows up here *before* it shows up as a queue-depth
+problem in `health_check.py`. Modeled on the existing `api_health` table (job-scan polling's
+adaptive/fullscan health tracker) — reuses its write mechanics and column shapes where they
+apply, deliberately diverges where they don't.
+
+```sql
+CREATE TABLE external_api_health (
+    id                  BIGSERIAL PRIMARY KEY,
+    date                DATE NOT NULL,
+    service             TEXT NOT NULL,   -- 'certspotter' | 'crtsh' | 'brave' | 'kg'
+
+    requests_made       INTEGER DEFAULT 0,
+    requests_ok         INTEGER DEFAULT 0,
+    requests_429        INTEGER DEFAULT 0,
+    requests_403        INTEGER DEFAULT 0,
+    requests_404        INTEGER DEFAULT 0,
+    requests_5xx        INTEGER DEFAULT 0,
+    requests_other_err  INTEGER DEFAULT 0,
+
+    avg_response_ms     INTEGER DEFAULT 0,
+    max_response_ms     INTEGER DEFAULT 0,
+    total_ms            BIGINT  DEFAULT 0,
+
+    first_429_at        TIMESTAMP,
+    backoff_total_s     INTEGER DEFAULT 0,
+
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, service)
+);
+```
+
+**Column rationale:**
+- `avg_response_ms` / `max_response_ms` / `total_ms` — directly relevant to the throughput
+  investigation's slow-tail premise. `api_health`'s write pattern is reused exactly: `avg` is
+  recomputed as `total_ms / requests_made` on every write (cheap, exact — not sampled/decayed),
+  `max` via `GREATEST()`.
+- `first_429_at` — certspotter, Brave, and KG all have documented rate limits with 429
+  semantics. Knowing *when* the cap was first hit in the day (e.g. 14:32 vs 09:15) distinguishes
+  early-exhaustion (needs harder throttling) from end-of-day noise (fine as-is) — info the
+  aggregate 429 count alone can't give.
+- `backoff_total_s` — quantifies actual worker time lost waiting on a third party, ties
+  straight into the report's utilization/slow-tail sections. certspotter's existing
+  `_certspotter_retry_after` backoff logic just needs this column to make that cost visible.
+- `created_at`, `UNIQUE(date, service)` — kept for consistency with `api_health`
+  (`platform` renamed to `service` here).
+- **`requests_403`** — added beyond `api_health`'s column set. certspotter/crt.sh treat
+  401/403 as an alert-worthy "key revoked" condition (per the `log_monitor` suppression
+  rules), so it gets its own bucket instead of falling into `requests_other_err`.
+- **Deliberately NOT copied from `api_health`:** the `context` column
+  (`'normal' | 'backoff' | 'canary'`) — that concept exists there for job-scan polling's
+  adaptive-vs-fullscan machinery, which doesn't apply to these 4 one-shot enrichment API calls.
+
+**Retention:** follows the exact same pattern as `api_health` and `h1b_enrichment_metrics` —
+a `RETENTION_EXTERNAL_API_HEALTH` constant in `config.py`, a `_cleanup_external_api_health(c)`
+function in `db/schema.py` (`DELETE FROM external_api_health WHERE date < cutoff`, cutoff =
+`datetime.now() - timedelta(days=RETENTION_EXTERNAL_API_HEALTH)`), and a call to it added to
+the `# ── Cleanup pass ──` block inside `init_db()` (runs on every process startup, not a cron —
+same as every other `_cleanup_*` function in that block). **Value: 60 days, matching
+`RETENTION_API_HEALTH` (config.py, `= 60`)** — this table is explicitly modeled on `api_health`,
+and daily third-party-API-health aggregates don't need `h1b_enrichment_metrics`'s 90-day window
+(that's per-company phase history used for regression detection over a full quarter; this is a
+much smaller, coarser per-service-per-day rollup where 60 days of trend is plenty).
+
+**Status as of 2026-09-22: IMPLEMENTED** — `config.py` has `RETENTION_EXTERNAL_API_HEALTH = 60`;
+`db/schema.py` has the `CREATE TABLE`/index and `_cleanup_external_api_health(c)`, wired into
+`init_db()`'s cleanup pass; the new `db/external_api_health.py` module (synchronous write,
+modeled on `api_health.py::record_scaling_event`'s retry-once pattern — call volume here never
+approaches the 20-thread job-scan volume that justifies `api_health`'s own background writer
+queue) provides `record_external_request()` + query functions; all 4 call sites are
+instrumented (`_ct_certspotter`/`_ct_crtsh` in `jobs/public_domain.py`, `kg_search`/
+`brave_career_search` in `scripts/discover_h1b_ats.py`); `pipeline_metrics.py` has a new
+"EXTERNAL API HEALTH" report section. 16 new unit tests in `tests/test_external_api_health.py`,
+all passing. **Not yet verified against a live database** (no Postgres in this dev environment —
+same caveat as the denominator-model work above; user owns live verification on next VM deploy).
+Full implementation detail in `project_codebase_map.md` under each touched file's entry and
+`project_enrichment_throughput_analysis.md`'s "Performance report" section.
 
 ---
 

@@ -30,6 +30,7 @@ _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
 
 from config import CERTSPOTTER_API_KEY
 from logger import get_logger
+from db.external_api_health import record_external_request
 
 log = get_logger(__name__)
 
@@ -282,6 +283,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
     if CERTSPOTTER_API_KEY:
         headers["Authorization"] = f"Bearer {CERTSPOTTER_API_KEY}"
 
+    _t0 = time.time()
     try:
         r = requests.get(
             "https://api.certspotter.com/v1/issuances",
@@ -290,6 +292,7 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             timeout=_CT_TIMEOUT,
             stream=True,
         )
+        response_ms = int((time.time() - _t0) * 1000)
         if r.status_code == 429:
             _ra = r.headers.get("Retry-After", "3600")
             try:
@@ -299,11 +302,13 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
             retry_after = max(1, min(retry_after, 3600))
             _certspotter_retry_after = time.time() + retry_after
             log.warning("certspotter 429 for %s — retry after %ds", domain, retry_after)
+            record_external_request("certspotter", 429, response_ms, backoff_s=retry_after)
             r.close()
             return [], retry_after
 
         if r.status_code != 200:
             log.warning("certspotter HTTP %d for %s", r.status_code, domain)
+            record_external_request("certspotter", r.status_code, response_ms)
             r.close()
             return [], None
 
@@ -320,15 +325,18 @@ def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
 
         top = sorted(roots, key=lambda x: (-roots[x], x))[:10]
         log.debug("certspotter: %d certs for %s → top roots: %s", len(certs), domain, top)
+        record_external_request("certspotter", 200, response_ms)
         return top, None
 
     except Exception as e:
         log.warning("certspotter error for %s: %s", domain, e)
+        record_external_request("certspotter", 0, int((time.time() - _t0) * 1000))
         return [], None
 
 
 def _ct_crtsh(domain: str) -> list[str]:
     """crt.sh fallback — slower, sometimes unavailable."""
+    _t0 = time.time()
     try:
         r = requests.get(
             "https://crt.sh/",
@@ -337,8 +345,10 @@ def _ct_crtsh(domain: str) -> list[str]:
             headers={"User-Agent": "python-h1b-discovery/1.0"},
             stream=True,
         )
+        response_ms = int((time.time() - _t0) * 1000)
         if r.status_code != 200:
             log.warning("crt.sh HTTP %d for %s", r.status_code, domain)
+            record_external_request("crtsh", r.status_code, response_ms)
             r.close()
             return []
 
@@ -354,10 +364,12 @@ def _ct_crtsh(domain: str) -> list[str]:
 
         top = sorted(roots, key=lambda x: (-roots[x], x))[:10]
         log.debug("crt.sh: top roots for %s: %s", domain, top)
+        record_external_request("crtsh", 200, response_ms)
         return top
 
     except Exception as e:
         log.warning("crt.sh error for %s: %s", domain, e)
+        record_external_request("crtsh", 0, int((time.time() - _t0) * 1000))
         return []
 
 
