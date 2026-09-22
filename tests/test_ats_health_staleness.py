@@ -73,14 +73,12 @@ class TestPlannerStats(unittest.TestCase):
         order = []
         conn = MagicMock()
         r = MagicMock()
-        args = MagicMock(dry_run=True, enrichment_only=False,
-                         discovery_only=False, redetect_only=False)
+        args = MagicMock(dry_run=True, enrichment_only=False, redetect_only=False)
         with patch.object(sc, "get_redis", return_value=r), \
              patch.object(sc, "_is_maintenance", return_value=False), \
              patch.object(sc, "get_conn", return_value=conn), \
              patch.object(sc, "refresh_planner_stats", side_effect=lambda c: order.append("analyze")), \
              patch.object(sc, "run_enrichment_staleness", side_effect=lambda *a, **k: order.append("enrich") or 0), \
-             patch.object(sc, "run_discovery_staleness", side_effect=lambda *a, **k: order.append("disc") or 0), \
              patch.object(sc, "run_redetect_staleness", side_effect=lambda *a, **k: order.append("redetect") or 0), \
              patch.object(sc, "run_stale_purge", side_effect=lambda *a, **k: order.append("purge") or 0):
             sc.main(args)

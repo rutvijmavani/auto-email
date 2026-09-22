@@ -11,9 +11,8 @@ For each company FEIN:
 
 Worker exits cleanly when queue is empty — not a perpetual daemon.
 Started by:
-  - fuzzy_match_uscis_dol.py   (after bulk queue population)
-  - staleness_checker cron      (every ENRICH_STALENESS_DAYS days, default 90; also for
-                                  companies with public_domain IS NULL regardless of age)
+  - fuzzy_match_uscis_dol.py   (after bulk queue population; never-enriched companies only)
+  - staleness_checker cron      (enriched more than ENRICH_STALENESS_DAYS ago, default 90)
   - API endpoint                (on-demand user-triggered re-enrichment)
 
 Usage:

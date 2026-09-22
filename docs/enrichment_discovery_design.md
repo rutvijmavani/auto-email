@@ -147,11 +147,10 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 - 2 workers (discover-h1b-ats-worker@1, discover-h1b-ats-worker@2)
 - Same quota-throttled model
 
-### Discovery Queue Sources (4)
-1. `domain_enrichment_worker` — after enrichment completes for a company above threshold
-2. `staleness_checker` cron — `(last_discovered_at IS NULL OR last_discovered_at < NOW() - DISCOVER_REDETECT_EMPTY_DAYS interval (30d)) AND petition_count >= threshold`
-3. `job_fetcher_worker` — `consecutive_zero_jobs > threshold` (re-detection trigger)
-4. Admin script — new ATS platform added → push all monitored companies
+### Discovery Queue Sources (3)
+1. `domain_enrichment_worker` — after every completed enrichment run (first-time AND the 90-day re-enrichment), when `petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS` (or trigger is `redetect`). This is the ONLY entry for `discovery:batch`; there is no discovery staleness cron (removed 2026-09-21 — it queued every FEIN a second time under a different trigger, doubling the work). Discovery therefore re-runs every `ENRICH_STALENESS_DAYS` via enrichment.
+2. `job_fetcher_worker` — `consecutive_zero_jobs > threshold` (re-detection trigger)
+3. Admin script — new ATS platform added → push all monitored companies
 
 ### Processing Steps (per company)
 
@@ -343,21 +342,18 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 
 ### Enrichment triggers (populating scripts enqueue work; manager.py autoscaler starts workers)
 ```text
-1. fuzzy_match_uscis_dol.py completes
-       → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "fuzzy_match"}
-         (all null/stale public_domain rows)
+1. fuzzy_match_uscis_dol.py completes (daily via h1b-pipeline 03:00)
+       WHERE last_enriched_at IS NULL            -- never enriched, ONLY
+       → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "enrichment", "tier": "batch"}
 
-2. staleness_checker (daily cron)
-       WHERE (
-         -- Never resolved but past staleness window (prevents re-queue every day for persistent fails)
-         (public_domain IS NULL
-           AND (last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'))
-         OR
-         -- Stale or never processed, only for actively monitored companies
-         (last_enriched_at IS NULL OR last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days')
-         AND employer_fein IN (monitored_feins from get_monitorable_companies())
-       )
-       → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness"}
+2. staleness_checker (daily cron 05:00)
+       WHERE last_enriched_at < NOW() - INTERVAL '<ENRICH_STALENESS_DAYS> days'   -- enriched before, now stale
+         careers_url IS NULL     → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "staleness", "tier": "batch"}
+         careers_url IS NOT NULL → guarded RPUSH head_check:batch {"fein": ..., "trigger": "staleness"}
+
+   The two selection sets are disjoint (NULL vs. older-than-90-days), so a FEIN is never queued twice.
+   The trigger is part of the ZSET member JSON; when both producers selected the same FEIN, ZADD
+   saw two different members and every company was enriched twice (fixed 2026-09-21).
 
 3. User visits company page (on-demand verification — see below)
        → LPUSH enrichment:on_demand {"fein": ..., "trigger": "on_demand"}
@@ -365,10 +361,10 @@ trigger_source — add: 'enrichment' | 'discovery' | 'redetection'
 
 ### Discovery triggers
 ```text
-staleness_checker (daily cron):
-    WHERE last_discovered_at < NOW() - INTERVAL '<DISCOVER_REDETECT_EMPTY_DAYS> days'
-      AND petition_count >= threshold
-        → ZADD discovery:batch petition_count fein
+domain_enrichment_worker (after each completed run, incl. the 90-day re-enrichment):
+    petition_count >= STALENESS_DISCOVERY_MIN_PETITIONS (or trigger="redetect")
+        → ZADD discovery:batch petition_count {"fein": ..., "trigger": <enrichment trigger>, "source": ...}
+    (No discovery staleness cron — removed 2026-09-21; enrichment forwarding is the only entry.)
 
 head_check_worker (trigger="redetect" path):
         → ZADD discovery:redetect petition_count fein
@@ -520,5 +516,5 @@ because pipeline debugging benefits from a full quarter of phase-by-phase histor
    - No quota file needed — react to 429 + Retry-After
    - Reference script: /tmp/test_pd4.py (8/8 passing, ready to integrate)
 5. **Re-detection threshold** — `JOB_MONITOR_REDETECT_DAYS = 14` (already in config.py)
-   and `DISCOVER_REDETECT_EMPTY_DAYS = 30` for discovery staleness
+   (`DISCOVER_REDETECT_EMPTY_DAYS = 30` is now used only by h1b_pipeline; there is no discovery staleness cron)
 6. **Staleness interval** — `ENRICH_STALENESS_DAYS = 90` (in config.py); enrichment refresh after 90 days
