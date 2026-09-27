@@ -288,6 +288,62 @@ class TestProspectiveDB(unittest.TestCase):
         self.assertIn("status", result)
         self.assertIn("priority", result)
 
+    def test_enable_monitoring_default_false_leaves_is_monitored_unchanged(self):
+        """Default enable_monitoring=False never touches is_monitored on conflict."""
+        db_module.add_prospective_company("Google")
+        # Force is_monitored to FALSE directly, mimicking a not-yet-monitored row.
+        from db.connection import get_conn
+        conn = get_conn()
+        conn.execute(
+            "UPDATE prospective_companies SET is_monitored = FALSE WHERE company = ?",
+            ("Google",),
+        )
+        conn.commit()
+        conn.close()
+
+        # Conflict-path add (company already exists) without enable_monitoring.
+        result = db_module.add_prospective_company("Google", platform="greenhouse", slug="google")
+        self.assertFalse(result)
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT is_monitored FROM prospective_companies WHERE company = ?", ("Google",)
+        ).fetchone()
+        conn.close()
+        self.assertFalse(bool(row["is_monitored"]))
+
+    def test_enable_monitoring_true_flips_is_monitored_on_conflict(self):
+        """enable_monitoring=True unconditionally raises is_monitored on the conflict path."""
+        db_module.add_prospective_company("Google")
+        from db.connection import get_conn
+        conn = get_conn()
+        conn.execute(
+            "UPDATE prospective_companies SET is_monitored = FALSE WHERE company = ?",
+            ("Google",),
+        )
+        conn.commit()
+        conn.close()
+
+        result = db_module.add_prospective_company(
+            "Google", platform="greenhouse", slug="google", enable_monitoring=True
+        )
+        self.assertFalse(result)  # still a conflict, not a new insert
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT is_monitored FROM prospective_companies WHERE company = ?", ("Google",)
+        ).fetchone()
+        conn.close()
+        self.assertTrue(bool(row["is_monitored"]))
+
+    def test_enable_monitoring_true_does_not_lower_already_true(self):
+        """enable_monitoring=True never toggles is_monitored down — it's an unconditional raise only."""
+        db_module.add_prospective_company("Google")  # is_monitored defaults TRUE
+        result = db_module.add_prospective_company(
+            "Google", platform="greenhouse", slug="google", enable_monitoring=True
+        )
+        self.assertFalse(result)
+        company = db_module.get_prospective_company("Google")
+        self.assertTrue(bool(company["is_monitored"]))
+
 
 # ─────────────────────────────────────────
 # TEST: convert_prospective_to_active

@@ -1158,6 +1158,7 @@ else:
                             domain=_norm_domain(website),
                             platform=platform,
                             slug=slug,
+                            enable_monitoring=True,
                         )
                         # Feed URLs to the sheet only for new inserts.
                         if inserted:
@@ -1310,12 +1311,18 @@ else:
                                            WHERE employer_fein = %s""",
                                         (fein,),
                                     )
+                                    # Part 6.2 (docs/discovery-pipeline-hardening.md): match
+                                    # on (domain, platform) — company_ats's own UNIQUE
+                                    # constraint key — not employer_fein, which isn't
+                                    # reliably populated on every company_ats row. Matching
+                                    # on fein silently affected 0 rows on such a row, leaving
+                                    # the wrong platform's monitoring active.
                                     _cur.execute(
                                         """UPDATE company_ats
                                            SET is_monitored = FALSE
-                                           WHERE employer_fein = %s
+                                           WHERE domain = %s
                                              AND platform = %s""",
-                                        (fein, platform),
+                                        (_norm_domain(website), platform),
                                     )
                                     _dc.commit()
                                 finally:
