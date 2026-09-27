@@ -1732,6 +1732,12 @@ def init_db():
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_verified_at TIMESTAMPTZ")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_source TEXT")
+    # Public-domain confirmation gate fix (docs/discovery-pipeline-hardening.md Part 1) —
+    # last_status records the numeric status seen on the last INCONCLUSIVE pd resolution
+    # attempt (NULL on a clean 2xx confirmation or a non-HTTP error); retry_count tracks
+    # consecutive transient (429/503) plain-retries, reset to 0 on any 2xx confirmation.
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_last_status INT")
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_retry_count INT NOT NULL DEFAULT 0")
     # Expression index: supports the LATERAL join in job_monitor.py that matches
     # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
     # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.

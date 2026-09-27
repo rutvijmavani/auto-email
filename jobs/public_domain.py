@@ -160,12 +160,20 @@ _REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
 _REDIRECT_BUDGET_S   = 20
 
 
-def _redirect_domain(host: str) -> "str | None":
+def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
     """
-    Follow HTTP redirects on host. Returns:
-      str  — root domain of final URL differs from host → redirect found
-      ""   — final URL has same root as host → already public
-      None — connection error / DNS fail / redirect chain leads to a private host
+    Follow HTTP redirects on host. Returns (domain, last_status):
+      ("", None)        — final response is 2xx and same root as host → confirmed public
+      (str, None)        — final response is 2xx and root differs from host → redirect found
+      (None, status)     — final response is not 2xx (status is the code seen) → inconclusive,
+                            never a confirmation and never a rejection; caller must cascade
+      (None, None)        — connection error / DNS fail / redirect chain leads to a private
+                            host / no HTTP response obtained at all
+
+    Only an actual 2xx response, after following redirects to their final hop, confirms
+    a domain (docs/discovery-pipeline-hardening.md Part 1) — a non-2xx final response
+    (e.g. a 403 from an IP-reputation/WAF block) must never be treated as "already public"
+    or as a genuine redirect target; it cascades to the next resolution step instead.
 
     Redirects are followed manually so every intermediate hop is validated as a
     publicly-routable address before connecting (prevents SSRF via redirect chain).
@@ -176,12 +184,13 @@ def _redirect_domain(host: str) -> "str | None":
     _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
+        final_status: "int | None" = None
         try:
             _last_headers: dict = {}
             for _ in range(_REDIRECT_MAX_HOPS):
                 if time.monotonic() > _budget_deadline:
                     log.debug("_redirect_domain: budget exceeded for %s — aborting", host)
-                    return None
+                    return None, None
                 hop_host = urlparse(current).hostname or ""
                 if not hop_host or not _is_public_host(hop_host):
                     log.debug("_redirect_domain: non-public host in chain: %s", hop_host)
@@ -213,6 +222,7 @@ def _redirect_domain(host: str) -> "str | None":
                                 current = None
                                 break
                 _last_headers = dict(r.headers)
+                final_status = r.status_code
                 r.close()
                 if r.status_code not in _REDIRECT_CODES:
                     break  # current is the final URL
@@ -232,20 +242,28 @@ def _redirect_domain(host: str) -> "str | None":
             if final in _CHALLENGE_DOMAINS or _is_challenge_response(_last_headers):
                 log.debug("_redirect_domain: challenge page detected (%s) — origin %s is real domain",
                           final, host)
-                return ""
-            return final if final != _root(host) else ""
+                return "", None
+            # Only an actual 2xx confirms — any other final status (403/404/5xx/etc.) is
+            # inconclusive, never a confirmation and never a rejection (Part 1 gate fix).
+            if final_status is None or not (200 <= final_status < 300):
+                log.debug("_redirect_domain: final status for %s is %s (not 2xx) — inconclusive",
+                          host, final_status)
+                return None, final_status
+            return (final if final != _root(host) else ""), None
         except Exception as _exc:
             log.debug("_redirect_domain: scheme probe failed for %r (%s): %s", host, scheme, _exc)
             continue
-    return None
+    return None, None
 
 
 def _has_web(root: str) -> bool:
-    """Return True if root domain serves any HTTP response (status < 500).
+    """Return True if root domain serves a non-error HTTP response (status < 400).
 
     Validates that root resolves only to public addresses before connecting.
-    Redirects are not followed — a 3xx response (< 500) still means the domain
-    is live and serving HTTP, which is all the caller cares about.
+    Redirects are not followed — a 3xx response (< 400) still means the domain
+    is live and serving HTTP, which is all the caller cares about. A 4xx/5xx no
+    longer counts (Part 1 gate fix) — a 403 from an IP-reputation/WAF block is
+    not evidence the candidate domain is the company's real site.
     """
     if not _is_public_host(root):
         return False
@@ -257,7 +275,7 @@ def _has_web(root: str) -> bool:
             r = _safe_session.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
             status = r.status_code
             r.close()
-            if status < 500:
+            if status < 400:
                 return True
         except Exception:
             pass
@@ -388,28 +406,36 @@ def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
     return candidates, None, "crtsh"
 
 
-def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int | None]":
+def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int | None, int | None]":
     """
     Resolve an internal/email domain to the company's real public domain.
 
-    Returns (public_domain, method, retry_after):
+    Returns (public_domain, method, retry_after, last_status):
       public_domain — resolved domain string, or None if unresolvable
       method        — 'http_redirect' | 'root_fallback' | 'certspotter' |
                       'crtsh' | 'same_domain' | 'ct_quota' | 'no_signal'
       retry_after   — seconds before re-queuing (certspotter 429), else None
+      last_status   — numeric HTTP status seen on the last INCONCLUSIVE confirmation
+                      attempt (Part 1 gate fix), or None on a clean 2xx / non-HTTP
+                      failure / successful resolution. Caller persists this into
+                      fein_domain_map.public_domain_last_status.
     """
     domain = (assigned_domain or "").lower().strip()
     if not domain:
-        return None, "no_signal", None
+        return None, "no_signal", None, None
 
     if _is_private_ip_literal(domain):
         log.warning("public_domain: rejecting private address %s", domain)
-        return None, "no_signal", None
+        return None, "no_signal", None, None
+
+    last_status: "int | None" = None
 
     # Step 1 — HTTP redirect on full domain
-    redir = _redirect_domain(domain)
+    redir, status = _redirect_domain(domain)
+    if status is not None:
+        last_status = status
     if redir is None:
-        log.debug("DNS fail for %s — trying root fallback", domain)
+        log.debug("DNS fail or inconclusive status for %s — trying root fallback", domain)
     elif redir == "":
         # Accept "already public" for root domains and www-prefixed subdomains.
         # A subdomain like ny.email.gs.com resolves within the same root (gs.com),
@@ -418,11 +444,11 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         sub = _tldextract(domain).subdomain
         if not sub or sub == "www":
             log.debug("%s already resolves publicly", domain)
-            return domain, "same_domain", None
+            return domain, "same_domain", None, None
         log.debug("%s resolves within its root but has subdomain — continuing", domain)
     elif redir not in GENERIC_ROOTS:
         log.info("public_domain: %s → %s (http_redirect)", domain, redir)
-        return redir, "http_redirect", None
+        return redir, "http_redirect", None, None
     else:
         log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
@@ -430,16 +456,18 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     ext      = _tldextract(domain)
     root_try = ext.registered_domain
     if root_try and root_try != domain:
-        redir = _redirect_domain(root_try)
+        redir, status = _redirect_domain(root_try)
+        if status is not None:
+            last_status = status
         if redir is None:
             pass
         elif redir == "":
             if root_try not in GENERIC_ROOTS:
                 log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
-                return root_try, "root_fallback", None
+                return root_try, "root_fallback", None, None
         elif redir not in GENERIC_ROOTS:
             log.info("public_domain: %s → %s (root_fallback)", domain, redir)
-            return redir, "root_fallback", None
+            return redir, "root_fallback", None, None
         else:
             log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
@@ -448,7 +476,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     candidates, retry_after, ct_source = _ct_domains(domain)
 
     if retry_after is not None:
-        return None, "ct_quota", retry_after
+        return None, "ct_quota", retry_after, None
 
     _ct_budget_start = time.time()
     for candidate in candidates[:10]:
@@ -457,10 +485,10 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
             break
         if _has_web(candidate):
             log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
-            return candidate, ct_source, None
+            return candidate, ct_source, None, None
 
     log.debug("no public domain signal for %s", domain)
-    return None, "no_signal", None
+    return None, "no_signal", None, last_status
 
 
 

@@ -354,6 +354,12 @@ CF_WORKER_DAILY_LIMIT = int(os.getenv("CF_WORKER_DAILY_LIMIT", "85000"))
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 
+# Public-domain confirmation gate fix (docs/discovery-pipeline-hardening.md Part 1) —
+# transient (429/503) pd resolutions get plain-retried up to PD_RETRY_CAP times, spaced
+# PD_RETRY_INTERVAL_DAYS apart, before escalating to the mobile relay queue (Part 3).
+PD_RETRY_CAP           = int(os.getenv("PD_RETRY_CAP", "4"))
+PD_RETRY_INTERVAL_DAYS = int(os.getenv("PD_RETRY_INTERVAL_DAYS", "2"))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
 # ─────────────────────────────────────────────────────────────────────────────

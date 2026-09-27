@@ -213,6 +213,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.careers_url,
             f.public_domain,
             f.public_domain_method,
+            COALESCE(f.public_domain_retry_count, 0) AS public_domain_retry_count,
             e.employer_name,
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
@@ -225,27 +226,42 @@ def _load_company(conn, fein: str) -> "dict | None":
     return dict(row)
 
 
-def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> None:
+def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
+                  last_status: "int|None", prev_retry_count: int) -> None:
     # Does NOT touch last_enriched_at — Phase 3/6 haven't run yet at this point,
     # and if either later raises, the attempt is a failure that must not look
     # like a completed enrichment cycle to staleness-based re-detection.
     # last_enriched_at is advanced once, in _process_company, only after both
     # phases have completed without raising.
+    #
+    # public_domain_last_status/public_domain_retry_count (Part 1 gate fix):
+    # a clean 2xx resolution always clears both (NULL / 0). A failed resolution
+    # records the inconclusive status seen and increments the retry counter only
+    # for transient (429/503) statuses — the staleness_checker pd-retry pass reads
+    # this counter to decide when to stop plain-retrying and escalate to the relay
+    # queue (Part 3) instead. Non-transient statuses (403/404/etc.) record the
+    # status but leave the counter alone — those are relay-eligible immediately,
+    # not part of the plain-retry loop.
     if public_domain is not None:
         conn.execute("""
             UPDATE fein_domain_map
-            SET public_domain        = %s,
-                public_domain_method = %s,
-                updated_at           = NOW()
+            SET public_domain              = %s,
+                public_domain_method        = %s,
+                public_domain_last_status   = NULL,
+                public_domain_retry_count   = 0,
+                updated_at                  = NOW()
             WHERE employer_fein = %s
         """, (public_domain, method, fein))
     else:
         # Resolution failed — preserve any previously stored domain.
+        new_retry_count = prev_retry_count + 1 if last_status in (429, 503) else prev_retry_count
         conn.execute("""
             UPDATE fein_domain_map
-            SET updated_at = NOW()
+            SET public_domain_last_status = %s,
+                public_domain_retry_count  = %s,
+                updated_at                 = NOW()
             WHERE employer_fein = %s
-        """, (fein,))
+        """, (last_status, new_retry_count, fein))
 
 
 def _write_metric(conn, fein: str, trigger: str,
@@ -361,6 +377,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         existing_careers   = company["careers_url"]
         stored_public      = company["public_domain"]
         db_petition_count  = company["petition_count"]
+        prev_retry_count   = company["public_domain_retry_count"]
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
@@ -371,7 +388,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 1: public domain resolution ──────────────────────────────────
-        public_domain, method, retry_after = discover_public_domain(assigned)
+        public_domain, method, retry_after, last_status = discover_public_domain(assigned)
 
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
@@ -386,11 +403,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         website_url      = f"https://{probe_domain}"
 
         # _write_domain persists public_domain/method when resolution succeeded, or just
-        # touches updated_at on failure (preserves existing stored domain). It does not
-        # advance last_enriched_at — see its docstring comment.
-        _write_domain(conn, fein, public_domain, method)
+        # records last_status/retry_count on failure (preserves existing stored domain).
+        # It does not advance last_enriched_at — see its docstring comment.
+        _write_domain(conn, fein, public_domain, method, last_status, prev_retry_count)
         conn.commit()
-        log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
+        log.info("fein=%s public_domain=%s method=%s last_status=%s (effective=%s)",
+                 fein, public_domain, method, last_status, effective_public)
 
         # ── Step 2: Phase 3 — career path probe (always runs) ────────────────
         # Routing upstream (entry check + head_check) guarantees we only arrive
