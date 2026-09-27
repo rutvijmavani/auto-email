@@ -1590,6 +1590,35 @@ def upsert_discovery(data: dict, conn, dry_run: bool = False) -> None:
     conn.commit()
 
 
+def _lookup_company_ats(conn, domain: str) -> "dict | None":
+    """Look up an already-resolved ATS platform/slug for domain in company_ats
+    (docs/discovery-pipeline-hardening.md Part 5.1) — cheap interim dedup mitigation
+    against re-running Phase 6/7's expensive scans when this domain's ATS is already
+    known from a prior enrichment pass or a prior discover_h1b_ats.py run.
+
+    Returns {"platform": ..., "slug": ...} for the best-matching row, or None if no
+    resolved (non-unknown/unsupported) row exists for domain. When multiple rows exist
+    for the same domain (different platforms detected over time), ties break:
+      1. is_monitored = TRUE wins (a human already confirmed this one)
+      2. most-recently-reviewed (reviewed_at DESC, NULLs last)
+      3. highest priority
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT platform, slug
+        FROM company_ats
+        WHERE domain = %s
+          AND platform NOT IN ('unknown', 'unsupported')
+          AND slug IS NOT NULL
+        ORDER BY is_monitored DESC, reviewed_at DESC NULLS LAST, priority DESC
+        LIMIT 1
+    """, (domain,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"platform": row["platform"], "slug": row["slug"]}
+
+
 def _upsert_company_ats(
     conn,
     fein: "str | None",
@@ -1966,6 +1995,19 @@ def process_employer(
             elif _phase3_blocked:
                 log.info("  Phase 3 block-like status %s — deferring Brave to relay pass",
                           careers_url_last_status)
+
+    # Part 5.1 cache check — before Phase 6's expensive scan, see if company_ats already
+    # has a resolved platform/slug for this domain (from a prior enrichment pass or a
+    # prior discover_h1b_ats.py run) and reuse it instead of re-scanning from scratch.
+    if not detected_platform and website_url:
+        _cache_domain = _root_domain(website_url)
+        _cached = _lookup_company_ats(conn, _cache_domain)
+        if _cached:
+            detected_platform = _cached["platform"]
+            detected_slug     = _cached["slug"]
+            ats_source        = "company_ats_cache"
+            log.info("  company_ats cache HIT: %s / %s (domain=%s)",
+                     detected_platform, detected_slug, _cache_domain)
 
     # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.

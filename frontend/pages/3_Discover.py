@@ -1179,6 +1179,19 @@ else:
                                 "WHERE employer_fein = %s",
                                 (fein,),
                             )
+                            # Part 5.3 (docs/discovery-pipeline-hardening.md): mirror the
+                            # monitoring flag into company_ats too, so the two ATS-tracking
+                            # systems don't silently diverge. Matched on (domain, platform) —
+                            # company_ats's own UNIQUE constraint key — not employer_fein,
+                            # which isn't reliably populated on every company_ats row. A
+                            # 0-row match (no company_ats row yet for this domain/platform)
+                            # is expected/harmless, not an error.
+                            cur.execute(
+                                """UPDATE company_ats
+                                   SET is_monitored = TRUE, reviewed_at = NOW()
+                                   WHERE domain = %s AND platform = %s""",
+                                (_norm_domain(website), platform),
+                            )
                             conn.commit()
                         finally:
                             conn.close()

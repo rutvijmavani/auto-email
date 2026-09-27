@@ -336,6 +336,37 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
     return cur.rowcount
 
 
+def _write_discovery_ats(conn, fein: str, employer_name: str,
+                          platform: str, slug: str, source: str) -> None:
+    """Mirror-write a company_ats detection into h1b_ats_discovery (docs/discovery-
+    pipeline-hardening.md Part 5.2) — keeps the two ATS-tracking systems from
+    silently diverging when enrichment (this worker) finds a platform/slug that
+    discover_h1b_ats.py's own pass hasn't seen yet, or has seen differently.
+
+    Ports the same platform-change guard scripts/discover_h1b_ats.py::upsert_discovery
+    already applies: a slug never survives under a different platform than the one
+    it was detected with — if this write's platform differs from what's on record,
+    the new slug replaces it outright (even NULL); otherwise COALESCE keeps whichever
+    slug is non-NULL. No commit — caller commits (same convention as _write_ats)."""
+    conn.execute("""
+        INSERT INTO h1b_ats_discovery
+            (employer_fein, employer_name, detected_platform, detected_slug,
+             ats_source, last_checked)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (employer_fein) DO UPDATE SET
+            employer_name     = COALESCE(EXCLUDED.employer_name, h1b_ats_discovery.employer_name),
+            detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
+            detected_slug     = CASE
+                WHEN EXCLUDED.detected_platform IS NOT NULL
+                     AND EXCLUDED.detected_platform IS DISTINCT FROM h1b_ats_discovery.detected_platform
+                THEN EXCLUDED.detected_slug
+                ELSE COALESCE(EXCLUDED.detected_slug, h1b_ats_discovery.detected_slug)
+            END,
+            ats_source        = COALESCE(EXCLUDED.ats_source, h1b_ats_discovery.ats_source),
+            last_checked      = NOW()
+    """, (fein, employer_name, platform, slug, source))
+
+
 def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None,
                        trigger: str = "enrichment") -> None:
     member = json.dumps({"fein": fein, "trigger": trigger, "source": source})
@@ -476,6 +507,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                 if p6_platform and p6_slug:
                     p6_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                                   p6_platform, p6_slug, db_petition_count))
+                    _write_discovery_ats(conn, fein, employer_name,
+                                          p6_platform, p6_slug, source="enrichment_phase6")
                     log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
 
         # Use Phase 3 ATS whenever Phase 6 found no platform
@@ -483,6 +516,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if not p6_platform and p3_platform and p3_slug:
             p3_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                           p3_platform, p3_slug, db_petition_count))
+            _write_discovery_ats(conn, fein, employer_name,
+                                  p3_platform, p3_slug, source="enrichment_phase3")
             log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
 
         # Phase 3 and Phase 6 both completed without raising — this is a genuinely
