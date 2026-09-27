@@ -510,7 +510,7 @@ def _run_inline_discovery(fein: str, emp_name: str) -> dict | None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             future = ex.submit(discover_careers_url, website_url)
             try:
-                careers_url, detected_platform, detected_slug = future.result(
+                careers_url, detected_platform, detected_slug, _last_status = future.result(
                     timeout=_INLINE_PROBE_TIMEOUT
                 )
             except concurrent.futures.TimeoutError:

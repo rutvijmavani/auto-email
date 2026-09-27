@@ -1738,6 +1738,12 @@ def init_db():
     # consecutive transient (429/503) plain-retries, reset to 0 on any 2xx confirmation.
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_last_status INT")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_retry_count INT NOT NULL DEFAULT 0")
+    # Chrome-impersonated fetching (docs/discovery-pipeline-hardening.md Part 2) —
+    # most block-like HTTP status seen across Phase 3's ~19 probed career-URL patterns
+    # in scripts/discover_h1b_ats.py. Gates whether Phase 4 (Brave) runs immediately
+    # (404/NULL — no block, just nothing there) or is deferred until after a mobile
+    # relay attempt (403/429/503 — looks like a WAF/bot-management block).
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_last_status INT")
     # Expression index: supports the LATERAL join in job_monitor.py that matches
     # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
     # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.

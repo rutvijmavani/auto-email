@@ -63,10 +63,12 @@ except Exception as _e:
     _PHASE3_AVAILABLE = False
 
 
-def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
+def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None, int|None]":
+    """4th element: careers_url_last_status (docs/discovery-pipeline-hardening.md Part 2)
+    — most block-like HTTP status seen across the probe, or None on a hit / network error."""
     if not _PHASE3_AVAILABLE:
         log.debug("phase3 unavailable (import-time failure) — skipping for %s", website_url)
-        return None, None, None
+        return None, None, None, None
     try:
         return _discover_careers_url(website_url)
     except Exception as e:
@@ -288,9 +290,23 @@ def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
         UPDATE fein_domain_map
         SET careers_url    = %s,
             careers_source = %s,
+            careers_url_last_status = NULL,
             updated_at     = NOW()
         WHERE employer_fein = %s
     """, (careers_url, source, fein))
+
+
+def _write_careers_last_status(conn, fein: str, last_status: "int | None") -> None:
+    """UPDATE-only counterpart to _write_careers() for the miss/block case
+    (docs/discovery-pipeline-hardening.md Part 2): persists the most block-like
+    status Phase 3 saw so a future staleness/relay pass can gate on it, without
+    touching careers_url/careers_source. No commit — caller commits."""
+    conn.execute("""
+        UPDATE fein_domain_map
+        SET careers_url_last_status = %s,
+            updated_at = NOW()
+        WHERE employer_fein = %s
+    """, (last_status, fein))
 
 
 def _invalidate_head_check_cache(r, fein: str) -> None:
@@ -417,13 +433,19 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         _careers_source_this_run = None
         p3_platform = p3_slug = None
 
-        careers_url, p3_platform, p3_slug = _phase3(website_url)
+        careers_url, p3_platform, p3_slug, p3_last_status = _phase3(website_url)
         if careers_url:
             _careers_source_this_run = "phase3"
             _write_careers(conn, fein, careers_url, source="phase3")
             conn.commit()
             _invalidate_head_check_cache(r, fein)
             log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
+        elif p3_last_status is not None:
+            # Block-like status (403/429/503) or first-seen miss (404) — persist so
+            # a future relay pass (Part 3) can gate on it, mirroring discover_h1b_ats.py.
+            _write_careers_last_status(conn, fein, p3_last_status)
+            conn.commit()
+            log.info("fein=%s careers_url_last_status=%s (phase3)", fein, p3_last_status)
 
         # ── Step 3: Phase 6 — career page ATS scan (only if Phase 3 found nothing) ──
         p6_platform = None

@@ -62,7 +62,10 @@ from db.connection import get_conn
 from db.external_api_health import get_day_request_count, get_month_request_count, record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
-from jobs.http_safe import make_safe_session as _make_safe_session
+from jobs.http_safe import (
+    make_safe_session as _make_safe_session,
+    make_safe_curl_session as _make_safe_curl_session,
+)
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 
@@ -96,6 +99,16 @@ _BRAVE_ENDPOINT  = "https://api.search.brave.com/res/v1/web/search"
 _BRAVE_API_KEY   = os.environ.get("BRAVE_API_KEY", "")
 _BRAVE_QUOTA_FILE = os.path.join("data", "brave_quota.json")
 _BRAVE_QUOTA_LIMIT = 950   # conservative out of 1000 free/month
+
+# 402 Payment Required = Brave's own account/billing state (plan quota used up,
+# payment issue), NOT our local usage counter — every subsequent call in the
+# same run is guaranteed to fail the same way until it's resolved on Brave's
+# side. Without this, a large batch hammers the dead endpoint once per
+# company (confirmed live 2026-09-22: 20 companies × 402 in one log excerpt).
+# Module-level, in-process only — trips for the life of the worker process,
+# rechecked after a cooldown in case the account issue gets resolved mid-run.
+_brave_blocked_until: float = 0.0
+_BRAVE_402_COOLDOWN_S = 3600   # 1h between retry attempts once 402 is seen
 
 _SPARQL_CHUNK_SIZE = 50    # Freebase MIDs per SPARQL VALUES block
 _HTTP_TIMEOUT      = 12
@@ -932,6 +945,14 @@ def brave_career_search(
         log.warning("Brave monthly quota exhausted — skipping search for %r", company_name)
         return None
 
+    global _brave_blocked_until
+    if time.time() < _brave_blocked_until:
+        log.debug(
+            "Brave: account blocked (402 seen this run) — skipping %r, retry after %s",
+            company_name, time.strftime("%H:%M:%S", time.localtime(_brave_blocked_until)),
+        )
+        return None
+
     query  = f"{company_name} careers"
     tokens = _company_tokens(company_name)
 
@@ -955,6 +976,15 @@ def brave_career_search(
         if resp.status_code == 429:
             log.warning("Brave API: rate limited for %r", company_name)
             record_external_request("brave", 429, _brave_response_ms)
+            return None
+        if resp.status_code == 402:
+            log.error(
+                "Brave API: HTTP 402 Payment Required — account/billing issue, "
+                "not our local quota. Circuit breaker tripped for %ds.",
+                _BRAVE_402_COOLDOWN_S,
+            )
+            _brave_blocked_until = time.time() + _BRAVE_402_COOLDOWN_S
+            record_external_request("brave", 402, _brave_response_ms)
             return None
         if resp.status_code != 200:
             log.debug("Brave API: HTTP %d for %r", resp.status_code, company_name)
@@ -1002,52 +1032,55 @@ def brave_career_search(
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_html(url: str, session=None) -> tuple[str | None, str]:
+def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
     """
     GET url following redirects manually (SSRF-validates every hop).
-    Returns (html_text, final_url) or (None, url) on failure.
+    Returns (html_text, final_url, status) — status is the last direct HTTP status
+    seen (None on a network/timeout error with no response at all; 200 on a CF-Worker
+    fallback success, since that's the effective outcome the caller cares about).
 
-    session: optional caller-owned safe session, reused across probes and left open.
-    When omitted, a private session is created and closed before returning.
+    session: optional caller-owned session, reused across probes and left open. Defaults
+    to a Chrome-impersonated curl_cffi session (docs/discovery-pipeline-hardening.md
+    Part 2) when omitted, created here and closed before returning.
     """
     if not _is_public_url(url):
-        return None, url
+        return None, url, None
     current = url
     owns_session = session is None
     if owns_session:
-        session = _make_safe_session()
+        session = _make_safe_curl_session()
     try:
         for _ in range(_MAX_REDIRECTS):
             r = session.get(
                 current, headers=_HEADERS, timeout=_HTTP_TIMEOUT,
                 allow_redirects=False,
             )
-            if r.is_redirect:
+            if r.status_code in (301, 302, 303, 307, 308):
                 location = r.headers.get("Location", "")
                 next_url  = urljoin(current, location)
                 if not _is_public_url(next_url):
                     log.debug("Redirect to non-public URL blocked: %s", next_url)
-                    return None, url
+                    return None, url, None
                 current = next_url
                 continue
-            if r.status_code in (403, 429):
+            if r.status_code in (403, 429, 503):
                 result = _fetch_via_worker(current)
                 if result:
-                    return result
-                return None, current
+                    return result[0], result[1], 200
+                return None, current, r.status_code
             if r.status_code < 400:
-                return r.text, current
-            return None, current
+                return r.text, current, r.status_code
+            return None, current, r.status_code
         log.debug("Too many redirects for %s", url)
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         log.debug("Fetch error %s: %s", url, e)
         result = _fetch_via_worker(url)
         if result:
-            return result
+            return result[0], result[1], 200
     finally:
         if owns_session:
             session.close()
-    return None, url
+    return None, url, None
 
 
 def _fetch_via_worker(url: str) -> tuple[str, str] | None:
@@ -1060,6 +1093,19 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
     tracked atomically via db/external_api_health.py (service="cf_worker") —
     same record_external_request()/get_day_request_count() pattern used for
     Brave's monthly quota, just windowed to a day instead of a month.
+
+    Two distinct failure layers get recorded differently, on purpose:
+      - resp.status_code != 200 is a failure of OUR call to the Worker itself
+        (bad/rotated secret, malformed request, Cloudflare-side outage) —
+        recorded as-is, so a real 401 here genuinely means "key rejected"
+        (see db/external_api_health.py::_classify_status).
+      - data["status"] (only reachable once resp.status_code == 200) is the
+        status of the WORKER'S fetch of the target career site — a 401/403
+        there just means that site blocked the probe, which is the exact
+        scenario this fallback exists for, not a problem with our own key.
+        Recorded with a sentinel (1) that always lands in the generic
+        other_err bucket, so it still counts toward Err% without triggering
+        the "key rejected/revoked" 401/403 alert that bucket is reserved for.
     """
     if not CF_WORKER_URL or not CF_WORKER_SECRET:
         return None
@@ -1075,20 +1121,38 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
             timeout=30,
         )
         _ms = int((time.time() - _t0) * 1000)
-        data = resp.json()
-        if data.get("error") or (data.get("status") or 0) >= 400:
-            record_external_request("cf_worker", data.get("status") or 502, _ms)
-            log.debug("CF Worker: %s → error=%s status=%s", url, data.get("error"), data.get("status"))
-            return None
-        final_url = data.get("final_url") or url
-        body      = data.get("body") or ""
-        record_external_request("cf_worker", data.get("status") or 200, _ms)
-        log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
-        return body, final_url
     except Exception as exc:
         record_external_request("cf_worker", 0, int((time.time() - _t0) * 1000))
         log.debug("CF Worker request failed for %s: %s", url, exc)
         return None
+
+    if resp.status_code != 200:
+        # Worker-level failure (bad secret, bad request, Cloudflare outage) —
+        # this status IS about our own call, classify it as-is.
+        record_external_request("cf_worker", resp.status_code, _ms)
+        log.debug("CF Worker: HTTP %s for %s (worker call itself failed)", resp.status_code, url)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        record_external_request("cf_worker", 0, _ms)
+        log.debug("CF Worker: invalid JSON body for %s: %s", url, exc)
+        return None
+
+    if data.get("error") or (data.get("status") or 0) >= 400:
+        # Target site's response, not ours — see docstring. Sentinel 1 keeps
+        # this out of the 429/403 buckets while still counting as an error.
+        record_external_request("cf_worker", 1, _ms)
+        log.debug("CF Worker: %s → error=%s status=%s (target site, not worker auth)",
+                   url, data.get("error"), data.get("status"))
+        return None
+
+    final_url = data.get("final_url") or url
+    body      = data.get("body") or ""
+    record_external_request("cf_worker", 200, _ms)
+    log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
+    return body, final_url
 
 
 def _find_ats_in_html(html: str) -> tuple[str | None, str | None]:
@@ -1146,18 +1210,19 @@ def _resolve_website_redirect(url: str, session=None) -> str:
     final_url = None
     owns_session = session is None
     if owns_session:
-        session = _make_safe_session()
+        session = _make_safe_curl_session()
 
     try:
-        # Manual redirect loop: every hop is SSRF-validated (allow_redirects=True
-        # would let a public host bounce us to an internal address unchecked).
-        # The safe session's SSRFAdapter re-validates the resolved IPs at connect
-        # time and pins the connection to the validated address for HTTP hops.
+        # Manual redirect loop: every hop is SSRF-validated via _is_public_url()
+        # (allow_redirects=True would let a public host bounce us to an internal
+        # address unchecked). curl_cffi (the default session, Chrome-impersonated,
+        # Part 2) has no SSRFAdapter-style connect-time pinning, so this per-hop
+        # check is the only guard — same accepted TOCTOU-gap precedent as elsewhere.
         current = root_url
         for _ in range(_MAX_REDIRECTS):
             r = session.get(current, timeout=8, allow_redirects=False,
                             headers=_API_HEADERS)
-            if r.is_redirect:
+            if r.status_code in (301, 302, 303, 307, 308):
                 next_url = urljoin(current, r.headers.get("Location", ""))
                 if not _is_public_url(next_url):
                     log.debug("_resolve_website_redirect: redirect to non-public URL blocked: %s", next_url)
@@ -1212,10 +1277,10 @@ def _resolve_website_redirect(url: str, session=None) -> str:
 def discover_careers_url(
     website_url: str,
     session=None,
-) -> tuple[str | None, str | None, str | None]:
+) -> tuple[str | None, str | None, str | None, "int | None"]:
     """
     Probe 19 career URL patterns for company website.
-    Returns (careers_url, detected_platform, detected_slug).
+    Returns (careers_url, detected_platform, detected_slug, careers_url_last_status).
 
     Follows redirects but rejects:
       - Final URL is homepage (path == "/" or empty)
@@ -1224,13 +1289,19 @@ def discover_careers_url(
 
     Bonus: if redirect lands on known ATS domain, captures ATS from URL directly.
 
-    session: optional caller-owned safe session, reused for every probe and left open.
-    When omitted, ONE session is created for the whole probe run and closed on exit
-    (including failures). Sessions are never shared across threads or held module-wide.
+    careers_url_last_status is the most block-like HTTP status seen across all 19
+    probes (docs/discovery-pipeline-hardening.md Part 2) — None on a hit or on
+    plain network errors only. Persisted to fein_domain_map.careers_url_last_status
+    by the caller; gates whether Phase 4 (Brave) runs immediately or defers.
+
+    session: optional caller-owned session, reused for every probe and left open.
+    Defaults to a Chrome-impersonated curl_cffi session (Part 2) created here for
+    the whole probe run and closed on exit (including failures). Sessions are never
+    shared across threads or held module-wide.
     """
     owns_session = session is None
     if owns_session:
-        session = _make_safe_session()
+        session = _make_safe_curl_session()
     try:
         return _probe_career_urls(website_url, session)
     finally:
@@ -1238,14 +1309,37 @@ def discover_careers_url(
             session.close()
 
 
+_BLOCK_STATUS_PRIORITY = {403: 3, 429: 2, 503: 1}
+
+
+def _worse_status(current: "int | None", new: "int | None") -> "int | None":
+    """Track the most block-like status across the 19 career-URL probe candidates
+    (docs/discovery-pipeline-hardening.md Part 2) — 403 > 429 > 503 > any other
+    non-2xx > None. Any other non-2xx status is kept as-is if seen first (only a
+    genuine block-like code ever displaces it)."""
+    if new is None:
+        return current
+    if current is None:
+        return new
+    if _BLOCK_STATUS_PRIORITY.get(new, 0) > _BLOCK_STATUS_PRIORITY.get(current, 0):
+        return new
+    return current
+
+
 def _probe_career_urls(
     website_url: str,
     session,
-) -> tuple[str | None, str | None, str | None]:
-    """Body of discover_careers_url: probe candidates with the caller's session."""
+) -> tuple[str | None, str | None, str | None, int | None]:
+    """Body of discover_careers_url: probe candidates with the caller's session.
+
+    4th return value: careers_url_last_status — the most block-like HTTP status seen
+    across all probed candidates (Part 2), or None if every attempt either succeeded
+    or hit a plain network error. Persisted so the staleness pass can decide whether
+    Phase 4 (Brave) should run immediately or defer to a mobile relay attempt (Part 3).
+    """
     if not _is_public_url(website_url):
         log.warning("Skipping non-public URL: %s", website_url)
-        return None, None, None
+        return None, None, None, None
 
     parsed        = urlparse(website_url)
     netloc        = parsed.netloc
@@ -1261,8 +1355,10 @@ def _probe_career_urls(
         candidates.append(base + path)
 
     _fallback = None  # ATS-domain hit with no slug match — returned only if no better result found
+    last_status: "int | None" = None
     for url in candidates:
-        html, final_url = _fetch_html(url, session)
+        html, final_url, status = _fetch_html(url, session)
+        last_status = _worse_status(last_status, status)
         if html is None:
             continue
 
@@ -1287,13 +1383,13 @@ def _probe_career_urls(
                     "  %s → ATS redirect: %s slug=%s",
                     url, result["platform"], result["slug"],
                 )
-                return final_url, result["platform"], result["slug"]
+                return final_url, result["platform"], result["slug"], None
             # Pattern didn't match (e.g. new ATS subdomain without a known slug format).
             # Record as fallback hint but keep probing remaining candidates — a later
             # candidate may yield the slug-bearing URL (e.g. company.com/careers → ATS).
             log.debug("  %s → ATS domain (%s) but no slug match — keeping as fallback", url, final_root)
             if _fallback is None:
-                _fallback = (final_url, None, None)
+                _fallback = (final_url, None, None, None)
             continue
 
         # Reject redirect that jumped to an unrelated external domain (e.g. stafflinepro.com)
@@ -1307,9 +1403,9 @@ def _probe_career_urls(
             "  %s → career page found; platform=%s slug=%s",
             final_url, platform, slug,
         )
-        return final_url, platform, slug
+        return final_url, platform, slug, None
 
-    return _fallback or (None, None, None)
+    return _fallback or (None, None, None, last_status)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1757,6 +1853,7 @@ def process_employer(
     detected_slug     = None
     ats_source        = None   # which phase found the ATS platform
     careers_source    = None   # which phase found the careers URL
+    careers_url_last_status = None   # Part 2 — most block-like status from Phase 3's probes
 
     if known_careers_url:
         # Normal first-pass path (discover_h1b_ats_worker, trigger ∈ {enrichment, staleness}):
@@ -1785,14 +1882,15 @@ def process_employer(
             detected_slug     = _hit.get("slug")
             ats_source        = "phase1_kg"
     elif website_url:
-        # One safe session for this employer's whole Phase 3-5 fetch run (redirect
-        # resolution, 19 probes, Brave-page fingerprint); closed on every exit path.
-        with _make_safe_session() as _fetch_session:
+        # One Chrome-impersonated session (Part 2) for this employer's whole Phase 3-5
+        # fetch run (redirect resolution, 19 probes, Brave-page fingerprint); closed on
+        # every exit path.
+        with _make_safe_curl_session() as _fetch_session:
             # Phase 3: 19-pattern probe
             website_url = _resolve_website_redirect(website_url, _fetch_session)
             log.info("  Probing 19 career URL patterns on %s …", website_url)
             try:
-                careers_url, detected_platform, detected_slug = discover_careers_url(
+                careers_url, detected_platform, detected_slug, careers_url_last_status = discover_careers_url(
                     website_url, _fetch_session
                 )
                 if careers_url:
@@ -1802,8 +1900,13 @@ def process_employer(
             except Exception as e:
                 log.warning("  Career probe failed: %s", e)
 
-            # Phase 4: Brave search fallback (skipped in batch/KG-only mode)
-            if not careers_url and not skip_brave:
+            # Phase 4: Brave search fallback (skipped in batch/KG-only mode). Deferred —
+            # not skipped outright — when Phase 3 looked block-like (403/429/503): Brave
+            # itself can't get past a WAF block, so this run leaves careers_url_last_status
+            # persisted for the staleness pass to route to a mobile relay attempt instead
+            # (Part 3, not yet built). A plain miss (404/NULL) still runs Brave immediately.
+            _phase3_blocked = careers_url_last_status in (403, 429, 503)
+            if not careers_url and not skip_brave and not _phase3_blocked:
                 search_name = canonical_name or strip_legal_suffixes(name) or name
                 log.info("  Brave search fallback for %r …", search_name)
                 brave_url = brave_career_search(search_name, website_url=website_url)
@@ -1813,13 +1916,16 @@ def process_employer(
                     log.info("  Brave found: %s", brave_url)
                     # Phase 5: fingerprint the Brave result page
                     try:
-                        html, _ = _fetch_html(brave_url, _fetch_session)
+                        html, _, _ = _fetch_html(brave_url, _fetch_session)
                         if html:
                             detected_platform, detected_slug = _find_ats_in_html(html)
                             if detected_platform:
                                 ats_source = "phase5"
                     except Exception as e:
                         log.warning("  HTML fingerprint failed: %s", e)
+            elif _phase3_blocked:
+                log.info("  Phase 3 block-like status %s — deferring Brave to relay pass",
+                          careers_url_last_status)
 
     # Phase 6: career_page.py — 3-layer deep scan (redirect + full HTML + job links)
     # Runs when platform still unknown, whether jobs_url or website_url was found.
@@ -1926,11 +2032,12 @@ def process_employer(
     if not dry_run and careers_url:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, updated_at)
-            VALUES (%s, %s, %s, NOW())
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, careers_url_last_status, updated_at)
+            VALUES (%s, %s, %s, NULL, NOW())
             ON CONFLICT (employer_fein) DO UPDATE
                 SET careers_url    = EXCLUDED.careers_url,
                     careers_source = EXCLUDED.careers_source,
+                    careers_url_last_status = NULL,
                     careers_url_verified_at = CASE
                         WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
                         THEN NULL
@@ -1938,6 +2045,18 @@ def process_employer(
                     END,
                     updated_at     = NOW()
         """, (fein, careers_url, careers_source))
+        conn.commit()
+    elif not dry_run and careers_url_last_status is not None:
+        # No careers_url hit this run, but Phase 3 saw a block-like status (Part 2) —
+        # persist it on the EXISTING row only (never creates one): the staleness pass
+        # reads this to route the company to a mobile relay attempt (Part 3) instead of
+        # re-probing from the same blocked egress IP.
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE fein_domain_map
+            SET careers_url_last_status = %s, updated_at = NOW()
+            WHERE employer_fein = %s
+        """, (careers_url_last_status, fein))
         conn.commit()
 
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
@@ -2075,7 +2194,7 @@ def _run_brave_pass(conn, r, args) -> None:
                     _ats_source = "phase4"
                 else:
                     try:
-                        html_content, _ = _fetch_html(brave_url)
+                        html_content, _, _ = _fetch_html(brave_url)
                         if html_content:
                             platform, slug = _find_ats_in_html(html_content)
                             if platform:

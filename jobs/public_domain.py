@@ -10,8 +10,10 @@ Three-step algorithm:
   3. CT log (certspotter)   — fmr.com → fidelity.com via cert SANs
      Fallback: crt.sh if certspotter unavailable.
 
-Returns (public_domain, method, retry_after) where retry_after is non-None
-only on certspotter 429 — caller should re-queue the company with that delay.
+Returns (public_domain, method, retry_after, last_status) where retry_after is non-None
+only on certspotter 429 — caller should re-queue the company with that delay. Fetches use
+a Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-hardening.md
+Part 2); pass session= to inject a different one (e.g. Part 3's mobile relay worker).
 """
 
 import ipaddress
@@ -21,7 +23,10 @@ import time
 from urllib.parse import urljoin, urlparse
 
 import requests
-from jobs.http_safe import make_safe_session as _make_safe_session
+from jobs.http_safe import (
+    make_safe_session as _make_safe_session,
+    make_safe_curl_session as _make_safe_curl_session,
+)
 import tldextract
 _tldextract = tldextract.TLDExtract(suffix_list_urls=(), cache_dir=None)
 import urllib3
@@ -30,7 +35,14 @@ _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
 
 from config import CERTSPOTTER_API_KEY
 from logger import get_logger
-from db.external_api_health import record_external_request
+from db.external_api_health import record_external_request, get_day_request_count
+
+try:
+    from config import CF_WORKER_URL, CF_WORKER_SECRET, CF_WORKER_DAILY_LIMIT
+except ImportError:
+    CF_WORKER_URL = ""
+    CF_WORKER_SECRET = ""
+    CF_WORKER_DAILY_LIMIT = 0
 
 log = get_logger(__name__)
 
@@ -107,6 +119,71 @@ _CHALLENGE_HEADERS = frozenset({
 
 _safe_session = _make_safe_session()
 
+# Chrome-impersonated fetching (docs/discovery-pipeline-hardening.md Part 2) —
+# this is the DEFAULT session for the redirect/web-liveness probes below (_redirect_domain,
+# _has_web). CT-log queries (_ct_certspotter, _ct_crtsh) keep using plain `requests` above —
+# those hit certspotter/crt.sh directly, not the company's own WAF-fronted site, so Chrome
+# impersonation buys nothing there.
+#
+# session= params on _redirect_domain/_has_web/discover_public_domain let Part 3's mobile
+# relay worker (not yet built) pass an identical function call with a SOCKS5-proxied
+# session instead of this module default — same code path, different egress IP.
+_default_curl_session = _make_safe_curl_session()
+
+
+def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
+    """Proxy a single GET through the Cloudflare probe Worker — fallback tier used when
+    the direct curl_cffi attempt to `url` comes back inconclusive (403/429/503).
+
+    Shares the same daily cap and atomic external_api_health tracking (service="cf_worker")
+    as jobs/ats/career_detector.py::_fetch_via_worker and
+    scripts/discover_h1b_ats.py::_fetch_via_worker — all three count against one shared
+    daily total. The shared limit is NOT raised for this addition (locked 2026-09-27).
+
+    Returns (final_url, status) — status is the WORKER's read of the target site, which
+    may itself still be non-2xx. Returns None on any failure of the call to the worker
+    itself (quota exhausted, no config, network error, bad worker response).
+    """
+    if not CF_WORKER_URL or not CF_WORKER_SECRET:
+        return None
+    if get_day_request_count("cf_worker") >= CF_WORKER_DAILY_LIMIT:
+        log.debug("public_domain: CF Worker daily quota reached, skipping %s", url)
+        return None
+    _t0 = time.time()
+    try:
+        resp = requests.post(
+            CF_WORKER_URL,
+            json={"url": url, "max_bytes": 4096},
+            headers={"Authorization": f"Bearer {CF_WORKER_SECRET}"},
+            timeout=30,
+        )
+        _ms = int((time.time() - _t0) * 1000)
+    except Exception as exc:
+        record_external_request("cf_worker", 0, int((time.time() - _t0) * 1000))
+        log.debug("public_domain: CF Worker call failed for %s: %s", url, exc)
+        return None
+
+    if resp.status_code != 200:
+        record_external_request("cf_worker", resp.status_code, _ms)
+        log.debug("public_domain: CF Worker HTTP %s for %s (worker call itself failed)",
+                  resp.status_code, url)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        record_external_request("cf_worker", 0, _ms)
+        log.debug("public_domain: CF Worker invalid JSON for %s: %s", url, exc)
+        return None
+
+    target_status = data.get("status") or 0
+    # Sentinel 1 for a target-site error, matching career_detector's convention: it lands
+    # in the generic other_err bucket without triggering the "key rejected" 401/403 alert.
+    record_external_request("cf_worker", 200 if 200 <= target_status < 300 else 1, _ms)
+    final_url = data.get("final_url") or url
+    log.debug("public_domain: CF Worker %s → %s (status=%s)", url, final_url, target_status)
+    return final_url, target_status
+
 
 def _is_challenge_response(headers: dict) -> bool:
     """Return True if response headers indicate a bot-protection challenge page."""
@@ -160,7 +237,7 @@ _REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
 _REDIRECT_BUDGET_S   = 20
 
 
-def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
+def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]":
     """
     Follow HTTP redirects on host. Returns (domain, last_status):
       ("", None)        — final response is 2xx and same root as host → confirmed public
@@ -177,10 +254,15 @@ def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
 
     Redirects are followed manually so every intermediate hop is validated as a
     publicly-routable address before connecting (prevents SSRF via redirect chain).
-    verify=False is applied only when the initial HTTPS attempt raises SSLError —
+    verify=False is applied only when the initial HTTPS attempt raises an SSL error —
     company domains frequently have self-signed or expired certs; we only use the
     final URL's domain name, never the response body.
+
+    session — Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-
+    hardening.md Part 2); pass an explicit session (e.g. Part 3's SOCKS5-proxied relay
+    session) to fetch through a different egress path with identical logic.
     """
+    sess = session if session is not None else _default_curl_session
     _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
@@ -197,15 +279,23 @@ def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
                     current = None
                     break
                 try:
-                    r = _safe_session.get(current, allow_redirects=False,
-                                              timeout=_REDIRECT_TIMEOUT, stream=True)
-                except requests.exceptions.SSLError:
+                    r = sess.get(current, allow_redirects=False,
+                                 timeout=_REDIRECT_TIMEOUT, stream=True)
+                except Exception as _fetch_exc:
+                    # requests raises requests.exceptions.SSLError; curl_cffi raises its own
+                    # SSL-flavored error class — duck-type on the exception name/message
+                    # rather than importing curl_cffi's error types, since sess may be
+                    # either kind (plain make_safe_session() fallback or curl_cffi).
+                    _is_ssl_err = ("ssl" in type(_fetch_exc).__name__.lower()
+                                   or "ssl" in str(_fetch_exc).lower())
+                    if not _is_ssl_err:
+                        raise
                     try:
                         import warnings
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                            r = _safe_session.get(current, allow_redirects=False,
-                                                  timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
+                            r = sess.get(current, allow_redirects=False,
+                                         timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
                     except Exception:
                         log.debug("_redirect_domain: SSL error for %s — no redirect signal", current)
                         current = None
@@ -246,6 +336,21 @@ def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
             # Only an actual 2xx confirms — any other final status (403/404/5xx/etc.) is
             # inconclusive, never a confirmation and never a rejection (Part 1 gate fix).
             if final_status is None or not (200 <= final_status < 300):
+                # CF-Worker fallback tier (Part 2) — a block-like status might just mean
+                # the OCI/local egress IP is blocked, not that the domain is genuinely
+                # unreachable. One extra read through the Worker's IP is near-free against
+                # the shared daily quota; only tried on the block-like codes, not every
+                # inconclusive status (e.g. never on a 404, which is a real answer).
+                if final_status in (403, 429, 503):
+                    worker_result = _fetch_via_worker(current)
+                    if worker_result:
+                        w_final_url, w_status = worker_result
+                        if 200 <= w_status < 300:
+                            w_root = _root(w_final_url)
+                            log.info("_redirect_domain: CF Worker confirmed %s via %s (status=%s)",
+                                     host, w_final_url, w_status)
+                            return (w_root if w_root != _root(host) else ""), None
+                        final_status = w_status or final_status
                 log.debug("_redirect_domain: final status for %s is %s (not 2xx) — inconclusive",
                           host, final_status)
                 return None, final_status
@@ -256,7 +361,7 @@ def _redirect_domain(host: str) -> "tuple[str | None, int | None]":
     return None, None
 
 
-def _has_web(root: str) -> bool:
+def _has_web(root: str, session=None) -> bool:
     """Return True if root domain serves a non-error HTTP response (status < 400).
 
     Validates that root resolves only to public addresses before connecting.
@@ -264,15 +369,19 @@ def _has_web(root: str) -> bool:
     is live and serving HTTP, which is all the caller cares about. A 4xx/5xx no
     longer counts (Part 1 gate fix) — a 403 from an IP-reputation/WAF block is
     not evidence the candidate domain is the company's real site.
+
+    session — Chrome-impersonated curl_cffi session by default (Part 2); see
+    _redirect_domain's docstring for the session-injection rationale.
     """
     if not _is_public_host(root):
         return False
     if root in _CHALLENGE_DOMAINS:
         return False
+    sess = session if session is not None else _default_curl_session
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
         try:
-            r = _safe_session.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
+            r = sess.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
             status = r.status_code
             r.close()
             if status < 400:
@@ -406,7 +515,7 @@ def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
     return candidates, None, "crtsh"
 
 
-def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int | None, int | None]":
+def discover_public_domain(assigned_domain: str, session=None) -> "tuple[str | None, str, int | None, int | None]":
     """
     Resolve an internal/email domain to the company's real public domain.
 
@@ -419,6 +528,11 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
                       attempt (Part 1 gate fix), or None on a clean 2xx / non-HTTP
                       failure / successful resolution. Caller persists this into
                       fein_domain_map.public_domain_last_status.
+
+    session — Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-
+    hardening.md Part 2). Pass an explicit session (Part 3's mobile relay worker) to
+    resolve through a different egress path with identical logic — every internal
+    _redirect_domain/_has_web call below is threaded with this same session.
     """
     domain = (assigned_domain or "").lower().strip()
     if not domain:
@@ -431,7 +545,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     last_status: "int | None" = None
 
     # Step 1 — HTTP redirect on full domain
-    redir, status = _redirect_domain(domain)
+    redir, status = _redirect_domain(domain, session=session)
     if status is not None:
         last_status = status
     if redir is None:
@@ -456,7 +570,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
     ext      = _tldextract(domain)
     root_try = ext.registered_domain
     if root_try and root_try != domain:
-        redir, status = _redirect_domain(root_try)
+        redir, status = _redirect_domain(root_try, session=session)
         if status is not None:
             last_status = status
         if redir is None:
@@ -483,7 +597,7 @@ def discover_public_domain(assigned_domain: str) -> "tuple[str | None, str, int 
         if time.time() - _ct_budget_start > _CT_PROBE_BUDGET_S:
             log.debug("CT probe budget exhausted for %s — stopping early", domain)
             break
-        if _has_web(candidate):
+        if _has_web(candidate, session=session):
             log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
             return candidate, ct_source, None, None
 
