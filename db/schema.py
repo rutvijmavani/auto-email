@@ -1744,6 +1744,14 @@ def init_db():
     # (404/NULL — no block, just nothing there) or is deferred until after a mobile
     # relay attempt (403/429/503 — looks like a WAF/bot-management block).
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS careers_url_last_status INT")
+    # Per-phase, per-origin request metrics (docs/discovery-pipeline-hardening.md Part 4) —
+    # same error-subtype split api_health already has (line ~1125), added here so pd/career
+    # curl_cffi/CF-Worker/relay failure modes (timeout vs. conn-refused vs. other) stay
+    # distinguishable per origin instead of all folding into requests_other_err. Existing
+    # services (certspotter/crtsh/brave/kg/cf_worker) keep writing 0 into both — see
+    # db/external_api_health.py::record_external_request's new optional error_kind param.
+    c.execute("ALTER TABLE external_api_health ADD COLUMN IF NOT EXISTS requests_timeout  INTEGER DEFAULT 0")
+    c.execute("ALTER TABLE external_api_health ADD COLUMN IF NOT EXISTS requests_conn_err INTEGER DEFAULT 0")
     # Expression index: supports the LATERAL join in job_monitor.py that matches
     # assigned_domain to prospective_companies.domain (scheme then www stripped, lowercased).
     # Pass 49 added scheme-stripping to the query; index must match or PostgreSQL ignores it.

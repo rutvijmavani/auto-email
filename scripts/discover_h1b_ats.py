@@ -1042,6 +1042,12 @@ def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
     session: optional caller-owned session, reused across probes and left open. Defaults
     to a Chrome-impersonated curl_cffi session (docs/discovery-pipeline-hardening.md
     Part 2) when omitted, created here and closed before returning.
+
+    Records one "career_oci" external_api_health entry per call, for the direct-OCI
+    curl_cffi fetch (docs/discovery-pipeline-hardening.md Part 4) — status_code is the
+    last direct hop status seen (0 on a network error, with error_kind set so timeout
+    vs. connection-refused stay distinguishable). The CF-Worker fallback tier keeps
+    recording its own separate "cf_worker" entry inside _fetch_via_worker(), unchanged.
     """
     if not _is_public_url(url):
         return None, url, None
@@ -1049,6 +1055,7 @@ def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
     owns_session = session is None
     if owns_session:
         session = _make_safe_curl_session()
+    _t0 = time.time()
     try:
         for _ in range(_MAX_REDIRECTS):
             r = session.get(
@@ -1060,19 +1067,28 @@ def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
                 next_url  = urljoin(current, location)
                 if not _is_public_url(next_url):
                     log.debug("Redirect to non-public URL blocked: %s", next_url)
+                    record_external_request("career_oci", r.status_code, int((time.time() - _t0) * 1000))
                     return None, url, None
                 current = next_url
                 continue
             if r.status_code in (403, 429, 503):
+                record_external_request("career_oci", r.status_code, int((time.time() - _t0) * 1000))
                 result = _fetch_via_worker(current)
                 if result:
                     return result[0], result[1], 200
                 return None, current, r.status_code
+            record_external_request("career_oci", r.status_code, int((time.time() - _t0) * 1000))
             if r.status_code < 400:
                 return r.text, current, r.status_code
             return None, current, r.status_code
         log.debug("Too many redirects for %s", url)
+        record_external_request("career_oci", 0, int((time.time() - _t0) * 1000))
     except Exception as e:
+        _err_name = type(e).__name__.lower()
+        _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(e).lower() else (
+            "conn_err" if "connect" in _err_name or "connection" in str(e).lower() else None
+        )
+        record_external_request("career_oci", 0, int((time.time() - _t0) * 1000), error_kind=_err_kind)
         log.debug("Fetch error %s: %s", url, e)
         result = _fetch_via_worker(url)
         if result:
@@ -1106,6 +1122,12 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         Recorded with a sentinel (1) that always lands in the generic
         other_err bucket, so it still counts toward Err% without triggering
         the "key rejected/revoked" 401/403 alert that bucket is reserved for.
+
+    Also double-writes an identical, purely-additive "career_cf_worker" entry
+    alongside every "cf_worker" write below (docs/discovery-pipeline-hardening.md
+    Part 4) — for phase×origin reporting only. The unlabeled "cf_worker" write
+    itself is never renamed or altered; CF_WORKER_DAILY_LIMIT's quota gate
+    (get_day_request_count("cf_worker") above) keeps reading only that one.
     """
     if not CF_WORKER_URL or not CF_WORKER_SECRET:
         return None
@@ -1123,6 +1145,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         _ms = int((time.time() - _t0) * 1000)
     except Exception as exc:
         record_external_request("cf_worker", 0, int((time.time() - _t0) * 1000))
+        record_external_request("career_cf_worker", 0, int((time.time() - _t0) * 1000))
         log.debug("CF Worker request failed for %s: %s", url, exc)
         return None
 
@@ -1130,6 +1153,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         # Worker-level failure (bad secret, bad request, Cloudflare outage) —
         # this status IS about our own call, classify it as-is.
         record_external_request("cf_worker", resp.status_code, _ms)
+        record_external_request("career_cf_worker", resp.status_code, _ms)
         log.debug("CF Worker: HTTP %s for %s (worker call itself failed)", resp.status_code, url)
         return None
 
@@ -1137,6 +1161,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         data = resp.json()
     except Exception as exc:
         record_external_request("cf_worker", 0, _ms)
+        record_external_request("career_cf_worker", 0, _ms)
         log.debug("CF Worker: invalid JSON body for %s: %s", url, exc)
         return None
 
@@ -1144,6 +1169,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
         # Target site's response, not ours — see docstring. Sentinel 1 keeps
         # this out of the 429/403 buckets while still counting as an error.
         record_external_request("cf_worker", 1, _ms)
+        record_external_request("career_cf_worker", 1, _ms)
         log.debug("CF Worker: %s → error=%s status=%s (target site, not worker auth)",
                    url, data.get("error"), data.get("status"))
         return None
@@ -1151,6 +1177,7 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
     final_url = data.get("final_url") or url
     body      = data.get("body") or ""
     record_external_request("cf_worker", 200, _ms)
+    record_external_request("career_cf_worker", 200, _ms)
     log.debug("CF Worker: %s → %s (status=%s)", url, final_url, data.get("status"))
     return body, final_url
 
@@ -1202,6 +1229,10 @@ def _resolve_website_redirect(url: str, session=None) -> str:
       - Redirect → CDN or generic host     → return original (don't trust it)
       - Redirect → same root domain        → return resolved (http→https, www→naked are fine)
       - Redirect → different root domain   → return resolved (genuine rebrand)
+
+    Records one "career_oci" external_api_health entry per call (docs/discovery-
+    pipeline-hardening.md Part 4) — same convention as _fetch_html above, since
+    this is also a direct-OCI curl_cffi fetch inside the career-discovery script.
     """
     if not _is_public_url(url):
         return url
@@ -1211,6 +1242,7 @@ def _resolve_website_redirect(url: str, session=None) -> str:
     owns_session = session is None
     if owns_session:
         session = _make_safe_curl_session()
+    _t0 = time.time()
 
     try:
         # Manual redirect loop: every hop is SSRF-validated via _is_public_url()
@@ -1226,15 +1258,23 @@ def _resolve_website_redirect(url: str, session=None) -> str:
                 next_url = urljoin(current, r.headers.get("Location", ""))
                 if not _is_public_url(next_url):
                     log.debug("_resolve_website_redirect: redirect to non-public URL blocked: %s", next_url)
+                    record_external_request("career_oci", r.status_code, int((time.time() - _t0) * 1000))
                     return url
                 current = next_url
                 continue
+            record_external_request("career_oci", r.status_code, int((time.time() - _t0) * 1000))
             final_url = current.rstrip("/")
             break
         else:
             log.debug("_resolve_website_redirect: too many redirects for %s — keeping original", url)
+            record_external_request("career_oci", 0, int((time.time() - _t0) * 1000))
             return url
     except Exception as exc:
+        _err_name = type(exc).__name__.lower()
+        _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(exc).lower() else (
+            "conn_err" if "connect" in _err_name or "connection" in str(exc).lower() else None
+        )
+        record_external_request("career_oci", 0, int((time.time() - _t0) * 1000), error_kind=_err_kind)
         log.debug("_resolve_website_redirect: fetch failed for %s: %s", url, exc)
         result = _fetch_via_worker(root_url)
         if result:

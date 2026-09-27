@@ -143,6 +143,12 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
     Returns (final_url, status) — status is the WORKER's read of the target site, which
     may itself still be non-2xx. Returns None on any failure of the call to the worker
     itself (quota exhausted, no config, network error, bad worker response).
+
+    Also double-writes an identical, purely-additive "pd_cf_worker" entry alongside
+    every "cf_worker" write below (docs/discovery-pipeline-hardening.md Part 4) — for
+    phase×origin reporting only. The unlabeled "cf_worker" write itself is never
+    renamed or altered; CF_WORKER_DAILY_LIMIT's quota gate (get_day_request_count
+    ("cf_worker") above) keeps reading only that one.
     """
     if not CF_WORKER_URL or not CF_WORKER_SECRET:
         return None
@@ -160,11 +166,13 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
         _ms = int((time.time() - _t0) * 1000)
     except Exception as exc:
         record_external_request("cf_worker", 0, int((time.time() - _t0) * 1000))
+        record_external_request("pd_cf_worker", 0, int((time.time() - _t0) * 1000))
         log.debug("public_domain: CF Worker call failed for %s: %s", url, exc)
         return None
 
     if resp.status_code != 200:
         record_external_request("cf_worker", resp.status_code, _ms)
+        record_external_request("pd_cf_worker", resp.status_code, _ms)
         log.debug("public_domain: CF Worker HTTP %s for %s (worker call itself failed)",
                   resp.status_code, url)
         return None
@@ -173,13 +181,16 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
         data = resp.json()
     except Exception as exc:
         record_external_request("cf_worker", 0, _ms)
+        record_external_request("pd_cf_worker", 0, _ms)
         log.debug("public_domain: CF Worker invalid JSON for %s: %s", url, exc)
         return None
 
     target_status = data.get("status") or 0
     # Sentinel 1 for a target-site error, matching career_detector's convention: it lands
     # in the generic other_err bucket without triggering the "key rejected" 401/403 alert.
-    record_external_request("cf_worker", 200 if 200 <= target_status < 300 else 1, _ms)
+    _pd_status = 200 if 200 <= target_status < 300 else 1
+    record_external_request("cf_worker", _pd_status, _ms)
+    record_external_request("pd_cf_worker", _pd_status, _ms)
     final_url = data.get("final_url") or url
     log.debug("public_domain: CF Worker %s → %s (status=%s)", url, final_url, target_status)
     return final_url, target_status
@@ -261,12 +272,17 @@ def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]"
     session — Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-
     hardening.md Part 2); pass an explicit session (e.g. Part 3's SOCKS5-proxied relay
     session) to fetch through a different egress path with identical logic.
+
+    Records one "pd_oci" external_api_health entry per scheme attempt (Part 4) — the
+    CF-Worker fallback tier above keeps recording its own separate "pd_cf_worker" entry
+    inside _fetch_via_worker(), unchanged.
     """
     sess = session if session is not None else _default_curl_session
     _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
         final_status: "int | None" = None
+        _scheme_t0 = time.time()
         try:
             _last_headers: dict = {}
             for _ in range(_REDIRECT_MAX_HOPS):
@@ -326,12 +342,17 @@ def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]"
                 current = None
 
             if current is None:
+                # Records one "pd_oci" entry per scheme attempt (docs/discovery-pipeline-
+                # hardening.md Part 4) — status 0 when no HTTP response was ever obtained
+                # for this scheme (non-public hop, unrecoverable SSL error, hop limit).
+                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
                 continue  # try next scheme
             final = _root(current)
             # If the chain landed on a bot-protection vendor domain, the origin is the real domain.
             if final in _CHALLENGE_DOMAINS or _is_challenge_response(_last_headers):
                 log.debug("_redirect_domain: challenge page detected (%s) — origin %s is real domain",
                           final, host)
+                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
                 return "", None
             # Only an actual 2xx confirms — any other final status (403/404/5xx/etc.) is
             # inconclusive, never a confirmation and never a rejection (Part 1 gate fix).
@@ -353,9 +374,16 @@ def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]"
                         final_status = w_status or final_status
                 log.debug("_redirect_domain: final status for %s is %s (not 2xx) — inconclusive",
                           host, final_status)
+                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
                 return None, final_status
+            record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
             return (final if final != _root(host) else ""), None
         except Exception as _exc:
+            _err_name = type(_exc).__name__.lower()
+            _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(_exc).lower() else (
+                "conn_err" if "connect" in _err_name or "connection" in str(_exc).lower() else None
+            )
+            record_external_request("pd_oci", 0, int((time.time() - _scheme_t0) * 1000), error_kind=_err_kind)
             log.debug("_redirect_domain: scheme probe failed for %r (%s): %s", host, scheme, _exc)
             continue
     return None, None
@@ -372,6 +400,9 @@ def _has_web(root: str, session=None) -> bool:
 
     session — Chrome-impersonated curl_cffi session by default (Part 2); see
     _redirect_domain's docstring for the session-injection rationale.
+
+    Records one "pd_oci" external_api_health entry per scheme attempt (Part 4) —
+    same convention as _redirect_domain above.
     """
     if not _is_public_host(root):
         return False
@@ -380,14 +411,20 @@ def _has_web(root: str, session=None) -> bool:
     sess = session if session is not None else _default_curl_session
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
+        _t0 = time.time()
         try:
             r = sess.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
             status = r.status_code
             r.close()
+            record_external_request("pd_oci", status, int((time.time() - _t0) * 1000))
             if status < 400:
                 return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _err_name = type(_exc).__name__.lower()
+            _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(_exc).lower() else (
+                "conn_err" if "connect" in _err_name or "connection" in str(_exc).lower() else None
+            )
+            record_external_request("pd_oci", 0, int((time.time() - _t0) * 1000), error_kind=_err_kind)
     return False
 
 
