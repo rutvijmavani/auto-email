@@ -338,8 +338,13 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
                 _write_domain(conn, fein, public_domain, method, last_status,
                               company["public_domain_retry_count"])
                 conn.commit()
-                record_external_request("mobile_relay", last_status or (200 if public_domain else 0),
-                                         int((time.time() - t_start) * 1000))
+                _pd_status = last_status or (200 if public_domain else 0)
+                _pd_ms = int((time.time() - t_start) * 1000)
+                record_external_request("mobile_relay", _pd_status, _pd_ms)
+                # Phase×origin metrics (docs/discovery-pipeline-hardening.md Part 4) —
+                # second, additive write under the pd-specific label, alongside the
+                # relay-wide "mobile_relay" write above; never read by any quota gate.
+                record_external_request("pd_relay", _pd_status, _pd_ms)
                 if public_domain:
                     company["public_domain"] = public_domain
                     pd_missing = False
@@ -355,16 +360,21 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
                     )
                 except Exception as e:
                     log.error("fein=%s: careers relay resolution failed: %s", fein, e, exc_info=True)
-                    record_external_request("mobile_relay", 0, int((time.time() - t_start) * 1000),
-                                             error_kind=type(e).__name__)
+                    _err_ms = int((time.time() - t_start) * 1000)
+                    record_external_request("mobile_relay", 0, _err_ms, error_kind=type(e).__name__)
+                    # Phase×origin metrics (Part 4) — second, additive write, see above.
+                    record_external_request("career_relay", 0, _err_ms, error_kind=type(e).__name__)
                     return None
 
                 det_platform = result.get("detected_platform")
                 det_slug     = result.get("detected_slug")
                 res_careers  = result.get("careers_url")
                 careers_missing = res_careers is None
-                record_external_request("mobile_relay", 200 if res_careers else 404,
-                                         int((time.time() - t_start) * 1000))
+                _career_status = 200 if res_careers else 404
+                _career_ms = int((time.time() - t_start) * 1000)
+                record_external_request("mobile_relay", _career_status, _career_ms)
+                # Phase×origin metrics (Part 4) — second, additive write, see above.
+                record_external_request("career_relay", _career_status, _career_ms)
         finally:
             relay_session.close()
 
