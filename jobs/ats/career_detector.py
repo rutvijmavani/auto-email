@@ -72,6 +72,24 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
     (service="cf_worker") as scripts/discover_h1b_ats.py::_fetch_via_worker —
     both implementations hit the same Cloudflare Worker/account, so their
     calls are counted together against one shared daily total.
+
+    Two distinct failure layers get recorded differently, on purpose (mirrors
+    scripts/discover_h1b_ats.py::_fetch_via_worker — see its docstring):
+      - resp.status_code != 200 is a failure of OUR call to the Worker itself
+        (bad/rotated secret, malformed request, Cloudflare-side outage) —
+        recorded as-is, so a real 401 here genuinely means "key rejected".
+      - data["status"] (only reachable once resp.status_code == 200) is the
+        status of the WORKER'S fetch of the target career site — a 401/403
+        there just means that site blocked the probe, not a problem with our
+        own key. Recorded with sentinel 1 (always lands in the generic
+        other_err bucket) so it still counts toward Err% without triggering
+        the "key rejected/revoked" 401/403 alert.
+
+    Also double-writes an identical, purely-additive "career_cf_worker" entry
+    alongside every "cf_worker" write below (docs/discovery-pipeline-hardening.md
+    Part 4) — for phase×origin reporting only. The unlabeled "cf_worker" write
+    itself is never renamed or altered; the shared daily quota gate
+    (_get_day_request_count("cf_worker") above) keeps reading only that one.
     """
     if not _CF_WORKER_URL or not _CF_WORKER_SECRET or not _requests_plain:
         return None
@@ -88,22 +106,41 @@ def _fetch_via_worker(url: str) -> tuple[str, str] | None:
             timeout=30,
         )
         _ms = int((_time.time() - _t0) * 1000)
-        data = resp.json()
-        if data.get("error") or (data.get("status") or 0) >= 400:
-            _record_external_request("cf_worker", data.get("status") or 502, _ms)
-            logger.debug("[detector] CF Worker: %s → error=%s status=%s",
-                         url, data.get("error"), data.get("status"))
-            return None
-        body = data.get("body") or ""
-        final_url = data.get("final_url") or url
-        _record_external_request("cf_worker", data.get("status") or 200, _ms)
-        logger.debug("[detector] CF Worker: %s → %s (status=%s)",
-                     url, final_url, data.get("status"))
-        return body, final_url
     except Exception as exc:
         _record_external_request("cf_worker", 0, int((_time.time() - _t0) * 1000))
+        _record_external_request("career_cf_worker", 0, int((_time.time() - _t0) * 1000))
         logger.debug("[detector] CF Worker failed for %s: %s", url, exc)
         return None
+
+    if resp.status_code != 200:
+        _record_external_request("cf_worker", resp.status_code, _ms)
+        _record_external_request("career_cf_worker", resp.status_code, _ms)
+        logger.debug("[detector] CF Worker: HTTP %s for %s (worker call itself failed)",
+                     resp.status_code, url)
+        return None
+
+    try:
+        data = resp.json()
+    except Exception as exc:
+        _record_external_request("cf_worker", 0, _ms)
+        _record_external_request("career_cf_worker", 0, _ms)
+        logger.debug("[detector] CF Worker: invalid JSON body for %s: %s", url, exc)
+        return None
+
+    if data.get("error") or (data.get("status") or 0) >= 400:
+        _record_external_request("cf_worker", 1, _ms)
+        _record_external_request("career_cf_worker", 1, _ms)
+        logger.debug("[detector] CF Worker: %s → error=%s status=%s (target site, not worker auth)",
+                     url, data.get("error"), data.get("status"))
+        return None
+
+    body = data.get("body") or ""
+    final_url = data.get("final_url") or url
+    _record_external_request("cf_worker", 200, _ms)
+    _record_external_request("career_cf_worker", 200, _ms)
+    logger.debug("[detector] CF Worker: %s → %s (status=%s)",
+                 url, final_url, data.get("status"))
+    return body, final_url
 
 def _host_root(hostname: str) -> str:
     """Return the registrable domain using the PSL-aware offline tldextract instance."""

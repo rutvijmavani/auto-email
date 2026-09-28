@@ -63,10 +63,12 @@ except Exception as _e:
     _PHASE3_AVAILABLE = False
 
 
-def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None]":
+def _phase3(website_url: str) -> "tuple[str|None, str|None, str|None, int|None]":
+    """4th element: careers_url_last_status (docs/discovery-pipeline-hardening.md Part 2)
+    — most block-like HTTP status seen across the probe, or None on a hit / network error."""
     if not _PHASE3_AVAILABLE:
         log.debug("phase3 unavailable (import-time failure) — skipping for %s", website_url)
-        return None, None, None
+        return None, None, None, None
     try:
         return _discover_careers_url(website_url)
     except Exception as e:
@@ -213,6 +215,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.careers_url,
             f.public_domain,
             f.public_domain_method,
+            COALESCE(f.public_domain_retry_count, 0) AS public_domain_retry_count,
             e.employer_name,
             COALESCE(u.petition_count, 0) AS petition_count
         FROM fein_domain_map f
@@ -225,27 +228,51 @@ def _load_company(conn, fein: str) -> "dict | None":
     return dict(row)
 
 
-def _write_domain(conn, fein: str, public_domain: "str|None", method: str) -> None:
+def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
+                  last_status: "int|None", prev_retry_count: int) -> None:
     # Does NOT touch last_enriched_at — Phase 3/6 haven't run yet at this point,
     # and if either later raises, the attempt is a failure that must not look
     # like a completed enrichment cycle to staleness-based re-detection.
     # last_enriched_at is advanced once, in _process_company, only after both
     # phases have completed without raising.
+    #
+    # public_domain_last_status/public_domain_retry_count (Part 1 gate fix):
+    # a clean 2xx resolution always clears both (NULL / 0). A failed resolution
+    # records the inconclusive status seen and increments the retry counter only
+    # for transient (429/503) statuses — the staleness_checker pd-retry pass reads
+    # this counter to decide when to stop plain-retrying and escalate to the relay
+    # queue (Part 3) instead. Non-transient statuses (403/404/etc.) record the
+    # status but leave the counter alone — those are relay-eligible immediately,
+    # not part of the plain-retry loop.
+    #
+    # public_domain_last_attempt_at: the retry-age gate staleness_checker's Pass 1c
+    # actually reads. Deliberately separate from updated_at, which is touched by
+    # every write to this row (careers_url resolution, mobile relay guard clears,
+    # etc.) and would otherwise silently reset the pd-retry backoff clock on writes
+    # unrelated to a retry attempt. Cleared on a clean resolution (nothing left to
+    # gate); set only on an actual failed attempt.
     if public_domain is not None:
         conn.execute("""
             UPDATE fein_domain_map
-            SET public_domain        = %s,
-                public_domain_method = %s,
-                updated_at           = NOW()
+            SET public_domain              = %s,
+                public_domain_method        = %s,
+                public_domain_last_status   = NULL,
+                public_domain_retry_count   = 0,
+                public_domain_last_attempt_at = NULL,
+                updated_at                  = NOW()
             WHERE employer_fein = %s
         """, (public_domain, method, fein))
     else:
         # Resolution failed — preserve any previously stored domain.
+        new_retry_count = prev_retry_count + 1 if last_status in (429, 503) else prev_retry_count
         conn.execute("""
             UPDATE fein_domain_map
-            SET updated_at = NOW()
+            SET public_domain_last_status = %s,
+                public_domain_retry_count  = %s,
+                public_domain_last_attempt_at = NOW(),
+                updated_at                 = NOW()
             WHERE employer_fein = %s
-        """, (fein,))
+        """, (last_status, new_retry_count, fein))
 
 
 def _write_metric(conn, fein: str, trigger: str,
@@ -272,9 +299,23 @@ def _write_careers(conn, fein: str, careers_url: str, source: str) -> None:
         UPDATE fein_domain_map
         SET careers_url    = %s,
             careers_source = %s,
+            careers_url_last_status = NULL,
             updated_at     = NOW()
         WHERE employer_fein = %s
     """, (careers_url, source, fein))
+
+
+def _write_careers_last_status(conn, fein: str, last_status: "int | None") -> None:
+    """UPDATE-only counterpart to _write_careers() for the miss/block case
+    (docs/discovery-pipeline-hardening.md Part 2): persists the most block-like
+    status Phase 3 saw so a future staleness/relay pass can gate on it, without
+    touching careers_url/careers_source. No commit — caller commits."""
+    conn.execute("""
+        UPDATE fein_domain_map
+        SET careers_url_last_status = %s,
+            updated_at = NOW()
+        WHERE employer_fein = %s
+    """, (last_status, fein))
 
 
 def _invalidate_head_check_cache(r, fein: str) -> None:
@@ -302,6 +343,37 @@ def _write_ats(conn, fein: str, domain: str, company_name: str,
         WHERE company_ats.reviewed_at IS NULL AND company_ats.is_monitored = FALSE
     """, (fein, domain, company_name, platform, slug, petition_count))
     return cur.rowcount
+
+
+def _write_discovery_ats(conn, fein: str, employer_name: str,
+                          platform: str, slug: str, source: str) -> None:
+    """Mirror-write a company_ats detection into h1b_ats_discovery (docs/discovery-
+    pipeline-hardening.md Part 5.2) — keeps the two ATS-tracking systems from
+    silently diverging when enrichment (this worker) finds a platform/slug that
+    discover_h1b_ats.py's own pass hasn't seen yet, or has seen differently.
+
+    Ports the same platform-change guard scripts/discover_h1b_ats.py::upsert_discovery
+    already applies: a slug never survives under a different platform than the one
+    it was detected with — if this write's platform differs from what's on record,
+    the new slug replaces it outright (even NULL); otherwise COALESCE keeps whichever
+    slug is non-NULL. No commit — caller commits (same convention as _write_ats)."""
+    conn.execute("""
+        INSERT INTO h1b_ats_discovery
+            (employer_fein, employer_name, detected_platform, detected_slug,
+             ats_source, last_checked)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (employer_fein) DO UPDATE SET
+            employer_name     = COALESCE(EXCLUDED.employer_name, h1b_ats_discovery.employer_name),
+            detected_platform = COALESCE(EXCLUDED.detected_platform, h1b_ats_discovery.detected_platform),
+            detected_slug     = CASE
+                WHEN EXCLUDED.detected_platform IS NOT NULL
+                     AND EXCLUDED.detected_platform IS DISTINCT FROM h1b_ats_discovery.detected_platform
+                THEN EXCLUDED.detected_slug
+                ELSE COALESCE(EXCLUDED.detected_slug, h1b_ats_discovery.detected_slug)
+            END,
+            ats_source        = COALESCE(EXCLUDED.ats_source, h1b_ats_discovery.ats_source),
+            last_checked      = NOW()
+    """, (fein, employer_name, platform, slug, source))
 
 
 def _push_to_discovery(r, fein: str, petition_count: int, source: "str | None" = None,
@@ -361,6 +433,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         existing_careers   = company["careers_url"]
         stored_public      = company["public_domain"]
         db_petition_count  = company["petition_count"]
+        prev_retry_count   = company["public_domain_retry_count"]
 
         log.info("enriching fein=%s domain=%s name=%r", fein, assigned, employer_name)
 
@@ -371,7 +444,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 1: public domain resolution ──────────────────────────────────
-        public_domain, method, retry_after = discover_public_domain(assigned)
+        public_domain, method, retry_after, last_status = discover_public_domain(assigned)
 
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
@@ -386,11 +459,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         website_url      = f"https://{probe_domain}"
 
         # _write_domain persists public_domain/method when resolution succeeded, or just
-        # touches updated_at on failure (preserves existing stored domain). It does not
-        # advance last_enriched_at — see its docstring comment.
-        _write_domain(conn, fein, public_domain, method)
+        # records last_status/retry_count on failure (preserves existing stored domain).
+        # It does not advance last_enriched_at — see its docstring comment.
+        _write_domain(conn, fein, public_domain, method, last_status, prev_retry_count)
         conn.commit()
-        log.info("fein=%s public_domain=%s method=%s (effective=%s)", fein, public_domain, method, effective_public)
+        log.info("fein=%s public_domain=%s method=%s last_status=%s (effective=%s)",
+                 fein, public_domain, method, last_status, effective_public)
 
         # ── Step 2: Phase 3 — career path probe (always runs) ────────────────
         # Routing upstream (entry check + head_check) guarantees we only arrive
@@ -399,13 +473,19 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         _careers_source_this_run = None
         p3_platform = p3_slug = None
 
-        careers_url, p3_platform, p3_slug = _phase3(website_url)
+        careers_url, p3_platform, p3_slug, p3_last_status = _phase3(website_url)
         if careers_url:
             _careers_source_this_run = "phase3"
             _write_careers(conn, fein, careers_url, source="phase3")
             conn.commit()
             _invalidate_head_check_cache(r, fein)
             log.info("fein=%s careers_url=%s (phase3)", fein, careers_url)
+        elif p3_last_status is not None:
+            # Block-like status (403/429/503) or first-seen miss (404) — persist so
+            # a future relay pass (Part 3) can gate on it, mirroring discover_h1b_ats.py.
+            _write_careers_last_status(conn, fein, p3_last_status)
+            conn.commit()
+            log.info("fein=%s careers_url_last_status=%s (phase3)", fein, p3_last_status)
 
         # ── Step 3: Phase 6 — career page ATS scan (only if Phase 3 found nothing) ──
         p6_platform = None
@@ -436,6 +516,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                 if p6_platform and p6_slug:
                     p6_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                                   p6_platform, p6_slug, db_petition_count))
+                    _write_discovery_ats(conn, fein, employer_name,
+                                          p6_platform, p6_slug, source="enrichment_phase6")
                     log.info("fein=%s ATS detected: %s slug=%s (phase6)", fein, p6_platform, p6_slug)
 
         # Use Phase 3 ATS whenever Phase 6 found no platform
@@ -443,6 +525,8 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         if not p6_platform and p3_platform and p3_slug:
             p3_written = bool(_write_ats(conn, fein, probe_domain, employer_name,
                                           p3_platform, p3_slug, db_petition_count))
+            _write_discovery_ats(conn, fein, employer_name,
+                                  p3_platform, p3_slug, source="enrichment_phase3")
             log.info("fein=%s ATS detected: %s slug=%s (phase3)", fein, p3_platform, p3_slug)
 
         # Phase 3 and Phase 6 both completed without raising — this is a genuinely

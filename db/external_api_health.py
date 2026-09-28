@@ -10,9 +10,14 @@
 #     canary machinery; these are one-shot enrichment API calls, it doesn't apply
 #   - has a dedicated `requests_403` bucket (401/403 = "key revoked" for
 #     certspotter/crt.sh, alert-worthy on its own, not lumped into other_err)
-#   - no `requests_timeout`/`requests_conn_err` sub-type columns — those are
-#     folded into requests_other_err here (call volume is far lower than
-#     ATS job-scanning, doesn't need the same fan-out)
+#   - `requests_timeout`/`requests_conn_err` sub-type columns (added
+#     docs/discovery-pipeline-hardening.md Part 4, 2026-09-27) — needed once
+#     pd/career-url origin comparison (curl_cffi direct-OCI vs. CF Worker vs.
+#     mobile relay) requires telling timeout apart from connection-refused,
+#     not just folding both into other_err. Only populated when the caller
+#     passes record_external_request(..., error_kind=...); every pre-existing
+#     caller (certspotter/crtsh/brave/kg/cf_worker) omits it and keeps writing
+#     0 into both, exactly as before this column existed.
 #
 # See docs/enrichment_discovery_design.md §11 "External API Health Tracking"
 # for the full finalized schema + retention policy.
@@ -39,6 +44,14 @@ def _classify_status(status_code):
     401 is folded into the 403 bucket — certspotter/crt.sh both use 401/403
     interchangeably for "key revoked/rejected", and both are alert-worthy in
     the same way (see docs/enrichment_discovery_design.md §11).
+
+    For cf_worker specifically, only the Worker's OWN HTTP response code
+    should ever reach this function as 401/403 (genuine "key rejected") — its
+    two call sites (scripts/discover_h1b_ats.py, jobs/ats/career_detector.py)
+    deliberately never pass a target-site-relayed 401/403 through here (they
+    remap those to a sentinel that lands in other_err instead), since that
+    would mean the probed career site blocked the request, not that our own
+    key was rejected. See either _fetch_via_worker docstring for the fix.
     """
     if status_code == 200:
         return 1, 0, 0, 0, 0, 0
@@ -53,7 +66,7 @@ def _classify_status(status_code):
     return 0, 0, 0, 0, 0, 1   # 0 (timeout/conn err) or any other code
 
 
-def record_external_request(service, status_code, response_ms, backoff_s=0):
+def record_external_request(service, status_code, response_ms, backoff_s=0, error_kind=None):
     """
     Record one third-party API request in external_api_health.
 
@@ -62,13 +75,34 @@ def record_external_request(service, status_code, response_ms, backoff_s=0):
     writer queue.
 
     Args:
-        service:      'certspotter' | 'crtsh' | 'brave' | 'kg'
+        service:      'certspotter' | 'crtsh' | 'brave' | 'kg' | 'cf_worker' |
+                       'mobile_relay' | one of the Part 4 phase×origin labels
+                       (pd_oci/pd_cf_worker/pd_relay/career_oci/career_cf_worker/
+                       career_relay — docs/discovery-pipeline-hardening.md Part 4)
         status_code:  HTTP status code (0 for non-HTTP errors, e.g. timeout)
         response_ms:  response time in milliseconds
         backoff_s:    seconds waited due to rate limit / Retry-After
+        error_kind:   optional, only consulted when status_code == 0 (a non-HTTP
+                       failure): 'timeout' | 'conn_err' | None. Routes into the
+                       new requests_timeout/requests_conn_err sub-type columns
+                       (Part 4) instead of always falling into requests_other_err.
+                       Omitting it (every pre-Part-4 caller) reproduces today's
+                       exact behavior — status_code == 0 with no error_kind still
+                       lands in requests_other_err, unchanged.
     """
     today = date.today().isoformat()
     ok_inc, e429_inc, e403_inc, e404_inc, e5xx_inc, other_inc = _classify_status(status_code)
+
+    timeout_inc = conn_err_inc = 0
+    if status_code == 0 and error_kind in ("timeout", "conn_err"):
+        # Move this request's other_err increment into the matching sub-type
+        # column instead — status_code==0 always classifies as other_inc=1
+        # above (see _classify_status), so undo that and route it here.
+        other_inc = 0
+        if error_kind == "timeout":
+            timeout_inc = 1
+        else:
+            conn_err_inc = 1
 
     def _do_write():
         conn = get_conn()
@@ -90,6 +124,8 @@ def record_external_request(service, status_code, response_ms, backoff_s=0):
                     requests_404        = requests_404        + ?,
                     requests_5xx        = requests_5xx        + ?,
                     requests_other_err  = requests_other_err  + ?,
+                    requests_timeout    = requests_timeout    + ?,
+                    requests_conn_err   = requests_conn_err   + ?,
                     total_ms            = total_ms            + ?,
                     max_response_ms     = GREATEST(max_response_ms, ?),
                     backoff_total_s     = backoff_total_s     + ?,
@@ -101,6 +137,7 @@ def record_external_request(service, status_code, response_ms, backoff_s=0):
                 WHERE date = ? AND service = ?
             """, (
                 ok_inc, e429_inc, e403_inc, e404_inc, e5xx_inc, other_inc,
+                timeout_inc, conn_err_inc,
                 response_ms, response_ms,
                 backoff_s,
                 e429_inc,

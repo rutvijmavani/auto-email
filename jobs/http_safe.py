@@ -18,6 +18,23 @@ from urllib.parse import urlparse, urlunparse
 import requests
 from requests.adapters import HTTPAdapter
 
+# Chrome-impersonated fetching (docs/discovery-pipeline-hardening.md Part 2) —
+# curl_cffi matches Chrome's TLS fingerprint (JA3) + HTTP/2, which plain urllib3
+# does not, so WAF/bot-management vendors (Cloudflare, Akamai, PerimeterX) that
+# fingerprint the TLS handshake stop distinguishing us from a real browser.
+# curl_cffi has no clean CURLOPT_RESOLVE/resolve= kwarg for DNS pinning (checked
+# against the installed 0.15.0: not present in Session.request's signature), so
+# unlike SSRFAdapter above there is no resolve-then-pin adapter for it. Callers
+# must pre-flight-validate each host/hop with is_private_host() before every
+# request/redirect hop instead — same accepted TOCTOU-gap precedent already in
+# use in jobs/ats/career_detector.py (all URLs originate from our own DB, no
+# untrusted user input enters these fetches).
+try:
+    from curl_cffi.requests import Session as _CurlSession
+    _CURL_AVAILABLE = True
+except ImportError:
+    _CURL_AVAILABLE = False
+
 _PRIVATE_NETS = [
     ipaddress.ip_network(r) for r in (
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -137,6 +154,36 @@ def make_safe_session() -> requests.Session:
     session.mount("http://",  SSRFAdapter())
     session.mount("https://", SSRFAdapter())
     return session
+
+
+def make_safe_curl_session():
+    """Return a curl_cffi Session impersonating Chrome 124 (docs/discovery-pipeline-
+    hardening.md Part 2), falling back to make_safe_session() when curl_cffi isn't
+    installed.
+
+    No SSRFAdapter-style DNS pinning here — see the note above on _CURL_AVAILABLE.
+    Callers must call is_private_host() on every host/hop before connecting.
+    """
+    if _CURL_AVAILABLE:
+        return _CurlSession(impersonate="chrome124")
+    return make_safe_session()
+
+
+def make_relay_curl_session(proxy_host: str, proxy_port: int):
+    """Return a curl_cffi Session identical to make_safe_curl_session() but routed
+    through a local SOCKS5 proxy (docs/discovery-pipeline-hardening.md Part 3 —
+    the WireGuard-tunneled home-PC relay, scripts/mobile_relay_socks5.py).
+
+    Requires curl_cffi — the mobile relay drain worker is the only caller and
+    curl_cffi is already a hard dependency of the rest of the discovery pipeline
+    it shares a process with, so no requests-based fallback is provided here.
+    socks5h (not socks5) so DNS resolution also happens at the proxy end, on the
+    home PC's network — not on the OCI VM, which is the whole point of the relay.
+    """
+    if not _CURL_AVAILABLE:
+        raise RuntimeError("make_relay_curl_session requires curl_cffi, which is not installed")
+    proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
+    return _CurlSession(impersonate="chrome124", proxies={"http": proxy_url, "https": proxy_url})
 
 
 class ResponseTooLarge(Exception):

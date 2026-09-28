@@ -89,7 +89,8 @@ def _normalize_company(name):
     return normalized
 
 
-def add_prospective_company(company, priority=0, domain=None, platform=None, slug=None):
+def add_prospective_company(company, priority=0, domain=None, platform=None, slug=None,
+                             enable_monitoring=False):
     """
     Add a company to the prospective list.
     Silently ignores duplicates (INSERT OR IGNORE).
@@ -100,6 +101,15 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
     so the company is immediately monitorable without a separate --detect-ats run.
     When omitted, ats_platform stays NULL and get_detection_queue() will pick it
     up as Priority 1 (new, never detected).
+
+    enable_monitoring (docs/discovery-pipeline-hardening.md Part 6, Fix 1): when True,
+    the conflict-path UPDATE (company already existed) also sets is_monitored = TRUE —
+    an unconditional raise, never a toggle-down. Without this, a prospective_companies
+    row that already exists with is_monitored = FALSE silently stays unmonitored even
+    after "Add to monitoring" reports success, because the pre-existing conflict-path
+    UPDATE below never touched is_monitored at all. Default False keeps every other
+    call site's behavior (the no-ATS paste-URL flow, the wrong-ATS override) unchanged —
+    only the one platform-known "Add to monitoring" button passes True.
     """
     company = _normalize_company(company)
     conn = get_conn()
@@ -138,9 +148,10 @@ def add_prospective_company(company, priority=0, domain=None, platform=None, slu
                         WHEN ? = ats_platform
                              THEN COALESCE(NULLIF(ats_slug, ''), COALESCE(?, ats_slug))
                         ELSE ats_slug
-                    END
+                    END,
+                    is_monitored = CASE WHEN ? THEN TRUE ELSE is_monitored END
                 WHERE company = ?
-            """, (domain, platform, slug, platform, slug, company))
+            """, (domain, platform, slug, platform, slug, enable_monitoring, company))
             conn.commit()
     finally:
         conn.close()

@@ -18,6 +18,14 @@ Discovery is NOT fed from here: the enrichment worker forwards each company to d
 after a completed run (including stale re-enrichments), so discovery re-runs every
 ENRICH_STALENESS_DAYS via enrichment. Silent monitored companies re-enter via Pass 3.
 
+Pass 1c — Public-domain retry staleness (docs/discovery-pipeline-hardening.md Part 1):
+    fein_domain_map WHERE public_domain_last_status IN (429, 503)
+        AND public_domain_retry_count < PD_RETRY_CAP
+        AND public_domain_last_attempt_at < NOW() - PD_RETRY_INTERVAL_DAYS days
+    → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "pd_retry"}
+    Plain-retries a transient pd resolution; once retry_count reaches PD_RETRY_CAP the row
+    falls out of this pass and becomes relay-eligible (Part 3) instead.
+
 Pass 3 — ATS re-detection staleness:
     company_ats WHERE is_monitored=TRUE AND consecutive_empty_days >= JOB_MONITOR_REDETECT_DAYS
         AND platform NOT IN ('unknown','unsupported') AND stale_since IS NULL
@@ -56,6 +64,8 @@ from config import (
     HEAD_CHECK_BATCH,
     HEAD_CHECK_ENQUEUE_GUARD_TTL_S,
     JOB_MONITOR_REDETECT_DAYS,
+    PD_RETRY_CAP,
+    PD_RETRY_INTERVAL_DAYS,
     REDIS_DB_MAINTENANCE,
     STALENESS_ANALYZE_TABLES,
     STALENESS_ZADD_BATCH,
@@ -244,6 +254,51 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     return added_a + added_b
 
 
+def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
+    """Push transient (429/503) public-domain resolutions back to enrichment for a plain
+    retry (docs/discovery-pipeline-hardening.md Part 1).
+
+    fein_domain_map WHERE public_domain_last_status IN (429, 503)
+        AND public_domain_retry_count < PD_RETRY_CAP
+        AND public_domain_last_attempt_at < NOW() - PD_RETRY_INTERVAL_DAYS days
+    → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "pd_retry"}
+
+    Reuses domain_enrichment_worker.py's existing pd-resolution step (Step 1) — no new
+    worker needed. This pass only scans and pushes; it does not touch
+    public_domain_retry_count itself (that's owned by the enrichment worker's write path,
+    _write_domain, which resets it to 0 on a 2xx and increments it on a repeat 429/503).
+    Once retry_count reaches PD_RETRY_CAP, the row naturally falls out of this pass's
+    WHERE clause and becomes relay-eligible (Part 3) instead of retried again here.
+
+    Gates on public_domain_last_attempt_at, not updated_at — updated_at is touched by
+    every write to the row (careers_url resolution, mobile relay guard clears, etc.),
+    which would otherwise silently reset this backoff clock on writes unrelated to a
+    pd retry attempt. public_domain_last_attempt_at is set only by _write_domain's
+    failure branch and cleared on a clean resolution.
+    """
+    sql = """
+        SELECT
+            f.employer_fein,
+            COALESCE(u.petition_count, 0) AS petition_count
+        FROM fein_domain_map f
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
+        WHERE f.public_domain_last_status IN (429, 503)
+          AND f.public_domain_retry_count < %s
+          AND f.public_domain_last_attempt_at IS NOT NULL
+          AND f.public_domain_last_attempt_at < NOW() - make_interval(days => %s)
+        ORDER BY petition_count DESC
+    """
+    return _stream_and_zadd(
+        conn, r, sql, (PD_RETRY_CAP, PD_RETRY_INTERVAL_DAYS),
+        queue_key=ENRICHMENT_BATCH,
+        cursor_name="pd_retry_staleness",
+        log_prefix="pd-retry staleness",
+        dry_run=dry_run,
+        trigger="pd_retry",
+        tier="batch",
+    )
+
+
 def run_redetect_staleness(conn, r, dry_run: bool = False) -> int:
     """Push companies with silent monitored ATS paths to head_check:batch with trigger=redetect (pass 3).
 
@@ -387,11 +442,13 @@ def main(args: argparse.Namespace) -> None:
         t0 = time.time()
 
         enrich_added = 0
+        pd_retry_added = 0
         redetect_added = 0
         purged = 0
 
         if not args.redetect_only:
             enrich_added = run_enrichment_staleness(conn, r, dry_run=args.dry_run)
+            pd_retry_added = run_pd_retry_staleness(conn, r, dry_run=args.dry_run)
 
         if not args.enrichment_only:
             redetect_added = run_redetect_staleness(conn, r, dry_run=args.dry_run)
@@ -399,9 +456,9 @@ def main(args: argparse.Namespace) -> None:
 
         elapsed = time.time() - t0
         log.info(
-            "staleness_checker done in %.1fs — enrichment: %d, "
+            "staleness_checker done in %.1fs — enrichment: %d, pd_retry: %d, "
             "redetect: %d, purged: %d%s",
-            elapsed, enrich_added, redetect_added, purged,
+            elapsed, enrich_added, pd_retry_added, redetect_added, purged,
             " [dry-run]" if args.dry_run else "",
         )
     finally:

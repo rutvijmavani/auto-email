@@ -64,6 +64,11 @@ from config import (
     DISCOVERY_DELAYED,
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
+    MOBILE_RELAY_QUEUE,
+    MOBILE_RELAY_INFLIGHT,
+    MOBILE_RELAY_PROXY_HOST,
+    MOBILE_RELAY_PROXY_PORT,
+    MOBILE_RELAY_PROBE_TIMEOUT_S,
 )
 
 logger = get_logger(__name__)
@@ -1400,6 +1405,77 @@ def _run_ats_pool_cycle(
                 start_workers(_unit)
 
 
+def _mobile_relay_inflight_depth(r) -> int:
+    """Sum the cardinalities of every per-instance mobile-relay inflight ZSET.
+
+    scripts/mobile_relay_drain_worker.py keys its inflight ZSET as
+    "{MOBILE_RELAY_INFLIGHT}:{WORKER_INSTANCE}" (e.g. "...:1" for the
+    mobile-relay-drain-worker@1 systemd instance, which sets WORKER_INSTANCE=%i —
+    see deploy/systemd/mobile-relay-drain-worker@.service). Reading only the bare
+    MOBILE_RELAY_INFLIGHT key here always saw zero, since nothing is ever written
+    there under the systemd deployment — undercounting combined_depth and risking
+    the autoscaler treating a worker with genuinely inflight items as idle.
+
+    Scans for "{MOBILE_RELAY_INFLIGHT}:*" (per-instance keys) and separately adds
+    the bare key (covers a manual/local run with no WORKER_INSTANCE set) — the two
+    patterns never overlap, so no double-counting.
+    """
+    depth = r.zcard(MOBILE_RELAY_INFLIGHT)
+    cursor = 0
+    while True:
+        cursor, keys = r.scan(cursor, match=f"{MOBILE_RELAY_INFLIGHT}:*", count=100)
+        for key in keys:
+            depth += r.zcard(key)
+        if cursor == 0:
+            break
+    return depth
+
+
+def _probe_mobile_relay_reachable(timeout_s: float = MOBILE_RELAY_PROBE_TIMEOUT_S) -> bool:
+    """TCP-connect probe to the home PC's WireGuard-tunneled SOCKS5 relay.
+
+    A single connect() is enough — we're only checking whether the tunnel + the
+    relay process on the other end are both up, not doing a real SOCKS5 handshake.
+    Cheap (~50ms typical over an established tunnel), so safe to run every cycle.
+    """
+    import socket
+    try:
+        with socket.create_connection((MOBILE_RELAY_PROXY_HOST, MOBILE_RELAY_PROXY_PORT), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _run_mobile_relay_cycle(r) -> None:
+    """Autoscaling for the single-instance mobile relay drain worker (Part 3).
+
+    Reuses the same _run_ats_pool_cycle primitive as head_check/enrichment/discovery
+    (docs/discovery-pipeline-hardening.md Part 3, "rewire manager.py to reuse
+    _run_ats_pool_cycle"). combined_depth is queue+inflight, same shape as the other
+    pools — except it is forced to 0 whenever the WireGuard tunnel is unreachable, so
+    an unreachable relay scales the pool to 0 exactly like an empty queue would,
+    instead of wasting a systemd start on a proxy nothing can reach.
+    """
+    from workers.worker_control import MOBILE_RELAY_WORKERS
+
+    reachable      = _probe_mobile_relay_reachable()
+    combined_depth = r.zcard(MOBILE_RELAY_QUEUE) + _mobile_relay_inflight_depth(r)
+    if not reachable and combined_depth > 0:
+        logger.info(
+            "manager [mobile_relay]: tunnel unreachable — depth=%d treated as 0",
+            combined_depth,
+        )
+        combined_depth = 0
+
+    _run_ats_pool_cycle(
+        r,
+        pool_label="mobile_relay",
+        combined_depth=combined_depth,
+        worker_units=MOBILE_RELAY_WORKERS,
+        hb_prefix="mobile_relay_drain_worker",
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main manager loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1617,6 +1693,15 @@ def run_manager() -> None:
                         )
                 except Exception as exc:
                     logger.error("manager: ATS pool cycle failed: %s", exc, exc_info=True)
+
+                # ── Mobile relay pool autoscaling (Part 3 — isolated on its own
+                # try/except, separate from the ATS block above, so a bug in this
+                # brand-new reachability-probe path can never take head_check/
+                # domain_enrichment/discovery scaling down with it) ─────────────
+                try:
+                    _run_mobile_relay_cycle(r)
+                except Exception as exc:
+                    logger.error("manager: mobile relay pool cycle failed: %s", exc, exc_info=True)
 
                 # ── Update prev_depth for next cycle's inflow_rate snapshot ────
                 for pool in pools:

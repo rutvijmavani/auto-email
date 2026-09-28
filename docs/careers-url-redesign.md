@@ -788,7 +788,8 @@ QUEUE LANES (universal member schema on all: {fein, trigger, source}):
           │    always → enrichment:batch (one target only)   │
           │                                                  │
           │  Step 1: Phase 1 — public domain resolution      │
-          │    → CF Worker probe  ← cf_quota.json            │
+          │    → CF Worker probe  ← CF_WORKER_DAILY_LIMIT    │
+          │      (external_api_health, Postgres — not a file)│
           │    → certspotter      ← 10/hr, react 429         │
           │    → if found: write public_domain to DB now     │
           │    → certspotter 429: push enrichment:delayed    │
@@ -833,13 +834,15 @@ QUEUE LANES (universal member schema on all: {fein, trigger, source}):
           │    (written by enrichment worker — no Phase 3)   │
           │                                                  │
           │  Step 2: KG / Wikidata P10311                    │
-          │    → kg_quota.json 85K/day                       │
+          │    → db/quota.py can_call("kg_api") 100K/day     │
+          │      (Postgres model_usage table — not a file)   │
           │    → exhausted: push discovery:delayed           │
           │      (score = now + 86400), return               │
           │    → if found: careers_source='phase1_kg'        │
           │                                                  │
           │  Step 3: Brave (only if KG found nothing)        │
-          │    → brave_quota.json 950/month                  │
+          │    → get_month_request_count("brave") 950/month  │
+          │      (external_api_health, Postgres — not a file)│
           │    → exhausted: skip, go Phase 7, log WARNING    │
           │    → if found: careers_source='phase4'           │
           │    → if no result: fein_domain_map unchanged;    │
@@ -899,25 +902,41 @@ _write_careers() — unconditional, no trigger param, same in both workers:
 └──────────────────────────────────────────────────────────┘
 
 QUOTA BUDGET (now spread across the day):
-┌───────────────┬────────────────┬─────────────────────────────────────────┐
-│ Quota         │ Limit          │ When exhausted                          │
-├───────────────┼────────────────┼─────────────────────────────────────────┤
-│ KG            │ 85K/day        │ Skip KG. Push to discovery:delayed      │
-│ kg_quota.json │                │ score=now()+86400. flush_delayed picks  │
-│               │                │ up after midnight quota reset.          │
-├───────────────┼────────────────┼─────────────────────────────────────────┤
-│ Brave         │ 950/month      │ Skip Brave. Jump to Phase 7.            │
-│brave_quota.json│               │ Log WARNING once per exhaustion event.  │
-│               │                │ Phase 7 runs in its place — no re-queue.│
-├───────────────┼────────────────┼─────────────────────────────────────────┤
-│ CF Worker     │ daily (config) │ Fall back to direct requests. If direct │
-│ cf_quota.json │                │ also fails → enrichment:delayed with    │
-│               │                │ fixed backoff. Never silently drop.     │
-├───────────────┼────────────────┼─────────────────────────────────────────┤
-│ Certspotter   │ 10 req/hr      │ React to 429 + Retry-After. Push to     │
-│ (react to 429)│                │ enrichment:delayed score=now()+Retry-   │
-│               │                │ After. Already implemented — no change. │
-└───────────────┴────────────────┴─────────────────────────────────────────┘
+┌────────────────┬───────────────────────┬───────────────────────────────────┐
+│ Quota          │ Limit                 │ When exhausted                    │
+├────────────────┼───────────────────────┼───────────────────────────────────┤
+│ KG              │ 100K/day             │ Skip KG. Push to discovery:delayed│
+│ db/quota.py     │ (DAILY_LIMITS         │ score=now()+86400. flush_delayed  │
+│ can_call/       │  ["kg_api"])          │ picks up after midnight reset.    │
+│ increment_usage │                       │                                   │
+├────────────────┼───────────────────────┼───────────────────────────────────┤
+│ Brave           │ 950/month             │ Skip Brave. Jump to Phase 7.      │
+│ external_api_   │ (_BRAVE_QUOTA_LIMIT)  │ Log WARNING once per exhaustion   │
+│ health.get_     │                       │ event. Phase 7 runs in its place  │
+│ month_request_  │                       │ — no re-queue. (also has a 402   │
+│ count("brave")  │                       │ fast-fail circuit breaker, 1h     │
+│                 │                       │ cooldown, independent of quota)   │
+├────────────────┼───────────────────────┼───────────────────────────────────┤
+│ CF Worker       │ 85000/day             │ Fall back to direct requests. If  │
+│ external_api_   │ (config.py            │ direct also fails → enrichment:   │
+│ health.get_day_ │ CF_WORKER_DAILY_LIMIT)│ delayed with fixed backoff. Never │
+│ request_count   │                       │ silently drop.                    │
+│ ("cf_worker")   │                       │                                   │
+├────────────────┼───────────────────────┼───────────────────────────────────┤
+│ Certspotter     │ 10 req/hr             │ React to 429 + Retry-After. Push  │
+│ (react to 429)  │                       │ to enrichment:delayed score=now() │
+│                 │                       │ +Retry-After. No proactive quota  │
+│                 │                       │ file — reactive only, unchanged.  │
+└────────────────┴───────────────────────┴───────────────────────────────────┘
+
+Note (2026-09-28 correction): the `kg_quota.json`/`cf_quota.json`/`brave_quota.json` local
+JSON files shown in this section were the original plan but were never built that way (or, for
+Brave, were built then later replaced). All three quotas ended up Postgres-backed instead —
+`db/quota.py` (KG, pre-existing) and `db/external_api_health.py` (Brave and CF Worker, added/
+migrated 2026-09-22, commits `0ad2351`/`9c32964`) — see
+[[project_enrichment_throughput_analysis]] for the full history. The box labels above are kept
+for historical/structural reference (queue routing, worker steps, lane names) but their
+`*_quota.json` annotations specifically are stale; the table above reflects the real mechanism.
 ```
 
 ---

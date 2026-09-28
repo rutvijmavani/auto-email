@@ -345,7 +345,10 @@ def init_logging(command: str = "pipeline") -> None:
     # Under cron, stdout is NOT a TTY, so we skip this handler.
     # Console stays human-readable (pipe-delimited) for operator UX.
     # File handlers always use JSON so log files are machine-parseable.
-    if sys.stdout.isatty():
+    # sys.stdout is None under pythonw.exe / other no-console launchers
+    # (e.g. the mobile relay's Startup-folder auto-launch) — guard against
+    # that so init_logging() doesn't crash before any handler is attached.
+    if sys.stdout is not None and sys.stdout.isatty():
         console = logging.StreamHandler(sys.stdout)
         console.setLevel(LOG_LEVEL)
         console.setFormatter(human_formatter)

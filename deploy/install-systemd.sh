@@ -232,6 +232,40 @@ $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_INSTALL_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $UNIT_SYNC_BIN
 $SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN daemon-reload
 EOF
+
+# workers/worker_control.py's start_workers()/stop_workers() (used by workers/manager.py's
+# autoscaler for every pool it manages) run:
+#   sudo -n systemctl stop <instance>
+#   sudo -n systemctl start --no-block <instance>
+# against CONCRETE instance names (e.g. "mobile-relay-drain-worker@1"), not the bare
+# template unit — the per-service loop above only grants restart/reset-failed/is-active
+# on the bare template, which sudoers' exact-match rules do NOT satisfy for a concrete
+# "@N" instance. Without this block, the autoscaler's start/stop calls silently fail
+# (sudo -n exits non-zero, logged as a warning, never surfaced loudly) for every pool,
+# not just the mobile relay worker.
+#
+# This list must be kept in sync with workers/worker_control.py's _KNOWN_UNITS —
+# it is duplicated here (not read from worker_control.py, since this is a pre-Python,
+# root-run shell script) rather than templated from instance counts, since the exact
+# set is small and stable.
+echo "► Adding sudoers rules for autoscaler start/stop (worker_control.py)..."
+cat >> "$_SUDOERS_TMP" << EOF
+# Autoscaled worker pools — concrete instances (workers/worker_control.py _KNOWN_UNITS):
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop head-check-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block head-check-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop head-check-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block head-check-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop domain-enrichment-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block domain-enrichment-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop domain-enrichment-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block domain-enrichment-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop discover-h1b-ats-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block discover-h1b-ats-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop discover-h1b-ats-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block discover-h1b-ats-worker@2
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN stop mobile-relay-drain-worker@1
+$SERVICE_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start --no-block mobile-relay-drain-worker@1
+EOF
 chmod 440 "$_SUDOERS_TMP"
 
 if visudo -c -f "$_SUDOERS_TMP" 2>/dev/null; then

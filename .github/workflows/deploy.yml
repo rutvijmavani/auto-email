@@ -165,7 +165,7 @@ jobs:
             # its own inflight ZSET on start). Units are taken from live systemd state, not a
             # hardcoded list, and `|| true` keeps a stop failure from tripping the ERR-trap rollback.
             _worker_units=$(systemctl list-units --plain --no-legend --state=active,activating,deactivating \
-              'discover-h1b-ats-worker@*' 'domain-enrichment-worker@*' 'head-check-worker@*' \
+              'discover-h1b-ats-worker@*' 'domain-enrichment-worker@*' 'head-check-worker@*' 'mobile-relay-drain-worker@*' \
               | awk '{print $1}') || true
             if [ -n "$_worker_units" ]; then
               echo "  Pre-restart: stopping workers: $(echo $_worker_units | tr '\n' ' ')"

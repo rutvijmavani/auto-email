@@ -21,7 +21,8 @@ import tldextract as _tldextract_mod
 from urllib.parse import urljoin, urlparse, parse_qs
 
 from jobs.http_safe import (
-    make_safe_session as _make_safe_session,
+    make_safe_curl_session as _make_safe_curl_session,
+    is_private_host as _is_private_host,
     read_bounded_text as _read_bounded_text,
     ResponseTooLarge as _ResponseTooLarge,
 )
@@ -38,9 +39,12 @@ _session_local = _threading.local()
 
 
 def _get_session():
-    """Return a per-thread safe session, creating it lazily on first use."""
+    """Return a per-thread Chrome-impersonated curl_cffi session (docs/discovery-pipeline-
+    hardening.md Part 2), creating it lazily on first use. curl_cffi has no SSRFAdapter-style
+    DNS pinning, so _fetch_and_scan follows redirects manually and validates each hop's host
+    with is_private_host() before connecting — see _fetch_and_scan's docstring."""
     if not getattr(_session_local, "session", None):
-        _session_local.session = _make_safe_session()
+        _session_local.session = _make_safe_curl_session()
     return _session_local.session
 
 
@@ -128,7 +132,7 @@ _RICH_SLUG_PLATFORMS = {"phenom", "talentbrew", "avature"}
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_via_career_page(company, domain, *, careers_url=None):
+def detect_via_career_page(company, domain, *, careers_url=None, session=None):
     """
     Phase 3a: Scan company career page for ATS fingerprints.
 
@@ -137,6 +141,9 @@ def detect_via_career_page(company, domain, *, careers_url=None):
         domain:      company domain e.g. "stripe.com"
         careers_url: if provided, skip path probing — verify this URL and scan it.
                      Falls back to full probing if the URL is not accessible.
+        session:     Chrome-impersonated curl_cffi session by default (docs/discovery-
+                     pipeline-hardening.md Part 2); pass an explicit session (e.g. Part
+                     3's mobile relay worker) to fetch through a different egress path.
 
     Returns:
         {"platform": ..., "slug": ..., "careers_url": ...}  on hit or URL-only find
@@ -155,7 +162,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
 
     # ── Mode 1: careers_url already known — verify + scan, skip probing ───────
     if careers_url:
-        result, html, final_url = _fetch_and_scan(careers_url, company)
+        result, html, final_url = _fetch_and_scan(careers_url, company, session=session)
         if result and result.get("platform"):
             result["careers_url"] = final_url or careers_url
             logger.info("[P3a HIT via careers_url] %r → %s / %s",
@@ -172,7 +179,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
             effective_path = urlparse(effective_url).path
             on_domain = effective_root in (company_root, careers_root)
             if on_domain and effective_path not in ("", "/"):
-                job_result = _follow_job_links(html, effective_url, company, domain)
+                job_result = _follow_job_links(html, effective_url, company, domain, session=session)
                 if job_result:
                     logger.info("[P3a HIT via job link] %r → %s / %s",
                                 company, job_result["platform"], job_result["slug"])
@@ -197,7 +204,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
 
     for path in CAREER_PATHS:
         url = f"https://{probe_base}{path}"
-        result, html, final_url = _fetch_and_scan(url, company)
+        result, html, final_url = _fetch_and_scan(url, company, session=session)
         if result:
             if result["platform"] == "eightfold":
                 if tentative_eightfold is None:
@@ -232,7 +239,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     if first_career_html is None and first_redirect_url is None and tentative_eightfold is None and not domain.startswith("www."):
         for path in CAREER_PATHS:
             url = f"https://{domain}{path}"
-            result, html, final_url = _fetch_and_scan(url, company)
+            result, html, final_url = _fetch_and_scan(url, company, session=session)
             if result:
                 if result["platform"] == "eightfold":
                     if tentative_eightfold is None:
@@ -259,7 +266,7 @@ def detect_via_career_page(company, domain, *, careers_url=None):
     # (e.g. Greenhouse apply iframe, Workday apply redirect).
     if first_career_html and first_career_url:
         result = _follow_job_links(
-            first_career_html, first_career_url, company, domain
+            first_career_html, first_career_url, company, domain, session=session
         )
         if result:
             logger.info("[P3a HIT via job link] %r → %s / %s",
@@ -389,9 +396,22 @@ def _enrich_eightfold_domain(result, page_url):
 # HTTP fetch + scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_and_scan(url, company):
+_MAX_REDIRECT_HOPS = 8
+_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+
+
+def _fetch_and_scan(url, company, session=None):
     """
     Fetch URL, run Layers 1 + 2.
+
+    Redirects are followed manually (docs/discovery-pipeline-hardening.md Part 2) so
+    every hop's host is validated with is_private_host() before connecting — curl_cffi
+    (the default session, Chrome-impersonated) has no SSRFAdapter-style DNS-pinning
+    adapter, unlike the plain requests.Session fallback, so automatic redirect-following
+    would skip that validation on every hop past the first.
+
+    Args:
+        session: overrides the per-thread default session (Part 3 relay worker use).
 
     Returns:
         (result, html, final_url)
@@ -399,11 +419,33 @@ def _fetch_and_scan(url, company):
         html     — response text (None on error or non-200)
         final_url— URL after redirects
     """
+    sess = session if session is not None else _get_session()
+    current = url
+    resp = None
     try:
-        resp = _get_session().get(
-            url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True, stream=True
-        )
-        final_url = resp.url
+        for _ in range(_MAX_REDIRECT_HOPS):
+            parsed = urlparse(current)
+            host = parsed.hostname or ""
+            if parsed.scheme not in ("http", "https") or not host:
+                logger.debug("[P3a] blocked: bad scheme/host in %s", current)
+                return None, None, None
+            if _is_private_host(host):
+                logger.debug("[P3a] SSRF: blocked private host %r in %s", host, current)
+                return None, None, None
+            resp = sess.get(current, headers=HEADERS, timeout=TIMEOUT,
+                             allow_redirects=False, stream=True)
+            if resp.status_code not in _REDIRECT_STATUSES:
+                break
+            location = resp.headers.get("Location") or ""
+            resp.close()
+            if not location:
+                break
+            current = urljoin(current, location)
+        else:
+            logger.debug("[P3a] redirect hop limit reached for %s", url)
+            return None, None, None
+
+        final_url = current
 
         # Layer 1: redirect URL — check ATS pattern before 200 gate
         if final_url != url:
@@ -432,17 +474,19 @@ def _fetch_and_scan(url, company):
         logger.debug("[P3a] Oversized response skipped %s: %s", url, e)
         return None, None, None
 
-    except requests.exceptions.SSLError as e:
-        # Fail closed: a TLS failure is never retried over cleartext HTTP, where an
-        # on-path attacker could inject ATS links/markers that we would then persist.
-        logger.debug("[P3a] TLS failure, not retrying over HTTP %s: %s", url, e)
-        return None, None, None
-
-    except requests.exceptions.Timeout:
-        logger.debug("[P3a] Timeout: %s", url)
-        return None, None, None
     except Exception as e:
-        logger.debug("[P3a] Fetch error %s: %s", url, e)
+        # requests raises requests.exceptions.SSLError/Timeout; curl_cffi raises its own
+        # SSL/timeout-flavored error classes — duck-type on the exception rather than
+        # importing curl_cffi's error types, since sess may be either kind.
+        _msg = str(e).lower()
+        if "ssl" in type(e).__name__.lower() or "ssl" in _msg:
+            # Fail closed: a TLS failure is never retried over cleartext HTTP, where an
+            # on-path attacker could inject ATS links/markers that we would then persist.
+            logger.debug("[P3a] TLS failure, not retrying over HTTP %s: %s", url, e)
+        elif "timeout" in type(e).__name__.lower() or "timed out" in _msg:
+            logger.debug("[P3a] Timeout: %s", url)
+        else:
+            logger.debug("[P3a] Fetch error %s: %s", url, e)
         return None, None, None
 
 
@@ -549,7 +593,7 @@ def _scan_html(html, company):
 # Layer 3: job link following
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _follow_job_links(html, base_url, company, domain):
+def _follow_job_links(html, base_url, company, domain, session=None):
     """
     Extract individual job listing links from the career page and scan each.
 
@@ -569,7 +613,7 @@ def _follow_job_links(html, base_url, company, domain):
 
     for link_url in job_links[:_MAX_JOB_LINKS]:
         logger.debug("[P3a] Following job link: %s", link_url)
-        result, _, _ = _fetch_and_scan(link_url, company)
+        result, _, _ = _fetch_and_scan(link_url, company, session=session)
         if result:
             return result
 

@@ -12,6 +12,9 @@ Worker tuples (two instances each, managed by manager.py autoscaler):
   HEAD_CHECK_WORKERS  — head-check-worker@{1,2}
   ENRICHMENT_WORKERS  — domain-enrichment-worker@{1,2}
   DISCOVERY_WORKERS   — discover-h1b-ats-worker@{1,2}
+  MOBILE_RELAY_WORKERS — mobile-relay-drain-worker@1 (single instance — third-tier
+      fallback gated on WireGuard tunnel reachability, scales 0/1 only; see
+      discovery-pipeline-hardening.md Part 3)
 """
 
 import subprocess
@@ -20,14 +23,17 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
-HEAD_CHECK_WORKERS = ("head-check-worker@1",          "head-check-worker@2")
-ENRICHMENT_WORKERS = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
-DISCOVERY_WORKERS  = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
+HEAD_CHECK_WORKERS   = ("head-check-worker@1",          "head-check-worker@2")
+ENRICHMENT_WORKERS   = ("domain-enrichment-worker@1", "domain-enrichment-worker@2")
+DISCOVERY_WORKERS    = ("discover-h1b-ats-worker@1",  "discover-h1b-ats-worker@2")
+MOBILE_RELAY_WORKERS = ("mobile-relay-drain-worker@1",)
 
 # Explicit instance names only — every caller (workers/manager.py) always
 # passes a fully-qualified "unit@N" instance, never the bare template name,
 # and a bare template name isn't a startable/stoppable systemd unit anyway.
-_KNOWN_UNITS = frozenset(HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS)
+_KNOWN_UNITS = frozenset(
+    HEAD_CHECK_WORKERS + ENRICHMENT_WORKERS + DISCOVERY_WORKERS + MOBILE_RELAY_WORKERS
+)
 
 
 def stop_workers(*units: str, dry_run: bool = False) -> None:

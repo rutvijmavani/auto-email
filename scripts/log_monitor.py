@@ -159,6 +159,14 @@ SUPPRESS_WARNING_PATTERNS: list[tuple[str, re.Pattern]] = [
     # company. Working as designed; the line carries the per-company URL so it never dedups.
     ("Non-public / unresolvable website skipped by the SSRF guard (handled: no careers URL)",
      re.compile(r'Skipping non-public URL:')),
+    # scripts/discover_h1b_ats.py::brave_career_search / _run_brave_pass: the monthly quota
+    # gate (_brave_load_quota() >= _BRAVE_QUOTA_LIMIT) fired and the call was skipped before
+    # ever hitting Brave's API. brave_career_search returns None; callers already handle that
+    # (falls through to Phase 6/7, no exception, no retry). Self-resolves at the next calendar
+    # month. The existing "Brave Search API" suppression above doesn't match this message (no
+    # "api" token next to "brave"), so it mails on every scan once quota is exhausted.
+    ("Brave monthly quota exhausted (gate working as designed, resolves next calendar month)",
+     re.compile(r'Brave monthly quota exhausted')),
 ]
 
 

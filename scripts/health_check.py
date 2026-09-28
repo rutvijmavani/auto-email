@@ -146,6 +146,18 @@ def _ats_lanes() -> list:
             "inflight": (f"{_cfg.DISCOVERY_INFLIGHT}*", "zset"),
             "dlq": _cfg.DISCOVERY_DLQ,
         },
+        {
+            # Single-instance, reachability-gated pool (Part 3) — zero workers with a
+            # non-empty queue is NORMAL here whenever the WireGuard tunnel is down,
+            # unlike the other lanes where it signals the manager hasn't scaled up yet.
+            "name": "mobile-relay", "worker": "mobile_relay_drain_worker",
+            "heartbeat_s": 30,
+            "queues": [("queue", _cfg.MOBILE_RELAY_QUEUE, "zset")],
+            "delayed": None,
+            "inflight": (f"{_cfg.MOBILE_RELAY_INFLIGHT}*", "zset"),
+            "dlq": None,  # Part 3 rework: permanent drop is log + zrem, no DLQ persistence
+            "reachability_gated": True,
+        },
     ]
 
 
@@ -186,7 +198,7 @@ def check_ats_lane(r, lane: dict, now: float, dlq_warn: int) -> list:
     delayed = _depth(r, lane["delayed"], "zset") if lane["delayed"] else 0
     pattern, ikind = lane["inflight"]
     inflight = sum(_depth(r, k, ikind) for k in set(r.scan_iter(pattern, count=50)))
-    dlq = _depth(r, lane["dlq"], "list")
+    dlq = _depth(r, lane["dlq"], "list") if lane.get("dlq") else 0
 
     rows = []
     oldest = f"  oldest heartbeat {max(ages):.0f}s ago" if ages else ""
@@ -194,6 +206,12 @@ def check_ats_lane(r, lane: dict, now: float, dlq_warn: int) -> list:
     backlog = queued + delayed + inflight
     if stale:
         rows.append(("WARNING", wtype, f"{w_detail}  ({stale} STALE)"))
+    elif live == 0 and backlog > 0 and lane.get("reachability_gated"):
+        # mobile-relay only: no live worker + pending items is expected whenever the
+        # WireGuard tunnel is down — manager deliberately won't scale this one up
+        # (workers/manager.py::_run_mobile_relay_cycle probes reachability first).
+        rows.append(("OK", wtype,
+                     f"{w_detail}  idle, {backlog} item(s) pending (tunnel down or manager hasn't probed yet)"))
     elif live == 0 and backlog > 0:
         rows.append(("WARNING", wtype,
                      f"{w_detail}  no live workers but {backlog} item(s) pending "

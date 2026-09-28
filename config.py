@@ -354,6 +354,12 @@ CF_WORKER_DAILY_LIMIT = int(os.getenv("CF_WORKER_DAILY_LIMIT", "85000"))
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 
+# Public-domain confirmation gate fix (docs/discovery-pipeline-hardening.md Part 1) —
+# transient (429/503) pd resolutions get plain-retried up to PD_RETRY_CAP times, spaced
+# PD_RETRY_INTERVAL_DAYS apart, before escalating to the mobile relay queue (Part 3).
+PD_RETRY_CAP           = int(os.getenv("PD_RETRY_CAP", "4"))
+PD_RETRY_INTERVAL_DAYS = int(os.getenv("PD_RETRY_INTERVAL_DAYS", "2"))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,6 +382,25 @@ DISCOVERY_BATCH        = "discovery:batch"          # ZSET — score=petition_co
 DISCOVERY_DELAYED      = "discovery:delayed"        # ZSET — score=not_before (KG quota exhaustion)
 DISCOVERY_INFLIGHT     = "discovery:inflight"       # ZSET — crash recovery
 DISCOVERY_DLQ          = "discovery:dlq"            # LIST — failed discovery
+
+# mobile relay worker (discovery-pipeline-hardening Part 3) — third-tier fallback for
+# IP-reputation-blocked lookups, routed through a WireGuard tunnel to a home-PC SOCKS5
+# proxy bound only to the tunnel interface (see scripts/mobile_relay_socks5.py).
+MOBILE_RELAY_QUEUE    = "mobile_relay:queue"     # ZSET — score=enqueue timestamp (FIFO), payload carries attempts
+MOBILE_RELAY_INFLIGHT = "mobile_relay:inflight"  # ZSET — popped, currently being processed (crash recovery)
+MOBILE_RELAY_PROXY_HOST = os.getenv("MOBILE_RELAY_PROXY_HOST", "10.10.0.2")  # home PC's WireGuard interface IP
+MOBILE_RELAY_PROXY_PORT = int(os.getenv("MOBILE_RELAY_PROXY_PORT", "1080"))  # scripts/mobile_relay_socks5.py default port
+MOBILE_RELAY_MAX_ATTEMPTS = int(os.getenv("MOBILE_RELAY_MAX_ATTEMPTS", "5"))       # capped retries before permanent drop
+MOBILE_RELAY_PROBE_TIMEOUT_S = int(os.getenv("MOBILE_RELAY_PROBE_TIMEOUT_S", "2")) # cheap reachability check, not a real fetch
+# Per-FEIN SET NX guard (scripts/discover_h1b_ats.py::_push_mobile_relay) replacing an
+# O(n) ZRANGE scan of the whole queue for dedup — prevents two racing pushers from both
+# enqueuing the same fein. Guard is cleared explicitly by mobile_relay_drain_worker.py
+# whenever the queued item is dropped or removed (resolved or permanently exhausted);
+# the TTL below is a safety-net expiry only, sized generously since a relay item can
+# legitimately sit queued for days waiting on the home PC (see mobile_relay_drain_worker.py
+# module docstring) — not a normal-path expiry.
+MOBILE_RELAY_GUARD_PREFIX = os.getenv("MOBILE_RELAY_GUARD_PREFIX", "mobile_relay:guard:")
+MOBILE_RELAY_GUARD_TTL_S = int(os.getenv("MOBILE_RELAY_GUARD_TTL_S", str(30 * 86400)))
 
 ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
 ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker
