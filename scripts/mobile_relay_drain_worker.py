@@ -35,8 +35,10 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
+    MOBILE_RELAY_GUARD_PREFIX,
     MOBILE_RELAY_INFLIGHT,
     MOBILE_RELAY_MAX_ATTEMPTS,
+    MOBILE_RELAY_PROBE_TIMEOUT_S,
     MOBILE_RELAY_PROXY_HOST,
     MOBILE_RELAY_PROXY_PORT,
     MOBILE_RELAY_QUEUE,
@@ -77,6 +79,37 @@ def _get_discover_ats():
         except Exception as e:
             raise RuntimeError(f"discover_h1b_ats import failed: {e}") from e
     return _discover_ats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reachability
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _probe_mobile_relay_reachable(timeout_s: float = MOBILE_RELAY_PROBE_TIMEOUT_S) -> bool:
+    """TCP-connect probe to the home PC's WireGuard-tunneled SOCKS5 relay — same
+    check workers/manager.py::_probe_mobile_relay_reachable uses to decide whether
+    to autoscale this pool up/down. Duplicated here (not imported from manager.py,
+    to avoid pulling in the whole manager module) so the worker itself can bail out
+    of a mid-run item the instant the tunnel drops, rather than burning a full
+    connect-timeout (and an incremented attempt) against a dead proxy."""
+    import socket
+    try:
+        with socket.create_connection((MOBILE_RELAY_PROXY_HOST, MOBILE_RELAY_PROXY_PORT), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _clear_relay_guard(r, fein: str) -> None:
+    """Clear the SET NX push-dedup guard (scripts/discover_h1b_ats.py::_push_mobile_relay)
+    once this fein's queued item is actually dropped or removed — resolved, or
+    permanently exhausted after MOBILE_RELAY_MAX_ATTEMPTS. Must NOT be called when the
+    item is merely requeued for another attempt; the guard's job is to keep the fein
+    from being double-enqueued while still genuinely queued/inflight."""
+    try:
+        r.delete(f"{MOBILE_RELAY_GUARD_PREFIX}{fein}")
+    except Exception as exc:
+        log.warning("fein=%s: relay guard clear failed (%s) — will self-expire via TTL", fein, exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -483,15 +516,31 @@ def run_worker(once: bool = False) -> None:
                     r.zrem(_inflight_key, raw_member)
                     continue
 
+            # Cheap reachability check before spending a real attempt: if the tunnel
+            # has dropped since this item was popped, restore it to the queue exactly
+            # as popped (original payload, original FIFO score) — no attempts penalty,
+            # since the resolution itself was never even tried — and stop the loop so
+            # this instance doesn't spin tight-polling a dead proxy (manager.py's
+            # autoscaler will stop the unit once it independently observes the tunnel
+            # is unreachable).
+            if not _probe_mobile_relay_reachable():
+                _orig_score = _pop_result[1]
+                r.zadd(MOBILE_RELAY_QUEUE, {raw_member: _orig_score})
+                r.zrem(_inflight_key, raw_member)
+                log.warning("fein=%s: relay unreachable — restored to queue unchanged, exiting", fein)
+                break
+
             is_final_attempt = (attempts + 1) >= MOBILE_RELAY_MAX_ATTEMPTS
             outcome = _process_relay_item(fein, run_brave=is_final_attempt)
             processed["n"] += 1
 
             if outcome is True:
                 log.info("fein=%s relay: fully resolved — done", fein)
+                _clear_relay_guard(r, fein)
             elif is_final_attempt:
                 log.warning("fein=%s relay: attempt %d/%d exhausted — permanently dropping",
                             fein, attempts + 1, MOBILE_RELAY_MAX_ATTEMPTS)
+                _clear_relay_guard(r, fein)
             else:
                 # Still unresolved (outcome False) or errored (outcome None) — requeue with
                 # a fresh FIFO timestamp and attempts incremented. Unlike the discovery

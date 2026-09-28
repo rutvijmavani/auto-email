@@ -56,7 +56,7 @@ import requests
 from config import (
     CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
     DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
-    MOBILE_RELAY_QUEUE, PD_RETRY_CAP,
+    MOBILE_RELAY_GUARD_PREFIX, MOBILE_RELAY_GUARD_TTL_S, MOBILE_RELAY_QUEUE, PD_RETRY_CAP,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
@@ -1788,8 +1788,12 @@ def _push_mobile_relay(conn, fein: str) -> None:
     Part 1's plain-retry cap (public_domain_retry_count < PD_RETRY_CAP) — that case
     is still being plain-retried by domain_enrichment_worker and shouldn't be
     escalated to the relay yet. Any other status (403, other 4xx, or no status at
-    all / no_signal) is relay-worthy immediately. Dedups on fein: skips a fein
-    already sitting in the queue.
+    all / no_signal) is relay-worthy immediately. Dedups on fein via a Redis SET NX
+    guard (MOBILE_RELAY_GUARD_PREFIX+fein) rather than scanning MOBILE_RELAY_QUEUE —
+    an O(n) ZRANGE of the whole queue was both slow at scale and race-prone (two
+    pushers racing the scan could both see "not present" and both enqueue). The
+    guard is cleared by mobile_relay_drain_worker.py the moment the queued item is
+    actually dropped or removed (resolved or permanently exhausted), not here.
     """
     row = conn.execute("""
         SELECT public_domain, public_domain_last_status,
@@ -1817,12 +1821,10 @@ def _push_mobile_relay(conn, fein: str) -> None:
 
     try:
         r = get_redis()
-        for member in r.zrange(MOBILE_RELAY_QUEUE, 0, -1):
-            try:
-                if json.loads(member).get("fein") == fein:
-                    return  # already queued — skip duplicate push
-            except (TypeError, ValueError):
-                continue
+        guard_key = f"{MOBILE_RELAY_GUARD_PREFIX}{fein}"
+        if not r.set(guard_key, "1", nx=True, ex=MOBILE_RELAY_GUARD_TTL_S):
+            log.debug("  fein=%s: already queued (guard set) — skipping duplicate push", fein)
+            return  # another pusher already has this fein queued
         payload = json.dumps({"fein": fein, "attempts": 0})
         r.zadd(MOBILE_RELAY_QUEUE, {payload: time.time()})
         log.info("  fein=%s → pushed to MOBILE_RELAY_QUEUE (pd_unresolved=%s, careers_unresolved=%s)",

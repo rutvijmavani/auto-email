@@ -22,7 +22,9 @@
 
 import argparse
 import asyncio
+import ipaddress
 import os
+import socket
 import struct
 import sys
 
@@ -33,6 +35,54 @@ from logger import get_logger, init_logging
 log = get_logger(__name__)
 
 SOCKS_VERSION = 0x05
+
+# Same private/loopback/link-local/reserved/CGNAT exclusion set as
+# jobs/public_domain.py::_is_public_host and jobs/http_safe.py's SSRFAdapter —
+# kept as a self-contained stdlib check here (no project-module import) since
+# this relay is meant to run standalone on the home PC with minimal deps.
+_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def _is_global_addr(addr: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    """Return True only for a globally-routable address — rejects loopback,
+    link-local, RFC1918/ULA, CGNAT, reserved, unspecified, and multicast."""
+    if (addr.is_loopback or addr.is_link_local or addr.is_private
+            or addr.is_reserved or addr.is_unspecified or addr.is_multicast):
+        return False
+    if isinstance(addr, ipaddress.IPv4Address) and addr in _CGNAT_NET:
+        return False
+    return True
+
+
+def _first_global_ip(host: str) -> "str | None":
+    """Resolve host (or accept it as an IP literal) and return the first
+    globally-routable address found, or None if host is an IP literal that
+    isn't global, or every resolved address is non-global (fail-closed on
+    DNS failure too). Run in a thread executor by the caller — getaddrinfo
+    is blocking.
+
+    Resolving here and connecting to the returned IP literal (never to the
+    original hostname again) closes the DNS-rebinding TOCTOU gap: a second,
+    independent lookup at connect time could return a different, private
+    address for a TTL=0 attacker-controlled domain.
+    """
+    try:
+        addr = ipaddress.ip_address(host)
+        return host if _is_global_addr(addr) else None
+    except ValueError:
+        pass  # not an IP literal — resolve as a domain name
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return None
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _is_global_addr(addr):
+            return str(addr)
+    return None
 
 # Address types (RFC 1928 §5)
 ATYP_IPV4 = 0x01
@@ -118,9 +168,17 @@ async def _negotiate_and_relay(reader, writer, peer) -> None:
         writer.close()
         return
 
+    loop = asyncio.get_running_loop()
+    vetted_ip = await loop.run_in_executor(None, _first_global_ip, dst_addr)
+    if vetted_ip is None:
+        log.warning("Rejecting non-global destination %s:%d (client %s)", dst_addr, dst_port, peer)
+        await _send_reply(writer, 0x02)  # connection not allowed by ruleset
+        writer.close()
+        return
+
     try:
         target_reader, target_writer = await asyncio.wait_for(
-            asyncio.open_connection(dst_addr, dst_port), timeout=15
+            asyncio.open_connection(vetted_ip, dst_port), timeout=15
         )
     except asyncio.TimeoutError:
         log.warning("Connect timeout to %s:%d (client %s)", dst_addr, dst_port, peer)

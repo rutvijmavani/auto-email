@@ -1738,6 +1738,26 @@ def init_db():
     # consecutive transient (429/503) plain-retries, reset to 0 on any 2xx confirmation.
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_last_status INT")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_retry_count INT NOT NULL DEFAULT 0")
+    # Dedicated retry-age timestamp (not updated_at — updated_at is touched by every
+    # write to this row, including unrelated ones like careers_url resolution or
+    # mobile_relay_drain_worker.py's _clear_careers_url_last_status, so gating Pass 1c
+    # on updated_at let those unrelated writes silently reset the pd-retry backoff
+    # clock and delay legitimate retries indefinitely). Set only by
+    # workers/domain_enrichment_worker.py::_write_domain's failure branch — never by
+    # a successful resolution (which clears it) or by any other write path.
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_last_attempt_at TIMESTAMPTZ")
+    # One-time backfill: existing rows already sitting in a transient (429/503) retry
+    # state were tracked via updated_at under the old gate. Seed the new column from
+    # updated_at so they don't silently fall out of Pass 1c (NULL < interval is NULL/
+    # false in SQL) and lose their retry eligibility on this migration alone.
+    # _SkipNoopColumnDDL only skips the ADD COLUMN above when already applied — it
+    # does not skip this UPDATE, so scope it to rows the column hasn't been set on yet.
+    c.execute("""
+        UPDATE fein_domain_map
+        SET public_domain_last_attempt_at = updated_at
+        WHERE public_domain_last_status IN (429, 503)
+          AND public_domain_last_attempt_at IS NULL
+    """)
     # Chrome-impersonated fetching (docs/discovery-pipeline-hardening.md Part 2) —
     # most block-like HTTP status seen across Phase 3's ~19 probed career-URL patterns
     # in scripts/discover_h1b_ats.py. Gates whether Phase 4 (Brave) runs immediately

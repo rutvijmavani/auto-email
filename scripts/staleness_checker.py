@@ -21,7 +21,7 @@ ENRICH_STALENESS_DAYS via enrichment. Silent monitored companies re-enter via Pa
 Pass 1c — Public-domain retry staleness (docs/discovery-pipeline-hardening.md Part 1):
     fein_domain_map WHERE public_domain_last_status IN (429, 503)
         AND public_domain_retry_count < PD_RETRY_CAP
-        AND updated_at < NOW() - PD_RETRY_INTERVAL_DAYS days
+        AND public_domain_last_attempt_at < NOW() - PD_RETRY_INTERVAL_DAYS days
     → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "pd_retry"}
     Plain-retries a transient pd resolution; once retry_count reaches PD_RETRY_CAP the row
     falls out of this pass and becomes relay-eligible (Part 3) instead.
@@ -260,7 +260,7 @@ def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
 
     fein_domain_map WHERE public_domain_last_status IN (429, 503)
         AND public_domain_retry_count < PD_RETRY_CAP
-        AND updated_at < NOW() - PD_RETRY_INTERVAL_DAYS days
+        AND public_domain_last_attempt_at < NOW() - PD_RETRY_INTERVAL_DAYS days
     → ZADD enrichment:batch petition_count {"fein": ..., "trigger": "pd_retry"}
 
     Reuses domain_enrichment_worker.py's existing pd-resolution step (Step 1) — no new
@@ -269,6 +269,12 @@ def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
     _write_domain, which resets it to 0 on a 2xx and increments it on a repeat 429/503).
     Once retry_count reaches PD_RETRY_CAP, the row naturally falls out of this pass's
     WHERE clause and becomes relay-eligible (Part 3) instead of retried again here.
+
+    Gates on public_domain_last_attempt_at, not updated_at — updated_at is touched by
+    every write to the row (careers_url resolution, mobile relay guard clears, etc.),
+    which would otherwise silently reset this backoff clock on writes unrelated to a
+    pd retry attempt. public_domain_last_attempt_at is set only by _write_domain's
+    failure branch and cleared on a clean resolution.
     """
     sql = """
         SELECT
@@ -278,7 +284,8 @@ def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
         WHERE f.public_domain_last_status IN (429, 503)
           AND f.public_domain_retry_count < %s
-          AND f.updated_at < NOW() - make_interval(days => %s)
+          AND f.public_domain_last_attempt_at IS NOT NULL
+          AND f.public_domain_last_attempt_at < NOW() - make_interval(days => %s)
         ORDER BY petition_count DESC
     """
     return _stream_and_zadd(

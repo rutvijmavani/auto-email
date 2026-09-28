@@ -1405,6 +1405,32 @@ def _run_ats_pool_cycle(
                 start_workers(_unit)
 
 
+def _mobile_relay_inflight_depth(r) -> int:
+    """Sum the cardinalities of every per-instance mobile-relay inflight ZSET.
+
+    scripts/mobile_relay_drain_worker.py keys its inflight ZSET as
+    "{MOBILE_RELAY_INFLIGHT}:{WORKER_INSTANCE}" (e.g. "...:1" for the
+    mobile-relay-drain-worker@1 systemd instance, which sets WORKER_INSTANCE=%i —
+    see deploy/systemd/mobile-relay-drain-worker@.service). Reading only the bare
+    MOBILE_RELAY_INFLIGHT key here always saw zero, since nothing is ever written
+    there under the systemd deployment — undercounting combined_depth and risking
+    the autoscaler treating a worker with genuinely inflight items as idle.
+
+    Scans for "{MOBILE_RELAY_INFLIGHT}:*" (per-instance keys) and separately adds
+    the bare key (covers a manual/local run with no WORKER_INSTANCE set) — the two
+    patterns never overlap, so no double-counting.
+    """
+    depth = r.zcard(MOBILE_RELAY_INFLIGHT)
+    cursor = 0
+    while True:
+        cursor, keys = r.scan(cursor, match=f"{MOBILE_RELAY_INFLIGHT}:*", count=100)
+        for key in keys:
+            depth += r.zcard(key)
+        if cursor == 0:
+            break
+    return depth
+
+
 def _probe_mobile_relay_reachable(timeout_s: float = MOBILE_RELAY_PROBE_TIMEOUT_S) -> bool:
     """TCP-connect probe to the home PC's WireGuard-tunneled SOCKS5 relay.
 
@@ -1433,7 +1459,7 @@ def _run_mobile_relay_cycle(r) -> None:
     from workers.worker_control import MOBILE_RELAY_WORKERS
 
     reachable      = _probe_mobile_relay_reachable()
-    combined_depth = r.zcard(MOBILE_RELAY_QUEUE) + r.zcard(MOBILE_RELAY_INFLIGHT)
+    combined_depth = r.zcard(MOBILE_RELAY_QUEUE) + _mobile_relay_inflight_depth(r)
     if not reachable and combined_depth > 0:
         logger.info(
             "manager [mobile_relay]: tunnel unreachable — depth=%d treated as 0",

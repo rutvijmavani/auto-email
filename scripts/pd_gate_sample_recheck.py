@@ -62,8 +62,13 @@ def main(args: argparse.Namespace) -> None:
 
     log.info("re-checking %d same_domain rows against the fixed 2xx-only gate", len(rows))
 
-    still_confirmed = 0   # gate agrees: final response was a genuine 2xx
+    still_confirmed = 0   # gate agrees: a genuine 2xx was seen (redirect domain returned, not None)
     now_inconclusive = 0  # gate disagrees: final response was non-2xx (the bug's false positive)
+    no_response = 0       # neither a 2xx nor an HTTP status at all — DNS/connection failure,
+                           # not the false-confirmation bug (would have cascaded to root-fallback/
+                           # CT log either way), but also not a genuine reconfirmation — counting
+                           # it as "still_confirmed" would inflate that bucket with domains that
+                           # may simply be offline now, unrelated to the gate fix being measured.
     status_counts: "dict[int, int]" = {}
     inconclusive_examples: list = []
     t0 = time.time()
@@ -73,14 +78,16 @@ def main(args: argparse.Namespace) -> None:
         domain = (row["assigned_domain"] or "").lower().strip()
         if not domain:
             continue
-        _, status = _redirect_domain(domain)
-        if status is None:
-            # Either a genuine 2xx (confirmed) or a connection/DNS error — both look the
-            # same from _redirect_domain's return signature alone. The distinction doesn't
-            # matter for this measurement: neither is the false-confirmation bug, since a
-            # connection error would have fallen through to root-fallback/CT log anyway
-            # under both old and new logic, not stayed as same_domain.
+        redir, status = _redirect_domain(domain)
+        if status is None and redir is not None:
+            # Genuine 2xx: redir == "" (same root) or a differing root — either way
+            # _redirect_domain only returns status=None with a non-None redir after
+            # an actual 2xx final response.
             still_confirmed += 1
+        elif status is None:
+            # redir is also None: no HTTP response was ever obtained (DNS failure,
+            # connection error, or an unresolvable redirect chain) — not a confirmation.
+            no_response += 1
         else:
             now_inconclusive += 1
             status_counts[status] = status_counts.get(status, 0) + 1
@@ -89,13 +96,13 @@ def main(args: argparse.Namespace) -> None:
         if i % 50 == 0:
             log.info("progress: %d/%d checked (%.0fs elapsed)", i, len(rows), time.time() - t0)
 
-    total = still_confirmed + now_inconclusive
+    total = still_confirmed + now_inconclusive + no_response
     false_confirmation_rate = (now_inconclusive / total * 100) if total else 0.0
 
     log.info(
         "pd_gate_sample_recheck done in %.0fs — sample=%d still_confirmed=%d "
-        "now_inconclusive=%d false_confirmation_rate=%.1f%%",
-        time.time() - t0, total, still_confirmed, now_inconclusive, false_confirmation_rate,
+        "now_inconclusive=%d no_response=%d false_confirmation_rate=%.1f%%",
+        time.time() - t0, total, still_confirmed, now_inconclusive, no_response, false_confirmation_rate,
     )
     if status_counts:
         log.info("inconclusive status breakdown: %s", dict(sorted(status_counts.items())))

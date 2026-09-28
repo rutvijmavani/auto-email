@@ -244,6 +244,13 @@ def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
     # queue (Part 3) instead. Non-transient statuses (403/404/etc.) record the
     # status but leave the counter alone — those are relay-eligible immediately,
     # not part of the plain-retry loop.
+    #
+    # public_domain_last_attempt_at: the retry-age gate staleness_checker's Pass 1c
+    # actually reads. Deliberately separate from updated_at, which is touched by
+    # every write to this row (careers_url resolution, mobile relay guard clears,
+    # etc.) and would otherwise silently reset the pd-retry backoff clock on writes
+    # unrelated to a retry attempt. Cleared on a clean resolution (nothing left to
+    # gate); set only on an actual failed attempt.
     if public_domain is not None:
         conn.execute("""
             UPDATE fein_domain_map
@@ -251,6 +258,7 @@ def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
                 public_domain_method        = %s,
                 public_domain_last_status   = NULL,
                 public_domain_retry_count   = 0,
+                public_domain_last_attempt_at = NULL,
                 updated_at                  = NOW()
             WHERE employer_fein = %s
         """, (public_domain, method, fein))
@@ -261,6 +269,7 @@ def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
             UPDATE fein_domain_map
             SET public_domain_last_status = %s,
                 public_domain_retry_count  = %s,
+                public_domain_last_attempt_at = NOW(),
                 updated_at                 = NOW()
             WHERE employer_fein = %s
         """, (last_status, new_retry_count, fein))

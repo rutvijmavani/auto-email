@@ -19,6 +19,7 @@ Part 2); pass session= to inject a different one (e.g. Part 3's mobile relay wor
 import ipaddress
 import json
 import socket
+import threading
 import time
 from urllib.parse import urljoin, urlparse
 
@@ -126,9 +127,25 @@ _safe_session = _make_safe_session()
 # impersonation buys nothing there.
 #
 # session= params on _redirect_domain/_has_web/discover_public_domain let Part 3's mobile
-# relay worker (not yet built) pass an identical function call with a SOCKS5-proxied
-# session instead of this module default — same code path, different egress IP.
-_default_curl_session = _make_safe_curl_session()
+# relay worker pass an identical function call with a SOCKS5-proxied session instead of
+# this module default — same code path, different egress IP.
+#
+# curl_cffi sessions are not documented as thread-safe (no internal locking around the
+# underlying libcurl easy handle), so a single import-time session shared across threads
+# risks corrupted/interleaved requests if any caller ever runs these probes concurrently
+# (e.g. from a ThreadPoolExecutor). Lazily creating one session per thread, cached on a
+# threading.local, keeps the "session=None → use the module default" call sites unchanged
+# while making that default safe under concurrency; single-threaded callers (today's only
+# callers) pay one extra session construction on first use, same as before.
+_thread_local = threading.local()
+
+
+def _get_default_curl_session():
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = _make_safe_curl_session()
+        _thread_local.session = sess
+    return sess
 
 
 def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
@@ -277,7 +294,7 @@ def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]"
     CF-Worker fallback tier above keeps recording its own separate "pd_cf_worker" entry
     inside _fetch_via_worker(), unchanged.
     """
-    sess = session if session is not None else _default_curl_session
+    sess = session if session is not None else _get_default_curl_session()
     _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
     for scheme in ("https", "http"):
         current = f"{scheme}://{host}"
@@ -408,7 +425,7 @@ def _has_web(root: str, session=None) -> bool:
         return False
     if root in _CHALLENGE_DOMAINS:
         return False
-    sess = session if session is not None else _default_curl_session
+    sess = session if session is not None else _get_default_curl_session()
     for scheme in ("https", "http"):
         url = f"{scheme}://{root}"
         _t0 = time.time()

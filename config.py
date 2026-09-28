@@ -392,6 +392,15 @@ MOBILE_RELAY_PROXY_HOST = os.getenv("MOBILE_RELAY_PROXY_HOST", "10.10.0.2")  # h
 MOBILE_RELAY_PROXY_PORT = int(os.getenv("MOBILE_RELAY_PROXY_PORT", "1080"))  # scripts/mobile_relay_socks5.py default port
 MOBILE_RELAY_MAX_ATTEMPTS = int(os.getenv("MOBILE_RELAY_MAX_ATTEMPTS", "5"))       # capped retries before permanent drop
 MOBILE_RELAY_PROBE_TIMEOUT_S = int(os.getenv("MOBILE_RELAY_PROBE_TIMEOUT_S", "2")) # cheap reachability check, not a real fetch
+# Per-FEIN SET NX guard (scripts/discover_h1b_ats.py::_push_mobile_relay) replacing an
+# O(n) ZRANGE scan of the whole queue for dedup — prevents two racing pushers from both
+# enqueuing the same fein. Guard is cleared explicitly by mobile_relay_drain_worker.py
+# whenever the queued item is dropped or removed (resolved or permanently exhausted);
+# the TTL below is a safety-net expiry only, sized generously since a relay item can
+# legitimately sit queued for days waiting on the home PC (see mobile_relay_drain_worker.py
+# module docstring) — not a normal-path expiry.
+MOBILE_RELAY_GUARD_PREFIX = os.getenv("MOBILE_RELAY_GUARD_PREFIX", "mobile_relay:guard:")
+MOBILE_RELAY_GUARD_TTL_S = int(os.getenv("MOBILE_RELAY_GUARD_TTL_S", str(30 * 86400)))
 
 ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
 ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker
