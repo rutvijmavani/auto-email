@@ -122,7 +122,10 @@ STEP 4 — Push to discovery:redetect or discovery:batch (Section 5 queue keys)
   (which uses petition_count as score).
 
 ### Quota Tracking
-- `cf_quota.json` — shared with existing workers (CF Worker calls)
+- **CF Worker** — `config.py::CF_WORKER_DAILY_LIMIT` (env var, default 85000) gates against
+  `db/external_api_health.py::get_day_request_count("cf_worker")` — an atomic Postgres counter,
+  not a local JSON file. `cf_quota.json` was the original plan here but was never built; the
+  DB-backed version shipped instead (2026-09-22, commit `9c32964`).
 - Certspotter: NO quota file — react to 429 + Retry-After header only
   (no rate-limit headers on success responses, can't proactively track)
 
@@ -154,15 +157,12 @@ Uses quota-heavy phases (KG, Brave) that are too expensive to run for all 25k.
 
 ### Processing Steps (per company)
 
-**⚠️ Design/code drift, identified 2026-09-22:** this section documents intended behavior
-that `process_employer()` / `discover_h1b_ats_worker.py` never actually implemented — the
-code runs the full Phase 3→4→5→6→7 chain unconditionally on every company reaching this
-worker, even though `domain_enrichment_worker` (§3) already ran Phase 3 and Phase 6 against
-the exact same domain moments earlier and is guaranteed to have failed at both (see the
-"Guaranteed redundancy" note below). The flow below is the corrected version, refined from
-the original flat "careers_url set → skip 3+4+5+6" rule to account for KG priority and the
-domain-gate check. **Not yet implemented in code as of 2026-09-22** — this section is the
-target for that fix.
+**✅ Implemented 2026-09-22 (commit `c69966a`)** — `discover_h1b_ats_worker._process_company()`
+now passes `known_careers_url` / `known_careers_source` (from `fein_domain_map`, trusted only
+when `trigger ∈ {enrichment, staleness}`) and `skip_phase6=True` on that same normal path into
+`process_employer()`, which honors them exactly as described below (skips Phase 3/4 entirely
+when `known_careers_url` is set, skips Phase 6 unconditionally on the normal path, never lets
+KG's `jobs_url` overwrite a known careers_url). Verified against current code 2026-09-24.
 
 **Guaranteed redundancy this fixes:** `domain_enrichment_worker` (§3, Steps 2-3) always runs
 Phase 3, and always runs Phase 6 unless Phase 3 already found the ATS. A FEIN only reaches
@@ -229,9 +229,20 @@ When triggered by job_fetcher or admin script:
 - DLQ tagged with trigger source and error reason
 
 ### Quota Tracking
-- `kg_quota.json` — shared (85K/day)
-- `cf_quota.json` — shared (85K/day)
-- `brave_quota.json` — shared
+- **KG** — `db/quota.py::can_call("kg_api")`/`increment_usage("kg_api")`, backed by the
+  `model_usage` Postgres table and `db/connection.py::DAILY_LIMITS["kg_api"] = 100_000`/day
+  (not the 85K/day/`kg_quota.json` originally planned here — no such file was ever built; KG
+  quota has always been Postgres-backed via this same `db/quota.py` module used for
+  CareerShift/Gemini).
+- **CF Worker** — same `CF_WORKER_DAILY_LIMIT` / `external_api_health.get_day_request_count
+  ("cf_worker")` mechanism as §3 above (not `cf_quota.json`).
+- **Brave** — `_BRAVE_QUOTA_LIMIT = 950`/month (`scripts/discover_h1b_ats.py`), gated against
+  `db/external_api_health.py::get_month_request_count("brave")` — also an atomic Postgres
+  counter, not `brave_quota.json`. A `data/brave_quota.json` file was the real original
+  mechanism (unlike CF/KG's file, this one actually existed), but it had an unlocked
+  concurrent-writer race between two scripts and was replaced by the DB-backed counter
+  2026-09-22 (commit `0ad2351`) — see [[project_enrichment_throughput_analysis]] for the
+  full incident writeup.
 
 ### Maintenance Window
 - Same as all other workers
