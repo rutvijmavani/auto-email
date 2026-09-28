@@ -386,12 +386,12 @@ DISCOVERY_DLQ          = "discovery:dlq"            # LIST — failed discovery
 # mobile relay worker (discovery-pipeline-hardening Part 3) — third-tier fallback for
 # IP-reputation-blocked lookups, routed through a WireGuard tunnel to a home-PC SOCKS5
 # proxy bound only to the tunnel interface (see scripts/mobile_relay_socks5.py).
-MOBILE_RELAY_QUEUE      = "mobile_relay:queue"       # ZSET — score=petition_count, pushed post-cascade
-MOBILE_RELAY_INFLIGHT   = "mobile_relay:inflight"    # ZSET — crash recovery
-MOBILE_RELAY_DLQ        = "mobile_relay:dlq"         # LIST — failed relay lookups
+MOBILE_RELAY_QUEUE    = "mobile_relay:queue"     # ZSET — score=enqueue timestamp (FIFO), payload carries attempts
+MOBILE_RELAY_INFLIGHT = "mobile_relay:inflight"  # ZSET — popped, currently being processed (crash recovery)
 MOBILE_RELAY_PROXY_HOST = os.getenv("MOBILE_RELAY_PROXY_HOST", "10.10.0.2")  # home PC's WireGuard interface IP
 MOBILE_RELAY_PROXY_PORT = int(os.getenv("MOBILE_RELAY_PROXY_PORT", "1080"))  # scripts/mobile_relay_socks5.py default port
-MOBILE_RELAY_MAX_RETRIES = int(os.getenv("MOBILE_RELAY_MAX_RETRIES", "3"))
+MOBILE_RELAY_MAX_ATTEMPTS = int(os.getenv("MOBILE_RELAY_MAX_ATTEMPTS", "5"))       # capped retries before permanent drop
+MOBILE_RELAY_PROBE_TIMEOUT_S = int(os.getenv("MOBILE_RELAY_PROBE_TIMEOUT_S", "2")) # cheap reachability check, not a real fetch
 
 ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
 ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker

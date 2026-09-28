@@ -155,7 +155,7 @@ def _ats_lanes() -> list:
             "queues": [("queue", _cfg.MOBILE_RELAY_QUEUE, "zset")],
             "delayed": None,
             "inflight": (f"{_cfg.MOBILE_RELAY_INFLIGHT}*", "zset"),
-            "dlq": _cfg.MOBILE_RELAY_DLQ,
+            "dlq": None,  # Part 3 rework: permanent drop is log + zrem, no DLQ persistence
             "reachability_gated": True,
         },
     ]
@@ -198,7 +198,7 @@ def check_ats_lane(r, lane: dict, now: float, dlq_warn: int) -> list:
     delayed = _depth(r, lane["delayed"], "zset") if lane["delayed"] else 0
     pattern, ikind = lane["inflight"]
     inflight = sum(_depth(r, k, ikind) for k in set(r.scan_iter(pattern, count=50)))
-    dlq = _depth(r, lane["dlq"], "list")
+    dlq = _depth(r, lane["dlq"], "list") if lane.get("dlq") else 0
 
     rows = []
     oldest = f"  oldest heartbeat {max(ages):.0f}s ago" if ages else ""

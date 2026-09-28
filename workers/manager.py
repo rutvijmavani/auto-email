@@ -65,8 +65,10 @@ from config import (
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
     MOBILE_RELAY_QUEUE,
+    MOBILE_RELAY_INFLIGHT,
     MOBILE_RELAY_PROXY_HOST,
     MOBILE_RELAY_PROXY_PORT,
+    MOBILE_RELAY_PROBE_TIMEOUT_S,
 )
 
 logger = get_logger(__name__)
@@ -1403,7 +1405,7 @@ def _run_ats_pool_cycle(
                 start_workers(_unit)
 
 
-def _probe_mobile_relay_reachable(timeout_s: float = 2.0) -> bool:
+def _probe_mobile_relay_reachable(timeout_s: float = MOBILE_RELAY_PROBE_TIMEOUT_S) -> bool:
     """TCP-connect probe to the home PC's WireGuard-tunneled SOCKS5 relay.
 
     A single connect() is enough — we're only checking whether the tunnel + the
@@ -1419,34 +1421,33 @@ def _probe_mobile_relay_reachable(timeout_s: float = 2.0) -> bool:
 
 
 def _run_mobile_relay_cycle(r) -> None:
-    """On/off scaling for the single-instance mobile relay drain worker (Part 3).
+    """Autoscaling for the single-instance mobile relay drain worker (Part 3).
 
-    Unlike _run_ats_pool_cycle's depth+idle-cycle logic (built for 2-instance
-    threshold scaling), this pool is gated on WireGuard-tunnel reachability
-    first — starting or leaving the worker running when the tunnel/home PC is
-    down just wastes a systemd start that will sit polling an unreachable proxy.
-    Depth alone never starts it; reachability alone never keeps it running once
-    the queue is empty.
+    Reuses the same _run_ats_pool_cycle primitive as head_check/enrichment/discovery
+    (docs/discovery-pipeline-hardening.md Part 3, "rewire manager.py to reuse
+    _run_ats_pool_cycle"). combined_depth is queue+inflight, same shape as the other
+    pools — except it is forced to 0 whenever the WireGuard tunnel is unreachable, so
+    an unreachable relay scales the pool to 0 exactly like an empty queue would,
+    instead of wasting a systemd start on a proxy nothing can reach.
     """
-    from workers.worker_control import MOBILE_RELAY_WORKERS, start_workers, stop_workers
+    from workers.worker_control import MOBILE_RELAY_WORKERS
 
-    depth     = r.zcard(MOBILE_RELAY_QUEUE)
-    reachable = _probe_mobile_relay_reachable()
-    alive     = _get_ats_alive_count(r, "mobile_relay_drain_worker")
-
-    if reachable and depth > 0:
-        if alive == 0:
-            logger.info(
-                "manager [mobile_relay]: depth=%d, tunnel reachable — starting %s",
-                depth, MOBILE_RELAY_WORKERS[0],
-            )
-            start_workers(MOBILE_RELAY_WORKERS[0])
-    elif alive > 0:
+    reachable      = _probe_mobile_relay_reachable()
+    combined_depth = r.zcard(MOBILE_RELAY_QUEUE) + r.zcard(MOBILE_RELAY_INFLIGHT)
+    if not reachable and combined_depth > 0:
         logger.info(
-            "manager [mobile_relay]: reachable=%s depth=%d — stopping workers",
-            reachable, depth,
+            "manager [mobile_relay]: tunnel unreachable — depth=%d treated as 0",
+            combined_depth,
         )
-        stop_workers(*MOBILE_RELAY_WORKERS)
+        combined_depth = 0
+
+    _run_ats_pool_cycle(
+        r,
+        pool_label="mobile_relay",
+        combined_depth=combined_depth,
+        worker_units=MOBILE_RELAY_WORKERS,
+        hb_prefix="mobile_relay_drain_worker",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

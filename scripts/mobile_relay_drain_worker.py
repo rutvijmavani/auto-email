@@ -2,19 +2,25 @@
 scripts/mobile_relay_drain_worker.py — third-tier IP-reputation-block fallback
 (docs/discovery-pipeline-hardening.md Part 3).
 
-When scripts/discover_h1b_ats.py's Phase 3 probe comes back block-like (403/429/503),
-it defers Brave/Phase 4 and leaves careers_url_last_status persisted instead of
-guessing further from the OCI VM's IP. The post-cascade push in discover_h1b_ats.py
-then lands that company in MOBILE_RELAY_QUEUE. This worker drains that queue and
-re-attempts the identical Phase 3-5 fetch run, but through a curl_cffi session
-proxied over a WireGuard tunnel to a SOCKS5 relay on the user's home PC
-(scripts/mobile_relay_socks5.py) — a different egress IP the target site hasn't
-seen fail yet.
+scripts/discover_h1b_ats.py pushes a company here, at the very end of its full
+Phase 1/3/4/5/6/7 cascade, whenever the CURRENT fein_domain_map row still shows
+public_domain and/or careers_url unresolved (see _push_mobile_relay there). This
+worker drains that queue and re-attempts whichever of the two is still missing,
+through a curl_cffi session proxied over a WireGuard tunnel to a SOCKS5 relay on
+the user's home PC (scripts/mobile_relay_socks5.py) — a different egress IP the
+target site hasn't seen fail yet.
+
+Phase 4 (Brave) is deliberately skipped on every attempt except the last one
+right before an item is permanently dropped — it's a search-API call, not a
+target-site fetch, so a different egress IP doesn't help it; quota is spent only
+at that last-resort point. Phase 6 (career_page scan) runs on every attempt like
+Phase 3, since it is a target-site fetch the relay IP can help with.
 
 Single instance only (worker_control.MOBILE_RELAY_WORKERS) — this is a narrow
 fallback path, not a primary throughput pool. workers/manager.py starts it (0→1)
-only when the tunnel is reachable and MOBILE_RELAY_QUEUE is non-empty, and stops
-it (1→0) as soon as either condition is no longer true.
+only when the tunnel is reachable and MOBILE_RELAY_QUEUE+MOBILE_RELAY_INFLIGHT
+combined depth is non-zero, and stops it (1→0) as soon as either condition is no
+longer true.
 
 Usage:
   python -m scripts.mobile_relay_drain_worker
@@ -29,9 +35,8 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config import (
-    MOBILE_RELAY_DLQ,
     MOBILE_RELAY_INFLIGHT,
-    MOBILE_RELAY_MAX_RETRIES,
+    MOBILE_RELAY_MAX_ATTEMPTS,
     MOBILE_RELAY_PROXY_HOST,
     MOBILE_RELAY_PROXY_PORT,
     MOBILE_RELAY_QUEUE,
@@ -45,19 +50,15 @@ from workers.redis_client import get_redis
 
 log = get_logger(__name__)
 
-# Lua: atomically pop highest-score member from KEYS[1] (ZSET queue)
-# and add it to KEYS[2] (inflight ZSET) with the same score.
+# Lua: atomically pop the LOWEST-score member (oldest — FIFO) from KEYS[1] (ZSET
+# queue) and add it to KEYS[2] (inflight ZSET) with the same score.
 # Returns {member, score} or {} when the queue is empty.
-# (identical to workers/discover_h1b_ats_worker.py's _POP_ZSET_TO_INFLIGHT_LUA)
 _POP_ZSET_TO_INFLIGHT_LUA = """
-local res = redis.call('ZPOPMAX', KEYS[1], 1)
+local res = redis.call('ZPOPMIN', KEYS[1], 1)
 if #res == 0 then return {} end
 redis.call('ZADD', KEYS[2], tonumber(res[2]), res[1])
 return {res[1], res[2]}
 """
-
-_RETRY_KEY_PREFIX = "mobile_relay:retry:"
-_RETRY_TTL_S      = 86400 * 7  # 7 days — mirrors discovery worker's retry TTL
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,40 +92,6 @@ def _is_maintenance(r) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Retry tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _retry_key(fein: str) -> str:
-    return f"{_RETRY_KEY_PREFIX}{fein}"
-
-
-def _get_retry_count(r, fein: str) -> int:
-    return int(r.get(_retry_key(fein)) or 0)
-
-
-def _incr_retry(r, fein: str) -> int:
-    key = _retry_key(fein)
-    count = r.incr(key)
-    r.expire(key, _RETRY_TTL_S)
-    return count
-
-
-def _clear_retry(r, fein: str) -> None:
-    r.delete(_retry_key(fein))
-
-
-def _move_to_dlq(r, fein: str, error_reason: str, retry_count: int) -> None:
-    payload = json.dumps({
-        "fein":         fein,
-        "error_reason": error_reason,
-        "retry_count":  retry_count,
-        "failed_at":    time.time(),
-    })
-    r.lpush(MOBILE_RELAY_DLQ, payload)
-    log.error("DLQ: fein=%s reason=%s retries=%d", fein, error_reason, retry_count)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # DB helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -134,6 +101,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.employer_fein,
             f.assigned_domain,
             f.public_domain,
+            COALESCE(f.public_domain_retry_count, 0) AS public_domain_retry_count,
             f.careers_url,
             f.careers_source,
             e.employer_name,
@@ -160,13 +128,176 @@ def _clear_careers_url_last_status(conn, fein: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Careers-URL resolution — Phase 3 → Phase 6 → Phase 7, called directly
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_name: str,
+                                total_approvals: int, run_brave: bool, session) -> dict:
+    """Phase 3 → Phase 6 → Phase 7 career-discovery chain over the relay session —
+    the exact same functions scripts.discover_h1b_ats.process_employer calls for
+    those phases (discover_careers_url, jobs.career_page.detect_via_career_page,
+    jobs.ats.career_detector.detect_company), called directly instead of going
+    through process_employer itself, since that function's KG/SPARQL/canonical-name
+    resolution and company_ats upsert don't belong in this relay re-fetch-only
+    context (docs/discovery-pipeline-hardening.md Part 3).
+
+    Phase 4 (Brave) is deliberately NOT part of this chain — it's a search-API
+    call, not a target-site fetch, so a different egress IP can't help it. It only
+    runs, once, directly, right here, when run_brave is True (the final attempt
+    before permanent drop) and careers_url is still unresolved after Phase 3/6/7 —
+    matching the doc's "before the permanent drop specifically... call Phase 4
+    once, directly, right here".
+
+    Persists exactly like process_employer's own direct-OCI persist block: a
+    careers_url hit UPSERTs fein_domain_map; a block-like miss (403/429/503, only
+    possible from Phase 3) updates careers_url_last_status only; a resolved
+    platform+slug upserts company_ats.
+    """
+    careers_url = detected_platform = detected_slug = careers_source = None
+    careers_url_last_status = None
+
+    website_url = m._resolve_website_redirect(website_url, session)
+
+    # Phase 3: 19-pattern probe
+    try:
+        careers_url, detected_platform, detected_slug, careers_url_last_status = \
+            m.discover_careers_url(website_url, session)
+        if careers_url:
+            careers_source = "phase3"
+    except Exception as e:
+        log.warning("fein=%s: relay Phase 3 probe failed: %s", fein, e)
+
+    # Phase 4: Brave — last-resort only, right before permanent drop (see docstring)
+    if not careers_url and run_brave:
+        try:
+            search_name = m.strip_legal_suffixes(company_name) or company_name
+            brave_url = m.brave_career_search(search_name, website_url=website_url)
+            if brave_url:
+                careers_url    = brave_url
+                careers_source = "phase4"
+                log.info("fein=%s: relay Phase 4 (Brave) found: %s", fein, brave_url)
+                try:
+                    html, _, _ = m._fetch_html(brave_url, session)
+                    if html:
+                        detected_platform, detected_slug = m._find_ats_in_html(html)
+                except Exception as e:
+                    log.warning("fein=%s: relay Phase 4 HTML fingerprint failed: %s", fein, e)
+        except Exception as e:
+            log.warning("fein=%s: relay Phase 4 (Brave) failed: %s", fein, e)
+
+    # Phase 6: career_page.py — 3-layer deep scan
+    if not detected_platform:
+        try:
+            from jobs.career_page import detect_via_career_page
+            _domain = m._root_domain(website_url)
+            _seed = careers_url if careers_source in {"phase3"} else None
+            _cp = detect_via_career_page(company_name, _domain, careers_url=_seed, session=session)
+            if _cp:
+                if _cp.get("platform"):
+                    detected_platform = _cp["platform"]
+                    detected_slug     = _cp.get("slug")
+                if _cp.get("careers_url"):
+                    careers_url    = _cp["careers_url"]
+                    careers_source = "phase6"
+        except Exception as e:
+            log.warning("fein=%s: relay Phase 6 (career_page) failed: %s", fein, e)
+
+    # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
+    if not detected_platform:
+        try:
+            from jobs.ats.career_detector import detect_company
+            _domain = m._root_domain(website_url)
+            _seed = careers_url if careers_source in {"phase3", "phase6"} else None
+            _results = detect_company(_domain, session=session, seed_url=_seed)
+            if _results:
+                _best = next((r for r in _results if r.get("slug")), _results[0])
+                detected_platform = _best["platform"]
+                _best_slug = _best.get("slug") or ""
+                if _best_slug:
+                    detected_slug = _best_slug
+                if not careers_url:
+                    _src = _best.get("source_url")
+                    if _src:
+                        careers_url    = _src
+                        careers_source = "phase7"
+        except Exception as e:
+            log.warning("fein=%s: relay Phase 7 (career_detector) failed: %s", fein, e)
+
+    # Persist — same shape as process_employer's own direct-OCI persist block
+    # (scripts/discover_h1b_ats.py, end of process_employer).
+    if careers_url:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO fein_domain_map (employer_fein, careers_url, careers_source, careers_url_last_status, updated_at)
+            VALUES (%s, %s, %s, NULL, NOW())
+            ON CONFLICT (employer_fein) DO UPDATE
+                SET careers_url    = EXCLUDED.careers_url,
+                    careers_source = EXCLUDED.careers_source,
+                    careers_url_last_status = NULL,
+                    careers_url_verified_at = CASE
+                        WHEN fein_domain_map.careers_url IS DISTINCT FROM EXCLUDED.careers_url
+                        THEN NULL
+                        ELSE fein_domain_map.careers_url_verified_at
+                    END,
+                    updated_at     = NOW()
+        """, (fein, careers_url, careers_source))
+        conn.commit()
+    elif careers_url_last_status is not None:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE fein_domain_map
+            SET careers_url_last_status = %s, updated_at = NOW()
+            WHERE employer_fein = %s
+        """, (careers_url_last_status, fein))
+        conn.commit()
+
+    if detected_platform and detected_slug and website_url:
+        domain = m._root_domain(website_url)
+        if domain:
+            m._upsert_company_ats(
+                conn, fein=fein, domain=domain, company_name=company_name,
+                platform=detected_platform, slug=detected_slug,
+                priority=total_approvals,
+            )
+            log.info("fein=%s: relay company_ats upserted: %s / %s / %s",
+                      fein, domain, detected_platform, detected_slug)
+
+    return {
+        "careers_url": careers_url,
+        "detected_platform": detected_platform,
+        "detected_slug": detected_slug,
+        "careers_url_last_status": careers_url_last_status,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-company processing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _process_relay_item(fein: str, petition_count: int) -> bool:
+def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
     """
-    Re-run the Phase 3-5 fetch for one company through the mobile relay session.
-    Returns True on success (or permanent skip), False on transient error (retry).
+    Resolve whichever of public_domain / careers_url the current row is still
+    missing, through the mobile relay session. public_domain uses the exact same
+    function the direct-OCI path calls (jobs.public_domain.discover_public_domain).
+    careers_url calls Phase 3/6/7 (discover_careers_url / detect_via_career_page /
+    career_detector.detect_company) directly — see _resolve_careers_via_relay —
+    rather than the full process_employer() orchestration, whose KG/SPARQL/
+    canonical-name resolution and company_ats upsert don't belong in a relay
+    re-fetch-only context. Per the doc: "No separate 'quick check' step and no
+    separate 'from scratch' step" — same underlying fetch functions, just handed
+    a relay-backed session.
+
+    run_brave (True only on the final attempt before permanent drop): when True,
+    Phase 4 (Brave) is allowed to run if careers_url is still unresolved after
+    Phase 3/6/7. Every other attempt skips it entirely.
+
+    Returns:
+      True  — attempt completed without error, and the row is now fully resolved
+              (or was already fully resolved when re-checked) — caller can drop.
+      False — attempt completed without error, but something is still unresolved
+              and this was not the final (run_brave) attempt — caller retries.
+      None  — an exception occurred — caller treats this as a failed attempt too
+              (same retry/drop accounting as False, logged separately).
     """
     conn = None
     t_start = time.time()
@@ -179,52 +310,74 @@ def _process_relay_item(fein: str, petition_count: int) -> bool:
             return True
 
         employer_name = company["employer_name"]
-        probe_domain  = company["public_domain"] or company["assigned_domain"]
-        if not probe_domain:
-            log.warning("fein=%s has no domain — skipping", fein)
+        assigned_domain = company["assigned_domain"]
+        pd_missing = company["public_domain"] is None
+        careers_missing = company["careers_url"] is None
+
+        if not pd_missing and not careers_missing:
+            log.info("fein=%s already fully resolved — skipping", fein)
             return True
 
-        log.info("relay discovery fein=%s domain=%s name=%r", fein, probe_domain, employer_name)
+        if not assigned_domain:
+            log.warning("fein=%s has no assigned_domain — cannot relay, skipping", fein)
+            return True
 
-        emp = {
-            "employer_fein":   fein,
-            "employer_name":   employer_name,
-            "assigned_domain": probe_domain,
-            "total_approvals": petition_count,
-        }
+        log.info("relay discovery fein=%s domain=%s name=%r pd_missing=%s careers_missing=%s "
+                  "run_brave=%s", fein, assigned_domain, employer_name, pd_missing,
+                  careers_missing, run_brave)
 
         from jobs.http_safe import make_relay_curl_session
         relay_session = make_relay_curl_session(MOBILE_RELAY_PROXY_HOST, MOBILE_RELAY_PROXY_PORT)
         try:
-            result = m.process_employer(
-                emp, conn, dry_run=False, force=True,
-                prefetched=None, skip_brave=False,
-                known_careers_url=None, known_careers_source=None,
-                skip_phase6=True,  # Phase 6 doesn't route through `session` — no relay benefit, skip it
-                session=relay_session,
-            )
+            if pd_missing:
+                from jobs.public_domain import discover_public_domain
+                from workers.domain_enrichment_worker import _write_domain
+                public_domain, method, retry_after, last_status = discover_public_domain(
+                    assigned_domain, session=relay_session,
+                )
+                _write_domain(conn, fein, public_domain, method, last_status,
+                              company["public_domain_retry_count"])
+                conn.commit()
+                record_external_request("mobile_relay", last_status or (200 if public_domain else 0),
+                                         int((time.time() - t_start) * 1000))
+                if public_domain:
+                    company["public_domain"] = public_domain
+                    pd_missing = False
+
+            det_platform = det_slug = res_careers = None
+            if careers_missing:
+                probe_domain = company["public_domain"] or assigned_domain
+                website_url = "https://" + probe_domain
+                try:
+                    result = _resolve_careers_via_relay(
+                        conn, m, fein, website_url, employer_name,
+                        int(company["petition_count"] or 0), run_brave, relay_session,
+                    )
+                except Exception as e:
+                    log.error("fein=%s: careers relay resolution failed: %s", fein, e, exc_info=True)
+                    record_external_request("mobile_relay", 0, int((time.time() - t_start) * 1000),
+                                             error_kind=type(e).__name__)
+                    return None
+
+                det_platform = result.get("detected_platform")
+                det_slug     = result.get("detected_slug")
+                res_careers  = result.get("careers_url")
+                careers_missing = res_careers is None
+                record_external_request("mobile_relay", 200 if res_careers else 404,
+                                         int((time.time() - t_start) * 1000))
         finally:
             relay_session.close()
 
-        if not isinstance(result, dict):
-            log.error("fein=%s: process_employer returned %s — treating as failure",
-                      fein, type(result).__name__)
-            record_external_request("mobile_relay", 0, int((time.time() - t_start) * 1000),
-                                     error_kind="bad_result")
-            return False
+        fully_resolved = not pd_missing and not careers_missing
+        if fully_resolved or run_brave:
+            # Relay has had its full shot (resolved, or this was the last attempt) —
+            # stop deferring Phase 4 on the direct (OCI) path for this fein forever.
+            _clear_careers_url_last_status(conn, fein)
+            conn.commit()
 
-        det_platform = result.get("detected_platform")
-        res_careers  = result.get("careers_url")
-        duration_ms  = int((time.time() - t_start) * 1000)
-
-        record_external_request("mobile_relay", 200 if res_careers else 404, duration_ms)
-
-        _clear_careers_url_last_status(conn, fein)
-        conn.commit()
-
-        log.info("fein=%s relay done: careers=%s platform=%s slug=%s",
-                 fein, res_careers, det_platform, result.get("detected_slug"))
-        return True
+        log.info("fein=%s relay attempt done: pd_missing=%s careers=%s platform=%s slug=%s",
+                 fein, pd_missing, res_careers, det_platform, det_slug)
+        return fully_resolved
 
     except Exception as exc:
         log.error("unexpected error in relay discovery fein=%s: %s", fein, exc, exc_info=True)
@@ -238,7 +391,7 @@ def _process_relay_item(fein: str, petition_count: int) -> bool:
                 conn.rollback()
             except Exception:
                 pass
-        return False
+        return None
     finally:
         if conn:
             conn.close()
@@ -255,9 +408,9 @@ def _reclaim_inflight(r, inflight_key: str) -> None:
         return
     log.warning("reclaiming %d inflight FEINs from prior run (key=%s)", len(items), inflight_key)
     for raw_member, score in items:
-        r.zadd(MOBILE_RELAY_QUEUE, {raw_member: int(score)}, gt=True)
+        r.zadd(MOBILE_RELAY_QUEUE, {raw_member: score}, gt=True)
         r.zrem(inflight_key, raw_member)
-        log.info("reclaimed inflight member=%s score=%d", raw_member, int(score))
+        log.info("reclaimed inflight member=%s score=%s", raw_member, score)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,51 +457,41 @@ def run_worker(once: bool = False) -> None:
                 time.sleep(1)
                 continue
 
-            raw_member     = _pop_result[0]
-            petition_count = int(float(_pop_result[1]))
+            raw_member = _pop_result[0]
 
             try:
-                data = json.loads(raw_member)
-                fein = data["fein"]
+                data     = json.loads(raw_member)
+                fein     = data["fein"]
+                attempts = int(data.get("attempts", 0))
             except (json.JSONDecodeError, KeyError, TypeError):
                 bare = raw_member.strip() if isinstance(raw_member, str) else raw_member.decode(errors="replace").strip()
                 if bare.isdigit():
-                    fein = bare
+                    fein, attempts = bare, 0
                     log.debug("Legacy bare-FEIN member %r", bare)
                 else:
-                    _dlq_payload = json.dumps({
-                        "fein": "MALFORMED", "error_reason": "malformed_member",
-                        "raw": repr(raw_member), "failed_at": time.time(),
-                    })
-                    log.error("Malformed relay queue member %r — sending to DLQ", raw_member)
-                    r.lpush(MOBILE_RELAY_DLQ, _dlq_payload)
+                    log.error("Malformed relay queue member %r — dropping", raw_member)
                     r.zrem(_inflight_key, raw_member)
                     continue
 
-            retry_count = _get_retry_count(r, fein)
-            if retry_count >= MOBILE_RELAY_MAX_RETRIES:
-                _move_to_dlq(r, fein, "max_retries_exceeded", retry_count)
-                _clear_retry(r, fein)
-                r.zrem(_inflight_key, raw_member)
-                continue
-
-            success = _process_relay_item(fein, petition_count)
+            is_final_attempt = (attempts + 1) >= MOBILE_RELAY_MAX_ATTEMPTS
+            outcome = _process_relay_item(fein, run_brave=is_final_attempt)
             processed["n"] += 1
 
-            if not success:
-                count = _incr_retry(r, fein)
-                if count >= MOBILE_RELAY_MAX_RETRIES:
-                    _move_to_dlq(r, fein, "processing_error", count)
-                    _clear_retry(r, fein)
-                else:
-                    # Re-queue immediately at the same priority — unlike the discovery
-                    # worker's exponential backoff, a relay failure is far more likely
-                    # to be "tunnel dropped mid-run" (manager stops this worker as soon
-                    # as the tunnel is unreachable, so a retry basically never runs hot).
-                    r.zadd(MOBILE_RELAY_QUEUE, {raw_member: petition_count}, gt=True)
-                    log.warning("fein=%s retry %d/%d — requeued", fein, count, MOBILE_RELAY_MAX_RETRIES)
+            if outcome is True:
+                log.info("fein=%s relay: fully resolved — done", fein)
+            elif is_final_attempt:
+                log.warning("fein=%s relay: attempt %d/%d exhausted — permanently dropping",
+                            fein, attempts + 1, MOBILE_RELAY_MAX_ATTEMPTS)
             else:
-                _clear_retry(r, fein)
+                # Still unresolved (outcome False) or errored (outcome None) — requeue with
+                # a fresh FIFO timestamp and attempts incremented. Unlike the discovery
+                # worker's exponential backoff, a relay failure is far more likely to be
+                # "tunnel dropped mid-run" (manager stops this worker as soon as the tunnel
+                # is unreachable), so an immediate requeue at the back of the FIFO is enough.
+                new_payload = json.dumps({"fein": fein, "attempts": attempts + 1})
+                r.zadd(MOBILE_RELAY_QUEUE, {new_payload: time.time()})
+                log.warning("fein=%s relay attempt %d/%d incomplete — requeued",
+                            fein, attempts + 1, MOBILE_RELAY_MAX_ATTEMPTS)
 
             r.zrem(_inflight_key, raw_member)
 

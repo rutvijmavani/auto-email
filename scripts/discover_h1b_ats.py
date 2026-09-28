@@ -56,7 +56,7 @@ import requests
 from config import (
     CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
     DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
-    MOBILE_RELAY_MAX_RETRIES, MOBILE_RELAY_QUEUE,
+    MOBILE_RELAY_QUEUE, PD_RETRY_CAP,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
@@ -1771,42 +1771,62 @@ def _is_recently_checked(
     return None
 
 
-_MOBILE_RELAY_PUSH_KEY_PREFIX = "mobile_relay:pushed:"
-_MOBILE_RELAY_PUSH_TTL_S      = 86400 * 7  # 7 days — same window as the drain worker's retry TTL
+def _push_mobile_relay(conn, fein: str) -> None:
+    """End-of-cascade push to MOBILE_RELAY_QUEUE (Part 3, doc-matched rewrite) — called
+    once at the very end of process_employer(), after every write this run has made.
 
+    Re-reads the CURRENT fein_domain_map row rather than trusting this run's in-memory
+    status/result: the row may already have been touched by another pipeline path
+    (domain_enrichment_worker, staleness_checker), and the relay item itself can sit
+    in the queue for hours/days before a home PC comes online, so only a fresh read at
+    push time is meaningful. The drain worker re-reads the row again itself at process
+    time for the same reason — the queue payload deliberately carries nothing but
+    {"fein", "attempts"}.
 
-def _push_mobile_relay(fein: str, petition_count: int, status: int) -> None:
-    """Post-cascade push to MOBILE_RELAY_QUEUE (Part 3) — called right after Phase 3
-    persists a block-like careers_url_last_status on an existing fein_domain_map row.
-
-    403 (hard WAF/bot-detection block) pushes unconditionally: a different egress
-    IP is exactly the thing that can resolve it, and this only fires once per
-    discovery run for a given fein anyway.
-
-    429/503 (rate-limited / overloaded) are retry-cap gated: the site is telling
-    us to back off, and pushing it to the relay repeatedly on every discovery re-run
-    would just move the same overload onto the home PC's IP instead of respecting
-    the signal. Capped at MOBILE_RELAY_MAX_RETRIES pushes per fein per 7-day window
-    (mirrors mobile_relay_drain_worker's own retry cap on the processing side).
+    Pushes when public_domain and/or careers_url is still unresolved on the current
+    row, UNLESS public_domain_last_status is a transient code (429/503) still under
+    Part 1's plain-retry cap (public_domain_retry_count < PD_RETRY_CAP) — that case
+    is still being plain-retried by domain_enrichment_worker and shouldn't be
+    escalated to the relay yet. Any other status (403, other 4xx, or no status at
+    all / no_signal) is relay-worthy immediately. Dedups on fein: skips a fein
+    already sitting in the queue.
     """
-    if status in (429, 503):
-        try:
-            r = get_redis()
-            key = f"{_MOBILE_RELAY_PUSH_KEY_PREFIX}{fein}"
-            count = r.incr(key)
-            r.expire(key, _MOBILE_RELAY_PUSH_TTL_S)
-            if count > MOBILE_RELAY_MAX_RETRIES:
-                log.info("  fein=%s status=%s — mobile relay push cap reached (%d) — not re-pushing",
-                          fein, status, MOBILE_RELAY_MAX_RETRIES)
-                return
-        except Exception as exc:
-            log.warning("  fein=%s: mobile relay push-cap check failed (%s) — pushing anyway", fein, exc)
+    row = conn.execute("""
+        SELECT public_domain, public_domain_last_status,
+               COALESCE(public_domain_retry_count, 0) AS public_domain_retry_count,
+               careers_url
+        FROM fein_domain_map
+        WHERE employer_fein = %s
+    """, (fein,)).fetchone()
+    if not row:
+        return
+    row = dict(row)
+
+    pd_unresolved = row["public_domain"] is None
+    careers_unresolved = row["careers_url"] is None
+    if not pd_unresolved and not careers_unresolved:
+        return  # both resolved — nothing to relay
+
+    pd_status = row["public_domain_last_status"]
+    if pd_status in (429, 503) and row["public_domain_retry_count"] < PD_RETRY_CAP:
+        log.debug(
+            "  fein=%s: public_domain still under plain-retry (status=%s, retry_count=%d < %d) "
+            "— not relaying yet", fein, pd_status, row["public_domain_retry_count"], PD_RETRY_CAP,
+        )
+        return
+
     try:
         r = get_redis()
-        member = json.dumps({"fein": fein, "status": status})
-        r.zadd(MOBILE_RELAY_QUEUE, {member: petition_count}, gt=True)
-        log.info("  fein=%s status=%s → pushed to MOBILE_RELAY_QUEUE (petition_count=%d)",
-                  fein, status, petition_count)
+        for member in r.zrange(MOBILE_RELAY_QUEUE, 0, -1):
+            try:
+                if json.loads(member).get("fein") == fein:
+                    return  # already queued — skip duplicate push
+            except (TypeError, ValueError):
+                continue
+        payload = json.dumps({"fein": fein, "attempts": 0})
+        r.zadd(MOBILE_RELAY_QUEUE, {payload: time.time()})
+        log.info("  fein=%s → pushed to MOBILE_RELAY_QUEUE (pd_unresolved=%s, careers_unresolved=%s)",
+                  fein, pd_unresolved, careers_unresolved)
     except Exception as exc:
         log.warning("  fein=%s: mobile relay push failed (%s)", fein, exc)
 
@@ -2196,7 +2216,6 @@ def process_employer(
             WHERE employer_fein = %s
         """, (careers_url_last_status, fein))
         conn.commit()
-        _push_mobile_relay(fein, int(emp.get("total_approvals") or 0), careers_url_last_status)
 
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
         domain = _root_domain(result["website_url"])
@@ -2211,6 +2230,11 @@ def process_employer(
                 priority=int(emp.get("total_approvals") or 0),
             )
             log.info("  → company_ats upserted: %s / %s / %s", domain, detected_platform, detected_slug)
+
+    if not dry_run:
+        # End-of-cascade mobile relay push (Part 3) — must run last, after every write
+        # above, so it reads the row this run actually left behind.
+        _push_mobile_relay(conn, fein)
 
     return result
 
