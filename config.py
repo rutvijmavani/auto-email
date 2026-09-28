@@ -383,6 +383,16 @@ DISCOVERY_DELAYED      = "discovery:delayed"        # ZSET — score=not_before 
 DISCOVERY_INFLIGHT     = "discovery:inflight"       # ZSET — crash recovery
 DISCOVERY_DLQ          = "discovery:dlq"            # LIST — failed discovery
 
+# mobile relay worker (discovery-pipeline-hardening Part 3) — third-tier fallback for
+# IP-reputation-blocked lookups, routed through a WireGuard tunnel to a home-PC SOCKS5
+# proxy bound only to the tunnel interface (see scripts/mobile_relay_socks5.py).
+MOBILE_RELAY_QUEUE      = "mobile_relay:queue"       # ZSET — score=petition_count, pushed post-cascade
+MOBILE_RELAY_INFLIGHT   = "mobile_relay:inflight"    # ZSET — crash recovery
+MOBILE_RELAY_DLQ        = "mobile_relay:dlq"         # LIST — failed relay lookups
+MOBILE_RELAY_PROXY_HOST = os.getenv("MOBILE_RELAY_PROXY_HOST", "10.10.0.2")  # home PC's WireGuard interface IP
+MOBILE_RELAY_PROXY_PORT = int(os.getenv("MOBILE_RELAY_PROXY_PORT", "1080"))  # scripts/mobile_relay_socks5.py default port
+MOBILE_RELAY_MAX_RETRIES = int(os.getenv("MOBILE_RELAY_MAX_RETRIES", "3"))
+
 ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
 ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker
 ATS_MANAGER_IDLE_CYCLES         = int(os.getenv("ATS_MANAGER_IDLE_CYCLES",         "3"))    # consecutive empty poll cycles → stop workers

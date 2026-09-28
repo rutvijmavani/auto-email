@@ -64,6 +64,9 @@ from config import (
     DISCOVERY_DELAYED,
     ATS_MANAGER_SCALE_UP_THRESHOLD,
     ATS_MANAGER_IDLE_CYCLES,
+    MOBILE_RELAY_QUEUE,
+    MOBILE_RELAY_PROXY_HOST,
+    MOBILE_RELAY_PROXY_PORT,
 )
 
 logger = get_logger(__name__)
@@ -1400,6 +1403,52 @@ def _run_ats_pool_cycle(
                 start_workers(_unit)
 
 
+def _probe_mobile_relay_reachable(timeout_s: float = 2.0) -> bool:
+    """TCP-connect probe to the home PC's WireGuard-tunneled SOCKS5 relay.
+
+    A single connect() is enough — we're only checking whether the tunnel + the
+    relay process on the other end are both up, not doing a real SOCKS5 handshake.
+    Cheap (~50ms typical over an established tunnel), so safe to run every cycle.
+    """
+    import socket
+    try:
+        with socket.create_connection((MOBILE_RELAY_PROXY_HOST, MOBILE_RELAY_PROXY_PORT), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _run_mobile_relay_cycle(r) -> None:
+    """On/off scaling for the single-instance mobile relay drain worker (Part 3).
+
+    Unlike _run_ats_pool_cycle's depth+idle-cycle logic (built for 2-instance
+    threshold scaling), this pool is gated on WireGuard-tunnel reachability
+    first — starting or leaving the worker running when the tunnel/home PC is
+    down just wastes a systemd start that will sit polling an unreachable proxy.
+    Depth alone never starts it; reachability alone never keeps it running once
+    the queue is empty.
+    """
+    from workers.worker_control import MOBILE_RELAY_WORKERS, start_workers, stop_workers
+
+    depth     = r.zcard(MOBILE_RELAY_QUEUE)
+    reachable = _probe_mobile_relay_reachable()
+    alive     = _get_ats_alive_count(r, "mobile_relay_drain_worker")
+
+    if reachable and depth > 0:
+        if alive == 0:
+            logger.info(
+                "manager [mobile_relay]: depth=%d, tunnel reachable — starting %s",
+                depth, MOBILE_RELAY_WORKERS[0],
+            )
+            start_workers(MOBILE_RELAY_WORKERS[0])
+    elif alive > 0:
+        logger.info(
+            "manager [mobile_relay]: reachable=%s depth=%d — stopping workers",
+            reachable, depth,
+        )
+        stop_workers(*MOBILE_RELAY_WORKERS)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main manager loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1617,6 +1666,15 @@ def run_manager() -> None:
                         )
                 except Exception as exc:
                     logger.error("manager: ATS pool cycle failed: %s", exc, exc_info=True)
+
+                # ── Mobile relay pool autoscaling (Part 3 — isolated on its own
+                # try/except, separate from the ATS block above, so a bug in this
+                # brand-new reachability-probe path can never take head_check/
+                # domain_enrichment/discovery scaling down with it) ─────────────
+                try:
+                    _run_mobile_relay_cycle(r)
+                except Exception as exc:
+                    logger.error("manager: mobile relay pool cycle failed: %s", exc, exc_info=True)
 
                 # ── Update prev_depth for next cycle's inflow_rate snapshot ────
                 for pool in pools:

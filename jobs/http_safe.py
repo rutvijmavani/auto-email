@@ -169,6 +169,23 @@ def make_safe_curl_session():
     return make_safe_session()
 
 
+def make_relay_curl_session(proxy_host: str, proxy_port: int):
+    """Return a curl_cffi Session identical to make_safe_curl_session() but routed
+    through a local SOCKS5 proxy (docs/discovery-pipeline-hardening.md Part 3 —
+    the WireGuard-tunneled home-PC relay, scripts/mobile_relay_socks5.py).
+
+    Requires curl_cffi — the mobile relay drain worker is the only caller and
+    curl_cffi is already a hard dependency of the rest of the discovery pipeline
+    it shares a process with, so no requests-based fallback is provided here.
+    socks5h (not socks5) so DNS resolution also happens at the proxy end, on the
+    home PC's network — not on the OCI VM, which is the whole point of the relay.
+    """
+    if not _CURL_AVAILABLE:
+        raise RuntimeError("make_relay_curl_session requires curl_cffi, which is not installed")
+    proxy_url = f"socks5h://{proxy_host}:{proxy_port}"
+    return _CurlSession(impersonate="chrome124", proxies={"http": proxy_url, "https": proxy_url})
+
+
 class ResponseTooLarge(Exception):
     """Raised by read_bounded_text when a response body exceeds the byte limit."""
 

@@ -56,6 +56,7 @@ import requests
 from config import (
     CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
     DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
+    MOBILE_RELAY_MAX_RETRIES, MOBILE_RELAY_QUEUE,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
 from db.connection import get_conn
@@ -1770,6 +1771,46 @@ def _is_recently_checked(
     return None
 
 
+_MOBILE_RELAY_PUSH_KEY_PREFIX = "mobile_relay:pushed:"
+_MOBILE_RELAY_PUSH_TTL_S      = 86400 * 7  # 7 days — same window as the drain worker's retry TTL
+
+
+def _push_mobile_relay(fein: str, petition_count: int, status: int) -> None:
+    """Post-cascade push to MOBILE_RELAY_QUEUE (Part 3) — called right after Phase 3
+    persists a block-like careers_url_last_status on an existing fein_domain_map row.
+
+    403 (hard WAF/bot-detection block) pushes unconditionally: a different egress
+    IP is exactly the thing that can resolve it, and this only fires once per
+    discovery run for a given fein anyway.
+
+    429/503 (rate-limited / overloaded) are retry-cap gated: the site is telling
+    us to back off, and pushing it to the relay repeatedly on every discovery re-run
+    would just move the same overload onto the home PC's IP instead of respecting
+    the signal. Capped at MOBILE_RELAY_MAX_RETRIES pushes per fein per 7-day window
+    (mirrors mobile_relay_drain_worker's own retry cap on the processing side).
+    """
+    if status in (429, 503):
+        try:
+            r = get_redis()
+            key = f"{_MOBILE_RELAY_PUSH_KEY_PREFIX}{fein}"
+            count = r.incr(key)
+            r.expire(key, _MOBILE_RELAY_PUSH_TTL_S)
+            if count > MOBILE_RELAY_MAX_RETRIES:
+                log.info("  fein=%s status=%s — mobile relay push cap reached (%d) — not re-pushing",
+                          fein, status, MOBILE_RELAY_MAX_RETRIES)
+                return
+        except Exception as exc:
+            log.warning("  fein=%s: mobile relay push-cap check failed (%s) — pushing anyway", fein, exc)
+    try:
+        r = get_redis()
+        member = json.dumps({"fein": fein, "status": status})
+        r.zadd(MOBILE_RELAY_QUEUE, {member: petition_count}, gt=True)
+        log.info("  fein=%s status=%s → pushed to MOBILE_RELAY_QUEUE (petition_count=%d)",
+                  fein, status, petition_count)
+    except Exception as exc:
+        log.warning("  fein=%s: mobile relay push failed (%s)", fein, exc)
+
+
 def process_employer(
     emp: dict,
     conn,
@@ -1780,6 +1821,7 @@ def process_employer(
     known_careers_url: str | None = None,
     known_careers_source: str | None = None,
     skip_phase6: bool = False,
+    session=None,
 ) -> dict:
     """
     Enrich one employer through the full pipeline and upsert into h1b_ats_discovery.
@@ -1796,6 +1838,14 @@ def process_employer(
     KG's jobs_url is NEVER allowed to overwrite it. skip_phase6 additionally skips Phase 6
     (career_page scan) unconditionally, since enrichment always ran it already whenever
     known_careers_url's caller is reached with already_has_ats False.
+
+    session (mobile_relay_drain_worker, Part 3): a pre-built curl_cffi session to use for
+    the whole Phase 3-5 fetch run instead of a fresh direct-egress session — the drain
+    worker passes one proxied through the WireGuard-tunneled SOCKS5 relay so these fetches
+    originate from the home PC's IP instead of the OCI VM's IP-reputation-blocked one.
+    When given, this function does not close it — the caller owns its lifecycle. None
+    (the default) preserves the original behavior: a fresh _make_safe_curl_session() is
+    created and closed here.
     """
     fein = emp["employer_fein"]
     name = emp["employer_name"]
@@ -1953,8 +2003,11 @@ def process_employer(
     elif website_url:
         # One Chrome-impersonated session (Part 2) for this employer's whole Phase 3-5
         # fetch run (redirect resolution, 19 probes, Brave-page fingerprint); closed on
-        # every exit path.
-        with _make_safe_curl_session() as _fetch_session:
+        # every exit path — unless the caller supplied its own (Part 3's mobile relay
+        # session), which the caller owns and must close itself.
+        _owns_fetch_session = session is None
+        _fetch_session = session if session is not None else _make_safe_curl_session()
+        try:
             # Phase 3: 19-pattern probe
             website_url = _resolve_website_redirect(website_url, _fetch_session)
             log.info("  Probing 19 career URL patterns on %s …", website_url)
@@ -1995,6 +2048,9 @@ def process_employer(
             elif _phase3_blocked:
                 log.info("  Phase 3 block-like status %s — deferring Brave to relay pass",
                           careers_url_last_status)
+        finally:
+            if _owns_fetch_session:
+                _fetch_session.close()
 
     # Part 5.1 cache check — before Phase 6's expensive scan, see if company_ats already
     # has a resolved platform/slug for this domain (from a prior enrichment pass or a
@@ -2140,6 +2196,7 @@ def process_employer(
             WHERE employer_fein = %s
         """, (careers_url_last_status, fein))
         conn.commit()
+        _push_mobile_relay(fein, int(emp.get("total_approvals") or 0), careers_url_last_status)
 
     if not dry_run and detected_platform and detected_slug and result.get("website_url"):
         domain = _root_domain(result["website_url"])
