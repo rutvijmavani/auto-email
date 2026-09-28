@@ -55,6 +55,7 @@ def _prefetched(jobs_url=None):
 class TestKnownCareersUrlSkipsPhase3And4(unittest.TestCase):
     """known_careers_url set → Phase 3 probe and Phase 4 Brave never run."""
 
+    @patch("scripts.discover_h1b_ats._push_mobile_relay")
     @patch("scripts.discover_h1b_ats._upsert_company_ats")
     @patch("scripts.discover_h1b_ats.upsert_discovery")
     @patch("jobs.ats.career_detector.detect_company")
@@ -62,7 +63,7 @@ class TestKnownCareersUrlSkipsPhase3And4(unittest.TestCase):
     @patch("scripts.discover_h1b_ats.discover_careers_url")
     @patch("scripts.discover_h1b_ats._is_recently_checked", return_value=None)
     def test_probe_and_brave_never_called(
-        self, _recent, mock_probe, mock_brave, mock_phase7, mock_upsert, mock_ats_upsert,
+        self, _recent, mock_probe, mock_brave, mock_phase7, mock_upsert, mock_ats_upsert, _mock_relay,
     ):
         mock_phase7.return_value = []  # Phase 7 still runs (no platform known yet)
         conn = MagicMock()
@@ -80,12 +81,13 @@ class TestKnownCareersUrlSkipsPhase3And4(unittest.TestCase):
         self.assertEqual(result["careers_url"], "https://acme.com/careers")
         self.assertEqual(result["careers_source"], "phase3")
 
+    @patch("scripts.discover_h1b_ats._push_mobile_relay")
     @patch("scripts.discover_h1b_ats._upsert_company_ats")
     @patch("scripts.discover_h1b_ats.upsert_discovery")
     @patch("jobs.ats.career_detector.detect_company")
     @patch("scripts.discover_h1b_ats._is_recently_checked", return_value=None)
     def test_phase6_skipped_when_skip_phase6_true(
-        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert,
+        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert, _mock_relay,
     ):
         mock_phase7.return_value = []
         conn = MagicMock()
@@ -100,12 +102,14 @@ class TestKnownCareersUrlSkipsPhase3And4(unittest.TestCase):
             )
             mock_phase6.assert_not_called()
 
+    @patch("scripts.discover_h1b_ats._push_mobile_relay")
+    @patch("scripts.discover_h1b_ats._lookup_company_ats", return_value=None)
     @patch("scripts.discover_h1b_ats._upsert_company_ats")
     @patch("scripts.discover_h1b_ats.upsert_discovery")
     @patch("jobs.ats.career_detector.detect_company")
     @patch("scripts.discover_h1b_ats._is_recently_checked", return_value=None)
     def test_phase7_still_runs_when_platform_unknown(
-        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert,
+        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert, _mock_cache, _mock_relay,
     ):
         """Phase 7 is the only genuinely new work on the normal path — must still run."""
         mock_phase7.return_value = []
@@ -127,12 +131,13 @@ class TestKnownCareersUrlSkipsPhase3And4(unittest.TestCase):
 class TestKnownCareersUrlOutranksKg(unittest.TestCase):
     """known_careers_url must never be overwritten by KG's jobs_url."""
 
+    @patch("scripts.discover_h1b_ats._push_mobile_relay")
     @patch("scripts.discover_h1b_ats._upsert_company_ats")
     @patch("scripts.discover_h1b_ats.upsert_discovery")
     @patch("jobs.ats.career_detector.detect_company")
     @patch("scripts.discover_h1b_ats._is_recently_checked", return_value=None)
     def test_kg_jobs_url_does_not_overwrite(
-        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert,
+        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert, _mock_relay,
     ):
         mock_phase7.return_value = []
         conn = MagicMock()
@@ -152,12 +157,13 @@ class TestKnownCareersUrlOutranksKg(unittest.TestCase):
 class TestKnownCareersUrlAtsPatternShortCircuitsPhase7(unittest.TestCase):
     """A known_careers_url that itself matches a known ATS pattern needs no BFS."""
 
+    @patch("scripts.discover_h1b_ats._push_mobile_relay")
     @patch("scripts.discover_h1b_ats._upsert_company_ats")
     @patch("scripts.discover_h1b_ats.upsert_discovery")
     @patch("jobs.ats.career_detector.detect_company")
     @patch("scripts.discover_h1b_ats._is_recently_checked", return_value=None)
     def test_ats_pattern_match_skips_phase7(
-        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert,
+        self, _recent, mock_phase7, mock_upsert, mock_ats_upsert, _mock_relay,
     ):
         conn = MagicMock()
 
