@@ -1300,5 +1300,58 @@ class TestFullCycleIntegration(unittest.TestCase):
                              f"Scan pool still inflated at {n} workers")
 
 
+# Section 15 — On-demand mobile relay start (2026-09-28)
+# scripts/mobile_relay_watcher.py runs on the home PC; manager.py pushes a
+# "START" trigger to it whenever the mobile-relay queue has backlog but the
+# relay port isn't reachable, so the SOCKS5 relay only runs on demand.
+class TestMobileRelayOnDemandTrigger(unittest.TestCase):
+    def test_trigger_sends_start_line(self):
+        mock_sock = MagicMock()
+        mock_sock.__enter__.return_value = mock_sock
+        with patch("socket.create_connection", return_value=mock_sock) as mock_conn:
+            mgr._trigger_mobile_relay_start()
+        mock_conn.assert_called_once_with(
+            (mgr.MOBILE_RELAY_WATCHER_HOST, mgr.MOBILE_RELAY_WATCHER_PORT),
+            timeout=mgr.MOBILE_RELAY_WATCHER_TRIGGER_TIMEOUT_S,
+        )
+        mock_sock.sendall.assert_called_once_with(b"START\n")
+
+    def test_trigger_swallows_connection_failure(self):
+        with patch("socket.create_connection", side_effect=OSError("refused")):
+            mgr._trigger_mobile_relay_start()  # must not raise
+
+    def test_cycle_triggers_watcher_when_unreachable_with_backlog(self):
+        r = MagicMock()
+        r.zcard.return_value = 3
+        with patch.object(mgr, "_probe_mobile_relay_reachable", return_value=False), \
+             patch.object(mgr, "_mobile_relay_inflight_depth", return_value=0), \
+             patch.object(mgr, "_trigger_mobile_relay_start") as mock_trigger, \
+             patch.object(mgr, "_run_ats_pool_cycle") as mock_run_pool:
+            mgr._run_mobile_relay_cycle(r)
+        mock_trigger.assert_called_once()
+        # depth is still forced to 0 for the pool-cycle call, trigger is additive
+        self.assertEqual(mock_run_pool.call_args.kwargs["combined_depth"], 0)
+
+    def test_cycle_does_not_trigger_when_reachable(self):
+        r = MagicMock()
+        r.zcard.return_value = 3
+        with patch.object(mgr, "_probe_mobile_relay_reachable", return_value=True), \
+             patch.object(mgr, "_mobile_relay_inflight_depth", return_value=0), \
+             patch.object(mgr, "_trigger_mobile_relay_start") as mock_trigger, \
+             patch.object(mgr, "_run_ats_pool_cycle"):
+            mgr._run_mobile_relay_cycle(r)
+        mock_trigger.assert_not_called()
+
+    def test_cycle_does_not_trigger_when_unreachable_and_empty(self):
+        r = MagicMock()
+        r.zcard.return_value = 0
+        with patch.object(mgr, "_probe_mobile_relay_reachable", return_value=False), \
+             patch.object(mgr, "_mobile_relay_inflight_depth", return_value=0), \
+             patch.object(mgr, "_trigger_mobile_relay_start") as mock_trigger, \
+             patch.object(mgr, "_run_ats_pool_cycle"):
+            mgr._run_mobile_relay_cycle(r)
+        mock_trigger.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -191,10 +191,14 @@ class TestAtsLaneHealth(unittest.TestCase):
         r2 = FakeRedis(lists={"head_check:inflight:instance:1:batch": ["x", "y"]})
         self.assertIn("in-flight=2", self.check(r2)[1][2])
 
-    def test_lanes_cover_three_workers(self):
+    def test_lanes_cover_four_workers(self):
+        # mobile_relay_drain_worker added by the Part 3 rework (commit d4b66a3 /
+        # e0c2a77) — reachability-gated 4th lane, distinct semantics (zero workers
+        # with a queued backlog is normal there, not a scale-up-failed signal like
+        # the other three lanes).
         self.assertEqual({l["worker"] for l in hc._ats_lanes()},
                          {"head_check_worker", "domain_enrichment_worker",
-                          "discover_h1b_ats_worker"})
+                          "discover_h1b_ats_worker", "mobile_relay_drain_worker"})
 
 
 if __name__ == "__main__":

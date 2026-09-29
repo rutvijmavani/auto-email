@@ -85,7 +85,8 @@ def _run_verify_only_mocked(mock_page_url="https://www.careershift.com/App/Dashb
     with patch("pipeline.sync_playwright") as mock_pw_ctx, \
          patch("pipeline.run_tiered_verification") as mock_verify, \
          patch("pipeline.load_dotenv"), \
-         patch("careershift.utils.human_delay"), \
+         patch("pipeline.human_delay"), \
+         patch("outreach.report_templates.verify_report.build_verify_report"), \
          patch("os.path.exists", return_value=True):
         mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
         mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -165,7 +166,8 @@ class TestVerifyOnlySessionHandling(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification") as mock_verify, \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO) as mock_out:
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -195,7 +197,8 @@ class TestVerifyOnlySessionHandling(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification") as mock_verify, \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO) as mock_out:
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -224,7 +227,8 @@ class TestVerifyOnlySessionHandling(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification"), \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO) as mock_out:
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -252,7 +256,8 @@ class TestVerifyOnlySessionHandling(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification"), \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO):
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -345,7 +350,8 @@ class TestVerifyOnlyNoApplications(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification"), \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO):
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -385,7 +391,8 @@ class TestVerifyOnlyUnderStockedReport(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification"), \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO) as mock_out:
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -566,7 +573,8 @@ class TestVerifyOnlyVerificationCalled(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification") as mock_verify, \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO):
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
@@ -644,7 +652,8 @@ class TestVerifyOnlyVerificationCalled(unittest.TestCase):
              patch("pipeline.sync_playwright") as mock_pw_ctx, \
              patch("pipeline.run_tiered_verification") as mock_verify, \
              patch("pipeline.load_dotenv"), \
-             patch("careershift.utils.human_delay"), \
+             patch("pipeline.human_delay"), \
+             patch("outreach.report_templates.verify_report.build_verify_report"), \
              patch("sys.stdout", new_callable=StringIO):
             mock_pw_ctx.return_value.__enter__ = MagicMock(return_value=mock_playwright)
             mock_pw_ctx.return_value.__exit__ = MagicMock(return_value=False)
