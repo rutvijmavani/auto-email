@@ -743,7 +743,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         job = scraper.scrape("https://boards.greenhouse.io/test/jobs/123")
         self.assertIsNotNone(job)
         self.assertEqual(job.portal, "greenhouse")
@@ -753,7 +753,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         import requests
         from jobs.job_scraper import JobScraper
         mock_get.side_effect = requests.HTTPError("404 Not Found")
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         job = scraper.scrape("https://boards.greenhouse.io/test/jobs/999")
         self.assertIsNone(job)
 
@@ -761,7 +761,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
     def test_returns_none_on_generic_exception(self, mock_get):
         from jobs.job_scraper import JobScraper
         mock_get.side_effect = Exception("Connection timeout")
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         job = scraper.scrape("https://boards.greenhouse.io/test/jobs/999")
         self.assertIsNone(job)
 
@@ -776,7 +776,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         job = scraper.scrape("https://boards.greenhouse.io/test/jobs/123")
         if job and job.description:
             self.assertNotIn("\n\n\n\n", job.description)
@@ -809,7 +809,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         job = scraper.scrape("https://www.unknowncompany.com/careers/swe")
         self.assertIsNotNone(job)
         self.assertEqual(job.portal, "generic")
@@ -824,7 +824,7 @@ class TestJobScraperOrchestrator(unittest.TestCase):
         mock_response.raise_for_status = MagicMock()
         mock_get.return_value = mock_response
 
-        scraper = JobScraper()
+        scraper = JobScraper(delay=0)
         url = "https://boards.greenhouse.io/test/jobs/123"
         job = scraper.scrape(url)
         self.assertEqual(job.url, url)
@@ -1003,7 +1003,7 @@ class TestJobScraperLive(unittest.TestCase):
                     pass
         db_module.init_db()
         from jobs.job_scraper import JobScraper
-        self.scraper = JobScraper()
+        self.scraper = JobScraper(delay=0)
 
     def tearDown(self):
         # Force WAL checkpoint and close all connections before deleting on Windows

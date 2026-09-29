@@ -401,6 +401,15 @@ MOBILE_RELAY_PROBE_TIMEOUT_S = int(os.getenv("MOBILE_RELAY_PROBE_TIMEOUT_S", "2"
 # module docstring) — not a normal-path expiry.
 MOBILE_RELAY_GUARD_PREFIX = os.getenv("MOBILE_RELAY_GUARD_PREFIX", "mobile_relay:guard:")
 MOBILE_RELAY_GUARD_TTL_S = int(os.getenv("MOBILE_RELAY_GUARD_TTL_S", str(30 * 86400)))
+# On-demand relay start (2026-09-28): scripts/mobile_relay_watcher.py runs on the home
+# PC as an auto-start Windows service (NSSM), bound only to the tunnel interface like
+# the relay itself — never 0.0.0.0. workers/manager.py pushes a one-line "START" trigger
+# to it whenever the mobile-relay queue has backlog but the relay port isn't reachable
+# yet, so scripts/mobile_relay_socks5.py only runs while there's real work, not 24/7.
+MOBILE_RELAY_WATCHER_HOST = os.getenv("MOBILE_RELAY_WATCHER_HOST", MOBILE_RELAY_PROXY_HOST)  # same home PC, tunnel IP
+MOBILE_RELAY_WATCHER_PORT = int(os.getenv("MOBILE_RELAY_WATCHER_PORT", "1081"))  # scripts/mobile_relay_watcher.py control port
+MOBILE_RELAY_WATCHER_TRIGGER_TIMEOUT_S = int(os.getenv("MOBILE_RELAY_WATCHER_TRIGGER_TIMEOUT_S", "2"))  # best-effort push, never blocks the autoscaler cycle
+MOBILE_RELAY_IDLE_STOP_S = int(os.getenv("MOBILE_RELAY_IDLE_STOP_S", "300"))  # relay subprocess auto-stops after this long with no new START trigger
 
 ATS_STALE_TTL_DAYS              = int(os.getenv("ATS_STALE_TTL_DAYS",              "30"))   # days before stale company_ats rows are purged
 ATS_MANAGER_SCALE_UP_THRESHOLD  = int(os.getenv("ATS_MANAGER_SCALE_UP_THRESHOLD",  "50"))   # queue depth → start 2nd enrichment/discovery worker

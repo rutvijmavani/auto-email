@@ -69,6 +69,9 @@ from config import (
     MOBILE_RELAY_PROXY_HOST,
     MOBILE_RELAY_PROXY_PORT,
     MOBILE_RELAY_PROBE_TIMEOUT_S,
+    MOBILE_RELAY_WATCHER_HOST,
+    MOBILE_RELAY_WATCHER_PORT,
+    MOBILE_RELAY_WATCHER_TRIGGER_TIMEOUT_S,
 )
 
 logger = get_logger(__name__)
@@ -1446,6 +1449,29 @@ def _probe_mobile_relay_reachable(timeout_s: float = MOBILE_RELAY_PROBE_TIMEOUT_
         return False
 
 
+def _trigger_mobile_relay_start() -> None:
+    """Best-effort push to scripts/mobile_relay_watcher.py's control listener on
+    the home PC (on-demand-start follow-up, 2026-09-28 — see config.py's
+    MOBILE_RELAY_WATCHER_* comment). Sends a bare "START\\n" line; the watcher
+    spawns scripts/mobile_relay_socks5.py if it isn't already running.
+
+    Never allowed to slow down or fail the autoscaler cycle: a short connect+send
+    timeout, and any failure (watcher not running, PC off, tunnel down) is just
+    logged at debug level — the existing _probe_mobile_relay_reachable() check
+    already treats an unreachable relay as "depth 0" regardless of this trigger's
+    outcome, so there is nothing else to fall back to here.
+    """
+    import socket
+    try:
+        with socket.create_connection(
+            (MOBILE_RELAY_WATCHER_HOST, MOBILE_RELAY_WATCHER_PORT),
+            timeout=MOBILE_RELAY_WATCHER_TRIGGER_TIMEOUT_S,
+        ) as sock:
+            sock.sendall(b"START\n")
+    except OSError as e:
+        logger.debug("mobile relay watcher trigger failed (PC/watcher likely offline): %s", e)
+
+
 def _run_mobile_relay_cycle(r) -> None:
     """Autoscaling for the single-instance mobile relay drain worker (Part 3).
 
@@ -1462,9 +1488,11 @@ def _run_mobile_relay_cycle(r) -> None:
     combined_depth = r.zcard(MOBILE_RELAY_QUEUE) + _mobile_relay_inflight_depth(r)
     if not reachable and combined_depth > 0:
         logger.info(
-            "manager [mobile_relay]: tunnel unreachable — depth=%d treated as 0",
+            "manager [mobile_relay]: tunnel unreachable — depth=%d treated as 0, "
+            "triggering on-demand relay start",
             combined_depth,
         )
+        _trigger_mobile_relay_start()
         combined_depth = 0
 
     _run_ats_pool_cycle(
