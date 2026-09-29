@@ -26,7 +26,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from config import H1B_DISAMBIG_MAXLEN, H1B_DISAMBIG_STREAM, REDIS_DB_MAINTENANCE
+from config import H1B_DISAMBIG_MAXLEN, H1B_DISAMBIG_STREAM, REDIS_DB_MAINTENANCE, STALENESS_DISCOVERY_MIN_PETITIONS
 from db.connection import get_conn
 from logger import get_logger, init_logging
 from workers.redis_client import get_redis
@@ -326,6 +326,12 @@ def _populate_enrichment_queue(conn, r) -> None:
     disjoint is what stops the same FEIN being queued twice under two different member JSONs.
     Score = petition_count (highest priority first).
     Workers are started on demand by manager.py (autoscaled on queue depth).
+
+    Gated on STALENESS_DISCOVERY_MIN_PETITIONS: below that floor, enrichment can never
+    reach the discovery push anyway (domain_enrichment_worker.py Step 4), so queuing these
+    FEINs only burns worker cycles on companies that were already decided not to be worth
+    it right now. Re-widen this filter once PD/career-URL/ATS resolution rates for the
+    >=floor cohort hit target (2026-09-28 decision — see project_codebase_review_log memory).
     """
     from config import ENRICHMENT_BATCH
 
@@ -341,7 +347,8 @@ def _populate_enrichment_queue(conn, r) -> None:
             FROM fein_domain_map f
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE f.last_enriched_at IS NULL
-        """)
+              AND COALESCE(u.petition_count, 0) >= %s
+        """, (STALENESS_DISCOVERY_MIN_PETITIONS,))
         for row in named_cur:
             member = json.dumps({"fein": row["employer_fein"], "trigger": "enrichment", "source": None, "tier": "batch"})
             pipe.zadd(ENRICHMENT_BATCH, {member: row["petition_count"]}, gt=True)

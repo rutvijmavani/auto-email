@@ -68,6 +68,7 @@ from config import (
     PD_RETRY_INTERVAL_DAYS,
     REDIS_DB_MAINTENANCE,
     STALENESS_ANALYZE_TABLES,
+    STALENESS_DISCOVERY_MIN_PETITIONS,
     STALENESS_ZADD_BATCH,
 )
 from db.connection import get_conn
@@ -210,11 +211,18 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
     """
     _stale_interval = f"{ENRICH_STALENESS_DAYS} days"
 
-    def _build_sql_params(careers_url_condition: str):
+    def _build_sql_params(careers_url_condition: str, min_petitions: "int | None" = None):
         # Stale = enriched before, but more than ENRICH_STALENESS_DAYS ago. Never-enriched
         # rows (last_enriched_at IS NULL) are NOT selected here — fuzzy_match's
         # _populate_enrichment_queue owns them. The two sets are disjoint on purpose so a
         # FEIN is never queued under two different members (trigger is part of the member).
+        #
+        # min_petitions (Pass 1a only, 2026-09-28): below STALENESS_DISCOVERY_MIN_PETITIONS,
+        # a re-enrichment can never reach the discovery push anyway (domain_enrichment_worker.py
+        # Step 4), so re-queuing these only burns worker cycles on companies already decided
+        # not worth it right now. Pass 1b is left unfiltered — it's a cheap liveness check on
+        # companies that already have a careers_url, not new enrichment work.
+        petitions_clause = " AND COALESCE(u.petition_count, 0) >= %s" if min_petitions is not None else ""
         sql = f"""
             SELECT
                 f.employer_fein,
@@ -223,12 +231,14 @@ def run_enrichment_staleness(conn, r, dry_run: bool = False) -> int:
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = f.employer_fein
             WHERE {careers_url_condition}
               AND f.last_enriched_at < NOW() - %s::interval
+              {petitions_clause}
             ORDER BY petition_count DESC
         """
-        return sql, (_stale_interval,)
+        params = (_stale_interval,) if min_petitions is None else (_stale_interval, min_petitions)
+        return sql, params
 
     # Pass 1a: no careers URL — needs full enrichment
-    sql_a, params_a = _build_sql_params("f.careers_url IS NULL")
+    sql_a, params_a = _build_sql_params("f.careers_url IS NULL", min_petitions=STALENESS_DISCOVERY_MIN_PETITIONS)
     added_a = _stream_and_zadd(
         conn, r, sql_a, params_a,
         queue_key=ENRICHMENT_BATCH,
@@ -275,6 +285,10 @@ def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
     which would otherwise silently reset this backoff clock on writes unrelated to a
     pd retry attempt. public_domain_last_attempt_at is set only by _write_domain's
     failure branch and cleared on a clean resolution.
+
+    Also gated on STALENESS_DISCOVERY_MIN_PETITIONS (2026-09-28) — same rationale as
+    Pass 1a: below the floor, re-enrichment can't reach the discovery push anyway, so
+    it isn't worth burning a retry cycle on right now.
     """
     sql = """
         SELECT
@@ -286,10 +300,11 @@ def run_pd_retry_staleness(conn, r, dry_run: bool = False) -> int:
           AND f.public_domain_retry_count < %s
           AND f.public_domain_last_attempt_at IS NOT NULL
           AND f.public_domain_last_attempt_at < NOW() - make_interval(days => %s)
+          AND COALESCE(u.petition_count, 0) >= %s
         ORDER BY petition_count DESC
     """
     return _stream_and_zadd(
-        conn, r, sql, (PD_RETRY_CAP, PD_RETRY_INTERVAL_DAYS),
+        conn, r, sql, (PD_RETRY_CAP, PD_RETRY_INTERVAL_DAYS, STALENESS_DISCOVERY_MIN_PETITIONS),
         queue_key=ENRICHMENT_BATCH,
         cursor_name="pd_retry_staleness",
         log_prefix="pd-retry staleness",

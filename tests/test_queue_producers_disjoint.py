@@ -41,8 +41,10 @@ class TestPopulateEnrichmentQueue(unittest.TestCase):
         self.assertIn("f.last_enriched_at IS NULL", sql)
         self.assertNotIn("interval", sql.lower())
         self.assertNotIn(" OR ", sql)
-        # no interval parameter is passed any more
-        self.assertEqual(len(cur.execute.call_args.args), 1)
+        # petition-count floor gate (2026-09-28): sub-floor rows can never reach the
+        # discovery push anyway, so they're excluded at the producer level too.
+        self.assertIn("COALESCE(u.petition_count, 0) >= %s", sql)
+        self.assertEqual(cur.execute.call_args.args[1], (fm.STALENESS_DISCOVERY_MIN_PETITIONS,))
 
         mapping = r.pipeline.return_value.zadd.call_args.args[1]
         member = json.loads(next(iter(mapping)))
@@ -70,7 +72,16 @@ class TestStalenessSelectsOnlyStale(unittest.TestCase):
             self.assertNotIn("last_enriched_at IS NULL", sql)
             self.assertNotIn("public_domain", sql)
             self.assertNotIn("ANY(", sql)         # monitored-FEIN branch is gone
-            self.assertEqual(params, (f"{sc.ENRICH_STALENESS_DAYS} days",))
+
+        # Pass 1a (ENRICHMENT_BATCH) is gated on the petition-count floor (2026-09-28);
+        # Pass 1b (HEAD_CHECK_BATCH) is a cheap liveness check and stays unfiltered.
+        sql_a, params_a, q_a, _kw_a = calls[0]
+        self.assertIn("COALESCE(u.petition_count, 0) >= %s", sql_a)
+        self.assertEqual(params_a, (f"{sc.ENRICH_STALENESS_DAYS} days", sc.STALENESS_DISCOVERY_MIN_PETITIONS))
+
+        sql_b, params_b, q_b, _kw_b = calls[1]
+        self.assertNotIn("petition_count) >=", sql_b)
+        self.assertEqual(params_b, (f"{sc.ENRICH_STALENESS_DAYS} days",))
 
     def test_split_by_careers_url(self):
         (sql_a, _pa, q_a, kw_a), (sql_b, _pb, q_b, kw_b) = self._capture()

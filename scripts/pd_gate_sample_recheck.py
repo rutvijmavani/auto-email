@@ -16,7 +16,7 @@ commissioned (see Part 1 "Expected consequence", locked 2026-09-27).
 Usage:
     python scripts/pd_gate_sample_recheck.py                # default 300 rows
     python scripts/pd_gate_sample_recheck.py --sample-size 500
-    python scripts/pd_gate_sample_recheck.py --seed 42       # reproducible sample
+    python scripts/pd_gate_sample_recheck.py --seed 0.42     # reproducible sample (range -1.0..1.0)
 """
 
 import argparse
