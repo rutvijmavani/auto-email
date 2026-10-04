@@ -1461,6 +1461,7 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
             d.employer_name,
             d.poc_email_domain,
             fdm.assigned_domain,
+            CASE WHEN fdm.public_domain IS NOT NULL THEN fdm.public_domain_host END AS fetch_host,
             COALESCE(
                 SUM(
                     u.new_employment_approval +
@@ -1502,7 +1503,8 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
             )
         )
         GROUP BY d.employer_fein, d.employer_name, d.poc_email_domain,
-                 fdm.assigned_domain, d.total_certified
+                 fdm.assigned_domain, fdm.public_domain, fdm.public_domain_host,
+                 d.total_certified
         ORDER BY total_approvals DESC NULLS LAST
         LIMIT %s
     """, (limit,))
@@ -1513,7 +1515,8 @@ def load_by_fein(fein: str, conn) -> dict | None:
     cur = conn.cursor()
     cur.execute("""
         SELECT d.employer_fein, d.employer_name, d.poc_email_domain,
-               fdm.assigned_domain
+               fdm.assigned_domain,
+               CASE WHEN fdm.public_domain IS NOT NULL THEN fdm.public_domain_host END AS fetch_host
         FROM dol_h1b_employers d
         LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = d.employer_fein
         WHERE d.employer_fein = %s
@@ -2589,7 +2592,7 @@ def main():
 
                 # website_url: always from assigned_domain (LCA email-first).
                 if assigned_domain:
-                    entry["website_url"] = "https://" + assigned_domain
+                    entry["website_url"] = "https://" + (emp_row.get("fetch_host") or assigned_domain)
                 elif emp_row.get("poc_email_domain"):
                     entry["website_url"] = "https://" + emp_row["poc_email_domain"]
                 else:

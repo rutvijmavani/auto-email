@@ -768,7 +768,13 @@ def init_db():
             probed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
     """)
+    # Per-tier hash + cookie evidence (2026-10-04): lets Rule 2/3 mining cluster each source separately
+    # and records which vendor cookie fired Rule 1 when only the Worker/relay could read the page.
+    for _col in ("worker_body_hash", "worker_cookie_names", "relay_body_hash", "relay_cookie_names"):
+        c.execute(f"ALTER TABLE pd_probe_observation ADD COLUMN IF NOT EXISTS {_col} TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_body_hash ON pd_probe_observation(body_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_worker_body_hash ON pd_probe_observation(worker_body_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_relay_body_hash ON pd_probe_observation(relay_body_hash)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_verdict   ON pd_probe_observation(final_verdict)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_fein      ON pd_probe_observation(employer_fein)")
 

@@ -351,6 +351,9 @@ CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler s
 # via db/external_api_health.py (service="cf_worker"), same pattern as Brave's
 # monthly quota — see _BRAVE_QUOTA_LIMIT in scripts/discover_h1b_ats.py.
 CF_WORKER_DAILY_LIMIT = int(os.getenv("CF_WORKER_DAILY_LIMIT", "85000"))
+# Redirect hops the probe Worker follows per request (jobs/public_domain.py::_fetch_via_worker sends it as
+# max_hops; the Worker caps it at 20). Should match the direct tier's hop budget.
+CF_WORKER_MAX_HOPS = int(os.getenv("CF_WORKER_MAX_HOPS", "8"))
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 

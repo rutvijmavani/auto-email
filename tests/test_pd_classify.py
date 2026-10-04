@@ -172,15 +172,40 @@ class TestRecordProbe(unittest.TestCase):
             self.assertFalse(pd_probe.record_probe("a.com", {}))
             gc.assert_not_called()
 
-    def test_writes_one_param_per_column_plus_domain(self):
+    def test_writes_only_present_columns_plus_domain(self):
         conn = mock.MagicMock()
         with mock.patch.object(pd_probe, "get_conn", return_value=conn):
             self.assertTrue(pd_probe.record_probe(" A.com ", {"final_verdict": "ok", "status": 200}))
         sql, params = conn.execute.call_args[0]
         self.assertEqual(params[0], "a.com")
-        self.assertEqual(len(params), 1 + len(pd_probe._FIELDS))
+        self.assertEqual(len(params), 3)                 # domain + the two present keys
         self.assertEqual(sql.count("?"), len(params))
+        self.assertNotIn("relay_status", sql)            # absent tier columns are left untouched
+        self.assertNotIn("worker_title", sql)
         conn.commit.assert_called_once()
+
+    def test_relay_write_never_touches_oci_or_worker_columns(self):
+        conn = mock.MagicMock()
+        obs = {"final_verdict": "parked", "relay_status": 200, "relay_body_hash": "h",
+               "relay_cookie_names": "lander_type"}
+        with mock.patch.object(pd_probe, "get_conn", return_value=conn):
+            pd_probe.record_probe("a.com", obs)
+        sql = conn.execute.call_args[0][0]
+        for col in ("body_hash", "title", "cookie_names", "status", "worker_status"):
+            self.assertNotIn(f" {col} = EXCLUDED.{col}", sql)
+        self.assertIn("relay_body_hash = EXCLUDED.relay_body_hash", sql)
+
+    def test_explicit_none_clears_a_column(self):
+        conn = mock.MagicMock()
+        with mock.patch.object(pd_probe, "get_conn", return_value=conn):
+            pd_probe.record_probe("a.com", {"final_verdict": "ok", "worker_body_hash": None})
+        sql, params = conn.execute.call_args[0]
+        self.assertIn("worker_body_hash = EXCLUDED.worker_body_hash", sql)
+        self.assertIsNone(params[-1])
+
+    def test_all_new_tier_columns_are_known(self):
+        for col in ("worker_body_hash", "worker_cookie_names", "relay_body_hash", "relay_cookie_names"):
+            self.assertIn(col, pd_probe._FIELDS)
 
     def test_failure_is_swallowed_and_retried_once(self):
         conn = mock.MagicMock()

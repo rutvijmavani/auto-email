@@ -40,6 +40,7 @@ _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
 
 from config import (
     CERTSPOTTER_API_KEY, PD_BODY_MAX_BYTES, PD_SNIPPET_CHARS, PD_PROBE_RECORD_ENABLED,
+    CF_WORKER_MAX_HOPS,
 )
 from logger import get_logger
 from db.external_api_health import record_external_request, get_day_request_count
@@ -151,7 +152,7 @@ def _get_default_curl_session():
     return sess
 
 
-def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
+def _fetch_via_worker(url: str) -> "dict | None":
     """Proxy a single GET through the Cloudflare probe Worker — fallback tier used when
     the direct curl_cffi attempt to `url` comes back inconclusive (403/429/503).
 
@@ -160,9 +161,16 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
     scripts/discover_h1b_ats.py::_fetch_via_worker — all three count against one shared
     daily total. The shared limit is NOT raised for this addition (locked 2026-09-27).
 
-    Returns (final_url, status) — status is the WORKER's read of the target site, which
-    may itself still be non-2xx. Returns None on any failure of the call to the worker
-    itself (quota exhausted, no config, network error, bad worker response).
+    Returns a res-shaped dict {status, headers, body, final_url, cookies, error_type} so
+    jobs/pd_classify.classify can judge the Worker's response exactly like a direct fetch —
+    status is the WORKER's read of the target site, which may itself still be non-2xx.
+    Requests the same bounded body as the direct tier (PD_BODY_MAX_BYTES) and a hop cap
+    (CF_WORKER_MAX_HOPS). The redeployed Worker also returns response headers, Set-Cookie
+    names across the redirect chain and a `truncated` flag; an OLD Worker omits them and
+    we fall back to empty headers/cookies (body/path/title signatures still work).
+    A body that hit the cap is marked oversize (x-scan-too-large, body "") — a page that big
+    is a real site, mirroring _fetch_chain. Returns None on any failure of the call to the
+    worker itself (quota exhausted, no config, network error, bad worker response).
 
     Also double-writes an identical, purely-additive "pd_cf_worker" entry alongside
     every "cf_worker" write below (docs/discovery-pipeline-hardening.md Part 4) — for
@@ -179,7 +187,7 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
     try:
         resp = requests.post(
             CF_WORKER_URL,
-            json={"url": url, "max_bytes": 4096},
+            json={"url": url, "max_bytes": PD_BODY_MAX_BYTES, "max_hops": CF_WORKER_MAX_HOPS},
             headers={"Authorization": f"Bearer {CF_WORKER_SECRET}"},
             timeout=30,
         )
@@ -213,7 +221,22 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
     record_external_request("pd_cf_worker", _pd_status, _ms)
     final_url = data.get("final_url") or url
     log.debug("public_domain: CF Worker %s → %s (status=%s)", url, final_url, target_status)
-    return final_url, target_status
+
+    body = data.get("body") or ""
+    raw_headers = data.get("headers")
+    headers = ({str(k).lower(): str(v) for k, v in raw_headers.items()}
+               if isinstance(raw_headers, dict) else {})
+    raw_cookies = data.get("cookies")
+    cookies = ({str(c) for c in raw_cookies} if isinstance(raw_cookies, list) else set())
+    # New Worker says so explicitly; an old one is inferred from the body hitting the cap.
+    truncated = data.get("truncated")
+    if truncated is None:
+        truncated = len(body.encode("utf-8", "ignore")) >= PD_BODY_MAX_BYTES
+    if truncated:
+        headers["x-scan-too-large"] = "1"
+        body = ""
+    return {"status": target_status, "headers": headers, "body": body, "final_url": final_url,
+            "cookies": cookies, "error_type": ""}
 
 
 _REDIRECT_TIMEOUT    = 8
@@ -436,14 +459,29 @@ def _probe_host(host: str, session=None, relay_mode: bool = False) -> dict:
     if not relay_mode and (verdict == "blocked" or reason.startswith("retry_later:")):
         worker_result = _fetch_via_worker(final_url)
         if worker_result:
-            w_final_url, w_status = worker_result
+            w_status, w_final_url = worker_result["status"], worker_result["final_url"]
             worker_obs = {"worker_status": w_status}
             if 200 <= w_status < 300:
-                log.info("_probe_host: CF Worker confirmed %s via %s (status=%s)", host, w_final_url, w_status)
-                final_url, final_root, resolved_by = w_final_url, _root(w_final_url), "worker"
-                verdict, reason, cross = apply_outcome_rules("ok", "", host_root, final_root)
+                # A Worker 2xx is classified like a direct one (body/title/path/cookie signatures) —
+                # it no longer confirms blindly: parked/template -> nothing stored, challenge/ok -> confirmed.
+                w_root = _root(w_final_url)
+                w_platform = platform_no_site(worker_result)
+                if w_platform:
+                    worker_result["www_conflict"] = _www_conflict(host, w_platform, sess, deadline)
+                w_verdict, w_reason = classify(worker_result, w_root, _CHALLENGE_DOMAINS)
+                w_verdict, w_reason, w_cross = apply_outcome_rules(w_verdict, w_reason, host_root, w_root)
+                worker_obs.update({"worker_verdict": w_verdict, "worker_res": worker_result})
+                log.info("_probe_host: CF Worker read %s via %s (status=%s) -> %s/%s",
+                         host, w_final_url, w_status, w_verdict, w_reason)
+                final_url, final_root, resolved_by = w_final_url, w_root, "worker"
+                verdict, reason, cross = w_verdict, w_reason, w_cross
                 status = w_status
             else:
+                # Non-2xx Worker answer: the decision is unchanged, but its verdict + body fingerprint
+                # are still evidence (e.g. a WAF block page seen from Cloudflare too).
+                worker_obs.update({"worker_verdict": classify(worker_result, _root(w_final_url),
+                                                              _CHALLENGE_DOMAINS)[0],
+                                   "worker_res": worker_result})
                 status = w_status or status
 
     confirmed, root, out_host = False, "", ""
@@ -469,25 +507,46 @@ def _probe_host(host: str, session=None, relay_mode: bool = False) -> dict:
 
 def _record_probe_result(host: str, res: dict, result: dict, scheme: str, relay_mode: bool,
                          worker_obs: dict) -> None:
-    """Best-effort write to pd_probe_observation — never raises, never gates resolution."""
+    """Best-effort write to pd_probe_observation — never raises, never gates resolution.
+
+    Each tier owns its own column group and writes ONLY that group (db/pd_probe.py skips absent keys):
+      OCI    status..error_type + body_hash/title/cookies — the VM's direct fetch (non-relay probes)
+      worker worker_*  — the CF Worker's response (non-relay probes; set to NULL when the Worker did not
+                         run, so a stale answer from an earlier probe never sits beside fresh OCI data)
+      relay  relay_*   — the home relay's response (relay-mode probes only; OCI/worker columns untouched)
+    """
     try:
-        d = describe(res, PD_SNIPPET_CHARS)
-        lh = {str(k).lower(): v for k, v in (res.get("headers") or {}).items()}
         obs = {
             "final_verdict": result["verdict"], "final_reason": result["reason"],
             "resolved_by": result["resolved_by"], "final_host": result["final_host"] or _final_host(result["final_url"]),
             "cross_domain": result["cross_domain"],
-            "status": res.get("status"), "final_url": res.get("final_url"), "server": lh.get("server"),
-            "fetch_via": scheme, "body_len": d["body_len"], "ext_refs": d["ext_refs"],
-            "body_hash": d["body_hash"], "title": d["title"], "snippet": d["snippet"],
-            "cookie_names": ",".join(sorted(res.get("cookies") or ())),
-            "header_names": ",".join(sorted(lh)), "error_type": res.get("error_type") or None,
-            "worker_status": worker_obs.get("worker_status"),
-            "impersonate": getattr(_get_default_curl_session(), "impersonate", None),
         }
+        d = describe(res, PD_SNIPPET_CHARS)
         if relay_mode:
             obs.update({"relay_status": res.get("status"), "relay_verdict": result["verdict"],
-                        "relay_body_len": d["body_len"], "relay_title": d["title"]})
+                        "relay_body_len": d["body_len"], "relay_title": d["title"],
+                        "relay_body_hash": d["body_hash"],
+                        "relay_cookie_names": ",".join(sorted(res.get("cookies") or ()))})
+        else:
+            lh = {str(k).lower(): v for k, v in (res.get("headers") or {}).items()}
+            obs.update({
+                "status": res.get("status"), "final_url": res.get("final_url"), "server": lh.get("server"),
+                "fetch_via": scheme, "body_len": d["body_len"], "ext_refs": d["ext_refs"],
+                "body_hash": d["body_hash"], "title": d["title"], "snippet": d["snippet"],
+                "cookie_names": ",".join(sorted(res.get("cookies") or ())),
+                "header_names": ",".join(sorted(lh)), "error_type": res.get("error_type") or None,
+                "impersonate": getattr(_get_default_curl_session(), "impersonate", None),
+                "worker_status": worker_obs.get("worker_status"),
+                "worker_verdict": worker_obs.get("worker_verdict"),
+                "worker_body_len": None, "worker_title": None,
+                "worker_body_hash": None, "worker_cookie_names": None,
+            })
+            wres = worker_obs.get("worker_res")
+            if wres is not None:
+                wd = describe(wres, PD_SNIPPET_CHARS)
+                obs.update({"worker_body_len": wd["body_len"], "worker_title": wd["title"],
+                            "worker_body_hash": wd["body_hash"],
+                            "worker_cookie_names": ",".join(sorted(wres.get("cookies") or ()))})
         record_probe(host, obs)
     except Exception as exc:
         log.debug("pd_probe: could not build observation for %s: %s", host, exc)
