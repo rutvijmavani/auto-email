@@ -1,12 +1,14 @@
 """
 scripts/pd_candidates.py — Rule 2 / Rule 3 candidate mining over pd_probe_observation.
 
-Report-only: never changes a verdict or any row. Lists the content clusters that Rule 1
+Report-only: never changes a verdict. (--notify additionally records emailed clusters in pd_candidate_seen
+and prunes old pd_probe_observation / pd_candidate_seen rows.) Lists the content clusters that Rule 1
 (jobs/pd_classify.py) does not yet explain, so a human can sample-fetch them and promote
 confirmed ones into pd_classify.py as new vendor signatures.
 
   Rule 3: body hashes shared by >= --min-cluster domains where some rows still ended ok/inconclusive.
-  Rule 2: ok rows with a tiny body and no external script/stylesheet refs, grouped by title.
+  Rule 2: ok rows with a tiny body, grouped by title. For --source oci also requires no external
+          script/stylesheet refs; ext_refs is only recorded for the direct fetch, so worker/relay skip that check.
 
 Usage:
     python scripts/pd_candidates.py [--min-cluster 3] [--samples 3] [--source oci|worker|relay]
@@ -207,7 +209,9 @@ def main():
                   f"hash={c['body_hash'][:8]} title={(c['title'] or '')[:40]!r} verdicts={c['verdicts']}\n"
                   f"      samples: {c['sample_domains']}")
         r2 = rule2_titles(conn, args.samples, args.source)
-        print(f"\n== Rule 2 candidates: ok rows with tiny body and no external refs ({sum(r['n'] for r in r2)} rows) ==")
+        # ext_refs is only recorded for the direct (OCI) fetch, so worker/relay rows are matched on body length alone.
+        crit = "tiny body and no external refs" if args.source == "oci" else "tiny body (external refs not checked)"
+        print(f"\n== Rule 2 candidates: ok rows with {crit} ({sum(r['n'] for r in r2)} rows) ==")
         for c in r2:
             print(f"  {c['n']:3}  {c['title'][:50]!r}  e.g. {', '.join(c['sample_domains'])}")
     finally:
