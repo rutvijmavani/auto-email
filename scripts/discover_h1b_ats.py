@@ -1977,7 +1977,7 @@ def process_employer(
         # website_url: always from assigned_domain (LCA email-first).
         # Fall back to poc_email_domain only if fein_domain_map not yet populated.
         if assigned_domain:
-            website_url = "https://" + assigned_domain
+            website_url = "https://" + (emp.get("fetch_host") or assigned_domain)
         elif emp.get("poc_email_domain"):
             website_url = "https://" + emp["poc_email_domain"]
             log.debug("  poc_email_domain fallback (fein_domain_map not yet populated): %s", website_url)

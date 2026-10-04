@@ -215,6 +215,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.careers_url,
             f.public_domain,
             f.public_domain_method,
+            f.public_domain_host,
             COALESCE(f.public_domain_retry_count, 0) AS public_domain_retry_count,
             e.employer_name,
             COALESCE(u.petition_count, 0) AS petition_count
@@ -229,7 +230,11 @@ def _load_company(conn, fein: str) -> "dict | None":
 
 
 def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
-                  last_status: "int|None", prev_retry_count: int) -> None:
+                  last_status: "int|None", prev_retry_count: int,
+                  host: "str|None" = None) -> None:
+    # host: exact host that answered (e.g. www.example.com), stored in
+    # public_domain_host and used ONLY to fetch the website. Invariant enforced here:
+    # registrable root(host) must equal public_domain, else host is stored as NULL.
     # Does NOT touch last_enriched_at — Phase 3/6 haven't run yet at this point,
     # and if either later raises, the attempt is a failure that must not look
     # like a completed enrichment cycle to staleness-based re-detection.
@@ -252,16 +257,23 @@ def _write_domain(conn, fein: str, public_domain: "str|None", method: str,
     # unrelated to a retry attempt. Cleared on a clean resolution (nothing left to
     # gate); set only on an actual failed attempt.
     if public_domain is not None:
+        if host:
+            from jobs.public_domain import _root
+            if _root(host) != _root(public_domain):
+                log.warning("fein=%s host %s root != public_domain %s — host not stored",
+                            fein, host, public_domain)
+                host = None
         conn.execute("""
             UPDATE fein_domain_map
             SET public_domain              = %s,
+                public_domain_host          = %s,
                 public_domain_method        = %s,
                 public_domain_last_status   = NULL,
                 public_domain_retry_count   = 0,
                 public_domain_last_attempt_at = NULL,
                 updated_at                  = NOW()
             WHERE employer_fein = %s
-        """, (public_domain, method, fein))
+        """, (public_domain, host, method, fein))
     else:
         # Resolution failed — preserve any previously stored domain.
         new_retry_count = prev_retry_count + 1 if last_status in (429, 503) else prev_retry_count
@@ -444,7 +456,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 1: public domain resolution ──────────────────────────────────
-        public_domain, method, retry_after, last_status = discover_public_domain(assigned)
+        public_domain, method, retry_after, last_status, pd_host = discover_public_domain(assigned)
 
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry
@@ -456,12 +468,15 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         # downstream phases probe the best-known domain rather than the raw assigned one.
         effective_public = public_domain or stored_public
         probe_domain     = effective_public or assigned
-        website_url      = f"https://{probe_domain}"
+        # Fetch uses the exact host that answered; identity (ATS/KG) keeps the root.
+        # Fallback chain: host -> public_domain -> assigned.
+        fetch_host       = (pd_host if public_domain else company.get("public_domain_host")) or probe_domain
+        website_url      = f"https://{fetch_host}"
 
         # _write_domain persists public_domain/method when resolution succeeded, or just
         # records last_status/retry_count on failure (preserves existing stored domain).
         # It does not advance last_enriched_at — see its docstring comment.
-        _write_domain(conn, fein, public_domain, method, last_status, prev_retry_count)
+        _write_domain(conn, fein, public_domain, method, last_status, prev_retry_count, pd_host)
         conn.commit()
         log.info("fein=%s public_domain=%s method=%s last_status=%s (effective=%s)",
                  fein, public_domain, method, last_status, effective_public)

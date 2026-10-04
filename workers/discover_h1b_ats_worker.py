@@ -194,6 +194,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.employer_fein,
             f.assigned_domain,
             f.public_domain,
+            f.public_domain_host,
             f.careers_url,
             f.careers_source,
             f.kg_checked,
@@ -336,6 +337,9 @@ def _process_company(fein: str, petition_count: int, trigger: str,
             "employer_name":   employer_name,
             "assigned_domain": probe_domain,
             "total_approvals": petition_count,
+            # Host-only: used to FETCH the website; assigned_domain (root) stays the identity
+            # for the KG gate and all other checks. Only valid alongside a stored public_domain.
+            "fetch_host":      company.get("public_domain_host") if company["public_domain"] else None,
         }
 
         # Normal first-pass path (enrichment forwards here, or staleness re-checks): trust

@@ -10,10 +10,14 @@ Three-step algorithm:
   3. CT log (certspotter)   — fmr.com → fidelity.com via cert SANs
      Fallback: crt.sh if certspotter unavailable.
 
-Returns (public_domain, method, retry_after, last_status) where retry_after is non-None
-only on certspotter 429 — caller should re-queue the company with that delay. Fetches use
-a Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-hardening.md
-Part 2); pass session= to inject a different one (e.g. Part 3's mobile relay worker).
+Returns (public_domain, method, retry_after, last_status, host) where retry_after is non-None
+only on certspotter 429 — caller should re-queue the company with that delay, and host is the
+exact host that answered (stored in fein_domain_map.public_domain_host, used only to fetch the
+site). Every probe (_probe_host) fetches bare + www, classifies the final response with the
+Rule 1 vendor-signature classifier (jobs/pd_classify.py) and only a 2xx / challenge page confirms;
+parked, junk-landing and platform-template results store nothing; a 403 is kept as the pd only in
+relay_mode (home relay drain worker). Fetches use a Chrome-impersonated curl_cffi session by default
+(docs/discovery-pipeline-hardening.md Part 2); pass session= to inject a different one.
 """
 
 import ipaddress
@@ -34,9 +38,15 @@ import urllib3
 
 _urllib3_no_ssl_warn = urllib3.exceptions.InsecureRequestWarning
 
-from config import CERTSPOTTER_API_KEY
+from config import (
+    CERTSPOTTER_API_KEY, PD_BODY_MAX_BYTES, PD_SNIPPET_CHARS, PD_PROBE_RECORD_ENABLED,
+)
 from logger import get_logger
 from db.external_api_health import record_external_request, get_day_request_count
+from db.pd_probe import record_probe
+from jobs.pd_classify import (
+    PLATFORM_REASON_PREFIX, apply_outcome_rules, classify, describe, platform_no_site,
+)
 
 try:
     from config import CF_WORKER_URL, CF_WORKER_SECRET, CF_WORKER_DAILY_LIMIT
@@ -107,26 +117,19 @@ _CHALLENGE_DOMAINS = frozenset({
     "kasada.io",         # Kasada
 })
 
-# Response headers that identify a bot-protection challenge page served from the company's
-# own domain (e.g. an Imperva inline challenge stays on company.com but sets x-iinfo).
-# Cloudflare is NOT included here: cf-ray is present on every Cloudflare-proxied response
-# (challenge or not), so its mere presence isn't a challenge signal — see cf-mitigated below.
-_CHALLENGE_HEADERS = frozenset({
-    "x-iinfo",             # Imperva (inline mode — served from company domain)
-    "x-sucuri-id",         # Sucuri (inline mode)
-    "x-px-access-denied",  # PerimeterX
-})
-
+# Header-based challenge detection (x-iinfo, x-sucuri-id, cf-mitigated, ...) lives in
+# jobs/pd_classify.py::challenge_reason — vendor-presence headers only count when the response
+# is not a full page.
 
 _safe_session = _make_safe_session()
 
 # Chrome-impersonated fetching (docs/discovery-pipeline-hardening.md Part 2) —
-# this is the DEFAULT session for the redirect/web-liveness probes below (_redirect_domain,
-# _has_web). CT-log queries (_ct_certspotter, _ct_crtsh) keep using plain `requests` above —
+# this is the DEFAULT session for the redirect/web-liveness probes below (_probe_host,
+# _redirect_domain). CT-log queries (_ct_certspotter, _ct_crtsh) keep using plain `requests` above —
 # those hit certspotter/crt.sh directly, not the company's own WAF-fronted site, so Chrome
 # impersonation buys nothing there.
 #
-# session= params on _redirect_domain/_has_web/discover_public_domain let Part 3's mobile
+# session= params on _probe_host/_redirect_domain/discover_public_domain let Part 3's mobile
 # relay worker pass an identical function call with a SOCKS5-proxied session instead of
 # this module default — same code path, different egress IP.
 #
@@ -213,15 +216,6 @@ def _fetch_via_worker(url: str) -> "tuple[str, int] | None":
     return final_url, target_status
 
 
-def _is_challenge_response(headers: dict) -> bool:
-    """Return True if response headers indicate a bot-protection challenge page."""
-    lower_headers = {k.lower(): v for k, v in headers.items()}
-    if _CHALLENGE_HEADERS & lower_headers.keys():
-        return True
-    # Cloudflare only sets cf-mitigated: challenge when it actually served a challenge —
-    # cf-ray alone just means the response passed through Cloudflare's proxy.
-    return (lower_headers.get("cf-mitigated", "") or "").strip().lower() == "challenge"
-
 _REDIRECT_TIMEOUT    = 8
 _WEB_TIMEOUT         = 6
 _CT_TIMEOUT          = 20
@@ -265,184 +259,280 @@ _REDIRECT_CODES      = frozenset((301, 302, 303, 307, 308))
 _REDIRECT_BUDGET_S   = 20
 
 
-def _redirect_domain(host: str, session=None) -> "tuple[str | None, int | None]":
+def _read_body(r) -> "tuple[str, bool]":
+    """Bounded read of a streaming response body -> (text, too_large).
+
+    A body larger than PD_BODY_MAX_BYTES is dropped (too_large=True): a page that big is a real
+    site, never a parked stub, and the caller marks it with the x-scan-too-large header
+    jobs/pd_classify.py treats as "full page". A failed read keeps whatever status/headers we have.
     """
-    Follow HTTP redirects on host. Returns (domain, last_status):
-      ("", None)        — final response is 2xx and same root as host → confirmed public
-      (str, None)        — final response is 2xx and root differs from host → redirect found
-      (None, status)     — final response is not 2xx (status is the code seen) → inconclusive,
-                            never a confirmation and never a rejection; caller must cascade
-      (None, None)        — connection error / DNS fail / redirect chain leads to a private
-                            host / no HTTP response obtained at all
+    chunks, received = [], 0
+    try:
+        for chunk in r.iter_content(chunk_size=8192):
+            received += len(chunk)
+            if received > PD_BODY_MAX_BYTES:
+                return "", True
+            chunks.append(chunk)
+    except Exception:
+        pass
+    return b"".join(chunks).decode("utf-8", "ignore"), False
 
-    Only an actual 2xx response, after following redirects to their final hop, confirms
-    a domain (docs/discovery-pipeline-hardening.md Part 1) — a non-2xx final response
-    (e.g. a 403 from an IP-reputation/WAF block) must never be treated as "already public"
-    or as a genuine redirect target; it cascades to the next resolution step instead.
 
-    Redirects are followed manually so every intermediate hop is validated as a
-    publicly-routable address before connecting (prevents SSRF via redirect chain).
-    verify=False is applied only when the initial HTTPS attempt raises an SSL error —
-    company domains frequently have self-signed or expired certs; we only use the
-    final URL's domain name, never the response body.
+def _cookie_names(r) -> set:
+    try:
+        return {str(k) for k in r.cookies.keys()}
+    except Exception:
+        return set()
 
-    session — Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-
-    hardening.md Part 2); pass an explicit session (e.g. Part 3's SOCKS5-proxied relay
-    session) to fetch through a different egress path with identical logic.
 
-    Records one "pd_oci" external_api_health entry per scheme attempt (Part 4) — the
-    CF-Worker fallback tier above keeps recording its own separate "pd_cf_worker" entry
-    inside _fetch_via_worker(), unchanged.
+def _err_kind_of(exc: Exception) -> str:
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if "timeout" in name or "timeout" in msg:
+        return "timeout"
+    if "connect" in name or "connection" in msg:
+        return "conn_err"
+    return "error"
+
+
+def _fetch_chain(host: str, scheme: str, sess, deadline: float) -> dict:
+    """Follow redirects from scheme://host and read the FINAL response's bounded body.
+
+    Returns the response dict documented in jobs/pd_classify.py (status None + error_type when no
+    HTTP response was obtained). Redirects are followed manually so every intermediate hop is
+    validated as a publicly-routable address before connecting (prevents SSRF via redirect chain).
+    verify=False is applied only after an SSL error on a hop; SSL-unverified hops may only stay on
+    the same registrable root.
+    """
+    res = {"status": None, "headers": {}, "body": "", "final_url": "", "cookies": set(),
+           "error_type": "no_response"}
+    current = f"{scheme}://{host}"
+    cookies: set = set()
+    for _ in range(_REDIRECT_MAX_HOPS):
+        if time.monotonic() > deadline:
+            res["error_type"] = "budget"
+            return res
+        hop_host = urlparse(current).hostname or ""
+        if not hop_host or not _is_public_host(hop_host):
+            log.debug("_fetch_chain: non-public host in chain: %s", hop_host)
+            res["error_type"] = "non_public_host"
+            return res
+        verify_off = False
+        try:
+            r = sess.get(current, allow_redirects=False, timeout=_REDIRECT_TIMEOUT, stream=True)
+        except Exception as fetch_exc:
+            # requests raises requests.exceptions.SSLError; curl_cffi raises its own SSL-flavored
+            # error class — duck-type on the exception name/message rather than importing
+            # curl_cffi's error types, since sess may be either kind.
+            if not ("ssl" in type(fetch_exc).__name__.lower() or "ssl" in str(fetch_exc).lower()):
+                res["error_type"] = _err_kind_of(fetch_exc)
+                return res
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
+                    r = sess.get(current, allow_redirects=False,
+                                 timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
+                verify_off = True
+            except Exception:
+                log.debug("_fetch_chain: SSL error for %s — no response", current)
+                res["error_type"] = "ssl_error"
+                return res
+        cookies |= _cookie_names(r)
+        loc = r.headers.get("Location", "") if r.status_code in _REDIRECT_CODES else ""
+        if loc:
+            if verify_off:
+                next_host = urlparse(urljoin(current, loc)).hostname or ""
+                if _root(next_host) != _root(hop_host):
+                    log.debug("_fetch_chain: cross-root redirect via verify=False — aborting")
+                    r.close()
+                    res["error_type"] = "ssl_cross_root"
+                    return res
+            r.close()
+            current = urljoin(current, loc)
+            continue
+        headers = dict(r.headers)
+        body, too_large = _read_body(r)
+        if too_large:
+            headers["x-scan-too-large"] = "1"
+        status = r.status_code
+        r.close()
+        return {"status": status, "headers": headers, "body": body, "final_url": current,
+                "cookies": cookies, "error_type": ""}
+    log.debug("_fetch_chain: hop limit reached for %s — rejecting chain", host)
+    res["error_type"] = "hop_limit"
+    return res
+
+
+def _www_conflict(host: str, platform: str, sess, deadline: float) -> str:
+    """Platform "no site" templates are only soft evidence on one host variant (scan v4: some domains
+    show one on the bare host yet serve a real site on www). Check the other variant:
+      ""            — it shows the same template, or doesn't exist (DNS fail / refused): template stands
+      "www_differs" — it answers with anything else (a real site wins)
+    """
+    alt = host[4:] if host.startswith("www.") else "www." + host
+    last = None
+    for scheme in ("https", "http"):
+        last = _fetch_chain(alt, scheme, sess, deadline)
+        if last["status"] is not None:
+            break
+    if last["status"] is None:
+        return "" if last["error_type"] in ("non_public_host", "conn_err") else "www_differs"
+    return "" if platform_no_site(last) == platform else "www_differs"
+
+
+def _final_host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower() if url else ""
+
+
+def _probe_host(host: str, session=None, relay_mode: bool = False) -> dict:
+    """Fetch host (https then http, redirects followed), classify the final response, and return:
+
+      confirmed   bool — host answered as a real company site and `root` is its public domain
+      root        registrable domain of the final URL ("" when nothing confirmed)
+      final_host  exact host that answered (only meaningful when confirmed)
+      status      last HTTP status seen (Worker's read replaces it when the Worker ran), or None
+      verdict/reason  jobs/pd_classify verdict (ok | parked | challenge | blocked | inconclusive | error)
+      cross_domain, resolved_by (oci | worker | relay), final_url
+
+    Confirmation policy (user-locked 2026-10-04): only a 2xx confirms; a challenge page also confirms
+    (a live bot-protected site — the origin is the real domain, as before). A 403 never decides on its
+    own: direct -> CF Worker (skipped in relay_mode) -> and only when the home relay (relay_mode=True)
+    ALSO sees 403 is it kept as the public domain. 429/503 and every other non-2xx store nothing
+    (retried later). Parked / junk-landing / platform-template results store nothing.
+
+    Each probe is also written to pd_probe_observation (evidence log, never read by the pipeline).
     """
     sess = session if session is not None else _get_default_curl_session()
-    _budget_deadline = time.monotonic() + _REDIRECT_BUDGET_S
+    deadline = time.monotonic() + _REDIRECT_BUDGET_S
+    host_root = _root(host)
+    res = {"status": None, "headers": {}, "body": "", "final_url": "", "cookies": set(),
+           "error_type": "no_response"}
+    scheme_used = ""
     for scheme in ("https", "http"):
-        current = f"{scheme}://{host}"
-        final_status: "int | None" = None
-        _scheme_t0 = time.time()
-        try:
-            _last_headers: dict = {}
-            for _ in range(_REDIRECT_MAX_HOPS):
-                if time.monotonic() > _budget_deadline:
-                    log.debug("_redirect_domain: budget exceeded for %s — aborting", host)
-                    return None, None
-                hop_host = urlparse(current).hostname or ""
-                if not hop_host or not _is_public_host(hop_host):
-                    log.debug("_redirect_domain: non-public host in chain: %s", hop_host)
-                    current = None
-                    break
-                try:
-                    r = sess.get(current, allow_redirects=False,
-                                 timeout=_REDIRECT_TIMEOUT, stream=True)
-                except Exception as _fetch_exc:
-                    # requests raises requests.exceptions.SSLError; curl_cffi raises its own
-                    # SSL-flavored error class — duck-type on the exception name/message
-                    # rather than importing curl_cffi's error types, since sess may be
-                    # either kind (plain make_safe_session() fallback or curl_cffi).
-                    _is_ssl_err = ("ssl" in type(_fetch_exc).__name__.lower()
-                                   or "ssl" in str(_fetch_exc).lower())
-                    if not _is_ssl_err:
-                        raise
-                    try:
-                        import warnings
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", _urllib3_no_ssl_warn)
-                            r = sess.get(current, allow_redirects=False,
-                                         timeout=_REDIRECT_TIMEOUT, verify=False, stream=True)
-                    except Exception:
-                        log.debug("_redirect_domain: SSL error for %s — no redirect signal", current)
-                        current = None
-                        break
-                    # SSL-unverified: cross-root redirects are untrusted — only same-root hops allowed.
-                    if r.status_code in _REDIRECT_CODES:
-                        _loc = r.headers.get("Location", "")
-                        if _loc:
-                            _next_host = urlparse(urljoin(current, _loc)).hostname or ""
-                            if _root(_next_host) != _root(urlparse(current).hostname or ""):
-                                log.debug("_redirect_domain: cross-root redirect via verify=False — aborting")
-                                _last_headers = dict(r.headers)
-                                r.close()
-                                current = None
-                                break
-                _last_headers = dict(r.headers)
-                final_status = r.status_code
-                r.close()
-                if r.status_code not in _REDIRECT_CODES:
-                    break  # current is the final URL
-                loc = r.headers.get("Location", "")
-                if not loc:
-                    break
-                current = urljoin(current, loc)
-            else:
-                # All hops consumed while still in redirect chain — last Location is unverified.
-                log.debug("_redirect_domain: hop limit reached for %s — rejecting chain", host)
-                current = None
+        t0 = time.time()
+        res = _fetch_chain(host, scheme, sess, deadline)
+        scheme_used = scheme
+        # One "pd_oci" external_api_health entry per scheme attempt (Part 4) — status 0 = no HTTP response.
+        record_external_request("pd_oci", res["status"] or 0, int((time.time() - t0) * 1000),
+                                error_kind=(res["error_type"] if res["status"] is None
+                                            and res["error_type"] in ("timeout", "conn_err") else None))
+        if res["status"] is not None or res["error_type"] == "budget":
+            break
 
-            if current is None:
-                # Records one "pd_oci" entry per scheme attempt (docs/discovery-pipeline-
-                # hardening.md Part 4) — status 0 when no HTTP response was ever obtained
-                # for this scheme (non-public hop, unrecoverable SSL error, hop limit).
-                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
-                continue  # try next scheme
-            final = _root(current)
-            # If the chain landed on a bot-protection vendor domain, the origin is the real domain.
-            if final in _CHALLENGE_DOMAINS or _is_challenge_response(_last_headers):
-                log.debug("_redirect_domain: challenge page detected (%s) — origin %s is real domain",
-                          final, host)
-                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
-                return "", None
-            # Only an actual 2xx confirms — any other final status (403/404/5xx/etc.) is
-            # inconclusive, never a confirmation and never a rejection (Part 1 gate fix).
-            if final_status is None or not (200 <= final_status < 300):
-                # CF-Worker fallback tier (Part 2) — a block-like status might just mean
-                # the OCI/local egress IP is blocked, not that the domain is genuinely
-                # unreachable. One extra read through the Worker's IP is near-free against
-                # the shared daily quota; only tried on the block-like codes, not every
-                # inconclusive status (e.g. never on a 404, which is a real answer).
-                if final_status in (403, 429, 503):
-                    worker_result = _fetch_via_worker(current)
-                    if worker_result:
-                        w_final_url, w_status = worker_result
-                        if 200 <= w_status < 300:
-                            w_root = _root(w_final_url)
-                            log.info("_redirect_domain: CF Worker confirmed %s via %s (status=%s)",
-                                     host, w_final_url, w_status)
-                            return (w_root if w_root != _root(host) else ""), None
-                        final_status = w_status or final_status
-                log.debug("_redirect_domain: final status for %s is %s (not 2xx) — inconclusive",
-                          host, final_status)
-                record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
-                return None, final_status
-            record_external_request("pd_oci", final_status or 0, int((time.time() - _scheme_t0) * 1000))
-            return (final if final != _root(host) else ""), None
-        except Exception as _exc:
-            _err_name = type(_exc).__name__.lower()
-            _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(_exc).lower() else (
-                "conn_err" if "connect" in _err_name or "connection" in str(_exc).lower() else None
-            )
-            record_external_request("pd_oci", 0, int((time.time() - _scheme_t0) * 1000), error_kind=_err_kind)
-            log.debug("_redirect_domain: scheme probe failed for %r (%s): %s", host, scheme, _exc)
-            continue
+    final_url = res["final_url"]
+    final_root = _root(final_url) if final_url else ""
+    platform = platform_no_site(res)
+    if platform:
+        res["www_conflict"] = _www_conflict(host, platform, sess, deadline)
+    verdict, reason = classify(res, final_root, _CHALLENGE_DOMAINS)
+    verdict, reason, cross = apply_outcome_rules(verdict, reason, host_root, final_root)
+
+    resolved_by = "relay" if relay_mode else "oci"
+    status = res["status"]
+    worker_obs: dict = {}
+    # CF-Worker tier: only on a 403 / retry-later 429/503 from the direct tier, never in relay mode
+    # (the Worker already had its turn in the first pass; the relay is the last word).
+    if not relay_mode and (verdict == "blocked" or reason.startswith("retry_later:")):
+        worker_result = _fetch_via_worker(final_url)
+        if worker_result:
+            w_final_url, w_status = worker_result
+            worker_obs = {"worker_status": w_status}
+            if 200 <= w_status < 300:
+                log.info("_probe_host: CF Worker confirmed %s via %s (status=%s)", host, w_final_url, w_status)
+                final_url, final_root, resolved_by = w_final_url, _root(w_final_url), "worker"
+                verdict, reason, cross = apply_outcome_rules("ok", "", host_root, final_root)
+                status = w_status
+            else:
+                status = w_status or status
+
+    confirmed, root, out_host = False, "", ""
+    if verdict == "ok":
+        confirmed, root, out_host = True, final_root, _final_host(final_url)
+    elif verdict == "challenge":
+        # Live, bot-protected site: the origin domain is real (a vendor-domain landing says nothing
+        # about where the company's site is, so the origin host itself is the answer).
+        confirmed, root = True, host_root
+        out_host = _final_host(final_url) if final_root == host_root else host
+    elif verdict == "blocked" and relay_mode:
+        # 403 from the home relay too — user decision: keep it as the public domain.
+        confirmed, root, out_host = True, final_root, _final_host(final_url)
+        reason = f"{reason}:relay_confirmed"
+
+    result = {"confirmed": confirmed, "root": root, "final_host": out_host, "status": status,
+              "verdict": verdict, "reason": reason, "cross_domain": cross,
+              "resolved_by": resolved_by, "final_url": final_url}
+    if PD_PROBE_RECORD_ENABLED:
+        _record_probe_result(host, res, result, scheme_used, relay_mode, worker_obs)
+    return result
+
+
+def _record_probe_result(host: str, res: dict, result: dict, scheme: str, relay_mode: bool,
+                         worker_obs: dict) -> None:
+    """Best-effort write to pd_probe_observation — never raises, never gates resolution."""
+    try:
+        d = describe(res, PD_SNIPPET_CHARS)
+        lh = {str(k).lower(): v for k, v in (res.get("headers") or {}).items()}
+        obs = {
+            "final_verdict": result["verdict"], "final_reason": result["reason"],
+            "resolved_by": result["resolved_by"], "final_host": result["final_host"] or _final_host(result["final_url"]),
+            "cross_domain": result["cross_domain"],
+            "status": res.get("status"), "final_url": res.get("final_url"), "server": lh.get("server"),
+            "fetch_via": scheme, "body_len": d["body_len"], "ext_refs": d["ext_refs"],
+            "body_hash": d["body_hash"], "title": d["title"], "snippet": d["snippet"],
+            "cookie_names": ",".join(sorted(res.get("cookies") or ())),
+            "header_names": ",".join(sorted(lh)), "error_type": res.get("error_type") or None,
+            "worker_status": worker_obs.get("worker_status"),
+            "impersonate": getattr(_get_default_curl_session(), "impersonate", None),
+        }
+        if relay_mode:
+            obs.update({"relay_status": res.get("status"), "relay_verdict": result["verdict"],
+                        "relay_body_len": d["body_len"], "relay_title": d["title"]})
+        record_probe(host, obs)
+    except Exception as exc:
+        log.debug("pd_probe: could not build observation for %s: %s", host, exc)
+
+
+def _redirect_domain(host: str, session=None, relay_mode: bool = False) -> "tuple[str | None, int | None]":
+    """Legacy-shaped view of _probe_host, used by scripts/pd_gate_sample_recheck.py. Returns (domain, last_status):
+      ("", None)       — confirmed, same root as host
+      (str, None)       — confirmed, different root (redirect found)
+      (None, status)    — inconclusive non-2xx (status seen); caller must cascade
+      (None, None)      — no response / parked / junk landing / platform template — nothing to store
+    """
+    return _legacy_view(_probe_host(host, session=session, relay_mode=relay_mode), host)
+
+
+def _legacy_view(r: dict, host: str) -> "tuple[str | None, int | None]":
+    if r["confirmed"]:
+        return (r["root"] if r["root"] != _root(host) else ""), None
+    if r["verdict"] in ("blocked", "inconclusive") and not r["reason"].startswith(
+            ("junk_landing", PLATFORM_REASON_PREFIX)):
+        return None, r["status"]
     return None, None
 
 
-def _has_web(root: str, session=None) -> bool:
-    """Return True if root domain serves a non-error HTTP response (status < 400).
+def _pd_host(public_domain: str, r: dict) -> "str | None":
+    """Host to store next to public_domain: the exact host that answered, only when its registrable
+    root matches public_domain (invariant — a mismatched pair is never stored)."""
+    h = r.get("final_host") or ""
+    return h if h and _root(h) == _root(public_domain) else None
 
-    Validates that root resolves only to public addresses before connecting.
-    Redirects are not followed — a 3xx response (< 400) still means the domain
-    is live and serving HTTP, which is all the caller cares about. A 4xx/5xx no
-    longer counts (Part 1 gate fix) — a 403 from an IP-reputation/WAF block is
-    not evidence the candidate domain is the company's real site.
 
-    session — Chrome-impersonated curl_cffi session by default (Part 2); see
-    _redirect_domain's docstring for the session-injection rationale.
+def _probe_candidate(root: str, session=None, relay_mode: bool = False) -> "dict | None":
+    """Confirm a CT-log candidate domain with the same classifier as every other probe.
 
-    Records one "pd_oci" external_api_health entry per scheme attempt (Part 4) —
-    same convention as _redirect_domain above.
+    Returns the _probe_host result when the candidate is a confirmed real site that stays on its own
+    registrable domain, else None. Stricter than the old status<400 check: a parked / 3xx-only /
+    non-2xx candidate is rejected, and a candidate that redirects to another domain is skipped
+    rather than silently swapping in a domain the CT lookup never proposed.
     """
-    if not _is_public_host(root):
-        return False
-    if root in _CHALLENGE_DOMAINS:
-        return False
-    sess = session if session is not None else _get_default_curl_session()
-    for scheme in ("https", "http"):
-        url = f"{scheme}://{root}"
-        _t0 = time.time()
-        try:
-            r = sess.get(url, timeout=_WEB_TIMEOUT, allow_redirects=False, stream=True)
-            status = r.status_code
-            r.close()
-            record_external_request("pd_oci", status, int((time.time() - _t0) * 1000))
-            if status < 400:
-                return True
-        except Exception as _exc:
-            _err_name = type(_exc).__name__.lower()
-            _err_kind = "timeout" if "timeout" in _err_name or "timeout" in str(_exc).lower() else (
-                "conn_err" if "connect" in _err_name or "connection" in str(_exc).lower() else None
-            )
-            record_external_request("pd_oci", 0, int((time.time() - _t0) * 1000), error_kind=_err_kind)
-    return False
+    if root in _CHALLENGE_DOMAINS or not _is_public_host(root):
+        return None
+    r = _probe_host(root, session=session, relay_mode=relay_mode)
+    if r["confirmed"] and r["root"] == _root(root):
+        return r
+    return None
 
 
 def _ct_certspotter(domain: str) -> "tuple[list[str], int | None]":
@@ -569,62 +659,62 @@ def _ct_domains(domain: str) -> "tuple[list[str], int | None, str]":
     return candidates, None, "crtsh"
 
 
-def discover_public_domain(assigned_domain: str, session=None) -> "tuple[str | None, str, int | None, int | None]":
+def discover_public_domain(assigned_domain: str, session=None, relay_mode: bool = False,
+                           ) -> "tuple[str | None, str, int | None, int | None, str | None]":
     """
     Resolve an internal/email domain to the company's real public domain.
 
-    Returns (public_domain, method, retry_after, last_status):
-      public_domain — resolved domain string, or None if unresolvable
+    Returns (public_domain, method, retry_after, last_status, host):
+      public_domain — resolved registrable domain, or None if unresolvable
       method        — 'http_redirect' | 'root_fallback' | 'certspotter' |
                       'crtsh' | 'same_domain' | 'ct_quota' | 'no_signal'
       retry_after   — seconds before re-queuing (certspotter 429), else None
-      last_status   — numeric HTTP status seen on the last INCONCLUSIVE confirmation
-                      attempt (Part 1 gate fix), or None on a clean 2xx / non-HTTP
-                      failure / successful resolution. Caller persists this into
-                      fein_domain_map.public_domain_last_status.
+      last_status   — HTTP status seen on the last INCONCLUSIVE attempt, else None
+                      (persisted into fein_domain_map.public_domain_last_status)
+      host          — exact host that answered (e.g. www.example.com) when its root
+                      equals public_domain, else None (persisted into
+                      fein_domain_map.public_domain_host; used only to FETCH the site)
 
-    session — Chrome-impersonated curl_cffi session by default (docs/discovery-pipeline-
-    hardening.md Part 2). Pass an explicit session (Part 3's mobile relay worker) to
-    resolve through a different egress path with identical logic — every internal
-    _redirect_domain/_has_web call below is threaded with this same session.
+    relay_mode — True only from the home-relay drain worker: a 403 there is the final
+    escalation tier and is accepted as the public domain (see _probe_host).
+    session — optional explicit session (mobile relay egress); identical logic.
     """
     domain = (assigned_domain or "").lower().strip()
     if not domain:
-        return None, "no_signal", None, None
+        return None, "no_signal", None, None, None
 
     if _is_private_ip_literal(domain):
         log.warning("public_domain: rejecting private address %s", domain)
-        return None, "no_signal", None, None
+        return None, "no_signal", None, None, None
 
     last_status: "int | None" = None
 
-    # Step 1 — HTTP redirect on full domain
-    redir, status = _redirect_domain(domain, session=session)
+    # Step 1 — probe the full domain (bare + www)
+    r = _probe_host(domain, session=session, relay_mode=relay_mode)
+    redir, status = _legacy_view(r, domain)
     if status is not None:
         last_status = status
     if redir is None:
         log.debug("DNS fail or inconclusive status for %s — trying root fallback", domain)
     elif redir == "":
-        # Accept "already public" for root domains and www-prefixed subdomains.
-        # A subdomain like ny.email.gs.com resolves within the same root (gs.com),
-        # but the real public site may be at goldmansachs.com — fall through to CT log.
-        # www is a standard public alias, not a meaningful subdomain.
+        # "Already public" only for root domains and www-prefixed subdomains; a deeper
+        # subdomain (ny.email.gs.com) falls through to the CT log.
         sub = _tldextract(domain).subdomain
         if not sub or sub == "www":
             log.debug("%s already resolves publicly", domain)
-            return domain, "same_domain", None, None
+            return domain, "same_domain", None, None, _pd_host(domain, r)
         log.debug("%s resolves within its root but has subdomain — continuing", domain)
     elif redir not in GENERIC_ROOTS:
         log.info("public_domain: %s → %s (http_redirect)", domain, redir)
-        return redir, "http_redirect", None, None
+        return redir, "http_redirect", None, None, _pd_host(redir, r)
     else:
         log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
-    # Step 2 — Root-domain fallback (strip subdomain prefix via PSL)
-    ext      = _tldextract(domain)
-    root_try = ext.registered_domain
+    # Step 2 — registered-domain fallback
+    root_try = _tldextract(domain).registered_domain
     if root_try and root_try != domain:
-        redir, status = _redirect_domain(root_try, session=session)
+        r2 = _probe_host(root_try, session=session, relay_mode=relay_mode)
+        redir, status = _legacy_view(r2, root_try)
         if status is not None:
             last_status = status
         if redir is None:
@@ -632,10 +722,10 @@ def discover_public_domain(assigned_domain: str, session=None) -> "tuple[str | N
         elif redir == "":
             if root_try not in GENERIC_ROOTS:
                 log.info("public_domain: %s → %s (root_fallback)", domain, root_try)
-                return root_try, "root_fallback", None, None
+                return root_try, "root_fallback", None, None, _pd_host(root_try, r2)
         elif redir not in GENERIC_ROOTS:
             log.info("public_domain: %s → %s (root_fallback)", domain, redir)
-            return redir, "root_fallback", None, None
+            return redir, "root_fallback", None, None, _pd_host(redir, r2)
         else:
             log.debug("public_domain: %s → %s (generic root — skipping)", domain, redir)
 
@@ -644,19 +734,17 @@ def discover_public_domain(assigned_domain: str, session=None) -> "tuple[str | N
     candidates, retry_after, ct_source = _ct_domains(domain)
 
     if retry_after is not None:
-        return None, "ct_quota", retry_after, None
+        return None, "ct_quota", retry_after, None, None
 
     _ct_budget_start = time.time()
     for candidate in candidates[:10]:
         if time.time() - _ct_budget_start > _CT_PROBE_BUDGET_S:
             log.debug("CT probe budget exhausted for %s — stopping early", domain)
             break
-        if _has_web(candidate, session=session):
+        rc = _probe_candidate(candidate, session=session, relay_mode=relay_mode)
+        if rc:
             log.info("public_domain: %s → %s (%s)", domain, candidate, ct_source)
-            return candidate, ct_source, None, None
+            return candidate, ct_source, None, None, _pd_host(candidate, rc)
 
     log.debug("no public domain signal for %s", domain)
-    return None, "no_signal", None, last_status
-
-
-
+    return None, "no_signal", None, last_status, None

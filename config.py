@@ -360,6 +360,13 @@ CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search 
 PD_RETRY_CAP           = int(os.getenv("PD_RETRY_CAP", "4"))
 PD_RETRY_INTERVAL_DAYS = int(os.getenv("PD_RETRY_INTERVAL_DAYS", "2"))
 
+# Parked/challenge page classification (jobs/pd_classify.py) + per-domain probe record
+# (db/pd_probe.py). Values mirror data/parked_domain_scan_v4.py so scan and production agree.
+PD_SMALL_BODY_BYTES = int(os.getenv("PD_SMALL_BODY_BYTES", "2000"))   # a 2xx body under this is a "stub", not a full page
+PD_SNIPPET_CHARS    = int(os.getenv("PD_SNIPPET_CHARS", "300"))      # body prefix stored in pd_probe_observation.snippet
+PD_BODY_MAX_BYTES   = int(os.getenv("PD_BODY_MAX_BYTES", "65536"))   # bounded body read per probe; larger body is dropped (marked oversize = full page)
+PD_PROBE_RECORD_ENABLED = os.getenv("PD_PROBE_RECORD_ENABLED", "1") != "0"   # write each probe to pd_probe_observation (evidence log only)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})
 # ─────────────────────────────────────────────────────────────────────────────
