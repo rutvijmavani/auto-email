@@ -46,7 +46,7 @@ from logger import get_logger
 from db.external_api_health import record_external_request, get_day_request_count
 from db.pd_probe import record_probe
 from jobs.pd_classify import (
-    PLATFORM_REASON_PREFIX, apply_outcome_rules, classify, describe, platform_no_site,
+    JUNK_LANDING_ROOTS, PLATFORM_REASON_PREFIX, apply_outcome_rules, classify, describe, platform_no_site,
 )
 
 try:
@@ -493,9 +493,13 @@ def _probe_host(host: str, session=None, relay_mode: bool = False) -> dict:
         confirmed, root = True, host_root
         out_host = _final_host(final_url) if final_root == host_root else host
     elif verdict == "blocked" and relay_mode:
-        # 403 from the home relay too — user decision: keep it as the public domain.
-        confirmed, root, out_host = True, final_root, _final_host(final_url)
-        reason = f"{reason}:relay_confirmed"
+        # 403 from the home relay too — user decision: keep it as the public domain, unless the 403 came
+        # from a junk-landing root (parking/hosting vendor): that says nothing about the company.
+        if final_root and final_root != host_root and final_root in JUNK_LANDING_ROOTS:
+            verdict, reason, cross = "inconclusive", f"junk_landing:{final_root}", True
+        else:
+            confirmed, root, out_host = True, final_root, _final_host(final_url)
+            reason = f"{reason}:relay_confirmed"
 
     result = {"confirmed": confirmed, "root": root, "final_host": out_host, "status": status,
               "verdict": verdict, "reason": reason, "cross_domain": cross,

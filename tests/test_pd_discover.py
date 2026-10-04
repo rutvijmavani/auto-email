@@ -141,6 +141,28 @@ class TestWorkerTierClassification(unittest.TestCase):
         self.assertEqual(out["resolved_by"], "relay")
 
 
+class TestRelayJunkLanding(unittest.TestCase):
+    """A relay 403 is kept as the pd, except when it landed on a junk-landing root."""
+
+    def _relay(self, final_url):
+        with mock.patch.object(pdm, "_fetch_chain", return_value=_chain(403, final_url=final_url)), \
+             mock.patch.object(pdm, "record_external_request"), \
+             mock.patch.object(pdm, "PD_PROBE_RECORD_ENABLED", False):
+            return pdm._probe_host("example.com", session=object(), relay_mode=True)
+
+    def test_relay_403_on_junk_root_not_confirmed(self):
+        out = self._relay("https://www.godaddy.com/")
+        self.assertFalse(out["confirmed"])
+        self.assertEqual(out["verdict"], "inconclusive")
+        self.assertTrue(out["reason"].startswith("junk_landing:"))
+        self.assertTrue(out["cross_domain"])
+
+    def test_relay_403_on_other_root_still_confirmed(self):
+        out = self._relay("https://www.real-co.com/")
+        self.assertTrue(out["confirmed"])
+        self.assertEqual(out["root"], "real-co.com")
+
+
 class TestProbeEvidenceRecording(unittest.TestCase):
     """_record_probe_result: each tier writes only its own evidence columns."""
 

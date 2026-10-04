@@ -36,6 +36,11 @@ class TestSources(unittest.TestCase):
         self.assertNotIn("ext_refs", _sql(pc.rule2_titles, 3, "relay"))
         self.assertIn("relay_title", _sql(pc.rule2_titles, 3, "relay"))
 
+    def test_oci_rule3_requires_oci_decided_rows_everywhere(self):
+        sql = _sql(pc.rule3_clusters, 3, 3, "oci")
+        self.assertEqual(sql.count("resolved_by = 'oci'"), 3)   # count/open rows, verdicts + samples
+        self.assertNotIn("resolved_by", _sql(pc.rule3_clusters, 3, 3, "relay"))
+
     def test_unknown_source_rejected(self):
         with self.assertRaises(KeyError):
             _sql(pc.rule3_clusters, 3, 3, "bogus")

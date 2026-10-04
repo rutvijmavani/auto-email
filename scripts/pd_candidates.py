@@ -44,6 +44,10 @@ SOURCES = {
 def rule3_clusters(conn, min_cluster: int, samples: int, source: str = "oci") -> list:
     s = SOURCES[source]
     h, t, ln, v = s["hash"], s["title"], s["len"], s["verdict"]
+    # final_verdict describes the OCI response only when the OCI tier decided the row; rows decided by
+    # the Worker/relay would pair an OCI hash with another tier's verdict (same filter as rule2_titles).
+    own = "resolved_by = 'oci'" if source == "oci" else "TRUE"
+    own_q = "q.resolved_by = 'oci'" if source == "oci" else "TRUE"
     rows = conn.execute(f"""
         SELECT {h}                                                        AS body_hash,
                COUNT(*)                                                   AS domains,
@@ -52,13 +56,13 @@ def rule3_clusters(conn, min_cluster: int, samples: int, source: str = "oci") ->
                MAX({t})                                                   AS title,
                (SELECT string_agg(vv || ':' || n, ', ')
                   FROM (SELECT {v} AS vv, COUNT(*) AS n FROM pd_probe_observation q
-                         WHERE q.{h} = p.{h} GROUP BY {v}) x)             AS verdicts,
+                         WHERE q.{h} = p.{h} AND {own_q} GROUP BY {v}) x) AS verdicts,
                (SELECT string_agg(domain, ', ')
                   FROM (SELECT domain FROM pd_probe_observation q
-                         WHERE q.{h} = p.{h} AND q.{v} IN ('ok', 'inconclusive')
+                         WHERE q.{h} = p.{h} AND {own_q} AND q.{v} IN ('ok', 'inconclusive')
                          ORDER BY domain LIMIT ?) sd)                     AS sample_domains
         FROM pd_probe_observation p
-        WHERE {h} IS NOT NULL
+        WHERE {h} IS NOT NULL AND {own}
         GROUP BY {h}
         HAVING COUNT(*) >= ? AND COUNT(*) FILTER (WHERE {v} IN ('ok', 'inconclusive')) > 0
         ORDER BY open_rows DESC, domains DESC
