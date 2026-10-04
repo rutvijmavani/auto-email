@@ -16,13 +16,15 @@ not a WAF block page); worker-only/relay-only is weak (IP-dependent) — sample-
 Reject any candidate rule that matches a known-real company domain.
 """
 import argparse
+import html
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import PD_SMALL_BODY_BYTES
+from config import PD_SMALL_BODY_BYTES, PD_PROBE_RETENTION_DAYS, PD_CANDIDATE_SEEN_RETENTION_DAYS
 from db.connection import get_conn
+from db.pd_probe import prune_observations, prune_candidate_seen
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
@@ -87,6 +89,97 @@ def rule2_titles(conn, samples: int, source: str = "oci") -> list:
     return [dict(r) for r in rows]
 
 
+def collect_clusters(conn, min_cluster: int, samples: int) -> list:
+    """Every Rule 2/3 cluster across all sources as flat dicts with a stable `cluster_key`
+    ('<rule>:<source>:<body_hash|title>'). Rule 2 groups below min_cluster are not clusters."""
+    out = []
+    for source in sorted(SOURCES):
+        for c in rule3_clusters(conn, min_cluster, samples, source):
+            out.append({"key": f"3:{source}:{c['body_hash']}", "rule": 3, "source": source,
+                        "domains": c["domains"], "title": c["title"] or "", "body_len": c["body_len"],
+                        "samples": c["sample_domains"] or ""})
+        for c in rule2_titles(conn, samples, source):
+            if c["n"] >= min_cluster:
+                out.append({"key": f"2:{source}:{c['title']}", "rule": 2, "source": source,
+                            "domains": c["n"], "title": c["title"], "body_len": None,
+                            "samples": ", ".join(c["sample_domains"] or ())})
+    return out
+
+
+def split_new(conn, clusters: list) -> tuple:
+    """-> (new, known) by presence of cluster_key in pd_candidate_seen."""
+    if not clusters:
+        return [], []
+    rows = conn.execute("SELECT cluster_key FROM pd_candidate_seen WHERE cluster_key = ANY(?)",
+                        ([c["key"] for c in clusters],)).fetchall()
+    seen = {r["cluster_key"] for r in rows}
+    return ([c for c in clusters if c["key"] not in seen],
+            [c for c in clusters if c["key"] in seen])
+
+
+def record_seen(conn, clusters: list) -> None:
+    """Upsert clusters into pd_candidate_seen: a new key is stamped notified_at=NOW(); a known key only
+    gets last_seen_at/domains refreshed (so an active cluster never ages out of retention)."""
+    for c in clusters:
+        conn.execute("""
+            INSERT INTO pd_candidate_seen (cluster_key, rule, source, title, domains, notified_at)
+            VALUES (?, ?, ?, ?, ?, NOW())
+            ON CONFLICT (cluster_key) DO UPDATE SET last_seen_at = NOW(), domains = EXCLUDED.domains
+        """, (c["key"], c["rule"], c["source"], c["title"][:200], c["domains"]))
+
+
+_SOURCE_HINT = {
+    "oci":    "OCI only = good (check it is not a WAF block page); strong if another source shows it too",
+    "worker": "Worker only = weak, IP-dependent — open a sample in a browser first",
+    "relay":  "relay only = weak, IP-dependent — open a sample in a browser first",
+}
+
+
+def build_email(new: list) -> tuple:
+    """-> (subject, html) listing the NEW clusters, strongest (most domains) first."""
+    rows = "".join(
+        f"<tr><td>Rule {c['rule']}</td><td>{html.escape(c['source'])}</td><td>{c['domains']}</td>"
+        f"<td>{html.escape(c['title'][:60])}</td><td>{html.escape(str(c['samples']))}</td></tr>"
+        for c in sorted(new, key=lambda c: -c["domains"])
+    )
+    hints = "".join(f"<li>{html.escape(h)}</li>" for h in _SOURCE_HINT.values())
+    body = (f"<p>{len(new)} new Rule 2/3 public-domain cluster(s) not explained by Rule 1.</p>"
+            f"<table border='1' cellpadding='4' style='border-collapse:collapse'>"
+            f"<tr><th>Rule</th><th>Source</th><th>Domains</th><th>Title</th><th>Samples</th></tr>{rows}</table>"
+            f"<p>Promotion guidance:</p><ul>{hints}</ul>"
+            f"<p>Reject any candidate rule that matches a known-real company domain. "
+            f"Run <code>python scripts/pd_candidates.py --source &lt;oci|worker|relay&gt;</code> for details.</p>")
+    return f"Public-domain: {len(new)} new parked-page candidate cluster(s)", body
+
+
+def run_notify(conn, min_cluster: int, samples: int, send=None) -> int:
+    """Weekly job: email NEW clusters, remember them, then prune both tables. Returns a process exit code.
+
+    The email is the commitment point: a new cluster is recorded in pd_candidate_seen only after it was sent,
+    and nothing is pruned unless the send succeeded (or there was nothing to send), so evidence is never
+    deleted before it has been reported. `send(subject, html)` -> True | False | None (injectable for tests).
+    """
+    clusters = collect_clusters(conn, min_cluster, samples)
+    new, known = split_new(conn, clusters)
+    log.info("pd_candidates: %d clusters (%d new, %d already reported)", len(clusters), len(new), len(known))
+    if new:
+        if send is None:
+            from scripts.log_monitor import _send_email as send   # lazy: log_monitor is Linux-only (fcntl)
+        subject, body = build_email(new)
+        if send(subject, body) is not True:
+            log.error("pd_candidates: email not sent — %d new cluster(s) left unrecorded for next run", len(new))
+            record_seen(conn, known)
+            conn.commit()
+            return 1
+    record_seen(conn, new + known)
+    obs_gone = prune_observations(conn, PD_PROBE_RETENTION_DAYS)
+    seen_gone = prune_candidate_seen(conn, PD_CANDIDATE_SEEN_RETENTION_DAYS)
+    conn.commit()
+    log.info("pd_candidates: pruned %d pd_probe_observation row(s) (>%dd), %d pd_candidate_seen row(s) (>%dd)",
+             obs_gone, PD_PROBE_RETENTION_DAYS, seen_gone, PD_CANDIDATE_SEEN_RETENTION_DAYS)
+    return 0
+
+
 def main():
     init_logging("pd_candidates")
     parser = argparse.ArgumentParser(description="Report uncovered Rule 2/3 clusters in pd_probe_observation")
@@ -94,9 +187,16 @@ def main():
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--source", choices=sorted(SOURCES), default="oci",
                         help="which tier's response to cluster (default oci; compare sources before promoting a rule)")
+    parser.add_argument("--notify", action="store_true",
+                        help="weekly mode: all sources, email only NEW clusters, then prune both tables")
     args = parser.parse_args()
 
     conn = get_conn()
+    if args.notify:
+        try:
+            sys.exit(run_notify(conn, args.min_cluster, args.samples))
+        finally:
+            conn.close()
     try:
         r3 = rule3_clusters(conn, args.min_cluster, args.samples, args.source)
         print(f"\n[source={args.source}]")

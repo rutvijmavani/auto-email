@@ -369,6 +369,11 @@ PD_SMALL_BODY_BYTES = int(os.getenv("PD_SMALL_BODY_BYTES", "2000"))   # a 2xx bo
 PD_SNIPPET_CHARS    = int(os.getenv("PD_SNIPPET_CHARS", "300"))      # body prefix stored in pd_probe_observation.snippet
 PD_BODY_MAX_BYTES   = int(os.getenv("PD_BODY_MAX_BYTES", "65536"))   # bounded body read per probe; larger body is dropped (marked oversize = full page)
 PD_PROBE_RECORD_ENABLED = os.getenv("PD_PROBE_RECORD_ENABLED", "1") != "0"   # write each probe to pd_probe_observation (evidence log only)
+# Weekly candidate-mining job (scripts/pd_candidates.py --notify). Retention is applied by that job only,
+# AFTER it has mined + emailed, so evidence is never deleted before it was looked at. The seen-cluster
+# memory must outlive the evidence it refers to (else a still-probed cluster would be emailed again).
+PD_PROBE_RETENTION_DAYS          = int(os.getenv("PD_PROBE_RETENTION_DAYS", "30"))           # pd_probe_observation rows by probed_at
+PD_CANDIDATE_SEEN_RETENTION_DAYS = int(os.getenv("PD_CANDIDATE_SEEN_RETENTION_DAYS", "90"))  # pd_candidate_seen rows by last_seen_at
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})

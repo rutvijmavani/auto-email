@@ -777,6 +777,25 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_relay_body_hash ON pd_probe_observation(relay_body_hash)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_verdict   ON pd_probe_observation(final_verdict)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_fein      ON pd_probe_observation(employer_fein)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_probed_at ON pd_probe_observation(probed_at)")
+
+    # pd_candidate_seen: memory of the Rule 2/3 clusters scripts/pd_candidates.py --notify already emailed,
+    # so the weekly job only reports NEW ones. cluster_key = '<rule>:<source>:<body_hash|title>'. last_seen_at is
+    # refreshed every run that still finds the cluster; rows not refreshed for PD_CANDIDATE_SEEN_RETENTION_DAYS
+    # are pruned by that same job (db/pd_probe.py::prune_candidate_seen).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pd_candidate_seen (
+            cluster_key    TEXT        PRIMARY KEY,
+            rule           SMALLINT    NOT NULL,
+            source         TEXT        NOT NULL,           -- oci | worker | relay
+            title          TEXT,
+            domains        INTEGER,
+            first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            notified_at    TIMESTAMPTZ
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_candidate_seen_last_seen ON pd_candidate_seen(last_seen_at)")
 
     # worker_scaling_events: append-only audit log for every worker pool
     # scaling decision (Phase 10 — Section 16).

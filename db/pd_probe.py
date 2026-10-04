@@ -47,6 +47,20 @@ def _build_sql(fields: tuple) -> str:
 """
 
 
+def prune_observations(conn, days: int) -> int:
+    """Delete pd_probe_observation rows not probed for `days` days. Returns rows deleted; caller commits."""
+    return conn.execute(
+        "DELETE FROM pd_probe_observation WHERE probed_at < NOW() - make_interval(days => ?)", (days,)
+    ).rowcount
+
+
+def prune_candidate_seen(conn, days: int) -> int:
+    """Delete pd_candidate_seen rows whose cluster was not re-found for `days` days. Caller commits."""
+    return conn.execute(
+        "DELETE FROM pd_candidate_seen WHERE last_seen_at < NOW() - make_interval(days => ?)", (days,)
+    ).rowcount
+
+
 def record_probe(domain: str, obs: dict) -> bool:
     """Upsert one probe observation. Returns True if written, False if skipped or failed (never raises).
 
