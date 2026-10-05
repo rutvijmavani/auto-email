@@ -55,6 +55,51 @@ class TestDiscover(unittest.TestCase):
         self.assertEqual(out[0], "example.com")
 
 
+class TestHttpSecondOpinion(unittest.TestCase):
+    """_probe_host: a parked https answer gets one http try (shared-host default vhost on https only)."""
+
+    PARKED = {"status": 200, "headers": {}, "body": "<html>Account Suspended</html>", "cookies": set(),
+              "final_url": "https://acme-corp.com/cgi-sys/suspendedpage.cgi", "error_type": ""}
+    LIVE = {"status": 200, "headers": {}, "body": "<html><title>Acme</title>" + "x" * 20000 + "</html>",
+            "cookies": set(), "final_url": "http://acme-corp.com/", "error_type": ""}
+
+    def _probe(self, chain):
+        calls = []
+
+        def fake_chain(host, scheme, sess, deadline):
+            calls.append(scheme)
+            return dict(chain[scheme])
+        with mock.patch.object(pdm, "_fetch_chain", side_effect=fake_chain), \
+             mock.patch.object(pdm, "_get_default_curl_session", return_value=mock.MagicMock()), \
+             mock.patch.object(pdm, "record_external_request"), \
+             mock.patch.object(pdm, "PD_PROBE_RECORD_ENABLED", False):
+            return pdm._probe_host("acme-corp.com"), calls
+
+    def test_https_parked_http_live_confirms(self):
+        r, calls = self._probe({"https": self.PARKED, "http": self.LIVE})
+        self.assertEqual(calls, ["https", "http"])
+        self.assertTrue(r["confirmed"])
+        self.assertEqual(r["verdict"], "ok")
+        self.assertEqual(r["root"], "acme-corp.com")
+
+    def test_both_parked_stays_parked(self):
+        r, _ = self._probe({"https": self.PARKED, "http": dict(self.PARKED)})
+        self.assertFalse(r["confirmed"])
+        self.assertEqual(r["verdict"], "parked")
+
+    def test_http_error_keeps_https_parked(self):
+        err = {"status": None, "headers": {}, "body": "", "cookies": set(), "final_url": "",
+               "error_type": "conn_err"}
+        r, _ = self._probe({"https": self.PARKED, "http": err})
+        self.assertEqual(r["verdict"], "parked")
+
+    def test_https_live_never_tries_http(self):
+        live_https = dict(self.LIVE, final_url="https://acme-corp.com/")
+        r, calls = self._probe({"https": live_https, "http": self.PARKED})
+        self.assertEqual(calls, ["https"])
+        self.assertTrue(r["confirmed"])
+
+
 class TestWriteDomainHost(unittest.TestCase):
     """_write_domain stores public_domain_host only when root(host) == public_domain."""
 
