@@ -41,19 +41,55 @@ export default {
       return Response.json({ error: "Only http/https URLs allowed" }, { status: 400 });
     }
 
+    // Redirect hop cap comes from the caller (config.py CF_WORKER_MAX_HOPS); the default only
+    // applies to older callers that do not send max_hops.
+    const rawHops = body.max_hops;
+    const maxHops = (Number.isFinite(rawHops) && rawHops > 0)
+      ? Math.min(Math.floor(rawHops), 20)
+      : 8;
+
     try {
-      const resp = await fetch(targetUrl, {
-        headers: {
-          "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.5",
-        },
-        redirect: "follow",
-      });
+      // Redirects are followed manually so Set-Cookie names can be collected from EVERY hop
+      // (parking vendors set their marker cookie on an intermediate redirect) — the same
+      // accumulation the direct tier does in jobs/public_domain.py::_fetch_chain.
+      const cookies = [];
+      let current = targetUrl;
+      let resp = null;
+      for (let hop = 0; hop <= maxHops; hop++) {
+        resp = await fetch(current, {
+          headers: {
+            "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+          },
+          redirect: "manual",
+        });
+        for (const sc of (resp.headers.getSetCookie ? resp.headers.getSetCookie() : [])) {
+          const name = sc.split("=")[0].trim();
+          if (name && !cookies.includes(name)) cookies.push(name);
+        }
+        const loc = [301, 302, 303, 307, 308].includes(resp.status) ? resp.headers.get("Location") : null;
+        if (!loc) break;
+        let next;
+        try {
+          next = new URL(loc, current);
+        } catch {
+          return Response.json({ status: 0, final_url: null, body: null, error: "Bad redirect Location" });
+        }
+        if (!["http:", "https:"].includes(next.protocol)) {
+          return Response.json({ status: 0, final_url: null, body: null, error: "Redirect to non-http(s)" });
+        }
+        if (hop === maxHops) {
+          return Response.json({ status: 0, final_url: null, body: null, error: "hop_limit" });
+        }
+        if (resp.body) resp.body.cancel().catch(() => {});
+        current = next.toString();
+      }
 
       // Read incrementally up to maxBytes — avoids buffering huge responses.
       // resp.body may be null for 204 No Content or HEAD responses.
       let text = "";
+      let truncated = false;
       if (resp.body) {
         const reader = resp.body.getReader();
         const chunks = [];
@@ -64,6 +100,14 @@ export default {
           const slice = value.slice(0, maxBytes - received);
           chunks.push(slice);
           received += slice.byteLength;
+          if (slice.byteLength < value.byteLength) truncated = true;   // chunk itself overran the cap
+        }
+        // Body bigger than maxBytes? Peek one more read so the caller can tell "exactly
+        // maxBytes" from "cut off" (an oversize page is a real site, never a parked stub).
+        // Skipped when an oversize chunk already proved truncation (the next read could be done=true).
+        if (received >= maxBytes && !truncated) {
+          const { done } = await reader.read();
+          truncated = !done;
         }
         reader.cancel().catch(() => {});
         const buf = new Uint8Array(received);
@@ -72,10 +116,16 @@ export default {
         text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
       }
 
+      const headers = {};
+      resp.headers.forEach((v, k) => { headers[k] = v; });
+
       return Response.json({
         status:    resp.status,
-        final_url: resp.url,
+        final_url: current,
         body:      text,
+        truncated: truncated,
+        headers:   headers,
+        cookies:   cookies,
         error:     null,
       });
     } catch (e) {

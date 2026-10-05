@@ -351,6 +351,9 @@ CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler s
 # via db/external_api_health.py (service="cf_worker"), same pattern as Brave's
 # monthly quota — see _BRAVE_QUOTA_LIMIT in scripts/discover_h1b_ats.py.
 CF_WORKER_DAILY_LIMIT = int(os.getenv("CF_WORKER_DAILY_LIMIT", "85000"))
+# Redirect hops the probe Worker follows per request (jobs/public_domain.py::_fetch_via_worker sends it as
+# max_hops; the Worker caps it at 20). Should match the direct tier's hop budget.
+CF_WORKER_MAX_HOPS = int(os.getenv("CF_WORKER_MAX_HOPS", "8"))
 
 CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search API (Bearer token)
 
@@ -359,6 +362,18 @@ CERTSPOTTER_API_KEY = os.getenv("CERTSPOTTER_API_KEY", "")  # SSLmate CT Search 
 # PD_RETRY_INTERVAL_DAYS apart, before escalating to the mobile relay queue (Part 3).
 PD_RETRY_CAP           = int(os.getenv("PD_RETRY_CAP", "4"))
 PD_RETRY_INTERVAL_DAYS = int(os.getenv("PD_RETRY_INTERVAL_DAYS", "2"))
+
+# Parked/challenge page classification (jobs/pd_classify.py) + per-domain probe record
+# (db/pd_probe.py). Values mirror data/parked_domain_scan_v4.py so scan and production agree.
+PD_SMALL_BODY_BYTES = int(os.getenv("PD_SMALL_BODY_BYTES", "2000"))   # a 2xx body under this is a "stub", not a full page
+PD_SNIPPET_CHARS    = int(os.getenv("PD_SNIPPET_CHARS", "300"))      # body prefix stored in pd_probe_observation.snippet
+PD_BODY_MAX_BYTES   = int(os.getenv("PD_BODY_MAX_BYTES", "65536"))   # bounded body read per probe; larger body is dropped (marked oversize = full page)
+PD_PROBE_RECORD_ENABLED = os.getenv("PD_PROBE_RECORD_ENABLED", "1") != "0"   # write each probe to pd_probe_observation (evidence log only)
+# Weekly candidate-mining job (scripts/pd_candidates.py --notify). Retention is applied by that job only,
+# AFTER it has mined + emailed, so evidence is never deleted before it was looked at. The seen-cluster
+# memory must outlive the evidence it refers to (else a still-probed cluster would be emailed again).
+PD_PROBE_RETENTION_DAYS          = int(os.getenv("PD_PROBE_RETENTION_DAYS", "30"))           # pd_probe_observation rows by probed_at
+PD_CANDIDATE_SEEN_RETENTION_DAYS = int(os.getenv("PD_CANDIDATE_SEEN_RETENTION_DAYS", "90"))  # pd_candidate_seen rows by last_seen_at
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})

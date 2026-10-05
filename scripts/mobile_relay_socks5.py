@@ -151,7 +151,16 @@ async def _negotiate_and_relay(reader, writer, peer) -> None:
         dst_addr = ".".join(str(b) for b in addr_bytes)
     elif atyp == ATYP_DOMAIN:
         (length,) = struct.unpack("!B", await reader.readexactly(1))
-        dst_addr = (await reader.readexactly(length)).decode("idna", errors="replace")
+        # ASCII only: socks5h clients (curl) send an IDN already punycoded. The "idna"
+        # codec rejects errors="replace" with UnicodeError, which used to drop every
+        # domain-name CONNECT (curl error 97 "connection to proxy closed") before any
+        # reply was written — so the relay never forwarded a single socks5h request.
+        try:
+            dst_addr = (await reader.readexactly(length)).decode("ascii")
+        except UnicodeDecodeError:
+            await _send_reply(writer, 0x08)  # address type not supported
+            writer.close()
+            return
     elif atyp == ATYP_IPV6:
         addr_bytes = await reader.readexactly(16)
         dst_addr = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))

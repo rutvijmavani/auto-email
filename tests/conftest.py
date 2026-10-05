@@ -38,6 +38,8 @@ _TRUNCATE_TABLES = [
     "worker_scaling_events",
     # Alerts / health
     "pipeline_alerts",
+    "pd_probe_observation",
+    "pd_candidate_seen",
     "api_health",
     # Quota singletons (low risk of interference but clear them too)
     "serper_quota",

@@ -718,6 +718,85 @@ def init_db():
         ON external_api_health(date, service)
     """)
 
+    # pd_probe_observation: latest public-domain probe result per domain — the evidence
+    # behind each parked/challenge/ok verdict (jobs/pd_classify.py) plus the content
+    # fingerprint (body_hash/title/body_len/ext_refs) that lets Rule 2/3 candidate mining
+    # (scripts/pd_candidates.py) run on live data instead of a scan CSV. One upserted row
+    # per domain; a standalone table (no FK, no ALTER on fein_domain_map) so a failed
+    # write here can never block the main pd write path.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pd_probe_observation (
+            domain              TEXT        PRIMARY KEY,
+            employer_fein       TEXT,
+
+            -- decision
+            final_verdict       TEXT        NOT NULL,   -- ok | parked | challenge | blocked | inconclusive | error
+            final_reason        TEXT,
+            resolved_by         TEXT,                   -- oci | worker | relay
+            final_host          TEXT,
+            cross_domain        BOOLEAN,
+
+            -- direct (OCI) response
+            status              INTEGER,
+            final_url           TEXT,
+            server              TEXT,
+            fetch_via           TEXT,                   -- '' | www | http (TLS-alternate path)
+            body_len            INTEGER,
+            ext_refs            INTEGER,
+            body_hash           TEXT,
+            title               TEXT,
+            snippet             TEXT,
+            cookie_names        TEXT,
+            header_names        TEXT,
+            error_type          TEXT,
+
+            -- other tiers
+            worker_status       INTEGER,
+            worker_verdict      TEXT,
+            worker_body_len     INTEGER,
+            worker_title        TEXT,
+            relay_status        INTEGER,
+            relay_verdict       TEXT,
+            relay_body_len      INTEGER,
+            relay_title         TEXT,
+
+            -- provenance / change tracking
+            impersonate         TEXT,
+            prev_verdict        TEXT,
+            verdict_changed_at  TIMESTAMPTZ,
+            first_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            probed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    # Per-tier hash + cookie evidence (2026-10-04): lets Rule 2/3 mining cluster each source separately
+    # and records which vendor cookie fired Rule 1 when only the Worker/relay could read the page.
+    for _col in ("worker_body_hash", "worker_cookie_names", "relay_body_hash", "relay_cookie_names"):
+        c.execute(f"ALTER TABLE pd_probe_observation ADD COLUMN IF NOT EXISTS {_col} TEXT")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_body_hash ON pd_probe_observation(body_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_worker_body_hash ON pd_probe_observation(worker_body_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_relay_body_hash ON pd_probe_observation(relay_body_hash)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_verdict   ON pd_probe_observation(final_verdict)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_fein      ON pd_probe_observation(employer_fein)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_probe_probed_at ON pd_probe_observation(probed_at)")
+
+    # pd_candidate_seen: memory of the Rule 2/3 clusters scripts/pd_candidates.py --notify already emailed,
+    # so the weekly job only reports NEW ones. cluster_key = '<rule>:<source>:<body_hash|title>'. last_seen_at is
+    # refreshed every run that still finds the cluster; rows not refreshed for PD_CANDIDATE_SEEN_RETENTION_DAYS
+    # are pruned by that same job (db/pd_probe.py::prune_candidate_seen).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pd_candidate_seen (
+            cluster_key    TEXT        PRIMARY KEY,
+            rule           SMALLINT    NOT NULL,
+            source         TEXT        NOT NULL,           -- oci | worker | relay
+            title          TEXT,
+            domains        INTEGER,
+            first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            notified_at    TIMESTAMPTZ
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_candidate_seen_last_seen ON pd_candidate_seen(last_seen_at)")
+
     # worker_scaling_events: append-only audit log for every worker pool
     # scaling decision (Phase 10 — Section 16).
     # Effectiveness is derived by querying adjacent events within a time
@@ -1727,6 +1806,10 @@ def init_db():
     # Enrichment worker columns — safe no-op on fresh installs
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain TEXT")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_method TEXT")
+    # Exact host that answered the pd probe (e.g. www.worldfuel.com). Invariant: its registrable
+    # root equals public_domain (enforced in workers/domain_enrichment_worker.py::_write_domain).
+    # Used ONLY to fetch the company website; identity/KG-gate checks keep using public_domain.
+    c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS public_domain_host TEXT")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_enriched_at TIMESTAMPTZ")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS last_discovered_at TIMESTAMPTZ")
     c.execute("ALTER TABLE fein_domain_map ADD COLUMN IF NOT EXISTS kg_checked BOOLEAN NOT NULL DEFAULT FALSE")

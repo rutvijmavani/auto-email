@@ -134,6 +134,7 @@ def _load_company(conn, fein: str) -> "dict | None":
             f.employer_fein,
             f.assigned_domain,
             f.public_domain,
+            f.public_domain_host,
             COALESCE(f.public_domain_retry_count, 0) AS public_domain_retry_count,
             f.careers_url,
             f.careers_source,
@@ -365,11 +366,12 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
             if pd_missing:
                 from jobs.public_domain import discover_public_domain
                 from workers.domain_enrichment_worker import _write_domain
-                public_domain, method, retry_after, last_status = discover_public_domain(
-                    assigned_domain, session=relay_session,
+                # relay_mode: final escalation tier — a 403 here is accepted as the pd.
+                public_domain, method, retry_after, last_status, pd_host = discover_public_domain(
+                    assigned_domain, session=relay_session, relay_mode=True,
                 )
                 _write_domain(conn, fein, public_domain, method, last_status,
-                              company["public_domain_retry_count"])
+                              company["public_domain_retry_count"], pd_host)
                 conn.commit()
                 _pd_status = last_status or (200 if public_domain else 0)
                 _pd_ms = int((time.time() - t_start) * 1000)
@@ -380,12 +382,14 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
                 record_external_request("pd_relay", _pd_status, _pd_ms)
                 if public_domain:
                     company["public_domain"] = public_domain
+                    company["public_domain_host"] = pd_host
                     pd_missing = False
 
             det_platform = det_slug = res_careers = None
             if careers_missing:
                 probe_domain = company["public_domain"] or assigned_domain
-                website_url = "https://" + probe_domain
+                # Fetch uses the stored host; fallback host -> public_domain -> assigned.
+                website_url = "https://" + (company.get("public_domain_host") or probe_domain)
                 try:
                     result = _resolve_careers_via_relay(
                         conn, m, fein, website_url, employer_name,
