@@ -59,6 +59,7 @@ _VALID_SERVICES = frozenset({
     "discover-h1b-ats-worker",
     "domain-enrichment-worker",
     "staleness-checker",
+    "pd-candidates",
 })
 
 # One-shot services (Type=oneshot): they run once and exit — OnFailure fires on a
@@ -66,6 +67,7 @@ _VALID_SERVICES = frozenset({
 # uses different wording for these.
 _ONESHOT_SERVICES = frozenset({
     "staleness-checker",
+    "pd-candidates",
 })
 
 # Template units whose OnFailure passes %p-%i (e.g. "domain-enrichment-worker-1").
@@ -243,9 +245,19 @@ _SERVICE_DISPLAY = {
     "recruiter-scheduler": "Scheduler (main pipeline process)",
     "recruiter-watchdog":  "Watchdog (health monitor)",
     "staleness-checker":   "Staleness Checker (enrichment queue populator)",
+    "pd-candidates":       "Weekly public-domain candidate report + retention prune",
 }
 
 _DIAGNOSE_HINTS = {
+    "pd-candidates": [
+        "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
+        "Exit 1 means the report email was not sent (SMTP/credentials in .env); new clusters are kept "
+        "for the next run and nothing was pruned",
+        "Check for Python errors: <code>journalctl -u pd-candidates -n 50</code>",
+        f"Try running manually: <code>cd {_PROJECT_DIR} &amp;&amp; source venv/bin/activate "
+        "&amp;&amp; python -m scripts.pd_candidates --notify</code>",
+        "Reset failed state after fixing: <code>sudo systemctl reset-failed pd-candidates</code>",
+    ],
     "staleness-checker": [
         "Check Redis is running: <code>systemctl status redis</code>",
         "Check PostgreSQL is running: <code>systemctl status postgresql</code>",
