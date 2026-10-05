@@ -100,10 +100,12 @@ export default {
           const slice = value.slice(0, maxBytes - received);
           chunks.push(slice);
           received += slice.byteLength;
+          if (slice.byteLength < value.byteLength) truncated = true;   // chunk itself overran the cap
         }
         // Body bigger than maxBytes? Peek one more read so the caller can tell "exactly
         // maxBytes" from "cut off" (an oversize page is a real site, never a parked stub).
-        if (received >= maxBytes) {
+        // Skipped when an oversize chunk already proved truncation (the next read could be done=true).
+        if (received >= maxBytes && !truncated) {
           const { done } = await reader.read();
           truncated = !done;
         }

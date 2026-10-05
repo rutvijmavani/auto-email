@@ -250,5 +250,26 @@ class TestFetchViaWorkerShape(unittest.TestCase):
         self.assertIn("x-scan-too-large", out["headers"])
 
 
+class TestScanDomain(unittest.TestCase):
+    """Phase 6/7 scan domain: the answering host when it is a real subdomain, else the root."""
+
+    def setUp(self):
+        from scripts.discover_h1b_ats import _scan_domain
+        self.f = _scan_domain
+
+    def test_no_host_uses_root(self):
+        self.assertEqual(self.f("https://careers.foo.com", None), "foo.com")
+
+    def test_subdomain_host_scanned_as_is(self):
+        self.assertEqual(self.f("https://us.foo.com", "us.foo.com"), "us.foo.com")
+
+    def test_www_or_apex_host_keeps_root(self):
+        self.assertEqual(self.f("https://foo.com", "www.foo.com"), "foo.com")
+        self.assertEqual(self.f("https://foo.com", "foo.com"), "foo.com")
+
+    def test_stale_host_with_other_root_ignored(self):
+        self.assertEqual(self.f("https://real.com", "us.foo.com"), "real.com")
+
+
 if __name__ == "__main__":
     unittest.main()

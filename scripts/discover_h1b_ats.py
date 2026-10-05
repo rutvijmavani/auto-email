@@ -237,6 +237,25 @@ def _root_domain(url: str) -> str:
     return ext.registered_domain or host
 
 
+def _scan_domain(website_url: str, fetch_host: str | None) -> str:
+    """Domain handed to the Phase 6/7 fallback scans.
+
+    The pd probe's answering host (fetch_host) is the only name known to serve the site, so a
+    non-apex, non-www host (e.g. 'us.foo.com') is scanned as-is — Phase 6 then probes www.<host>
+    and retries the bare host itself. A host that is just the root or www.<root> returns the root
+    unchanged (career_page already probes www.<root> then the apex). A host under a different
+    registrable root than website_url (stale after a redirect) is ignored. The root is still what
+    the scans use for territory checks, fixed subdomain probes and ATS writes.
+    """
+    root = _root_domain(website_url)
+    if not fetch_host:
+        return root
+    host = fetch_host.lower().strip().rstrip(".")
+    if _root_domain(host) != root or host.removeprefix("www.") == root:
+        return root
+    return host
+
+
 def _kg_domain_gate(kg_url: str | None, sparql_p856: str | None, assigned_domain: str) -> bool:
     """
     Verify a KG entity against the LCA email-derived assigned_domain.
@@ -2096,7 +2115,7 @@ def process_employer(
     # this phase already (unless its own Phase 3 found the ATS) — reaching here at all means
     # it ran and failed against this identical domain, so redoing it is guaranteed-redundant.
     if not detected_platform and website_url and not skip_phase6:
-        _cp_domain = _root_domain(website_url)
+        _cp_domain = _scan_domain(website_url, emp.get("fetch_host"))
         _cp_name   = canonical_name or name
         log.info("  Phase 6: career_page scan on domain=%s …", _cp_domain)
         try:
@@ -2118,7 +2137,7 @@ def process_employer(
 
     # Phase 7: career_detector.py — Chrome-impersonation BFS, last resort
     if not detected_platform and website_url:
-        _cd_domain = _root_domain(website_url)
+        _cd_domain = _scan_domain(website_url, emp.get("fetch_host"))
         log.info("  Phase 7: career_detector BFS on domain=%s …", _cd_domain)
         try:
             from jobs.ats.career_detector import detect_company
