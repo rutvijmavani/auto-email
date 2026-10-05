@@ -30,6 +30,7 @@ from config import (
 )
 from db.connection import get_conn
 from db.pd_probe import prune_observations, prune_candidate_seen
+from db.pd_redirect_review import mark_notified, pending_count, unnotified
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
@@ -140,21 +141,47 @@ _SOURCE_HINT = {
 }
 
 
-def build_email(new: list) -> tuple:
-    """-> (subject, html) listing the NEW clusters, strongest (most domains) first."""
+def _review_section(review: list, pending_total: int) -> str:
+    """HTML for NEW pd_redirect_review pairs (redirects held by the employer-name gate)."""
+    if not review:
+        return ""
+    rows = "".join(
+        f"<tr><td>{html.escape(str(r['employer_fein']))}</td><td>{html.escape(r['employer_name'] or '')}</td>"
+        f"<td>{html.escape(r['old_domain'])}</td><td>{html.escape(r['new_domain'])}</td>"
+        f"<td>{html.escape(r['hint'] or '')}</td><td>{html.escape(r['source'])}</td></tr>"
+        for r in review)
+    return (f"<h3>{len(review)} redirect(s) held by the employer-name gate</h3>"
+            f"<p>Nothing is stored for these until you decide ({pending_total} pending in total, including earlier weeks).</p>"
+            f"<table border='1' cellpadding='4' style='border-collapse:collapse'>"
+            f"<tr><th>FEIN</th><th>Employer</th><th>Old domain</th><th>Redirects to</th><th>Hint</th><th>Source</th></tr>"
+            f"{rows}</table>"
+            f"<p>Decide with <code>python -m scripts.pd_redirect_review approve|reject &lt;fein&gt; [new_domain]</code>. "
+            f"An approved pair is stored the next time that employer's domain is re-resolved "
+            f"(scheduled re-detection or the backfill).</p>")
+
+
+def build_email(new: list, review: list = (), pending_total: int = 0) -> tuple:
+    """-> (subject, html) listing the NEW clusters (strongest first) and the NEW name-gate review pairs."""
     rows = "".join(
         f"<tr><td>Rule {c['rule']}</td><td>{html.escape(c['source'])}</td><td>{c['domains']}</td>"
         f"<td>{html.escape(c['title'][:PD_CANDIDATE_TITLE_EMAIL_CHARS])}</td><td>{html.escape(str(c['samples']))}</td></tr>"
         for c in sorted(new, key=lambda c: -c["domains"])
     )
     hints = "".join(f"<li>{html.escape(h)}</li>" for h in _SOURCE_HINT.values())
-    body = (f"<p>{len(new)} new Rule 2/3 public-domain cluster(s) not explained by Rule 1.</p>"
-            f"<table border='1' cellpadding='4' style='border-collapse:collapse'>"
-            f"<tr><th>Rule</th><th>Source</th><th>Domains</th><th>Title</th><th>Samples</th></tr>{rows}</table>"
-            f"<p>Promotion guidance:</p><ul>{hints}</ul>"
-            f"<p>Reject any candidate rule that matches a known-real company domain. "
-            f"Run <code>python scripts/pd_candidates.py --source &lt;oci|worker|relay&gt;</code> for details.</p>")
-    return f"Public-domain: {len(new)} new parked-page candidate cluster(s)", body
+    body = ""
+    parts = []
+    if new:
+        body = (f"<p>{len(new)} new Rule 2/3 public-domain cluster(s) not explained by Rule 1.</p>"
+                f"<table border='1' cellpadding='4' style='border-collapse:collapse'>"
+                f"<tr><th>Rule</th><th>Source</th><th>Domains</th><th>Title</th><th>Samples</th></tr>{rows}</table>"
+                f"<p>Promotion guidance:</p><ul>{hints}</ul>"
+                f"<p>Reject any candidate rule that matches a known-real company domain. "
+                f"Run <code>python scripts/pd_candidates.py --source &lt;oci|worker|relay&gt;</code> for details.</p>")
+        parts.append(f"{len(new)} new parked-page candidate cluster(s)")
+    if review:
+        body += _review_section(list(review), pending_total)
+        parts.append(f"{len(review)} redirect(s) held for name review")
+    return "Public-domain: " + ", ".join(parts), body
 
 
 def run_notify(conn, min_cluster: int, samples: int, send=None) -> int:
@@ -166,17 +193,21 @@ def run_notify(conn, min_cluster: int, samples: int, send=None) -> int:
     """
     clusters = collect_clusters(conn, min_cluster, samples)
     new, known = split_new(conn, clusters)
-    log.info("pd_candidates: %d clusters (%d new, %d already reported)", len(clusters), len(new), len(known))
-    if new:
+    review = unnotified(conn)
+    log.info("pd_candidates: %d clusters (%d new, %d already reported); %d new name-gate review pair(s)",
+             len(clusters), len(new), len(known), len(review))
+    if new or review:
         if send is None:
             from scripts.log_monitor import _send_email as send   # lazy: log_monitor is Linux-only (fcntl)
-        subject, body = build_email(new)
+        subject, body = build_email(new, review, pending_count(conn) if review else 0)
         if send(subject, body) is not True:
-            log.error("pd_candidates: email not sent — %d new cluster(s) left unrecorded for next run", len(new))
+            log.error("pd_candidates: email not sent — %d new cluster(s) and %d review pair(s) left unrecorded "
+                      "for next run", len(new), len(review))
             record_seen(conn, known)
             conn.commit()
             return 1
     record_seen(conn, new + known)
+    mark_notified(conn, [(r["employer_fein"], r["old_domain"], r["new_domain"]) for r in review])
     obs_gone = prune_observations(conn, PD_PROBE_RETENTION_DAYS)
     seen_gone = prune_candidate_seen(conn, PD_CANDIDATE_SEEN_RETENTION_DAYS)
     conn.commit()

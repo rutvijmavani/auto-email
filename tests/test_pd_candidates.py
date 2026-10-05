@@ -88,6 +88,8 @@ class TestRunNotify(unittest.TestCase):
         with mock.patch.object(pc, "collect_clusters", return_value=new + known), \
              mock.patch.object(pc, "split_new", return_value=(new, known)), \
              mock.patch.object(pc, "record_seen") as rec, \
+             mock.patch.object(pc, "unnotified", return_value=[]), \
+             mock.patch.object(pc, "mark_notified"), \
              mock.patch.object(pc, "prune_observations", return_value=1) as po, \
              mock.patch.object(pc, "prune_candidate_seen", return_value=2) as ps:
             rc = pc.run_notify(conn, 3, 3, send=send)
@@ -119,6 +121,64 @@ class TestRunNotify(unittest.TestCase):
         sql = conn.execute.call_args[0][0]
         self.assertIn("notified_at", sql.split("ON CONFLICT")[0])
         self.assertNotIn("notified_at", sql.split("DO UPDATE")[1])
+
+
+def _rv(fein="1", name="Acme <b>", old="a.com", new="b.com"):
+    return {"employer_fein": fein, "employer_name": name, "old_domain": old, "new_domain": new,
+            "hint": "no-name-match", "source": "enrichment"}
+
+
+class TestReviewSection(unittest.TestCase):
+    def test_email_lists_review_pairs_escaped_and_pending_total(self):
+        subject, body = pc.build_email([], [_rv()], 7)
+        self.assertIn("held for name review", subject)
+        self.assertNotIn("<b>", body)
+        self.assertIn("b.com", body)
+        self.assertIn("7 pending", body)
+
+    def test_email_without_review_is_unchanged(self):
+        subject, body = pc.build_email([_cl("k")])
+        self.assertNotIn("name review", subject)
+        self.assertNotIn("name gate", body)
+
+    def _run(self, send, review, new=()):
+        conn = mock.MagicMock()
+        with mock.patch.object(pc, "collect_clusters", return_value=list(new)), \
+             mock.patch.object(pc, "split_new", return_value=(list(new), [])), \
+             mock.patch.object(pc, "record_seen"), \
+             mock.patch.object(pc, "unnotified", return_value=review), \
+             mock.patch.object(pc, "pending_count", return_value=3), \
+             mock.patch.object(pc, "mark_notified") as mn, \
+             mock.patch.object(pc, "prune_observations", return_value=0), \
+             mock.patch.object(pc, "prune_candidate_seen", return_value=0):
+            rc = pc.run_notify(conn, 3, 3, send=send)
+        return rc, mn
+
+    def test_review_only_week_sends_then_marks_notified(self):
+        sent = []
+        rc, mn = self._run(lambda s, b: sent.append(s) or True, [_rv()])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(mn.call_args[0][1], [("1", "a.com", "b.com")])
+
+    def test_failed_send_leaves_review_pairs_unnotified(self):
+        rc, mn = self._run(lambda s, b: False, [_rv()])
+        self.assertEqual(rc, 1)
+        mn.assert_not_called()
+
+
+class TestReviewCommand(unittest.TestCase):
+    def test_approve_and_reject_commit_and_set_exit_code(self):
+        from scripts import pd_redirect_review as cmd
+        for args, status, n, rc in ((["approve", "1", "b.com"], "approved", 1, 0),
+                                    (["reject", "1"], "rejected", 0, 1)):
+            conn = mock.MagicMock()
+            with mock.patch.object(cmd, "get_conn", return_value=conn), \
+                 mock.patch.object(cmd, "init_logging"), \
+                 mock.patch.object(cmd, "decide", return_value=n) as d:
+                self.assertEqual(cmd.main(args), rc)
+            self.assertEqual(d.call_args[0][1:3], ("1", status))
+            conn.commit.assert_called_once()
 
 
 class TestPruneHelpers(unittest.TestCase):

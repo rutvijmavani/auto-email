@@ -797,6 +797,31 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_pd_candidate_seen_last_seen ON pd_candidate_seen(last_seen_at)")
 
+    # pd_redirect_review: cross-domain redirects (old -> new) whose employer name did not match the new domain
+    # (jobs/pd_name_gate.py). Nothing is stored in fein_domain_map for a pending/rejected pair. Read by the live
+    # resolvers (an 'approved' pair is accepted) and mailed weekly by scripts/pd_candidates.py --notify
+    # (notified_at NULL = not yet emailed). NO retention: approved/rejected rows are decisions production reads,
+    # pending rows stay until reviewed (scripts/pd_redirect_review.py approve|reject).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pd_redirect_review (
+            employer_fein  TEXT        NOT NULL,
+            old_domain     TEXT        NOT NULL,
+            new_domain     TEXT        NOT NULL,
+            new_host       TEXT,
+            employer_name  TEXT,
+            hint           TEXT,                               -- acquisition-like | no-name-match
+            source         TEXT,                               -- backfill | enrichment | relay | discover
+            status         TEXT        NOT NULL DEFAULT 'pending',   -- pending | approved | rejected
+            first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            notified_at    TIMESTAMPTZ,
+            decided_at     TIMESTAMPTZ,
+            PRIMARY KEY (employer_fein, old_domain, new_domain)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pd_redirect_review_unnotified "
+              "ON pd_redirect_review(status) WHERE notified_at IS NULL")
+
     # worker_scaling_events: append-only audit log for every worker pool
     # scaling decision (Phase 10 — Section 16).
     # Effectiveness is derived by querying adjacent events within a time

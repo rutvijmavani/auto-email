@@ -43,7 +43,7 @@ from config import (
 )
 from db.connection import get_conn
 from jobs.career_page import detect_via_career_page
-from jobs.public_domain import discover_public_domain
+from jobs.public_domain import discover_public_domain_gated
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
 from workers.redis_client import get_redis
@@ -456,7 +456,9 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
         conn.commit()
 
         # ── Step 1: public domain resolution ──────────────────────────────────
-        public_domain, method, retry_after, last_status, pd_host = discover_public_domain(assigned)
+        # Cross-domain redirects must pass the employer-name gate (else held in pd_redirect_review).
+        public_domain, method, retry_after, last_status, pd_host = discover_public_domain_gated(
+            conn, fein, employer_name, assigned, source="enrichment")
 
         if retry_after is not None:
             # Certspotter quota exhausted — re-queue with delay, don't count as retry

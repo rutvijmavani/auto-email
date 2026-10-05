@@ -831,3 +831,48 @@ def discover_public_domain(assigned_domain: str, session=None, relay_mode: bool 
 
     log.debug("no public domain signal for %s", domain)
     return None, "no_signal", None, last_status, None
+
+
+# Result methods that are a redirect to ANOTHER company-owned root; only these go through the name gate.
+# (CT-log candidates are certificate SAN siblings, not redirects, and are deliberately not gated.)
+_GATED_METHODS = ("http_redirect", "root_fallback")
+METHOD_NAME_GATE_HELD = "name_gate_held"
+
+
+def discover_public_domain_gated(conn, fein: str, employer_name: "str | None", assigned_domain: str,
+                                 source: str, session=None, relay_mode: bool = False,
+                                 ) -> "tuple[str | None, str, int | None, int | None, str | None]":
+    """discover_public_domain + employer-name gate on cross-domain redirects (jobs/pd_name_gate.py).
+
+    Same 5-tuple. A redirect to another root whose name check fails is NOT stored: the result becomes
+    (None, 'name_gate_held', None, None, None) — no last_status, so no pd-retry loop — and the (fein, old, new)
+    pair is queued in pd_redirect_review for the weekly email. A pair a human approved is accepted; a rejected
+    pair is dropped silently (not re-queued). Runs on the caller's conn and never commits; callers commit
+    after _write_domain as before.
+    """
+    from db import pd_redirect_review as review
+    from jobs.pd_name_gate import check_redirect
+
+    pd, method, retry_after, last_status, host = discover_public_domain(
+        assigned_domain, session=session, relay_mode=relay_mode)
+    if pd is None or method not in _GATED_METHODS:
+        return pd, method, retry_after, last_status, host
+    old_root, new_root = _root(assigned_domain), _root(pd)
+    if new_root == old_root:
+        return pd, method, retry_after, last_status, host
+
+    decision = review.get_status(conn, fein, new_root)
+    if decision == review.APPROVED:
+        return pd, method, retry_after, last_status, host
+    held = (None, METHOD_NAME_GATE_HELD, None, None, None)
+    if decision == review.REJECTED:
+        log.info("public_domain: fein=%s %s → %s rejected in pd_redirect_review — storing nothing",
+                 fein, old_root, new_root)
+        return held
+    ok, hint = check_redirect(employer_name or "", old_root, new_root)
+    if ok:
+        return pd, method, retry_after, last_status, host
+    log.info("public_domain: fein=%s %s → %s held by name gate (%s) — queued for review",
+             fein, old_root, new_root, hint)
+    review.queue_pair(conn, fein, old_root, new_root, host, employer_name, hint, source)
+    return held

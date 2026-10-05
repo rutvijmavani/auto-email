@@ -3,7 +3,13 @@
 # Does two things, per CSV row (domain = fein_domain_map.public_domain at scan time):
 #   1. fein_domain_map: verdict parked -> clear public_domain + method + host + last_status/retry/attempt
 #      (careers_url untouched); verdict ok/challenge -> fill a NULL public_domain_host from final_host when its
-#      registrable root equals public_domain (the _write_domain invariant).
+#      registrable root equals public_domain (the _write_domain invariant); verdict ok whose final host is on
+#      a DIFFERENT root (cross-domain redirect, ~255 rows) -> repoint public_domain to the landing root +
+#      host, method http_redirect (owner's redirect is authoritative, user decision 2026-10-04; landing
+#      roots in GENERIC_ROOTS are skipped, as in discover_public_domain). STRICT NAME GATE
+#      (jobs/pd_name_gate.py): the repoint is written only if the employer name matches the NEW domain (or a
+#      human approved the pair); otherwise nothing is written to fein_domain_map and the pair is queued in
+#      pd_redirect_review for the weekly email (--apply only; the dry run prints the full held list).
 #   2. pd_probe_observation: one whole-snapshot evidence row per domain from the oci_* / worker_* / relay_*
 #      columns (oci_hash -> body_hash), via db.pd_probe.backfill_probe (never overwrites a row probed at or
 #      after the scan time).
@@ -30,7 +36,9 @@ from config import PD_BACKFILL_RECHECK_WORKERS
 from concurrent.futures import ThreadPoolExecutor
 from db.connection import get_conn
 from db.pd_probe import backfill_probe
-from jobs.public_domain import _pd_host, _probe_host, _root
+from db.pd_redirect_review import APPROVED, REJECTED, fetch_statuses, queue_pair
+from jobs.pd_name_gate import check_redirect
+from jobs.public_domain import GENERIC_ROOTS, _pd_host, _probe_host, _root
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
@@ -127,14 +135,20 @@ def recheck(domains: list, workers: int) -> dict:
         return dict(ex.map(one, domains))
 
 
-def plan(rows: list, fmap: dict, probed: dict, scan_ts: datetime, rechecked: "dict | None" = None) -> dict:
-    """Classify every row. Returns {clear: [...], fill: [...], obs: [...], stats: Counter, samples: {...}}.
+def plan(rows: list, fmap: dict, probed: dict, scan_ts: datetime, rechecked: "dict | None" = None,
+         statuses: "dict | None" = None) -> dict:
+    """Classify every row. Returns {clear, fill, repoint, review, obs: [...], stats: Counter, samples: {...}}.
 
     rechecked ({domain: live _probe_host result}) gates the clears: a parked row is cleared only if the live
     probe is still parked; a live ok/challenge result keeps the row (and may fill the host instead).
+    statuses ({(fein, new_root): approved|rejected|pending}, db.pd_redirect_review.fetch_statuses) gates the
+    repoints: a cross-domain redirect whose employer name does not match the NEW domain
+    (jobs.pd_name_gate.check_redirect) is held in `review` (nothing written to fein_domain_map) unless a human
+    already approved it; a rejected pair is skipped.
     """
     rechecked = rechecked or {}
-    p = {"clear": [], "fill": [], "obs": [], "stats": Counter(), "samples": {}}
+    statuses = statuses or {}
+    p = {"clear": [], "fill": [], "repoint": [], "review": [], "obs": [], "stats": Counter(), "samples": {}}
     st = p["stats"]
     for row in rows:
         domain = row["domain"].strip().lower()
@@ -145,6 +159,11 @@ def plan(rows: list, fmap: dict, probed: dict, scan_ts: datetime, rechecked: "di
             st["cross_domain (report only)"] += 1
             p["samples"].setdefault("cross_domain", []).append((domain, row.get("final_host")))
         existing = probed.get(domain)
+        if "/" in domain or ":" in domain:
+            # The scan falls back to careers_url when public_domain is NULL, so this row probed a careers
+            # URL, not a domain: no observation key, and fmap's public_domain can't equal it either.
+            st["skipped (careers_url fallback, not a domain)"] += 1
+            continue
         if verdict and (existing is None or existing < scan_ts):
             p["obs"].append((domain, build_obs(row)))
             st["obs insert" if existing is None else "obs update"] += 1
@@ -170,15 +189,38 @@ def plan(rows: list, fmap: dict, probed: dict, scan_ts: datetime, rechecked: "di
                     continue
                 p["clear"].append((fein, domain))
                 p["samples"].setdefault("clear", []).append((domain, row.get("final_reason")))
-        elif verdict in _FILL_VERDICTS and not cur["public_domain_host"]:
+        elif verdict in _FILL_VERDICTS:
             host = (row.get("final_host") or "").strip().lower()
             if host and _root(host) == _root(domain):
-                p["fill"].append((fein, host))
-                p["samples"].setdefault("fill", []).append((domain, host))
+                if not cur["public_domain_host"]:
+                    p["fill"].append((fein, host))
+                    p["samples"].setdefault("fill", []).append((domain, host))
+            elif verdict == "ok" and host:
+                # Cross-domain redirect: the owner's own redirect is authoritative (user decision
+                # 2026-10-04, e.g. mmm.com -> 3m.com); same rule as discover_public_domain's http_redirect.
+                if cur["last_enriched_at"] is not None and cur["last_enriched_at"] > scan_ts:
+                    st["repoint skipped (re-enriched since scan)"] += 1
+                elif _root(host) in GENERIC_ROOTS:
+                    st["repoint skipped (generic root)"] += 1
+                    p["samples"].setdefault("repoint skipped (generic root)", []).append((domain, host))
+                else:
+                    new_root = _root(host)
+                    decision = statuses.get((fein, new_root))
+                    ok, hint = check_redirect(row.get("employer_name") or "", _root(domain), new_root)
+                    if decision == APPROVED or (ok and decision != REJECTED):
+                        p["repoint"].append((fein, domain, new_root, host))
+                        p["samples"].setdefault("repoint", []).append((domain, new_root, host))
+                    elif decision == REJECTED:
+                        st["repoint skipped (rejected in pd_redirect_review)"] += 1
+                    else:   # name gate failed (or still pending): store nothing, queue for the weekly email
+                        p["review"].append((fein, domain, new_root, host, row.get("employer_name") or "", hint))
+                        st["repoint held for review (name gate)"] += 1
             else:
-                st["fill skipped (host root != domain / empty)"] += 1
+                st["fill skipped (empty host / challenge on other root)"] += 1
     st["WOULD CLEAR public_domain"] = len(p["clear"])
     st["WOULD FILL public_domain_host"] = len(p["fill"])
+    st["WOULD REPOINT public_domain (redirect)"] = len(p["repoint"])
+    st["WOULD QUEUE for review (pd_redirect_review)"] = len(p["review"])
     return p
 
 
@@ -190,6 +232,10 @@ def report(p: dict, scan_ts: datetime) -> None:
         print(f"\n{name} samples ({len(items)} total):")
         for it in items[:_SAMPLE_N]:
             print("   ", it)
+    if p["review"]:   # the full list, not a sample: this is what a human decides on
+        print(f"\nHELD FOR REVIEW — employer name does not match the new domain ({len(p['review'])}):")
+        for fein, old, new, host, name, hint in sorted(p["review"], key=lambda x: (x[5], x[4])):
+            print(f"    [{hint}] {name} | {old} -> {new}")
 
 
 def apply(conn, p: dict) -> tuple:
@@ -205,8 +251,17 @@ def apply(conn, p: dict) -> tuple:
         filled += conn.execute(
             "UPDATE fein_domain_map SET public_domain_host = ? "
             "WHERE employer_fein = ? AND public_domain_host IS NULL", (host, fein)).rowcount
+    repointed = 0
+    for fein, old, new, host in p["repoint"]:   # same columns as _write_domain's success branch
+        repointed += conn.execute(
+            "UPDATE fein_domain_map SET public_domain = ?, public_domain_host = ?, "
+            "public_domain_method = 'http_redirect', public_domain_last_status = NULL, "
+            "public_domain_retry_count = 0, public_domain_last_attempt_at = NULL, updated_at = NOW() "
+            "WHERE employer_fein = ? AND public_domain = ?", (new, host, fein, old)).rowcount
+    queued = sum(queue_pair(conn, fein, old, new, host, name, hint, "backfill")
+                 for fein, old, new, host, name, hint in p["review"])
     conn.commit()
-    return cleared, filled
+    return cleared, filled, repointed, queued
 
 
 def main() -> None:
@@ -235,20 +290,23 @@ def main() -> None:
             pd.PD_PROBE_RECORD_ENABLED = False   # dry-run: probe live but write no pd_probe_observation rows
         log.info("re-probing %d parked domains live (%d workers)", len(parked), args.workers)
         rechecked = recheck(parked, args.workers)
-        p = plan(rows, fmap, probed, scan_ts, rechecked)
+        statuses = fetch_statuses(conn, [r["employer_fein"].strip() for r in rows if r.get("employer_fein")])
+        p = plan(rows, fmap, probed, scan_ts, rechecked, statuses)
         report(p, scan_ts)
         if not args.apply:
             print("\nDRY RUN — nothing written. Re-run with --apply to write.")
             return
-        cleared, filled = apply(conn, p)
+        cleared, filled, repointed, queued = apply(conn, p)
         wrote = 0
         for i, (domain, obs) in enumerate(p["obs"], 1):
             wrote += backfill_probe(conn, domain, obs, scan_ts)
             if i % _BATCH == 0:
                 conn.commit()
         conn.commit()
-        log.info("applied: cleared=%d host_filled=%d obs_written=%d", cleared, filled, wrote)
-        print(f"\nAPPLIED: cleared={cleared} host_filled={filled} obs_written={wrote}")
+        log.info("applied: cleared=%d host_filled=%d repointed=%d queued_for_review=%d obs_written=%d",
+                 cleared, filled, repointed, queued, wrote)
+        print(f"\nAPPLIED: cleared={cleared} host_filled={filled} repointed={repointed} "
+              f"queued_for_review={queued} obs_written={wrote}")
     except Exception:
         conn.rollback()
         raise

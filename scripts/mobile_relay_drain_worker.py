@@ -364,11 +364,13 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
         relay_session = make_relay_curl_session(MOBILE_RELAY_PROXY_HOST, MOBILE_RELAY_PROXY_PORT)
         try:
             if pd_missing:
-                from jobs.public_domain import discover_public_domain
+                from jobs.public_domain import discover_public_domain_gated
                 from workers.domain_enrichment_worker import _write_domain
                 # relay_mode: final escalation tier — a 403 here is accepted as the pd.
-                public_domain, method, retry_after, last_status, pd_host = discover_public_domain(
-                    assigned_domain, session=relay_session, relay_mode=True,
+                # Cross-domain redirects still pass the employer-name gate (held in pd_redirect_review).
+                public_domain, method, retry_after, last_status, pd_host = discover_public_domain_gated(
+                    conn, fein, employer_name, assigned_domain, source="relay",
+                    session=relay_session, relay_mode=True,
                 )
                 _write_domain(conn, fein, public_domain, method, last_status,
                               company["public_domain_retry_count"], pd_host)
