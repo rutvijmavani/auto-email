@@ -377,6 +377,8 @@ PD_CANDIDATE_SEEN_RETENTION_DAYS = int(os.getenv("PD_CANDIDATE_SEEN_RETENTION_DA
 PD_CANDIDATE_TITLE_STORE_CHARS   = int(os.getenv("PD_CANDIDATE_TITLE_STORE_CHARS", "200"))   # title chars kept in pd_candidate_seen
 PD_CANDIDATE_TITLE_EMAIL_CHARS   = int(os.getenv("PD_CANDIDATE_TITLE_EMAIL_CHARS", "60"))    # title chars shown in the weekly email
 PD_BACKFILL_RECHECK_WORKERS      = int(os.getenv("PD_BACKFILL_RECHECK_WORKERS", "8"))        # threads re-probing parked rows in scripts/pd_backfill_from_scan.py
+PD_NAME_GATE_MIN_LABEL           = int(os.getenv("PD_NAME_GATE_MIN_LABEL", "3"))             # shortest domain brand label that may match by containment (cme -> cmegroup)
+PD_NAME_GATE_MIN_TOKEN           = int(os.getenv("PD_NAME_GATE_MIN_TOKEN", "4"))             # shortest employer-name word / domain that counts as a match in jobs/pd_name_gate.py
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})

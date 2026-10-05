@@ -40,6 +40,7 @@ _TRUNCATE_TABLES = [
     "pipeline_alerts",
     "pd_probe_observation",
     "pd_candidate_seen",
+    "pd_redirect_review",
     "api_health",
     # Quota singletons (low risk of interference but clear them too)
     "serper_quota",
