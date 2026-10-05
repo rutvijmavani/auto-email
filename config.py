@@ -374,6 +374,8 @@ PD_PROBE_RECORD_ENABLED = os.getenv("PD_PROBE_RECORD_ENABLED", "1") != "0"   # w
 # memory must outlive the evidence it refers to (else a still-probed cluster would be emailed again).
 PD_PROBE_RETENTION_DAYS          = int(os.getenv("PD_PROBE_RETENTION_DAYS", "30"))           # pd_probe_observation rows by probed_at
 PD_CANDIDATE_SEEN_RETENTION_DAYS = int(os.getenv("PD_CANDIDATE_SEEN_RETENTION_DAYS", "90"))  # pd_candidate_seen rows by last_seen_at
+PD_CANDIDATE_TITLE_STORE_CHARS   = int(os.getenv("PD_CANDIDATE_TITLE_STORE_CHARS", "200"))   # title chars kept in pd_candidate_seen
+PD_CANDIDATE_TITLE_EMAIL_CHARS   = int(os.getenv("PD_CANDIDATE_TITLE_EMAIL_CHARS", "60"))    # title chars shown in the weekly email
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ATS PIPELINE QUEUES  (universal member schema: {fein, trigger, source})

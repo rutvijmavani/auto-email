@@ -24,7 +24,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config import PD_SMALL_BODY_BYTES, PD_PROBE_RETENTION_DAYS, PD_CANDIDATE_SEEN_RETENTION_DAYS
+from config import (
+    PD_SMALL_BODY_BYTES, PD_PROBE_RETENTION_DAYS, PD_CANDIDATE_SEEN_RETENTION_DAYS,
+    PD_CANDIDATE_TITLE_STORE_CHARS, PD_CANDIDATE_TITLE_EMAIL_CHARS,
+)
 from db.connection import get_conn
 from db.pd_probe import prune_observations, prune_candidate_seen
 from logger import get_logger, init_logging
@@ -127,7 +130,7 @@ def record_seen(conn, clusters: list) -> None:
             INSERT INTO pd_candidate_seen (cluster_key, rule, source, title, domains, notified_at)
             VALUES (?, ?, ?, ?, ?, NOW())
             ON CONFLICT (cluster_key) DO UPDATE SET last_seen_at = NOW(), domains = EXCLUDED.domains
-        """, (c["key"], c["rule"], c["source"], c["title"][:200], c["domains"]))
+        """, (c["key"], c["rule"], c["source"], c["title"][:PD_CANDIDATE_TITLE_STORE_CHARS], c["domains"]))
 
 
 _SOURCE_HINT = {
@@ -141,7 +144,7 @@ def build_email(new: list) -> tuple:
     """-> (subject, html) listing the NEW clusters, strongest (most domains) first."""
     rows = "".join(
         f"<tr><td>Rule {c['rule']}</td><td>{html.escape(c['source'])}</td><td>{c['domains']}</td>"
-        f"<td>{html.escape(c['title'][:60])}</td><td>{html.escape(str(c['samples']))}</td></tr>"
+        f"<td>{html.escape(c['title'][:PD_CANDIDATE_TITLE_EMAIL_CHARS])}</td><td>{html.escape(str(c['samples']))}</td></tr>"
         for c in sorted(new, key=lambda c: -c["domains"])
     )
     hints = "".join(f"<li>{html.escape(h)}</li>" for h in _SOURCE_HINT.values())
