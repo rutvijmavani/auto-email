@@ -443,13 +443,33 @@ def _probe_host(host: str, session=None, relay_mode: bool = False) -> dict:
         if res["status"] is not None or res["error_type"] == "budget":
             break
 
-    final_url = res["final_url"]
-    final_root = _root(final_url) if final_url else ""
-    platform = platform_no_site(res)
-    if platform:
-        res["www_conflict"] = _www_conflict(host, platform, sess, deadline)
-    verdict, reason = classify(res, final_root, _CHALLENGE_DOMAINS)
-    verdict, reason, cross = apply_outcome_rules(verdict, reason, host_root, final_root)
+    def _judge(r: dict) -> "tuple[str, str, bool, str, str]":
+        furl = r["final_url"]
+        froot = _root(furl) if furl else ""
+        platform = platform_no_site(r)
+        if platform:
+            r["www_conflict"] = _www_conflict(host, platform, sess, deadline)
+        v, why = classify(r, froot, _CHALLENGE_DOMAINS)
+        v, why, xdom = apply_outcome_rules(v, why, host_root, froot)
+        return v, why, xdom, furl, froot
+
+    verdict, reason, cross, final_url, final_root = _judge(res)
+    # A shared host can serve its default-vhost placeholder (parked / "Coming Soon" / "Site not found") on
+    # https while plain http serves the real site (https misconfigured for this name). A parked https
+    # answer therefore gets one http second opinion; a live http result wins, otherwise https stands.
+    if scheme_used == "https" and verdict == "parked" and time.monotonic() < deadline:
+        t0 = time.time()
+        http_res = _fetch_chain(host, "http", sess, deadline)
+        record_external_request("pd_oci", http_res["status"] or 0, int((time.time() - t0) * 1000),
+                                error_kind=(http_res["error_type"] if http_res["status"] is None
+                                            and http_res["error_type"] in ("timeout", "conn_err") else None))
+        if http_res["status"] is not None:
+            h_verdict, h_reason, h_cross, h_url, h_root = _judge(http_res)
+            if h_verdict != "parked":
+                log.info("_probe_host: %s parked on https but %s on http (%s) — using http",
+                         host, h_verdict, h_reason or "-")
+                res, scheme_used = http_res, "http"
+                verdict, reason, cross, final_url, final_root = h_verdict, h_reason, h_cross, h_url, h_root
 
     resolved_by = "relay" if relay_mode else "oci"
     status = res["status"]

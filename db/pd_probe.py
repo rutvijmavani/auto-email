@@ -47,6 +47,39 @@ def _build_sql(fields: tuple) -> str:
 """
 
 
+def _build_backfill_sql(fields: tuple) -> str:
+    return f"""
+    INSERT INTO pd_probe_observation (domain, first_seen_at, probed_at, {", ".join(fields)})
+    VALUES (?, ?, ?, {", ".join("?" for _ in fields)})
+    ON CONFLICT (domain) DO UPDATE SET
+        prev_verdict       = CASE WHEN pd_probe_observation.final_verdict IS DISTINCT FROM EXCLUDED.final_verdict
+                                  THEN pd_probe_observation.final_verdict
+                                  ELSE pd_probe_observation.prev_verdict END,
+        verdict_changed_at = CASE WHEN pd_probe_observation.final_verdict IS DISTINCT FROM EXCLUDED.final_verdict
+                                  THEN EXCLUDED.probed_at
+                                  ELSE pd_probe_observation.verdict_changed_at END,
+        probed_at          = EXCLUDED.probed_at,
+        {", ".join(f"{f} = EXCLUDED.{f}" for f in fields)}
+    WHERE pd_probe_observation.probed_at < EXCLUDED.probed_at
+"""
+
+
+def backfill_probe(conn, domain: str, obs: dict, probed_at) -> bool:
+    """Write one historical (scan CSV) observation on the caller's connection; caller commits.
+
+    Unlike record_probe this is a whole-snapshot write (every key in obs is written, None included, so no
+    stale tier evidence survives next to the new verdict) and it is freshness-guarded: an existing row
+    probed at or after `probed_at` is left untouched, so live evidence is never overwritten by an older
+    scan. Returns True if a row was inserted or updated. Raises on DB error (one-off script, not a
+    best-effort path).
+    """
+    if not domain or not obs.get("final_verdict"):
+        return False
+    fields = tuple(f for f in _FIELDS if f in obs)
+    params = (domain.lower().strip(), probed_at, probed_at) + tuple(obs[f] for f in fields)
+    return conn.execute(_build_backfill_sql(fields), params).rowcount > 0
+
+
 def prune_observations(conn, days: int) -> int:
     """Delete pd_probe_observation rows not probed for `days` days. Returns rows deleted; caller commits."""
     return conn.execute(
