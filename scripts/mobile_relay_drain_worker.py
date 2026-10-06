@@ -266,6 +266,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
             log.warning("fein=%s: relay dropping careers_url %s (%s, source=%s)",
                         fein, careers_url, _why, careers_source)
             careers_url = careers_source = None
+            detected_platform = detected_slug = None
 
     # Persist — same shape as process_employer's own direct-OCI persist block
     # (scripts/discover_h1b_ats.py, end of process_employer).

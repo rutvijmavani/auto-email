@@ -536,7 +536,7 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                     _why = blocked_reason(p6_careers, employer_name)
                     if _why:
                         log.warning("fein=%s dropping phase6 careers_url %s (%s)", fein, p6_careers, _why)
-                        p6_careers = None
+                        p6_careers = p6_platform = p6_slug = None
 
                 if p6_careers:
                     _careers_source_this_run = "phase6"

@@ -66,6 +66,14 @@ class TestPhase4AnchorCheck(unittest.TestCase):
         ok, why = self.check("https://boards.greenhouse.io/zenith", "acme.com", "Acme Corp")
         self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
 
+    def test_ats_tenant_must_equal_identifier_not_contain_it(self):
+        ok, why = self.check("https://boards.greenhouse.io/acme-other", "acme.com", "Acme Corp")
+        self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
+        ok, why = self.check("https://acmeother.wd5.myworkdayjobs.com/en-US/x", "acme.com", "Acme Corp")
+        self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
+        self.assertTrue(self.check("https://boards.greenhouse.io/acme-corp", "acme.com", "Acme Corp")[0])
+        self.assertTrue(self.check("https://jobs.lever.co/acme/abc123", "acme.com", "Acme Corp")[0])
+
     def test_vendor_anchor_never_blesses_vendor_landing(self):
         # pd is a Workspace-email domain: a google.com result for an unrelated employer stays rejected
         ok, why = self.check("https://www.google.com/about/careers", "tekdata.com", "Tek Data LLC")

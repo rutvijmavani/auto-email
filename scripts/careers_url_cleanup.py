@@ -101,7 +101,7 @@ def main(argv=None) -> int:
           f"{with_ats_rows} have company_ats rows")
     print("\nsample (first 15):")
     for r in failing[:15]:
-        print(f"  {r['employer_fein']}  {(r['employer_name'] or '')[:30]:30} {r['careers_source']:8} "
+        print(f"  {r['employer_fein']}  {(r['employer_name'] or '')[:30]:30} {(r['careers_source'] or '-'):8} "
               f"{r['reason']:22} {r['careers_url'][:70]}")
     print("\nNo database writes were made.")
     return 0

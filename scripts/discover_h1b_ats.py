@@ -2175,6 +2175,20 @@ def process_employer(
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
 
+    # Vendor / challenge / aggregator host guard, all phases: a probe that started from a mail or
+    # CDN domain (google.com, cloudflare.com) or followed a bot challenge (perfdrive.com) must not
+    # store that host as the employer's careers page. Phase 3-7 results are otherwise anchored by
+    # construction (they start from the company's own domain). Runs BEFORE the website_url rewrite
+    # below so a blocked host can never be promoted into website_url, and drops any ATS platform/slug
+    # derived from the blocked result (everything except the domain-keyed company_ats cache).
+    if careers_url:
+        _why = blocked_reason(careers_url, canonical_name or name)
+        if _why:
+            log.warning("  Dropping careers_url %s (%s, source=%s)", careers_url, _why, careers_source)
+            careers_url = careers_source = None
+            if ats_source != "company_ats_cache":
+                detected_platform = detected_slug = ats_source = None
+
     # Update website_url when careers discovery reveals a different real domain.
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
     # Skip when the careers URL lands on a third-party ATS vendor domain (greenhouse.io, etc.)
@@ -2196,16 +2210,6 @@ def process_employer(
             log.info("  Updating website_url: %s → https://%s (via careers domain)",
                      website_url, _careers_root)
             website_url = f"https://{_careers_root}"
-
-    # Vendor / challenge / aggregator host guard, all phases: a probe that started from a mail or
-    # CDN domain (google.com, cloudflare.com) or followed a bot challenge (perfdrive.com) must not
-    # store that host as the employer's careers page. Phase 3-7 results are otherwise anchored by
-    # construction (they start from the company's own domain).
-    if careers_url:
-        _why = blocked_reason(careers_url, canonical_name or name)
-        if _why:
-            log.warning("  Dropping careers_url %s (%s, source=%s)", careers_url, _why, careers_source)
-            careers_url = careers_source = None
 
     if careers_url:
         log.info(

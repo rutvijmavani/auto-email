@@ -20,7 +20,7 @@ Two checks, for two different failure modes:
 from urllib.parse import urlparse
 
 from config import PD_NAME_GATE_MIN_LABEL
-from jobs.pd_name_gate import NAME_STOP_WORDS, _brand, _matches, _name_tokens, _squash
+from jobs.pd_name_gate import NAME_STOP_WORDS, _brand, _name_tokens, _squash
 from jobs.public_domain import GENERIC_ROOTS, _CHALLENGE_DOMAINS, _root
 
 # Mail / CDN / hosting vendors beyond jobs.public_domain.GENERIC_ROOTS. Blocked as a careers host unless the
@@ -82,6 +82,23 @@ def _same_brand(a_root: str, b_root: str) -> bool:
     return len(short) >= PD_NAME_GATE_MIN_LABEL and short in long_
 
 
+def _tenant_matches(employer_name: str, brand: str, tenant_text: str) -> bool:
+    """True when a whole host label / path segment of an ATS URL IS the employer identifier.
+
+    tenant_text is the ATS subdomain + path ('acme.wd5.', '/acmecorp/jobs'). Segments split on '.' and '/'
+    only; hyphens/underscores stay inside a segment and are squashed away, so 'acme-other' becomes 'acmeother'
+    and does NOT equal 'acme', while 'acme-corp' / 'acmecorp' equals the full name 'Acme Corp'."""
+    import re
+    words = re.findall(r"[a-z0-9]+", (employer_name or "").lower())
+    identifiers = {t for t in _name_tokens(employer_name)}
+    identifiers.add("".join(words))
+    identifiers.add("".join(w for w in words if w not in NAME_STOP_WORDS))
+    if len(brand) >= PD_NAME_GATE_MIN_LABEL + 1:
+        identifiers.add(brand)
+    identifiers.discard("")
+    return any(_squash(seg) in identifiers for seg in re.split(r"[./]", tenant_text.lower()) if seg)
+
+
 def phase4_anchor_check(url: str, anchor_root: str, employer_name: str, ats_roots) -> "tuple[bool, str]":
     """-> (ok, reason). anchor_root is the stored public_domain root; callers must not call this without one."""
     reason = blocked_reason(url, employer_name)
@@ -94,12 +111,7 @@ def phase4_anchor_check(url: str, anchor_root: str, employer_name: str, ats_root
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
         sub = host[:-len(root)] if host.endswith(root) else host
-        text = _squash(sub + parsed.path)
-        tokens = _name_tokens(employer_name)
-        brand = _brand(anchor_root)
-        if len(brand) >= PD_NAME_GATE_MIN_LABEL + 1:
-            tokens.append(brand)
-        if _matches(tokens, text):
+        if _tenant_matches(employer_name, _brand(anchor_root), sub + parsed.path):
             return True, ""
         return False, REASON_ATS_NO_NAME
     return False, REASON_OFF_DOMAIN
