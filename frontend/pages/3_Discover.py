@@ -162,6 +162,10 @@ def load_filter_options() -> dict:
 
 SOC_SORT_FILED     = "Filed for SOC ↓"
 SOC_SORT_CERTIFIED = "Certified for SOC ↓"
+SORT_PETITIONS     = "Petition count ↓"
+
+FILTER_ANY, FILTER_HAS, FILTER_MISSING = "Any", "Has", "Missing"
+_FILTER_OPTIONS = [FILTER_ANY, FILTER_HAS, FILTER_MISSING]
 
 
 def _normalize_soc_prefix(raw: str) -> str:
@@ -184,9 +188,26 @@ def load_employers(
     min_certified: int,
     sort_by: str,
     limit: int,
+    ats_filter: str = FILTER_ANY,
+    careers_filter: str = FILTER_ANY,
+    pd_filter: str = FILTER_ANY,
 ) -> pd.DataFrame:
     clauses: list[str] = []
     params: list = []
+
+    # Data-completeness filters (ATS / careers page / public domain). Each is independent, so the three
+    # tri-state selectors cover every has/missing combination. "ATS" = an ATS detected in h1b_ats_discovery
+    # OR any company_ats row (the two ATS-tracking systems are unioned everywhere else in the pipeline).
+    for _flt, _expr in (
+        (ats_filter,     "(h.detected_platform IS NOT NULL OR EXISTS "
+                         "(SELECT 1 FROM company_ats ca WHERE ca.employer_fein = e.employer_fein))"),
+        (careers_filter, "(COALESCE(f.careers_url, '') <> '')"),
+        (pd_filter,      "(COALESCE(f.public_domain, '') <> '')"),
+    ):
+        if _flt == FILTER_HAS:
+            clauses.append(_expr)
+        elif _flt == FILTER_MISSING:
+            clauses.append(f"NOT {_expr}")
 
     if search:
         clauses.append("e.employer_name ILIKE %s")
@@ -244,15 +265,23 @@ def load_employers(
         }.get(sort_by, "sp.soc_filed DESC, sp.soc_certified DESC")
     else:
         order = {
+            SORT_PETITIONS:       "COALESCE(u.petition_count, 0) DESC, e.total_certified DESC",
             "Total certified ↓":  "e.total_certified DESC",
             "Approval rate ↓":    "e.approval_rate DESC NULLS LAST",
             "Total filed ↓":      "e.total_filed DESC",
             "Name A→Z":           "e.employer_name ASC",
-        }.get(sort_by, "e.total_certified DESC")
+        }.get(sort_by, "COALESCE(u.petition_count, 0) DESC, e.total_certified DESC")
 
     sql = f"""
         SELECT
             {soc_cols}
+            COALESCE(u.petition_count, 0) AS petition_count,
+            COALESCE(h.detected_platform,
+                     (SELECT ca.platform FROM company_ats ca
+                      WHERE ca.employer_fein = e.employer_fein
+                      ORDER BY ca.priority DESC LIMIT 1)) AS ats_platform,
+            f.careers_url,
+            f.public_domain,
             e.employer_fein,
             e.employer_name,
             e.employer_city,
@@ -268,6 +297,9 @@ def load_employers(
             e.top_job_titles,
             array_length(e.quarters_processed, 1) AS quarters_count
         FROM dol_h1b_employers e
+        LEFT JOIN uscis_petition_counts u ON u.employer_fein = e.employer_fein
+        LEFT JOIN fein_domain_map f       ON f.employer_fein = e.employer_fein
+        LEFT JOIN h1b_ats_discovery h     ON h.employer_fein = e.employer_fein
         {soc_join}
         {where}
         ORDER BY {order}
@@ -573,6 +605,13 @@ with st.sidebar:
 
     st.divider()
 
+    st.caption("Data completeness (combine freely)")
+    ats_filter     = st.selectbox("ATS", _FILTER_OPTIONS)
+    careers_filter = st.selectbox("Career page", _FILTER_OPTIONS)
+    pd_filter      = st.selectbox("Public domain", _FILTER_OPTIONS)
+
+    st.divider()
+
     h1b_dependent = st.checkbox("H1B dependent only")
     min_approval  = st.slider("Min approval rate (%)", 0, 100, 0, step=5)
     min_certified = st.number_input("Min certified (all-time)", min_value=0, value=0, step=10)
@@ -583,7 +622,7 @@ with st.sidebar:
         # SOC mode: ranking is by petitions for that SOC only, not the employer's all-time totals.
         _sort_options = [SOC_SORT_FILED, SOC_SORT_CERTIFIED, "Name A→Z"]
     else:
-        _sort_options = ["Total certified ↓", "Approval rate ↓", "Total filed ↓", "Name A→Z"]
+        _sort_options = [SORT_PETITIONS, "Total certified ↓", "Approval rate ↓", "Total filed ↓", "Name A→Z"]
     sort_by = st.selectbox("Sort by", _sort_options)
     limit = st.selectbox("Max results", [100, 500, 1000, 2000], index=1)
 
@@ -607,6 +646,9 @@ df = load_employers(
     min_certified=int(min_certified),
     sort_by=sort_by,
     limit=int(limit),
+    ats_filter=ats_filter,
+    careers_filter=careers_filter,
+    pd_filter=pd_filter,
 )
 
 
@@ -650,7 +692,8 @@ if _soc_mode:
     )
 display = df[
     (["soc_filed", "soc_certified"] if _soc_mode else []) + [
-        "employer_name", "employer_city", "employer_state", "naics_code",
+        "employer_name", "petition_count", "ats_platform", "careers_url", "public_domain",
+        "employer_city", "employer_state", "naics_code",
         "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
     ]
 ].copy()
@@ -662,6 +705,10 @@ display.rename(columns={
     "soc_filed":       "SOC Filed",
     "soc_certified":   "SOC Certified",
     "employer_name":   "Employer",
+    "petition_count":  "Petitions",
+    "ats_platform":    "ATS",
+    "careers_url":     "Career page",
+    "public_domain":   "Public domain",
     "employer_city":   "City",
     "employer_state":  "State",
     "naics_code":      "NAICS",
@@ -682,6 +729,8 @@ selected = st.dataframe(
         "Approval %": st.column_config.NumberColumn("Approval %", format="%.1f%%"),
         "SOC Filed":     st.column_config.NumberColumn("SOC Filed",     format="%d"),
         "SOC Certified": st.column_config.NumberColumn("SOC Certified", format="%d"),
+        "Petitions":  st.column_config.NumberColumn("Petitions",  format="%d"),
+        "Career page": st.column_config.LinkColumn("Career page"),
         "Filed":      st.column_config.NumberColumn("Filed",      format="%d"),
         "Certified":  st.column_config.NumberColumn("Certified",  format="%d"),
         "Qtrs":       st.column_config.NumberColumn("Qtrs",       format="%d"),

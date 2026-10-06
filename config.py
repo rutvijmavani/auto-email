@@ -344,7 +344,10 @@ EMAIL_LLM_GEMINI_MODEL     = os.getenv("EMAIL_LLM_GEMINI_MODEL", "gemma-4-26b-it
 DISCOVER_ATS_LLM_PROVIDER  = os.getenv("DISCOVER_ATS_LLM_PROVIDER", "gemini")
 DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b-it")
 
-CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "")     # Cloudflare probe-worker endpoint
+# Brave results requested per Phase 4 search (API max 20; one request = one quota call at any count)
+BRAVE_RESULT_COUNT = int(os.getenv("BRAVE_RESULT_COUNT", "20"))
+
+CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "") # Cloudflare probe-worker endpoint
 CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
 # Free-tier Workers plan resets daily (100K req/day); stop calling the worker
 # before the account gets throttled/suspended for the day. Tracked atomically

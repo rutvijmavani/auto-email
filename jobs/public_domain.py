@@ -855,6 +855,18 @@ def discover_public_domain_gated(conn, fein: str, employer_name: "str | None", a
 
     pd, method, retry_after, last_status, host = discover_public_domain(
         assigned_domain, session=session, relay_mode=relay_mode)
+
+    # Vendor guard (Issue 3): a mail/CDN/hosting vendor root is never a company's public domain unless the
+    # employer IS that vendor (Google LLC / Cloudflare Inc). Covers every exit (same_domain, redirects, CT).
+    # no_signal carries no last_status, so it does not enter the pd-retry loop.
+    if pd is not None:
+        from jobs.careers_url_check import VENDOR_ROOTS, _name_owns_root
+        pd_root = _root(pd)
+        if pd_root in VENDOR_ROOTS and not _name_owns_root(employer_name or "", pd_root):
+            log.info("public_domain: fein=%s %s → %s is a vendor root the employer does not own — storing nothing",
+                     fein, assigned_domain, pd_root)
+            return None, "no_signal", None, None, None
+
     if pd is None or method not in _GATED_METHODS:
         return pd, method, retry_after, last_status, host
     old_root, new_root = _root(assigned_domain), _root(pd)

@@ -55,7 +55,7 @@ import requests
 
 from config import (
     CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
-    DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
+    BRAVE_RESULT_COUNT, DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
     MOBILE_RELAY_GUARD_PREFIX, MOBILE_RELAY_GUARD_TTL_S, MOBILE_RELAY_QUEUE, PD_RETRY_CAP,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
@@ -63,6 +63,9 @@ from db.connection import get_conn
 from db.external_api_health import get_day_request_count, get_month_request_count, record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
+from jobs.careers_url_check import (
+    AGGREGATOR_ROOTS, ats_derived_from_careers_source, blocked_reason, phase4_rank,
+)
 from jobs.http_safe import (
     make_safe_session as _make_safe_session,
     make_safe_curl_session as _make_safe_curl_session,
@@ -884,11 +887,7 @@ def _company_tokens(name: str) -> set[str]:
     return tokens
 
 
-_AGGREGATOR_DOMAINS = frozenset({
-    "linkedin.com", "indeed.com", "glassdoor.com", "ziprecruiter.com",
-    "monster.com", "careerbuilder.com", "simplyhired.com", "dice.com",
-    "hired.com", "wellfound.com", "builtin.com",
-})
+_AGGREGATOR_DOMAINS = AGGREGATOR_ROOTS
 
 
 def _is_plausible_career_url(url: str, company_tokens: set[str]) -> bool:
@@ -949,13 +948,23 @@ def _brave_save_quota(data: dict) -> None:
 def brave_career_search(
     company_name: str,
     website_url: str | None = None,
+    anchor_domain: str | None = None,
 ) -> str | None:
     """
-    Search Brave for "{company} careers", filter top 10 results to plausible
-    career pages, then use Qwen3-8B to pick the best when multiple survive.
+    Search Brave for "{company} careers", filter the top BRAVE_RESULT_COUNT results to plausible
+    anchored career pages, keep only the best-ranked tier (pd root > same brand > ATS tenant), and use
+    the LLM only to break a tie inside that tier.
 
-    Returns the chosen URL or None if quota exhausted / key missing / no match.
+    anchor_domain is the employer's verified public_domain. A search result has no ownership
+    proof of its own, so without an anchor nothing is searched or stored (no Brave quota spent),
+    and with one only results on the pd root / a same-brand root / a known ATS host carrying the
+    employer name survive (jobs.careers_url_check.phase4_anchor_check).
+
+    Returns the chosen URL or None if no anchor / quota exhausted / key missing / no match.
     """
+    if not anchor_domain:
+        log.debug("Brave: no public_domain anchor for %r — skipping", company_name)
+        return None
     if not _BRAVE_API_KEY:
         log.debug("BRAVE_API_KEY not set — skipping Brave career search")
         return None
@@ -984,7 +993,7 @@ def brave_career_search(
                 "X-Subscription-Token": _BRAVE_API_KEY,
                 "Accept": "application/json",
             },
-            params={"q": query, "count": 10},
+            params={"q": query, "count": BRAVE_RESULT_COUNT},
             timeout=_HTTP_TIMEOUT,
         )
         _brave_response_ms = int((time.time() - _brave_t0) * 1000)
@@ -1014,20 +1023,29 @@ def brave_career_search(
         record_external_request("brave", 200, _brave_response_ms)
 
         organics   = resp.json().get("web", {}).get("results", [])
-        candidates = [
-            item["url"] for item in organics
-            if item.get("url")
-            and _is_public_url(item["url"])
-            and _is_plausible_career_url(item["url"], tokens)
-        ]
+        anchor_root = _root_domain(anchor_domain)
+        candidates = []
+        for item in organics:
+            url = item.get("url")
+            if not (url and _is_public_url(url) and _is_plausible_career_url(url, tokens)):
+                continue
+            rank, why = phase4_rank(url, anchor_root, company_name, _KNOWN_ATS_DOMAINS)
+            if rank is not None:
+                candidates.append((rank, url))
+            else:
+                log.debug("Brave: rejected %s for %r (%s, anchor=%s)", url, company_name, why, anchor_root)
 
         log.debug(
-            "Brave: %d/%d results plausible for %r",
+            "Brave: %d/%d results plausible+anchored for %r",
             len(candidates), len(organics), company_name,
         )
 
         if not candidates:
             return None
+        # Deterministic ranking: only the best-ranked tier (pd root > same brand > ATS tenant) is kept;
+        # search order is preserved within a tier. The LLM is just a tie-breaker inside that tier.
+        best_rank  = min(r for r, _ in candidates)
+        candidates = [u for r, u in candidates if r == best_rank]
         if len(candidates) == 1:
             log.debug("Brave: single candidate → %s", candidates[0])
             return candidates[0]
@@ -1051,6 +1069,19 @@ def brave_career_search(
 # ─────────────────────────────────────────────────────────────────────────────
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _brave_landing_rejected(final_url: str | None, employer_name: str, anchor_domain: str | None) -> str:
+    """Phase 4 rejection reason for the page a Brave result actually landed on after redirects
+    ('' = accepted / landing unknown). The candidate host passed phase4_rank before the fetch; a redirect
+    can still end on an aggregator, vendor host or an off-anchor domain, so the landing URL gets the same
+    anchored check (jobs.careers_url_check.phase4_rank) before it is stored or fingerprinted."""
+    if not final_url:
+        return ""
+    if not anchor_domain:
+        return blocked_reason(final_url, employer_name)
+    rank, why = phase4_rank(final_url, _root_domain(anchor_domain), employer_name, _KNOWN_ATS_DOMAINS)
+    return "" if rank is not None else why
+
 
 def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
     """
@@ -1480,6 +1511,7 @@ def load_top_sponsors(limit: int, conn) -> list[dict]:
             d.employer_name,
             d.poc_email_domain,
             fdm.assigned_domain,
+            fdm.public_domain,
             CASE WHEN fdm.public_domain IS NOT NULL THEN fdm.public_domain_host END AS fetch_host,
             COALESCE(
                 SUM(
@@ -1535,6 +1567,7 @@ def load_by_fein(fein: str, conn) -> dict | None:
     cur.execute("""
         SELECT d.employer_fein, d.employer_name, d.poc_email_domain,
                fdm.assigned_domain,
+               fdm.public_domain,
                CASE WHEN fdm.public_domain IS NOT NULL THEN fdm.public_domain_host END AS fetch_host
         FROM dol_h1b_employers d
         LEFT JOIN fein_domain_map fdm ON fdm.employer_fein = d.employer_fein
@@ -2075,15 +2108,21 @@ def process_employer(
             if not careers_url and not skip_brave and not _phase3_blocked:
                 search_name = canonical_name or strip_legal_suffixes(name) or name
                 log.info("  Brave search fallback for %r …", search_name)
-                brave_url = brave_career_search(search_name, website_url=website_url)
+                brave_url = brave_career_search(search_name, website_url=website_url,
+                                                anchor_domain=emp.get("public_domain"))
                 if brave_url:
                     careers_url    = brave_url
                     careers_source = "phase4"
                     log.info("  Brave found: %s", brave_url)
                     # Phase 5: fingerprint the Brave result page
                     try:
-                        html, _, _ = _fetch_html(brave_url, _fetch_session)
-                        if html:
+                        html, _final, _ = _fetch_html(brave_url, _fetch_session)
+                        _why = _brave_landing_rejected(_final, canonical_name or name, emp.get("public_domain"))
+                        if _why:
+                            log.warning("  Brave result %s landed on rejected %s (%s) — dropping",
+                                        brave_url, _final, _why)
+                            careers_url = careers_source = None
+                        elif html:
                             detected_platform, detected_slug = _find_ats_in_html(html)
                             if detected_platform:
                                 ats_source = "phase5"
@@ -2160,6 +2199,20 @@ def process_employer(
                     log.info("  Phase 7 HIT: %s / %s", detected_platform, detected_slug)
         except Exception as e:
             log.warning("  Phase 7 (career_detector) failed: %s", e)
+
+    # Vendor / challenge / aggregator host guard, all phases: a probe that started from a mail or
+    # CDN domain (google.com, cloudflare.com) or followed a bot challenge (perfdrive.com) must not
+    # store that host as the employer's careers page. Phase 3-7 results are otherwise anchored by
+    # construction (they start from the company's own domain). Runs BEFORE the website_url rewrite
+    # below so a blocked host can never be promoted into website_url, and drops any ATS platform/slug
+    # derived from the blocked result (everything except the domain-keyed company_ats cache).
+    if careers_url:
+        _why = blocked_reason(careers_url, canonical_name or name)
+        if _why:
+            log.warning("  Dropping careers_url %s (%s, source=%s)", careers_url, _why, careers_source)
+            if ats_derived_from_careers_source(ats_source, careers_source):
+                detected_platform = detected_slug = ats_source = None
+            careers_url = careers_source = None
 
     # Update website_url when careers discovery reveals a different real domain.
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.
@@ -2268,10 +2321,15 @@ def process_employer(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_brave_candidates(limit: int, conn) -> list[dict]:
-    """Companies enriched by KG+probe but still missing a careers URL."""
+    """Companies enriched by KG+probe but still missing a careers URL.
+
+    Only companies with a verified public_domain: Brave results are accepted only against that
+    anchor (brave_career_search), so a pd-less row would burn quota for a guaranteed rejection and
+    be stamped brave_checked_at, hiding it from the pass once its pd resolves."""
     cur = conn.cursor()
     cur.execute("""
         SELECT h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
+               fdm.public_domain,
                COALESCE(
                    SUM(
                        u.new_employment_approval +
@@ -2297,8 +2355,9 @@ def _load_brave_candidates(limit: int, conn) -> list[dict]:
           AND h.brave_checked_at IS NULL
           AND fdm.careers_url IS NULL
           AND h.website_url IS NOT NULL
+          AND fdm.public_domain IS NOT NULL
         GROUP BY h.employer_fein, h.employer_name, h.website_url, h.canonical_name,
-                 d.total_certified
+                 fdm.public_domain, d.total_certified
         ORDER BY h.last_checked ASC
         LIMIT %s
     """, (limit,))
@@ -2370,7 +2429,8 @@ def _run_brave_pass(conn, r, args) -> None:
                             i - 1, len(candidates))
                 break
 
-            brave_url   = brave_career_search(search_name, website_url=website_url)
+            brave_url   = brave_career_search(search_name, website_url=website_url,
+                                              anchor_domain=row.get("public_domain"))
             _ats_source = "brave_pass"
             if brave_url:
                 careers_url = brave_url
@@ -2381,8 +2441,14 @@ def _run_brave_pass(conn, r, args) -> None:
                     _ats_source = "phase4"
                 else:
                     try:
-                        html_content, _, _ = _fetch_html(brave_url)
-                        if html_content:
+                        html_content, _final, _ = _fetch_html(brave_url)
+                        _why = _brave_landing_rejected(_final, row.get("canonical_name") or name,
+                                                       row.get("public_domain"))
+                        if _why:
+                            log.warning("  Brave result %s landed on rejected %s (%s) — dropping",
+                                        brave_url, _final, _why)
+                            careers_url = None
+                        elif html_content:
                             platform, slug = _find_ats_in_html(html_content)
                             if platform:
                                 _ats_source = "phase5"

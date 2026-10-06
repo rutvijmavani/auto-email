@@ -166,7 +166,8 @@ def _clear_careers_url_last_status(conn, fein: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_name: str,
-                                total_approvals: int, run_brave: bool, session) -> dict:
+                                total_approvals: int, run_brave: bool, session,
+                                public_domain: "str | None" = None) -> dict:
     """Phase 3 → Phase 6 → Phase 7 career-discovery chain over the relay session —
     the exact same functions scripts.discover_h1b_ats.process_employer calls for
     those phases (discover_careers_url, jobs.career_page.detect_via_career_page,
@@ -187,7 +188,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
     possible from Phase 3) updates careers_url_last_status only; a resolved
     platform+slug upserts company_ats.
     """
-    careers_url = detected_platform = detected_slug = careers_source = None
+    careers_url = detected_platform = detected_slug = careers_source = ats_source = None
     careers_url_last_status = None
 
     website_url = m._resolve_website_redirect(website_url, session)
@@ -198,6 +199,8 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
             m.discover_careers_url(website_url, session)
         if careers_url:
             careers_source = "phase3"
+        if detected_platform:
+            ats_source = "phase3"
     except Exception as e:
         log.warning("fein=%s: relay Phase 3 probe failed: %s", fein, e)
 
@@ -205,15 +208,23 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
     if not careers_url and run_brave:
         try:
             search_name = m.strip_legal_suffixes(company_name) or company_name
-            brave_url = m.brave_career_search(search_name, website_url=website_url)
+            brave_url = m.brave_career_search(search_name, website_url=website_url,
+                                              anchor_domain=public_domain)
             if brave_url:
                 careers_url    = brave_url
                 careers_source = "phase4"
                 log.info("fein=%s: relay Phase 4 (Brave) found: %s", fein, brave_url)
                 try:
-                    html, _, _ = m._fetch_html(brave_url, session)
-                    if html:
+                    html, _final, _ = m._fetch_html(brave_url, session)
+                    _why = m._brave_landing_rejected(_final, company_name, public_domain)
+                    if _why:
+                        log.warning("fein=%s: relay Brave result %s landed on rejected %s (%s) — dropping",
+                                    fein, brave_url, _final, _why)
+                        careers_url = careers_source = None
+                    elif html:
                         detected_platform, detected_slug = m._find_ats_in_html(html)
+                        if detected_platform:
+                            ats_source = "phase5"
                 except Exception as e:
                     log.warning("fein=%s: relay Phase 4 HTML fingerprint failed: %s", fein, e)
         except Exception as e:
@@ -230,6 +241,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                 if _cp.get("platform"):
                     detected_platform = _cp["platform"]
                     detected_slug     = _cp.get("slug")
+                    ats_source        = "phase6"
                 if _cp.get("careers_url"):
                     careers_url    = _cp["careers_url"]
                     careers_source = "phase6"
@@ -249,6 +261,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                 _best_slug = _best.get("slug") or ""
                 if _best_slug:
                     detected_slug = _best_slug
+                ats_source = "phase7"
                 if not careers_url:
                     _src = _best.get("source_url")
                     if _src:
@@ -256,6 +269,16 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                         careers_source = "phase7"
         except Exception as e:
             log.warning("fein=%s: relay Phase 7 (career_detector) failed: %s", fein, e)
+
+    # Same all-phase vendor/challenge/aggregator host guard as process_employer.
+    if careers_url:
+        _why = m.blocked_reason(careers_url, company_name)
+        if _why:
+            log.warning("fein=%s: relay dropping careers_url %s (%s, source=%s)",
+                        fein, careers_url, _why, careers_source)
+            if m.ats_derived_from_careers_source(ats_source, careers_source):
+                detected_platform = detected_slug = ats_source = None
+            careers_url = careers_source = None
 
     # Persist — same shape as process_employer's own direct-OCI persist block
     # (scripts/discover_h1b_ats.py, end of process_employer).
@@ -396,6 +419,7 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
                     result = _resolve_careers_via_relay(
                         conn, m, fein, website_url, employer_name,
                         int(company["petition_count"] or 0), run_brave, relay_session,
+                        public_domain=company["public_domain"],
                     )
                 except Exception as e:
                     log.error("fein=%s: careers relay resolution failed: %s", fein, e, exc_info=True)

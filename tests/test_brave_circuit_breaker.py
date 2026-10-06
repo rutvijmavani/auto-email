@@ -49,7 +49,7 @@ class TestBrave402CircuitBreaker(unittest.TestCase):
         mock_resp.status_code = 402
         mock_get.return_value = mock_resp
 
-        result = dh.brave_career_search("Acme Corp")
+        result = dh.brave_career_search("Acme Corp", anchor_domain="acme.com")
 
         self.assertIsNone(result)
         self.assertGreater(dh._brave_blocked_until, time.time())
@@ -64,7 +64,7 @@ class TestBrave402CircuitBreaker(unittest.TestCase):
     def test_tripped_breaker_skips_http_call_entirely(self, mock_get, _mock_quota, mock_record):
         dh._brave_blocked_until = time.time() + dh._BRAVE_402_COOLDOWN_S
 
-        result = dh.brave_career_search("Acme Corp")
+        result = dh.brave_career_search("Acme Corp", anchor_domain="acme.com")
 
         self.assertIsNone(result)
         mock_get.assert_not_called()
@@ -83,7 +83,7 @@ class TestBrave402CircuitBreaker(unittest.TestCase):
         mock_resp.json.return_value = {"web": {"results": []}}
         mock_get.return_value = mock_resp
 
-        result = dh.brave_career_search("Acme Corp")
+        result = dh.brave_career_search("Acme Corp", anchor_domain="acme.com")
 
         mock_get.assert_called_once()
         self.assertIsNone(result)  # no plausible candidates in the fake response

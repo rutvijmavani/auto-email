@@ -43,6 +43,7 @@ from config import (
 )
 from db.connection import get_conn
 from jobs.career_page import detect_via_career_page
+from jobs.careers_url_check import blocked_reason
 from jobs.public_domain import discover_public_domain_gated
 from logger import get_logger, init_logging
 from workers.heartbeat import Heartbeat
@@ -492,6 +493,13 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
 
         careers_url, p3_platform, p3_slug, p3_last_status = _phase3(website_url)
         if careers_url:
+            # Vendor / challenge / aggregator host (google.com for a Workspace-email firm, a bot
+            # challenge page...) is not this employer's careers page — drop it and its ATS guess.
+            _why = blocked_reason(careers_url, employer_name)
+            if _why:
+                log.warning("fein=%s dropping phase3 careers_url %s (%s)", fein, careers_url, _why)
+                careers_url = p3_platform = p3_slug = None
+        if careers_url:
             _careers_source_this_run = "phase3"
             _write_careers(conn, fein, careers_url, source="phase3")
             conn.commit()
@@ -523,6 +531,12 @@ def _process_company(r, fein: str, petition_count: int, trigger: str = "enrichme
                 p6_careers  = p6_result.get("careers_url")
                 p6_platform = p6_result.get("platform")
                 p6_slug     = p6_result.get("slug")
+
+                if p6_careers:
+                    _why = blocked_reason(p6_careers, employer_name)
+                    if _why:
+                        log.warning("fein=%s dropping phase6 careers_url %s (%s)", fein, p6_careers, _why)
+                        p6_careers = p6_platform = p6_slug = None
 
                 if p6_careers:
                     _careers_source_this_run = "phase6"
