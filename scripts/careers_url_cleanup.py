@@ -18,14 +18,13 @@ import sys
 from collections import Counter
 
 from db.connection import get_conn
-from jobs.careers_url_check import blocked_reason, phase4_anchor_check
+from jobs.careers_url_check import ats_derived_from_careers_source, blocked_reason, phase4_anchor_check
 from jobs.public_domain import _root
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
 
 REASON_NO_ANCHOR = "no-public-domain-anchor"
-_BRAVE_DERIVED_ATS_SOURCES = ("phase4", "phase5", "brave_pass")
 
 _SQL = """
     SELECT f.employer_fein, e.employer_name, f.careers_url, f.careers_source, f.public_domain,
@@ -74,7 +73,11 @@ def main(argv=None) -> int:
         if not why:
             continue
         r["reason"] = why
-        r["ats_derived_from_page"] = bool(r["detected_platform"] and r["ats_source"] in _BRAVE_DERIVED_ATS_SOURCES)
+        r["ats_derived_from_page"] = bool(
+            r["detected_platform"]
+            and (ats_derived_from_careers_source(r["ats_source"], r["careers_source"])
+                 or (r["careers_source"] == "phase4" and r["ats_source"] == "brave_pass"))
+        )
         failing.append(r)
         by_reason[(r["careers_source"] or "-", why)] += 1
         by_source[r["careers_source"] or "-"] += 1

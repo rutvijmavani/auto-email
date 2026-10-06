@@ -80,6 +80,16 @@ class TestPhase4AnchorCheck(unittest.TestCase):
         self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
         self.assertTrue(self.check("https://boards.greenhouse.io/boards", "boards.com", "Boards Inc")[0])
 
+    def test_brave_landing_page_is_checked_after_redirects(self):
+        self.assertEqual(dh._brave_landing_blocked("https://www.myvisajobs.com/acme", "Acme Corp"), REASON_AGGREGATOR)
+        self.assertEqual(dh._brave_landing_blocked("https://careers.acme.com/jobs", "Acme Corp"), "")
+        self.assertEqual(dh._brave_landing_blocked(None, "Acme Corp"), "")
+
+    def test_cleanup_ats_provenance_covers_phase3_phase6_and_brave(self):
+        for ats, src in (("phase3", "phase3"), ("phase6", "phase6"), ("phase5", "phase4"), ("phase4", "phase4")):
+            self.assertTrue(ats_derived_from_careers_source(ats, src), (ats, src))
+        self.assertFalse(ats_derived_from_careers_source("company_ats_cache", "phase3"))
+
     def test_rank_order(self):
         r = lambda u: phase4_rank(u, "acme.com", "Acme Corp", ATS)[0]
         self.assertEqual(r("https://careers.acme.com/x"), RANK_PD_ROOT)

@@ -1070,6 +1070,13 @@ def brave_career_search(
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _brave_landing_blocked(final_url: str | None, employer_name: str) -> str:
+    """blocked_reason of the page a Brave result actually landed on after redirects ('' = fine / unknown).
+    The candidate host passed phase4_rank before the fetch; a redirect can still end on an aggregator,
+    challenge vendor or mail/CDN host, which must not be stored or fingerprinted."""
+    return blocked_reason(final_url, employer_name) if final_url else ""
+
+
 def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
     """
     GET url following redirects manually (SSRF-validates every hop).
@@ -2103,8 +2110,13 @@ def process_employer(
                     log.info("  Brave found: %s", brave_url)
                     # Phase 5: fingerprint the Brave result page
                     try:
-                        html, _, _ = _fetch_html(brave_url, _fetch_session)
-                        if html:
+                        html, _final, _ = _fetch_html(brave_url, _fetch_session)
+                        _why = _brave_landing_blocked(_final, canonical_name or name)
+                        if _why:
+                            log.warning("  Brave result %s landed on blocked %s (%s) — dropping",
+                                        brave_url, _final, _why)
+                            careers_url = careers_source = None
+                        elif html:
                             detected_platform, detected_slug = _find_ats_in_html(html)
                             if detected_platform:
                                 ats_source = "phase5"
@@ -2423,8 +2435,13 @@ def _run_brave_pass(conn, r, args) -> None:
                     _ats_source = "phase4"
                 else:
                     try:
-                        html_content, _, _ = _fetch_html(brave_url)
-                        if html_content:
+                        html_content, _final, _ = _fetch_html(brave_url)
+                        _why = _brave_landing_blocked(_final, row.get("canonical_name") or name)
+                        if _why:
+                            log.warning("  Brave result %s landed on blocked %s (%s) — dropping",
+                                        brave_url, _final, _why)
+                            careers_url = None
+                        elif html_content:
                             platform, slug = _find_ats_in_html(html_content)
                             if platform:
                                 _ats_source = "phase5"
