@@ -9,7 +9,7 @@ fein_domain_map.careers_url:
   * phase4 (Brave): must be anchored to the stored public_domain (phase4_anchor_check); no pd = no anchor
 
 Nothing is written to the database. The CSV lists every failing row with the reason, plus the blast radius a
-later cleanup would have to handle: the same URL copied into h1b_ats_discovery, an ATS platform/slug that was
+later cleanup would have to handle: an ATS platform/slug that was
 derived from the failing page (ats_source phase4/phase5/brave_pass), and company_ats rows for the employer.
 """
 import argparse
@@ -29,7 +29,7 @@ _BRAVE_DERIVED_ATS_SOURCES = ("phase4", "phase5", "brave_pass")
 
 _SQL = """
     SELECT f.employer_fein, e.employer_name, f.careers_url, f.careers_source, f.public_domain,
-           h.careers_url AS discovery_careers_url, h.detected_platform, h.detected_slug, h.ats_source,
+           h.detected_platform, h.detected_slug, h.ats_source,
            (SELECT COUNT(*) FROM company_ats c WHERE c.employer_fein = f.employer_fein) AS company_ats_rows
     FROM fein_domain_map f
     JOIN dol_h1b_employers e USING (employer_fein)
@@ -80,7 +80,7 @@ def main(argv=None) -> int:
         by_source[r["careers_source"] or "-"] += 1
 
     cols = ["employer_fein", "employer_name", "careers_source", "reason", "careers_url", "public_domain",
-            "discovery_careers_url", "detected_platform", "detected_slug", "ats_source",
+            "detected_platform", "detected_slug", "ats_source",
             "ats_derived_from_page", "company_ats_rows"]
     with open(args.out, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")

@@ -133,6 +133,8 @@ Step 5: Phase 7 — full ATS detector (career_detector.py detect_company())
 
 **Why Brave is last resort:** 950 request/month free-tier cap.
 
+**Ownership rules (2026-10-05, `jobs/careers_url_check.py`):** Brave is the only unanchored source, so Step 4 runs only for employers with a verified `public_domain` (no pd = no Brave call, no quota spent). A result is stored only if it is on the pd root or same brand, or is a known ATS host whose subdomain/path carries an employer-name token. Every phase additionally drops vendor (unless the employer owns the root, e.g. Google LLC), challenge-vendor and aggregator hosts before storing. `python -m scripts.careers_url_cleanup` is a read-only dry run over already-stored rows.
+
 ---
 
 ## 5. Queue Architecture
