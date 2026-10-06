@@ -113,6 +113,25 @@ class TestGatedDiscovery(unittest.TestCase):
             self.assertEqual(out, res, res)
             q.assert_not_called()
 
+    def test_vendor_root_dropped_for_every_method(self):
+        none = (None, "no_signal", None, None, None)
+        for method, pd, assigned, name in (
+                ("certspotter", "cloudflaressl.com", "align.com", "Align Technology"),
+                ("http_redirect", "icloud.com", "me.com", "Tiny Staffing LLC"),
+                ("same_domain", "google.com", "google.com", "Verily Life Sciences"),
+                ("http_redirect", "business.site", "foo.com", "Foo Consulting"),
+                ("certspotter", "att.net", "att.net", "Bar Systems Inc")):
+            out, q = self._run((pd, method, None, None, pd), assigned=assigned, name=name)
+            self.assertEqual(out, none, (method, pd))
+            q.assert_not_called()
+
+    def test_vendor_root_kept_for_the_vendor_itself(self):
+        for pd, name in (("google.com", "Google LLC"), ("cloudflare.com", "Cloudflare, Inc."),
+                         ("microsoft.com", "Microsoft Corporation")):
+            res = (pd, "same_domain", None, None, pd)
+            out, _ = self._run(res, assigned=pd, name=name)
+            self.assertEqual(out, res, pd)
+
 
 if __name__ == "__main__":
     unittest.main()
