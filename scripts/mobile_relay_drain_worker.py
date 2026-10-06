@@ -166,7 +166,8 @@ def _clear_careers_url_last_status(conn, fein: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_name: str,
-                                total_approvals: int, run_brave: bool, session) -> dict:
+                                total_approvals: int, run_brave: bool, session,
+                                public_domain: "str | None" = None) -> dict:
     """Phase 3 → Phase 6 → Phase 7 career-discovery chain over the relay session —
     the exact same functions scripts.discover_h1b_ats.process_employer calls for
     those phases (discover_careers_url, jobs.career_page.detect_via_career_page,
@@ -205,7 +206,8 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
     if not careers_url and run_brave:
         try:
             search_name = m.strip_legal_suffixes(company_name) or company_name
-            brave_url = m.brave_career_search(search_name, website_url=website_url)
+            brave_url = m.brave_career_search(search_name, website_url=website_url,
+                                              anchor_domain=public_domain)
             if brave_url:
                 careers_url    = brave_url
                 careers_source = "phase4"
@@ -256,6 +258,14 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                         careers_source = "phase7"
         except Exception as e:
             log.warning("fein=%s: relay Phase 7 (career_detector) failed: %s", fein, e)
+
+    # Same all-phase vendor/challenge/aggregator host guard as process_employer.
+    if careers_url:
+        _why = m.blocked_reason(careers_url, company_name)
+        if _why:
+            log.warning("fein=%s: relay dropping careers_url %s (%s, source=%s)",
+                        fein, careers_url, _why, careers_source)
+            careers_url = careers_source = None
 
     # Persist — same shape as process_employer's own direct-OCI persist block
     # (scripts/discover_h1b_ats.py, end of process_employer).
@@ -396,6 +406,7 @@ def _process_relay_item(fein: str, run_brave: bool) -> "bool | None":
                     result = _resolve_careers_via_relay(
                         conn, m, fein, website_url, employer_name,
                         int(company["petition_count"] or 0), run_brave, relay_session,
+                        public_domain=company["public_domain"],
                     )
                 except Exception as e:
                     log.error("fein=%s: careers relay resolution failed: %s", fein, e, exc_info=True)
