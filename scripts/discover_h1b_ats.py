@@ -1070,11 +1070,17 @@ def brave_career_search(
 # Career page detection
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _brave_landing_blocked(final_url: str | None, employer_name: str) -> str:
-    """blocked_reason of the page a Brave result actually landed on after redirects ('' = fine / unknown).
-    The candidate host passed phase4_rank before the fetch; a redirect can still end on an aggregator,
-    challenge vendor or mail/CDN host, which must not be stored or fingerprinted."""
-    return blocked_reason(final_url, employer_name) if final_url else ""
+def _brave_landing_rejected(final_url: str | None, employer_name: str, anchor_domain: str | None) -> str:
+    """Phase 4 rejection reason for the page a Brave result actually landed on after redirects
+    ('' = accepted / landing unknown). The candidate host passed phase4_rank before the fetch; a redirect
+    can still end on an aggregator, vendor host or an off-anchor domain, so the landing URL gets the same
+    anchored check (jobs.careers_url_check.phase4_rank) before it is stored or fingerprinted."""
+    if not final_url:
+        return ""
+    if not anchor_domain:
+        return blocked_reason(final_url, employer_name)
+    rank, why = phase4_rank(final_url, _root_domain(anchor_domain), employer_name, _KNOWN_ATS_DOMAINS)
+    return "" if rank is not None else why
 
 
 def _fetch_html(url: str, session=None) -> tuple[str | None, str, int | None]:
@@ -2111,9 +2117,9 @@ def process_employer(
                     # Phase 5: fingerprint the Brave result page
                     try:
                         html, _final, _ = _fetch_html(brave_url, _fetch_session)
-                        _why = _brave_landing_blocked(_final, canonical_name or name)
+                        _why = _brave_landing_rejected(_final, canonical_name or name, emp.get("public_domain"))
                         if _why:
-                            log.warning("  Brave result %s landed on blocked %s (%s) — dropping",
+                            log.warning("  Brave result %s landed on rejected %s (%s) — dropping",
                                         brave_url, _final, _why)
                             careers_url = careers_source = None
                         elif html:
@@ -2436,9 +2442,10 @@ def _run_brave_pass(conn, r, args) -> None:
                 else:
                     try:
                         html_content, _final, _ = _fetch_html(brave_url)
-                        _why = _brave_landing_blocked(_final, row.get("canonical_name") or name)
+                        _why = _brave_landing_rejected(_final, row.get("canonical_name") or name,
+                                                       row.get("public_domain"))
                         if _why:
-                            log.warning("  Brave result %s landed on blocked %s (%s) — dropping",
+                            log.warning("  Brave result %s landed on rejected %s (%s) — dropping",
                                         brave_url, _final, _why)
                             careers_url = None
                         elif html_content:

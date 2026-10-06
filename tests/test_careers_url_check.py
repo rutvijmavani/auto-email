@@ -81,9 +81,13 @@ class TestPhase4AnchorCheck(unittest.TestCase):
         self.assertTrue(self.check("https://boards.greenhouse.io/boards", "boards.com", "Boards Inc")[0])
 
     def test_brave_landing_page_is_checked_after_redirects(self):
-        self.assertEqual(dh._brave_landing_blocked("https://www.myvisajobs.com/acme", "Acme Corp"), REASON_AGGREGATOR)
-        self.assertEqual(dh._brave_landing_blocked("https://careers.acme.com/jobs", "Acme Corp"), "")
-        self.assertEqual(dh._brave_landing_blocked(None, "Acme Corp"), "")
+        f = dh._brave_landing_rejected
+        self.assertEqual(f("https://www.myvisajobs.com/acme", "Acme Corp", "acme.com"), REASON_AGGREGATOR)
+        self.assertEqual(f("https://careers.acme.com/jobs", "Acme Corp", "acme.com"), "")
+        self.assertEqual(f("https://boards.greenhouse.io/acme", "Acme Corp", "acme.com"), "")
+        self.assertEqual(f("https://random-site.com/jobs", "Acme Corp", "acme.com"), REASON_OFF_DOMAIN)
+        self.assertEqual(f("https://boards.greenhouse.io/zenith", "Acme Corp", "acme.com"), REASON_ATS_NO_NAME)
+        self.assertEqual(f(None, "Acme Corp", "acme.com"), "")
 
     def test_cleanup_ats_provenance_covers_phase3_phase6_and_brave(self):
         for ats, src in (("phase3", "phase3"), ("phase6", "phase6"), ("phase5", "phase4"), ("phase4", "phase4")):

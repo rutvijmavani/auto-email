@@ -216,9 +216,9 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                 log.info("fein=%s: relay Phase 4 (Brave) found: %s", fein, brave_url)
                 try:
                     html, _final, _ = m._fetch_html(brave_url, session)
-                    _why = m._brave_landing_blocked(_final, company_name)
+                    _why = m._brave_landing_rejected(_final, company_name, public_domain)
                     if _why:
-                        log.warning("fein=%s: relay Brave result %s landed on blocked %s (%s) — dropping",
+                        log.warning("fein=%s: relay Brave result %s landed on rejected %s (%s) — dropping",
                                     fein, brave_url, _final, _why)
                         careers_url = careers_source = None
                     elif html:
