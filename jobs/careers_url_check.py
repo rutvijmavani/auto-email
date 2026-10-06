@@ -50,7 +50,7 @@ ALWAYS_BLOCKED_ROOTS = AGGREGATOR_ROOTS | _CHALLENGE_DOMAINS
 # Host labels that are part of the ATS provider's own hostname layout, never the employer's tenant.
 _ATS_FIXED_LABELS = frozenset({"www", "boards", "job-boards", "boards-api", "api", "jobs", "careers", "apply", "hire"})
 
-REASON_AGGREGATOR ="aggregator-host"
+REASON_AGGREGATOR = "aggregator-host"
 REASON_CHALLENGE = "challenge-vendor-host"
 REASON_VENDOR = "vendor-host"
 REASON_OFF_DOMAIN = "off-domain"
@@ -85,6 +85,14 @@ def blocked_reason(url: str, employer_name: str) -> str:
     return ""
 
 
+def ats_derived_from_careers_source(ats_source, careers_source) -> bool:
+    """True when the ATS platform/slug was read off the same page as careers_url (so dropping a blocked
+    careers_url must drop the ATS too): same phase, or Phase 5 fingerprinting a Phase 4 Brave result. An ATS
+    found independently (company_ats cache, Phase 7 BFS under a different careers source) is kept."""
+    return bool(ats_source) and (ats_source == careers_source
+                                 or (careers_source == "phase4" and ats_source == "phase5"))
+
+
 def _same_brand(a_root: str, b_root: str) -> bool:
     short, long_ = sorted((_brand(a_root), _brand(b_root)), key=len)
     return len(short) >= PD_NAME_GATE_MIN_LABEL and short in long_
@@ -99,9 +107,13 @@ def _tenant_matches(employer_name: str, brand: str, tenant_text: str) -> bool:
     Fixed provider host labels (boards, job-boards, www ...) are not tenants and never count as a match, so
     'Boards Inc' does not match boards.greenhouse.io/zenith."""
     import re
-    host_part, _, path_part = tenant_text.partition("/")
-    tenant_text = ".".join(l for l in host_part.lower().split(".") if l and l not in _ATS_FIXED_LABELS) \
-        + "/" + path_part
+    host_part, _, path_part = tenant_text.lower().partition("/")
+    # Tenant-bearing positions only: first non-provider host label (acme.wd5.myworkdayjobs.com) and first path
+    # segment (boards.greenhouse.io/acme, jobs.lever.co/acme/<job>). Later path segments are job slugs / filters,
+    # so boards.greenhouse.io/zenith/jobs/acme is Zenith's board, not Acme's.
+    labels = [l for l in host_part.split(".") if l and l not in _ATS_FIXED_LABELS]
+    segments = [s for s in path_part.split("/") if s]
+    candidates = labels[:1] + segments[:1]
     words = re.findall(r"[a-z0-9]+", (employer_name or "").lower())
     identifiers = {t for t in _name_tokens(employer_name)}
     identifiers.add("".join(words))
@@ -109,22 +121,35 @@ def _tenant_matches(employer_name: str, brand: str, tenant_text: str) -> bool:
     if len(brand) >= PD_NAME_GATE_MIN_LABEL + 1:
         identifiers.add(brand)
     identifiers.discard("")
-    return any(_squash(seg) in identifiers for seg in re.split(r"[./]", tenant_text.lower()) if seg)
+    return any(_squash(c) in identifiers for c in candidates)
 
 
-def phase4_anchor_check(url: str, anchor_root: str, employer_name: str, ats_roots) -> "tuple[bool, str]":
-    """-> (ok, reason). anchor_root is the stored public_domain root; callers must not call this without one."""
+# Phase 4 confidence ranks (lower is better): the employer's own domain beats a same-brand domain beats an
+# ATS tenant page.
+RANK_PD_ROOT, RANK_SAME_BRAND, RANK_ATS_TENANT = 0, 1, 2
+
+
+def phase4_rank(url: str, anchor_root: str, employer_name: str, ats_roots) -> "tuple[int | None, str]":
+    """-> (rank, reason). rank is None (with a REASON_* tag) when the URL is rejected."""
     reason = blocked_reason(url, employer_name)
     if reason:
-        return False, reason
+        return None, reason
     root = _root(url)
-    if root == anchor_root or _same_brand(anchor_root, root):
-        return True, ""
+    if root == anchor_root:
+        return RANK_PD_ROOT, ""
+    if _same_brand(anchor_root, root):
+        return RANK_SAME_BRAND, ""
     if root in ats_roots:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
         sub = host[:-len(root)] if host.endswith(root) else host
         if _tenant_matches(employer_name, _brand(anchor_root), sub + parsed.path):
-            return True, ""
-        return False, REASON_ATS_NO_NAME
-    return False, REASON_OFF_DOMAIN
+            return RANK_ATS_TENANT, ""
+        return None, REASON_ATS_NO_NAME
+    return None, REASON_OFF_DOMAIN
+
+
+def phase4_anchor_check(url: str, anchor_root: str, employer_name: str, ats_roots) -> "tuple[bool, str]":
+    """-> (ok, reason). anchor_root is the stored public_domain root; callers must not call this without one."""
+    rank, reason = phase4_rank(url, anchor_root, employer_name, ats_roots)
+    return rank is not None, reason

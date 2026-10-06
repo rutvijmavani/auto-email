@@ -55,7 +55,7 @@ import requests
 
 from config import (
     CF_WORKER_DAILY_LIMIT, CF_WORKER_SECRET, CF_WORKER_URL,
-    DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
+    BRAVE_RESULT_COUNT, DISCOVER_ATS_GEMINI_MODEL, DISCOVER_ATS_LLM_PROVIDER,
     MOBILE_RELAY_GUARD_PREFIX, MOBILE_RELAY_GUARD_TTL_S, MOBILE_RELAY_QUEUE, PD_RETRY_CAP,
     REDIS_DB_MAINTENANCE, REDIS_GEMINI_LOCK,
 )
@@ -63,7 +63,9 @@ from db.connection import get_conn
 from db.external_api_health import get_day_request_count, get_month_request_count, record_external_request
 from db.quota import can_call, increment_usage, record_tpm, tpm_wait_seconds, within_rpm
 from db.schema import init_db
-from jobs.careers_url_check import AGGREGATOR_ROOTS, blocked_reason, phase4_anchor_check
+from jobs.careers_url_check import (
+    AGGREGATOR_ROOTS, ats_derived_from_careers_source, blocked_reason, phase4_rank,
+)
 from jobs.http_safe import (
     make_safe_session as _make_safe_session,
     make_safe_curl_session as _make_safe_curl_session,
@@ -949,8 +951,9 @@ def brave_career_search(
     anchor_domain: str | None = None,
 ) -> str | None:
     """
-    Search Brave for "{company} careers", filter top 10 results to plausible
-    career pages, then use Qwen3-8B to pick the best when multiple survive.
+    Search Brave for "{company} careers", filter the top BRAVE_RESULT_COUNT results to plausible
+    anchored career pages, keep only the best-ranked tier (pd root > same brand > ATS tenant), and use
+    the LLM only to break a tie inside that tier.
 
     anchor_domain is the employer's verified public_domain. A search result has no ownership
     proof of its own, so without an anchor nothing is searched or stored (no Brave quota spent),
@@ -990,7 +993,7 @@ def brave_career_search(
                 "X-Subscription-Token": _BRAVE_API_KEY,
                 "Accept": "application/json",
             },
-            params={"q": query, "count": 10},
+            params={"q": query, "count": BRAVE_RESULT_COUNT},
             timeout=_HTTP_TIMEOUT,
         )
         _brave_response_ms = int((time.time() - _brave_t0) * 1000)
@@ -1026,9 +1029,9 @@ def brave_career_search(
             url = item.get("url")
             if not (url and _is_public_url(url) and _is_plausible_career_url(url, tokens)):
                 continue
-            ok, why = phase4_anchor_check(url, anchor_root, company_name, _KNOWN_ATS_DOMAINS)
-            if ok:
-                candidates.append(url)
+            rank, why = phase4_rank(url, anchor_root, company_name, _KNOWN_ATS_DOMAINS)
+            if rank is not None:
+                candidates.append((rank, url))
             else:
                 log.debug("Brave: rejected %s for %r (%s, anchor=%s)", url, company_name, why, anchor_root)
 
@@ -1039,6 +1042,10 @@ def brave_career_search(
 
         if not candidates:
             return None
+        # Deterministic ranking: only the best-ranked tier (pd root > same brand > ATS tenant) is kept;
+        # search order is preserved within a tier. The LLM is just a tie-breaker inside that tier.
+        best_rank  = min(r for r, _ in candidates)
+        candidates = [u for r, u in candidates if r == best_rank]
         if len(candidates) == 1:
             log.debug("Brave: single candidate → %s", candidates[0])
             return candidates[0]
@@ -2185,9 +2192,9 @@ def process_employer(
         _why = blocked_reason(careers_url, canonical_name or name)
         if _why:
             log.warning("  Dropping careers_url %s (%s, source=%s)", careers_url, _why, careers_source)
-            careers_url = careers_source = None
-            if ats_source != "company_ats_cache":
+            if ats_derived_from_careers_source(ats_source, careers_source):
                 detected_platform = detected_slug = ats_source = None
+            careers_url = careers_source = None
 
     # Update website_url when careers discovery reveals a different real domain.
     # e.g. email domain ny.email.gs.com → real site goldmansachs.com via careers redirect.

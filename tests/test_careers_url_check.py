@@ -12,7 +12,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import scripts.discover_h1b_ats as dh
 from jobs.careers_url_check import (
     REASON_AGGREGATOR, REASON_ATS_NO_NAME, REASON_CHALLENGE, REASON_OFF_DOMAIN, REASON_VENDOR,
-    _name_owns_root, blocked_reason, phase4_anchor_check,
+    RANK_ATS_TENANT, RANK_PD_ROOT, RANK_SAME_BRAND,
+    _name_owns_root, ats_derived_from_careers_source, blocked_reason, phase4_anchor_check, phase4_rank,
 )
 
 ATS = dh._KNOWN_ATS_DOMAINS
@@ -78,6 +79,26 @@ class TestPhase4AnchorCheck(unittest.TestCase):
         ok, why = self.check("https://boards.greenhouse.io/zenith", "boards.com", "Boards Inc")
         self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
         self.assertTrue(self.check("https://boards.greenhouse.io/boards", "boards.com", "Boards Inc")[0])
+
+    def test_rank_order(self):
+        r = lambda u: phase4_rank(u, "acme.com", "Acme Corp", ATS)[0]
+        self.assertEqual(r("https://careers.acme.com/x"), RANK_PD_ROOT)
+        self.assertEqual(r("https://jobs.acme.org/x"), RANK_SAME_BRAND)
+        self.assertEqual(r("https://boards.greenhouse.io/acme"), RANK_ATS_TENANT)
+        self.assertIsNone(r("https://www.myvisajobs.com/acme"))
+
+    def test_tenant_only_in_tenant_position(self):
+        ok, why = self.check("https://boards.greenhouse.io/zenith/jobs/acme", "acme.com", "Acme Corp")
+        self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
+        self.assertTrue(self.check("https://boards.greenhouse.io/acme", "acme.com", "Acme Corp")[0])
+        self.assertTrue(self.check("https://acme.wd5.myworkdayjobs.com/External", "acme.com", "Acme Corp")[0])
+
+    def test_blocked_url_drops_only_ats_it_produced(self):
+        self.assertTrue(ats_derived_from_careers_source("phase3", "phase3"))
+        self.assertTrue(ats_derived_from_careers_source("phase5", "phase4"))
+        self.assertFalse(ats_derived_from_careers_source("phase7", "phase4"))
+        self.assertFalse(ats_derived_from_careers_source("company_ats_cache", "phase3"))
+        self.assertFalse(ats_derived_from_careers_source(None, "phase3"))
 
     def test_vendor_ownership_is_whole_name_not_containment(self):
         self.assertFalse(_name_owns_root("Business Solutions Inc", "business.site"))

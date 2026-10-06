@@ -25,7 +25,7 @@ WHERE f.public_domain IN (
   AND NOT EXISTS (
         SELECT 1
         FROM dol_h1b_employers e
-        JOIN (VALUES ('^google llc',                              'google.com'),
+        JOIN (VALUES ('^google( llc| inc\.?)?$',                  'google.com'),
                      ('at&t|cricket wireless|forged fiber',       'att.com'),
                      ('rafter|docmation',                         'rafter.one')) AS k(name_rx, root)
           ON e.employer_name ~* k.name_rx

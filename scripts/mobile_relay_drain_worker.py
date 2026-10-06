@@ -188,7 +188,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
     possible from Phase 3) updates careers_url_last_status only; a resolved
     platform+slug upserts company_ats.
     """
-    careers_url = detected_platform = detected_slug = careers_source = None
+    careers_url = detected_platform = detected_slug = careers_source = ats_source = None
     careers_url_last_status = None
 
     website_url = m._resolve_website_redirect(website_url, session)
@@ -199,6 +199,8 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
             m.discover_careers_url(website_url, session)
         if careers_url:
             careers_source = "phase3"
+        if detected_platform:
+            ats_source = "phase3"
     except Exception as e:
         log.warning("fein=%s: relay Phase 3 probe failed: %s", fein, e)
 
@@ -216,6 +218,8 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                     html, _, _ = m._fetch_html(brave_url, session)
                     if html:
                         detected_platform, detected_slug = m._find_ats_in_html(html)
+                        if detected_platform:
+                            ats_source = "phase5"
                 except Exception as e:
                     log.warning("fein=%s: relay Phase 4 HTML fingerprint failed: %s", fein, e)
         except Exception as e:
@@ -232,6 +236,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                 if _cp.get("platform"):
                     detected_platform = _cp["platform"]
                     detected_slug     = _cp.get("slug")
+                    ats_source        = "phase6"
                 if _cp.get("careers_url"):
                     careers_url    = _cp["careers_url"]
                     careers_source = "phase6"
@@ -251,6 +256,7 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
                 _best_slug = _best.get("slug") or ""
                 if _best_slug:
                     detected_slug = _best_slug
+                ats_source = "phase7"
                 if not careers_url:
                     _src = _best.get("source_url")
                     if _src:
@@ -265,8 +271,9 @@ def _resolve_careers_via_relay(conn, m, fein: str, website_url: str, company_nam
         if _why:
             log.warning("fein=%s: relay dropping careers_url %s (%s, source=%s)",
                         fein, careers_url, _why, careers_source)
+            if m.ats_derived_from_careers_source(ats_source, careers_source):
+                detected_platform = detected_slug = ats_source = None
             careers_url = careers_source = None
-            detected_platform = detected_slug = None
 
     # Persist — same shape as process_employer's own direct-OCI persist block
     # (scripts/discover_h1b_ats.py, end of process_employer).
