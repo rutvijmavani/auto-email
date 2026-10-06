@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import scripts.discover_h1b_ats as dh
 from jobs.careers_url_check import (
     REASON_AGGREGATOR, REASON_ATS_NO_NAME, REASON_CHALLENGE, REASON_OFF_DOMAIN, REASON_VENDOR,
-    blocked_reason, phase4_anchor_check,
+    _name_owns_root, blocked_reason, phase4_anchor_check,
 )
 
 ATS = dh._KNOWN_ATS_DOMAINS
@@ -73,6 +73,16 @@ class TestPhase4AnchorCheck(unittest.TestCase):
         self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
         self.assertTrue(self.check("https://boards.greenhouse.io/acme-corp", "acme.com", "Acme Corp")[0])
         self.assertTrue(self.check("https://jobs.lever.co/acme/abc123", "acme.com", "Acme Corp")[0])
+
+    def test_provider_host_label_is_not_a_tenant(self):
+        ok, why = self.check("https://boards.greenhouse.io/zenith", "boards.com", "Boards Inc")
+        self.assertEqual((ok, why), (False, REASON_ATS_NO_NAME))
+        self.assertTrue(self.check("https://boards.greenhouse.io/boards", "boards.com", "Boards Inc")[0])
+
+    def test_vendor_ownership_is_whole_name_not_containment(self):
+        self.assertFalse(_name_owns_root("Business Solutions Inc", "business.site"))
+        self.assertEqual(blocked_reason("https://careers.google.com/", "Google Public Sector"), REASON_VENDOR)
+        self.assertEqual(blocked_reason("https://careers.google.com/", "Google LLC"), "")
 
     def test_vendor_anchor_never_blesses_vendor_landing(self):
         # pd is a Workspace-email domain: a google.com result for an unrelated employer stays rejected

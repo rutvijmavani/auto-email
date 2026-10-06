@@ -32,6 +32,10 @@ _EXTRA_VENDOR_ROOTS = frozenset({
 })
 VENDOR_ROOTS = frozenset(GENERIC_ROOTS) | _EXTRA_VENDOR_ROOTS
 
+# Pure hosting/infrastructure roots whose brand is an ordinary word ('business'): no employer owns them, and
+# stop-word stripping would otherwise make "Business Solutions Inc" look like the owner of business.site.
+_NEVER_OWNED_ROOTS = frozenset({"business.site", "cloudflaressl.com"})
+
 # Job boards / aggregators: never a company's own careers page, whatever the employer is called.
 AGGREGATOR_ROOTS = frozenset({
     "linkedin.com", "indeed.com", "glassdoor.com", "ziprecruiter.com",
@@ -43,7 +47,10 @@ AGGREGATOR_ROOTS = frozenset({
 
 ALWAYS_BLOCKED_ROOTS = AGGREGATOR_ROOTS | _CHALLENGE_DOMAINS
 
-REASON_AGGREGATOR = "aggregator-host"
+# Host labels that are part of the ATS provider's own hostname layout, never the employer's tenant.
+_ATS_FIXED_LABELS = frozenset({"www", "boards", "job-boards", "boards-api", "api", "jobs", "careers", "apply", "hire"})
+
+REASON_AGGREGATOR ="aggregator-host"
 REASON_CHALLENGE = "challenge-vendor-host"
 REASON_VENDOR = "vendor-host"
 REASON_OFF_DOMAIN = "off-domain"
@@ -53,14 +60,15 @@ REASON_NO_ROOT = "no-registrable-domain"
 
 def _name_owns_root(employer_name: str, root: str) -> bool:
     """True when the employer name IS the root's brand ('Google LLC' / google.com, 'Cloudflare Inc' / cloudflare.com).
-    Whole-name comparison, not any-token: 'Cloud Tek Data' must not pass for cloudflare.com."""
+    Whole-name equality after dropping legal/generic suffix words, not containment: 'Cloud Tek Data' must not pass
+    for cloudflare.com and 'Business Solutions Inc' must not pass for business.site ('Google Public Sector' is a
+    subsidiary on its own domain, not Google LLC)."""
     import re
+    if root in _NEVER_OWNED_ROOTS:
+        return False
     words = [w for w in re.findall(r"[a-z0-9]+", (employer_name or "").lower()) if w not in NAME_STOP_WORDS]
     joined = "".join(words)
-    brand = _brand(root)
-    if min(len(joined), len(brand)) < PD_NAME_GATE_MIN_LABEL + 1:
-        return False
-    return brand in joined or joined in brand
+    return bool(joined) and joined == _brand(root)
 
 
 def blocked_reason(url: str, employer_name: str) -> str:
@@ -87,8 +95,13 @@ def _tenant_matches(employer_name: str, brand: str, tenant_text: str) -> bool:
 
     tenant_text is the ATS subdomain + path ('acme.wd5.', '/acmecorp/jobs'). Segments split on '.' and '/'
     only; hyphens/underscores stay inside a segment and are squashed away, so 'acme-other' becomes 'acmeother'
-    and does NOT equal 'acme', while 'acme-corp' / 'acmecorp' equals the full name 'Acme Corp'."""
+    and does NOT equal 'acme', while 'acme-corp' / 'acmecorp' equals the full name 'Acme Corp'.
+    Fixed provider host labels (boards, job-boards, www ...) are not tenants and never count as a match, so
+    'Boards Inc' does not match boards.greenhouse.io/zenith."""
     import re
+    host_part, _, path_part = tenant_text.partition("/")
+    tenant_text = ".".join(l for l in host_part.lower().split(".") if l and l not in _ATS_FIXED_LABELS) \
+        + "/" + path_part
     words = re.findall(r"[a-z0-9]+", (employer_name or "").lower())
     identifiers = {t for t in _name_tokens(employer_name)}
     identifiers.add("".join(words))

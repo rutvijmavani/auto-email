@@ -19,10 +19,18 @@ WHERE f.public_domain IN (
         'cloudflaressl.com', 'icloud.com', 'google.com', 'business.site', 'myworkday.com', 'msn.com',
         'att.net', 'att.com', 'googlemail.com', 'aol.com', 'live.com', 'comcast.net', 'verizon.net',
         'sbcglobal.net', 'outlook.com', 'hotmail.com', 'gmail.com', 'yahoo.com', 'office365.com')
+  -- A keeper is exempt only on the root it legitimately owns (name regex paired with that root), so e.g.
+  -- "Microsoft Partner Services LLC" on icloud.com is still nulled. Vendors on their own roots
+  -- (cloudflare.com, microsoft.com, akamai.com ...) are not in the root list above, so they are never selected.
   AND NOT EXISTS (
-        SELECT 1 FROM dol_h1b_employers e
+        SELECT 1
+        FROM dol_h1b_employers e
+        JOIN (VALUES ('^google llc',                              'google.com'),
+                     ('at&t|cricket wireless|forged fiber',       'att.com'),
+                     ('rafter|docmation',                         'rafter.one')) AS k(name_rx, root)
+          ON e.employer_name ~* k.name_rx
         WHERE e.employer_fein = f.employer_fein
-          AND e.employer_name ~* '(akamai|cloudflare|fastly|microsoft|mimecast|proofpoint|^google llc|at&t|cricket wireless|rafter|docmation|forged fiber)');
+          AND f.public_domain = k.root);
 
 SELECT public_domain, public_domain_method, COUNT(*) FROM _vendor_pd GROUP BY 1, 2 ORDER BY 3 DESC;
 SELECT * FROM _vendor_pd ORDER BY public_domain, employer_name;
@@ -35,6 +43,7 @@ SET public_domain = NULL,
     public_domain_host = NULL,
     last_enriched_at = NULL
 FROM _vendor_pd v
-WHERE f.employer_fein = v.employer_fein;
+WHERE f.employer_fein = v.employer_fein
+  AND f.public_domain = v.public_domain;  -- only rows still unchanged since the preview
 -- Change to COMMIT once the row count above matches the preview.
 ROLLBACK;
