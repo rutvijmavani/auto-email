@@ -347,6 +347,22 @@ DISCOVER_ATS_GEMINI_MODEL  = os.getenv("DISCOVER_ATS_GEMINI_MODEL", "gemma-4-26b
 # Brave results requested per Phase 4 search (API max 20; one request = one quota call at any count)
 BRAVE_RESULT_COUNT = int(os.getenv("BRAVE_RESULT_COUNT", "20"))
 
+# ── Cron job watcher (scripts/cron_watch.py, driven by log_monitor every 15 min) ──
+CRON_WATCH_ENABLED          = os.getenv("CRON_WATCH_ENABLED", "true").lower() == "true"
+CRON_WATCH_LOOKBACK_HOURS   = int(os.getenv("CRON_WATCH_LOOKBACK_HOURS", "24"))    # how far back to check for missed slots
+CRON_WATCH_START_GRACE_MIN  = int(os.getenv("CRON_WATCH_START_GRACE_MIN", "10"))   # window after a slot for the "started" line
+CRON_WATCH_STALL_FLOOR_MIN  = int(os.getenv("CRON_WATCH_STALL_FLOOR_MIN", "30"))   # min silence before "stalled" (>= 2 monitor cycles)
+CRON_WATCH_STALL_MULTIPLIER = float(os.getenv("CRON_WATCH_STALL_MULTIPLIER", "2")) # stall window = this x longest healthy silence
+CRON_WATCH_RUNTIME_MULTIPLIER = float(os.getenv("CRON_WATCH_RUNTIME_MULTIPLIER", "3"))  # runaway = this x longest healthy runtime
+CRON_WATCH_MIN_HISTORY_RUNS = int(os.getenv("CRON_WATCH_MIN_HISTORY_RUNS", "3"))   # runs before the learned baseline is trusted
+CRON_WATCH_HISTORY_DAYS     = int(os.getenv("CRON_WATCH_HISTORY_DAYS", "14"))      # history kept (matches daily-log retention)
+CRON_WATCH_REALERT_HOURS    = int(os.getenv("CRON_WATCH_REALERT_HOURS", "24"))     # re-alert interval while a problem persists
+# Comma-separated regexes of crontab lines the watcher skips (keep-alive loop, log_monitor itself, 9 AM fallback line)
+CRON_WATCH_IGNORE_PATTERNS  = os.getenv(
+    "CRON_WATCH_IGNORE_PATTERNS",
+    r"hashlib,scripts/log_monitor\.py,^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+grep -q",
+)
+
 CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "") # Cloudflare probe-worker endpoint
 CF_WORKER_SECRET = os.getenv("CF_WORKER_SECRET", "")  # Bearer token (wrangler secret put PROBE_SECRET)
 # Free-tier Workers plan resets daily (100K req/day); stop calling the worker

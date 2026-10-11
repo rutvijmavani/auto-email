@@ -964,6 +964,17 @@ def main() -> None:
     now = time.time()
     print(f"[log_monitor] scan started at {datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')}")
 
+    # ── 0. Cron job watcher (missed starts, stalls, non-zero exits) ──────────
+    # Independent of the log scan and Redis: runs first so no early return below skips it.
+    try:
+        try:
+            import cron_watch                       # run as `python scripts/log_monitor.py`
+        except ImportError:
+            from scripts import cron_watch          # imported as a package
+        cron_watch.run_safe(_send_email)
+    except Exception as _cw_err:
+        print(f"[log_monitor] cron_watch unavailable: {_cw_err}")
+
     # ── 1. Scan log files ────────────────────────────────────────────────────
     offsets                      = _load_offsets()
     inodes                       = _load_inodes()
