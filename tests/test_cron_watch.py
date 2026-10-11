@@ -183,6 +183,20 @@ class TestChecks(Base):
         cw.run(lambda s, b: calls.append(1) or True, now=NOW + 900, crontab=cron, state_path=self.state_path)
         self.assertEqual(len(calls), 2)
 
+    def test_failed_email_keeps_one_time_exit_alert(self):
+        self.wrapper()
+        cron = f"0 7 * * * {self.dir}/run_monitor.sh\n"
+        start = ts(2026, 10, 12, 7, 0, 3)
+        self.log("monitor", NOW, [f"[CRON] m started at {stamp(start)}",
+                                  f"[CRON] m finished at {stamp(start + 60)} | exit=3"])
+        cw.run(lambda s, b: False, now=NOW, crontab=cron, state_path=self.state_path)
+        sent = []
+        cw.run(lambda s, b: sent.append(b) or True, now=NOW + 900, crontab=cron, state_path=self.state_path)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("exit=3", sent[0])
+        cw.run(lambda s, b: sent.append(b) or True, now=NOW + 1800, crontab=cron, state_path=self.state_path)
+        self.assertEqual(len(sent), 1)               # delivered once, pending cleared
+
     def test_monthly_log_resolution(self):
         self.wrapper("run_monthly.sh", "monthly", "%Y-%m")
         self.log("monthly", ts(2026, 10, 1), [f"[CRON] monthly started at {stamp(ts(2026, 10, 1, 1, 0, 2))}"], "%Y-%m")

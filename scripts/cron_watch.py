@@ -208,12 +208,13 @@ def load_state(path: Path = STATE_FILE) -> dict:
             state.setdefault("jobs", {})
             state.setdefault("sent", {})
             state.setdefault("known_job_keys", [])
+            state.setdefault("pending", {})
             return state
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as exc:
         print(f"[cron_watch] state unreadable ({exc}) — starting fresh")
-    return {"jobs": {}, "sent": {}, "known_job_keys": []}
+    return {"jobs": {}, "sent": {}, "known_job_keys": [], "pending": {}}
 
 
 def save_state(state: dict, path: Path = STATE_FILE) -> None:
@@ -404,6 +405,11 @@ def _esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _is_one_time(alert: dict) -> bool:
+    """Alerts that are not re-derived on the next pass (the unreadable-crontab alert is, so it is excluded)."""
+    return alert["kind"] == "exit" or alert["key"].startswith("removed:")
+
+
 def run(send: Callable[[str, str], object], now: float | None = None,
         crontab: str | None = None, state_path: Path = STATE_FILE) -> list[dict]:
     """One watcher pass.  `send(subject, html)` follows log_monitor._send_email's return contract
@@ -428,6 +434,12 @@ def run(send: Callable[[str, str], object], now: float | None = None,
     else:
         state.setdefault("initialized_at", now)
 
+    # One-time alerts (exit != 0, removed job) are emitted once, when state first records them, so a
+    # failed send would lose them.  Carry unsent ones over and merge them into this pass.
+    seen = {a["key"] for a in alerts}
+    alerts += [a for k, a in state["pending"].items() if k not in seen]
+    state["pending"] = {}
+
     new = select_new_alerts(alerts, state, now)
     if new:
         subject, body = _alert_email(new)
@@ -437,6 +449,7 @@ def run(send: Callable[[str, str], object], now: float | None = None,
                 state["sent"][a["key"]] = now
         else:
             print("[cron_watch] email failed — will retry next run")
+            state["pending"] = {a["key"]: a for a in new if _is_one_time(a)}
         print(f"[cron_watch] {len(new)} alert(s): " + " | ".join(a["text"] for a in new))
     else:
         print(f"[cron_watch] ok — {len(entries)} cron line(s) checked, no new problems")

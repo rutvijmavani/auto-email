@@ -177,7 +177,7 @@ trap - ERR
 echo ""
 echo "► Checking cron wrappers..."
 _missing_wrappers=""
-_cron_wrappers=$(crontab -l 2>/dev/null | grep -oE "/[^ '\"]*/run_[a-z_]+\.sh" | sort -u || true)
+_cron_wrappers=$(crontab -l 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -oE "/[^ '\"]*/run_[a-z_]+\.sh" | sort -u || true)
 for _w in $_cron_wrappers; do
     if [[ ! -x "$_w" ]]; then
         _missing_wrappers="$_missing_wrappers $_w"
