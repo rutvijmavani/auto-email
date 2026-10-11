@@ -301,6 +301,20 @@ class TestState(Base):
             cw.run, cw.ERROR_FLAG = orig_run, orig_flag
         self.assertEqual(len(self.sent), 1)
 
+    def test_crash_alert_retried_when_email_fails(self):
+        orig_run, orig_flag = cw.run, cw.ERROR_FLAG
+        cw.ERROR_FLAG = self.dir / "flag"
+        cw.run = lambda send: (_ for _ in ()).throw(RuntimeError("boom"))
+        calls = []
+        try:
+            cw.run_safe(lambda s, b: calls.append(1) or False)
+            self.assertFalse(cw.ERROR_FLAG.exists())     # failed send must not arm the suppression flag
+            cw.run_safe(lambda s, b: calls.append(1) or True)
+            self.assertTrue(cw.ERROR_FLAG.exists())
+        finally:
+            cw.run, cw.ERROR_FLAG = orig_run, orig_flag
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

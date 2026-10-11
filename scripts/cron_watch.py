@@ -472,9 +472,10 @@ def run_safe(send: Callable[[str, str], object]) -> None:
         try:
             window = config.CRON_WATCH_REALERT_HOURS * 3600
             if not ERROR_FLAG.exists() or time.time() - ERROR_FLAG.stat().st_mtime >= window:
-                send("[Cron Alert] cron_watch itself crashed",
-                     f"<html><body><pre>{_esc(tb)}</pre></body></html>")
-                ERROR_FLAG.parent.mkdir(parents=True, exist_ok=True)
-                ERROR_FLAG.write_text(tb[-2000:], encoding="utf-8")
+                sent = send("[Cron Alert] cron_watch itself crashed",
+                            f"<html><body><pre>{_esc(tb)}</pre></body></html>")
+                if sent is not False:   # a failed send leaves the flag unset so the next pass retries
+                    ERROR_FLAG.parent.mkdir(parents=True, exist_ok=True)
+                    ERROR_FLAG.write_text(tb[-2000:], encoding="utf-8")
         except Exception as exc:
             print(f"[cron_watch] could not send crash alert: {exc}")

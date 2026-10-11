@@ -177,13 +177,24 @@ trap - ERR
 echo ""
 echo "► Checking cron wrappers..."
 _missing_wrappers=""
-_cron_wrappers=$(crontab -l 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -oE "/[^ '\"]*/run_[a-z_]+\.sh" | sort -u || true)
+_cron_wrappers=""
+_crontab_rc=0
+_crontab_out=$(crontab -l 2>&1) || _crontab_rc=$?
+if [[ $_crontab_rc -ne 0 ]]; then
+    # "crontab -l" fails both when no crontab exists and when it cannot be read; either way
+    # the wrapper check below would see an empty list, so say so instead of reporting all-clear.
+    echo "  [WARN] crontab -l failed (exit $_crontab_rc: ${_crontab_out:-no output}) — cannot verify cron wrappers"
+else
+    _cron_wrappers=$(printf '%s\n' "$_crontab_out" | grep -vE '^[[:space:]]*#' | grep -oE "/[^ '\"]*/run_[a-z_]+\.sh" | sort -u || true)
+fi
 for _w in $_cron_wrappers; do
     if [[ ! -x "$_w" ]]; then
         _missing_wrappers="$_missing_wrappers $_w"
     fi
 done
-if [[ -n "$_missing_wrappers" ]]; then
+if [[ $_crontab_rc -ne 0 ]]; then
+    :   # already warned above; deploy continues (self-heal is non-fatal)
+elif [[ -n "$_missing_wrappers" ]]; then
     echo "  [WARN] Cron wrapper(s) missing or not executable:$_missing_wrappers"
     echo "  [WARN] Something deleted them — regenerating via setup_cron.sh"
     if bash "$PROJECT_DIR/setup_cron.sh"; then
