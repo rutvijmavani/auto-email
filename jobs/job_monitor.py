@@ -907,6 +907,9 @@ def _process_company(company_row, position, total, _r=None):
     company  = company_row["company"]
     platform = company_row.get("ats_platform", "unknown")
     slug     = company_row.get("ats_slug")
+    # `company` is the tracking key ('ca:{id}' for company_ats rows); job_postings
+    # must carry the real name, exactly as the scan/fullscan workers do.
+    display_name = company_row.get("company_name") or company
 
     result = {
         "monitored":        1,
@@ -969,7 +972,7 @@ def _process_company(company_row, position, total, _r=None):
                 result["failure_name"] = company
                 return result
             logger.debug("%s fetch: %r slug=%s", platform, company, slug_info)
-            raw_jobs = ats_module.fetch_jobs(slug_info, company)
+            raw_jobs = ats_module.fetch_jobs(slug_info, display_name)
         except IncompleteSearchError as exc:
             # Avature SearchJobs pagination cut short (deadline or fetch failure).
             # Empty stubs means the very first page fetch failed — treat as a hard
@@ -1022,7 +1025,7 @@ def _process_company(company_row, position, total, _r=None):
 
     # URL presence tracking (DB reads — fast, no HTTP)
     fetched_urls = {job["job_url"] for job in raw_jobs}
-    tracked      = get_tracked_urls_for_company(company)
+    tracked      = get_tracked_urls_for_company(display_name)
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
     if present_ids:
         reset_missing_days(present_ids)
