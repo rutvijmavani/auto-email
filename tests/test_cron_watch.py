@@ -155,6 +155,15 @@ class TestChecks(Base):
         again = self.run_watch(f"0 7 * * * {self.dir}/run_monitor.sh\n", now=NOW + 900)
         self.assertEqual(again, [])                  # recorded, not repeated
 
+    def test_finished_run_in_older_slot_log_is_recorded(self):
+        self.wrapper()
+        start = ts(2026, 10, 9, 7, 0, 3)             # 3 days before NOW, outside today/yesterday logs
+        self.log("monitor", start, [f"[CRON] m started at {stamp(start)}",
+                                    f"[CRON] m finished at {stamp(start + 60)} | exit=4"])
+        with mock.patch.object(cw.config, "CRON_WATCH_LOOKBACK_HOURS", 96):
+            alerts = self.run_watch(f"0 7 * * * {self.dir}/run_monitor.sh\n")
+        self.assertIn("exit", [a["kind"] for a in alerts])
+
     def test_failure_before_watcher_existed_is_ignored(self):
         self.wrapper()
         start = ts(2026, 10, 12, 7, 0, 3)

@@ -188,6 +188,10 @@ else
     _cron_wrappers=$(printf '%s\n' "$_crontab_out" | grep -vE '^[[:space:]]*#' | grep -oE "/[^ '\"]*/run_[a-z_]+\.sh" | sort -u || true)
 fi
 for _w in $_cron_wrappers; do
+    # Only wrappers setup_cron.sh generates (same dir, same name) — a user's own run_custom.sh
+    # must not trigger a regeneration.
+    [[ "$(dirname "$_w")" == "$PROJECT_DIR" ]] || continue
+    grep -qF "\"\$PROJECT_DIR/$(basename "$_w")\"" "$PROJECT_DIR/setup_cron.sh" || continue
     if [[ ! -x "$_w" ]]; then
         _missing_wrappers="$_missing_wrappers $_w"
     fi

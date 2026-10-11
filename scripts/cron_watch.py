@@ -313,8 +313,9 @@ def evaluate(entries: list[dict], state: dict, now: float) -> list[dict]:
             continue
 
         # 2/3. Progress + finish checks over today's and yesterday's logs
+        # plus the log of every due slot, so a run older than yesterday (lookback > 24 h) is still recorded
         logs = {log_path_for(info["template"], datetime.fromtimestamp(t))
-                for t in (now, now - 86400)}
+                for t in (now, now - 86400, *slots)}
         for log in sorted(logs):
             runs = parse_runs(log)
             for i, run in enumerate(runs):
