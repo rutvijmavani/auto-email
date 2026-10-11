@@ -82,7 +82,8 @@ def is_ignored(line: str, patterns: list[str]) -> bool:
 
 
 def ignore_patterns() -> list[str]:
-    return [p.strip() for p in config.CRON_WATCH_IGNORE_PATTERNS.split(",") if p.strip()]
+    # ";;" delimiter: single commas are legal inside regexes ({1,3}, [a,b]).
+    return [p.strip() for p in config.CRON_WATCH_IGNORE_PATTERNS.split(";;") if p.strip()]
 
 
 # ── Log resolution ───────────────────────────────────────────────────────────

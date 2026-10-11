@@ -357,10 +357,11 @@ CRON_WATCH_RUNTIME_MULTIPLIER = float(os.getenv("CRON_WATCH_RUNTIME_MULTIPLIER",
 CRON_WATCH_MIN_HISTORY_RUNS = int(os.getenv("CRON_WATCH_MIN_HISTORY_RUNS", "3"))   # runs before the learned baseline is trusted
 CRON_WATCH_HISTORY_DAYS     = int(os.getenv("CRON_WATCH_HISTORY_DAYS", "14"))      # history kept (matches daily-log retention)
 CRON_WATCH_REALERT_HOURS    = int(os.getenv("CRON_WATCH_REALERT_HOURS", "24"))     # re-alert interval while a problem persists
-# Comma-separated regexes of crontab lines the watcher skips (keep-alive loop, log_monitor itself, 9 AM fallback line)
+# ";;"-separated regexes of crontab lines the watcher skips (keep-alive loop, log_monitor itself, 9 AM fallback line).
+# ";;" not "," so regexes containing commas (quantifiers like {1,3}) stay intact.
 CRON_WATCH_IGNORE_PATTERNS  = os.getenv(
     "CRON_WATCH_IGNORE_PATTERNS",
-    r"hashlib,scripts/log_monitor\.py,^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+grep -q",
+    r"hashlib;;scripts/log_monitor\.py;;^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+grep -q",
 )
 
 CF_WORKER_URL    = os.getenv("CF_WORKER_URL", "") # Cloudflare probe-worker endpoint

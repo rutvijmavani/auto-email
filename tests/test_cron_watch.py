@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -78,6 +79,12 @@ class TestParsing(unittest.TestCase):
         self.assertTrue(cw.is_ignored('0 */4 * * * python3 -c "import hashlib; ..."', pats))
         self.assertTrue(cw.is_ignored("*/15 * * * * /v/python /m/scripts/log_monitor.py >> /l", pats))
         self.assertFalse(cw.is_ignored("0 7 * * * /home/opc/mail/run_monitor.sh", pats))
+
+    def test_ignore_patterns_keep_commas_in_regex(self):
+        with mock.patch.object(cw.config, "CRON_WATCH_IGNORE_PATTERNS", r"foo\d{1,3}bar;;baz"):
+            pats = cw.ignore_patterns()
+        self.assertEqual(pats, [r"foo\d{1,3}bar", "baz"])
+        self.assertTrue(cw.is_ignored("x foo12bar", pats))
 
     def test_wrapper_log_template_daily_and_monthly(self):
         text = 'PROJECT_DIR="/p"\nLOG_DIR="$PROJECT_DIR/logs"\nLOG_FILE="$LOG_DIR/monthly_$(date +%Y-%m).log"\n'

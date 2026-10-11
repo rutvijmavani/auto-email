@@ -1,12 +1,21 @@
-# Cron job monitoring — design (APPROVED 2026-10-11, built, not yet committed/deployed)
+# Cron job monitoring — design (APPROVED 2026-10-11, implemented and committed locally, not yet deployed)
 
-Status: approved 2026-10-11; implemented in `scripts/cron_watch.py` (tests: `tests/test_cron_watch.py`).
+Status: approved 2026-10-11; implemented in `scripts/cron_watch.py` (commit `cb95420`; tests: `tests/test_cron_watch.py`);
+deploy self-heal in `deploy/deploy.sh` (commit `6016a8a`). Where the text below disagrees with the list that
+follows, the list (the implemented behaviour) wins; the superseded text is marked.
 
 Implementation deviations from the text below:
 - Alert de-duplication lives in the state file (`state["sent"]`), not Redis, so the watcher works when Redis is down.
+  (Supersedes the Redis `cron_watch:alert:*` keys in section 3.)
 - Silence is measured from the log file's mtime (no size tracking needed); history stores the longest silence
-  observed at 15-min checks during each run.
-- The watcher is called at the top of `log_monitor.main()` (before the early-return paths), via `cron_watch.run_safe`.
+  observed at 15-min checks during each run. (Supersedes the `size` / `last_growth_ts` fields in sections 5.2 and 6;
+  the state `current` entry holds `start` and `max_silence_s` only.)
+- Job keys are the wrapper basename (e.g. `run_monitor.sh`), `direct:<log basename>` for `>>` lines and
+  `line:<sha1[:8]>` for unresolved lines. (Supersedes the log-prefix key `monitor` in section 6; the state stores no
+  `wrapper` path.)
+- The watcher is called at the top of `log_monitor.main()` (before the early-return paths), via `cron_watch.run_safe`,
+  right after the "scan started" line, not after the existing scan. (Supersedes "after the existing scan" in section 3.)
+- `CRON_WATCH_IGNORE_PATTERNS` is `;;`-separated, not comma-separated, so regexes can contain commas.
 - Missing-wrapper alert fires immediately (not only when a slot is due).
 - A watcher crash emails once per re-alert window (flag file `data/cron_watch_error.flag`).
 
@@ -38,13 +47,13 @@ Non-goals
 ## 3. Where it lives
 
 A new module `scripts/cron_watch.py` holding pure, testable functions, called once per run from
-`log_monitor.main()` after the existing scan. It reuses `log_monitor`'s lock (`data/log_monitor.lock`),
+`log_monitor.main()` (as implemented: at the top, before the early-return paths; see the deviations list). It reuses `log_monitor`'s lock (`data/log_monitor.lock`),
 its `_send_email()` (Gmail, same recipient) and its 15-minute cron entry. No new cron entry is needed, which
 matters: a new cron entry could itself vanish.
 
 New state file `data/cron_watch_state.json` (atomic write via tmp + rename, same pattern as
-`log_monitor_state.json`). Alert de-duplication keys go in Redis (`cron_watch:alert:*`), like the existing
-fingerprints; if Redis is down, fall back to the state file so an outage cannot hide a cron failure.
+`log_monitor_state.json`). ~~Alert de-duplication keys go in Redis (`cron_watch:alert:*`)~~ **Superseded:** de-duplication keys live only in
+the state file (`sent`), so an outage of Redis cannot hide a cron failure.
 
 New dependency: `croniter` (pinned in `requirements.txt`). To verify before building: the deploy workflow
 installs `requirements.txt` on the VM, so the dependency arrives with the next deploy.
@@ -73,7 +82,7 @@ Every run of the watcher does this:
    one "unmonitored cron job: <line>" alert per day until it is fixed or ignored on purpose. This is the safety
    net that stops a new job being silently skipped.
 
-Ignore list (the only config the monitor needs, `CRON_WATCH_IGNORE_PATTERNS`, comma-separated regexes):
+Ignore list (the only config the monitor needs, `CRON_WATCH_IGNORE_PATTERNS`, `;;`-separated regexes):
 - the keep-alive hash loop (no log),
 - `scripts/log_monitor.py` (cannot watch itself, see section 9),
 - the 9 AM fallback line (starts with `grep -q`, only runs when the 7 AM run failed; the 7 AM slot already
@@ -95,8 +104,8 @@ Alert text: `Cron job did not start: <wrapper or command> (slot 07:00, log monit
 
 ### 5.2 Progress check (is it still working?)
 A run is "in progress" if its log has a `started` line with no later `finished` line. Every watcher run
-(every 15 minutes) records, per in-progress run, the log file size and the time it last grew
-(`last_growth_ts`) and the longest silence seen so far in that run.
+(every 15 minutes) records, per in-progress run, the longest silence seen so far in that run. Silence is the time
+since the log file's mtime (**as implemented**; the original text tracked the log size and a `last_growth_ts`).
 
 A run is stalled when its current silence exceeds
 `max(CRON_WATCH_STALL_FLOOR_MIN, CRON_WATCH_STALL_MULTIPLIER x learned_max_silence)`
@@ -126,6 +135,10 @@ Alert if `crontab -l` fails, returns nothing, or the set of resolved jobs shrink
 (a line removed by accident).
 
 ## 6. State layout (`data/cron_watch_state.json`)
+
+**Superseded in part:** the implemented layout keys jobs by wrapper basename (`run_monitor.sh`), has no `wrapper`
+field, `current` holds only `start` and `max_silence_s`, and there is an extra top-level `sent` map of alert keys to
+send timestamps. The sketch below is the original proposal.
 
 ```json
 {
