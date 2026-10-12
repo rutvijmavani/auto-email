@@ -56,6 +56,10 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
             return None, f"{platform} slug must be a non-empty JSON object."
         if platform == "workday" and not obj.get("slug"):
             return None, "workday slug JSON needs a \"slug\" key."
+        if platform == "successfactors" and not all(obj.get(k) for k in ("slug", "dc", "region")):
+            # fetch_jobs silently returns [] without all three — a row saved like
+            # that would look enabled but never scan.
+            return None, "successfactors slug JSON needs \"slug\", \"dc\" and \"region\"."
     return slug, None
 
 

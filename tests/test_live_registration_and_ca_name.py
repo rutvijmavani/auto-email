@@ -68,11 +68,9 @@ class TestSharedNameAbsenceGuard(unittest.TestCase):
                           return_value={"u1": 1, "other": 2}), \
              patch.object(jm, "reset_missing_days") as reset, \
              patch.object(jm, "increment_missing_days") as incr, \
+             patch.object(jm, "filter_jobs", return_value=[]), \
              patch.object(jm, "update_company_check"):
-            try:
-                jm._process_company(row, 1, 1)
-            except Exception:
-                pass
+            jm._process_company(row, 1, 1)
         return reset, incr
 
     def test_shared_name_skips_increment_but_still_resets(self):

@@ -1294,12 +1294,14 @@ else:
         key=f"redetect_job_url_{fein}",
     )
     _target_id = None
-    if job_url_in.strip() and len(ca_entries) > 1:
-        _opts = {f"{ca['platform']} · {ca['slug']} · {ca['domain']}": ca["id"] for ca in ca_entries}
+    # custom entries are never overwritten from here (see db/company_ats_admin.py)
+    _targets = [ca for ca in ca_entries if ca.get("platform") != "custom"]
+    if job_url_in.strip() and len(_targets) > 1:
+        _opts = {f"{ca['platform']} · {ca['slug']} · {ca['domain']}": ca["id"] for ca in _targets}
         _pick = st.selectbox("Overwrite which entry?", list(_opts), key=f"redetect_target_{fein}")
         _target_id = _opts[_pick]
-    elif job_url_in.strip() and len(ca_entries) == 1:
-        _target_id = ca_entries[0]["id"]
+    elif job_url_in.strip() and len(_targets) == 1:
+        _target_id = _targets[0]["id"]
 
     if st.button("Re-detect ATS", key=f"redetect_btn_{fein}", type="primary"):
         try:

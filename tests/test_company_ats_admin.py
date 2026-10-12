@@ -41,6 +41,14 @@ class TestValidate(unittest.TestCase):
         slug = json.dumps({"slug": "acme", "wd": "wd5", "path": "External"})
         self.assertEqual(adm.validate_platform_slug("workday", slug)[0], slug)
 
+    def test_successfactors_needs_slug_dc_region(self):
+        self.assertIsNotNone(adm.validate_platform_slug("successfactors", "acme")[1])
+        self.assertIsNotNone(adm.validate_platform_slug("successfactors", '{"slug": "acme"}')[1])
+        self.assertIsNotNone(adm.validate_platform_slug(
+            "successfactors", '{"slug": "acme", "dc": "4"}')[1])
+        slug = json.dumps({"slug": "acme", "dc": "4", "region": "com"})
+        self.assertEqual(adm.validate_platform_slug("successfactors", slug)[0], slug)
+
     def test_editable_platforms_excludes_custom(self):
         plats = adm.editable_platforms()
         self.assertNotIn("custom", plats)
@@ -62,6 +70,18 @@ class TestMatchJobUrl(unittest.TestCase):
         self.assertIsNone(err)
         self.assertEqual(hit["platform"], "greenhouse")
         self.assertEqual(hit["slug"], "acme")
+
+    def test_incomplete_successfactors_urls_are_refused(self):
+        for url in ("https://acme.jobs2web.com/job/x/1",
+                    "https://acme.successfactors.com/careers"):
+            hit, err = adm.match_job_url(url)
+            self.assertIsNone(hit, url)
+            self.assertIn("cannot be monitored", err)
+        hit, err = adm.match_job_url(
+            "https://career4.successfactors.com/careers?company=acme")
+        self.assertIsNone(err)
+        self.assertEqual(json.loads(hit["slug"]),
+                         {"slug": "acme", "dc": "4", "region": "com", "path": "/careers"})
 
     def test_matched_custom_pattern_is_refused(self):
         with patch.object(adm, "match_ats_pattern",
