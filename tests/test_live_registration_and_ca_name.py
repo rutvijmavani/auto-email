@@ -52,6 +52,46 @@ class TestCompanyAtsDisplayName(unittest.TestCase):
         ats.fetch_jobs.assert_called_once_with("slug", "Acme")
 
 
+class TestSharedNameAbsenceGuard(unittest.TestCase):
+    """Absence update is skipped when several monitorable entries share a name."""
+
+    def _run(self, row):
+        import jobs.job_monitor as jm
+        ats_module = MagicMock()
+        ats_module.fetch_jobs.return_value = [{"job_url": "u1", "title": "t"}]
+        with patch.object(jm, "needs_redetection", return_value=False), \
+             patch.object(jm, "get_config", return_value={}), \
+             patch.object(jm, "get_ats_module", return_value=ats_module), \
+             patch.object(jm, "_get_semaphore", return_value=MagicMock()), \
+             patch.object(jm, "_parse_slug", return_value="slug"), \
+             patch.object(jm, "get_tracked_urls_for_company",
+                          return_value={"u1": 1, "other": 2}), \
+             patch.object(jm, "reset_missing_days") as reset, \
+             patch.object(jm, "increment_missing_days") as incr, \
+             patch.object(jm, "update_company_check"):
+            try:
+                jm._process_company(row, 1, 1)
+            except Exception:
+                pass
+        return reset, incr
+
+    def test_shared_name_skips_increment_but_still_resets(self):
+        reset, incr = self._run({
+            "company": "ca:1", "company_name": "Acme", "name_shared": True,
+            "ats_platform": "workday", "ats_slug": "x",
+        })
+        reset.assert_called_once_with([1])
+        incr.assert_not_called()
+
+    def test_unshared_name_still_increments_when_scan_complete(self):
+        reset, incr = self._run({
+            "company": "ca:1", "company_name": "Acme", "name_shared": False,
+            "ats_platform": "workday", "ats_slug": "x",
+        })
+        reset.assert_called_once_with([1])
+        incr.assert_called_once_with([2])
+
+
 class TestRegisterNewCompanies(unittest.TestCase):
 
     def _redis(self, zfull=None, zadaptive=None, zinflight=None, markers=()):

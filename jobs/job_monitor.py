@@ -423,6 +423,18 @@ def run():
         print("[INFO] Then: python pipeline.py --detect-ats")
         return {}
 
+    # job_postings has no column naming the ATS entry that produced a row, so
+    # absence tracking is keyed by display name only.  When two monitorable
+    # entries share a name (e.g. a platform migration left both enabled), each
+    # one's scan would count the other's jobs as missing — flag them so
+    # _process_company skips the absence update for those names.
+    _name_counts = {}
+    for _c in companies:
+        _n = _c.get("company_name") or _c["company"]
+        _name_counts[_n] = _name_counts.get(_n, 0) + 1
+    for _c in companies:
+        _c["name_shared"] = _name_counts[_c.get("company_name") or _c["company"]] > 1
+
     all_companies = get_all_monitored_companies()
     skipped = len(all_companies) - len(companies)
     if skipped > 0:
@@ -1029,7 +1041,12 @@ def _process_company(company_row, position, total, _r=None):
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
     if present_ids:
         reset_missing_days(present_ids)
-    if _scan_complete:
+    if company_row.get("name_shared"):
+        # Another monitorable entry stores jobs under this same name; its jobs
+        # would look "missing" from this entry's scan.  Resets above are safe.
+        logger.debug("Skipping absence update for %r: name shared by several "
+                     "monitorable entries", display_name)
+    elif _scan_complete:
         missing_ids = [tracked[url] for url in tracked if url not in fetched_urls]
         if missing_ids:
             increment_missing_days(missing_ids)

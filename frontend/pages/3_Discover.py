@@ -1245,7 +1245,7 @@ else:
                         ok, msg = update_company_ats_row(
                             _target_id, hit["platform"], hit["slug"], enable=_enable)
                     else:
-                        _dom = _norm_domain(_domain_hint or website or careers)
+                        _dom = _norm_domain(_domain_hint or website)
                         ok, msg = insert_company_ats_row(
                             fein, _dom, canonical if canonical != "—" else name,
                             hit["platform"], hit["slug"], enable=_enable)
