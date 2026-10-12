@@ -6,8 +6,9 @@
 # they are partial and repeat many times a day.
 #
 # One hash field per company, overwritten by that company's latest completed
-# full scan — a re-run or resumed scan can never double count.  The hash is
-# deleted by record_cycle_start() once the digest has been sent.
+# full scan — a re-run or resumed scan can never double count.  Once the digest
+# has been sent, record_cycle_start() removes only the entries the digest read
+# (compare-and-delete), so counts written meanwhile carry into the next digest.
 
 import logging
 
@@ -25,26 +26,44 @@ def record_fullscan_counts(r, company: str, fetched: int, matched: int) -> None:
         logger.warning("digest_counts: could not record counts for %r: %s", company, exc)
 
 
-def read_fullscan_totals(r, exclude=()) -> dict:
-    """Sum the stored counts, skipping companies in `exclude`.
+def read_fullscan_counts(r) -> dict:
+    """Return the raw stored counts as {company: "fetched:matched"} (decoded).
 
-    Returns {"fetched": int, "matched": int, "companies": int}; zeros when the
-    hash is empty or Redis is unavailable.
+    Empty when the hash is empty or Redis is unavailable.  The digest reads
+    this once and passes the same snapshot to sum_fullscan_counts() and, after
+    the digest is sent, to reset_fullscan_counts().
     """
-    totals = {"fetched": 0, "matched": 0, "companies": 0}
     if r is None:
-        return totals
+        return {}
     try:
         entries = r.hgetall(REDIS_DIGEST_FULLSCAN_COUNTS) or {}
     except Exception as exc:
         logger.warning("digest_counts: could not read counts: %s", exc)
-        return totals
+        return {}
+    out = {}
     for company, value in entries.items():
         if isinstance(company, bytes):
             company = company.decode()
         if isinstance(value, bytes):
             value = value.decode()
+        out[company] = str(value)
+    return out
+
+
+def sum_fullscan_counts(entries: dict, exclude=(), include=None) -> dict:
+    """Sum `entries`, skipping companies in `exclude`.
+
+    When `include` is given, only companies in it are counted (e.g. the
+    currently monitorable set, so a disabled company's leftover count is not
+    added to the digest).
+
+    Returns {"fetched": int, "matched": int, "companies": int}.
+    """
+    totals = {"fetched": 0, "matched": 0, "companies": 0}
+    for company, value in entries.items():
         if company in exclude:
+            continue
+        if include is not None and company not in include:
             continue
         try:
             fetched, matched = (int(x) for x in str(value).split(":", 1))
@@ -56,9 +75,37 @@ def read_fullscan_totals(r, exclude=()) -> dict:
     return totals
 
 
-def reset_fullscan_counts(r) -> None:
-    """Start a new digest window. Never raises."""
+def read_fullscan_totals(r, exclude=(), include=None) -> dict:
+    """Read and sum the stored counts; zeros when empty or Redis is unavailable."""
+    return sum_fullscan_counts(read_fullscan_counts(r), exclude, include)
+
+
+# Delete each field only if it still holds the value the digest read, so a
+# count a full scan wrote after the digest read it survives for the next digest.
+_DELETE_IF_UNCHANGED_LUA = """
+for i = 1, #ARGV, 2 do
+    if redis.call('HGET', KEYS[1], ARGV[i]) == ARGV[i + 1] then
+        redis.call('HDEL', KEYS[1], ARGV[i])
+    end
+end
+return 1
+"""
+
+
+def reset_fullscan_counts(r, snapshot=None) -> None:
+    """Start a new digest window. Never raises.
+
+    With `snapshot` (the dict read_fullscan_counts() returned for the digest),
+    only entries still equal to that snapshot are removed; entries written or
+    changed since are kept.  Without it the whole hash is deleted.
+    """
     try:
-        r.delete(REDIS_DIGEST_FULLSCAN_COUNTS)
+        if snapshot is None:
+            r.delete(REDIS_DIGEST_FULLSCAN_COUNTS)
+        elif snapshot:
+            args = []
+            for company, value in snapshot.items():
+                args.extend((company, value))
+            r.eval(_DELETE_IF_UNCHANGED_LUA, 1, REDIS_DIGEST_FULLSCAN_COUNTS, *args)
     except Exception as exc:
         logger.warning("digest_counts: could not reset counts: %s", exc)

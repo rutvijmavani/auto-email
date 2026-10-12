@@ -23,6 +23,13 @@ class _FakeRedis:
     def delete(self, key):
         self.h.clear()
 
+    def eval(self, script, numkeys, key, *args):
+        # Mimics the compare-and-delete script: remove a field only if unchanged.
+        for i in range(0, len(args), 2):
+            if self.h.get(args[i]) == args[i + 1]:
+                del self.h[args[i]]
+        return 1
+
 
 class TestDigestCounts(unittest.TestCase):
 
@@ -52,6 +59,36 @@ class TestDigestCounts(unittest.TestCase):
         dc.record_fullscan_counts(r, "A", 1, 1)
         dc.reset_fullscan_counts(r)
         self.assertEqual(dc.read_fullscan_totals(r)["companies"], 0)
+
+    def test_include_limits_to_monitorable_companies(self):
+        r = _FakeRedis()
+        dc.record_fullscan_counts(r, "A", 100, 10)
+        dc.record_fullscan_counts(r, "B", 50, 5)     # e.g. disabled company
+        dc.record_fullscan_counts(r, "C", 20, 2)     # unconfirmed fallback
+        totals = dc.read_fullscan_totals(r, exclude={"C"}, include={"A", "C"})
+        self.assertEqual(totals, {"fetched": 100, "matched": 10, "companies": 1})
+
+    def test_snapshot_reset_keeps_counts_written_after_read(self):
+        r = _FakeRedis()
+        dc.record_fullscan_counts(r, "A", 100, 10)
+        dc.record_fullscan_counts(r, "B", 50, 5)
+        snap = dc.read_fullscan_counts(r)
+        dc.record_fullscan_counts(r, "A", 130, 13)   # rescan finished mid-digest
+        dc.record_fullscan_counts(r, "D", 7, 1)      # new company mid-digest
+        dc.reset_fullscan_counts(r, snap)
+        self.assertEqual(r.h, {"A": "130:13", "D": "7:1"})
+
+    def test_snapshot_reset_clears_unchanged_entries(self):
+        r = _FakeRedis()
+        dc.record_fullscan_counts(r, "A", 1, 1)
+        dc.reset_fullscan_counts(r, dc.read_fullscan_counts(r))
+        self.assertEqual(r.h, {})
+
+    def test_empty_snapshot_deletes_nothing(self):
+        r = _FakeRedis()
+        dc.record_fullscan_counts(r, "A", 1, 1)
+        dc.reset_fullscan_counts(r, {})
+        self.assertEqual(r.h, {"A": "1:1"})
 
     def test_redis_failures_never_raise(self):
         r = MagicMock()

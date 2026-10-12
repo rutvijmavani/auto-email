@@ -74,7 +74,7 @@ from config import (
 logger = get_logger(__name__)
 
 
-def _record_cycle_start() -> None:
+def _record_cycle_start(counts_snapshot=None) -> None:
     """
     Write cycle:start to Redis after digest email is sent and jobs digested.
 
@@ -85,7 +85,7 @@ def _record_cycle_start() -> None:
     """
     try:
         from workers.scheduler import record_cycle_start
-        ts = record_cycle_start()
+        ts = record_cycle_start(counts_snapshot)
         logger.info("cycle:start written (unix=%.0f)", ts)
     except Exception as exc:
         # Non-fatal — scheduler may not be running (e.g. daily batch mode)
@@ -745,9 +745,15 @@ def run():
     # covered recorded their full-scan counts in Redis; companies in
     # missed_names and unconfirmed in-flight companies were fallback-fetched
     # above, so skip both to never double count.
-    from workers.digest_counts import read_fullscan_totals
-    _worker_counts = read_fullscan_totals(
-        _shared_r, exclude=missed_names | _all_unconfirmed,
+    # Only currently monitorable companies count (a disabled company's leftover
+    # entry is ignored).  The raw snapshot is kept so the post-digest reset
+    # removes just these entries and not counts written while the digest runs.
+    from workers.digest_counts import read_fullscan_counts, sum_fullscan_counts
+    _counts_snapshot = read_fullscan_counts(_shared_r)
+    _worker_counts = sum_fullscan_counts(
+        _counts_snapshot,
+        exclude=missed_names | _all_unconfirmed,
+        include={c["company"] for c in companies},
     )
     stats["total_jobs_fetched"]   += _worker_counts["fetched"]
     stats["jobs_matched_filters"] += _worker_counts["matched"]
@@ -802,7 +808,7 @@ def run():
                 mark_postings_digested()
                 logger.info("Marked %d posting(s) as digested",
                             len(new_postings))
-                _record_cycle_start()
+                _record_cycle_start(_counts_snapshot)
         except Exception as e:
             logger.error("PDF generation failed: %s", e, exc_info=True)
             print(f"[ERROR] PDF generation failed: {e}")
@@ -810,7 +816,7 @@ def run():
             email_sent = _send_text_fallback(new_postings)
             if email_sent:
                 mark_postings_digested()
-                _record_cycle_start()
+                _record_cycle_start(_counts_snapshot)
     else:
         logger.info("No new jobs — sending no-jobs email")
         print(f"\n[INFO] No new matching jobs today.")
@@ -820,7 +826,7 @@ def run():
             # No cycle:start on a no-jobs day, but the digest window still
             # ended — drop the counts it used so they are not re-added tomorrow.
             from workers.digest_counts import reset_fullscan_counts
-            reset_fullscan_counts(_shared_r)
+            reset_fullscan_counts(_shared_r, _counts_snapshot)
 
     final_stats = {
         **stats,

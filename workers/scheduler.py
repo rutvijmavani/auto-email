@@ -392,7 +392,7 @@ def claim_stale_work(r, stream_key: str, group: str,
 # CYCLE START (called from --monitor-jobs)
 # ─────────────────────────────────────────
 
-def record_cycle_start() -> float:
+def record_cycle_start(counts_snapshot=None) -> float:
     """
     Write cycle:start Unix timestamp to Redis.
 
@@ -414,9 +414,10 @@ def record_cycle_start() -> float:
                 datetime.fromtimestamp(redis_time_s).isoformat(),
                 redis_time_s)
 
-    # New digest window: drop the per-company full-scan counts the digest just used.
+    # New digest window: drop the per-company full-scan counts the digest just used
+    # (only those in counts_snapshot when given, so counts written since survive).
     from workers.digest_counts import reset_fullscan_counts
-    reset_fullscan_counts(r)
+    reset_fullscan_counts(r, counts_snapshot)
 
     # Recalibrate band thresholds from today's actual score distribution so
     # all interval decisions this cycle use up-to-date percentile boundaries.
