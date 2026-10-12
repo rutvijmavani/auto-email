@@ -604,6 +604,15 @@ CYCLE_START_HOUR               = 7          # monitoring day runs 7 AM → 7 AM
                                              # used by rebuild_poll_queues() to
                                              # distinguish stale (previous cycle) from
                                              # current-cycle companies on restart.
+# Live registration sweep (workers/scheduler.py::_registration_sweep_loop):
+# picks up companies enabled for monitoring after scheduler start (e.g. via the
+# Discover page) without a scheduler restart.  Spread uses the same
+# ceil(N / WORKER_FLOOR) * STARTUP_AVG_SCAN_TIME_S window as rebuild_poll_queues().
+COMPANY_REGISTRATION_SWEEP_INTERVAL_S = int(os.getenv("COMPANY_REGISTRATION_SWEEP_INTERVAL_S", "300"))
+# A registered company is not re-registered until this TTL lapses (covers the
+# window between dispatch and the first fullscan writing its company_poll_stats
+# row; a failed first scan is retried after the TTL).
+COMPANY_REGISTRATION_MARKER_TTL_S     = int(os.getenv("COMPANY_REGISTRATION_MARKER_TTL_S", "21600"))
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan
 SCHEDULER_FULL_SCAN_INTERVAL_S = 86400      # default full scan every 24h
 SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)

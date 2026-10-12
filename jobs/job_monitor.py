@@ -423,6 +423,18 @@ def run():
         print("[INFO] Then: python pipeline.py --detect-ats")
         return {}
 
+    # job_postings has no column naming the ATS entry that produced a row, so
+    # absence tracking is keyed by display name only.  When two monitorable
+    # entries share a name (e.g. a platform migration left both enabled), each
+    # one's scan would count the other's jobs as missing — flag them so
+    # _process_company skips the absence update for those names.
+    _name_counts = {}
+    for _c in companies:
+        _n = _c.get("company_name") or _c["company"]
+        _name_counts[_n] = _name_counts.get(_n, 0) + 1
+    for _c in companies:
+        _c["name_shared"] = _name_counts[_c.get("company_name") or _c["company"]] > 1
+
     all_companies = get_all_monitored_companies()
     skipped = len(all_companies) - len(companies)
     if skipped > 0:
@@ -907,6 +919,9 @@ def _process_company(company_row, position, total, _r=None):
     company  = company_row["company"]
     platform = company_row.get("ats_platform", "unknown")
     slug     = company_row.get("ats_slug")
+    # `company` is the tracking key ('ca:{id}' for company_ats rows); job_postings
+    # must carry the real name, exactly as the scan/fullscan workers do.
+    display_name = company_row.get("company_name") or company
 
     result = {
         "monitored":        1,
@@ -969,7 +984,7 @@ def _process_company(company_row, position, total, _r=None):
                 result["failure_name"] = company
                 return result
             logger.debug("%s fetch: %r slug=%s", platform, company, slug_info)
-            raw_jobs = ats_module.fetch_jobs(slug_info, company)
+            raw_jobs = ats_module.fetch_jobs(slug_info, display_name)
         except IncompleteSearchError as exc:
             # Avature SearchJobs pagination cut short (deadline or fetch failure).
             # Empty stubs means the very first page fetch failed — treat as a hard
@@ -1022,11 +1037,16 @@ def _process_company(company_row, position, total, _r=None):
 
     # URL presence tracking (DB reads — fast, no HTTP)
     fetched_urls = {job["job_url"] for job in raw_jobs}
-    tracked      = get_tracked_urls_for_company(company)
+    tracked      = get_tracked_urls_for_company(display_name)
     present_ids  = [tracked[url] for url in fetched_urls if url in tracked]
     if present_ids:
         reset_missing_days(present_ids)
-    if _scan_complete:
+    if company_row.get("name_shared"):
+        # Another monitorable entry stores jobs under this same name; its jobs
+        # would look "missing" from this entry's scan.  Resets above are safe.
+        logger.debug("Skipping absence update for %r: name shared by several "
+                     "monitorable entries", display_name)
+    elif _scan_complete:
         missing_ids = [tracked[url] for url in tracked if url not in fetched_urls]
         if missing_ids:
             increment_missing_days(missing_ids)

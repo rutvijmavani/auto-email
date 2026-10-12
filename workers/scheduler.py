@@ -230,6 +230,37 @@ def _get_stream_pending_count(r, stream_key: str,
         return 0
 
 
+def _get_stream_undelivered_companies(r, stream_key: str,
+                                      group: str = STREAM_CONSUMER_GROUP):
+    """Return the set of companies queued in a stream but not yet claimed by a worker.
+
+    Entries after the group's last-delivered-id have reached no consumer, so
+    they are in neither the poll ZSETs nor the inflight ZSET.  Returns None
+    when the stream state cannot be read, so callers can fail safe.
+    """
+    def _s(v):
+        return v.decode() if isinstance(v, bytes) else v
+
+    try:
+        last_id = None
+        for g in r.xinfo_groups(stream_key):
+            if _s(g.get("name", b"")) == group:
+                last_id = _s(g.get("last-delivered-id", "0-0"))
+                break
+        if last_id is None:
+            return set()
+        entries = r.xrange(stream_key, min=f"({last_id}", max="+")
+        companies = set()
+        for _msg_id, fields in entries:
+            raw = fields.get("company", fields.get(b"company"))
+            if raw:
+                companies.add(_s(raw))
+        return companies
+    except Exception as exc:
+        logger.warning("stream: undelivered scan failed for %r: %s", stream_key, exc)
+        return None
+
+
 def _get_stream_undelivered_count(r, stream_key: str,
                                    group: str = STREAM_CONSUMER_GROUP) -> int:
     """Return the count of messages in the stream not yet delivered to any consumer.
@@ -2392,6 +2423,121 @@ def _liveness_check_loop() -> None:
 _SCHEDULER_START_TS = time.time()
 
 
+def _register_new_companies(r) -> int:
+    """
+    Register monitorable companies that were never scanned into poll:fullscan
+    without a scheduler restart.  Returns the number registered.
+
+    rebuild_poll_queues() does this only at startup; this is the live
+    equivalent.  It is deliberately narrow so it can never disturb a healthy
+    queue:
+
+      * candidates are monitorable companies with no company_poll_stats row, or
+        a row with neither last_poll_at nor last_full_scan_at (rebuild's NEW
+        bucket) — companies that already have scan history are never touched
+        (an in-flight adaptive scan is out of every ZSET and would otherwise be
+        mistaken for unregistered);
+      * skipped when already in poll:fullscan / poll:adaptive / inflight:fullscan,
+        queued in stream:fullscan and not yet claimed by a worker, or when a
+        registration marker (TTL) exists — covers the window between
+        dispatch and the first fullscan writing its stats row;
+      * the batch is spread over the same ceil(N / WORKER_FLOOR) *
+        STARTUP_AVG_SCAN_TIME_S window rebuild uses, and each slot goes through
+        _atomic_schedule() (gap-avoiding, Redis-locked, skip_if_future), so a
+        batch cannot cluster on itself or on already-scheduled fullscans.
+    """
+    from db.job_monitor import get_monitorable_companies
+    from workers.rebuild import _spread_window_s
+    from config import (
+        STARTUP_AVG_SCAN_TIME_S, COMPANY_REGISTRATION_MARKER_TTL_S,
+    )
+
+    keys = [c["company"] for c in get_monitorable_companies()]
+    if not keys:
+        return 0
+
+    conn = get_conn()
+    try:
+        scanned = {
+            row["company"] for row in conn.execute(
+                "SELECT company FROM company_poll_stats "
+                "WHERE company = ANY(%s) "
+                "AND (last_poll_at IS NOT NULL OR last_full_scan_at IS NOT NULL)",
+                (keys,),
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    candidates = [k for k in keys if k not in scanned]
+    if not candidates:
+        return 0
+
+    pipe = r.pipeline()
+    for company in candidates:
+        pipe.zscore(REDIS_POLL_FULLSCAN, company)
+        pipe.zscore(REDIS_POLL_ADAPTIVE, company)
+        pipe.zscore(REDIS_INFLIGHT_FULLSCAN, company)
+        pipe.exists(f"poll:registered:{company}")
+    flags = pipe.execute()
+
+    # Dispatched to stream:fullscan but not yet claimed by a worker: out of the
+    # poll ZSET and not yet inflight, so only the stream itself shows it.
+    queued = _get_stream_undelivered_companies(r, REDIS_STREAM_FULLSCAN)
+    if queued is None:
+        return 0
+
+    pending = []
+    for i, company in enumerate(candidates):
+        z_full, z_adaptive, z_inflight, marker = flags[i * 4:(i + 1) * 4]
+        if (z_full is None and z_adaptive is None and z_inflight is None
+                and not marker and company not in queued):
+            pending.append(company)
+    if not pending:
+        return 0
+
+    now    = time.time()
+    n      = len(pending)
+    window = _spread_window_s(n, WORKER_FLOOR, STARTUP_AVG_SCAN_TIME_S)
+    done   = 0
+    for i, company in enumerate(pending):
+        scheduled = _atomic_schedule(
+            r, REDIS_POLL_FULLSCAN, company,
+            now + (i / n) * window,
+            SCHEDULER_FULL_SCAN_INTERVAL_S, 0.20,
+            skip_if_future=True,
+        )
+        if scheduled is not None:
+            r.set(f"poll:registered:{company}", "1",
+                  ex=COMPANY_REGISTRATION_MARKER_TTL_S)
+            done += 1
+    logger.info(
+        "registration_sweep: registered %d new compan%s into poll:fullscan "
+        "(spread=%.0fs)", done, "y" if done == 1 else "ies", window,
+    )
+    return done
+
+
+def _registration_sweep_loop() -> None:
+    """Run _register_new_companies() every COMPANY_REGISTRATION_SWEEP_INTERVAL_S."""
+    from config import COMPANY_REGISTRATION_SWEEP_INTERVAL_S
+
+    r = get_redis()
+    logger.info("registration_sweep_loop: started (interval=%ds)",
+                COMPANY_REGISTRATION_SWEEP_INTERVAL_S)
+    while True:
+        try:
+            time.sleep(COMPANY_REGISTRATION_SWEEP_INTERVAL_S)
+            if _pause_event.is_set():
+                continue
+            _register_new_companies(r)
+        except KeyboardInterrupt:
+            logger.info("registration_sweep_loop: stopping")
+            break
+        except Exception as exc:
+            logger.error("registration_sweep_loop: error: %s", exc, exc_info=True)
+
+
 def _redis_watchdog_loop() -> None:
     """
     Detect Redis restarts while the scheduler process is still running and
@@ -2468,6 +2614,7 @@ def _manager_cmds_loop() -> None:
         "platform:deprioritize:{platform}"  — call _deprioritise_platform()
         "platform:outage:{platform}:set"    — set worker:outage:{platform} (TTL from config)
         "platform:outage:{platform}:clear"  — delete worker:outage:{platform}
+        "registration:sweep"                — run _register_new_companies() now
 
     Zero-risk when manager.py is not running: the list stays empty, BLPOP
     returns None every 5s, loop sleeps and tries again.  No state is changed.
@@ -2555,6 +2702,13 @@ def _manager_cmds_loop() -> None:
                     )
                 else:
                     logger.warning("manager_cmds: unknown outage action %r in cmd %r", action, cmd)
+
+            # ── registration:sweep — register newly enabled companies now ─────
+            elif cmd == "registration:sweep":
+                logger.info(
+                    "manager_cmds: registration:sweep registered %d compan(ies)",
+                    _register_new_companies(r),
+                )
 
             else:
                 logger.warning("manager_cmds: unrecognised command %r", cmd)
@@ -3152,6 +3306,8 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
                          name="manager_cmds",            daemon=True),
         threading.Thread(target=_redis_watchdog_loop,
                          name="redis_watchdog",          daemon=True),
+        threading.Thread(target=_registration_sweep_loop,
+                         name="registration_sweep",      daemon=True),
     ]
 
     for t in threads:

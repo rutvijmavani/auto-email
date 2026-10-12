@@ -338,7 +338,9 @@ def get_monitorable_companies():
     company_ats rules:
       - is_monitored = TRUE
       - platform not unknown/unsupported, slug present
-      - Returned with 'ca:{id}' as company key for write-back routing
+      - Returned with 'ca:{id}' as company key for write-back routing, plus
+        company_name (the real display name stored on job_postings; NULL for
+        prospective rows, whose key already is the name)
     """
     conn = get_conn()
     try:
@@ -350,7 +352,8 @@ def get_monitorable_companies():
                    pc.last_checked_at, pc.consecutive_empty_days,
                    pc.domain,
                    f.employer_fein,
-                   COALESCE(u.petition_count, 0)::int AS petition_count
+                   COALESCE(u.petition_count, 0)::int AS petition_count,
+                   NULL::text AS company_name
             FROM prospective_companies pc
             LEFT JOIN LATERAL (
                 SELECT employer_fein
@@ -384,7 +387,8 @@ def get_monitorable_companies():
                 ca.consecutive_empty_days,
                 ca.domain,
                 ca.employer_fein,
-                COALESCE(u.petition_count, 0)::int AS petition_count
+                COALESCE(u.petition_count, 0)::int AS petition_count,
+                ca.company_name
             FROM company_ats ca
             LEFT JOIN uscis_petition_counts u ON u.employer_fein = ca.employer_fein
             WHERE ca.is_monitored = TRUE
