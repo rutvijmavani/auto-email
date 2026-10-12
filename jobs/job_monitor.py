@@ -739,6 +739,20 @@ def run():
                     with stats_lock:
                         stats["enrichment_queued"] += 1
 
+    # ── Add worker full-scan counts to the fetched/matched totals ─────────────
+    # stats so far hold only the fallback companies.  Companies the workers
+    # covered recorded their full-scan counts in Redis; companies in
+    # missed_names were re-fetched above, so skip them to never double count.
+    from workers.digest_counts import read_fullscan_totals
+    _worker_counts = read_fullscan_totals(_shared_r, exclude=missed_names)
+    stats["total_jobs_fetched"]   += _worker_counts["fetched"]
+    stats["jobs_matched_filters"] += _worker_counts["matched"]
+    logger.info(
+        "Worker full-scan counts added: %d companies, fetched=%d matched=%d",
+        _worker_counts["companies"], _worker_counts["fetched"],
+        _worker_counts["matched"],
+    )
+
     # ── Generate PDF digest (sequential — happens once) ────
     new_postings  = get_new_postings_for_digest()
     pdf_generated = False

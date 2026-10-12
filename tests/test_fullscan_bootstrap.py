@@ -527,6 +527,7 @@ class TestFullscanEmptyDaysSignal(unittest.TestCase):
 
     def _run(self, raw_jobs, title_matched):
         r = MagicMock()
+        r.exists.return_value = False   # no maintenance pause / lever flags
         with patch("workers.fullscan._get_fullscan_state", return_value={
                  "full_scan_interrupted": False, "interrupted_at_page": None,
                  "full_scan_interval_s": 86400,
@@ -546,7 +547,9 @@ class TestFullscanEmptyDaysSignal(unittest.TestCase):
              patch("workers.fullscan._BloomPair") as mock_bloom, \
              patch("workers.fullscan.get_conn") as mock_conn_fn, \
              patch("workers.fullscan._bootstrap_warming_adaptive"), \
+             patch("workers.fullscan.record_fullscan_counts") as rec, \
              patch("db.job_monitor.update_company_check") as upd:
+            self.rec = rec
             mock_ats.return_value.fetch_jobs.return_value = raw_jobs
             mock_bloom.return_value.old_exists.return_value = False
             mock_conn = MagicMock()
@@ -566,6 +569,14 @@ class TestFullscanEmptyDaysSignal(unittest.TestCase):
     def test_board_returning_zero_jobs_increments_counter(self):
         upd = self._run(raw_jobs=[], title_matched=[])
         upd.assert_called_once_with("TestCo", found_jobs=False)
+
+    def test_completed_scan_records_digest_counts(self):
+        jobs = [{"job_id": str(i), "job_url": f"https://x.test/{i}", "title": "Nurse"}
+                for i in range(3)]
+        self._run(raw_jobs=jobs, title_matched=jobs[:1])
+        self.rec.assert_called_once()
+        args = self.rec.call_args.args
+        self.assertEqual(args[1:], ("TestCo", 3, 1))
 
 
 if __name__ == "__main__":

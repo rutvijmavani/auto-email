@@ -103,6 +103,7 @@ except ImportError:
 from typing import Optional
 
 from logger import get_logger
+from workers.digest_counts import record_fullscan_counts
 from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
@@ -1366,6 +1367,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                                 "company will be rescheduled by next adaptive cycle",
                                 company, _zadd_err,
                             )
+
+                # Daily digest: this scan saw the whole board, so its counts are
+                # the company's "jobs fetched / matched" (see workers/digest_counts).
+                record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
 
                 # Sync prospective_companies.last_checked_at and
                 # consecutive_empty_days so the monitor table reflects actual

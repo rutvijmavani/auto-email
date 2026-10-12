@@ -414,6 +414,10 @@ def record_cycle_start() -> float:
                 datetime.fromtimestamp(redis_time_s).isoformat(),
                 redis_time_s)
 
+    # New digest window: drop the per-company full-scan counts the digest just used.
+    from workers.digest_counts import reset_fullscan_counts
+    reset_fullscan_counts(r)
+
     # Recalibrate band thresholds from today's actual score distribution so
     # all interval decisions this cycle use up-to-date percentile boundaries.
     try:

@@ -516,6 +516,9 @@ REDIS_DETAIL_DLQ       = "queue:detail:dlq"       # LIST — dead-letter queue f
 REDIS_EMAIL_PUSH       = "queue:email:push"        # LIST — incoming Pub/Sub email notifications
 REDIS_EMAIL_DLQ        = "queue:email:dlq"         # LIST — dead-letter queue for failed email jobs (≤200)
 REDIS_CYCLE_START      = "cycle:start"             # STRING — Unix ts of today's cycle start
+REDIS_DIGEST_FULLSCAN_COUNTS = "digest:fullscan_counts"  # HASH — company → "fetched:matched" from its latest completed full scan this cycle
+# Backstop expiry if the digest never runs to reset the hash (record_cycle_start deletes it).
+DIGEST_FULLSCAN_COUNTS_TTL_S = int(os.getenv("DIGEST_FULLSCAN_COUNTS_TTL_S", str(3 * 86400)))
 REDIS_PAUSE_CHANNEL    = "pipeline:pause"          # PubSub — nightly maintenance pause
 REDIS_RESUME_CHANNEL   = "pipeline:resume"         # PubSub — nightly maintenance resume
 REDIS_CRONCHAIN_ALIVE  = "cronchain:alive"         # STRING TTL=300 — cron chain heartbeat
