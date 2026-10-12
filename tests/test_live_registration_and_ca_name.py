@@ -175,6 +175,38 @@ class TestRegisterNewCompanies(unittest.TestCase):
         self.assertEqual(n, 0)
         sched.assert_not_called()
 
+    def test_skips_companies_queued_unclaimed_in_stream(self):
+        import workers.scheduler as sch
+        r = self._redis()
+        with patch.object(sch, "_get_stream_undelivered_companies",
+                          return_value={"a"}):
+            n, sched = self._go(r, ["a", "b"], scanned=[])
+        self.assertEqual(n, 1)
+        self.assertEqual(sched.call_args_list[0].args[2], "b")
+
+    def test_unreadable_stream_registers_nothing(self):
+        import workers.scheduler as sch
+        r = self._redis()
+        with patch.object(sch, "_get_stream_undelivered_companies",
+                          return_value=None):
+            n, sched = self._go(r, ["a"], scanned=[])
+        self.assertEqual(n, 0)
+        sched.assert_not_called()
+
+    def test_undelivered_companies_reads_entries_after_last_delivered(self):
+        import workers.scheduler as sch
+        r = MagicMock()
+        r.xinfo_groups.return_value = [
+            {"name": sch.STREAM_CONSUMER_GROUP, "last-delivered-id": "5-0"}
+        ]
+        r.xrange.return_value = [("6-0", {"company": "x"}),
+                                 (b"7-0", {b"company": b"y"})]
+        got = sch._get_stream_undelivered_companies(r, "stream:fullscan")
+        self.assertEqual(got, {"x", "y"})
+        self.assertEqual(r.xrange.call_args.kwargs["min"], "(5-0")
+        r.xinfo_groups.side_effect = RuntimeError("down")
+        self.assertIsNone(sch._get_stream_undelivered_companies(r, "stream:fullscan"))
+
 
 if __name__ == "__main__":
     unittest.main()

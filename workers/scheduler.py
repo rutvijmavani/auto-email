@@ -230,6 +230,37 @@ def _get_stream_pending_count(r, stream_key: str,
         return 0
 
 
+def _get_stream_undelivered_companies(r, stream_key: str,
+                                      group: str = STREAM_CONSUMER_GROUP):
+    """Return the set of companies queued in a stream but not yet claimed by a worker.
+
+    Entries after the group's last-delivered-id have reached no consumer, so
+    they are in neither the poll ZSETs nor the inflight ZSET.  Returns None
+    when the stream state cannot be read, so callers can fail safe.
+    """
+    def _s(v):
+        return v.decode() if isinstance(v, bytes) else v
+
+    try:
+        last_id = None
+        for g in r.xinfo_groups(stream_key):
+            if _s(g.get("name", b"")) == group:
+                last_id = _s(g.get("last-delivered-id", "0-0"))
+                break
+        if last_id is None:
+            return set()
+        entries = r.xrange(stream_key, min=f"({last_id}", max="+")
+        companies = set()
+        for _msg_id, fields in entries:
+            raw = fields.get("company", fields.get(b"company"))
+            if raw:
+                companies.add(_s(raw))
+        return companies
+    except Exception as exc:
+        logger.warning("stream: undelivered scan failed for %r: %s", stream_key, exc)
+        return None
+
+
 def _get_stream_undelivered_count(r, stream_key: str,
                                    group: str = STREAM_CONSUMER_GROUP) -> int:
     """Return the count of messages in the stream not yet delivered to any consumer.
@@ -2406,8 +2437,9 @@ def _register_new_companies(r) -> int:
         bucket) — companies that already have scan history are never touched
         (an in-flight adaptive scan is out of every ZSET and would otherwise be
         mistaken for unregistered);
-      * skipped when already in poll:fullscan / poll:adaptive / inflight:fullscan
-        or when a registration marker (TTL) exists — covers the window between
+      * skipped when already in poll:fullscan / poll:adaptive / inflight:fullscan,
+        queued in stream:fullscan and not yet claimed by a worker, or when a
+        registration marker (TTL) exists — covers the window between
         dispatch and the first fullscan writing its stats row;
       * the batch is spread over the same ceil(N / WORKER_FLOOR) *
         STARTUP_AVG_SCAN_TIME_S window rebuild uses, and each slot goes through
@@ -2448,10 +2480,18 @@ def _register_new_companies(r) -> int:
         pipe.zscore(REDIS_INFLIGHT_FULLSCAN, company)
         pipe.exists(f"poll:registered:{company}")
     flags = pipe.execute()
+
+    # Dispatched to stream:fullscan but not yet claimed by a worker: out of the
+    # poll ZSET and not yet inflight, so only the stream itself shows it.
+    queued = _get_stream_undelivered_companies(r, REDIS_STREAM_FULLSCAN)
+    if queued is None:
+        return 0
+
     pending = []
     for i, company in enumerate(candidates):
         z_full, z_adaptive, z_inflight, marker = flags[i * 4:(i + 1) * 4]
-        if z_full is None and z_adaptive is None and z_inflight is None and not marker:
+        if (z_full is None and z_adaptive is None and z_inflight is None
+                and not marker and company not in queued):
             pending.append(company)
     if not pending:
         return 0

@@ -418,6 +418,59 @@ def _pipeline_status(employer_name: str, canonical_name: str | None = None, doma
         conn.close()
 
 
+def _pipeline_row_scans(row: dict) -> bool:
+    """True when a prospective_companies row is actually scanned by the monitor.
+
+    Same condition get_monitorable_companies() applies: is_monitored, a usable
+    platform, a slug, and for 'custom' a non-empty slug.url.
+    """
+    platform, slug = row.get("ats_platform"), row.get("ats_slug")
+    if not row.get("is_monitored") or not slug:
+        return False
+    if platform in (None, "", "unknown", "unsupported"):
+        return False
+    if platform == "custom":
+        try:
+            return bool((json.loads(slug) or {}).get("url"))
+        except (TypeError, ValueError, AttributeError):
+            return False
+    return True
+
+
+def _pipeline_monitored(employer_name: str, canonical_name: str | None = None, domain: str | None = None) -> bool:
+    """True when the prospective pipeline really monitors this company.
+
+    Uses the same name-then-domain row match as _pipeline_status but judges the
+    matching rows' is_monitored / ats_platform / ats_slug, not the status string.
+    """
+    names = [employer_name.strip()]
+    if canonical_name and canonical_name not in ("—", employer_name.strip()):
+        names.append(canonical_name.strip())
+    cols = "is_monitored, ats_platform, ats_slug"
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        placeholders = ", ".join(["%s"] * len(names))
+        cur.execute(
+            f"SELECT {cols} FROM prospective_companies WHERE company IN ({placeholders})",
+            names,
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        if not rows:
+            norm = _norm_domain(domain)
+            if norm:
+                cur.execute(
+                    f"SELECT {cols} FROM prospective_companies "
+                    "WHERE regexp_replace(regexp_replace(LOWER(domain), '^https?://', ''), '^www\\.', '') "
+                    "    = %s",
+                    (norm,),
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+        return any(_pipeline_row_scans(r) for r in rows)
+    finally:
+        conn.close()
+
+
 @st.cache_data(ttl=120)
 def load_ats_discovery(fein: str) -> dict | None:
     """Load ATS discovery row for a given employer FEIN, with careers_url from fein_domain_map."""
@@ -1033,6 +1086,19 @@ pipeline_st = _pipeline_status(
     (disc or {}).get("canonical_name") or None,
     domain=_domain_hint or (disc or {}).get("website_url"),
 )
+# Whether the pipeline really scans this company (is_monitored + usable ATS),
+# as opposed to merely having a row — drives the enable/message decisions.
+pipeline_monitored = _pipeline_monitored(
+    name,
+    (disc or {}).get("canonical_name") or None,
+    domain=_domain_hint or (disc or {}).get("website_url"),
+)
+
+# One-shot result of the last Re-detect (set just before st.rerun(), which would
+# otherwise discard a message rendered in the same run).
+_flash = st.session_state.pop(f"redetect_flash_{fein}", None)
+if _flash:
+    st.success(_flash)
 
 if disc is None:
     st.info("No discovery data yet for this employer.")
@@ -1201,8 +1267,11 @@ else:
         with action_col:
             if ca_any_monitored:
                 st.info("Monitored via ATS detection — see entries below")
-            elif pipeline_st:
+            elif pipeline_monitored:
                 st.info(f"Already monitored via the prospective pipeline — {pipeline_st}")
+            elif pipeline_st:
+                st.caption(f"In the prospective pipeline ({pipeline_st}) but not monitored "
+                           "— enable it on the matching entry below.")
             else:
                 st.caption("Not monitored yet — enable it on the matching entry below.")
     else:
@@ -1240,7 +1309,7 @@ else:
                     st.error(err)
                 else:
                     # Enable immediately unless the prospective pipeline already scans this company.
-                    _enable = not pipeline_st
+                    _enable = not pipeline_monitored
                     if _target_id is not None:
                         ok, msg = update_company_ats_row(
                             _target_id, hit["platform"], hit["slug"], enable=_enable)
@@ -1251,9 +1320,10 @@ else:
                             hit["platform"], hit["slug"], enable=_enable)
                     if ok:
                         load_company_ats_entries.clear()
-                        st.success(msg + (" — monitoring enabled, scanned within ~5 minutes."
-                                          if _enable else " — saved; already monitored via the "
-                                          "prospective pipeline, so monitoring was not enabled."))
+                        st.session_state[f"redetect_flash_{fein}"] = msg + (
+                            " — monitoring enabled, scanned within ~5 minutes."
+                            if _enable else " — saved; already monitored via the "
+                            "prospective pipeline, so monitoring was not enabled.")
                         st.rerun()
                     else:
                         st.error(msg)
@@ -1330,7 +1400,7 @@ if ca_entries:
             st.markdown("")
             btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
             btn_type  = "secondary" if ca_monitored else "primary"
-            already_in_pipeline = bool(pipeline_st) and not ca_monitored
+            already_in_pipeline = pipeline_monitored and not ca_monitored
             btn_disabled = (not ca_monitored and not ca_slug) or already_in_pipeline
             if already_in_pipeline:
                 st.caption(f"Already monitored via pipeline ({pipeline_st}) — disable that first")
