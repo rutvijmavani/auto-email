@@ -47,7 +47,7 @@ HEADERS = {
 }
 
 COOKIES  = {"locale": "en"}
-SECTIONS = ["ex", "cs", "2", "1", "campus", "external"]
+SECTIONS = ["ex", "ext", "cs", "2", "1", "campus", "external"]
 
 DATE_FORMATS = ["%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]
 
@@ -85,7 +85,9 @@ def fetch_jobs(slug_info, company):
         return []
 
     if not portal_id:
-        portal_id, section = _discover_portal_id(taleo_company)
+        portal_id, section = _discover_portal_id(
+            taleo_company, slug_info.get("section", ""),
+        )
         if not portal_id:
             return []
         slug_info["portal_id"] = portal_id
@@ -476,16 +478,21 @@ def _build_payload(page=1):
     }
 
 
-def _discover_portal_id(taleo_company):
+def _discover_portal_id(taleo_company, preferred_section=""):
     """
     Auto-discover portal_id by scraping the Taleo jobsearch page.
+    preferred_section (the section already stored on the row, if any) is tried
+    first, then the default SECTIONS.
     Returns (portal_id, section) or (None, None).
     """
     base_url = f"https://{taleo_company}.taleo.net"
     headers  = {**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"}
     session  = _make_session()
 
-    for section in SECTIONS:
+    sections = ([preferred_section] if preferred_section else []) + [
+        s for s in SECTIONS if s != preferred_section
+    ]
+    for section in sections:
         url = f"{base_url}/careersection/{section}/jobsearch.ftl?lang=en"
         try:
             resp = session.get(
