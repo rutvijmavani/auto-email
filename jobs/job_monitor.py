@@ -449,6 +449,7 @@ def run():
     # ── Split: covered by workers vs missed vs in-flight ─────────────────────
     missed, in_flight_names = _get_worker_missed_companies(companies)
     missed_names = {c["company"] for c in missed}   # O(1) lookups
+    _all_unconfirmed: set = set()   # filled by the in-flight wait below
     # covered = confirmed done (last_full_scan_at within 24 h)
     # in-flight companies are NOT in missed and NOT in covered — they are
     # actively scanning and not yet confirmed complete.  Counting them in
@@ -742,9 +743,12 @@ def run():
     # ── Add worker full-scan counts to the fetched/matched totals ─────────────
     # stats so far hold only the fallback companies.  Companies the workers
     # covered recorded their full-scan counts in Redis; companies in
-    # missed_names were re-fetched above, so skip them to never double count.
+    # missed_names and unconfirmed in-flight companies were fallback-fetched
+    # above, so skip both to never double count.
     from workers.digest_counts import read_fullscan_totals
-    _worker_counts = read_fullscan_totals(_shared_r, exclude=missed_names)
+    _worker_counts = read_fullscan_totals(
+        _shared_r, exclude=missed_names | _all_unconfirmed,
+    )
     stats["total_jobs_fetched"]   += _worker_counts["fetched"]
     stats["jobs_matched_filters"] += _worker_counts["matched"]
     logger.info(
@@ -812,6 +816,11 @@ def run():
         print(f"\n[INFO] No new matching jobs today.")
         alerts     = _build_alerts(stats, len(companies))
         email_sent = _send_no_jobs_email(alerts=alerts)
+        if email_sent:
+            # No cycle:start on a no-jobs day, but the digest window still
+            # ended — drop the counts it used so they are not re-added tomorrow.
+            from workers.digest_counts import reset_fullscan_counts
+            reset_fullscan_counts(_shared_r)
 
     final_stats = {
         **stats,

@@ -9,22 +9,27 @@ import jobs.ats.taleo as taleo
 HOST = "https://acme.taleo.net"
 
 
-def _resp(status=200, text="", url=HOST + "/"):
+def _resp(status=200, text="", url=HOST + "/", location=None):
     r = MagicMock()
     r.status_code, r.text, r.url = status, text, url
+    r.headers = {"Location": location} if location else {}
     return r
 
 
 def _session(pages, redirect=None):
-    """GET fake. pages: {section: html} for /careersection/<section>/ URLs.
-    redirect: (final_url, html) served for the section-less URL, else 404."""
+    """GET fake (no auto-redirects). pages: {section: html} for
+    /careersection/<section>/ URLs. redirect: (final_url, html) — the
+    section-less URL answers 302 to final_url, which then serves html."""
     session = MagicMock()
 
     def _get(url, **_kw):
+        assert _kw.get("allow_redirects") is False
         if "/careersection/jobsearch.ftl" in url:
             if redirect:
-                return _resp(200, redirect[1], redirect[0])
+                return _resp(302, "", url, location=redirect[0])
             return _resp(404)
+        if redirect and url == redirect[0]:
+            return _resp(200, redirect[1], url)
         for section, text in pages.items():
             if f"/careersection/{section}/" in url:
                 return _resp(200, text, url)
@@ -54,7 +59,7 @@ class TestDiscoverPortalId(unittest.TestCase):
         with patch.object(taleo, "_make_session", return_value=session):
             self.assertEqual(taleo._discover_portal_id("kindred"),
                              ("7654321", "kndext"))
-        self.assertEqual(len(_urls(session)), 1)
+        self.assertEqual(len(_urls(session)), 2)   # redirect + target
 
     def test_wrong_stored_section_falls_to_default_redirect(self):
         final = HOST + "/careersection/oh_ext/jobsearch.ftl"
@@ -72,6 +77,28 @@ class TestDiscoverPortalId(unittest.TestCase):
                              (None, None))
         self.assertIn("acme", cm.output[0])
         self.assertIn("lateral", cm.output[0])
+        self.assertNotIn(off, _urls(session))   # never requested
+
+    def test_relative_redirect_is_resolved_and_followed(self):
+        session = _session({}, redirect=("/careersection/ex/jobsearch.ftl",
+                                         "portal=1234567"))
+        # relative Location resolves against the current URL; fake serves it
+        full = HOST + "/careersection/ex/jobsearch.ftl"
+        orig = session.get.side_effect
+        session.get.side_effect = lambda url, **kw: (
+            _resp(200, "portal=1234567", url) if url == full else orig(url, **kw))
+        with patch.object(taleo, "_make_session", return_value=session):
+            self.assertEqual(taleo._discover_portal_id("acme"),
+                             ("1234567", "ex"))
+
+    def test_redirect_loop_is_capped(self):
+        session = MagicMock()
+        session.get.side_effect = lambda url, **kw: _resp(
+            302, "", url, location=HOST + "/careersection/jobsearch.ftl?x=1")
+        with patch.object(taleo, "_make_session", return_value=session),              self.assertLogs(taleo.logger, level="WARNING"):
+            self.assertEqual(taleo._discover_portal_id("acme"), (None, None))
+        self.assertLessEqual(len(_urls(session)),
+                             (taleo._MAX_REDIRECTS + 1) * (len(taleo.SECTIONS) + 1))
 
     def test_fixed_list_is_last_resort(self):
         session = _session({"ext": "portal=8100108034"})
@@ -92,8 +119,10 @@ class TestDiscoverPortalId(unittest.TestCase):
         session = MagicMock()
         session.get.side_effect = [
             requests.RequestException("boom"),            # stored section
+            _resp(302, "", HOST + "/careersection/jobsearch.ftl",
+                  location=HOST + "/careersection/ex/jobsearch.ftl"),
             _resp(200, "portal=7654321",
-                  HOST + "/careersection/ex/jobsearch.ftl"),  # default redirect
+                  HOST + "/careersection/ex/jobsearch.ftl"),
         ]
         with patch.object(taleo, "_make_session", return_value=session):
             self.assertEqual(taleo._discover_portal_id("acme", "ext"),

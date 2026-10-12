@@ -18,7 +18,7 @@ import json
 import math
 import logging
 import requests
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -47,6 +47,7 @@ HEADERS = {
 }
 
 COOKIES  = {"locale": "en"}
+_MAX_REDIRECTS = 5   # hops followed per portal_id probe
 SECTIONS = ["ex", "ext", "cs", "2", "1", "campus", "external"]
 
 DATE_FORMATS = ["%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]
@@ -494,23 +495,36 @@ def _discover_portal_id(taleo_company, preferred_section=""):
 
     def _probe(url, fallback_section):
         """(portal_id, section) from one jobsearch page, or None."""
-        try:
-            resp = session.get(
-                url, headers=headers, timeout=12, allow_redirects=True
-            )
-        except requests.RequestException:
-            return None
+        # Follow redirects by hand so a hop off *.taleo.net (the company left
+        # Taleo) is never requested, not just rejected after the fact.
+        resp = None
+        for _ in range(_MAX_REDIRECTS + 1):
+            host = (urlparse(url).hostname or "").lower()
+            if not host.endswith(".taleo.net"):
+                return None
+            try:
+                resp = session.get(
+                    url, headers=headers, timeout=12, allow_redirects=False
+                )
+            except requests.RequestException:
+                return None
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return None
+                url = urljoin(url, location)
+                continue
+            break
+        else:
+            return None   # redirect limit exceeded
         if resp.status_code != 200:
             return None
-        # A redirect off *.taleo.net means the company left Taleo.
-        host = (urlparse(resp.url).hostname or "").lower()
-        if not host.endswith(".taleo.net"):
-            return None
+        resp_url = url
         matches = re.findall(r'portal[=:]\s*["\']?(\d{6,})', resp.text)
         if not matches:
             return None
         found = re.search(
-            r"/careersection/([^/?#]+)/jobsearch\.ftl", resp.url, re.IGNORECASE
+            r"/careersection/([^/?#]+)/jobsearch\.ftl", resp_url, re.IGNORECASE
         )
         return (
             max(set(matches), key=matches.count),
