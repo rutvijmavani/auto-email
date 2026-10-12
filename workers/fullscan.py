@@ -1370,9 +1370,12 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 # Sync prospective_companies.last_checked_at and
                 # consecutive_empty_days so the monitor table reflects actual
                 # worker activity — without this, covered companies appear frozen.
+                # "Empty" means the ATS returned no jobs at all (valid_jobs), never
+                # "no job matched our title filter": a big board with no matching
+                # titles is healthy and must not drift toward ATS re-detection.
                 try:
                     from db.job_monitor import update_company_check
-                    update_company_check(company, found_jobs=(len(title_matched) > 0))
+                    update_company_check(company, found_jobs=(len(valid_jobs) > 0))
                 except Exception as _uc_exc:
                     logger.warning(
                         "fullscan [%s]: update_company_check failed (non-fatal): %s",
