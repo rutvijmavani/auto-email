@@ -20,7 +20,14 @@ import streamlit as st
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
-from db.prospective import add_prospective_company, submit_to_prospective_sheet
+from db.prospective import add_prospective_company
+from db.company_ats_admin import (
+    editable_platforms,
+    insert_company_ats_row,
+    match_job_url,
+    queue_redetect,
+    update_company_ats_row,
+)
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
 from workers.redis_client import get_redis as _get_redis
 from jobs.http_safe import make_safe_session as _make_safe_session, is_private_host as _is_private_host
@@ -1192,214 +1199,70 @@ else:
         badge_col.success(f"ATS detected: **{platform}**" + (f"  ·  slug: `{slug}`" if slug else ""))
 
         with action_col:
-            if monitored or pipeline_st or ca_any_monitored:
-                if ca_any_monitored and not monitored and not pipeline_st:
-                    st.info("Already monitored via ATS detection — see entries below")
-                else:
-                    st.info(f"Already in pipeline — {pipeline_st or 'monitoring'}")
+            if ca_any_monitored:
+                st.info("Monitored via ATS detection — see entries below")
+            elif pipeline_st:
+                st.info(f"Already monitored via the prospective pipeline — {pipeline_st}")
             else:
-                if st.button("Add to monitoring", key=f"add_mon_{fein}", type="primary"):
-                    try:
-                        pipeline_name = canonical if canonical != "—" else name
-                        inserted = add_prospective_company(
-                            pipeline_name,
-                            priority=1,
-                            domain=_norm_domain(website),
-                            platform=platform,
-                            slug=slug,
-                            enable_monitoring=True,
-                        )
-                        # Feed URLs to the sheet only for new inserts.
-                        if inserted:
-                            try:
-                                submit_to_prospective_sheet(
-                                    company        = pipeline_name,
-                                    career_page_url= disc.get("careers_url"),
-                                    job_url        = disc.get("jobs_url"),
-                                    domain         = website,
-                                )
-                            except Exception as _se:
-                                log.warning("Sheet queue failed for %r: %s", pipeline_name, _se)
-                        # Mark is_monitored only after pipeline insert succeeds
-                        conn = get_conn()
-                        try:
-                            cur = conn.cursor()
-                            cur.execute(
-                                "UPDATE h1b_ats_discovery SET is_monitored = TRUE "
-                                "WHERE employer_fein = %s",
-                                (fein,),
-                            )
-                            # Part 5.3 (docs/discovery-pipeline-hardening.md): mirror the
-                            # monitoring flag into company_ats too, so the two ATS-tracking
-                            # systems don't silently diverge. Matched on (domain, platform) —
-                            # company_ats's own UNIQUE constraint key — not employer_fein,
-                            # which isn't reliably populated on every company_ats row. A
-                            # 0-row match (no company_ats row yet for this domain/platform)
-                            # is expected/harmless, not an error.
-                            cur.execute(
-                                """UPDATE company_ats
-                                   SET is_monitored = TRUE, reviewed_at = NOW()
-                                   WHERE domain = %s AND platform = %s""",
-                                (_norm_domain(website), platform),
-                            )
-                            conn.commit()
-                        finally:
-                            conn.close()
-                        load_ats_discovery.clear()
-                        if inserted:
-                            st.success(f"Added to monitoring! ({platform} · ready to scan)")
-                        else:
-                            st.info("Already in pipeline.")
-                        st.rerun()
-                    except Exception as exc:
-                        log.exception("Failed to add %r to pipeline", name)
-                        st.error(f"Error: {exc}")
+                st.caption("Not monitored yet — enable it on the matching entry below.")
     else:
-        # No ATS detected — let user paste a real job listing URL for form sync to process
-        st.warning("ATS not detected from careers page. Paste a real job listing URL below — "
-                   "the pipeline will detect the ATS automatically.")
+        st.warning("ATS not detected. Fix the careers page above and re-detect, or paste a "
+                   "direct job URL below.")
 
-        paste_url = st.text_input(
-            "Job listing URL",
-            placeholder="https://boards.greenhouse.io/stripe  or  https://stripe.wd1.myworkdayjobs.com/…",
-            key=f"paste_ats_url_{fein}",
-        )
-
-        if paste_url:
-            if not paste_url.startswith(("http://", "https://")):
-                st.error("Please paste a full URL starting with https://")
-            else:
-                if st.button("Add to monitoring", key=f"confirm_ats_{fein}", type="primary"):
-                    try:
-                        pipeline_name = canonical if canonical != "—" else name
-                        inserted = add_prospective_company(
-                            pipeline_name,
-                            priority=1,
-                            domain=_norm_domain(website),
-                            # platform/slug intentionally omitted — form sync will detect
-                        )
-                        sheet_ok = submit_to_prospective_sheet(
-                            company        = pipeline_name,
-                            career_page_url= disc.get("careers_url"),
-                            job_url        = paste_url,
-                            domain         = _norm_domain(website),
-                        )
-                        if not sheet_ok:
-                            log.warning("Sheet queue failed for %r", pipeline_name)
-                            st.warning("Could not queue for detection — run form sync manually to trigger ATS detection.")
-                        conn = get_conn()
-                        try:
-                            cur = conn.cursor()
-                            cur.execute("""
-                                UPDATE h1b_ats_discovery
-                                SET sample_apply_url = COALESCE(sample_apply_url, %s),
-                                    is_monitored     = CASE WHEN %s THEN TRUE ELSE is_monitored END
-                                WHERE employer_fein = %s
-                            """, (paste_url, sheet_ok, fein))
-                            conn.commit()
-                        finally:
-                            conn.close()
-                        load_ats_discovery.clear()
-                        if sheet_ok and inserted:
-                            st.success("Queued for ATS detection — will be ready to scan after form sync runs.")
-                            st.rerun()
-                        elif sheet_ok:
-                            st.success("Re-queued for ATS detection — will be re-scanned after form sync runs.")
-                            st.rerun()
-                        elif inserted:
-                            st.info("Added to pipeline — run form sync manually to trigger ATS detection.")
-                            st.rerun()
-                        else:
-                            st.info("Already in pipeline.")
-                            st.rerun()
-                    except Exception as exc:
-                        log.exception("Failed to add %r to pipeline", name)
-                        st.error(f"Error: {exc}")
-
-    # ── Wrong ATS override ───────────────────────────────────────────────────
-    if platform:
-        with st.expander("Wrong ATS? Fix it"):
-            st.caption("Paste a real job listing URL — the pipeline will re-detect the correct ATS.")
-            override_url = st.text_input(
-                "Job listing URL",
-                placeholder="https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/…",
-                key=f"override_url_{fein}",
-            )
-            if override_url:
-                if not override_url.startswith(("http://", "https://")):
-                    st.error("Please paste a full URL starting with https://")
-                else:
-                    if st.button("Submit correction", key=f"override_btn_{fein}", type="primary"):
-                        try:
-                            pipeline_name = canonical if canonical != "—" else name
-                            inserted = add_prospective_company(pipeline_name, priority=1, domain=_norm_domain(website))
-                            _sheet_ok = submit_to_prospective_sheet(
-                                company         = pipeline_name,
-                                career_page_url = disc.get("careers_url"),
-                                job_url         = override_url,
-                                domain          = _norm_domain(website),
-                            )
-                            if not _sheet_ok:
-                                log.warning("Sheet queue failed for %r", pipeline_name)
-                                st.warning("Could not queue for re-detection — run form sync manually.")
-                            else:
-                                _dc = get_conn()
-                                try:
-                                    _cur = _dc.cursor()
-                                    if not inserted:
-                                        # Company already in pipeline — reset platform so form sync can re-detect
-                                        _cur.execute(
-                                            "UPDATE prospective_companies SET ats_platform = NULL, ats_slug = NULL WHERE company = %s",
-                                            (pipeline_name.strip(),),
-                                        )
-                                    _cur.execute(
-                                        """UPDATE h1b_ats_discovery
-                                           SET is_monitored = TRUE,
-                                               detected_platform = NULL,
-                                               detected_slug = NULL
-                                           WHERE employer_fein = %s""",
-                                        (fein,),
-                                    )
-                                    # Part 6.2 (docs/discovery-pipeline-hardening.md): match
-                                    # on (domain, platform) — company_ats's own UNIQUE
-                                    # constraint key — not employer_fein, which isn't
-                                    # reliably populated on every company_ats row. Matching
-                                    # on fein silently affected 0 rows on such a row, leaving
-                                    # the wrong platform's monitoring active.
-                                    _cur.execute(
-                                        """UPDATE company_ats
-                                           SET is_monitored = FALSE
-                                           WHERE domain = %s
-                                             AND platform = %s""",
-                                        (_norm_domain(website), platform),
-                                    )
-                                    _dc.commit()
-                                finally:
-                                    _dc.close()
-                                load_ats_discovery.clear()
-                                load_company_ats_entries.clear()
-                                st.success("Correction submitted — ATS will be re-detected on next form sync run.")
-                                st.rerun()
-                        except Exception as exc:
-                            log.exception("ATS override failed for %r", name)
-                            st.error(f"Error: {exc}")
-
-    # ── Re-run discovery ──────────────────────────────────────────────────────
+    # ── Re-detect / job-URL control ──────────────────────────────────────────
+    # One button. With a job URL: match it against the known URL patterns and write
+    # the result to company_ats (no worker). Without one: queue the enrichment +
+    # discover workers for a forced re-probe.
     checked = disc.get("last_checked")
     if checked:
         checked_str = str(checked)[:16].replace("T", " ")
         st.caption(f"Last checked: {checked_str}")
 
-    if st.button("Re-run discovery", key=f"rerun_disc_{fein}"):
-        with st.spinner("Re-checking …"):
-            try:
-                _run_inline_discovery(fein, name)
-                load_ats_discovery.clear()
-                load_company_ats_entries.clear()
-                st.rerun()
-            except Exception as exc:
-                log.exception("Re-run discovery failed for %r", name)
-                st.error(f"Error: {exc}")
+    st.markdown("**Re-detect ATS**")
+    job_url_in = st.text_input(
+        "Direct job URL (optional)",
+        placeholder="https://acme.wd5.myworkdayjobs.com/External/job/…  — leave empty for normal detection",
+        key=f"redetect_job_url_{fein}",
+    )
+    _target_id = None
+    if job_url_in.strip() and len(ca_entries) > 1:
+        _opts = {f"{ca['platform']} · {ca['slug']} · {ca['domain']}": ca["id"] for ca in ca_entries}
+        _pick = st.selectbox("Overwrite which entry?", list(_opts), key=f"redetect_target_{fein}")
+        _target_id = _opts[_pick]
+    elif job_url_in.strip() and len(ca_entries) == 1:
+        _target_id = ca_entries[0]["id"]
+
+    if st.button("Re-detect ATS", key=f"redetect_btn_{fein}", type="primary"):
+        try:
+            if job_url_in.strip():
+                hit, err = match_job_url(job_url_in)
+                if err:
+                    st.error(err)
+                else:
+                    # Enable immediately unless the prospective pipeline already scans this company.
+                    _enable = not pipeline_st
+                    if _target_id is not None:
+                        ok, msg = update_company_ats_row(
+                            _target_id, hit["platform"], hit["slug"], enable=_enable)
+                    else:
+                        _dom = _norm_domain(_domain_hint or website or careers)
+                        ok, msg = insert_company_ats_row(
+                            fein, _dom, canonical if canonical != "—" else name,
+                            hit["platform"], hit["slug"], enable=_enable)
+                    if ok:
+                        load_company_ats_entries.clear()
+                        st.success(msg + (" — monitoring enabled, scanned within ~5 minutes."
+                                          if _enable else " — saved; already monitored via the "
+                                          "prospective pipeline, so monitoring was not enabled."))
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            else:
+                ok, msg = queue_redetect(fein, _get_redis())
+                (st.success if ok else st.error)(msg)
+        except Exception as exc:
+            log.exception("Re-detect failed for %r", name)
+            st.error(f"Error: {exc}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # company_ats review panel — flip is_monitored after manual review
@@ -1435,6 +1298,34 @@ if ca_entries:
             meta_cols[0].markdown(f"**Source**\n\n{ca_source}")
             meta_cols[1].markdown(f"**Status**\n\n{ca_status}")
             meta_cols[2].markdown(f"**Priority**\n\n{ca.get('priority', 0):,}")
+
+            if ca.get("stale_since") is not None and not pd.isna(ca.get("stale_since")):
+                st.warning("Marked stale by the redetect — this entry is not being scanned. "
+                           "Saving an edit below clears the flag.")
+
+            with st.expander("Edit platform / slug"):
+                _plats = editable_platforms()
+                if ca_platform == "custom":
+                    st.caption("Custom ATS entries can't be edited here — use the prospective form.")
+                else:
+                    with st.form(key=f"ca_edit_form_{ca_id}"):
+                        _new_plat = st.selectbox(
+                            "Platform", _plats,
+                            index=_plats.index(ca_platform) if ca_platform in _plats else 0,
+                            key=f"ca_edit_plat_{ca_id}",
+                        )
+                        _new_slug = st.text_input(
+                            "Slug (JSON object for workday, oracle_hcm and other JSON platforms)",
+                            value=ca_slug or "", key=f"ca_edit_slug_{ca_id}",
+                        )
+                        _saved = st.form_submit_button("Save", type="primary")
+                    if _saved:
+                        _ok, _msg = update_company_ats_row(ca_id, _new_plat, _new_slug)
+                        if _ok:
+                            load_company_ats_entries.clear()
+                            st.rerun()
+                        else:
+                            st.error(_msg)
 
             st.markdown("")
             btn_label = "Disable monitoring" if ca_monitored else "Enable monitoring"
