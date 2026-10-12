@@ -92,28 +92,12 @@ def _base_stats(**overrides):
 
 def _call_health_section(stats):
     """
-    Call _build_health_section() and capture the health_data list that is
-    passed to Table().  Returns the list, or raises if the call fails.
-
-    We patch the module-level `Table` name so the mock records the call
-    while the function body runs normally for everything else.
+    Return the plain-string health rows (header first).  The table cells are
+    wrapped in Paragraphs when rendered, so the rows are read from
+    _health_rows() — the data _build_health_section() renders.
     """
     import outreach.report_templates.monitor_report as mrep
-
-    captured = {}
-
-    def _table_ctor(data, **kw):
-        captured["data"] = data
-        return MagicMock()   # fake table object
-
-    with patch.object(mrep, "Table", side_effect=_table_ctor), \
-         patch.object(mrep, "Paragraph", return_value=MagicMock()), \
-         patch.object(mrep, "HRFlowable", return_value=MagicMock()):
-        alerts_mock = []
-        styles_mock = MagicMock()
-        mrep._build_health_section(stats, alerts_mock, styles_mock)
-
-    return captured.get("data", [])
+    return mrep._health_rows(stats)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,3 +480,28 @@ class TestQueueHealthSection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestHealthTableLayout(unittest.TestCase):
+    """The long Coverage detail must wrap inside the Value column, not spill
+    into the Status column (digest PDF overlap bug)."""
+
+    def test_coverage_cell_wraps_within_value_column(self):
+        import outreach.report_templates.monitor_report as mrep
+        from reportlab.lib.units import inch
+        from reportlab.platypus import Table
+
+        stats = _base_stats(covered_by_workers=114, fallback_scanned=60,
+                            companies_with_results=56, companies_monitored=174)
+        styles = mrep._get_styles()
+        elements = mrep._build_health_section(stats, [], styles)
+        table = next(e for e in elements if isinstance(e, Table))
+        value_w = 4.2 * inch
+        self.assertAlmostEqual(table._argW[1], value_w)
+        table.wrapOn(None, 6.5 * inch, 10 * inch)
+        coverage_cell = table._cellvalues[1][1]
+        if isinstance(coverage_cell, (list, tuple)):   # expanded cell wrapper
+            coverage_cell = coverage_cell[0]
+        w, h = coverage_cell.wrap(value_w - 16, 1000)
+        self.assertLessEqual(w, value_w - 16)
+        self.assertGreater(h, 11)   # wrapped onto more than one line

@@ -252,14 +252,8 @@ def _compute_coverage(stats: dict) -> tuple:
     return cov_pct, f"{total_covered}/{total} ({cov_pct}%)", detail
 
 
-def _build_health_section(stats, alerts, styles):
-    """Build pipeline health section."""
-    elements = []
-    elements.append(Paragraph("Pipeline Health", styles["section"]))
-    elements.append(HRFlowable(width="100%", thickness=1,
-                               color=colors.HexColor("#e2e8f0"),
-                               spaceAfter=8))
-
+def _health_rows(stats):
+    """Return the Pipeline Health table as plain-string rows (header first)."""
     total = stats.get("companies_monitored", 0)
     known_ats = total - stats.get("companies_unknown_ats", 0)
     ats_pct = int(known_ats / total * 100) if total else 0
@@ -271,7 +265,7 @@ def _build_health_section(stats, alerts, styles):
     coverage_pct, coverage_str, coverage_detail = _compute_coverage(stats)
     coverage_val = f"{coverage_str}  [{coverage_detail}]"
 
-    health_data = [
+    return [
         ["Metric",          "Value",          "Status"],
         ["Coverage",
          coverage_val,
@@ -287,8 +281,39 @@ def _build_health_section(stats, alerts, styles):
          "OK"],
     ]
 
+
+def _build_health_section(stats, alerts, styles):
+    """Build pipeline health section."""
+    elements = []
+    elements.append(Paragraph("Pipeline Health", styles["section"]))
+    elements.append(HRFlowable(width="100%", thickness=1,
+                               color=colors.HexColor("#e2e8f0"),
+                               spaceAfter=8))
+
+    health_data = _health_rows(stats)
+
+    # Plain strings never wrap in a Table cell, so the long Coverage detail ran
+    # into the Status column.  Paragraph cells wrap inside the column width.
+    cell_style = ParagraphStyle(
+        "health_cell", parent=styles["normal"], fontSize=9, leading=11,
+        spaceAfter=0,
+    )
+    status_style = ParagraphStyle(
+        "health_status", parent=cell_style, alignment=TA_CENTER,
+    )
+    head_style = ParagraphStyle(
+        "health_head", parent=cell_style, fontName="Helvetica-Bold",
+        textColor=MUTED,
+    )
+    health_data = [
+        [Paragraph(_safe_text(c), head_style if r == 0
+                   else (status_style if i == 2 else cell_style))
+         for i, c in enumerate(row)]
+        for r, row in enumerate(health_data)
+    ]
+
     health_table = Table(health_data,
-                         colWidths=[2.5*inch, 2.5*inch, 1.5*inch])
+                         colWidths=[1.3*inch, 4.2*inch, 1.0*inch])
     health_table.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,0), colors.HexColor("#f8fafc")),
         ("FONTNAME",     (0,0), (-1,0), "Helvetica-Bold"),
