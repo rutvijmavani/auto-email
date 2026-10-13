@@ -39,6 +39,9 @@ import html as html_lib
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -94,8 +97,7 @@ def detect(company):
                     if not resp.text.strip().startswith("<?xml"):
                         continue
 
-                    soup = BeautifulSoup(resp.text, "xml")
-                    jobs = soup.find_all("Job")
+                    jobs = _parse_jobs(resp.text, f"{company} ({slug})")
                     if not jobs:
                         continue
 
@@ -183,8 +185,7 @@ def fetch_jobs(slug_info, company):
         if not resp.text.strip().startswith("<?xml"):
             continue
 
-        soup = BeautifulSoup(resp.text, "xml")
-        jobs = soup.find_all("Job")
+        jobs = _parse_jobs(resp.text, f"{company} ({slug})")
 
         # Pass the path that actually worked so _normalize builds correct job URLs.
         # This ensures SAP (path stored) and new slugs (no path stored) both get
@@ -193,6 +194,37 @@ def fetch_jobs(slug_info, company):
         return [_normalize(j, company, effective) for j in jobs if j.find("JobTitle")]
 
     return []
+
+
+# ─────────────────────────────────────────
+# XML PARSING
+# ─────────────────────────────────────────
+
+# Some tenants (Capgemini) emit unnamed tags like <>123</> inside every <Job>.
+# They are invalid XML: the parser stops at the first one and silently returns
+# a single job. Remove them before parsing.
+_UNNAMED_TAG_RE = re.compile(r"<>[^<]*</>")
+_JOB_OPEN_RE    = re.compile(r"<Job[>\s]")
+
+
+def _parse_jobs(xml_text, label):
+    """
+    Parse a SuccessFactors feed into its <Job> elements.
+
+    Strips unnamed tags first, then warns when fewer <Job> elements were parsed
+    than the feed contains — a silent truncation would otherwise look like a
+    healthy board with one job.
+    """
+    cleaned = _UNNAMED_TAG_RE.sub("", xml_text)
+    jobs    = BeautifulSoup(cleaned, "xml").find_all("Job")
+    raw_cnt = len(_JOB_OPEN_RE.findall(cleaned))
+    if len(jobs) < raw_cnt:
+        logger.warning(
+            "successfactors [%s]: parsed %d of %d <Job> elements — "
+            "feed is malformed, jobs are being lost",
+            label, len(jobs), raw_cnt,
+        )
+    return jobs
 
 
 # ─────────────────────────────────────────
