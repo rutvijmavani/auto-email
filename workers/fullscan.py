@@ -145,6 +145,7 @@ from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
 from db.job_monitor import (
     get_company_row,
+    is_company_row_active,
     save_pending_detail,
 )
 
@@ -820,6 +821,17 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         logger.warning("fullscan [%s]: company not found in DB — skipping", company)
         result["outcome"] = "skipped"
         _release_dc("company-not-found")
+        return result
+
+    # Disabled (or marked stale) after it was queued: drop this delivery and do
+    # NOT reschedule — the scheduler's reconcile sweep clears its remaining state.
+    if not is_company_row_active(company_row):
+        logger.info(
+            "fullscan [%s]: no longer monitored (disabled/stale) — skipping, not rescheduling",
+            company,
+        )
+        result["outcome"] = "skipped"
+        _release_dc("company-disabled")
         return result
 
     display_name = company_row.get("company_name") or company

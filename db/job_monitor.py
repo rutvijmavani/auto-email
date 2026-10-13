@@ -737,6 +737,19 @@ def get_tracked_urls_for_company(company):
 # ADAPTIVE POLLING HELPERS
 # ─────────────────────────────────────────
 
+def is_company_row_active(row: dict) -> bool:
+    """
+    True when a get_company_row() result is still monitorable.
+
+    Fails open: a row without the flags (older shape / test doubles) counts
+    as active, so only an explicit is_monitored=False or a set stale_since
+    makes a worker skip the company.
+    """
+    if not row.get("is_monitored", True):
+        return False
+    return not row.get("stale_since")
+
+
 def get_company_row(company: str) -> "dict | None":
     """
     Fetch a single company row by key for the scan worker.
@@ -744,6 +757,9 @@ def get_company_row(company: str) -> "dict | None":
     plus domain (used by re-detection logging in _process_company).
 
     company_ats entries use the 'ca:{id}' prefix — routed to company_ats.
+    Also carries is_monitored (and stale_since for company_ats rows) so workers
+    can drop a company that was disabled after it was queued; use
+    is_company_row_active() to interpret them.
     Returns None if company not found in either table.
     """
     id_ = parse_company_ats_key(company)
@@ -760,7 +776,9 @@ def get_company_row(company: str) -> "dict | None":
                     last_checked_at,
                     consecutive_empty_days,
                     domain,
-                    company_name
+                    company_name,
+                    is_monitored,
+                    stale_since
                 FROM company_ats
                 WHERE id = %s
             """, (id_,)).fetchone()
@@ -773,7 +791,7 @@ def get_company_row(company: str) -> "dict | None":
             SELECT company, ats_platform, ats_slug,
                    ats_detected_at, first_scanned_at,
                    last_checked_at, consecutive_empty_days,
-                   domain
+                   domain, is_monitored
             FROM prospective_companies
             WHERE company = ?
         """, (company,)).fetchone()

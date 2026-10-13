@@ -206,5 +206,109 @@ class TestRegisterNewCompanies(unittest.TestCase):
         self.assertIsNone(sch._get_stream_undelivered_companies(r, "stream:fullscan"))
 
 
+class TestDeregisterDisabledCompanies(unittest.TestCase):
+
+    def _go(self, monitorable, zadaptive=(), zfull=(), stats=(), inflight=()):
+        import workers.scheduler as sch
+        r = MagicMock()
+        r.zrange.side_effect = lambda k, a, b: (
+            list(zadaptive) if k == "poll:adaptive" else list(zfull))
+        pipe = MagicMock()
+        r.pipeline.return_value = pipe
+        pipe.zscore.side_effect = lambda k, c: None
+        # execute() is called twice: the inflight probe, then the cleanup batch.
+        probe = []
+        pipe.zscore.side_effect = lambda k, c: probe.append(c)
+        pipe.execute.side_effect = lambda: (
+            [1.0 if c in inflight else None for c in probe] if probe else [])
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = [
+            {"company": c} for c in stats]
+        with patch("db.job_monitor.get_monitorable_companies",
+                   return_value=[{"company": c} for c in monitorable]), \
+             patch.object(sch, "get_conn", return_value=conn):
+            n = sch._deregister_disabled_companies(r)
+        return n, r, pipe, conn
+
+    def test_cleans_disabled_company_everywhere_and_leaves_monitorable(self):
+        n, r, pipe, conn = self._go(
+            ["ca:1"], zadaptive=["ca:1", "ca:2"], zfull=["ca:2"], stats=["ca:1", "ca:2"])
+        self.assertEqual(n, 1)
+        zrems = {(c.args[0], c.args[1]) for c in pipe.zrem.call_args_list}
+        self.assertEqual(zrems, {("poll:adaptive", "ca:2"), ("poll:fullscan", "ca:2"),
+                                 ("inflight:fullscan", "ca:2")})
+        deleted = set(pipe.delete.call_args.args)
+        self.assertIn("fullscan:lock:ca:2", deleted)
+        self.assertIn("poll:registered:ca:2", deleted)
+        self.assertIn("stats:ca:2", deleted)
+        self.assertFalse(any("ca:1" in k for k in deleted))
+        self.assertEqual(pipe.hdel.call_args.args[1], "ca:2")
+        sql, params = conn.execute.call_args_list[-1].args
+        self.assertIn("DELETE FROM company_poll_stats", sql)
+        self.assertEqual(params[0], ["ca:2"])
+
+    def test_bloom_filters_are_kept(self):
+        _, _, pipe, _ = self._go(["a"], zfull=["b"], stats=["b"])
+        self.assertFalse(any("bloom" in k or "adaptive_seen" in k
+                             for k in pipe.delete.call_args.args))
+
+    def test_empty_monitorable_list_wipes_nothing(self):
+        n, r, pipe, conn = self._go([], zadaptive=["x"], zfull=["y"], stats=["x"])
+        self.assertEqual(n, 0)
+        pipe.zrem.assert_not_called()
+        conn.execute.assert_not_called()
+
+    def test_company_currently_fullscanning_is_left_for_next_tick(self):
+        n, _, pipe, conn = self._go(["a"], zfull=["b"], stats=["b"], inflight=["b"])
+        self.assertEqual(n, 0)
+        pipe.zrem.assert_not_called()
+
+    def test_nothing_to_clean_is_a_noop(self):
+        n, _, pipe, _ = self._go(["a", "b"], zadaptive=["a"], zfull=["b"], stats=["a", "b"])
+        self.assertEqual(n, 0)
+        pipe.zrem.assert_not_called()
+
+    def test_reconcile_registers_even_if_deregister_fails(self):
+        import workers.scheduler as sch
+        with patch.object(sch, "_deregister_disabled_companies",
+                          side_effect=RuntimeError("db down")), \
+             patch.object(sch, "_register_new_companies") as reg:
+            sch._reconcile_company_registry(MagicMock())
+        reg.assert_called_once()
+
+
+class TestWorkersSkipDisabledCompany(unittest.TestCase):
+
+    def test_is_company_row_active(self):
+        from db.job_monitor import is_company_row_active as act
+        self.assertTrue(act({}))                                   # fail-open
+        self.assertTrue(act({"is_monitored": True, "stale_since": None}))
+        self.assertFalse(act({"is_monitored": False}))
+        self.assertFalse(act({"is_monitored": None}))
+        self.assertFalse(act({"is_monitored": True, "stale_since": "2026-10-01"}))
+
+    def test_fullscan_skips_disabled_without_rescheduling(self):
+        import workers.fullscan as fs
+        r = MagicMock()
+        row = {"is_monitored": False, "ats_platform": "greenhouse", "ats_slug": "x"}
+        with patch.object(fs, "get_company_row", return_value=row):
+            res = fs._run_fullscan("ca:9", r, dc_key="greenhouse")
+        self.assertEqual(res["outcome"], "skipped")
+        r.zadd.assert_not_called()
+        r.zrem.assert_called_once_with("inflight:fullscans:greenhouse", "ca:9")
+
+    def test_scan_worker_flags_disabled_and_skips_scan(self):
+        import workers.scan_worker as sw
+        row = {"is_monitored": True, "stale_since": "2026-10-01",
+               "ats_platform": "greenhouse", "ats_slug": "x"}
+        with patch.object(sw, "get_company_row", return_value=row), \
+             patch.object(sw, "get_redis", return_value=MagicMock()), \
+             patch.object(sw, "set_heartbeat") as hb:
+            res = sw._run_listing_scan({"company": "ca:9", "scan_type": "adaptive"})
+        self.assertTrue(res.get("disabled"))
+        self.assertFalse(res["success"])
+        hb.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2523,8 +2523,129 @@ def _register_new_companies(r) -> int:
     return done
 
 
+def _deregister_disabled_companies(r) -> int:
+    """
+    Remove companies that are no longer monitorable (disabled in Discover, marked
+    stale, or shadowed) from the live scheduling state, without a restart.
+    Returns the number of companies cleaned.  The mirror of _register_new_companies().
+
+    Candidates = members of poll:adaptive / poll:fullscan plus every
+    company_poll_stats row, minus get_monitorable_companies().  Per company:
+
+      * ZREM from poll:adaptive, poll:fullscan and inflight:fullscan;
+      * DEL the scheduling/transient keys (fullscan lock, retry backoffs, stats
+        cache, heartbeat, progress, registration marker) and HDEL its digest
+        fullscan-count field;
+      * DELETE its company_poll_stats row.  Deleting (not nulling) the row keeps
+        the coverage watchdog and the percentile aggregates from seeing a
+        never-scanned company, and lets _register_new_companies() treat a later
+        re-enable as brand new.
+
+    Deliberately NOT touched: bloom filters and adaptive_seen (they self-expire,
+    and keeping them stops a re-enabled company replaying its whole listing) and
+    detail-queue payloads (they carry the display name, not the routing key, and
+    drain on their own).
+
+    Safe by construction:
+      * if the monitorable list is empty the function does nothing — an empty
+        read must never wipe every company's schedule;
+      * a company with a fullscan in flight is left for the next tick (its
+        completion would otherwise re-create the state);
+      * workers also skip a disabled company at pick-up, so a stale stream
+        entry never reschedules it;
+      * idempotent — a scan that finishes after disable and re-adds the company
+        is cleaned on the next tick.
+    """
+    from db.job_monitor import get_monitorable_companies
+    from config import (
+        REDIS_BACKOFF_PREFIX, REDIS_DIGEST_FULLSCAN_COUNTS,
+    )
+
+    monitorable = {c["company"] for c in get_monitorable_companies()}
+    if not monitorable:
+        logger.warning(
+            "deregister_disabled: monitorable list is empty — doing nothing "
+            "(refusing to wipe every schedule)"
+        )
+        return 0
+
+    conn = get_conn()
+    try:
+        stats_companies = {
+            row["company"] for row in conn.execute(
+                "SELECT company FROM company_poll_stats"
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    known = (
+        set(r.zrange(REDIS_POLL_ADAPTIVE, 0, -1))
+        | set(r.zrange(REDIS_POLL_FULLSCAN, 0, -1))
+        | stats_companies
+    )
+    candidates = sorted(known - monitorable)
+    if not candidates:
+        return 0
+
+    pipe = r.pipeline()
+    for company in candidates:
+        pipe.zscore(REDIS_INFLIGHT_FULLSCAN, company)
+    inflight = pipe.execute()
+    targets = [c for c, z in zip(candidates, inflight) if z is None]
+    if not targets:
+        return 0
+
+    pipe = r.pipeline()
+    for company in targets:
+        pipe.zrem(REDIS_POLL_ADAPTIVE, company)
+        pipe.zrem(REDIS_POLL_FULLSCAN, company)
+        pipe.zrem(REDIS_INFLIGHT_FULLSCAN, company)
+        pipe.delete(
+            f"fullscan:lock:{company}",
+            f"{REDIS_BACKOFF_PREFIX}:scan:{company}",
+            f"{REDIS_BACKOFF_PREFIX}:detail:{company}",
+            f"{REDIS_BACKOFF_PREFIX}:fullscan:{company}",
+            f"stats:{company}",
+            f"heartbeat:{company}",
+            f"progress:{company}",
+            f"poll:registered:{company}",
+        )
+        pipe.hdel(REDIS_DIGEST_FULLSCAN_COUNTS, company)
+    pipe.execute()
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            "DELETE FROM company_poll_stats WHERE company = ANY(%s)",
+            (targets,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info(
+        "deregister_disabled: cleaned %d no-longer-monitorable compan%s: %s",
+        len(targets), "y" if len(targets) == 1 else "ies", targets[:20],
+    )
+    return len(targets)
+
+
+def _reconcile_company_registry(r) -> None:
+    """Deregister disabled companies, then register new ones.
+
+    Deregister runs in its own try/except so a failure there can never block
+    registration of newly enabled companies.
+    """
+    try:
+        _deregister_disabled_companies(r)
+    except Exception as exc:
+        logger.error("registration_sweep: deregister failed: %s", exc, exc_info=True)
+    _register_new_companies(r)
+
+
 def _registration_sweep_loop() -> None:
-    """Run _register_new_companies() every COMPANY_REGISTRATION_SWEEP_INTERVAL_S."""
+    """Run _reconcile_company_registry() every COMPANY_REGISTRATION_SWEEP_INTERVAL_S."""
     from config import COMPANY_REGISTRATION_SWEEP_INTERVAL_S
 
     r = get_redis()
@@ -2535,7 +2656,7 @@ def _registration_sweep_loop() -> None:
             time.sleep(COMPANY_REGISTRATION_SWEEP_INTERVAL_S)
             if _pause_event.is_set():
                 continue
-            _register_new_companies(r)
+            _reconcile_company_registry(r)
         except KeyboardInterrupt:
             logger.info("registration_sweep_loop: stopping")
             break
@@ -2619,7 +2740,7 @@ def _manager_cmds_loop() -> None:
         "platform:deprioritize:{platform}"  — call _deprioritise_platform()
         "platform:outage:{platform}:set"    — set worker:outage:{platform} (TTL from config)
         "platform:outage:{platform}:clear"  — delete worker:outage:{platform}
-        "registration:sweep"                — run _register_new_companies() now
+        "registration:sweep"                — run _reconcile_company_registry() now
 
     Zero-risk when manager.py is not running: the list stays empty, BLPOP
     returns None every 5s, loop sleeps and tries again.  No state is changed.
@@ -2710,10 +2831,8 @@ def _manager_cmds_loop() -> None:
 
             # ── registration:sweep — register newly enabled companies now ─────
             elif cmd == "registration:sweep":
-                logger.info(
-                    "manager_cmds: registration:sweep registered %d compan(ies)",
-                    _register_new_companies(r),
-                )
+                _reconcile_company_registry(r)
+                logger.info("manager_cmds: registration:sweep completed")
 
             else:
                 logger.warning("manager_cmds: unrecognised command %r", cmd)
