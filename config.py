@@ -70,6 +70,19 @@ RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer
 RETENTION_EXTERNAL_API_HEALTH  = 60     # external_api_health — matches RETENTION_API_HEALTH (same shape/cadence)
 VERIFY_TASK_QUEUE_CAP          = 200    # max concurrent+queued background verify/enrich tasks
 
+# scripts/audit_fetch_health.py — read-only live audit for silently under-fetched companies
+AUDIT_WORKERS               = int(os.getenv("AUDIT_WORKERS", "4"))                # parallel companies
+AUDIT_DROPPED_RATIO         = float(os.getenv("AUDIT_DROPPED_RATIO", "0.2"))      # flag when >= this share of raw jobs lack job_url/job_id
+AUDIT_ROUND_COUNTS          = os.getenv("AUDIT_ROUND_COUNTS", "10,20,25,50,100")  # raw counts that look like one full page
+AUDIT_STORED_FETCHED_RATIO  = float(os.getenv("AUDIT_STORED_FETCHED_RATIO", "0.5"))  # flag when title-matched < this share of stored open jobs
+AUDIT_STORED_MIN_OPEN       = int(os.getenv("AUDIT_STORED_MIN_OPEN", "5"))        # ...and stored open jobs >= this
+AUDIT_BIG_EMPLOYER_PETITIONS = int(os.getenv("AUDIT_BIG_EMPLOYER_PETITIONS", "100"))  # "big employer" = at least this many H1B petitions
+AUDIT_BIG_EMPLOYER_MAX_RAW  = int(os.getenv("AUDIT_BIG_EMPLOYER_MAX_RAW", "20"))  # ...yet fetched fewer raw jobs than this
+AUDIT_NO_NEW_DAYS           = int(os.getenv("AUDIT_NO_NEW_DAYS", "30"))          # window for "no new job stored"
+AUDIT_NO_NEW_MIN_RAW        = int(os.getenv("AUDIT_NO_NEW_MIN_RAW", "100"))      # only flag no-new-jobs for boards at least this large
+AUDIT_CEILING_RETRIES       = int(os.getenv("AUDIT_CEILING_RETRIES", "5"))       # retries when the platform concurrency ceiling is hit
+AUDIT_CEILING_WAIT_S        = float(os.getenv("AUDIT_CEILING_WAIT_S", "5"))      # wait between ceiling retries
+
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
 # These will never appear on Workday/Oracle/Greenhouse/Lever/Ashby
@@ -107,6 +120,8 @@ CAREERSHIFT_SAMPLE_SIZE       = 10   # cards per batch
 CAREERSHIFT_HIGH_CONFIDENCE   = 90   # skip remaining HR terms
 CAREERSHIFT_MEDIUM_CONFIDENCE = 70   # continue to next HR term
 CAREERSHIFT_MAX_PROFILES      = 3    # hard cap — never visit more than this
+CAREERSHIFT_UI_CAPTURE_DIR    = os.getenv("CAREERSHIFT_UI_CAPTURE_DIR", "data/cs_ui")  # selftest screenshots/HTML
+CAREERSHIFT_LOGIN_URL         = os.getenv("CAREERSHIFT_LOGIN_URL", "https://www.careershift.com/")  # selftest login entry
 MIN_BUFFER_SIZE               = 2    # minimum for domain consistency check
 MIN_RECRUITERS_PER_COMPANY    = 1    # minimum active recruiters to start outreach
                                       # pipeline tops up to MAX_CONTACTS_HARD_CAP over time
