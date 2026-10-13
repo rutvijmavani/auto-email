@@ -103,6 +103,7 @@ except ImportError:
 from typing import Optional
 
 from logger import get_logger
+from workers.digest_counts import record_fullscan_counts
 from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
@@ -144,6 +145,7 @@ from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
 from db.job_monitor import (
     get_company_row,
+    is_company_row_active,
     save_pending_detail,
 )
 
@@ -821,6 +823,17 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         _release_dc("company-not-found")
         return result
 
+    # Disabled (or marked stale) after it was queued: drop this delivery and do
+    # NOT reschedule — the scheduler's reconcile sweep clears its remaining state.
+    if not is_company_row_active(company_row):
+        logger.info(
+            "fullscan [%s]: no longer monitored (disabled/stale) — skipping, not rescheduling",
+            company,
+        )
+        result["outcome"] = "skipped"
+        _release_dc("company-disabled")
+        return result
+
     display_name = company_row.get("company_name") or company
 
     platform = company_row.get("ats_platform", "unknown")
@@ -1367,12 +1380,19 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                                 company, _zadd_err,
                             )
 
+                # Daily digest: this scan saw the whole board, so its counts are
+                # the company's "jobs fetched / matched" (see workers/digest_counts).
+                record_fullscan_counts(r, company, len(valid_jobs), len(title_matched))
+
                 # Sync prospective_companies.last_checked_at and
                 # consecutive_empty_days so the monitor table reflects actual
                 # worker activity — without this, covered companies appear frozen.
+                # "Empty" means the ATS returned no jobs at all (valid_jobs), never
+                # "no job matched our title filter": a big board with no matching
+                # titles is healthy and must not drift toward ATS re-detection.
                 try:
                     from db.job_monitor import update_company_check
-                    update_company_check(company, found_jobs=(len(title_matched) > 0))
+                    update_company_check(company, found_jobs=(len(valid_jobs) > 0))
                 except Exception as _uc_exc:
                     logger.warning(
                         "fullscan [%s]: update_company_check failed (non-fatal): %s",

@@ -109,6 +109,7 @@ from config import (
     REDIS_STREAM_ADAPTIVE,
     STREAM_CONSUMER_GROUP,
     STREAM_BLOCK_MS,
+    REDIS_INFLIGHT_PREFIX,
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import Heartbeat
@@ -122,6 +123,7 @@ from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db
 from db.job_monitor import (
     get_company_row,
+    is_company_row_active,
     upsert_poll_stats,
     save_pending_detail,
     save_pre_existing_listing,
@@ -261,6 +263,16 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 "scan_worker [%s]: company %r not found in DB",
                 request_id, company,
             )
+            return result
+
+        # Disabled (or marked stale) after it was queued: flag it so the main
+        # loop skips on_adaptive_complete (which would reschedule it forever).
+        if not is_company_row_active(company_row):
+            logger.info(
+                "scan_worker [%s]: %r no longer monitored (disabled/stale) — skipping",
+                request_id, company,
+            )
+            result["disabled"] = True
             return result
 
         # display_name is the real company name written to job_postings.company.
@@ -1007,6 +1019,20 @@ def run_worker(once: bool = False, shutdown_event=None,
                     "leaving in PEL for XAUTOCLAIM reclaim",
                     msg_id,
                 )
+            elif result.get("disabled"):
+                # Company was disabled after dispatch: finish the delivery without
+                # on_adaptive_complete (it would reschedule the company). Release the
+                # per-DC inflight slot the dispatcher claimed; the scheduler's
+                # reconcile sweep clears the rest of its state.
+                try:
+                    r.zrem(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", company)
+                    r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
+                except Exception as dis_exc:
+                    logger.error(
+                        "scan_worker: could not close delivery for disabled %r: %s — "
+                        "leaving in PEL",
+                        company, dis_exc, exc_info=True,
+                    )
             elif result.get("error") == "shutdown_mid_scan" or result.get("requeued"):
                 logger.info(
                     "scan_worker: %r result=%s — skipping OAC, leaving in PEL",

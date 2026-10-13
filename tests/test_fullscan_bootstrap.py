@@ -514,5 +514,70 @@ class TestRunFullscanBootstrapIntegration(unittest.TestCase):
         )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TestFullscanEmptyDaysSignal
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFullscanEmptyDaysSignal(unittest.TestCase):
+    """
+    consecutive_empty_days means "the ATS returned no jobs at all", never "no job
+    matched our title filter" — a healthy board with no matching titles must not
+    drift toward ATS re-detection.
+    """
+
+    def _run(self, raw_jobs, title_matched):
+        r = MagicMock()
+        r.exists.return_value = False   # no maintenance pause / lever flags
+        with patch("workers.fullscan._get_fullscan_state", return_value={
+                 "full_scan_interrupted": False, "interrupted_at_page": None,
+                 "full_scan_interval_s": 86400,
+                 "last_poll_at": None, "last_full_scan_at": None}), \
+             patch("workers.fullscan._acquire_lock", return_value=True), \
+             patch("workers.fullscan._release_lock"), \
+             patch("workers.fullscan.get_company_row",
+                   return_value={"company": "TestCo", "ats_platform": "greenhouse",
+                                 "ats_slug": "test-co", "first_scanned_at": None}), \
+             patch("workers.fullscan.get_ats_module") as mock_ats, \
+             patch("workers.fullscan.get_config", return_value={}), \
+             patch("workers.fullscan.parse_slug", return_value="test-co"), \
+             patch("workers.fullscan.set_heartbeat"), \
+             patch("workers.fullscan.set_progress"), \
+             patch("workers.fullscan.clear_heartbeat"), \
+             patch("workers.fullscan.filter_jobs", return_value=title_matched), \
+             patch("workers.fullscan._BloomPair") as mock_bloom, \
+             patch("workers.fullscan.get_conn") as mock_conn_fn, \
+             patch("workers.fullscan._bootstrap_warming_adaptive"), \
+             patch("workers.fullscan.record_fullscan_counts") as rec, \
+             patch("db.job_monitor.update_company_check") as upd:
+            self.rec = rec
+            mock_ats.return_value.fetch_jobs.return_value = raw_jobs
+            mock_bloom.return_value.old_exists.return_value = False
+            mock_conn = MagicMock()
+            mock_conn.execute.return_value.fetchone.return_value = None
+            mock_conn_fn.return_value = mock_conn
+
+            from workers.fullscan import _run_fullscan
+            _run_fullscan("TestCo", r)
+        return upd
+
+    def test_board_with_jobs_but_no_title_match_resets_counter(self):
+        jobs = [{"job_id": str(i), "job_url": f"https://x.test/{i}", "title": "Nurse"}
+                for i in range(3)]
+        upd = self._run(raw_jobs=jobs, title_matched=[])
+        upd.assert_called_once_with("TestCo", found_jobs=True)
+
+    def test_board_returning_zero_jobs_increments_counter(self):
+        upd = self._run(raw_jobs=[], title_matched=[])
+        upd.assert_called_once_with("TestCo", found_jobs=False)
+
+    def test_completed_scan_records_digest_counts(self):
+        jobs = [{"job_id": str(i), "job_url": f"https://x.test/{i}", "title": "Nurse"}
+                for i in range(3)]
+        self._run(raw_jobs=jobs, title_matched=jobs[:1])
+        self.rec.assert_called_once()
+        args = self.rec.call_args.args
+        self.assertEqual(args[1:], ("TestCo", 3, 1))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

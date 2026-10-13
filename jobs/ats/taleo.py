@@ -18,7 +18,7 @@ import json
 import math
 import logging
 import requests
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlparse
 from datetime import datetime
 from bs4 import BeautifulSoup
 
@@ -47,7 +47,8 @@ HEADERS = {
 }
 
 COOKIES  = {"locale": "en"}
-SECTIONS = ["ex", "cs", "2", "1", "campus", "external"]
+_MAX_REDIRECTS = 5   # hops followed per portal_id probe
+SECTIONS = ["ex", "ext", "cs", "2", "1", "campus", "external"]
 
 DATE_FORMATS = ["%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]
 
@@ -85,7 +86,9 @@ def fetch_jobs(slug_info, company):
         return []
 
     if not portal_id:
-        portal_id, section = _discover_portal_id(taleo_company)
+        portal_id, section = _discover_portal_id(
+            taleo_company, slug_info.get("section", ""),
+        )
         if not portal_id:
             return []
         slug_info["portal_id"] = portal_id
@@ -476,30 +479,88 @@ def _build_payload(page=1):
     }
 
 
-def _discover_portal_id(taleo_company):
+def _discover_portal_id(taleo_company, preferred_section=""):
     """
     Auto-discover portal_id by scraping the Taleo jobsearch page.
-    Returns (portal_id, section) or (None, None).
+    Order: preferred_section (already stored on the row, if any), then the
+    section-less /careersection/jobsearch.ftl (Taleo redirects it to the
+    company's own default section, so the section name needs no guessing),
+    then the fixed SECTIONS list as a last resort.
+    Returns (portal_id, section) or (None, None); a failure is logged with the
+    sections tried.
     """
     base_url = f"https://{taleo_company}.taleo.net"
     headers  = {**HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"}
     session  = _make_session()
 
-    for section in SECTIONS:
-        url = f"{base_url}/careersection/{section}/jobsearch.ftl?lang=en"
-        try:
-            resp = session.get(
-                url, headers=headers, timeout=12, allow_redirects=True
-            )
-            if resp.status_code != 200:
+    def _probe(url, fallback_section):
+        """(portal_id, section) from one jobsearch page, or None."""
+        # Follow redirects by hand so a hop off *.taleo.net (the company left
+        # Taleo) is never requested, not just rejected after the fact.
+        resp = None
+        for _ in range(_MAX_REDIRECTS + 1):
+            host = (urlparse(url).hostname or "").lower()
+            if not host.endswith(".taleo.net"):
+                return None
+            try:
+                resp = session.get(
+                    url, headers=headers, timeout=12, allow_redirects=False
+                )
+            except requests.RequestException:
+                return None
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return None
+                url = urljoin(url, location)
                 continue
-            matches = re.findall(r'portal[=:]\s*["\']?(\d{6,})', resp.text)
-            if matches:
-                portal_id = max(set(matches), key=matches.count)
-                return portal_id, section
-        except requests.RequestException:
-            continue
+            break
+        else:
+            return None   # redirect limit exceeded
+        if resp.status_code != 200:
+            return None
+        resp_url = url
+        matches = re.findall(r'portal[=:]\s*["\']?(\d{6,})', resp.text)
+        if not matches:
+            return None
+        found = re.search(
+            r"/careersection/([^/?#]+)/jobsearch\.ftl", resp_url, re.IGNORECASE
+        )
+        return (
+            max(set(matches), key=matches.count),
+            found.group(1) if found else fallback_section,
+        )
 
+    tried = []
+    if preferred_section:
+        tried.append(preferred_section)
+        hit = _probe(
+            f"{base_url}/careersection/{preferred_section}/jobsearch.ftl?lang=en",
+            preferred_section,
+        )
+        if hit:
+            return hit
+
+    tried.append("<default redirect>")
+    hit = _probe(f"{base_url}/careersection/jobsearch.ftl?lang=en", "")
+    if hit and hit[1]:
+        return hit
+
+    for section in SECTIONS:
+        if section == preferred_section:
+            continue
+        tried.append(section)
+        hit = _probe(
+            f"{base_url}/careersection/{section}/jobsearch.ftl?lang=en", section
+        )
+        if hit:
+            return hit
+
+    logger.warning(
+        "taleo: portal_id discovery failed for %s (tried: %s) — the company "
+        "may have left Taleo; re-detect its ATS",
+        taleo_company, ", ".join(tried),
+    )
     return None, None
 
 
