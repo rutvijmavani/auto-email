@@ -448,7 +448,21 @@ def _store_detection(company, platform, slug):
 
 
 def override_ats(company, platform, slug):
-    """Manually override ATS detection. Never auto-re-detected."""
+    """
+    Manually override ATS detection. Never auto-re-detected.
+
+    A slug that cannot work for a registry platform (a json platform without the keys its
+    module needs, e.g. `--override workday capitalone`) is refused before anything is written.
+    Returns True when the row was written, False when refused.
+    """
+    from jobs.ats.registry import ATS_REGISTRY
+    if platform in ATS_REGISTRY and platform != "custom":
+        from db.company_ats_admin import validate_platform_slug
+        _, err = validate_platform_slug(platform, slug)
+        if err:
+            logger.error("Manual override refused: %r → %s: %s", company, platform, err)
+            print(f"[ERROR] {company}: override refused — {err} Nothing was changed.")
+            return False
     logger.info("Manual override: %r → %s", company, platform)
     try:
         parsed_json = bool(slug and slug.lstrip().startswith("{"))
@@ -477,6 +491,7 @@ def override_ats(company, platform, slug):
         """, (platform, slug_str, company))
         conn.commit()
         print(f"[OK] {company} -> manually set to {platform}")
+        return True
     finally:
         conn.close()
 

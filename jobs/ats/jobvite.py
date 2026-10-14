@@ -3,9 +3,17 @@
 # Jobvite does not expose a public JSON API for job listings.
 # Jobs are fetched via HTML scraping of the career site.
 #
-# URL pattern:  jobs.jobvite.com/{slug}/jobs
-# Pagination:   jobs.jobvite.com/{slug}/search?c={category}&p={page}
+# URL pattern:  jobs.jobvite.com/{slug}/jobs   (landing page — some tenants show only a subset
+#               and no "Show More" links: Marelli 4 of 6, Knight 4 of 30, verified 2026-10-14)
+# Pagination:   jobs.jobvite.com/{slug}/search?p={page}   — unfiltered, 50 rows/page, 0-based,
+#               an EMPTY page is the proven end (verified on 9 tenants, never lost a job)
 # Job selector: table a[href*="/job/"]
+#
+# Completeness: Jobvite has no total on the page. The company-account XML feed
+#               (app.jobvite.com/CompanyJobs/Xml.aspx?c={companyEId}) is the independent
+#               cross-check — see verify_fetch(). The feed spans EVERY careersite of the
+#               account (WebMD's lists internetbrands + pulsepoint; Knight's lists Swift's),
+#               so a feed job is only "missing" when its redirect lands on OUR careersite.
 #
 # Option C freshness strategy:
 #   1. Fetch listing page → extract all job IDs
@@ -20,13 +28,37 @@
 
 import re
 import time
+import requests
 from bs4 import BeautifulSoup
+from config import (
+    JOBVITE_MAX_PAGES,
+    JOBVITE_FEED_MAX_ATTEMPTS,
+    JOBVITE_FEED_DEFAULT_WAIT_S,
+    JOBVITE_FEED_MAX_WAIT_S,
+    JOBVITE_FEED_TIMEOUT_S,
+    JOBVITE_FEED_TRACE_MAX,
+)
 from jobs.ats.base import fetch_html, slugify, validate_company_match
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 BASE_URL      = "https://jobs.jobvite.com/{slug}/jobs"
 SEARCH_URL    = "https://jobs.jobvite.com/{slug}/search"
-MAX_PAGES     = 20   # safety cap on category pagination
+FEED_URL      = "https://app.jobvite.com/CompanyJobs/Xml.aspx"
+JOB_REDIRECT_URL = "https://app.jobvite.com/CompanyJobs/Job.aspx"
 JOB_ID_RE     = re.compile(r"/job/([A-Za-z0-9]+)(?:/|\?|$)")
+COMPANY_EID_RE = re.compile(r"companyEId:\s*'([^']+)'")
+FEED_ID_RE    = re.compile(r"<job><id>([^<]+)</id>")
+# careersite name in a job URL: /{name}/job/{id} or /careers/{name}/job/{id}
+SITE_NAME_RE  = re.compile(r"jobs\.jobvite\.com/(?:careers/)?([^/?]+)/job/")
+HEADERS       = {"User-Agent": "Mozilla/5.0"}
+
+# stop reasons of the paging loop (shared with fetch_report) — only EMPTY_PAGE proves the end of the board
+from jobs.ats.fetch_report import (  # noqa: E402
+    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    STOP_REQUEST_FAILED, attach, count_distinct, failed,
+)
 
 
 # ─────────────────────────────────────────
@@ -72,94 +104,190 @@ def detect(company):
 # FETCH JOBS (listing)
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug, company):
+def fetch_board(slug, company):
     """
-    Fetch all jobs for company from Jobvite.
+    Fetch the whole Jobvite board and record HOW the paging loop ended.
 
     Strategy:
-      1. Fetch /jobs listing page — gets all jobs grouped by category
-      2. Follow "Show More" pagination per category via /search?c=...&p=...
-      3. Deduplicate by job ID across all categories
+      1. /jobs landing page — kept as a union source (jobs it shows that
+         /search somehow lacks are still returned, and warned about)
+      2. Unfiltered /search?p=N, 50 rows per page, 0-based, until an EMPTY page.
+         No category filter: tenants with a custom landing page (Marelli, Knight)
+         have no category links, so a category loop silently under-fetches them.
 
-    Args:
-        slug:    company slug (e.g. "nutanix")
-        company: company name (e.g. "Nutanix")
-
-    Returns:
-        List of normalized job dicts.
-        posted_at is always None — Jobvite hides posting dates.
-        location and description filled by fetch_job_detail().
+    Returns (jobs, report). report["stop_reason"] is one of STOP_*; only
+    STOP_EMPTY_PAGE proves the board was read to its end.
     """
+    report = {"stop_reason": STOP_EMPTY_PAGE, "pages": 0, "landing_only": 0}
     if not slug:
-        return []
+        return [], report
 
     all_jobs = []
     seen_ids = set()
 
-    # ── Step 1: Fetch main listing page ──
-    url  = BASE_URL.format(slug=slug)
-    resp = fetch_html(url, platform="jobvite")
+    def _add(anchors):
+        new = 0
+        for anchor in anchors:
+            job = _anchor_to_job(anchor, slug, company)
+            if job and job["job_id"] not in seen_ids:
+                seen_ids.add(job["job_id"])
+                all_jobs.append(job)
+                new += 1
+        return new
 
-    if resp is None:
-        return []
+    # ── Step 1: landing page ──
+    landing_jobs = []
+    landing = fetch_html(BASE_URL.format(slug=slug), platform="jobvite")
+    if landing is not None:
+        landing_anchors = _extract_job_anchors(BeautifulSoup(landing.text, "html.parser"))
+        landing_jobs = [j for j in (_anchor_to_job(a, slug, company) for a in landing_anchors) if j]
 
-    soup    = BeautifulSoup(resp.text, "html.parser")
-    anchors = _extract_job_anchors(soup)
+    # ── Step 2: unfiltered paging ──
+    report["stop_reason"] = STOP_PAGE_CAP
+    for page in range(JOBVITE_MAX_PAGES):
+        resp = fetch_html(SEARCH_URL.format(slug=slug), params={"p": page}, platform="jobvite")
+        if resp is None:
+            report["stop_reason"] = STOP_REQUEST_FAILED
+            break
+        anchors = _extract_job_anchors(BeautifulSoup(resp.text, "html.parser"))
+        if not anchors:
+            report["stop_reason"] = STOP_EMPTY_PAGE
+            break
+        report["pages"] += 1
+        if _add(anchors) == 0:
+            # non-empty page with nothing new = the site ignored p (loop would never end)
+            report["stop_reason"] = STOP_REPEAT_PAGE
+            break
 
-    for anchor in anchors:
-        job = _anchor_to_job(anchor, slug, company)
-        if job and job["job_id"] not in seen_ids:
+    # ── Step 3: union with landing page ──
+    for job in landing_jobs:
+        if job["job_id"] not in seen_ids:
             seen_ids.add(job["job_id"])
             all_jobs.append(job)
+            report["landing_only"] += 1
+    if report["landing_only"] and report["stop_reason"] == STOP_EMPTY_PAGE:
+        logger.warning(
+            "[jobvite] %s: %d landing-page job(s) absent from /search paging", slug, report["landing_only"]
+        )
 
-    # ── Step 2: Follow "Show More" category pagination ──
-    # Jobvite shows ~20 jobs per category then a "Show More" link
-    # /search?c={category}&p=0 returns page 0, p=1 next page, etc.
-    show_more_links = soup.select("a[href*='/search?c=']")
-    categories_seen = set()
+    return all_jobs, report
 
-    for link in show_more_links:
-        href = link.get("href", "")
-        m    = re.search(r"[?&]c=([^&]+)", href)
-        if not m:
-            continue
 
-        category = m.group(1)
-        if category in categories_seen:
-            continue
-        categories_seen.add(category)
+def fetch_jobs(slug, company):
+    """
+    Fetch all jobs for company from Jobvite (list of normalized job dicts).
+    posted_at is always None — Jobvite hides posting dates.
+    location and description filled by fetch_job_detail().
+    """
+    if not slug:
+        return failed(STOP_NO_CONFIG, "empty slug")
+    jobs, report = fetch_board(slug, company)
+    if report["stop_reason"] != STOP_EMPTY_PAGE:
+        logger.warning(
+            "[jobvite] %s: paging ended by %s after %d page(s) — %d job(s) may be incomplete",
+            slug, report["stop_reason"], report["pages"], len(jobs),
+        )
+    # No total on the page: complete stays None on a clean end (verify_fetch's feed check is the
+    # independent cross-check); an abnormal stop is complete=False.
+    return attach(jobs, FetchReport(
+        stop_reason      = report["stop_reason"],
+        pages            = report["pages"],
+        fetched_distinct = count_distinct(jobs),
+        repeated_pages   = 1 if report["stop_reason"] == STOP_REPEAT_PAGE else 0,
+        note             = f"{report['landing_only']} landing-only" if report["landing_only"] else "",
+    ))
 
-        for page in range(MAX_PAGES):
-            page_url  = SEARCH_URL.format(slug=slug)
-            page_resp = fetch_html(
-                page_url,
-                params={"c": category, "p": page},
-                platform="jobvite",
-            )
-            if page_resp is None:
-                break
 
-            page_soup    = BeautifulSoup(page_resp.text, "html.parser")
-            page_anchors = _extract_job_anchors(page_soup)
+# ─────────────────────────────────────────
+# COMPLETENESS — XML FEED CROSS-CHECK
+# ─────────────────────────────────────────
 
-            if not page_anchors:
-                break
+def _get_with_retry(url, params=None):
+    """
+    GET that obeys the server's own 429 pacing: wait Retry-After seconds
+    (capped by JOBVITE_FEED_MAX_WAIT_S), else JOBVITE_FEED_DEFAULT_WAIT_S.
+    Returns the response (any non-429 status) or None when attempts are exhausted
+    or the request errors.
+    """
+    for attempt in range(JOBVITE_FEED_MAX_ATTEMPTS):
+        try:
+            resp = requests.get(url, params=params, headers=HEADERS, timeout=JOBVITE_FEED_TIMEOUT_S)
+        except requests.RequestException as e:
+            logger.warning("[jobvite] request error %s: %s", url, e)
+            return None
+        if resp.status_code != 429:
+            return resp
+        if attempt == JOBVITE_FEED_MAX_ATTEMPTS - 1:
+            break
+        try:
+            wait = int(resp.headers.get("Retry-After", ""))
+        except ValueError:
+            wait = JOBVITE_FEED_DEFAULT_WAIT_S
+        time.sleep(min(max(wait, 0), JOBVITE_FEED_MAX_WAIT_S))
+    return None
 
-            new_on_page = 0
-            for anchor in page_anchors:
-                job = _anchor_to_job(anchor, slug, company)
-                if job and job["job_id"] not in seen_ids:
-                    seen_ids.add(job["job_id"])
-                    all_jobs.append(job)
-                    new_on_page += 1
 
-            # No new jobs on this page → end of category
-            if new_on_page == 0:
-                break
+def _result(status, reason, **extra):
+    out = {"status": status, "reason": reason}
+    out.update(extra)
+    return out
 
-            time.sleep(0.3)
 
-    return all_jobs
+def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE):
+    """
+    Cross-check a finished board fetch against the account XML feed.
+
+    status:
+      verified    — paging ended on an empty page AND every feed job that
+                    resolves to OUR careersite is in `jobs`
+      unverified  — paging fine but the feed could not be used (no companyEId,
+                    feed unavailable, or some feed-only jobs could not be traced)
+      incomplete  — paging ended abnormally, or a feed job resolving to our
+                    careersite is missing from `jobs`
+
+    The feed spans the whole Jobvite account (sibling careersites included);
+    feed-only jobs are resolved through app.jobvite.com/CompanyJobs/Job.aspx,
+    whose redirect names the careersite they belong to. Jobs on another
+    careersite are not ours and are ignored.
+    """
+    if stop_reason != STOP_EMPTY_PAGE:
+        return _result("incomplete", f"paging ended by {stop_reason}")
+
+    landing = fetch_html(BASE_URL.format(slug=slug), platform="jobvite", track=False)
+    m = COMPANY_EID_RE.search(landing.text) if landing is not None else None
+    if not m:
+        return _result("unverified", "no companyEId on landing page")
+    eid = m.group(1)
+
+    feed = _get_with_retry(FEED_URL, params={"c": eid})
+    if feed is None or feed.status_code != 200:
+        return _result("unverified", "feed unavailable")
+    feed_ids = {i.split("-")[0] for i in FEED_ID_RE.findall(feed.text)}
+    ours_ids = {j["job_id"] for j in jobs}
+    feed_only = sorted(feed_ids - ours_ids)
+
+    ours_name = slug.split("/")[-1].lower()
+    missing, foreign, unresolved = [], 0, 0
+    for n, jid in enumerate(feed_only):
+        if n >= JOBVITE_FEED_TRACE_MAX:
+            unresolved += len(feed_only) - n
+            break
+        resp = _get_with_retry(JOB_REDIRECT_URL, params={"c": eid, "j": jid})
+        nm = SITE_NAME_RE.search(resp.url) if resp is not None else None
+        if not nm:
+            unresolved += 1
+        elif nm.group(1).lower() == ours_name:
+            missing.append(jid)
+        else:
+            foreign += 1
+
+    info = dict(feed_total=len(feed_ids), feed_only=len(feed_only), foreign=foreign,
+                unresolved=unresolved, missing=missing)
+    if missing:
+        return _result("incomplete", f"{len(missing)} feed job(s) on our careersite not fetched", **info)
+    if unresolved:
+        return _result("unverified", f"{unresolved} feed-only job(s) could not be traced", **info)
+    return _result("verified", "paging ended on empty page; feed cross-check clean", **info)
 
 
 # ─────────────────────────────────────────

@@ -63,12 +63,20 @@ import re
 import time
 import uuid
 import json
-import logging
 import requests
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 
-logger = logging.getLogger(__name__)
+from config import EIGHTFOLD_MAX_PAGES
+from logger import get_logger
+
+logger = get_logger(__name__)
+
+# Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
+from jobs.ats.fetch_report import (  # noqa: E402
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
+    STOP_REPEAT_PAGE, STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
+)
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -77,7 +85,7 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 25   # sent as num= param but Eightfold ignores it and uses its own
                  # default (observed: 10 jobs/page). Pagination uses actual
                  # len(positions) returned, not this constant. Kept for the param.
-MAX_PAGES = 2000  # safety cap: 2000 × 25 = 5,0000 jobs max per run
+# Page cap: config.EIGHTFOLD_MAX_PAGES
 
 # Primary path — confirmed from DevTools across most Eightfold tenants.
 PRIMARY_API_PATH = "/api/pcsx/search"
@@ -123,24 +131,24 @@ def fetch_jobs(slug_info, company):
         description is empty — filled by fetch_job_detail() (Option C).
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
             logger.error("eightfold: invalid slug_info JSON for %s", company)
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     if not isinstance(slug_info, dict):
         logger.error("eightfold: invalid slug_info JSON for %s", company)
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info is not a dict")
 
     slug   = slug_info.get("slug", "")
     stored_domain = slug_info.get("domain", "")
 
     if not slug:
         logger.error("eightfold: missing slug for %s", company)
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no slug")
 
     base_url = f"https://{slug}.eightfold.ai"
 
@@ -173,7 +181,7 @@ def fetch_jobs(slug_info, company):
             "eightfold: no working (api_path, domain) combination found for %s",
             slug,
         )
-        return []
+        return failed(STOP_NO_CONFIG, "no working (api_path, domain) combination")
 
     if api_path != PRIMARY_API_PATH:
         logger.warning(
@@ -182,23 +190,38 @@ def fetch_jobs(slug_info, company):
         )
 
     # Step 3: Paginate through all jobs
-    all_jobs = []
-    start    = 0
+    all_jobs    = []
+    seen_ids    = set()
+    start       = 0
+    total       = 0
+    stop_reason = STOP_ALL_PAGES
+    pages       = 0
 
-    for page in range(MAX_PAGES):
-        positions, total, _ = _fetch_page(
+    for page in range(EIGHTFOLD_MAX_PAGES):
+        positions, page_total, _ = _fetch_page(
             session, slug, domain, base_url, start, csrf_token, api_path
         )
+        pages += 1
 
         if positions is None:
-            # Hard error — stop
+            stop_reason = STOP_REQUEST_FAILED
             break
 
         if not positions:
             # Empty page = end of results
+            stop_reason = STOP_EMPTY_PAGE
             break
 
+        total = page_total or total
+
+        new = 0
         for pos in positions:
+            pos_id = pos.get("id")
+            if pos_id is not None:
+                if pos_id in seen_ids:
+                    continue
+                seen_ids.add(pos_id)
+            new += 1
             job = _normalize(pos, company, slug, base_url)
             if job:
                 all_jobs.append(job)
@@ -210,11 +233,31 @@ def fetch_jobs(slug_info, company):
             slug, page + 1, len(all_jobs), total,
         )
 
-        if start >= total:
+        if new == 0:
+            stop_reason = STOP_REPEAT_PAGE
             break
 
-    logger.info("eightfold: fetched %d jobs for %s", len(all_jobs), company)
-    return all_jobs
+        if start >= total:
+            break
+    else:
+        stop_reason = STOP_PAGE_CAP
+
+    if len(all_jobs) < total or stop_reason != STOP_ALL_PAGES:
+        logger.warning(
+            "eightfold: %s fetched %d distinct of %d reported (stop=%s)",
+            slug, len(all_jobs), total, stop_reason,
+        )
+    else:
+        logger.info("eightfold: fetched %d jobs for %s", len(all_jobs), company)
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop_reason,
+        pages            = pages,
+        fetched_distinct = len(seen_ids) if seen_ids else len(all_jobs),
+        unusable         = max(len(seen_ids) - len(all_jobs), 0),
+        reported_total   = total or None,      # count==0 on a tenant means "not reported"
+        total_source     = TOTAL_ATS if total else None,
+        repeated_pages   = 1 if stop_reason == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 # ─────────────────────────────────────────

@@ -49,8 +49,10 @@ from db.db import (
 from jobs.ats_detector import (
     detect_ats, needs_redetection, override_ats, get_ats_module,
 )
-from jobs.ats.registry import get_config, should_fetch_detail
+from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
+from jobs.ats.fetch_report import STOP_REQUEST_FAILED, failed, report_of
+from db.scan_health import SOURCE_MONITOR, record_scan
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
     is_fresh, make_legacy_content_hash,
@@ -129,26 +131,11 @@ def _parse_slug(platform, slug, config):
     """
     Parse the raw DB slug into the form each ATS module expects.
 
-    Registry slug_type:
-      "string" → pass slug as-is (str)
-      "json"   → json.loads(slug); platform-specific defaults if parse fails
-
-    Returns either a string (slug_type="string") or a dict (slug_type="json").
+    Delegates to registry.parse_slug so every scan path (adaptive, fullscan, --monitor-jobs,
+    detail worker) parses slugs identically — including unwrapping a manual-override JSON blob
+    for string-slug platforms.
     """
-    if config.get("slug_type") != "json":
-        return slug
-    try:
-        slug_info = json.loads(slug)
-        # Workday: ensure "path" key exists (older slugs may predate it)
-        if platform == "workday" and "path" not in slug_info:
-            slug_info["path"] = "careers"
-        return slug_info
-    except (json.JSONDecodeError, TypeError):
-        defaults = {
-            "workday":    {"slug": slug or "", "wd": "wd5", "path": "careers"},
-            "oracle_hcm": {"slug": slug or "", "site": ""},
-        }
-        return defaults.get(platform, {})
+    return parse_slug(platform, slug, config)
 
 
 
@@ -1044,6 +1031,8 @@ def _process_company(company_row, position, total, _r=None):
             logger.error("API fetch failed for %r (platform=%s): %s",
                          company, platform, e, exc_info=True)
             print(f"  [{position}/{total}] {company} — [ERROR] {e}")
+            record_scan(company, platform, SOURCE_MONITOR, failed(STOP_REQUEST_FAILED).report,
+                        error=e)
             result["failed"]       = 1
             result["failure_name"] = company
             return result
@@ -1052,6 +1041,19 @@ def _process_company(company_row, position, total, _r=None):
     # NOTE: fetch_job_detail calls below re-acquire the semaphore individually
     # to throttle detail HTTP requests with the same per-platform limit.
     logger.debug("Fetched %d raw jobs for %r", len(raw_jobs), company)
+
+    # Completeness verdict of this fetch (jobs/ats/fetch_report.py): recorded, and an incomplete
+    # fetch skips absence tracking exactly like Avature's partial one.
+    _report = report_of(raw_jobs)
+    if not _scan_complete:
+        _report.complete    = False
+        _report.stop_reason = STOP_REQUEST_FAILED
+        _report.note        = _report.note or "avature partial fetch"
+    elif _report.complete is False:
+        _scan_complete = False
+        logger.warning("%s: fetch incomplete (stop=%s, fetched=%d, reported=%s) — absence tracking skipped",
+                       company, _report.stop_reason, _report.fetched_distinct, _report.reported_total)
+    record_scan(company, platform, SOURCE_MONITOR, _report, raw_count=len(raw_jobs))
 
     # Filter out entries missing job_url before processing
     initial_count = len(raw_jobs)

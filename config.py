@@ -64,6 +64,7 @@ APPLICATION_AUTO_CLOSE_DAYS    = 60
 RETENTION_COVERAGE_STATS       = 60
 RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
+RETENTION_SCAN_HEALTH_DAYS     = int(os.getenv("RETENTION_SCAN_HEALTH_DAYS", "90"))  # scan_health — one row per scan, history checks need weeks
 DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
 RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
 RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
@@ -86,6 +87,40 @@ AUDIT_CEILING_WAIT_S        = float(os.getenv("AUDIT_CEILING_WAIT_S", "5"))     
 # scripts/probe_feeder_totals.py — read-only probe of the total/paging fields each ATS exposes
 PROBE_MAX_CALLS             = int(os.getenv("PROBE_MAX_CALLS", "4"))             # responses recorded per company before the fetch is aborted
 PROBE_MAX_SCALARS           = int(os.getenv("PROBE_MAX_SCALARS", "60"))          # scalar fields kept per recorded JSON response
+MCLOUD_API_BASE             = os.getenv("MCLOUD_API_BASE", "https://jobsapi-google.m-cloud.io/api/job/search")  # m-cloud (Google Talent Solution wrapper) search endpoint
+MCLOUD_PAGE_SIZE            = int(os.getenv("MCLOUD_PAGE_SIZE", "100"))          # rows per m-cloud search call
+MCLOUD_MAX_PAGES            = int(os.getenv("MCLOUD_MAX_PAGES", "100"))          # page cap per employer in the probe
+MCLOUD_PROBE_WORKERS        = int(os.getenv("MCLOUD_PROBE_WORKERS", "8"))        # parallel career-page scans in the m-cloud/Taleo probe
+MCLOUD_PROBE_TIMEOUT        = int(os.getenv("MCLOUD_PROBE_TIMEOUT", "20"))       # seconds per HTTP call in the m-cloud/Taleo probe
+MCLOUD_PROBE_MAX_LINKS      = int(os.getenv("MCLOUD_PROBE_MAX_LINKS", "6"))      # same-host job/career links followed one level deep per company
+
+# jobs/ats/fetch_report.py — a fetch counts as complete when distinct jobs >= reported total less this tolerance
+FETCH_TOLERANCE_PCT         = float(os.getenv("FETCH_TOLERANCE_PCT", "5"))       # % under the ATS-claimed total still accepted as complete
+FETCH_SERVER_SHORT_MIN_PCT  = float(os.getenv("FETCH_SERVER_SHORT_MIN_PCT", "50"))  # advisory totals (Taleo): a clean end this far under the total is the server's doing; further under is suspect
+
+# jobs/ats/workday.py — Workday caps each search at WORKDAY_RESULT_CAP results regardless of the real board size
+WORKDAY_PAGE_SIZE           = int(os.getenv("WORKDAY_PAGE_SIZE", "20"))          # Workday rejects larger limits
+WORKDAY_RESULT_CAP          = int(os.getenv("WORKDAY_RESULT_CAP", "2000"))       # observed hard ceiling of `total` (Nvidia, T-Mobile)
+WORKDAY_FACET_SPLIT_AT      = int(os.getenv("WORKDAY_FACET_SPLIT_AT", "1900"))   # total >= this → fetch one query per facet value
+WORKDAY_SPLIT_FACETS        = tuple(os.getenv("WORKDAY_SPLIT_FACETS", "jobFamilyGroup,timeType,workerSubType").split(","))  # tried in order
+
+# jobs/ats/jibe.py — page-count safety cap (loop normally ends at totalCount; this only bounds a runaway feed)
+JIBE_MAX_PAGES              = int(os.getenv("JIBE_MAX_PAGES", "200"))            # x 100 per page = 20,000 jobs
+
+# jobs/ats/oracle_hcm.py — offset paging, 200 rows/page, stops at items[0].TotalJobsCount
+ORACLE_HCM_MAX_PAGES        = int(os.getenv("ORACLE_HCM_MAX_PAGES", "100"))      # x 200 per page = 20,000 jobs; hitting it = incomplete
+
+# jobs/ats/eightfold.py — offset paging, the server returns ~10 rows/page whatever num= says
+EIGHTFOLD_MAX_PAGES         = int(os.getenv("EIGHTFOLD_MAX_PAGES", "5000"))      # x ~10 per page = ~50,000 jobs (Starbucks ~21,500 today); hitting it = incomplete
+
+# jobs/ats/jobvite.py — unfiltered /search?p=N paging (50 rows/page) + XML-feed completeness check
+JOBVITE_MAX_PAGES             = int(os.getenv("JOBVITE_MAX_PAGES", "200"))            # x 50 per page = 10,000 jobs; hitting it = incomplete
+JOBVITE_FEED_VERIFY_INTERVAL_H = int(os.getenv("JOBVITE_FEED_VERIFY_INTERVAL_H", "24"))  # feed cross-check at most once per company per N hours (Redis gate)
+JOBVITE_FEED_MAX_ATTEMPTS     = int(os.getenv("JOBVITE_FEED_MAX_ATTEMPTS", "3"))      # tries per feed/redirect request when the server answers 429
+JOBVITE_FEED_DEFAULT_WAIT_S   = int(os.getenv("JOBVITE_FEED_DEFAULT_WAIT_S", "30"))   # wait after a 429 that carries no Retry-After (observed server value: 30)
+JOBVITE_FEED_MAX_WAIT_S       = int(os.getenv("JOBVITE_FEED_MAX_WAIT_S", "120"))      # ceiling on a server-supplied Retry-After so one request cannot stall a worker
+JOBVITE_FEED_TIMEOUT_S        = int(os.getenv("JOBVITE_FEED_TIMEOUT_S", "120"))       # read timeout; feeds run 25 KB – 6.6 MB
+JOBVITE_FEED_TRACE_MAX        = int(os.getenv("JOBVITE_FEED_TRACE_MAX", "300"))       # max feed-only jobs traced (redirect lookup) per check; the rest = unresolved
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
@@ -535,6 +570,7 @@ REDIS_DETAIL_DLQ       = "queue:detail:dlq"       # LIST — dead-letter queue f
 REDIS_EMAIL_PUSH       = "queue:email:push"        # LIST — incoming Pub/Sub email notifications
 REDIS_EMAIL_DLQ        = "queue:email:dlq"         # LIST — dead-letter queue for failed email jobs (≤200)
 REDIS_CYCLE_START      = "cycle:start"             # STRING — Unix ts of today's cycle start
+REDIS_FEED_VERIFY_PREFIX = "verify:feed"           # STRING per company — set NX with TTL JOBVITE_FEED_VERIFY_INTERVAL_H; present = checked recently
 REDIS_DIGEST_FULLSCAN_COUNTS = "digest:fullscan_counts"  # HASH — company → "fetched:matched" from its latest completed full scan this cycle
 # Backstop expiry if the digest never runs to reset the hash (record_cycle_start deletes it).
 DIGEST_FULLSCAN_COUNTS_TTL_S = int(os.getenv("DIGEST_FULLSCAN_COUNTS_TTL_S", str(3 * 86400)))

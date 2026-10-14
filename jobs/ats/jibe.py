@@ -4,7 +4,9 @@
 # to custom career pages powered by iCIMS's Jibe platform.
 #
 # API endpoint: https://{careers_domain}/api/jobs
-# Pagination:   ?limit=100&offset=N
+# Pagination:   ?limit=100&page=N (1-based). `offset` is IGNORED by the API — it returns page 1
+#               every time (verified live 2026-10-14: Docusign 100/100/68 = totalCount 268).
+# Total:        totalCount (also count) in every response
 # Date field:   posted_date — RELIABLE (ISO 8601)
 # job_id:       req_id field
 #
@@ -15,13 +17,17 @@
 
 import time
 from datetime import datetime, timezone
+from config import JIBE_MAX_PAGES
 from jobs.ats.base import fetch_json
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
+)
 from logger import get_logger
 
 logger = get_logger(__name__)
 
 PAGE_SIZE = 100
-MAX_PAGES = 20  # safety cap — 20 × 100 = 2000 jobs max
 
 HEADERS = {
     "User-Agent": (
@@ -46,47 +52,84 @@ def fetch_jobs(slug, company):
         List of normalized job dicts.
     """
     if not slug:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug")
 
     base_url = f"https://{slug}/api/jobs"
     all_jobs = []
-    offset   = 0
+    seen_ids = set()   # distinct raw ids across pages — the API ignores unknown params and repeats page 1
+    total    = None
+    stop     = STOP_ALL_PAGES
+    pages    = 0
 
-    for page in range(MAX_PAGES):
-        url  = f"{base_url}?limit={PAGE_SIZE}&offset={offset}"
+    for page in range(1, JIBE_MAX_PAGES + 1):
+        url  = f"{base_url}?limit={PAGE_SIZE}&page={page}"
         data = fetch_json(url, headers=HEADERS)
+        pages += 1
 
         if not data:
-            logger.debug("Jibe fetch: no data for %r page=%d", company, page)
+            logger.warning("Jibe fetch: no data for %r page=%d — partial result (%d jobs)",
+                           company, page, len(all_jobs))
+            stop = STOP_REQUEST_FAILED
             break
 
         jobs_page = data.get("jobs", [])
         if not jobs_page:
+            stop = STOP_EMPTY_PAGE
             break  # end of results
 
+        new_ids = 0
         for item in jobs_page:
             job = item.get("data", {})
             if not job:
                 continue
 
+            raw_id = str(job.get("req_id") or job.get("slug") or "")
+            if raw_id:
+                if raw_id in seen_ids:
+                    continue
+                seen_ids.add(raw_id)
+            new_ids += 1
+
             normalized = _normalize(job, company, slug)
             if normalized:
                 all_jobs.append(normalized)
 
-        logger.debug("Jibe page %d: %d jobs for %r (total so far: %d)",
-                     page, len(jobs_page), company, len(all_jobs))
+        logger.debug("Jibe page %d: %d jobs (%d new) for %r (total so far: %d)",
+                     page, len(jobs_page), new_ids, company, len(all_jobs))
+
+        if new_ids == 0:
+            logger.warning("Jibe fetch: page %d of %r added no new jobs (repeated page) — stopping "
+                           "with %d jobs", page, company, len(all_jobs))
+            stop = STOP_REPEAT_PAGE
+            break
 
         total = data.get("totalCount")
-        offset += PAGE_SIZE
-        if isinstance(total, int) and total > 0 and offset >= total:
+        if isinstance(total, int) and total > 0 and len(seen_ids) >= total:
             break
         if len(jobs_page) < PAGE_SIZE:
+            stop = STOP_EMPTY_PAGE   # a short page is the server's last
             break
 
         time.sleep(0.3)
+    else:
+        stop = STOP_PAGE_CAP
+        logger.warning("Jibe fetch: hit JIBE_MAX_PAGES=%d for %r — result truncated at %d jobs",
+                       JIBE_MAX_PAGES, company, len(all_jobs))
 
+    if isinstance(total, int) and total > len(seen_ids):
+        logger.warning("Jibe fetch: %r reports %d jobs but only %d distinct fetched",
+                       company, total, len(seen_ids))
     logger.info("Jibe fetch complete: %d jobs for %r", len(all_jobs), company)
-    return all_jobs
+    has_total = isinstance(total, int) and total > 0
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = len(seen_ids) if seen_ids else len(all_jobs),
+        unusable         = max(len(seen_ids) - len(all_jobs), 0),
+        reported_total   = total if has_total else None,
+        total_source     = TOTAL_ATS if has_total else None,
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 def _normalize(job, company, slug):

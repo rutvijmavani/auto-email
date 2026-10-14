@@ -156,6 +156,17 @@ scales to any company count without code changes.
 
 ---
 
+### 🔴 Feeder under-fetch — remaining per-ATS gaps (found by `scripts/probe_feeder_totals.py`, 2026-10-14)
+**Description:** Companies silently return fewer jobs than the ATS reports. Fixed so far: Jibe, Workday
+(see Resolved Issues). Still open:
+- **Eightfold:** Johns Hopkins pcsx returns 404 (never worked). (Page cap fixed, see Resolved.)
+- **Taleo:** the list API itself withholds jobs — UTSW `totalCount` 649 but every sort order and every `JOB_FIELD` facet slice yields the same 506 distinct ids (probed 2026-10-14), so the missing ~143 cannot be fetched through this endpoint. The feeder now warns with the shortfall; a true fix needs another source (unknown) and the completeness record must treat such a company as "server short", not "ours".
+- **No total available / not yet probed:** Ashby, Lever, SuccessFactors (count `<Job>`), sitemap platforms (Phenom/TalentBrew/Avature), ADP, Thermo Fisher, iCIMS, Paycom, Google, Avature EA.
+- **Completeness record (built):** every fetch writes a `scan_health` row (`db/scan_health.py`, report from `jobs/ats/fetch_report.py`): stop reason, pages, distinct fetched, reported total + source, `complete` (True/False/NULL=unknown), `server_short`. Covered feeders: Workday, SuccessFactors, Jobvite (no total → NULL when clean), Jibe, Eightfold, Oracle HCM, Taleo. All other platforms (Greenhouse, SmartRecruiters, …) record `complete=NULL`; `matched_count` is not populated yet. The verdict layer (`company_health`, alerts, Discover/digest) is the next step.
+**Files:** `jobs/ats/*.py`, `scripts/probe_feeder_totals.py`, `scripts/audit_fetch_health.py`
+
+---
+
 ### 🟢 Single Oracle VM — plan for 750-1000 companies
 **Planned:** When company count reaches 750+
 **Description:** At 750+ companies, consider splitting
@@ -292,6 +303,44 @@ old version may still be tracked.
 ---
 
 ## Resolved Issues ⚪
+
+### ⚪ `--override` on a string-slug platform returned zero jobs (manual JSON blob sent to the ATS URL)
+**Resolved:** 2026-10-14 (needs VM deploy)
+**Was:** `override_ats` always stores `{"_manual": true, "_platform": ..., "slug": "acme"}`. The `_manual` flag is what stops re-detection, so the blob must stay stored. But `parse_slug` passed string-slug platforms (greenhouse, lever, ashby, jibe, smartrecruiters, icims, jobvite, adp) through untouched, so the whole JSON went into the ATS URL → 400 → 0 jobs. Found via Western Digital (smartrecruiters, set 2026-03-11, 339 live jobs never monitored); it was the only affected row in prospective_companies.
+**Fix:** `registry.parse_slug` unwraps the blob to its `slug` value for string platforms; `job_monitor._parse_slug` now delegates to it (one implementation for adaptive scan_worker, fullscan, --monitor-jobs, detail_worker, audit, probe). Stored data and `override_ats` unchanged. No data fix needed.
+**Files:** `jobs/ats/registry.py`, `jobs/job_monitor.py`, `tests/test_parse_slug.py`
+**Also covered (2026-10-14):** `override_ats` now validates through `validate_platform_slug` against `registry.SLUG_REQUIRED_KEYS` (workday slug+wd, successfactors slug+dc+region, avature/phenom/talentbrew base, sitemap url, taleo company, paycom host+key, oracle_hcm/eightfold slug). An incomplete json slug (e.g. `--override workday capitalone`) is refused with a message and nothing is written; `override_ats` returns True/False. The Discover edit form uses the same check. Tests: `tests/test_override_validation.py`.
+
+### ⚪ Jibe companies only ever saw their first 100 jobs
+**Resolved:** 2026-10-14 (needs VM deploy)
+**Was:** `jibe.py` paged with `offset=`, which the API ignores (every request returned page 1) — AMD showed 100 of 1290.
+**Fix:** page with `page=N` (1-based), dedup by req id, stop at `totalCount` / short page / repeated page, warn on failed page, repeated page, `JIBE_MAX_PAGES` hit or fewer distinct than `totalCount`.
+**Effect:** first scan after deploy surfaces a burst of "new" older jobs for Jibe companies.
+**Files:** `jobs/ats/jibe.py`, `config.py` (`JIBE_MAX_PAGES`), `tests/test_jibe.py`
+
+### ⚪ Eightfold / Oracle HCM / Taleo: silent caps and no shortfall signal
+**Resolved:** 2026-10-14 (needs VM deploy)
+**Was:** Eightfold stopped at a hard 20000-job cap (Starbucks reports 21500+) and swallowed failed/empty pages silently; Oracle HCM never read `items[0].TotalJobsCount` and stopped on the first short page; Taleo used `print` and had no distinct count or shortfall warning.
+**Fix:** all three dedup by job id, stop on empty / repeated / failed page or the page cap, record a stop reason and log a WARNING when fewer distinct jobs than the reported total were fetched. Eightfold cap is `EIGHTFOLD_MAX_PAGES` (5000 × ~10 rows); Oracle pages by `TotalJobsCount` with `ORACLE_HCM_MAX_PAGES`.
+**Effect:** Starbucks-size Eightfold boards are fully fetched; the first scan after deploy surfaces the previously unseen jobs.
+**Files:** `jobs/ats/eightfold.py`, `jobs/ats/oracle_hcm.py`, `jobs/ats/taleo.py`, `config.py`, `tests/test_feeder_paging.py`
+
+### ⚪ Jobvite companies with a custom landing page lost most jobs; no completeness proof
+**Resolved:** 2026-10-14 (needs VM deploy)
+**Was:** `jobvite.py` read `/jobs` then followed per-category "Show More" links. Tenants with a custom landing page (Marelli 4 of 6, Knight 4 of 30) have no category links, so jobs were silently dropped. The category loop also double-encoded `+` (`Product+Support` → `%2B`).
+**Fix:** `fetch_board` pages unfiltered `/search?p=N` (50/page, 0-based) until an empty page, unions the landing page, and records the stop reason (`empty_page` / `request_failed` / `repeat_page` / `page_cap`; `fetch_jobs` warns on anything but `empty_page`). `verify_fetch` cross-checks the account XML feed (`app.jobvite.com/CompanyJobs/Xml.aspx?c=<companyEId>`): feed-only jobs are traced via `Job.aspx` redirect; those on another careersite of the account are ignored (WebMD feed 144 = 71 ours + 73 sibling), those on ours but not fetched = `incomplete`. Verdicts: verified / unverified / incomplete. 429s honour `Retry-After` (observed 30s), else `JOBVITE_FEED_DEFAULT_WAIT_S`.
+**Run:** fullscan calls it after a finished Jobvite scan, once per company per `JOBVITE_FEED_VERIFY_INTERVAL_H` (Redis `verify:feed:<company>` NX gate), logging only; on demand: `python scripts/verify_jobvite_feed.py <slug>...`.
+**Not yet:** verdict is logged, not persisted into a completeness record; the first scan after deploy surfaces a burst of "new" jobs for affected tenants.
+**Files:** `jobs/ats/jobvite.py`, `workers/fullscan.py`, `scripts/verify_jobvite_feed.py`, `config.py` (`JOBVITE_*`, `REDIS_FEED_VERIFY_PREFIX`), `tests/test_jobvite.py`
+
+### ⚪ Workday boards over 2000 jobs lost their oldest jobs
+**Resolved:** 2026-10-14 (needs VM deploy)
+**Was:** Workday caps every search at 2000 results (Nvidia 2701 real, reported total 2000); offsets past the cap repeat. Also, a failed/empty page mid-pagination ended the loop silently.
+**Fix:** when page 1 reports total ≥ `WORKDAY_FACET_SPLIT_AT` (1900) the unsplit query is not paged; one query per `jobFamilyGroup` value is fetched (sub-split by `timeType`/`workerSubType` if a slice is still too big) and merged by `externalPath`. Warns when a slice cannot be split, distinct < facet-count sum, or a page fails/is empty before the total.
+**Effect:** big boards (Nvidia, T-Mobile, Genpact, Target, Citibank, Capital One, Bank of America, Applied Materials, General Hospital) return their full list: more jobs, burst of "new" older jobs on first scan, longer scans.
+**Files:** `jobs/ats/workday.py`, `config.py` (`WORKDAY_PAGE_SIZE`, `WORKDAY_RESULT_CAP`, `WORKDAY_FACET_SPLIT_AT`, `WORKDAY_SPLIT_FACETS`), `tests/test_workday_split.py`
+
+---
 
 ### ⚪ --monitor-jobs cycle-boundary bug — all companies always "missed"
 **Resolved:** 2026-05-27

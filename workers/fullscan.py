@@ -109,6 +109,8 @@ from config import (
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_FULLSCAN,
     REDIS_CYCLE_START,
+    REDIS_FEED_VERIFY_PREFIX,
+    JOBVITE_FEED_VERIFY_INTERVAL_H,
     REDIS_DB_MAINTENANCE,
     REDIS_INFLIGHT_FULLSCAN,
     REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
@@ -140,6 +142,8 @@ from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
+from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, report_of
+from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
@@ -764,6 +768,33 @@ def _build_detail_payload(
 
 
 # ─────────────────────────────────────────
+# JOBVITE COMPLETENESS (feed cross-check)
+# ─────────────────────────────────────────
+
+def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
+                         stop_reason: str = STOP_EMPTY_PAGE) -> None:
+    """
+    After a finished Jobvite full scan, cross-check the fetched board against the
+    account XML feed — at most once per JOBVITE_FEED_VERIFY_INTERVAL_H per company
+    (Redis SET NX gate). Logs the verdict and stores it on the scan's scan_health row;
+    never raises, never blocks the scan result.
+    """
+    try:
+        gate = f"{REDIS_FEED_VERIFY_PREFIX}:{company}"
+        if not r.set(gate, "1", nx=True, ex=JOBVITE_FEED_VERIFY_INTERVAL_H * 3600):
+            return
+        from jobs.ats import jobvite
+        verdict = jobvite.verify_fetch(slug_info, valid_jobs, stop_reason)
+        annotate_latest(company, SOURCE_FULLSCAN, verdict["status"])
+        log = logger.info if verdict["status"] == "verified" else logger.warning
+        log("fullscan [%s]: jobvite feed check %s — %s %s", company,
+            verdict["status"], verdict["reason"],
+            verdict.get("missing", [])[:10])
+    except Exception as exc:
+        logger.warning("fullscan [%s]: jobvite feed check failed: %s", company, exc)
+
+
+# ─────────────────────────────────────────
 # CORE: run one full scan
 # ─────────────────────────────────────────
 
@@ -1038,6 +1069,24 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             )
 
         result["fetched"] = len(valid_jobs)
+
+        # Completeness verdict of this fetch (jobs/ats/fetch_report.py): recorded, and an incomplete
+        # fetch is treated like Avature's partial one so nothing downstream reads it as the full board.
+        _report = report_of(raw_jobs)
+        if _partial_fetch:
+            _report.complete    = False
+            _report.stop_reason = STOP_REQUEST_FAILED
+            _report.note        = _report.note or "avature partial fetch"
+        elif _report.complete is False:
+            _partial_fetch = True
+        record_scan(
+            company, platform, SOURCE_FULLSCAN, _report,
+            raw_count=len(raw_jobs), valid_count=len(valid_jobs),
+            duration_ms=int((time.monotonic() - start_mono) * 1000),
+        )
+
+        if platform == "jobvite" and not _partial_fetch:
+            _verify_jobvite_feed(company, r, slug_info, valid_jobs, _report.stop_reason)
 
         # ── 8. Apply listing-level title filter (same as scan_worker) ─────────
         listing_filter = config.get("listing_filter", "full")

@@ -243,8 +243,10 @@ def _apply_to_db(company, platform, slug):
     """Apply detected ATS to pipeline DB."""
     try:
         from jobs.ats_detector import override_ats
-        override_ats(company, platform, slug)
-        print(f"    [DB] {company} → {platform}")
+        if override_ats(company, platform, slug):
+            print(f"    [DB] {company} → {platform}")
+        else:
+            print(f"    [DB SKIPPED] {company}: slug rejected for {platform}")
     except Exception as e:
         print(f"    [DB ERROR] {company}: {e}")
 

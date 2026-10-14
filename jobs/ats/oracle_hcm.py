@@ -8,7 +8,17 @@
 import json
 import logging
 from datetime import datetime
+from config import ORACLE_HCM_MAX_PAGES
 from jobs.ats.base import fetch_json
+from logger import get_logger
+
+logger = get_logger(__name__)
+
+# Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
+from jobs.ats.fetch_report import (  # noqa: E402
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
+    STOP_REPEAT_PAGE, STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
+)
 
 
 # Oracle HCM REST API endpoint
@@ -100,7 +110,6 @@ def detect(company, domain):
 
     domain = re.sub(r"^https?://", "", domain).rstrip("/")
     # company is used for logging context
-    logger = logging.getLogger(__name__)
     logger.debug("Oracle detect: company=%s domain=%s", company, domain)
 
     # Steps 1+2: Visit career pages, find oraclecloud URL in HTML
@@ -199,7 +208,7 @@ def fetch_jobs(slug_info, company):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     slug    = slug_info.get("slug", "")
     site_id = slug_info.get("site", "")
@@ -207,48 +216,93 @@ def fetch_jobs(slug_info, company):
     ocs     = slug_info.get("ocs", False)
 
     if not slug:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no slug")
 
     # site="" means the tenant was detected from a JS asset URL (custom-domain career page)
     # and /sites/{id} was not present — auto-discover the site number via the sites API.
     if not site_id:
-        logger = logging.getLogger(__name__)
         logger.debug("Oracle HCM: site_id missing for %r, attempting auto-discovery", slug)
         site_id = _discover_site_id(slug, region, ocs=ocs)
         if not site_id:
             logger.warning("Oracle HCM: could not discover site_id for slug=%r — skipping", slug)
-            return []
+            return failed(STOP_NO_CONFIG, "site_id not discoverable")
         logger.info("Oracle HCM: auto-discovered site_id=%r for slug=%r", site_id, slug)
 
-    all_jobs = []
-    offset   = 0
-    limit    = 200
+    all_jobs    = []
+    seen_ids    = set()
+    offset      = 0
+    limit       = 200
+    total       = None          # items[0].TotalJobsCount, read from page 1
+    stop_reason = STOP_ALL_PAGES
+    pages       = 0
 
-    while True:
+    for _ in range(ORACLE_HCM_MAX_PAGES):
         url  = _build_oracle_url(slug, region, site_id, limit, offset, ocs=ocs)
         data = fetch_json(url, platform="oracle_hcm")  # tracked for api_health
+        pages += 1
         if not data:
+            stop_reason = STOP_REQUEST_FAILED
             break
 
         items = data.get("items", [])
         if not items:
+            stop_reason = STOP_EMPTY_PAGE
             break
 
         # Oracle always returns 1 item wrapper — jobs are in requisitionList
+        if total is None:
+            try:
+                total = int(items[0].get("TotalJobsCount"))
+            except (TypeError, ValueError):
+                total = None
         reqs = items[0].get("requisitionList", [])
         if not reqs:
+            stop_reason = STOP_EMPTY_PAGE
             break
 
-        all_jobs.extend(reqs)
-
-        # Paginate by job count — stop when fewer than limit returned
-        if len(reqs) < limit:
+        new = 0
+        for j in reqs:
+            key = j.get("Id") or j.get("ExternalJobId") or j.get("RequisitionId")
+            if key is not None:
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            all_jobs.append(j)
+            new += 1
+        if new == 0:
+            stop_reason = STOP_REPEAT_PAGE
             break
 
-        offset += limit
+        offset += len(reqs)
 
-    return [_normalize(j, company, slug_info, slug, site_id)
-            for j in all_jobs if j.get("Title")]
+        # Done once the reported total is reached; with no total, a short
+        # page is the only end signal.
+        if total is not None:
+            if offset >= total:
+                break
+        elif len(reqs) < limit:
+            break
+    else:
+        stop_reason = STOP_PAGE_CAP
+
+    if total is not None and len(all_jobs) < total:
+        logger.warning("oracle_hcm: %s fetched %d distinct of %d reported (stop=%s)",
+                       slug, len(all_jobs), total, stop_reason)
+    elif stop_reason != STOP_ALL_PAGES:
+        logger.warning("oracle_hcm: %s stopped early at %d jobs (stop=%s, reported=%s)",
+                       slug, len(all_jobs), stop_reason, total)
+
+    out = [_normalize(j, company, slug_info, slug, site_id)
+           for j in all_jobs if j.get("Title")]
+    return attach(out, FetchReport(
+        stop_reason      = stop_reason,
+        pages            = pages,
+        fetched_distinct = len(seen_ids) if seen_ids else len(all_jobs),
+        unusable         = len(all_jobs) - len(out),
+        reported_total   = total,
+        total_source     = TOTAL_ATS if total is not None else None,
+        repeated_pages   = 1 if stop_reason == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 def _normalize(job, company, slug_info, slug, site_id):
