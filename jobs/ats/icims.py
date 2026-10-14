@@ -25,6 +25,10 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import alpha2_to_country_name
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
+    attach, count_distinct, failed,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -83,7 +87,7 @@ def fetch_jobs(slug, company):
         We probe both variants on page 0 and use whichever responds with 200.
     """
     if not slug:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug")
 
     # Normalise to bare slug regardless of how it was stored
     bare_slug = slug[len("careers-"):] if slug.startswith("careers-") else slug
@@ -91,25 +95,37 @@ def fetch_jobs(slug, company):
     # Probe both URL formats — use whichever responds
     base_url = _resolve_base_url(bare_slug, company)
     if base_url is None:
-        return []  # neither URL variant responded — company not on iCIMS
+        # neither URL variant responded — company not on iCIMS
+        return failed(STOP_NO_CONFIG, "no iCIMS URL variant responded")
 
     all_jobs = []
     seen_ids = set()
+    pages    = 0
+    stop     = STOP_PAGE_CAP     # the loop ran all MAX_PAGES without reaching the end
 
     for page in range(MAX_PAGES):
         url  = f"{base_url}/jobs/search?pr={page}&in_iframe=1"
         jobs = _fetch_listing_page(url, base_url, company, seen_ids)
 
         if jobs is None:
+            stop = STOP_REQUEST_FAILED
             break  # network/HTTP error — stop pagination
 
+        pages += 1
         if len(jobs) == 0:
+            stop = STOP_EMPTY_PAGE
             break  # genuine end of results
 
         all_jobs.extend(jobs)
         time.sleep(PAGE_DELAY)
 
-    return all_jobs
+    # iCIMS shows no total we can read, so a clean stop leaves complete unknown; a page_cap or
+    # request_failed stop is recorded as incomplete.
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(all_jobs),
+    ))
 
 
 def _resolve_base_url(bare_slug, company):
@@ -231,12 +247,12 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return []
+        return None   # an error, not an end of results: [] here made a timed-out page look like the last one
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return []
+        return None
 
 
 def fetch_job_detail(job):

@@ -116,6 +116,34 @@ def failed(stop_reason: str, note: str = "") -> FetchResult:
     return attach([], FetchReport(stop_reason=stop_reason, note=note))
 
 
+def new_sitemap_stats() -> dict:
+    """Counters a sitemap walker fills in: files fetched, files that failed, branches cut by the depth limit."""
+    return {"files": 0, "failed": 0, "too_deep": 0}
+
+
+def sitemap_report(stats: dict, jobs, unusable: int = 0) -> FetchReport:
+    """
+    Report for a sitemap-derived fetch. The sitemap IS the board's listing, so there is no separate total:
+    the thing to prove is that every sitemap file was read. A failed or depth-cut file means part of the
+    listing was never seen (one dead child of a 4-file index silently drops a quarter of the jobs).
+    complete therefore stays None on a clean read — whether the sitemap lags the live board is unknowable.
+    """
+    cut = stats.get("failed", 0) + stats.get("too_deep", 0)
+    if cut:
+        stop = STOP_REQUEST_FAILED
+        note = f"{stats.get('failed', 0)} of {stats.get('files', 0)} sitemap files failed, {stats.get('too_deep', 0)} cut by depth limit"
+    else:
+        stop = STOP_ALL_PAGES if jobs else STOP_EMPTY_PAGE
+        note = ""
+    return FetchReport(
+        stop_reason      = stop,
+        pages            = stats.get("files", 0),
+        fetched_distinct = count_distinct(jobs),
+        unusable         = unusable,
+        note             = note,
+    )
+
+
 def report_of(jobs) -> FetchReport:
     """
     The report attached to a fetch result, or — for feeders that attach none — an "unknown" report

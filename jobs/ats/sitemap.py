@@ -45,6 +45,10 @@ from datetime import datetime
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from jobs.ats.base import fetch_html
+from jobs.ats.fetch_report import (
+    STOP_NO_CONFIG, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, FetchReport, attach,
+    count_distinct, failed, new_sitemap_stats, sitemap_report,
+)
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
@@ -137,7 +141,7 @@ def fetch_jobs(slug_info, company):
         For sitemaps: stubs with posted_at from lastmod, detail filled by fetch_job_detail().
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
 
     if isinstance(slug_info, str):
         try:
@@ -146,22 +150,25 @@ def fetch_jobs(slug_info, company):
             if slug_info.startswith("http"):
                 slug_info = {"url": slug_info}
             else:
-                return []
+                return failed(STOP_NO_CONFIG, "slug_info is neither JSON nor a URL")
 
     url         = slug_info.get("url", "")
     job_pattern = slug_info.get("job_pattern", "")
     locale_pref = slug_info.get("locale", "en")
 
     if not url:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no url")
 
     resp = fetch_html(url, platform="sitemap")
     if resp is None:
-        return []
+        return failed(STOP_REQUEST_FAILED, "sitemap/feed request failed")
 
     text = (resp.text or "").strip()
     if not text:
-        return []
+        return failed(STOP_REQUEST_FAILED, "sitemap/feed response was empty")
+
+    stats = new_sitemap_stats()
+    stats["files"] = 1
 
     # Detect XML format from root tag
     soup = BeautifulSoup(text, "html.parser")
@@ -172,7 +179,12 @@ def fetch_jobs(slug_info, company):
     root_name = root_tag.name.lower() if root_tag else ""
 
     if root_name in ("jobs", "job-listing", "feed", "rss"):
-        return _parse_xml_feed(soup, slug_info, company, url)
+        feed = _parse_xml_feed(soup, slug_info, company, url)
+        return attach(feed, FetchReport(
+            stop_reason      = STOP_SINGLE_RESPONSE,
+            pages            = 1,
+            fetched_distinct = count_distinct(feed),
+        ))
 
     # ── Format 2: Sitemap index ─────────────────────────────────────────────
     if soup.find("sitemapindex") or soup.find("sitemap"):
@@ -180,25 +192,32 @@ def fetch_jobs(slug_info, company):
         sitemap_tags = soup.find_all("sitemap")
         if sitemap_tags and any(s.find("loc") for s in sitemap_tags):
             all_entries = []
+            # children beyond MAX_SUB_SITEMAPS are never read — counted as cut, not silently dropped
+            stats["too_deep"] += max(len(sitemap_tags) - MAX_SUB_SITEMAPS, 0)
             for sitemap_tag in sitemap_tags[:MAX_SUB_SITEMAPS]:
                 loc = sitemap_tag.find("loc")
                 if not loc:
                     continue
                 sub_url  = loc.get_text(strip=True)
+                stats["files"] += 1
                 sub_resp = fetch_html(sub_url, platform="sitemap")
                 if sub_resp is None:
+                    stats["failed"] += 1
                     continue
                 sub_text = (sub_resp.text or "").strip()
                 if not sub_text:
+                    stats["failed"] += 1
                     continue
                 sub_soup = BeautifulSoup(sub_text, "html.parser")
                 all_entries.extend(_extract_sitemap_entries(sub_soup))
-            return _entries_to_stubs(all_entries, slug_info, company,
-                                     job_pattern, locale_pref)
+            stubs = _entries_to_stubs(all_entries, slug_info, company,
+                                      job_pattern, locale_pref)
+            return attach(stubs, sitemap_report(stats, stubs))
 
     # ── Format 3: Standard sitemap ─────────────────────────────────────────
     entries = _extract_sitemap_entries(soup)
-    return _entries_to_stubs(entries, slug_info, company, job_pattern, locale_pref)
+    stubs = _entries_to_stubs(entries, slug_info, company, job_pattern, locale_pref)
+    return attach(stubs, sitemap_report(stats, stubs))
 
 
 # ─────────────────────────────────────────

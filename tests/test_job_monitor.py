@@ -273,9 +273,9 @@ class TestGreenhouseClient(unittest.TestCase):
         self.gh = greenhouse
 
     def _job(self, title="Senior SWE",
-             url="https://boards.greenhouse.io/stripe/jobs/1"):
+             url="https://boards.greenhouse.io/stripe/jobs/1", job_id=None):
         return {
-            "id": 1, "title": title, "absolute_url": url,
+            "id": job_id if job_id is not None else url, "title": title, "absolute_url": url,
             "location": {"name": "Remote"}, "content": "Python",
         }
 

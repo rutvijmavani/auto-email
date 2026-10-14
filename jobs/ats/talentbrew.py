@@ -41,6 +41,7 @@ from collections import Counter
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match, country_to_alpha2, alpha2_to_country_name
+from jobs.ats.fetch_report import STOP_NO_CONFIG, STOP_REQUEST_FAILED, attach, failed, new_sitemap_stats, sitemap_report
 
 
 # ─────────────────────────────────────────
@@ -131,31 +132,40 @@ def fetch_jobs(slug_info, company):
         persist the corrected value back to the DB.
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
 
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     base      = slug_info.get("base", "")
     tenant_id = slug_info.get("tenant_id", "")
     if not base:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no base")
 
     sitemap_url = f"{base}/sitemap.xml"
+    stats       = new_sitemap_stats()
 
     # First pass: fetch all locs (handles sitemap index + sub-sitemaps + fallback
     # to sitemap_index.xml) WITHOUT tenant_id filter, so we can auto-detect
     # the live tenant_id from whatever URLs the sitemap actually contains.
     # (connect_timeout=10, read_timeout=None) — see module header for rationale.
-    all_locs = _follow_sitemap(sitemap_url)
+    all_locs = _follow_sitemap(sitemap_url, _stats=stats)
 
     if not any(JOB_URL_RE.search(u) for u in all_locs):
         # sitemap.xml empty or missing — try sitemap_index.xml
         index_url = f"{base}/sitemap_index.xml"
-        all_locs  = _follow_sitemap(index_url)
+        fb_stats  = new_sitemap_stats()
+        fb_locs   = _follow_sitemap(index_url, _stats=fb_stats)
+        if any(JOB_URL_RE.search(u) for u in fb_locs):
+            # the fallback is the real entry point; the primary's 404 is not a failure of the read
+            all_locs = fb_locs
+            stats.clear()
+            stats.update(fb_stats)
+        else:
+            all_locs = fb_locs or all_locs
 
     # Auto-detect live tenant_id from the collected URLs
     from collections import Counter as _Counter
@@ -181,12 +191,16 @@ def fetch_jobs(slug_info, company):
             "talentbrew: could not determine tenant_id for %s — aborting",
             company,
         )
-        return []
+        # A dead sitemap is also "no tenant_id": report the read failure when that is the cause.
+        rep = sitemap_report(stats, [])
+        return failed(STOP_REQUEST_FAILED if rep.stop_reason == STOP_REQUEST_FAILED else STOP_NO_CONFIG,
+                      rep.note or "could not determine tenant_id")
 
     job_urls = [u for u in all_locs
                 if JOB_URL_RE.search(u)
                 and JOB_URL_RE.search(u).group(1) == tenant_id]
-    return _urls_to_stubs(job_urls, slug_info, company)
+    stubs = _urls_to_stubs(job_urls, slug_info, company)
+    return attach(stubs, sitemap_report(stats, stubs, unusable=len(job_urls) - len(stubs)))
 
 
 # ─────────────────────────────────────────
@@ -254,7 +268,7 @@ def fetch_job_detail(job):
 # HELPERS — SITEMAP FETCHING
 # ─────────────────────────────────────────
 
-def _follow_sitemap(sitemap_url, depth=0, _seen=None):
+def _follow_sitemap(sitemap_url, depth=0, _seen=None, _stats=None):
     """
     Recursively fetch all <loc> entries from a sitemap or sitemap index.
 
@@ -268,6 +282,8 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
     depth limit = 3. Returns flat list of URL strings.
     """
     if depth > 3:
+        if _stats is not None:
+            _stats["too_deep"] += 1
         return []
     if _seen is None:
         _seen = set()
@@ -275,8 +291,12 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
         return []
     _seen.add(sitemap_url)
 
+    if _stats is not None:
+        _stats["files"] += 1
     resp = fetch_html(sitemap_url, platform="talentbrew", timeout=(10, None))
     if resp is None:
+        if _stats is not None:
+            _stats["failed"] += 1
         return []
 
     # IMPORTANT: html.parser — BOM prefix breaks xml/lxml-xml parsers
@@ -290,7 +310,7 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
             loc_tag = tag.find("loc")
             if loc_tag and loc_tag.text.strip():
                 all_locs.extend(
-                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen)
+                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen, _stats)
                 )
         return all_locs
 

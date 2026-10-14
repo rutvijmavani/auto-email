@@ -98,6 +98,12 @@ from jobs.utils import (
     extract_job_id_from_path as _extract_id_from_path,
 )
 
+from jobs.ats.fetch_report import (
+    STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, TOTAL_ATS, FetchReport, attach,
+    count_distinct, failed,
+)
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
@@ -625,18 +631,18 @@ def fetch_jobs(slug_info, company):
     Warms session before every call — cookies never expire.
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
             logger.error("custom_career: invalid slug_info for %r", company)
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     base_url = slug_info.get("url", "")
     if not base_url:
         logger.error("custom_career: no url in slug_info for %r", company)
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no url")
 
     logger.info("custom_career: starting for %r at %s", company, base_url)
     # Store company name in slug_info so _fetch_page can use it in diagnostics
@@ -664,7 +670,7 @@ def fetch_jobs(slug_info, company):
             "custom_career: page 1 failed for %r", company
         )
         _flag_expired(company)
-        return []
+        return failed(STOP_REQUEST_FAILED, "page 1 request failed")
 
     # Auto-detect structure or use cached
     needs_detection = not all([
@@ -693,7 +699,7 @@ def fetch_jobs(slug_info, company):
                     f"Raw response stored — inspect to identify new pattern."
                 ),
             )
-            return []
+            return failed(STOP_NO_CONFIG, "structure detection failed")
         slug_info = {**slug_info, **detected}
         _save_enriched_config(company, slug_info)
         logger.info(
@@ -713,7 +719,8 @@ def fetch_jobs(slug_info, company):
         logger.warning(
             "custom_career: no jobs on page 1 for %r", company
         )
-        return []
+        # an unparseable page 1 and a genuinely empty board look the same here — never call it clean
+        return failed(STOP_REQUEST_FAILED, "no jobs found on page 1")
 
     logger.info("custom_career: page 1 — %d jobs for %r",
                 len(jobs_arr), company)
@@ -753,8 +760,15 @@ def fetch_jobs(slug_info, company):
     pagination = slug_info.get("pagination", {})
     pag_type   = pagination.get("type", "none")
 
-    if pag_type != "none" and total and len(jobs_arr) < total:
-        extra = _paginate(session, slug_info, jobs_arr, total, company , initial_page = initial_page)
+    outcome = {"stop": STOP_SINGLE_RESPONSE, "pages": 0}
+    if pag_type == "none":
+        pass
+    elif total and len(jobs_arr) >= total:
+        outcome["stop"] = STOP_ALL_PAGES
+    elif pag_type != "none":
+        # total unknown → exhaustion mode (page until empty/repeat) rather than silently stopping at page 1
+        extra = _paginate(session, slug_info, jobs_arr, total or None, company,
+                          initial_page = initial_page, outcome = outcome)
         all_raw.extend(extra)
 
     logger.info("custom_career: %d raw jobs for %r", len(all_raw), company)
@@ -769,7 +783,14 @@ def fetch_jobs(slug_info, company):
 
     logger.info("custom_career: %d normalized jobs for %r",
                 len(results), company)
-    return results
+    return attach(results, FetchReport(
+        stop_reason      = outcome["stop"],
+        pages            = 1 + outcome["pages"],
+        fetched_distinct = count_distinct(results),
+        unusable         = min(len(all_raw), MAX_JOBS) - len(results),
+        reported_total   = total or None,
+        total_source     = TOTAL_ATS if total else None,
+    ))
 
 
 # ─────────────────────────────────────────
@@ -2462,8 +2483,11 @@ def _resolve_protobuf_long(v):
 # PAGINATION
 # ─────────────────────────────────────────
 
-def _paginate(session, slug_info, first_page_jobs, total, company, initial_page = 0):
+def _paginate(session, slug_info, first_page_jobs, total, company, initial_page = 0, outcome=None):
     """
+    `outcome` (optional dict) receives {"stop": <fetch_report STOP_*>, "pages": <extra pages fetched>}
+    so fetch_jobs can report why paging ended; the return value is unchanged.
+
     Fetch all pages beyond page 1.
 
     Two modes:
@@ -2482,12 +2506,17 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
 
     # If page 1 returned fewer than configured page size,
     # we already have all jobs — no need to paginate
+    if outcome is None:
+        outcome = {}
+    outcome.update(stop=STOP_PAGE_CAP, pages=0)
+
     if actual_size > 0 and actual_size < configured_size and pag_type == "offset":
         logger.debug(
             "custom_career: page 1 returned %d < configured %d — "
             "single page result for %r",
             actual_size, configured_size, company
         )
+        outcome["stop"] = STOP_ALL_PAGES
         return []
 
     all_extra       = []
@@ -2507,8 +2536,10 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
     for _ in range(MAX_PAGES - 1):
         collected = len(first_page_jobs) + len(all_extra)
         if collected >= MAX_JOBS:
+            outcome["stop"] = STOP_PAGE_CAP
             break
         if not exhaustion_mode and offset >= total:
+            outcome["stop"] = STOP_ALL_PAGES
             break
 
         raw = _fetch_page(
@@ -2520,6 +2551,7 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
                 "custom_career: page %d failed for %r — stopping",
                 page_num, company
             )
+            outcome["stop"] = STOP_REQUEST_FAILED
             break
 
         jobs_arr = _extract_jobs_array(raw, slug_info)
@@ -2528,6 +2560,7 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
                 "custom_career: empty page %d for %r — pagination complete",
                 page_num, company
             )
+            outcome["stop"] = STOP_EMPTY_PAGE
             break
 
         new_ids = _job_fingerprints(jobs_arr)
@@ -2536,10 +2569,12 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
                 "custom_career: pagination loop at page %d for %r",
                 page_num, company
             )
+            outcome["stop"] = STOP_REPEAT_PAGE
             break
 
         seen_ids.update(new_ids)
         all_extra.extend(jobs_arr)
+        outcome["pages"] += 1
 
         logger.info(
             "custom_career: page %d — %d jobs (total so far %d) for %r",
@@ -2558,6 +2593,7 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
                 if isinstance(cursor_data, dict) else None
             )
             if not cursor:
+                outcome["stop"] = STOP_ALL_PAGES   # the cursor chain ended
                 break
 
         time.sleep(PAGE_RETRY_DELAY)

@@ -33,6 +33,10 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE, attach, count_distinct, failed,
+)
+
 logger = logging.getLogger(__name__)
 
 _TAKE = 100  # jobs per listing request
@@ -69,24 +73,41 @@ def fetch_jobs(slug, company):
     """
     host, key = _parse_slug(slug)
     if not host or not key:
-        return []
+        return failed(STOP_NO_CONFIG, "slug has no host/key")
 
     session, jwt, api_base = _get_session(host, key)
     if not jwt:
         raise RuntimeError(f"paycom: failed to obtain JWT for {host}/{key}")
 
     previews = []
+    seen = set()
     skip = 0
+    pages = 0
+    # _search_page raises on any HTTP/parse failure, so the caller sees a failed fetch, never a short list.
+    stop = STOP_EMPTY_PAGE
     while True:
         batch = _search_page(session, jwt, api_base, host, key, skip)
         if not batch:
             break
-        previews.extend(batch)
-        if len(batch) < _TAKE:
+        pages += 1
+        new = [p for p in batch if p.get("jobId") not in seen]
+        if not new:
+            stop = STOP_REPEAT_PAGE      # `skip` ignored — the same page again (would otherwise loop forever)
             break
+        seen.update(p.get("jobId") for p in new)
+        previews.extend(new)
+        if len(batch) < _TAKE:
+            break                        # a short page is the server's last
         skip += _TAKE
 
-    return [_preview_to_stub(p, host, key, company) for p in previews]
+    stubs = [_preview_to_stub(p, host, key, company) for p in previews]
+    # Paycom's search response carries no total we have confirmed, so complete stays unknown on a clean stop.
+    return attach(stubs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(stubs),
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 # ─────────────────────────────────────────

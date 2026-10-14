@@ -5,6 +5,10 @@ import html as _html
 from datetime import datetime
 
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED,
+    STOP_SINGLE_RESPONSE, TOTAL_ATS, attach, count_distinct,
+)
 from jobs.utils import clean_html
 
 
@@ -51,8 +55,12 @@ def fetch_jobs(slug, company):
     Returns list of normalized job dicts.
     """
     all_jobs = []
+    seen = set()
     offset = 0
     limit = 100
+    pages = 0
+    total = None
+    stop = STOP_ALL_PAGES
 
     while True:
         data = fetch_json(
@@ -61,17 +69,35 @@ def fetch_jobs(slug, company):
             platform="smartrecruiters",  # tracked for api_health
         )
         if not data:
+            stop = STOP_REQUEST_FAILED
             break
+        pages += 1
         jobs = data.get("content", [])
         if not jobs:
+            stop = STOP_EMPTY_PAGE
             break
-        all_jobs.extend(jobs)
-        total = data.get("totalFound", 0)
+        new = [j for j in jobs if j.get("id") not in seen]
+        if not new:
+            stop = STOP_REPEAT_PAGE         # `offset` ignored — the same rows came back
+            break
+        seen.update(j.get("id") for j in new)
+        all_jobs.extend(new)
+        total = data.get("totalFound")
         offset += limit
-        if offset >= total:
+        if total is None or offset >= total:
+            stop = STOP_ALL_PAGES if total is not None else STOP_SINGLE_RESPONSE
             break
 
-    return [_normalize(j, company, slug) for j in all_jobs if j.get("name")]
+    result = [_normalize(j, company, slug) for j in all_jobs if j.get("name")]
+    return attach(result, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(result),
+        unusable         = len(all_jobs) - len(result),
+        reported_total   = total if isinstance(total, int) else None,
+        total_source     = TOTAL_ATS if isinstance(total, int) else None,
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 def fetch_job_detail(job):
