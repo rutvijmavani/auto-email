@@ -85,7 +85,6 @@ AUDIT_CEILING_WAIT_S        = float(os.getenv("AUDIT_CEILING_WAIT_S", "5"))     
 
 # scripts/probe_feeder_totals.py — read-only probe of the total/paging fields each ATS exposes
 PROBE_MAX_CALLS             = int(os.getenv("PROBE_MAX_CALLS", "4"))             # responses recorded per company before the fetch is aborted
-PROBE_PER_PLATFORM          = int(os.getenv("PROBE_PER_PLATFORM", "1"))          # companies probed per platform
 PROBE_MAX_SCALARS           = int(os.getenv("PROBE_MAX_SCALARS", "60"))          # scalar fields kept per recorded JSON response
 
 # ─────────────────────────────────────────
