@@ -83,6 +83,11 @@ AUDIT_NO_NEW_MIN_RAW        = int(os.getenv("AUDIT_NO_NEW_MIN_RAW", "100"))     
 AUDIT_CEILING_RETRIES       = int(os.getenv("AUDIT_CEILING_RETRIES", "5"))       # retries when the platform concurrency ceiling is hit
 AUDIT_CEILING_WAIT_S        = float(os.getenv("AUDIT_CEILING_WAIT_S", "5"))      # wait between ceiling retries
 
+# scripts/probe_feeder_totals.py — read-only probe of the total/paging fields each ATS exposes
+PROBE_MAX_CALLS             = int(os.getenv("PROBE_MAX_CALLS", "4"))             # responses recorded per company before the fetch is aborted
+PROBE_PER_PLATFORM          = int(os.getenv("PROBE_PER_PLATFORM", "1"))          # companies probed per platform
+PROBE_MAX_SCALARS           = int(os.getenv("PROBE_MAX_SCALARS", "60"))          # scalar fields kept per recorded JSON response
+
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely
 # These will never appear on Workday/Oracle/Greenhouse/Lever/Ashby
