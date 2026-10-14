@@ -2,9 +2,10 @@
 scripts/probe_feeder_totals.py — READ-ONLY probe: which total/paging fields does each ATS really expose?
 
   python -m scripts.probe_feeder_totals [--platform eightfold] [--company "Starbucks"]
-                                        [--per-platform 1] [--max-calls 4] [--out data/probe_feeder_totals.json]
+                                        [--out data/probe_feeder_totals.json]
 
-For each ATS platform it picks the highest-petition monitored companies, runs the module's real
+For each ATS platform (custom excluded) it picks three monitored companies — the one with the most stored
+open jobs, the median one and the smallest one (see _PICK_SQL) — runs the module's real
 fetch_jobs, and records the FIRST --max-calls HTTP responses only (every module goes through
 requests.sessions.Session.request, so one hook sees them all), then aborts the fetch. For each recorded
 response it keeps: method, host+path, status, elapsed, size, and every scalar field (depth <= 3) plus the
@@ -20,9 +21,9 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import PROBE_MAX_CALLS, PROBE_PER_PLATFORM, PROBE_MAX_SCALARS
-from db.job_monitor import get_monitorable_companies
-from jobs.ats.registry import all_platforms, get_config, parse_slug
+from config import PROBE_MAX_CALLS, PROBE_MAX_SCALARS
+from db.connection import get_conn
+from jobs.ats.registry import get_config, parse_slug
 from jobs.ats_detector import get_ats_module
 from logger import get_logger, init_logging
 
@@ -69,7 +70,7 @@ def _summarise(resp, elapsed):
 
 def _probe_one(row):
     platform = row["ats_platform"]
-    company = row.get("company_name") or row["company"]
+    company = row["company_name"] or row["company"]
     calls, original = [], requests.sessions.Session.request
 
     def hooked(self, method, url, *args, **kwargs):
@@ -95,33 +96,69 @@ def _probe_one(row):
     return result
 
 
+# Per platform: the monitored company with the most stored open jobs, the median one and the smallest one
+# (custom excluded — it is verified by hand). Same monitorable rules as db.job_monitor.get_monitorable_companies.
+_PICK_SQL = r"""
+WITH m AS (
+    SELECT pc.company AS company, pc.company AS display, pc.ats_platform AS ats_platform, pc.ats_slug AS ats_slug
+    FROM prospective_companies pc
+    WHERE pc.ats_platform IS NOT NULL AND pc.ats_platform NOT IN ('unknown', 'unsupported', 'custom')
+      AND pc.ats_slug IS NOT NULL AND pc.is_monitored = TRUE
+    UNION ALL
+    SELECT 'ca:' || ca.id::text, ca.company_name, ca.platform, ca.slug
+    FROM company_ats ca
+    WHERE ca.is_monitored = TRUE AND ca.stale_since IS NULL
+      AND ca.platform IS NOT NULL AND ca.platform NOT IN ('unknown', 'unsupported', 'custom')
+      AND ca.slug IS NOT NULL
+), stored AS (
+    SELECT company, COUNT(*) AS n FROM job_postings WHERE status <> ALL(?) GROUP BY company
+), ranked AS (
+    SELECT m.*, COALESCE(s.n, 0) AS stored_open,
+           ROW_NUMBER() OVER (PARTITION BY m.ats_platform ORDER BY COALESCE(s.n, 0) DESC, m.company) AS rn,
+           COUNT(*)     OVER (PARTITION BY m.ats_platform) AS cnt
+    FROM m LEFT JOIN stored s ON s.company = m.display
+)
+SELECT company, display AS company_name, ats_platform, ats_slug, stored_open
+FROM ranked
+WHERE rn IN (1, (cnt + 1) / 2, cnt)
+ORDER BY ats_platform, rn
+"""
+
+
+def _pick_companies():
+    conn = get_conn()
+    try:
+        return [dict(r) for r in conn.execute(_PICK_SQL, (["filled", "expired"],)).fetchall()]
+    finally:
+        conn.close()
+
+
 def main(argv=None) -> int:
     init_logging("probe_feeder_totals")
     parser = argparse.ArgumentParser(description="Read-only probe of the total/paging fields each ATS exposes")
     parser.add_argument("--platform")
     parser.add_argument("--company", help="only companies whose key or display name contains this text")
-    parser.add_argument("--per-platform", type=int, default=PROBE_PER_PLATFORM)
     parser.add_argument("--out", default="data/probe_feeder_totals.json")
     args = parser.parse_args(argv)
 
-    rows = get_monitorable_companies()
-    rows.sort(key=lambda r: r.get("petition_count") or 0, reverse=True)
-    platforms = [args.platform] if args.platform else all_platforms()
+    rows = _pick_companies()
+    if args.platform:
+        rows = [r for r in rows if r["ats_platform"] == args.platform]
+    if args.company:
+        needle = args.company.lower()
+        rows = [r for r in rows if needle in (r["company"] or "").lower() or needle in (r["company_name"] or "").lower()]
     results = []
-    for platform in platforms:
-        picked = [r for r in rows if r.get("ats_platform") == platform]
-        if args.company:
-            needle = args.company.lower()
-            picked = [r for r in picked if needle in (r["company"] or "").lower() or needle in (r.get("company_name") or "").lower()]
-        for row in picked[: args.per_platform]:
-            print(f"probing {platform}: {row.get('company_name') or row['company']}")
-            results.append(_probe_one(row))
+    for row in rows:
+        print(f"probing {row['ats_platform']}: {row['company_name'] or row['company']} (stored open jobs: {row['stored_open']})")
+        res = _probe_one(row)
+        res["stored_open"] = row["stored_open"]
+        results.append(res)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(results, fh, indent=1, default=str)
     print(f"\n{len(results)} probes written to {args.out}")
     for res in results:
-        print(f"\n== {res['platform']} / {res['company']}: {res['outcome']}")
+        print(f"\n== {res['platform']} / {res['company']} (stored open: {res['stored_open']}): {res['outcome']}")
         for c in res["calls"]:
             print(f"  {c['method']} {c['url']}?{c['query'][:80]} -> {c['status']} {c['bytes']}B {c['elapsed_s']}s")
             for k, v in (c.get("json") or {}).items():
