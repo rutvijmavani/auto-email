@@ -4,7 +4,7 @@
 
 import logging
 from datetime import datetime
-from config import WORKDAY_FACET_SPLIT_AT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
+from config import FETCH_TOLERANCE_PCT, WORKDAY_FACET_SPLIT_AT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_ALL_PAGES, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
@@ -212,9 +212,26 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None):
     return postings, total or 0, facets
 
 
+def _flatten_facets(facets):
+    """
+    Expand grouped facets. Some tenants (Accenture's `locationMainGroup`) hold no values of their own: they
+    hold groups ("Country", "City"), each with its own facetParameter ("locationCountry", "locations") and
+    id/count values. The group's facetParameter is what appliedFacets takes, so each group is yielded as a
+    facet of its own; plain facets pass through unchanged.
+    """
+    out = []
+    for f in facets:
+        if not isinstance(f, dict):
+            continue
+        groups = [g for g in f.get("values") or []
+                  if isinstance(g, dict) and g.get("facetParameter") and isinstance(g.get("values"), list)]
+        out.extend(groups if groups else [f])
+    return out
+
+
 def _pick_split_facet(facets, used):
     """First configured split facet not yet applied that offers 2+ non-empty values; else (None, [])."""
-    by_name = {f.get("facetParameter"): f for f in facets if isinstance(f, dict)}
+    by_name = {f.get("facetParameter"): f for f in _flatten_facets(facets)}
     for name in WORKDAY_SPLIT_FACETS:
         if name in used or name not in by_name:
             continue
@@ -224,7 +241,7 @@ def _pick_split_facet(facets, used):
     return None, []
 
 
-def _collect(url, applied, used, first, company, rep=None):
+def _collect(url, applied, used, first, company, rep=None, slice_count=None):
     """
     Return every posting reachable for `applied`: the plain paged result when it is under the split
     threshold, otherwise the union (deduped by _job_key) of one query per facet value, recursing with
@@ -232,6 +249,10 @@ def _collect(url, applied, used, first, company, rep=None):
 
     rep (see _fetch_pages) also receives "capped" when a slice cannot be split below the result cap, and
     "expected" — the top-level facet-count sum — when the board was split.
+
+    slice_count: the parent facet's own count for this slice. A further split can lose jobs that carry no
+    value for the new facet (e.g. a city), so the merged result is checked against it and flagged capped
+    when it falls more than FETCH_TOLERANCE_PCT short.
     """
     postings, total, facets = first
     if total < WORKDAY_FACET_SPLIT_AT:
@@ -248,8 +269,13 @@ def _collect(url, applied, used, first, company, rep=None):
         slice_applied = {**applied, name: [value["id"]]}
         for p in _collect(url, slice_applied, used + (name,),
                           _fetch_pages(url, slice_applied, company, defer_large=True, rep=rep),
-                          company, rep):
+                          company, rep, value.get("count")):
             merged.setdefault(_job_key(p), p)
+    if slice_count and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
+        logger.warning("workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
+                       "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
+        if rep is not None:
+            rep["capped"] = True
     expected = sum(v.get("count", 0) for v in values)
     if rep is not None and not used:
         rep["expected"] = expected

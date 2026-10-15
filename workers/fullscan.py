@@ -1098,7 +1098,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             _report.complete    = False
             _report.stop_reason = STOP_REQUEST_FAILED
             _report.note        = _report.note or "avature partial fetch"
-        elif _report.complete is False:
+        elif _report.complete is False and _report.stop_reason == STOP_REQUEST_FAILED:
+            # Only a transient failure is worth the hourly retry; structural incompleteness (page cap,
+            # repeat page, shortfall) would loop forever, so it completes normally with its verdict recorded.
             _partial_fetch = True
         record_scan(
             company, platform, SOURCE_FULLSCAN, _report,

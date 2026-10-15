@@ -56,7 +56,8 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
         required = SLUG_REQUIRED_KEYS.get(platform, ())
         if not isinstance(obj, dict):
             return None, f"{platform} slug must be a JSON object."
-        missing = [k for k in required if not obj.get(k)]
+        missing = [k for k in required
+                   if not isinstance(obj.get(k), str) or not obj[k].strip()]
         if missing:
             # fetch_jobs silently returns [] (or raises) without these — a row saved like
             # that would look enabled but never scan.

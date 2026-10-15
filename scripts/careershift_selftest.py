@@ -219,7 +219,8 @@ def run(args):
                 print("[INFO] Old quota page is gone (the UI moved to app.careershift.com).")
                 print("[INFO] Switching to guided capture — no automated clicks, no quota risk.")
                 _guided_capture(page, args)
-                context.storage_state(path=session_file)
+                if _is_logged_in(page):
+                    context.storage_state(path=session_file)
                 return results
 
             # Search: first HR term that returns the target; stop at the first hit.

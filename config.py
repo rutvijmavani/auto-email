@@ -111,7 +111,7 @@ FETCH_SERVER_SHORT_MIN_PCT  = float(os.getenv("FETCH_SERVER_SHORT_MIN_PCT", "50"
 WORKDAY_PAGE_SIZE           = int(os.getenv("WORKDAY_PAGE_SIZE", "20"))          # Workday rejects larger limits
 WORKDAY_RESULT_CAP          = int(os.getenv("WORKDAY_RESULT_CAP", "2000"))       # observed hard ceiling of `total` (Nvidia, T-Mobile)
 WORKDAY_FACET_SPLIT_AT      = int(os.getenv("WORKDAY_FACET_SPLIT_AT", "1900"))   # total >= this → fetch one query per facet value
-WORKDAY_SPLIT_FACETS        = tuple(os.getenv("WORKDAY_SPLIT_FACETS", "jobFamilyGroup,timeType,workerSubType").split(","))  # tried in order
+WORKDAY_SPLIT_FACETS        = tuple(os.getenv("WORKDAY_SPLIT_FACETS", "jobFamilyGroup,timeType,workerSubType,locations").split(","))  # tried in order; `locations` = city, nested under locationMainGroup (Accenture)
 
 # jobs/ats/jibe.py — page-count safety cap (loop normally ends at totalCount; this only bounds a runaway feed)
 JIBE_MAX_PAGES              = int(os.getenv("JIBE_MAX_PAGES", "200"))            # x 100 per page = 20,000 jobs

@@ -360,7 +360,7 @@ def main(argv=None) -> int:
     print(f"  raw={tot['raw']}  location_pass={tot['n_location_pass']}  title_pass={tot['n_title_pass']}  "
           f"both={tot['n_both_pass']}  US-but-title-rejected={n_rejected} ({n_titles} distinct titles) -> {args.titles_out}")
 
-    print("\nVerdicts (open the careers page by hand for everything except OK):")
+    print("\nVerdicts (open the careers page by hand for everything except OK, and for OK rows that carry flags):")
     for verdict, n in sorted(Counter(r["verdict"] for r in results).items(), key=lambda kv: _VERDICT_ORDER.get(kv[0], 9)):
         print(f"  {verdict:12s} {n}")
     print("\nSHORT (the ATS itself says it has more jobs than we fetched):")

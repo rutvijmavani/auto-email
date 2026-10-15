@@ -76,6 +76,70 @@ def test_slice_still_over_threshold_is_split_again_or_warned():
     assert any("cannot be split" in c.args[0] for c in warn.call_args_list)
 
 
+def _nested_location_board(n_jobs, cities, no_city=()):
+    """One family over the cap; cities are nested under locationMainGroup like Accenture's tenant.
+    `no_city` = job indexes that carry no city (they vanish from every city slice)."""
+    city_of = {i: cities[i % len(cities)] for i in range(n_jobs) if i not in set(no_city)}
+
+    def facets_for():
+        city_vals = [{"descriptor": c, "id": c, "count": sum(1 for v in city_of.values() if v == c)} for c in cities]
+        return [
+            {"facetParameter": "jobFamilyGroup", "values": [{"descriptor": "eng", "id": "eng", "count": n_jobs},
+                                                              {"descriptor": "ops", "id": "ops", "count": 1}]},
+            {"facetParameter": "locationMainGroup", "values": [
+                {"facetParameter": "locationCountry", "descriptor": "Country",
+                 "values": [{"descriptor": "India", "id": "in", "count": n_jobs}]},
+                {"facetParameter": "locations", "descriptor": "City", "values": city_vals},
+            ]},
+        ]
+
+    def fake(url, body=None, headers=None, platform=None):
+        applied = (body or {}).get("appliedFacets") or {}
+        idx = list(range(n_jobs))
+        if "locations" in applied:
+            idx = [i for i in idx if city_of.get(i) in applied["locations"]]
+        if applied.get("jobFamilyGroup") == ["ops"]:
+            idx = [n_jobs]
+        total = min(len(idx), 2000)
+        off = body["offset"]
+        return {"total": total if off == 0 else 0,
+                "jobPostings": [_job(i) for i in idx[:total][off:off + body["limit"]]],
+                "facets": facets_for() if off == 0 else []}
+    return fake
+
+
+def test_flatten_facets_expands_nested_location_groups():
+    flat = workday._flatten_facets([
+        {"facetParameter": "timeType", "values": [{"id": "ft", "count": 1}]},
+        {"facetParameter": "locationMainGroup", "values": [
+            {"facetParameter": "locationCountry", "values": [{"id": "in", "count": 1}]},
+            {"facetParameter": "locations", "values": [{"id": "blr", "count": 1}]}]},
+    ])
+    assert [f["facetParameter"] for f in flat] == ["timeType", "locationCountry", "locations"]
+
+
+def test_pick_split_facet_uses_nested_city_when_earlier_facets_are_unavailable():
+    facets = _nested_location_board(10, ["A", "B"])(None, body={"offset": 0, "limit": 20})["facets"]
+    name, values = workday._pick_split_facet(facets, ("jobFamilyGroup",))
+    assert name == "locations" and {v["id"] for v in values} == {"A", "B"}
+
+
+def test_family_over_cap_is_split_by_nested_city():
+    jobs = _run(_nested_location_board(2600, ["Bengaluru", "Pune", "Mumbai"]))
+    assert len({j["job_id"] for j in jobs}) == 2601   # 2600 eng + 1 ops
+
+
+def test_jobs_without_a_city_flag_the_slice_incomplete():
+    # 300 of 2600 jobs have no city: the city split cannot see them → incomplete, not silently OK.
+    board = _nested_location_board(2600, ["Bengaluru", "Pune", "Mumbai"], no_city=range(300))
+    with patch.object(workday.logger, "warning") as warn:
+        with patch.object(workday, "fetch_json_post", side_effect=board):
+            jobs = workday.fetch_jobs(SLUG, "Acme")
+    assert len(jobs) < 2601
+    assert any("carry no" in c.args[0] for c in warn.call_args_list)
+    assert jobs.report.stop_reason == workday.STOP_PAGE_CAP and jobs.report.complete is False
+
+
 def test_failed_page_midway_warns_and_returns_partial():
     fake = _board({"eng": list(range(100))})
     def flaky(url, body=None, **kw):

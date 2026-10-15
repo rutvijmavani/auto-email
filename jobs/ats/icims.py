@@ -26,7 +26,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import alpha2_to_country_name
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
     attach, count_distinct, failed,
 )
 
@@ -128,6 +128,8 @@ def fetch_jobs(slug, company):
     note = ""
     if pages_total is not None and pages < pages_total:
         note = f"read {pages} of {pages_total} pages"
+    elif stop == STOP_PAGE_CAP and pages_total is not None:
+        stop = STOP_ALL_PAGES    # the board ends exactly at the cap: every reported page was read
     return attach(all_jobs, FetchReport(
         stop_reason      = stop,
         pages            = pages,
