@@ -41,7 +41,7 @@ from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_NO_CONFIG, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, TOTAL_FEED_COUNT,
-    attach, check_sitemap_body, failed, new_sitemap_stats,
+    attach, check_sitemap_body, count_distinct, failed, new_sitemap_stats,
 )
 from logger import get_logger
 
@@ -207,7 +207,7 @@ def fetch_jobs(slug_info, company):
             stop_reason      = STOP_SINGLE_RESPONSE if whole else STOP_REQUEST_FAILED,
             note             = "; ".join(file_stats.get("problems", [])[:3]),
             pages            = 1,
-            fetched_distinct = len(jobs),
+            fetched_distinct = count_distinct(out),
             unusable         = len(jobs) - len(out),
             reported_total   = counts["raw"],
             total_source     = TOTAL_FEED_COUNT,

@@ -30,6 +30,7 @@ from db.company_ats_admin import (
     update_company_ats_row,
 )
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
+from config import HEAD_CHECK_CACHE_TTL_S, HEAD_CHECK_ON_DEMAND
 from workers.redis_client import get_redis as _get_redis
 from jobs.http_safe import make_safe_session as _make_safe_session, is_private_host as _is_private_host
 
@@ -81,6 +82,24 @@ def _careers_head_ok(url: str) -> bool:
         return False
 
 
+def _queue_dead_careers_recheck(fein: str) -> None:
+    """A failed careers check was display-only; hand it to head_check_worker (on_demand) so a
+    dead URL is re-enriched/re-discovered like the extension's /verify-company does. Shares that
+    endpoint's cooldown key so repeated page views don't re-queue the same FEIN."""
+    try:
+        r = _get_redis()
+        if r.set(f"verify_company:cooldown:{fein}", 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S):
+            try:
+                r.lpush(HEAD_CHECK_ON_DEMAND,
+                        json.dumps({"fein": fein, "trigger": "on_demand", "source": None}))
+                log.info("discover: dead careers URL fein=%s → head_check:on_demand", fein)
+            except Exception:
+                r.delete(f"verify_company:cooldown:{fein}")
+                raise
+    except Exception as exc:
+        log.warning("discover: failed to queue head check fein=%s: %s", fein, exc)
+
+
 def _trigger_careers_check(url: str, fein: str) -> None:
     """Submit a background HEAD check if one isn't already running for this FEIN.
 
@@ -107,6 +126,8 @@ def _trigger_careers_check(url: str, fein: str) -> None:
                 )
             except Exception as _re:
                 log.debug("discover: Redis head_check write failed fein=%s: %s", fein, _re)
+            if not ok:
+                _queue_dead_careers_recheck(fein)
         finally:
             with _DISCOVER_LOCK:
                 _DISCOVER_INFLIGHT.discard((fein, url))

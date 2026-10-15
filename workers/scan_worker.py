@@ -120,7 +120,6 @@ from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.ats.fetch_report import STOP_REQUEST_FAILED, report_of
-from db.scan_health import SOURCE_SCAN, record_scan
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db
 from db.job_monitor import (
@@ -451,11 +450,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             _report.note = _report.note or "avature partial fetch"
         elif _report.complete is False:
             _fetch_complete = False
-        record_scan(
-            company, platform, SOURCE_SCAN, _report,
-            raw_count=len(raw_jobs), valid_count=len(valid_jobs),
-            duration_ms=int((time.monotonic() - start_mono) * 1000),
-        )
+        # Not recorded to scan_health: the completeness verdict comes from fullscan only, and adaptive
+        # scans run constantly — their rows would feed nothing.
 
         # ── 5. First-scan bootstrap ───────────────────────────────────────────
         is_first_scan = company_row.get("first_scanned_at") is None
