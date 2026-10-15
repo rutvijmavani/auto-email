@@ -792,6 +792,17 @@ def init_db():
         ON company_health(state)
     """)
 
+    # discover_priority: the user's personal High/Maybe/Skip flag per employer FEIN, set from the
+    # Discover page (frontend/pages/3_Discover.py). No row = unreviewed. Standalone table so it
+    # cannot affect monitoring or the pipeline.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS discover_priority (
+            employer_fein TEXT PRIMARY KEY,
+            level         TEXT NOT NULL,
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # pd_probe_observation: latest public-domain probe result per domain — the evidence
     # behind each parked/challenge/ok verdict (jobs/pd_classify.py) plus the content
     # fingerprint (body_hash/title/body_len/ext_refs) that lets Rule 2/3 candidate mining

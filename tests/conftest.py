@@ -44,6 +44,7 @@ _TRUNCATE_TABLES = [
     "api_health",
     "scan_health",
     "company_health",
+    "discover_priority",
     # Quota singletons (low risk of interference but clear them too)
     "serper_quota",
     "google_api_quota",

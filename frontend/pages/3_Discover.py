@@ -21,7 +21,7 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
 from db.prospective import add_prospective_company
-from db import company_health
+from db import company_health, discover_priority
 from db.company_ats_admin import (
     editable_platforms,
     insert_company_ats_row,
@@ -197,6 +197,25 @@ def _normalize_soc_prefix(raw: str) -> str:
     return v
 
 
+# Personal priority flag (db/discover_priority.py). "unreviewed" = no row.
+_PRIORITY_ICON  = {"high": "⭐", "maybe": "🤔", "skip": "🚫"}
+_PRIORITY_LABEL = {"high": "⭐ High", "maybe": "🤔 Maybe", "skip": "🚫 Skip", "unreviewed": "Unreviewed"}
+_PRIORITY_ALL   = ("unreviewed", "high", "maybe", "skip")
+
+
+@st.cache_data(ttl=300)
+def load_priority_counts() -> dict:
+    """Counts per flag over all employers; unreviewed = employers with no flag row."""
+    flagged = _query("SELECT level, COUNT(*) AS n FROM discover_priority GROUP BY level")
+    counts = {lvl: 0 for lvl in _PRIORITY_ALL}
+    for _, r in flagged.iterrows():
+        if r["level"] in counts:
+            counts[r["level"]] = int(r["n"])
+    total = _query("SELECT COUNT(*) AS n FROM dol_h1b_employers")
+    counts["unreviewed"] = max(0, int(total.iloc[0]["n"]) - counts["high"] - counts["maybe"] - counts["skip"])
+    return counts
+
+
 @st.cache_data(ttl=300)
 def load_employers(
     search: str,
@@ -212,9 +231,22 @@ def load_employers(
     careers_filter: str = FILTER_ANY,
     pd_filter: str = FILTER_ANY,
     health_filter: str = HEALTH_ANY,
+    priority_filter: tuple = _PRIORITY_ALL,
 ) -> pd.DataFrame:
     clauses: list[str] = []
     params: list = []
+
+    # Priority flag filter: all four selected = no restriction (also keeps rows whose level is unexpected).
+    _levels = [lv for lv in priority_filter if lv in _PRIORITY_ALL]
+    if _levels and len(_levels) < len(_PRIORITY_ALL):
+        _stored = [lv for lv in _levels if lv != "unreviewed"]
+        _parts = []
+        if _stored:
+            _parts.append("p.level = ANY(%s)")
+            params.append(_stored)
+        if "unreviewed" in _levels:
+            _parts.append("p.level IS NULL")
+        clauses.append("(" + " OR ".join(_parts) + ")")
 
     if health_filter in _HEALTH_CONDITION:
         clauses.append(
@@ -315,6 +347,7 @@ def load_employers(
               LIMIT 1) AS fetch_health,
             f.careers_url,
             f.public_domain,
+            p.level AS priority_level,
             e.employer_fein,
             e.employer_name,
             e.employer_city,
@@ -333,6 +366,7 @@ def load_employers(
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = e.employer_fein
         LEFT JOIN fein_domain_map f       ON f.employer_fein = e.employer_fein
         LEFT JOIN h1b_ats_discovery h     ON h.employer_fein = e.employer_fein
+        LEFT JOIN discover_priority p     ON p.employer_fein = e.employer_fein
         {soc_join}
         {where}
         ORDER BY {order}
@@ -724,6 +758,12 @@ with st.sidebar:
                                        "own normal range or did not finish; Failing = repeated bad scans or an empty "
                                        "board. Expected = you marked it as real.")
 
+    priority_sel = st.multiselect(
+        "My flags", list(_PRIORITY_ALL), default=list(_PRIORITY_ALL),
+        format_func=lambda x: _PRIORITY_LABEL[x],
+        help="Your own High / Maybe / Skip marks. Pick Unreviewed to see only companies you have not looked at yet.",
+    )
+
     st.divider()
 
     h1b_dependent = st.checkbox("H1B dependent only")
@@ -764,6 +804,7 @@ df = load_employers(
     careers_filter=careers_filter,
     pd_filter=pd_filter,
     health_filter=health_filter,
+    priority_filter=tuple(priority_sel),
 )
 
 
@@ -771,6 +812,10 @@ df = load_employers(
 # Metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
+_pc = load_priority_counts()
+st.caption(
+    f"My flags — ⭐ {_pc['high']:,} · 🤔 {_pc['maybe']:,} · 🚫 {_pc['skip']:,} · Unreviewed {_pc['unreviewed']:,}"
+)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Employers shown", f"{len(df):,}")
 m2.metric("States", df["employer_state"].nunique() if not df.empty else 0)
@@ -807,7 +852,7 @@ if _soc_mode:
     )
 display = df[
     (["soc_filed", "soc_certified"] if _soc_mode else []) + [
-        "employer_name", "petition_count", "ats_platform", "fetch_health", "careers_url", "public_domain",
+        "priority_level", "employer_name", "petition_count", "ats_platform", "fetch_health", "careers_url", "public_domain",
         "employer_city", "employer_state", "naics_code",
         "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
     ]
@@ -816,6 +861,7 @@ display = df[
 # Rank 1..N in the table's current sort order (petition count by default), so you can see how far down the list you are.
 display.insert(0, "#", range(1, len(display) + 1))
 
+display["priority_level"] = display["priority_level"].map(_PRIORITY_ICON).fillna("")
 display["fetch_health"] = display["fetch_health"].map(
     lambda s: f"{_HEALTH_ICON[s]} {s}" if s in _HEALTH_ICON else "")
 
@@ -825,6 +871,7 @@ display["h1b_dependent"] = display["h1b_dependent"].map({True: "✓", False: "",
 display.rename(columns={
     "soc_filed":       "SOC Filed",
     "soc_certified":   "SOC Certified",
+    "priority_level":  "Flag",
     "employer_name":   "Employer",
     "petition_count":  "Petitions",
     "ats_platform":    "ATS",
@@ -849,6 +896,7 @@ selected = st.dataframe(
     selection_mode="single-row",
     column_config={
         "#":          st.column_config.NumberColumn("#", format="%d", width="small"),
+        "Flag":       st.column_config.TextColumn("Flag", width="small"),
         "Approval %": st.column_config.NumberColumn("Approval %", format="%.1f%%"),
         "SOC Filed":    st.column_config.NumberColumn("SOC Filed",     format="%d"),
         "SOC Certified": st.column_config.NumberColumn("SOC Certified", format="%d"),
@@ -891,8 +939,26 @@ st.caption(
     f"  ·  NAICS: `{emp['naics_code'] or '—'}`"
 )
 
+_cur_level = emp["priority_level"] if emp["priority_level"] in _PRIORITY_ICON else None
+_flag_opts = ["high", "maybe", "skip", "clear"]
+_flag_label = {**_PRIORITY_LABEL, "clear": "Clear"}
+_new_level = st.radio(
+    "My flag", _flag_opts, index=_flag_opts.index(_cur_level) if _cur_level else None,
+    format_func=lambda x: _flag_label[x], horizontal=True, key=f"priority_{fein}",
+)
+# "clear" means no flag, so compare against None — otherwise the radio's stored "clear" would re-trigger forever.
+if _new_level is not None and (None if _new_level == "clear" else _new_level) != _cur_level:
+    _ok = (discover_priority.clear_level(fein) if _new_level == "clear"
+           else discover_priority.set_level(fein, _new_level))
+    if _ok:
+        load_employers.clear()
+        load_priority_counts.clear()
+        st.rerun()
+    else:
+        st.error("Could not save the flag.")
+
 disc = load_ats_discovery(fein)
-_canonical = (disc or {}).get("canonical_name") or None
+_canonical =(disc or {}).get("canonical_name") or None
 
 col_chart, col_meta = st.columns([3, 1])
 
