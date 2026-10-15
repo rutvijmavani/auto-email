@@ -5,6 +5,7 @@
 # (same pattern as db/external_api_health.py::record_external_request).
 
 from logger import get_logger
+from db import company_health
 from db.connection import get_conn
 
 logger = get_logger(__name__)
@@ -53,6 +54,8 @@ def record_scan(company_key, platform, source, report, raw_count=0, valid_count=
     for attempt in range(2):
         try:
             _do_write()
+            if source == SOURCE_FULLSCAN:
+                company_health.refresh(company_key)   # only fullscan rows feed the health verdict; never raises
             return True
         except Exception as exc:
             if attempt == 0:

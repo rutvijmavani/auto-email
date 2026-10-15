@@ -418,6 +418,64 @@ def _build_job_listings(jobs_by_company, styles):
     return elements
 
 
+def _health_snapshot():
+    """Fetch-health findings for this digest (db/company_health.py); empty snapshot on any failure."""
+    try:
+        from db.company_health import digest_snapshot
+        return digest_snapshot()
+    except Exception as exc:
+        print(f"[WARNING] fetch-health snapshot failed: {exc}")
+        return {"new": [], "still": [], "recovered": []}
+
+
+def _health_line(row):
+    """One company's finding as plain text: name, platform, state, how long, why."""
+    since = row.get("since")
+    days = f"{max((datetime.now() - since).days, 0)}d" if isinstance(since, datetime) else "?"
+    return (f"{row['company_key']} [{row.get('platform') or '?'}] "
+            f"{row['state']} for {days} — {row.get('reason') or ''}")
+
+
+def _build_fetch_health_pdf(snap, styles):
+    """PDF page 'Fetch Health': every new / still-bad / recovered company with the numbers behind it."""
+    elements = [Paragraph("Fetch Health", styles["section"]),
+                HRFlowable(width="100%", thickness=1, color=colors.HexColor("#e2e8f0"), spaceAfter=8)]
+    if not any(snap.values()):
+        elements.append(Paragraph("All monitored companies fetched as expected.", styles["normal"]))
+        return elements
+    for title, key in (("New since last digest", "new"), ("Still not healthy", "still"),
+                       ("Recovered", "recovered")):
+        rows = snap[key]
+        if not rows:
+            continue
+        elements.append(Paragraph(f"{title} ({len(rows)})", styles["normal"]))
+        for row in rows:
+            elements.append(Paragraph("• " + _safe_text(_health_line(row)), styles["normal"]))
+        elements.append(Spacer(1, 8))
+    return elements
+
+
+def _build_fetch_health_email(snap):
+    """Email-body block: counts plus the first HEALTH_DIGEST_MAX_LISTED problem companies."""
+    from config import HEALTH_DIGEST_MAX_LISTED
+    problems = snap["new"] + snap["still"]
+    if not problems and not snap["recovered"]:
+        return ""
+    failing = sum(1 for r in problems if r["state"] == "failing")
+    head = (f"{len(snap['new'])} new, {len(snap['still'])} still unhealthy "
+            f"({failing} failing), {len(snap['recovered'])} recovered")
+    items = "".join(
+        f'<p style="color:#92400e;background:#fffbeb;padding:8px;border-radius:4px;'
+        f'font-size:12px;margin:4px 0;">{html_lib.escape(_health_line(r))}</p>'
+        for r in problems[:HEALTH_DIGEST_MAX_LISTED]
+    )
+    more = (f'<p style="font-size:12px;color:#64748b;">… and {len(problems) - HEALTH_DIGEST_MAX_LISTED} '
+            f'more in the attached PDF.</p>' if len(problems) > HEALTH_DIGEST_MAX_LISTED else "")
+    return (f'<hr style="border:none;border-top:1px solid #e2e8f0;margin:16px 0;">'
+            f'<p style="font-weight:600;color:#374151;font-size:13px;margin-bottom:8px;">'
+            f'Fetch Health — {html_lib.escape(head)}</p>{items}{more}')
+
+
 def _build_api_warning_section():
     """
     Build warning section for daily digest email.
@@ -1262,6 +1320,13 @@ def build_monitor_report(new_postings, stats, alerts):
 
     story.append(Spacer(1, 16))
 
+    # Fetch health (company_health verdicts; the same snapshot feeds the email body)
+    health_snap = _health_snapshot()
+    for el in _build_fetch_health_pdf(health_snap, styles):
+        story.append(el)
+
+    story.append(Spacer(1, 16))
+
     # Top matches
     for el in _build_top_matches(new_postings, styles):
         story.append(el)
@@ -1299,13 +1364,20 @@ def build_monitor_report(new_postings, stats, alerts):
 
     # ── Send email with PDF attachment ──
     email_sent = _send_digest_email(
-        pdf_path, date_str, len(new_postings), alerts, stats
+        pdf_path, date_str, len(new_postings), alerts, stats,
+        health_snapshot=health_snap,
     )
+    if email_sent:
+        try:
+            from db.company_health import mark_reported
+            mark_reported()
+        except Exception as exc:
+            print(f"[WARNING] fetch-health mark_reported failed: {exc}")
 
     return {"pdf_generated": pdf_generated, "email_sent": email_sent}
 
 
-def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
+def _send_digest_email(pdf_path, date_str, job_count, alerts, stats, health_snapshot=None):
     """Send PDF digest as email attachment."""
     import smtplib
     from email.mime.multipart import MIMEMultipart
@@ -1344,6 +1416,7 @@ def _send_digest_email(pdf_path, date_str, job_count, alerts, stats):
         f'⚠ {html_lib.escape(str(a["message"]))}</p>'
         for a in alerts if a["level"] in ("warning","error")
       )}
+      {_build_fetch_health_email(health_snapshot) if health_snapshot else ""}
       {_build_queue_health_section()}
       {_build_api_warning_section()}
       {_build_adaptive_health_section() if datetime.now().weekday() == 0 else ""}

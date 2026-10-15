@@ -84,6 +84,15 @@ AUDIT_NO_NEW_MIN_RAW        = int(os.getenv("AUDIT_NO_NEW_MIN_RAW", "100"))     
 AUDIT_CEILING_RETRIES       = int(os.getenv("AUDIT_CEILING_RETRIES", "5"))       # retries when the platform concurrency ceiling is hit
 AUDIT_CEILING_WAIT_S        = float(os.getenv("AUDIT_CEILING_WAIT_S", "5"))      # wait between ceiling retries
 
+# Company health verdict (jobs/health_verdict.py, db/company_health.py) — fullscan rows of scan_health only
+HEALTH_Z                    = float(os.getenv("HEALTH_Z", "3"))                  # a count is suspect when it is this many spreads below the company's median
+HEALTH_MIN_HISTORY          = int(os.getenv("HEALTH_MIN_HISTORY", "4"))          # good fullscans a company needs before its own band is trusted
+HEALTH_BASELINE_SCANS       = int(os.getenv("HEALTH_BASELINE_SCANS", "8"))       # good fullscans (before the latest) that form the baseline
+HEALTH_FAILING_CONSECUTIVE  = int(os.getenv("HEALTH_FAILING_CONSECUTIVE", "2"))  # consecutive bad fullscans that turn suspect into failing
+HEALTH_PEER_PERCENTILE      = float(os.getenv("HEALTH_PEER_PERCENTILE", "90"))   # cold start: percentile of same-platform relative spreads used as the band
+HEALTH_MIN_PEERS            = int(os.getenv("HEALTH_MIN_PEERS", "5"))            # companies with their own band a platform needs before peers are trusted
+HEALTH_DIGEST_MAX_LISTED    = int(os.getenv("HEALTH_DIGEST_MAX_LISTED", "10"))   # problem companies listed in the digest email body (the PDF lists all)
+
 # scripts/probe_feeder_totals.py — read-only probe of the total/paging fields each ATS exposes
 PROBE_MAX_CALLS             = int(os.getenv("PROBE_MAX_CALLS", "4"))             # responses recorded per company before the fetch is aborted
 PROBE_MAX_SCALARS           = int(os.getenv("PROBE_MAX_SCALARS", "60"))          # scalar fields kept per recorded JSON response

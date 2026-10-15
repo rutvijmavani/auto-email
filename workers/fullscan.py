@@ -142,7 +142,7 @@ from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
-from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, report_of
+from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
 from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
@@ -771,6 +771,19 @@ def _build_detail_payload(
 # JOBVITE COMPLETENESS (feed cross-check)
 # ─────────────────────────────────────────
 
+def _record_fetch_failure(platform: str, company: str, exc: Exception, start_mono: float) -> None:
+    """
+    A fullscan whose fetch raised produces no jobs and so no completeness report; record it as a
+    failed scan so the health verdict sees the company failing instead of silently skipping it.
+    """
+    record_scan(
+        company, platform, SOURCE_FULLSCAN,
+        FetchReport(stop_reason=STOP_REQUEST_FAILED).finalize(),
+        duration_ms=int((time.monotonic() - start_mono) * 1000),
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
 def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
                          stop_reason: str = STOP_EMPTY_PAGE) -> None:
     """
@@ -1010,6 +1023,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             return result
         except IncompleteSearchError as exc:
             if not exc.stubs:
+                _record_fetch_failure(platform, company, exc, start_mono)
                 raise
             logger.warning(
                 "fullscan [%s]: avature partial fetch for %r — %d stubs "
@@ -1018,6 +1032,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             )
             raw_jobs = exc.stubs
             _partial_fetch = True
+        except Exception as exc:
+            _record_fetch_failure(platform, company, exc, start_mono)
+            raise
         set_progress(company, "fullscan_processing")
 
         # ── Persist slug_info mutations made in-place by ATS modules ──────────

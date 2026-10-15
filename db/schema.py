@@ -763,6 +763,31 @@ def init_db():
         ON scan_health(scanned_at)
     """)
 
+    # company_health: one row per company — the verdict of jobs/health_verdict.py over its fullscan
+    # scan_health rows (written by db/company_health.py::refresh after each fullscan). The daily digest
+    # reads it; reported_state/reported_at record what the last digest already told the user.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS company_health (
+            company_key    TEXT PRIMARY KEY,
+            platform       TEXT,
+            state          TEXT NOT NULL,       -- 'ok' | 'suspect' | 'failing'
+            reason         TEXT,
+            since          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,   -- when `state` last changed
+            last_scan_at   TIMESTAMP,
+            count          INTEGER,
+            baseline       DOUBLE PRECISION,    -- median of the good fullscans used
+            spread         DOUBLE PRECISION,
+            flag_line      DOUBLE PRECISION,
+            band_from      TEXT,                -- 'own' | 'peers'
+            reported_state TEXT,
+            reported_at    TIMESTAMP
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_health_state
+        ON company_health(state)
+    """)
+
     # pd_probe_observation: latest public-domain probe result per domain — the evidence
     # behind each parked/challenge/ok verdict (jobs/pd_classify.py) plus the content
     # fingerprint (body_hash/title/body_len/ext_refs) that lets Rule 2/3 candidate mining
