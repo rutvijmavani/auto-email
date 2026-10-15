@@ -234,7 +234,7 @@ def _result(status, reason, **extra):
     return out
 
 
-def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE):
+def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE, on_progress=None):
     """
     Cross-check a finished board fetch against the account XML feed.
 
@@ -250,16 +250,23 @@ def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE):
     feed-only jobs are resolved through app.jobvite.com/CompanyJobs/Job.aspx,
     whose redirect names the careersite they belong to. Jobs on another
     careersite are not ours and are ignored.
+
+    on_progress: optional no-arg callable run before each network step of the trace, so a caller that
+    keeps a liveness key (fullscan's progress key) can refresh it for as long as the check runs.
     """
     if stop_reason != STOP_EMPTY_PAGE:
         return _result("incomplete", f"paging ended by {stop_reason}")
 
+    if on_progress:
+        on_progress()
     landing = fetch_html(BASE_URL.format(slug=slug), platform="jobvite", track=False)
     m = COMPANY_EID_RE.search(landing.text) if landing is not None else None
     if not m:
         return _result("unverified", "no companyEId on landing page")
     eid = m.group(1)
 
+    if on_progress:
+        on_progress()
     feed = _get_with_retry(FEED_URL, params={"c": eid})
     if feed is None or feed.status_code != 200:
         return _result("unverified", "feed unavailable")
@@ -277,6 +284,8 @@ def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE):
         if n >= JOBVITE_FEED_TRACE_MAX or time.monotonic() >= deadline:
             unresolved += len(feed_only) - n
             break
+        if on_progress:
+            on_progress()
         resp = _get_with_retry(JOB_REDIRECT_URL, params={"c": eid, "j": jid})
         nm = SITE_NAME_RE.search(resp.url) if resp is not None else None
         if not nm:

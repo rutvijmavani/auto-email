@@ -797,7 +797,11 @@ def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
         if not r.set(gate, "1", nx=True, ex=JOBVITE_FEED_VERIFY_INTERVAL_H * 3600):
             return
         from jobs.ats import jobvite
-        verdict = jobvite.verify_fetch(slug_info, valid_jobs, stop_reason)
+        # progress:<company> has a short TTL and the trace can run for JOBVITE_FEED_TRACE_BUDGET_S, so refresh it
+        verdict = jobvite.verify_fetch(
+            slug_info, valid_jobs, stop_reason,
+            on_progress=lambda: set_progress(company, "fullscan_jobvite_verify"),
+        )
         annotate_latest(company, SOURCE_FULLSCAN, verdict["status"])
         log = logger.info if verdict["status"] == "verified" else logger.warning
         log("fullscan [%s]: jobvite feed check %s — %s %s", company,

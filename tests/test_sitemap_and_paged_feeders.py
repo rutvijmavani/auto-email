@@ -477,6 +477,33 @@ class TestCustomCareerPaginate(unittest.TestCase):
         self.assertEqual(extra, [])
         self.assertEqual(outcome["stop"], fr.STOP_ALL_PAGES)
 
+    def test_cursor_board_requests_page_two_with_first_cursor(self):
+        from jobs.ats import custom_career as cc
+        calls = []
+        slug_info = {"pagination": {"type": "cursor", "cursor_field": "next", "page_size": 2}}
+
+        def fake_fetch(session, si, page=1, offset=0, cursor=None):
+            calls.append(cursor)
+            return [{"id": 3}, {"id": 4}]
+        outcome = {}
+        with patch.object(cc, "_fetch_page", side_effect=fake_fetch), \
+             patch.object(cc, "_extract_jobs_array", side_effect=lambda raw, si: raw), \
+             patch.object(cc, "_detect_format", return_value=("json", {})), \
+             patch.object(cc.time, "sleep"):
+            extra = cc._paginate(None, slug_info, [{"id": 1}, {"id": 2}], None, "Co",
+                                 outcome=outcome, first_cursor="C1")
+        self.assertEqual(calls[0], "C1")
+        self.assertEqual(len(extra), 2)
+
+    def test_cursor_board_without_first_cursor_is_one_page(self):
+        from jobs.ats import custom_career as cc
+        outcome = {}
+        slug_info = {"pagination": {"type": "cursor", "cursor_field": "next", "page_size": 2}}
+        with patch.object(cc, "_fetch_page", side_effect=AssertionError("must not fetch")):
+            extra = cc._paginate(None, slug_info, [{"id": 1}, {"id": 2}], None, "Co", outcome=outcome)
+        self.assertEqual(extra, [])
+        self.assertEqual(outcome["stop"], fr.STOP_ALL_PAGES)
+
     def test_fetch_jobs_no_config(self):
         from jobs.ats import custom_career as cc
         self.assertEqual(fr.report_of(cc.fetch_jobs(None, "Co")).stop_reason, fr.STOP_NO_CONFIG)

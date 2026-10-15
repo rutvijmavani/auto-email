@@ -88,8 +88,11 @@ def _verdict(out: dict, rep) -> str:
     UNVERIFIED (clean read but the platform exposes no total — check by hand) / OK (complete=True)."""
     if "FETCH_ERROR" in out["flags"]:
         return "ERROR"
-    if rep.server_short or (rep.complete is False and rep.stop_reason in CLEAN_STOPS):
-        return "SHORT"      # server_short: complete=True only because the advisory total is unreliable — still inspect
+    if rep.server_short or (rep.complete is False and rep.stop_reason in CLEAN_STOPS
+                            and rep.reported_total is not None):
+        # server_short: complete=True only because the advisory total is unreliable — still inspect.
+        # A page-count shortfall with no reported job total is not "the ATS says it has more": FAILED_STOP.
+        return "SHORT"
     if rep.complete is False or "PARTIAL_FETCH" in out["flags"]:
         return "FAILED_STOP"
     if rep.complete is None:

@@ -19,8 +19,9 @@ def set_level(fein, level):
     """Save (or change) the flag for a FEIN. Returns True when saved."""
     if level not in LEVELS or not fein:
         return False
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         conn.execute("""
             INSERT INTO discover_priority (employer_fein, level, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
@@ -30,28 +31,33 @@ def set_level(fein, level):
         conn.commit()
         return True
     except Exception as e:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         logger.warning("discover_priority.set_level(%s, %s) failed: %s", fein, level, e)
         return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def clear_level(fein):
     """Remove the flag (back to unreviewed). Returns True when the statement ran."""
     if not fein:
         return False
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         conn.execute("DELETE FROM discover_priority WHERE employer_fein = ?", (str(fein),))
         conn.commit()
         return True
     except Exception as e:
-        conn.rollback()
+        if conn is not None:
+            conn.rollback()
         logger.warning("discover_priority.clear_level(%s) failed: %s", fein, e)
         return False
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 def get_level(fein):

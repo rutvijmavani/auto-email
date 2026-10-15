@@ -192,6 +192,23 @@ def process_sheet(dry_run=False, apply_db=False):
 
             print(f"  [MATCH] {company:<35} {p:<15} {slug[:40]}")
 
+            # A pattern can match a platform but yield a slug the monitor cannot use (a bare SuccessFactors
+            # slug lacks dc/region). Retrying that every run never helps — send it to manual completion.
+            from db.company_ats_admin import validate_platform_slug
+            _, slug_err = validate_platform_slug(p, slug)
+            if slug_err:
+                matched -= 1
+                print(f"    [MANUAL] {company}: {slug_err}")
+                if not dry_run:
+                    updates.append({
+                        "row":      i,
+                        "platform": "",
+                        "slug":     "",
+                        "status":   "manual",
+                        "notes":    f"Matched {p} but slug is incomplete — {slug_err}",
+                    })
+                continue
+
             if not dry_run:
                 # A failed DB write leaves the sheet row pending so the next run retries it.
                 if apply_db and not _apply_to_db(company, p, slug):

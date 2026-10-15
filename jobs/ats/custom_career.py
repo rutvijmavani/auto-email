@@ -767,8 +767,13 @@ def fetch_jobs(slug_info, company):
         outcome["stop"] = STOP_ALL_PAGES
     elif pag_type != "none":
         # total unknown → exhaustion mode (page until empty/repeat) rather than silently stopping at page 1
+        first_cursor = None
+        if pag_type == "cursor":
+            _, cursor_data = _detect_format(page1_response)
+            first_cursor = (cursor_data or {}).get(pagination.get("cursor_field", "nextCursor")) \
+                if isinstance(cursor_data, dict) else None
         extra = _paginate(session, slug_info, jobs_arr, total or None, company,
-                          initial_page = initial_page, outcome = outcome)
+                          initial_page = initial_page, outcome = outcome, first_cursor = first_cursor)
         all_raw.extend(extra)
 
     logger.info("custom_career: %d raw jobs for %r", len(all_raw), company)
@@ -2483,8 +2488,12 @@ def _resolve_protobuf_long(v):
 # PAGINATION
 # ─────────────────────────────────────────
 
-def _paginate(session, slug_info, first_page_jobs, total, company, initial_page = 0, outcome=None):
+def _paginate(session, slug_info, first_page_jobs, total, company, initial_page = 0, outcome=None,
+              first_cursor=None):
     """
+    `first_cursor` is the cursor page 1's response carried (cursor pagination only): page 2 is requested
+    with it instead of re-requesting page 1. A cursor board whose page 1 carries none is a one-page chain.
+
     `outcome` (optional dict) receives {"stop": <fetch_report STOP_*>, "pages": <extra pages fetched>}
     so fetch_jobs can report why paging ended; the return value is unchanged.
 
@@ -2523,8 +2532,12 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
     seen_ids        = _job_fingerprints(first_page_jobs)
     offset          = page_size
     page_num        = initial_page + 1
-    cursor          = None
+    cursor          = first_cursor if pag_type == "cursor" else None
     exhaustion_mode = (total is None)
+
+    if pag_type == "cursor" and not cursor:
+        outcome["stop"] = STOP_ALL_PAGES   # no cursor after page 1: the chain ended there
+        return []
 
     if exhaustion_mode:
         logger.info(

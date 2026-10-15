@@ -762,6 +762,16 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_scan_health_time
         ON scan_health(scanned_at)
     """)
+    # source-filtered reads of db/company_health.py: _own_rows (one company's recent rows of one source)
+    # and _peer_spread (same-platform peers' recent rows)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_company_source_time
+        ON scan_health(company_key, source, scanned_at DESC, id DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_source_platform
+        ON scan_health(source, platform, company_key, scanned_at DESC)
+    """)
 
     # company_health: one row per company — the verdict of jobs/health_verdict.py over its fullscan
     # scan_health rows (written by db/company_health.py::refresh after each fullscan). The daily digest

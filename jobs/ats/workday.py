@@ -126,7 +126,7 @@ def fetch_jobs(slug_info, company):
     # still too large) and the slices are merged by job path.
     rep      = {"pages": 0, "failed": False, "capped": False, "expected": None}
     first    = _fetch_pages(url, {}, company, defer_large=True, rep=rep)
-    all_jobs = _collect(url, {}, (), first, company, rep)
+    all_jobs = _collect(url, {}, (), first, company, rep, first[1] or None)
 
     results = []
     for j in all_jobs:
