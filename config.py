@@ -130,6 +130,7 @@ JOBVITE_FEED_DEFAULT_WAIT_S   = int(os.getenv("JOBVITE_FEED_DEFAULT_WAIT_S", "30
 JOBVITE_FEED_MAX_WAIT_S       = int(os.getenv("JOBVITE_FEED_MAX_WAIT_S", "120"))      # ceiling on a server-supplied Retry-After so one request cannot stall a worker
 JOBVITE_FEED_TIMEOUT_S        = int(os.getenv("JOBVITE_FEED_TIMEOUT_S", "120"))       # read timeout; feeds run 25 KB – 6.6 MB
 JOBVITE_FEED_TRACE_MAX        = int(os.getenv("JOBVITE_FEED_TRACE_MAX", "300"))       # max feed-only jobs traced (redirect lookup) per check; the rest = unresolved
+JOBVITE_FEED_TRACE_BUDGET_S   = int(os.getenv("JOBVITE_FEED_TRACE_BUDGET_S", "600"))  # wall-clock ceiling on the feed-only trace loop; remaining ids = unresolved
 
 # ─────────────────────────────────────────
 # Companies known to use fully custom ATS — skip Serper entirely

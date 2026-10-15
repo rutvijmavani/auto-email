@@ -26,8 +26,10 @@ import requests
 from config import (MCLOUD_API_BASE, MCLOUD_MAX_PAGES, MCLOUD_PAGE_SIZE, MCLOUD_PROBE_MAX_LINKS,
                     MCLOUD_PROBE_TIMEOUT, MCLOUD_PROBE_WORKERS)
 from db.connection import get_conn
+from jobs.ats.fetch_report import CLEAN_STOPS, report_of
 from jobs.ats.registry import get_config, parse_slug
 from jobs.ats import taleo
+from jobs.http_safe import is_private_host
 from logger import get_logger, init_logging
 
 log = get_logger(__name__)
@@ -54,10 +56,30 @@ WHERE ca.is_monitored = TRUE AND ca.stale_since IS NULL
 """
 
 
+_MAX_REDIRECTS = 5
+
+
+def _safe_url(url):
+    """http(s) only, and the host must not resolve to a private/loopback address."""
+    parts = urlparse(url)
+    return parts.scheme in ("http", "https") and bool(parts.hostname) and not is_private_host(parts.hostname)
+
+
 def _get(url):
+    """GET with redirects followed by hand so the initial URL and every hop pass the private-host check."""
     try:
-        resp = requests.get(url, headers=_HEADERS, timeout=MCLOUD_PROBE_TIMEOUT, allow_redirects=True)
-        return resp.text if resp.status_code == 200 else ""
+        for _ in range(_MAX_REDIRECTS + 1):
+            if not _safe_url(url):
+                return ""
+            resp = requests.get(url, headers=_HEADERS, timeout=MCLOUD_PROBE_TIMEOUT, allow_redirects=False)
+            if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location")
+                if not location:
+                    return ""
+                url = urljoin(url, location)
+                continue
+            return resp.text if resp.status_code == 200 else ""
+        return ""   # redirect chain too long
     except requests.RequestException:
         return ""
 
@@ -87,9 +109,13 @@ def _scan_company(row):
             continue
         found["pages_scanned"] += 1
         if _MARKER in html:
-            found["matched_url"] = url
-            found["uuids"] = sorted(set(m.lower() for m in _UUID_RE.findall(html)))
-            return found
+            if not found["matched_url"]:
+                found["matched_url"] = url      # keep the first marker-only hit if no page yields an id
+            uuids = sorted(set(m.lower() for m in _UUID_RE.findall(html)))
+            if uuids:
+                found["matched_url"] = url
+                found["uuids"] = uuids
+                return found
         host = urlparse(url).netloc
         for href in _LINK_RE.findall(html):
             if followed >= MCLOUD_PROBE_MAX_LINKS:
@@ -102,58 +128,64 @@ def _scan_company(row):
 
 
 def _mcloud_jobs(uuid):
-    """All m-cloud jobs for one employer id -> (jobs, totalHits)."""
+    """All m-cloud jobs for one employer id -> (jobs, totalHits, complete). complete is False when any page
+    failed (non-200, not JSON) or MCLOUD_MAX_PAGES ran out before the end, so counts must not be compared."""
     jobs, offset, total = [], 0, None
     for _ in range(MCLOUD_MAX_PAGES):
         try:
             resp = requests.get(MCLOUD_API_BASE, headers=_HEADERS, timeout=MCLOUD_PROBE_TIMEOUT,
                                 params={"pageSize": MCLOUD_PAGE_SIZE, "offset": offset, "companyName": f"companies/{uuid}"})
+            if resp.status_code != 200:
+                log.warning("m-cloud %s: HTTP %s at offset %d", uuid, resp.status_code, offset)
+                return jobs, total, False
             data = resp.json()
-        except (requests.RequestException, ValueError):
-            break
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("m-cloud %s: page at offset %d failed: %s", uuid, offset, exc)
+            return jobs, total, False
+        if not isinstance(data, dict):
+            return jobs, total, False
         total = data.get("totalHits", total)
         rows = data.get("searchResults") or []
         if not rows:
-            break
+            return jobs, total, total is None or offset >= total
         jobs += [r.get("job", {}) for r in rows]
         offset += len(rows)
         if total is not None and offset >= total:
-            break
-    return jobs, total
+            return jobs, total, True
+    return jobs, total, False   # page cap hit
 
 
 def _audit_taleo(row, uuids):
-    """Real fetch_jobs + the portal's own totalCount (read from the first search response)."""
-    reported, original = {}, requests.sessions.Session.request
-
-    def hooked(self, method, url, *args, **kwargs):
-        resp = original(self, method, url, *args, **kwargs)
-        if "searchjobs" in url and "reported" not in reported:
-            try:
-                reported["reported"] = resp.json().get("pagingData", {}).get("totalCount")
-            except ValueError:
-                pass
-        return resp
-
+    """Real fetch_jobs + the portal's own totalCount, read from the fetch's own FetchReport (per call, so
+    concurrent audits cannot cross-contaminate)."""
     rec = {"company": row["name"], "key": row["key"], "slug": str(row["slug"])[:120]}
-    requests.sessions.Session.request = hooked
     try:
         slug_info = parse_slug("taleo", row["slug"], get_config("taleo"))
         jobs = taleo.fetch_jobs(slug_info, row["name"])
     except Exception as exc:  # noqa: BLE001 — a probe reports every failure
         rec["error"] = f"{type(exc).__name__}: {exc}"[:300]
         return rec
-    finally:
-        requests.sessions.Session.request = original
+    report = report_of(jobs)
+    clean = report.stop_reason in CLEAN_STOPS
     contest = {j["contest_no"] for j in jobs}
-    rec.update(reported=reported.get("reported"), fetched_distinct=len(contest))
-    if rec["reported"] is not None:
-        rec["gap"] = rec["reported"] - len(contest)
+    rec.update(reported=report.reported_total, fetched_distinct=len(contest), stop_reason=report.stop_reason)
+    if clean:
+        if rec["reported"] is not None:
+            rec["gap"] = rec["reported"] - len(contest)
+    else:
+        rec["fetch_failed"] = True      # a short read is not a real gap — no definitive gap recorded
     for uuid in uuids:
-        m_jobs, m_total = _mcloud_jobs(uuid)
+        m_jobs, m_total, m_complete = _mcloud_jobs(uuid)
+        entry = {"uuid": uuid, "total_hits": m_total, "complete": m_complete}
+        rec.setdefault("mcloud", []).append(entry)
+        if not m_complete:
+            continue                    # a partial m-cloud list cannot be compared
         refs = {j.get("ref") for j in m_jobs if j.get("ref")}
-        rec.setdefault("mcloud", []).append({
-            "uuid": uuid, "total_hits": m_total, "distinct_refs": len(refs),
+        if not clean:
+            entry["distinct_refs"] = len(refs)
+            continue                    # nor can a failed Taleo fetch
+        entry.update({
+            "distinct_refs": len(refs),
             "in_taleo": len(refs & contest), "mcloud_only": len(refs - contest), "taleo_only": len(contest - refs),
             "by_portal": {p: sum(1 for j in m_jobs if j.get("ats_portalid") == p)
                           for p in sorted({j.get("ats_portalid") for j in m_jobs if j.get("ats_portalid")})},
@@ -199,9 +231,13 @@ def main(argv=None):
             if "error" in t:
                 print(f"  {t['company']}: ERROR {t['error']}")
                 continue
-            line = f"  {t['company']}: reported={t['reported']} fetched={t['fetched_distinct']} gap={t.get('gap')}"
+            gap = f"FETCH FAILED ({t['stop_reason']})" if t.get("fetch_failed") else t.get("gap")
+            line = f"  {t['company']}: reported={t['reported']} fetched={t['fetched_distinct']} gap={gap}"
             for m in t.get("mcloud", []):
-                line += f" | m-cloud hits={m['total_hits']} mcloud_only={m['mcloud_only']} taleo_only={m['taleo_only']}"
+                if "mcloud_only" in m:
+                    line += f" | m-cloud hits={m['total_hits']} mcloud_only={m['mcloud_only']} taleo_only={m['taleo_only']}"
+                else:
+                    line += f" | m-cloud hits={m['total_hits']} not compared (incomplete fetch)"
             print(line)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

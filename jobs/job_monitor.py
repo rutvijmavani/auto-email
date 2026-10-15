@@ -1011,6 +1011,8 @@ def _process_company(company_row, position, total, _r=None):
                     "avature [%s]: IncompleteSearchError with 0 stubs — treating as fetch failure",
                     company,
                 )
+                record_scan(company, platform, SOURCE_MONITOR, failed(STOP_REQUEST_FAILED).report,
+                            error=exc)
                 result["failed"]       = 1
                 result["failure_name"] = company
                 return result

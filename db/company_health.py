@@ -33,16 +33,19 @@ def _peer_spread(conn, company_key, platform):
     if not platform:
         return None
     rows = conn.execute("""
-        SELECT company_key, fetched_distinct FROM scan_health
-        WHERE source = ? AND platform = ? AND company_key <> ?
-          AND error IS NULL AND complete IS NOT FALSE
-        ORDER BY company_key, scanned_at DESC, id DESC
-    """, (_SOURCE_FULLSCAN, platform, str(company_key))).fetchall()
+        SELECT company_key, fetched_distinct FROM (
+            SELECT company_key, fetched_distinct,
+                   ROW_NUMBER() OVER (PARTITION BY company_key ORDER BY scanned_at DESC, id DESC) AS rn
+            FROM scan_health
+            WHERE source = ? AND platform = ? AND company_key <> ?
+              AND error IS NULL AND complete IS NOT FALSE
+        ) t
+        WHERE rn <= ?
+        ORDER BY company_key, rn
+    """, (_SOURCE_FULLSCAN, platform, str(company_key), HEALTH_BASELINE_SCANS)).fetchall()
     per_company = defaultdict(list)
     for r in rows:
-        values = per_company[r["company_key"]]
-        if len(values) < HEALTH_BASELINE_SCANS:
-            values.append(int(r["fetched_distinct"] or 0))
+        per_company[r["company_key"]].append(int(r["fetched_distinct"] or 0))
     return peer_relative_spread(list(per_company.values()), HEALTH_MIN_PEERS)
 
 
@@ -169,14 +172,26 @@ def clear_expected(company_key):
         conn.close()
 
 
-def mark_reported():
-    """Record that the digest just sent told the user the current state of every company."""
+def mark_reported(pairs=None):
+    """
+    Record that the digest just sent told the user a company's state.
+    `pairs` = the (company_key, state) pairs the digest actually contained: only a row whose current key
+    AND state still match a sent pair is stamped, so a row that changed after the snapshot was taken is
+    left for the next digest. With no pairs every company's current state is stamped.
+    """
     conn = get_conn()
     try:
-        conn.execute("""
-            UPDATE company_health SET reported_state = state, reported_at = CURRENT_TIMESTAMP
-            WHERE reported_state IS DISTINCT FROM state
-        """)
+        if pairs is None:
+            conn.execute("""
+                UPDATE company_health SET reported_state = state, reported_at = CURRENT_TIMESTAMP
+                WHERE reported_state IS DISTINCT FROM state
+            """)
+        else:
+            for key, state in pairs:
+                conn.execute("""
+                    UPDATE company_health SET reported_state = state, reported_at = CURRENT_TIMESTAMP
+                    WHERE company_key = ? AND state = ? AND reported_state IS DISTINCT FROM state
+                """, (str(key), state))
         conn.commit()
     except Exception as exc:
         try:

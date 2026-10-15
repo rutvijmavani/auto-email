@@ -37,6 +37,7 @@ from config import (
     JOBVITE_FEED_MAX_WAIT_S,
     JOBVITE_FEED_TIMEOUT_S,
     JOBVITE_FEED_TRACE_MAX,
+    JOBVITE_FEED_TRACE_BUDGET_S,
 )
 from jobs.ats.base import fetch_html, slugify, validate_company_match
 from logger import get_logger
@@ -263,13 +264,17 @@ def verify_fetch(slug, jobs, stop_reason=STOP_EMPTY_PAGE):
     if feed is None or feed.status_code != 200:
         return _result("unverified", "feed unavailable")
     feed_ids = {i.split("-")[0] for i in FEED_ID_RE.findall(feed.text)}
+    if not feed_ids and jobs:
+        # A feed naming no job at all while the board listed some is a bad/blocked feed, not a clean match.
+        return _result("unverified", f"feed lists no jobs but the board has {len(jobs)}")
     ours_ids = {j["job_id"] for j in jobs}
     feed_only = sorted(feed_ids - ours_ids)
 
     ours_name = slug.split("/")[-1].lower()
     missing, foreign, unresolved = [], 0, 0
+    deadline = time.monotonic() + JOBVITE_FEED_TRACE_BUDGET_S
     for n, jid in enumerate(feed_only):
-        if n >= JOBVITE_FEED_TRACE_MAX:
+        if n >= JOBVITE_FEED_TRACE_MAX or time.monotonic() >= deadline:
             unresolved += len(feed_only) - n
             break
         resp = _get_with_retry(JOB_REDIRECT_URL, params={"c": eid, "j": jid})

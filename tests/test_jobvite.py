@@ -132,6 +132,17 @@ def test_feed_unavailable_is_unverified():
     assert _verify(_jobs("oA1"), {}, feed="", feed_status=500)["status"] == "unverified"
 
 
+def test_empty_feed_with_jobs_on_board_is_unverified():
+    v = _verify(_jobs("oA1"), {}, feed="<jobs></jobs>")
+    assert v["status"] == "unverified" and "no jobs" in v["reason"]
+
+
+def test_trace_budget_exhausted_counts_rest_as_unresolved():
+    with patch.object(jobvite, "JOBVITE_FEED_TRACE_BUDGET_S", -1):
+        v = _verify(_jobs("oA1"), {})
+    assert v["status"] == "unverified" and v["unresolved"] == 2
+
+
 def test_abnormal_stop_is_incomplete_without_any_request():
     assert jobvite.verify_fetch("acme", [], jobvite.STOP_PAGE_CAP)["status"] == "incomplete"
 

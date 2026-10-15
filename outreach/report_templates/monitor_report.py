@@ -1370,7 +1370,10 @@ def build_monitor_report(new_postings, stats, alerts):
     if email_sent:
         try:
             from db.company_health import mark_reported
-            mark_reported()
+            snap = health_snap or {}
+            sent = [(r["company_key"], r["state"])
+                    for kind in ("new", "still", "recovered") for r in snap.get(kind, [])]
+            mark_reported(sent)
         except Exception as exc:
             print(f"[WARNING] fetch-health mark_reported failed: {exc}")
 

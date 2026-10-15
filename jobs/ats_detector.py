@@ -481,7 +481,7 @@ def override_ats(company, platform, slug):
 
     conn = get_conn()
     try:
-        conn.execute("""
+        cur = conn.execute("""
             UPDATE prospective_companies
             SET ats_platform           = ?,
                 ats_slug               = ?,
@@ -490,6 +490,10 @@ def override_ats(company, platform, slug):
             WHERE company = ?
         """, (platform, slug_str, company))
         conn.commit()
+        if cur.rowcount < 1:
+            logger.error("Manual override matched no row: %r → %s", company, platform)
+            print(f"[ERROR] {company}: no matching company row — nothing was changed.")
+            return False
         print(f"[OK] {company} -> manually set to {platform}")
         return True
     finally:

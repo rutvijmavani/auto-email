@@ -71,6 +71,7 @@ class TestOverrideAtsRefuses(unittest.TestCase):
     def test_complete_slug_written(self):
         from jobs import ats_detector
         with mock.patch.object(ats_detector, "get_conn") as gc:
+            gc.return_value.execute.return_value.rowcount = 1
             ok = ats_detector.override_ats("Acme", "workday", '{"slug":"acme","wd":"wd5"}')
         self.assertTrue(ok)
         gc.return_value.execute.assert_called_once()
@@ -78,8 +79,16 @@ class TestOverrideAtsRefuses(unittest.TestCase):
     def test_string_platform_bare_slug_written(self):
         from jobs import ats_detector
         with mock.patch.object(ats_detector, "get_conn") as gc:
+            gc.return_value.execute.return_value.rowcount = 1
             ok = ats_detector.override_ats("Acme", "greenhouse", "acme")
         self.assertTrue(ok)
+
+    def test_no_matching_row_returns_false(self):
+        from jobs import ats_detector
+        with mock.patch.object(ats_detector, "get_conn") as gc:
+            gc.return_value.execute.return_value.rowcount = 0
+            ok = ats_detector.override_ats("Ghost", "greenhouse", "ghost")
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

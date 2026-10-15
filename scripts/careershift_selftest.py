@@ -75,6 +75,19 @@ def _on_login_page(page):
     return "login" in u or "signin" in u
 
 
+def _is_logged_in(page):
+    """Affirmative check: on the authenticated /App/ area of careershift.com with no password field shown."""
+    if _on_login_page(page):
+        return False
+    u = page.url.lower()
+    if "careershift.com/app/" not in u:
+        return False
+    try:
+        return page.locator("input[type='password']").count() == 0
+    except Exception:
+        return False
+
+
 def _read_quota(page):
     """Parse 'Remaining' from the account usage page. Returns int or None. No DB writes."""
     page.goto(CAREERSHIFT_QUOTA_URL, wait_until="domcontentloaded", timeout=30000)
@@ -116,7 +129,7 @@ def _try_form_login(page, email, password):
 def _ensure_session(context, page, session_file):
     page.goto(_DASHBOARD, wait_until="domcontentloaded", timeout=30000)
     human_delay(1.5, 2.5)
-    if not _on_login_page(page):
+    if _is_logged_in(page):
         print("[OK] Saved session is valid.")
         return True
     print("[INFO] Saved session missing/expired — logging in.")
@@ -132,12 +145,12 @@ def _ensure_session(context, page, session_file):
     else:
         print("[WARN] No credentials found in .env for this user.")
     page.goto(_DASHBOARD, wait_until="domcontentloaded", timeout=30000)
-    if _on_login_page(page):
+    if not _is_logged_in(page):
         print("\n[ACTION] Complete the login (SSO/MFA) in the browser window, wait for the")
         print("         CareerShift dashboard, then press Enter here.")
         input()
         page.goto(_DASHBOARD, wait_until="domcontentloaded", timeout=30000)
-    if _on_login_page(page):
+    if not _is_logged_in(page):
         _capture(page, "03_login_failed")
         return False
     os.makedirs(os.path.dirname(session_file), exist_ok=True)

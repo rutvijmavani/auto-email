@@ -1434,6 +1434,7 @@ if ca_entries:
                                  help="Undo 'Mark as expected' — the daily digest lists it again."):
                         company_health.clear_expected(f"ca:{ca_id}")
                         load_company_health.clear()
+                        load_employers.clear()
                         st.rerun()
                 else:
                     if st.button("Mark as expected", key=f"ca_expect_{ca_id}",

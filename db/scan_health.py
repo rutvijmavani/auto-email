@@ -51,18 +51,22 @@ def record_scan(company_key, platform, source, report, raw_count=0, valid_count=
         finally:
             conn.close()
 
+    written = False
     for attempt in range(2):
         try:
             _do_write()
-            if source == SOURCE_FULLSCAN:
-                company_health.refresh(company_key)   # only fullscan rows feed the health verdict; never raises
-            return True
+            written = True
+            break
         except Exception as exc:
             if attempt == 0:
                 continue   # transient connection loss — retry once
             logger.warning("scan_health: record_scan failed (company=%r source=%r): %s",
                            company_key, source, exc)
-    return False
+    if not written:
+        return False
+    if source == SOURCE_FULLSCAN:
+        company_health.refresh(company_key)   # only fullscan rows feed the health verdict; never raises
+    return True
 
 
 def annotate_latest(company_key, source, feed_status):

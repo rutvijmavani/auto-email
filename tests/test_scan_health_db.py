@@ -67,6 +67,19 @@ class TestRecordScan(_DbCase):
         self.assertIs(row["complete"], True)
         self.assertIs(row["server_short"], False)
 
+    def test_refresh_runs_once_after_a_successful_write(self):
+        with patch("db.scan_health.company_health.refresh") as refresh:
+            self.assertTrue(_fullscan("Acme", 100))
+        refresh.assert_called_once_with("Acme")
+        self.assertEqual(len(scan_health.get_recent("Acme")), 1)
+
+    def test_write_failure_retries_once_and_skips_refresh(self):
+        with patch("db.scan_health.get_conn", side_effect=RuntimeError("down")) as gc, \
+             patch("db.scan_health.company_health.refresh") as refresh:
+            self.assertFalse(_fullscan("Acme", 100))
+        self.assertEqual(gc.call_count, 2)
+        refresh.assert_not_called()
+
     def test_unknown_completeness_is_stored_as_null(self):
         scan_health.record_scan("Acme", "lever", scan_health.SOURCE_SCAN, _report(50))
         self.assertIsNone(scan_health.get_recent("Acme")[0]["complete"])
@@ -292,6 +305,35 @@ class TestDigest(_DbCase):
         company_health.mark_expected("A")
         company_health.clear_expected("A")
         self.assertEqual([r["company_key"] for r in company_health.digest_snapshot()["new"]], ["A"])
+
+    def test_mark_reported_with_pairs_skips_changed_rows(self):
+        self._make("A", bad=True)
+        self._make("B", bad=True)
+        sent = [("A", "suspect"), ("B", "suspect")]
+        _fullscan("B", 0)                               # B went suspect -> failing after the snapshot
+        company_health.mark_reported(sent)
+        self.assertEqual(_health("A")["reported_state"], "suspect")
+        self.assertIsNone(_health("B")["reported_state"])
+        self.assertEqual([r["company_key"] for r in company_health.digest_snapshot()["new"]], ["B"])
+
+    def test_mark_reported_with_empty_pairs_stamps_nothing(self):
+        self._make("A", bad=True)
+        company_health.mark_reported([])
+        self.assertIsNone(_health("A")["reported_state"])
+
+    def test_peer_spread_uses_only_baseline_rows_per_company(self):
+        for key in ("P1", "P2", "P3", "P4"):
+            for c in [10] * 3 + [200] * HEALTH_BASELINE_SCANS:   # old rows must be ignored
+                _fullscan(key, c)
+        conn = company_health.get_conn()
+        try:
+            with patch("db.company_health.peer_relative_spread") as prs:
+                company_health._peer_spread(conn, "other", "workday")
+        finally:
+            conn.close()
+        groups = prs.call_args.args[0]
+        self.assertTrue(groups and all(len(g) <= HEALTH_BASELINE_SCANS for g in groups))
+        self.assertTrue(all(v == 200 for g in groups for v in g))
 
     def test_mark_reported_stamps_reported_at(self):
         self._make("A", bad=True)
