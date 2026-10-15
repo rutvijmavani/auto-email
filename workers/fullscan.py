@@ -792,8 +792,8 @@ def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
     (Redis SET NX gate). Logs the verdict and stores it on the scan's scan_health row;
     never raises, never blocks the scan result.
     """
+    gate = f"{REDIS_FEED_VERIFY_PREFIX}:{company}"
     try:
-        gate = f"{REDIS_FEED_VERIFY_PREFIX}:{company}"
         if not r.set(gate, "1", nx=True, ex=JOBVITE_FEED_VERIFY_INTERVAL_H * 3600):
             return
         from jobs.ats import jobvite
@@ -805,6 +805,10 @@ def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
             verdict.get("missing", [])[:10])
     except Exception as exc:
         logger.warning("fullscan [%s]: jobvite feed check failed: %s", company, exc)
+        try:
+            r.delete(gate)   # release the gate so a later fullscan can retry the check
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────

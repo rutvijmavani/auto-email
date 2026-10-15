@@ -170,7 +170,7 @@ CAREERSHIFT_HIGH_CONFIDENCE   = 90   # skip remaining HR terms
 CAREERSHIFT_MEDIUM_CONFIDENCE = 70   # continue to next HR term
 CAREERSHIFT_MAX_PROFILES      = 3    # hard cap — never visit more than this
 CAREERSHIFT_UI_CAPTURE_DIR    = os.getenv("CAREERSHIFT_UI_CAPTURE_DIR", "data/cs_ui")  # selftest screenshots/HTML
-CAREERSHIFT_LOGIN_URL         = os.getenv("CAREERSHIFT_LOGIN_URL", "https://www.careershift.com/")  # selftest login entry
+CAREERSHIFT_LOGIN_URL         = os.getenv("CAREERSHIFT_LOGIN_URL", "https://njit.careershift.com/signin/njit")  # selftest login entry
 MIN_BUFFER_SIZE               = 2    # minimum for domain consistency check
 MIN_RECRUITERS_PER_COMPANY    = 1    # minimum active recruiters to start outreach
                                       # pipeline tops up to MAX_CONTACTS_HARD_CAP over time

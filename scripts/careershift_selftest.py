@@ -229,8 +229,13 @@ def run(args):
                     continue
                 cards = parse_cards_from_html(page.content())
                 stage(f"cards parsed for '{term}'", len(cards) > 0, f"count={len(cards)}")
+                target_company = _norm_name(args.company)
                 for card in cards:
-                    if _norm_name(card[0]) == target_name:
+                    card_company = _norm_name(card[1])
+                    same_company = bool(card_company) and (
+                        target_company in card_company or card_company in target_company)
+                    # name alone is ambiguous across employers; the later --email comparison confirms the profile
+                    if _norm_name(card[0]) == target_name and same_company:
                         target_card = card
                         break
                 if target_card:

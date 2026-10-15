@@ -55,11 +55,6 @@ def _key(job):
     return job.get("id") or job.get("absolute_url")
 
 
-def _key(job):
-    """Identity of a raw row for repeat-page detection: id, else url."""
-    return job.get("id") or job.get("absolute_url")
-
-
 def fetch_jobs(slug, company):
     """
     Fetch all jobs for company from Greenhouse.
