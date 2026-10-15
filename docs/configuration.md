@@ -344,7 +344,7 @@ All env-overridable in `config.py`.
 | `WORKDAY_PAGE_SIZE` | 20 | Jobs per Workday request |
 | `WORKDAY_RESULT_CAP` | 2000 | Workday's per-query result cap (used in warnings) |
 | `WORKDAY_FACET_SPLIT_AT` | 1900 | Page-1 total at/above which the board is fetched one facet value at a time |
-| `WORKDAY_SPLIT_FACETS` | `jobFamilyGroup,timeType,workerSubType` | Facets tried in order when splitting |
+| `WORKDAY_SPLIT_FACETS` | `jobFamilyGroup,timeType,workerSubType,locations` | Facets tried in order when splitting |
 | `AUDIT_*` | see `config.py` | Thresholds for `scripts/audit_fetch_health.py` (read-only under-fetch audit) |
 | `PROBE_MAX_CALLS`, `PROBE_MAX_SCALARS` | 4, 60 | Responses / scalar fields recorded per company by `scripts/probe_feeder_totals.py` |
 | `FETCH_TOLERANCE_PCT` | 5 | Percent shortfall vs the ATS-reported total still counted as a complete fetch (0 for exact feed-count totals, e.g. SuccessFactors) |

@@ -139,6 +139,12 @@ class TestDigestBlocks(unittest.TestCase):
         self.assertIn("3d", line)
         self.assertIn("empty board", line)
 
+    def test_line_prefers_display_name(self):
+        from outreach.report_templates.monitor_report import _health_line
+        line = _health_line(self._row(company_key="ca:42", display_name="Acme Corp"))
+        self.assertTrue(line.startswith("Acme Corp ["))
+        self.assertTrue(_health_line(self._row(company_key="ca:42")).startswith("ca:42 ["))
+
 
 if __name__ == "__main__":
     unittest.main()

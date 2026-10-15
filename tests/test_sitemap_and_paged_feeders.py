@@ -41,6 +41,12 @@ class TestSitemapReport(unittest.TestCase):
     def test_helper_depth_cut_is_incomplete(self):
         rep = fr.sitemap_report({"files": 1, "failed": 0, "too_deep": 2}, []).finalize()
         self.assertFalse(rep.complete)
+        self.assertEqual(rep.stop_reason, fr.STOP_PAGE_CAP)
+
+    def test_helper_depth_cut_plus_failed_file_is_request_failed(self):
+        rep = fr.sitemap_report({"files": 3, "failed": 1, "too_deep": 2}, []).finalize()
+        self.assertFalse(rep.complete)
+        self.assertEqual(rep.stop_reason, fr.STOP_REQUEST_FAILED)
 
     def test_helper_empty_sitemap(self):
         rep = fr.sitemap_report({"files": 1, "failed": 0, "too_deep": 0}, []).finalize()

@@ -432,7 +432,8 @@ def _health_line(row):
     """One company's finding as plain text: name, platform, state, how long, why."""
     since = row.get("since")
     days = f"{max((datetime.now() - since).days, 0)}d" if isinstance(since, datetime) else "?"
-    return (f"{row['company_key']} [{row.get('platform') or '?'}] "
+    name = row.get("display_name") or row["company_key"]
+    return (f"{name} [{row.get('platform') or '?'}] "
             f"{row['state']} for {days} — {row.get('reason') or ''}")
 
 

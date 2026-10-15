@@ -111,10 +111,13 @@ def digest_snapshot():
     conn = get_conn()
     try:
         rows = [dict(r) for r in conn.execute("""
-            SELECT * FROM company_health
-            WHERE (state <> ? OR COALESCE(reported_state, ?) <> ?)
-              AND expected_state IS DISTINCT FROM state
-            ORDER BY CASE state WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, since
+            SELECT ch.*, COALESCE(NULLIF(ca.company_name, ''), ch.company_key) AS display_name
+            FROM company_health ch
+            LEFT JOIN company_ats ca
+                   ON ch.company_key = 'ca:' || ca.id::text
+            WHERE (ch.state <> ? OR COALESCE(ch.reported_state, ?) <> ?)
+              AND ch.expected_state IS DISTINCT FROM ch.state
+            ORDER BY CASE ch.state WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, ch.since
         """, (STATE_OK, STATE_OK, STATE_OK, STATE_FAILING, STATE_SUSPECT)).fetchall()]
     finally:
         conn.close()

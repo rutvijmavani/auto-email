@@ -217,9 +217,11 @@ def sitemap_report(stats: dict, jobs, unusable: int = 0) -> FetchReport:
     silently drops a quarter of the jobs). complete therefore stays None on a clean read — whether the
     sitemap lags the live board is unknowable.
     """
-    cut = stats.get("failed", 0) + stats.get("too_deep", 0) + stats.get("truncated", 0)
+    broken = stats.get("failed", 0) + stats.get("truncated", 0)
+    cut = broken + stats.get("too_deep", 0)
     if cut:
-        stop = STOP_REQUEST_FAILED
+        # a file that failed or was cut short is a request problem; a cut by depth alone is a cap we chose
+        stop = STOP_REQUEST_FAILED if broken else STOP_PAGE_CAP
         note = (f"{stats.get('failed', 0)} of {stats.get('files', 0)} sitemap files failed, "
                 f"{stats.get('too_deep', 0)} cut by depth limit, {stats.get('truncated', 0)} truncated")
         if stats.get("problems"):
