@@ -368,7 +368,8 @@ def main(argv=None) -> int:
         print(f"  {res['display_name'][:34]:34s} {res['platform'] or '?':12s} "
               f"reported={res['reported_total']!s:<6} fetched={res['fetched_distinct']:<5d} stop={res['stop_reason']}")
 
-    flagged = [r for r in results if r["flags"]]
+    # results is sorted verdict-first for the CSV; the "top flagged" list is by flag count, then petitions
+    flagged = sorted((r for r in results if r["flags"]), key=lambda r: (-len(r["flags"]), -r["petitions"]))
     by_flag, by_platform = Counter(), defaultdict(Counter)
     for res in flagged:
         for f in res["flags"]:
