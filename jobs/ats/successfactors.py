@@ -41,7 +41,7 @@ from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match
 from jobs.ats.fetch_report import (
     FetchReport, STOP_NO_CONFIG, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, TOTAL_FEED_COUNT,
-    attach, failed,
+    attach, check_sitemap_body, failed, new_sitemap_stats,
 )
 from logger import get_logger
 
@@ -199,8 +199,13 @@ def fetch_jobs(slug_info, company):
         # correct URLs — whichever path variant returned valid XML is used.
         effective = {**slug_info, "path": try_path}
         out = [_normalize(j, company, effective) for j in jobs if j.find("JobTitle")]
+        # a feed cut off mid-download still parses, to fewer jobs — with a raw count taken from the same
+        # cut text, so only the closed root / declared size can expose it
+        file_stats = new_sitemap_stats()
+        whole = check_sitemap_body(resp, file_stats)
         return attach(out, FetchReport(
-            stop_reason      = STOP_SINGLE_RESPONSE,
+            stop_reason      = STOP_SINGLE_RESPONSE if whole else STOP_REQUEST_FAILED,
+            note             = "; ".join(file_stats.get("problems", [])[:3]),
             pages            = 1,
             fetched_distinct = len(jobs),
             unusable         = len(jobs) - len(out),

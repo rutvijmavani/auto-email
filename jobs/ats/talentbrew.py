@@ -41,7 +41,9 @@ from collections import Counter
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match, country_to_alpha2, alpha2_to_country_name
-from jobs.ats.fetch_report import STOP_NO_CONFIG, STOP_REQUEST_FAILED, attach, failed, new_sitemap_stats, sitemap_report
+from jobs.ats.fetch_report import (
+    STOP_NO_CONFIG, STOP_REQUEST_FAILED, attach, check_sitemap_body, failed, new_sitemap_stats, sitemap_report,
+)
 
 
 # ─────────────────────────────────────────
@@ -301,6 +303,8 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None, _stats=None):
 
     # IMPORTANT: html.parser — BOM prefix breaks xml/lxml-xml parsers
     soup = BeautifulSoup(resp.text, "html.parser")
+    if _stats is not None:
+        check_sitemap_body(resp, _stats, soup=soup)
 
     # Sitemap index: has <sitemap> child elements each with a <loc>
     sub_tags = soup.find_all("sitemap")

@@ -85,6 +85,138 @@ class TestSitemapReport(unittest.TestCase):
         self.assertEqual(fr.report_of(avature.fetch_jobs({"path": "careers"}, "X")).stop_reason,
                          fr.STOP_NO_CONFIG)
 
+    def test_sitemap_truncated_child_is_incomplete(self):
+        from jobs.ats import sitemap
+        cut = _urlset("https://x.com/jobs/1234567", "https://x.com/jobs/2345678")[:-len("</urlset>")]
+        pages = {
+            "https://x.com/index.xml": _index("https://x.com/a.xml"),
+            "https://x.com/a.xml":     cut,
+        }
+        with patch.object(sitemap, "fetch_html", side_effect=lambda u, **k: _resp(pages[u])):
+            jobs = sitemap.fetch_jobs({"url": "https://x.com/index.xml"}, "X")
+        rep = fr.report_of(jobs).finalize()
+        self.assertEqual(rep.stop_reason, fr.STOP_REQUEST_FAILED)
+        self.assertFalse(rep.complete)
+        self.assertIn("never closed", rep.note)
+
+    def test_helper_truncated_counts_as_cut(self):
+        stats = {"files": 2, "failed": 0, "too_deep": 0, "truncated": 1, "problems": ["root <urlset> never closed"]}
+        rep = fr.sitemap_report(stats, [{"job_id": "1"}]).finalize()
+        self.assertEqual(rep.stop_reason, fr.STOP_REQUEST_FAILED)
+        self.assertFalse(rep.complete)
+        self.assertIn("1 truncated", rep.note)
+
+
+class TestCheckSitemapBody(unittest.TestCase):
+
+    def _check(self, resp, soup=None):
+        stats = fr.new_sitemap_stats()
+        return fr.check_sitemap_body(resp, stats, soup=soup), stats
+
+    @staticmethod
+    def _soup(text, parser="html.parser"):
+        from bs4 import BeautifulSoup
+        return BeautifulSoup(text, parser)
+
+    def test_whole_file_ok_and_bytes_counted(self):
+        text = _urlset("https://x.com/a", "https://x.com/b")
+        ok, stats = self._check(_resp(text), soup=self._soup(text))
+        self.assertTrue(ok)
+        self.assertEqual(stats["truncated"], 0)
+        self.assertEqual(stats["bytes"], len(text.encode()))
+
+    def test_unclosed_root(self):
+        ok, stats = self._check(_resp(_urlset("https://x.com/a")[:-5]))
+        self.assertFalse(ok)
+        self.assertEqual(stats["truncated"], 1)
+        self.assertIn("never closed", stats["problems"][0])
+
+    def test_parser_dropped_elements_any_tag_name(self):
+        text = "<feed><Job><id>1</id></Job><Job><id>2</id></Job><Job><id>3</id></Job></feed>"
+        partial = self._soup("<feed><Job><id>1</id></Job></feed>")     # parser kept 1 of 3
+        ok, stats = self._check(_resp(text), soup=partial)
+        self.assertFalse(ok)
+        self.assertIn("parsed 1 of 3", stats["problems"][0])
+        self.assertIn("job", stats["problems"][0])
+
+    def test_matching_counts_with_xml_parser_and_namespace(self):
+        text = "<ns:feed><ns:Job>a</ns:Job><ns:Job>b</ns:Job></ns:feed>"
+        ok, _ = self._check(_resp(text), soup=self._soup(text, "xml"))
+        self.assertTrue(ok)
+
+    def test_cdata_and_comment_markup_not_counted(self):
+        text = "<feed><Job><d><![CDATA[<p>x</p><p>y</p>]]></d><!-- <Job> --></Job></feed>"
+        ok, _ = self._check(_resp(text), soup=self._soup(text))
+        self.assertTrue(ok)
+
+    def test_compressed_wire_bytes_match_declared(self):
+        text = _urlset("https://x.com/a")
+        resp = SimpleNamespace(text=text, content=text.encode(), raw=SimpleNamespace(tell=lambda: 10),
+                               headers={"Content-Length": "10", "Content-Encoding": "gzip"})
+        ok, _ = self._check(resp, soup=self._soup(text))
+        self.assertTrue(ok)
+
+    def test_compressed_wire_bytes_short(self):
+        text = _urlset("https://x.com/a")
+        resp = SimpleNamespace(text=text, content=text.encode(), raw=SimpleNamespace(tell=lambda: 6),
+                               headers={"Content-Length": "10", "Content-Encoding": "gzip"})
+        ok, stats = self._check(resp, soup=self._soup(text))
+        self.assertFalse(ok)
+        self.assertIn("received 6 of 10", stats["problems"][0])
+
+    def test_compressed_without_raw_is_not_compared(self):
+        text = _urlset("https://x.com/a")
+        resp = SimpleNamespace(text=text, content=text.encode(),
+                               headers={"Content-Length": "999", "Content-Encoding": "gzip"})
+        ok, _ = self._check(resp, soup=self._soup(text))
+        self.assertTrue(ok)
+
+    def test_uncompressed_short_vs_content_length(self):
+        text = _urlset("https://x.com/a")
+        resp = SimpleNamespace(text=text, content=text.encode(), headers={"Content-Length": str(len(text) + 50)})
+        ok, stats = self._check(resp, soup=self._soup(text))
+        self.assertFalse(ok)
+        self.assertIn("received", stats["problems"][0])
+
+    def test_uncompressed_exact_content_length_ok(self):
+        text = _urlset("https://x.com/a")
+        resp = SimpleNamespace(text=text, content=text.encode(), headers={"Content-Length": str(len(text.encode()))})
+        ok, _ = self._check(resp, soup=self._soup(text))
+        self.assertTrue(ok)
+
+    def test_empty_self_closed_root_ok(self):
+        ok, _ = self._check(_resp("<?xml version='1.0'?><urlset/>"))
+        self.assertTrue(ok)
+
+    def test_bom_prefixed_file_ok(self):
+        text = "﻿" + _urlset("https://x.com/a")
+        ok, _ = self._check(_resp(text), soup=self._soup(text))
+        self.assertTrue(ok)
+
+    def test_mock_without_headers_or_content(self):
+        ok, stats = self._check(SimpleNamespace(text=_urlset("https://x.com/a")))
+        self.assertTrue(ok)
+        self.assertGreater(stats["bytes"], 0)
+
+
+class TestSitemapBodyInFeeders(unittest.TestCase):
+
+    def test_phenom_truncated_sitemap(self):
+        from jobs.ats import phenom
+        stats = fr.new_sitemap_stats()
+        cut = _urlset("https://x.com/job/NYC/Engineer/1")[:-len("</urlset>")]
+        with patch.object(phenom, "fetch_html", return_value=_resp(cut)):
+            phenom._follow_sitemap("https://x.com/sitemap.xml", _stats=stats)
+        self.assertGreaterEqual(stats["truncated"], 1)
+
+    def test_talentbrew_truncated_sitemap(self):
+        from jobs.ats import talentbrew
+        stats = fr.new_sitemap_stats()
+        cut = _urlset("https://x.com/job/nyc/engineer/1/2")[:-len("</urlset>")]
+        with patch.object(talentbrew, "fetch_html", return_value=_resp(cut)):
+            talentbrew._follow_sitemap("https://x.com/sitemap.xml", _stats=stats)
+        self.assertGreaterEqual(stats["truncated"], 1)
+
 
 class TestAdp(unittest.TestCase):
 

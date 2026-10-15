@@ -19,6 +19,7 @@
 # Platforms without a total (Ashby, Lever, sitemap …) stay complete=None; a missing page is not
 # detectable there, a repeated page still is.
 
+import re
 from dataclasses import asdict, dataclass
 from typing import Optional
 
@@ -117,21 +118,108 @@ def failed(stop_reason: str, note: str = "") -> FetchResult:
 
 
 def new_sitemap_stats() -> dict:
-    """Counters a sitemap walker fills in: files fetched, files that failed, branches cut by the depth limit."""
-    return {"files": 0, "failed": 0, "too_deep": 0}
+    """
+    Counters a sitemap walker fills in: files fetched, files that failed, branches cut by the depth limit,
+    files that arrived but were not read to their end (truncated), and the bytes received.
+    """
+    return {"files": 0, "failed": 0, "too_deep": 0, "truncated": 0, "bytes": 0}
+
+
+_ROOT_RE  = re.compile(r"<([A-Za-z_][\w:.-]*)")   # first element start; skips <?xml, <!-- and <!DOCTYPE
+_TAG_RE   = re.compile(r"<([A-Za-z_][\w:.-]*)")
+_SKIP_RE  = re.compile(r"<!\[CDATA\[.*?\]\]>|<!--.*?-->", re.DOTALL)   # text inside is content, not structure
+_TAIL_LEN = 256
+
+
+def _local(name: str) -> str:
+    """Tag name without namespace prefix, lowercased (html.parser lowercases, the xml parser does not)."""
+    return name.rsplit(":", 1)[-1].lower()
+
+
+def check_sitemap_body(resp, stats, soup=None) -> bool:
+    """
+    Did this sitemap/feed file arrive, and get read by OUR code, in full? Records the answer in `stats`
+    (stats["bytes"] += size, stats["truncated"] += 1 on a problem) and returns True when it looks whole.
+
+    A sitemap lists non-job pages too, so its URL count can't be compared with a job count. What can be
+    proved is that the file itself was consumed completely:
+      * the root element is closed at the end of the text (a cut-off file ends mid-entry);
+      * for EVERY tag name in the file, the raw text holds no more elements than the parser produced
+        (`soup`, when the caller passes it) — a lenient parser silently drops what it can't read
+        (Capgemini: 1 of ~1537 <Job>). Tag names come from the file itself, nothing is hardcoded;
+        CDATA and comments are removed first so markup inside descriptions isn't counted.
+    * when the server declares Content-Length, the bytes read off the connection (`resp.raw.tell()`, counted
+      before decompression, so gzip is covered; else len(content) for an uncompressed body) must reach it.
+    Chunked responses declare no length, so that check is skipped and the structural checks decide.
+    """
+    text = getattr(resp, "text", "") or ""
+    content = getattr(resp, "content", None)
+    size = len(content) if isinstance(content, (bytes, bytearray)) else len(text.encode("utf-8", "ignore"))
+    stats["bytes"] = stats.get("bytes", 0) + size
+
+    problem = ""
+    headers = getattr(resp, "headers", None)
+    declared = headers.get("Content-Length") if hasattr(headers, "get") else None
+    encoded = headers.get("Content-Encoding") if hasattr(headers, "get") else None
+    wire = None                       # bytes actually read off the connection (pre-decompression)
+    tell = getattr(getattr(resp, "raw", None), "tell", None)
+    if callable(tell):
+        try:
+            v = tell()
+            wire = v if isinstance(v, int) and v > 0 else None
+        except Exception:
+            wire = None
+    if wire is None and not isinstance(encoded, str) and isinstance(content, (bytes, bytearray)):
+        wire = len(content)
+    if isinstance(declared, (str, int)) and str(declared).isdigit() and wire is not None \
+            and wire < int(declared):
+        problem = f"received {wire} of {declared} bytes"
+    body = _SKIP_RE.sub("", text.lstrip("﻿").strip())
+    raw = {}
+    for name in _TAG_RE.findall(body):
+        key = _local(name)
+        raw[key] = raw.get(key, 0) + 1
+    if body and not problem:
+        m = _ROOT_RE.search(body)
+        if m:
+            tail = body[-_TAIL_LEN:]
+            closed = re.search(r"</\s*" + re.escape(m.group(1)) + r"\s*>\s*$", tail, re.IGNORECASE)
+            empty_root = sum(raw.values()) == 1 and re.search(r"/>\s*$", tail)
+            if not closed and not empty_root:
+                problem = f"root <{m.group(1)}> never closed"
+    if not problem and soup is not None:
+        parsed = {}
+        for tag in soup.find_all(True):
+            key = _local(tag.name or "")
+            parsed[key] = parsed.get(key, 0) + 1
+        short = {k: (parsed.get(k, 0), n) for k, n in raw.items() if parsed.get(k, 0) < n}
+        if short:
+            worst = max(short, key=lambda k: short[k][1] - short[k][0])
+            got, want = short[worst]
+            problem = f"parsed {got} of {want} <{worst}> elements"
+
+    if problem:
+        stats["truncated"] = stats.get("truncated", 0) + 1
+        stats.setdefault("problems", []).append(problem)
+        return False
+    return True
 
 
 def sitemap_report(stats: dict, jobs, unusable: int = 0) -> FetchReport:
     """
     Report for a sitemap-derived fetch. The sitemap IS the board's listing, so there is no separate total:
-    the thing to prove is that every sitemap file was read. A failed or depth-cut file means part of the
-    listing was never seen (one dead child of a 4-file index silently drops a quarter of the jobs).
-    complete therefore stays None on a clean read — whether the sitemap lags the live board is unknowable.
+    the thing to prove is that every sitemap file was read — fetched, and consumed to its end. A failed,
+    truncated or depth-cut file means part of the listing was never seen (one dead child of a 4-file index
+    silently drops a quarter of the jobs). complete therefore stays None on a clean read — whether the
+    sitemap lags the live board is unknowable.
     """
-    cut = stats.get("failed", 0) + stats.get("too_deep", 0)
+    cut = stats.get("failed", 0) + stats.get("too_deep", 0) + stats.get("truncated", 0)
     if cut:
         stop = STOP_REQUEST_FAILED
-        note = f"{stats.get('failed', 0)} of {stats.get('files', 0)} sitemap files failed, {stats.get('too_deep', 0)} cut by depth limit"
+        note = (f"{stats.get('failed', 0)} of {stats.get('files', 0)} sitemap files failed, "
+                f"{stats.get('too_deep', 0)} cut by depth limit, {stats.get('truncated', 0)} truncated")
+        if stats.get("problems"):
+            note += " (" + "; ".join(stats["problems"][:3]) + ")"
     else:
         stop = STOP_ALL_PAGES if jobs else STOP_EMPTY_PAGE
         note = ""

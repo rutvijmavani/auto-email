@@ -47,6 +47,7 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from jobs.ats.base import fetch_html
 from jobs.ats.fetch_report import (
     STOP_NO_CONFIG, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, FetchReport, attach,
+    STOP_REQUEST_FAILED as _STOP_FAILED, check_sitemap_body,
     count_distinct, failed, new_sitemap_stats, sitemap_report,
 )
 
@@ -172,6 +173,8 @@ def fetch_jobs(slug_info, company):
 
     # Detect XML format from root tag
     soup = BeautifulSoup(text, "html.parser")
+    # the file must be read to its end: closed root, every <loc> parsed, all declared bytes received
+    check_sitemap_body(resp, stats, soup=soup)
 
     # ── Format 1: Custom XML job feed ──────────────────────────────────────
     # Google: <jobs>, SuccessFactors: <Job-Listing>
@@ -181,9 +184,11 @@ def fetch_jobs(slug_info, company):
     if root_name in ("jobs", "job-listing", "feed", "rss"):
         feed = _parse_xml_feed(soup, slug_info, company, url)
         return attach(feed, FetchReport(
-            stop_reason      = STOP_SINGLE_RESPONSE,
+            # a feed cut off mid-way parses to a shorter list that still looks like a whole response
+            stop_reason      = _STOP_FAILED if stats["truncated"] else STOP_SINGLE_RESPONSE,
             pages            = 1,
             fetched_distinct = count_distinct(feed),
+            note             = "; ".join(stats.get("problems", [])[:3]),
         ))
 
     # ── Format 2: Sitemap index ─────────────────────────────────────────────
@@ -209,6 +214,7 @@ def fetch_jobs(slug_info, company):
                     stats["failed"] += 1
                     continue
                 sub_soup = BeautifulSoup(sub_text, "html.parser")
+                check_sitemap_body(sub_resp, stats, soup=sub_soup)
                 all_entries.extend(_extract_sitemap_entries(sub_soup))
             stubs = _entries_to_stubs(all_entries, slug_info, company,
                                       job_pattern, locale_pref)

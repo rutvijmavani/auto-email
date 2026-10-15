@@ -40,7 +40,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    STOP_EMPTY_PAGE, STOP_NO_CONFIG, FetchReport, attach, count_distinct, failed,
+    STOP_EMPTY_PAGE, STOP_NO_CONFIG, FetchReport, attach, check_sitemap_body, count_distinct, failed,
     new_sitemap_stats, sitemap_report,
 )
 
@@ -215,8 +215,11 @@ def fetch_jobs(slug_info, company):
     resp        = fetch_html(sitemap_url, platform="avature",
                              timeout=(10, None))
 
+    stats = new_sitemap_stats()
+    stats["files"] = 1
     if resp is not None:
         soup     = BeautifulSoup(resp.text, "xml")
+        check_sitemap_body(resp, stats, soup=soup)
         job_urls = _extract_job_urls(soup)
     else:
         job_urls = []
@@ -227,8 +230,6 @@ def fetch_jobs(slug_info, company):
         return _fetch_via_search(slug_info, company)
 
     stubs = _urls_to_stubs(job_urls, slug_info, company)
-    stats = new_sitemap_stats()
-    stats["files"] = 1
     return attach(stubs, sitemap_report(stats, stubs, unusable=len(job_urls) - len(stubs)))
 
 
