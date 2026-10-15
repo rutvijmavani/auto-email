@@ -813,6 +813,9 @@ display = df[
     ]
 ].copy()
 
+# Rank 1..N in the table's current sort order (petition count by default), so you can see how far down the list you are.
+display.insert(0, "#", range(1, len(display) + 1))
+
 display["fetch_health"] = display["fetch_health"].map(
     lambda s: f"{_HEALTH_ICON[s]} {s}" if s in _HEALTH_ICON else "")
 
@@ -845,8 +848,9 @@ selected = st.dataframe(
     on_select="rerun",
     selection_mode="single-row",
     column_config={
+        "#":          st.column_config.NumberColumn("#", format="%d", width="small"),
         "Approval %": st.column_config.NumberColumn("Approval %", format="%.1f%%"),
-        "SOC Filed":     st.column_config.NumberColumn("SOC Filed",     format="%d"),
+        "SOC Filed":    st.column_config.NumberColumn("SOC Filed",     format="%d"),
         "SOC Certified": st.column_config.NumberColumn("SOC Certified", format="%d"),
         "Petitions":  st.column_config.NumberColumn("Petitions",  format="%d"),
         "Career page": st.column_config.LinkColumn("Career page"),
