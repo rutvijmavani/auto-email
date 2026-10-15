@@ -21,6 +21,7 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
 from db.prospective import add_prospective_company
+from db import company_health
 from db.company_ats_admin import (
     editable_platforms,
     insert_company_ats_row,
@@ -174,6 +175,18 @@ SORT_PETITIONS     = "Petition count ↓"
 FILTER_ANY, FILTER_HAS, FILTER_MISSING = "Any", "Has", "Missing"
 _FILTER_OPTIONS = [FILTER_ANY, FILTER_HAS, FILTER_MISSING]
 
+# Fetch-health filter (company_health, keyed 'ca:{company_ats.id}'). "Problem" = non-ok and not yet marked expected.
+HEALTH_ANY, HEALTH_PROBLEM, HEALTH_FAILING, HEALTH_SUSPECT, HEALTH_EXPECTED = (
+    "Any", "Problem (suspect or failing)", "Failing", "Suspect", "Expected (silenced)")
+_HEALTH_OPTIONS = [HEALTH_ANY, HEALTH_PROBLEM, HEALTH_FAILING, HEALTH_SUSPECT, HEALTH_EXPECTED]
+_HEALTH_CONDITION = {
+    HEALTH_PROBLEM:  "ch.state <> 'ok' AND ch.expected_state IS DISTINCT FROM ch.state",
+    HEALTH_FAILING:  "ch.state = 'failing'",
+    HEALTH_SUSPECT:  "ch.state = 'suspect'",
+    HEALTH_EXPECTED: "ch.expected_state = ch.state",
+}
+_HEALTH_ICON = {"ok": "🟢", "suspect": "🟠", "failing": "🔴"}
+
 
 def _normalize_soc_prefix(raw: str) -> str:
     """'15-1252.00' -> '15-1252'. DOL stores the same occupation with and without the
@@ -198,9 +211,17 @@ def load_employers(
     ats_filter: str = FILTER_ANY,
     careers_filter: str = FILTER_ANY,
     pd_filter: str = FILTER_ANY,
+    health_filter: str = HEALTH_ANY,
 ) -> pd.DataFrame:
     clauses: list[str] = []
     params: list = []
+
+    if health_filter in _HEALTH_CONDITION:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM company_ats ca JOIN company_health ch "
+            "ON ch.company_key = 'ca:' || ca.id::text "
+            f"WHERE ca.employer_fein = e.employer_fein AND {_HEALTH_CONDITION[health_filter]})"
+        )
 
     # Data-completeness filters (ATS / careers page / public domain). Each is independent, so the three
     # tri-state selectors cover every has/missing combination. "ATS" = an ATS detected in h1b_ats_discovery
@@ -287,6 +308,11 @@ def load_employers(
                      (SELECT ca.platform FROM company_ats ca
                       WHERE ca.employer_fein = e.employer_fein
                       ORDER BY ca.priority DESC LIMIT 1)) AS ats_platform,
+            (SELECT ch.state FROM company_ats ca JOIN company_health ch
+               ON ch.company_key = 'ca:' || ca.id::text
+              WHERE ca.employer_fein = e.employer_fein
+              ORDER BY CASE ch.state WHEN 'failing' THEN 0 WHEN 'suspect' THEN 1 ELSE 2 END
+              LIMIT 1) AS fetch_health,
             f.careers_url,
             f.public_domain,
             e.employer_fein,
@@ -496,6 +522,30 @@ def load_company_ats_entries(fein: str) -> list[dict]:
     return df.to_dict("records") if not df.empty else []
 
 
+@st.cache_data(ttl=60)
+def load_company_health(keys: tuple) -> dict:
+    """company_health rows for the given tracking keys ('ca:{id}'), as {company_key: row}."""
+    if not keys:
+        return {}
+    df = _query("SELECT * FROM company_health WHERE company_key = ANY(%s)", (list(keys),))
+    return {r["company_key"]: r for r in df.to_dict("records")} if not df.empty else {}
+
+
+def _health_detail(h: dict) -> str:
+    """One caption line for a company_health row: state, why, how long, and the count against its range."""
+    parts = [f"{_HEALTH_ICON.get(h['state'], '')} **{h['state']}**"]
+    if h.get("reason"):
+        parts.append(h["reason"])
+    if h.get("since") is not None and not pd.isna(h["since"]):
+        parts.append(f"since {pd.Timestamp(h['since']):%Y-%m-%d}")
+    if h.get("count") is not None and not pd.isna(h["count"]) and h.get("baseline") is not None and not pd.isna(h["baseline"]):
+        line = f"last full scan {int(h['count'])} jobs vs normal ~{h['baseline']:.0f}"
+        if h.get("flag_line") is not None and not pd.isna(h["flag_line"]):
+            line += f" (flagged below {h['flag_line']:.0f})"
+        parts.append(line)
+    return " · ".join(parts)
+
+
 @st.cache_data(ttl=300)
 def load_email_data(fein: str) -> dict | None:
     """Load email domain map + patterns for a FEIN. Returns None if no data."""
@@ -669,6 +719,10 @@ with st.sidebar:
     ats_filter     = st.selectbox("ATS", _FILTER_OPTIONS)
     careers_filter = st.selectbox("Career page", _FILTER_OPTIONS)
     pd_filter      = st.selectbox("Public domain", _FILTER_OPTIONS)
+    health_filter  = st.selectbox("Fetch health", _HEALTH_OPTIONS,
+                                  help="Verdict from the full scans: Suspect = the last scan fell below the company's "
+                                       "own normal range or did not finish; Failing = repeated bad scans or an empty "
+                                       "board. Expected = you marked it as real.")
 
     st.divider()
 
@@ -709,6 +763,7 @@ df = load_employers(
     ats_filter=ats_filter,
     careers_filter=careers_filter,
     pd_filter=pd_filter,
+    health_filter=health_filter,
 )
 
 
@@ -752,11 +807,14 @@ if _soc_mode:
     )
 display = df[
     (["soc_filed", "soc_certified"] if _soc_mode else []) + [
-        "employer_name", "petition_count", "ats_platform", "careers_url", "public_domain",
+        "employer_name", "petition_count", "ats_platform", "fetch_health", "careers_url", "public_domain",
         "employer_city", "employer_state", "naics_code",
         "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
     ]
 ].copy()
+
+display["fetch_health"] = display["fetch_health"].map(
+    lambda s: f"{_HEALTH_ICON[s]} {s}" if s in _HEALTH_ICON else "")
 
 display["approval_rate"] = (display["approval_rate"] * 100).round(1)
 display["h1b_dependent"] = display["h1b_dependent"].map({True: "✓", False: "", None: ""}).fillna("")
@@ -767,6 +825,7 @@ display.rename(columns={
     "employer_name":   "Employer",
     "petition_count":  "Petitions",
     "ats_platform":    "ATS",
+    "fetch_health":    "Fetch",
     "careers_url":     "Career page",
     "public_domain":   "Public domain",
     "employer_city":   "City",
@@ -1347,6 +1406,7 @@ if ca_entries:
         "These entries were discovered by the H-1B ATS pipeline. "
         "Toggle **Monitor** to start job tracking once you've confirmed the slug is correct."
     )
+    health_by_key = load_company_health(tuple(f"ca:{ca['id']}" for ca in ca_entries))
     for ca in ca_entries:
         ca_id       = ca["id"]
         ca_platform = ca.get("platform", "unknown")
@@ -1355,12 +1415,36 @@ if ca_entries:
         ca_monitored = bool(ca.get("is_monitored"))
         ca_status   = ca.get("status", "pending")
         ca_source   = ca.get("source", "")
+        ca_health   = health_by_key.get(f"ca:{ca_id}")
+        ca_problem  = bool(ca_health) and ca_health["state"] != "ok"
+        ca_expected = ca_problem and ca_health.get("expected_state") == ca_health["state"]
 
         badge = "🟢 Monitored" if ca_monitored else "⚪ Pending review"
+        if ca_problem:
+            badge += f"  {_HEALTH_ICON[ca_health['state']]} fetch {ca_health['state']}" + (" (expected)" if ca_expected else "")
         with st.expander(
             f"{badge}  ·  {ca_platform}  ·  `{ca_slug}`  ·  {ca_domain}",
-            expanded=not ca_monitored,
+            expanded=(not ca_monitored) or (ca_problem and not ca_expected),
         ):
+            if ca_health:
+                st.caption(_health_detail(ca_health))
+            if ca_problem:
+                if ca_expected:
+                    if st.button("Report this again", key=f"ca_unexpect_{ca_id}",
+                                 help="Undo 'Mark as expected' — the daily digest lists it again."):
+                        company_health.clear_expected(f"ca:{ca_id}")
+                        load_company_health.clear()
+                        st.rerun()
+                else:
+                    if st.button("Mark as expected", key=f"ca_expect_{ca_id}",
+                                 help="This is the real state of the board (it shrank, or the site changed). "
+                                      "The daily digest stops listing it; if the state changes again "
+                                      "(e.g. suspect → failing) it is reported again."):
+                        company_health.mark_expected(f"ca:{ca_id}")
+                        load_company_health.clear()
+                        load_employers.clear()
+                        st.rerun()
+
             info_cols = st.columns(3)
             info_cols[0].markdown(f"**Platform**\n\n{ca_platform}")
             info_cols[1].markdown(f"**Slug**\n\n`{ca_slug}`")

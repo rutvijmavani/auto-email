@@ -66,6 +66,10 @@ def refresh(company_key):
                     platform     = EXCLUDED.platform,
                     since        = CASE WHEN company_health.state <> EXCLUDED.state
                                         THEN CURRENT_TIMESTAMP ELSE company_health.since END,
+                    expected_state = CASE WHEN company_health.expected_state = EXCLUDED.state
+                                          THEN company_health.expected_state END,
+                    expected_at    = CASE WHEN company_health.expected_state = EXCLUDED.state
+                                          THEN company_health.expected_at END,
                     state        = EXCLUDED.state,
                     reason       = EXCLUDED.reason,
                     last_scan_at = EXCLUDED.last_scan_at,
@@ -98,12 +102,15 @@ def digest_snapshot():
       still     — non-ok now, same state the last digest reported
       recovered — ok now, last digest reported suspect/failing
     Failing sorts before suspect, oldest `since` first.
+    A company the user marked expected in its current state is left out (mark_expected); a change of
+    state clears the mark, so a new kind of failure is reported again.
     """
     conn = get_conn()
     try:
         rows = [dict(r) for r in conn.execute("""
             SELECT * FROM company_health
-            WHERE state <> ? OR COALESCE(reported_state, ?) <> ?
+            WHERE (state <> ? OR COALESCE(reported_state, ?) <> ?)
+              AND expected_state IS DISTINCT FROM state
             ORDER BY CASE state WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END, since
         """, (STATE_OK, STATE_OK, STATE_OK, STATE_FAILING, STATE_SUSPECT)).fetchall()]
     finally:
@@ -118,6 +125,48 @@ def digest_snapshot():
         else:
             snap["new"].append(r)
     return snap
+
+
+def mark_expected(company_key):
+    """
+    The user judged the company's current non-ok state to be real (a board that shrank, a page that
+    moved): keep the verdict but stop reporting it. Cleared automatically by refresh() the moment the
+    state changes. Returns True when a non-ok row was marked.
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute("""
+            UPDATE company_health SET expected_state = state, expected_at = CURRENT_TIMESTAMP
+            WHERE company_key = ? AND state <> ?
+        """, (str(company_key), STATE_OK))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("company_health: mark_expected failed (company=%r): %s", company_key, exc)
+        return False
+    finally:
+        conn.close()
+
+
+def clear_expected(company_key):
+    """Undo mark_expected — the company is reported again from the next digest."""
+    conn = get_conn()
+    try:
+        conn.execute("UPDATE company_health SET expected_state = NULL, expected_at = NULL "
+                     "WHERE company_key = ?", (str(company_key),))
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("company_health: clear_expected failed (company=%r): %s", company_key, exc)
+    finally:
+        conn.close()
 
 
 def mark_reported():

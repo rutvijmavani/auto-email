@@ -780,9 +780,13 @@ def init_db():
             flag_line      DOUBLE PRECISION,
             band_from      TEXT,                -- 'own' | 'peers'
             reported_state TEXT,
-            reported_at    TIMESTAMP
+            reported_at    TIMESTAMP,
+            expected_state TEXT,                -- state the user marked "expected" in Discover; silences the digest while state stays equal
+            expected_at    TIMESTAMP
         )
     """)
+    for _col in ("expected_state TEXT", "expected_at TIMESTAMP"):
+        c.execute(f"ALTER TABLE company_health ADD COLUMN IF NOT EXISTS {_col}")
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_company_health_state
         ON company_health(state)
