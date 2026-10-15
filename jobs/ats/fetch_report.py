@@ -53,7 +53,8 @@ class FetchReport:
     reported_total:   Optional[int] = None
     total_source:     Optional[str] = None
     repeated_pages:   int = 0
-    advisory_total:   bool = False            # the platform may serve fewer rows than it reports
+    reported_pages:   Optional[int] = None    # board says it spans this many pages (iCIMS "Page 1 of N"); `pages` = pages that returned jobs
+    advisory_total:   bool = False           # the platform may serve fewer rows than it reports
     complete:         Optional[bool] = None
     server_short:     bool = False
     note:             str = ""
@@ -74,6 +75,9 @@ class FetchReport:
         self.server_short = False
         if self.stop_reason in FAILED_STOPS:
             self.complete = False
+        elif self.stop_reason in CLEAN_STOPS and self.reported_total is None and self.reported_pages is not None:
+            # A page total (no job total): the server ran dry, so it must have done so on the last page.
+            self.complete = self.pages >= self.reported_pages
         elif self.stop_reason not in CLEAN_STOPS or self.reported_total is None:
             self.complete = None
         elif self.fetched_distinct >= self.reported_total * (1 - self._tolerance_pct() / 100):

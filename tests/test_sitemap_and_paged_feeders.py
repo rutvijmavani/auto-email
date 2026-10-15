@@ -303,6 +303,57 @@ class TestIcims(unittest.TestCase):
         with patch.object(icims, "_resolve_base_url", return_value=None):
             self.assertEqual(fr.report_of(icims.fetch_jobs("slug", "Co")).stop_reason, fr.STOP_NO_CONFIG)
 
+    def _run_with_total(self, listing, pages_total):
+        from jobs.ats import icims
+        it = iter(listing)
+
+        def page(*a, info=None, **k):
+            if info is not None and pages_total is not None:
+                info.setdefault("pages_total", pages_total)
+            return next(it)
+
+        with patch.object(icims, "_resolve_base_url", return_value="https://b"), \
+             patch.object(icims, "_fetch_listing_page", side_effect=page), \
+             patch.object(icims.time, "sleep"):
+            return fr.report_of(icims.fetch_jobs("slug", "Co"))
+
+    def test_all_pages_read_is_complete(self):
+        rep = self._run_with_total([[{"job_id": "1"}], [{"job_id": "2"}], []], 2)
+        self.assertEqual((rep.pages, rep.reported_pages), (2, 2))
+        self.assertTrue(rep.complete)
+
+    def test_server_ran_dry_before_last_page_is_incomplete(self):
+        rep = self._run_with_total([[{"job_id": "1"}], []], 4)
+        self.assertEqual(rep.stop_reason, fr.STOP_EMPTY_PAGE)
+        self.assertFalse(rep.complete)
+        self.assertEqual(rep.note, "read 1 of 4 pages")
+
+    def test_page_cap_below_board_pages_is_incomplete_with_note(self):
+        from jobs.ats import icims
+        n = {"i": 0}
+
+        def listing(*a, info=None, **k):
+            n["i"] += 1
+            if info is not None:
+                info.setdefault("pages_total", icims.MAX_PAGES + 5)
+            return [{"job_id": str(n["i"])}]
+
+        with patch.object(icims, "_resolve_base_url", return_value="https://b"), \
+             patch.object(icims, "_fetch_listing_page", side_effect=listing), \
+             patch.object(icims.time, "sleep"):
+            rep = fr.report_of(icims.fetch_jobs("slug", "Co"))
+        self.assertEqual(rep.stop_reason, fr.STOP_PAGE_CAP)
+        self.assertFalse(rep.complete)
+        self.assertEqual(rep.note, f"read {icims.MAX_PAGES} of {icims.MAX_PAGES + 5} pages")
+
+    def test_page_total_parsed_from_header(self):
+        from bs4 import BeautifulSoup
+        from jobs.ats import icims
+        html = ('<div class="container-fluid iCIMS_SearchResultsHeader"><h2 class="iCIMS_SubHeader">'
+                'Search Results\nPage 1 of 4 \n</h2></div><div class="iCIMS_Paging">Page 2 of 4</div>')
+        self.assertEqual(icims._page_total(BeautifulSoup(html, "html.parser")), 4)
+        self.assertIsNone(icims._page_total(BeautifulSoup("<p>Page 1 of 4</p>", "html.parser")))
+
 
 class TestPaycom(unittest.TestCase):
 
@@ -334,6 +385,49 @@ class TestPaycom(unittest.TestCase):
         from jobs.ats import paycom
         with patch.object(paycom, "_parse_slug", return_value=("", "")):
             self.assertEqual(fr.report_of(paycom.fetch_jobs("x", "Co")).stop_reason, fr.STOP_NO_CONFIG)
+
+    def _run_total(self, batches, total):
+        from jobs.ats import paycom
+        it = iter(batches)
+
+        def search(*a, info=None, **k):
+            if info is not None and total is not None:
+                info.setdefault("total", total)
+            return next(it, [])
+
+        with patch.object(paycom, "_parse_slug", return_value=("h", "k")), \
+             patch.object(paycom, "_get_session", return_value=(object(), "jwt", "api")), \
+             patch.object(paycom, "_search_page", side_effect=search), \
+             patch.object(paycom, "_preview_to_stub",
+                          side_effect=lambda p, h, k, c: {"job_id": str(p["jobId"]), "job_url": f"u{p['jobId']}"}):
+            return fr.report_of(paycom.fetch_jobs("slug", "Co"))
+
+    def test_total_matched_is_complete(self):
+        rep = self._run_total([[{"jobId": 1}, {"jobId": 2}]], 2)
+        self.assertEqual((rep.reported_total, rep.total_source), (2, fr.TOTAL_ATS))
+        self.assertTrue(rep.complete)
+
+    def test_total_larger_than_fetched_is_incomplete(self):
+        rep = self._run_total([[{"jobId": 1}, {"jobId": 2}]], 50)
+        self.assertEqual(rep.stop_reason, fr.STOP_EMPTY_PAGE)
+        self.assertFalse(rep.complete)
+
+    def test_zero_total_empty_board_is_complete(self):
+        self.assertTrue(self._run_total([[]], 0).complete)
+
+    def test_search_page_reads_count_field(self):
+        from jobs.ats import paycom
+
+        class Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"jobPostingPreviews": [{"jobId": 1}], "jobPostingPreviewsCount": 105}
+
+        class Sess:
+            def post(self, *a, **k): return Resp()
+
+        info = {}
+        self.assertEqual(paycom._search_page(Sess(), "j", "api", "h", "k", 0, info=info), [{"jobId": 1}])
+        self.assertEqual(info, {"total": 105})
 
 
 class TestCustomCareerPaginate(unittest.TestCase):
