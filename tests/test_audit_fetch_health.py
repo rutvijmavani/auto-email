@@ -119,6 +119,27 @@ def test_verdict_ok_unverified_failed_and_error():
     assert _run([], exc=audit.IncompleteSearchError(_jobs(4)))["verdict"] == "FAILED_STOP"
 
 
+def test_verdict_short_for_advisory_server_short():
+    # advisory total (Taleo): 60 of 100 is within FETCH_SERVER_SHORT_MIN_PCT -> complete=True but server_short
+    jobs = _with_report(60, stop_reason="all_pages", reported_total=100, advisory_total=True, total_source="ats", pages=1)
+    res = _run(jobs)
+    assert res["verdict"] == "SHORT"
+    # 10 of 100 is far under -> complete=False -> SHORT as well
+    jobs = _with_report(10, stop_reason="all_pages", reported_total=100, advisory_total=True, total_source="ats", pages=1)
+    assert _run(jobs)["verdict"] == "SHORT"
+
+
+def test_csv_safe_escapes_formula_cells(tmp_path):
+    from collections import Counter
+    assert audit._csv_safe("=1+1") == "'=1+1" and audit._csv_safe("@x") == "'@x"
+    assert audit._csv_safe("-5") == "'-5" and audit._csv_safe("ok") == "ok" and audit._csv_safe(-3) == -3
+    results = [{"display_name": "=EVIL", "rejected_titles": Counter({"+cmd chef": 3})}]
+    path = str(tmp_path / "t.csv")
+    audit._write_title_reports(results, path)
+    lines = open(path, encoding="utf-8").read().splitlines()
+    assert lines[1] == "'+cmd chef,3,1,'=EVIL"
+
+
 def test_filter_funnel_counts_and_rejected_titles():
     jobs = [
         {"title": "Software Engineer", "job_url": "u1", "job_id": "1", "location": "New York, NY"},

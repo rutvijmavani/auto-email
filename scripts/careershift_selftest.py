@@ -144,7 +144,7 @@ def _ensure_session(context, page, session_file):
         _capture(page, "02_after_form_login")
     else:
         print("[WARN] No credentials found in .env for this user.")
-    page.goto(_DASHBOARD, wait_until="domcontentloaded", timeout=30000)
+    # No dashboard navigation before the operator confirms: it would yank the page away mid SSO/MFA.
     if not _is_logged_in(page):
         print("\n[ACTION] Complete the login (SSO/MFA) in the browser window, wait for the")
         print("         CareerShift dashboard, then press Enter here.")
@@ -209,7 +209,11 @@ def run(args):
             if not stage("session/login", _ensure_session(context, page, session_file)):
                 return results
 
-            before = _read_quota(page)
+            try:
+                before = _read_quota(page)
+            except Exception as exc:  # noqa: BLE001 — unreadable quota must not abort the run
+                print(f"   [quota] read failed: {type(exc).__name__}: {exc}")
+                before = None
             _capture(page, "04_quota_page")
             if not stage("quota readable (before)", before is not None, f"remaining={before}"):
                 print("[INFO] Old quota page is gone (the UI moved to app.careershift.com).")
@@ -260,7 +264,11 @@ def run(args):
                 stage("email matches DB", bool(email) and email.lower() == args.email.lower(),
                       f"expected={args.email}")
 
-            after = _read_quota(page)
+            try:
+                after = _read_quota(page)
+            except Exception as exc:  # noqa: BLE001
+                print(f"   [quota] read failed: {type(exc).__name__}: {exc}")
+                after = None
             stage("quota unchanged (no burn)", after == before, f"before={before} after={after}")
             context.storage_state(path=session_file)
         finally:

@@ -27,7 +27,7 @@ A flag is a lead, not a verdict: open the company's careers page and compare the
 
 CSV verdict column (sorted so the rows to open by hand come first):
   ERROR        fetch raised
-  SHORT        the ATS's own reported total is higher than what we fetched (FetchReport.complete=False after a clean stop)
+  SHORT        the ATS's own reported total is higher than what we fetched (FetchReport.complete=False after a clean stop, or server_short=True on an advisory total)
   FAILED_STOP  the paging loop was cut short (repeat_page/request_failed/page_cap/no_config, or a partial result)
   UNVERIFIED   clean read but the platform exposes no total — only a manual look can confirm it
   OK           the ATS total matched what we fetched
@@ -88,8 +88,8 @@ def _verdict(out: dict, rep) -> str:
     UNVERIFIED (clean read but the platform exposes no total — check by hand) / OK (complete=True)."""
     if "FETCH_ERROR" in out["flags"]:
         return "ERROR"
-    if rep.complete is False and rep.stop_reason in CLEAN_STOPS:
-        return "SHORT"
+    if rep.server_short or (rep.complete is False and rep.stop_reason in CLEAN_STOPS):
+        return "SHORT"      # server_short: complete=True only because the advisory total is unreliable — still inspect
     if rep.complete is False or "PARTIAL_FETCH" in out["flags"]:
         return "FAILED_STOP"
     if rep.complete is None:
@@ -262,6 +262,15 @@ def _audit_one(row: dict, stored: dict, round_counts: set, careers: dict = None,
 
 
 _TERM_MIN_COUNT = 3
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Neutralise spreadsheet formula injection: text cells (job titles, errors, notes come from remote
+    ATS/DB data) that start with = + - @ are prefixed with an apostrophe. Non-strings pass through."""
+    if isinstance(value, str) and value.startswith(_FORMULA_PREFIXES):
+        return "'" + value
+    return value
 
 
 def _write_title_reports(results: list, titles_path: str) -> tuple:
@@ -280,7 +289,7 @@ def _write_title_reports(results: list, titles_path: str) -> tuple:
         writer = csv.writer(fh)
         writer.writerow(["title", "jobs", "companies", "example_company"])
         for title, n in titles.most_common():
-            writer.writerow([title, n, len(companies[title]), sorted(companies[title])[0]])
+            writer.writerow([_csv_safe(title), n, len(companies[title]), _csv_safe(sorted(companies[title])[0])])
 
     terms = Counter()
     for title in titles:
@@ -293,7 +302,7 @@ def _write_title_reports(results: list, titles_path: str) -> tuple:
         writer.writerow(["term", "distinct_titles"])
         for term, n in terms.most_common():
             if n >= _TERM_MIN_COUNT:
-                writer.writerow([term, n])
+                writer.writerow([_csv_safe(term), n])
     return len(titles), sum(titles.values())
 
 
@@ -343,7 +352,7 @@ def main(argv=None) -> int:
         writer = csv.DictWriter(fh, fieldnames=_COLUMNS, extrasaction="ignore")
         writer.writeheader()
         for res in results:
-            writer.writerow({**res, "flags": " ".join(res["flags"])})
+            writer.writerow({k: _csv_safe(v) for k, v in {**res, "flags": " ".join(res["flags"])}.items()})
 
     n_titles, n_rejected = _write_title_reports(results, args.titles_out)
     tot = {k: sum(int(r.get(k) or 0) for r in results) for k in ("raw", "n_location_pass", "n_title_pass", "n_both_pass")}

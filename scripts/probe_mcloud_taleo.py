@@ -61,27 +61,32 @@ _MAX_REDIRECTS = 5
 
 def _safe_url(url):
     """http(s) only, and the host must not resolve to a private/loopback address."""
-    parts = urlparse(url)
-    return parts.scheme in ("http", "https") and bool(parts.hostname) and not is_private_host(parts.hostname)
+    try:
+        parts = urlparse(url)
+        host = parts.hostname
+    except ValueError:      # malformed (e.g. bad IPv6 bracket) -> not fetchable
+        return False
+    return parts.scheme in ("http", "https") and bool(host) and not is_private_host(host)
 
 
 def _get(url):
-    """GET with redirects followed by hand so the initial URL and every hop pass the private-host check."""
+    """GET with redirects followed by hand so the initial URL and every hop pass the private-host check.
+    Returns (html, final_url); html is "" on any failure. Callers resolve links against final_url."""
     try:
         for _ in range(_MAX_REDIRECTS + 1):
             if not _safe_url(url):
-                return ""
+                return "", url
             resp = requests.get(url, headers=_HEADERS, timeout=MCLOUD_PROBE_TIMEOUT, allow_redirects=False)
             if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location")
                 if not location:
-                    return ""
+                    return "", url
                 url = urljoin(url, location)
                 continue
-            return resp.text if resp.status_code == 200 else ""
-        return ""   # redirect chain too long
-    except requests.RequestException:
-        return ""
+            return (resp.text if resp.status_code == 200 else ""), url
+        return "", url   # redirect chain too long
+    except (requests.RequestException, ValueError):
+        return "", url
 
 
 def _candidates(row):
@@ -104,7 +109,7 @@ def _scan_company(row):
         if url in seen:
             continue
         seen.add(url)
-        html = _get(url)
+        html, final_url = _get(url)
         if not html:
             continue
         found["pages_scanned"] += 1
@@ -116,12 +121,19 @@ def _scan_company(row):
                 found["matched_url"] = url
                 found["uuids"] = uuids
                 return found
-        host = urlparse(url).netloc
+        try:
+            host = urlparse(final_url).netloc      # links are relative to where the page actually came from
+        except ValueError:
+            continue
         for href in _LINK_RE.findall(html):
             if followed >= MCLOUD_PROBE_MAX_LINKS:
                 break
-            full = urljoin(url, href)
-            if urlparse(full).netloc == host and _LINK_HINT.search(urlparse(full).path) and full not in seen:
+            try:
+                full = urljoin(final_url, href)
+                parsed = urlparse(full)
+            except ValueError:                      # malformed href — skip it, keep scanning
+                continue
+            if parsed.netloc == host and _LINK_HINT.search(parsed.path) and full not in seen:
                 queue.append(full)
                 followed += 1
     return found
@@ -145,9 +157,13 @@ def _mcloud_jobs(uuid):
         if not isinstance(data, dict):
             return jobs, total, False
         total = data.get("totalHits", total)
-        rows = data.get("searchResults") or []
+        rows = data.get("searchResults")
+        if rows is None or not isinstance(rows, list):
+            log.warning("m-cloud %s: searchResults missing/not a list at offset %d", uuid, offset)
+            return jobs, total, False
         if not rows:
-            return jobs, total, total is None or offset >= total
+            # an empty page only proves the end when the API told us the total and we have reached it
+            return jobs, total, total is not None and offset >= total
         jobs += [r.get("job", {}) for r in rows]
         offset += len(rows)
         if total is not None and offset >= total:
@@ -167,6 +183,9 @@ def _audit_taleo(row, uuids):
         return rec
     report = report_of(jobs)
     clean = report.stop_reason in CLEAN_STOPS
+    # the gap vs Taleo's total is the signal this probe reports; only the m-cloud ref comparison needs a Taleo
+    # list that is also judged complete (a short list would show phantom "mcloud_only" jobs)
+    comparable = clean and report.complete is not False
     contest = {j["contest_no"] for j in jobs}
     rec.update(reported=report.reported_total, fetched_distinct=len(contest), stop_reason=report.stop_reason)
     if clean:
@@ -181,9 +200,9 @@ def _audit_taleo(row, uuids):
         if not m_complete:
             continue                    # a partial m-cloud list cannot be compared
         refs = {j.get("ref") for j in m_jobs if j.get("ref")}
-        if not clean:
+        if not comparable:
             entry["distinct_refs"] = len(refs)
-            continue                    # nor can a failed Taleo fetch
+            continue                    # nor can a failed or short Taleo fetch
         entry.update({
             "distinct_refs": len(refs),
             "in_taleo": len(refs & contest), "mcloud_only": len(refs - contest), "taleo_only": len(contest - refs),
