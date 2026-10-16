@@ -122,7 +122,7 @@ _CAREER_CONTENT_RE = re.compile(
 
 # Platforms where the slug is opaque (not derived from company name) —
 # skip slug-vs-company validation for these
-_OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm"}
+_OPAQUE_SLUG_PLATFORMS = {"workday", "oracle_hcm", "paradox"}
 
 # Platforms where we detect presence but get the slug from a richer source
 _RICH_SLUG_PLATFORMS = {"phenom", "talentbrew", "avature"}
@@ -465,7 +465,7 @@ def _fetch_and_scan(url, company, session=None):
 
         # Layer 2: deep HTML scan (body read is byte-capped before parsing)
         text = _read_bounded_text(resp)
-        r = _scan_html(text, company)
+        r = _scan_html(text, company, page_url=final_url)
         if r:
             r = _enrich_eightfold_domain(r, final_url)
         return r, text, final_url
@@ -494,9 +494,11 @@ def _fetch_and_scan(url, company, session=None):
 # Layer 2: deep HTML scan
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _scan_html(html, company):
+def _scan_html(html, company, page_url=None):
     """
     Deep HTML scan using BeautifulSoup.
+
+    page_url: the URL the HTML was served from; needed only by host-based fingerprints (Paradox).
 
     Extracts candidate URLs from:
       • Every tag attribute that can hold a URL (src, href, action, data-*)
@@ -585,6 +587,16 @@ def _scan_html(html, company):
             r = {"platform": "successfactors", "slug": json.dumps(slug_info)}
             if _slug_ok(r, company):
                 return r
+
+    # ── Paradox (Olivia) fingerprint — tried LAST so it never relabels a platform above ──
+    # Paradox careers sites live on the tenant's own domain: no vendor URL appears anywhere in the page.
+    # The signal is the embedded window.__PRELOAD_STATE__ JSON carrying a `jobSearch` object (the paradox.ai
+    # chat widget alone — Cinemark, Chipotle — is not enough). The slug is the host the page was served from.
+    if page_url and "__PRELOAD_STATE__" in html:
+        from jobs.ats.paradox import has_paradox_state
+        host = (urlparse(page_url).hostname or "").lower()
+        if host and has_paradox_state(html):
+            return {"platform": "paradox", "slug": json.dumps({"host": host})}
 
     return None
 

@@ -836,6 +836,7 @@ def _build_detail_payload(
         "talentbrew":      [],
         "custom":          [],
         "eightfold":       [],
+        "paradox":         [],   # host is derived from job_url
     }
 
     for key in PLATFORM_DETAIL_KEYS.get(platform, []):

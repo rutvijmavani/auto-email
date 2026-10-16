@@ -334,6 +334,13 @@ All env-overridable in `config.py`.
 | `JIBE_MAX_PAGES` | 200 | Page cap for Jibe (`page=N`, 100 jobs/page); a WARNING is logged if hit |
 | `ORACLE_HCM_MAX_PAGES` | 100 | Page cap for Oracle HCM (200 rows/page = 20,000 jobs); a WARNING is logged if hit |
 | `EIGHTFOLD_MAX_PAGES` | 5000 | Page cap for Eightfold (server returns ~10 rows/page = ~50,000 jobs); a WARNING is logged if hit |
+| `PARADOX_PAGE_SIZE` | 100 | `page_size=` for Paradox listings (honored only for 50/100; others fall back to 25) |
+| `PARADOX_MAX_PAGES` | 200 | Page cap for Paradox listing crawl; hitting it = incomplete |
+| `PARADOX_TIME_BUDGET_S` | 900 | Wall-clock ceiling on one Paradox listing crawl (FedEx ~230s); exceeding it = incomplete (`page_cap`) |
+| `PARADOX_REQUEST_TIMEOUT_S` | 30 | Per-request timeout for Paradox pages (~500 KB each) |
+| `PARADOX_PAGE_RETRIES` | 2 | Extra tries per page (fresh warmed session) before the crawl is reported failed |
+| `PARADOX_RETRY_WAIT_S` | 2 | Pause (× attempt number) before re-warming a session and retrying a failed page |
+| `PARADOX_IMPERSONATE` | chrome146 | curl_cffi browser profile for Paradox; empty = plain `requests` |
 | `JOBVITE_MAX_PAGES` | 200 | Page cap for Jobvite unfiltered `/search?p=N` (50/page); hitting it = incomplete |
 | `JOBVITE_FEED_VERIFY_INTERVAL_H` | 24 | Feed cross-check at most once per company per N hours (Redis gate) |
 | `JOBVITE_FEED_MAX_ATTEMPTS` | 3 | Tries per feed/redirect request answered with 429 |

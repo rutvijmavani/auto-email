@@ -464,6 +464,25 @@ def _extract_jobvite(text):
     return {"platform": "jobvite", "slug": ""}
 
 
+def _detect_paradox(html, page_url):
+    """
+    Paradox (Olivia) careers sites sit on the tenant's own domain, so no keyword in the text identifies
+    them and the slug is the HOST the page came from — which is why this is not in ATS_KEYWORDS (those
+    extractors only see text). Signal: an embedded window.__PRELOAD_STATE__ carrying a `jobSearch` object;
+    the paradox.ai chat widget alone does not qualify. Called by _process_page only after scan() found
+    nothing, so no other platform is ever relabelled.
+    """
+    if "__PRELOAD_STATE__" not in html:
+        return None
+    host = (urlparse(page_url).hostname or "").lower()
+    if not host:
+        return None
+    from jobs.ats.paradox import has_paradox_state
+    if not has_paradox_state(html):
+        return None
+    return {"platform": "paradox", "slug": json.dumps({"host": host})}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Keyword → extractor table
 # Adding a new ATS = one line here + one extract_* function above
@@ -867,6 +886,12 @@ def _process_page(url, session, visited, hits, best, referer=None, company_root=
     # Rule 1: new complete ATS hit in HTML → leaf
     if len(hits) > hits_before:
         logger.debug("[detector] rule1 (HTML): new hit — leaf %s", final_url)
+        return []
+
+    # Paradox: host-based fingerprint, only when the text scan found nothing on this page.
+    _handle(_detect_paradox(html, final_url), "HTML paradox")
+    if len(hits) > hits_before:
+        logger.debug("[detector] rule1 (paradox): new hit — leaf %s", final_url)
         return []
 
     # Company territory confirmed — record this as the first successful company-territory URL.

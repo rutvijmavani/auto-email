@@ -756,7 +756,7 @@ def _scan_career_page(company, career_page_url, domain=None):
             }
 
     from jobs.career_page import _scan_html
-    result = _scan_html(html, "")
+    result = _scan_html(html, "", page_url=final_url)
     if result and result.get("platform") not in HARD_ATS:
         return result
 

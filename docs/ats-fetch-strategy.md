@@ -492,6 +492,13 @@ ATS_TIER1_CONFIG = {
         "date_format":       "iso",
         "page_size":         20,
     },
+    # paradox: listing = /jobs/page/N?page_size=100 (only 50/100 honoured) parsed from
+    # window.__PRELOAD_STATE__ (jobSearch.totalJob = TOTAL_ATS); detail = JSON-LD JobPosting.
+    "paradox": {
+        "detail_needed":     True,
+        "sorted_by_recency": False,
+        "page_size":         100,
+    },
     "taleo": {
         "detail_needed":     True,
         "sorted_by_recency": False,

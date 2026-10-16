@@ -29,7 +29,7 @@ from jobs.ats import (
     greenhouse, lever, ashby, smartrecruiters, workday,
     oracle_hcm, icims, jobvite, avature, phenom,
     talentbrew, sitemap, successfactors, google,
-    taleo, eightfold, jibe, custom_career, adp, paycom,
+    taleo, eightfold, jibe, custom_career, adp, paycom, paradox,
 )
 
 ATS_REGISTRY = {
@@ -268,6 +268,20 @@ ATS_REGISTRY = {
         "country_source": "text",
     },
 
+    "paradox": {
+        # Paradox (Olivia) careers site on the tenant's own domain (careers.fedex.com).
+        # Listing rows carry locations[].countryAbbr (alpha-2) → stored as _country_code, so the
+        # listing-level alpha-2 gate drops non-US before any detail fetch. Description and posted date
+        # exist only on the detail page (JSON-LD JobPosting). Slug is JSON {"host": "..."}.
+        "module":          paradox,
+        "slug_type":       "json",
+        "detect_phases":   ["career_page"],
+        "site_search":     None,
+        "listing_filter":  "full",
+        "has_detail":      True,
+        "country_source":  "alpha2",
+    },
+
     # ── Custom: catch-all for companies with curl-captured ATS configs ────────
 
     "custom": {
@@ -329,6 +343,7 @@ SLUG_REQUIRED_KEYS = {
     "taleo":          ("company",),
     "eightfold":      ("slug",),
     "paycom":         ("host", "key"),
+    "paradox":        ("host",),
     "google":         (),            # one global feed — the slug is ignored
 }
 

@@ -18,6 +18,7 @@ FULL = {
     "taleo":          {"company": "acme"},
     "eightfold":      {"slug": "acme"},
     "paycom":         {"host": "www.paycomonline.net", "key": "abc"},
+    "paradox":        {"host": "careers.example.com"},
     "google":         {"any": "thing"},
 }
 
