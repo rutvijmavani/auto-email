@@ -220,6 +220,7 @@ MONITOR_PLATFORM_CONCURRENCY = {
     "jobvite":          3,
     "successfactors":   2,   # slow avg (7161ms) — keep low
     "avature":          2,
+    "paradox":          2,   # bot-managed tenant host (Akamai), ~500KB listing pages — keep low
     "custom":           5,   # varies per company
     # default for unlisted: 5
 }
@@ -734,6 +735,7 @@ CONCURRENCY_FLOOR = {
     "jobvite":         1,
     "successfactors":  1,
     "avature":         1,
+    "paradox":         1,
     "custom":          1,
 }
 CONCURRENCY_FLOOR_DEFAULT = 1
@@ -751,6 +753,7 @@ CONCURRENCY_CEIL = {
     "jobvite":         4,
     "successfactors":  3,
     "avature":         3,
+    "paradox":         3,
     "custom":          6,
 }
 CONCURRENCY_CEIL_DEFAULT = 6
