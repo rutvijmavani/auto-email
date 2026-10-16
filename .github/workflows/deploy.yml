@@ -53,7 +53,13 @@ jobs:
       # ── Deploy exact validated commit to Oracle VM ─
       - name: Deploy to Oracle VM
         uses: appleboy/ssh-action@v1.0.3
+        env:
+          # Health gate retries: a restart re-dispatches many scans at once, so the
+          # first snapshot can show a transient detail-queue surge that drains on its own.
+          HEALTH_RETRY_MAX:      ${{ vars.HEALTH_RETRY_MAX || '5' }}
+          HEALTH_RETRY_INTERVAL: ${{ vars.HEALTH_RETRY_INTERVAL || '60' }}
         with:
+          envs:            HEALTH_RETRY_MAX,HEALTH_RETRY_INTERVAL
           host:            ${{ secrets.VM_HOST }}
           username:        ${{ secrets.VM_USER }}
           key:             ${{ secrets.VM_SSH_KEY }}
@@ -225,7 +231,24 @@ jobs:
             echo "  Running health check to verify pipeline state..."
             sleep 70   # fullscan_worker writes heartbeat every 60s — wait at least that long
             source venv/bin/activate
-            if ! python scripts/health_check.py; then
+
+            # Retry the health check: pass on the first healthy result, fail only if
+            # every attempt fails (a post-restart queue surge usually drains by then).
+            _health_with_retry() {
+              local _max="${HEALTH_RETRY_MAX:-5}" _gap="${HEALTH_RETRY_INTERVAL:-60}" _i
+              for ((_i = 1; _i <= _max; _i++)); do
+                if python scripts/health_check.py; then
+                  return 0
+                fi
+                if (( _i < _max )); then
+                  echo "  Health check attempt $_i/$_max failed — retrying in ${_gap}s"
+                  sleep "$_gap"
+                fi
+              done
+              return 1
+            }
+
+            if ! _health_with_retry; then
               echo "[ERROR] Health check failed — rolling back to $PREVIOUS_SHA"
               _rollback_to_sha "$PREVIOUS_SHA"
 
@@ -243,7 +266,7 @@ jobs:
 
               echo "[ROLLBACK] Re-running health check to confirm pipeline is healthy..."
               sleep 70
-              if ! python scripts/health_check.py; then
+              if ! _health_with_retry; then
                 echo "[FATAL] Health check still failing after rollback to $PREVIOUS_SHA"
                 echo "[FATAL] Pipeline is unhealthy — manual intervention required"
                 exit 1
