@@ -345,6 +345,8 @@ All env-overridable in `config.py`.
 | `WORKDAY_RESULT_CAP` | 2000 | Workday's per-query result cap (used in warnings) |
 | `WORKDAY_FACET_SPLIT_AT` | 1900 | Page-1 total at/above which the board is fetched one facet value at a time |
 | `WORKDAY_SPLIT_FACETS` | `jobFamilyGroup,timeType,workerSubType,locations` | Facets tried in order when splitting |
+| `FULLSCAN_PARTIAL_MAX_RETRIES` | 3 | Hourly fullscan retries after a `request_failed` fetch; past this the scan completes with its incomplete verdict recorded |
+| `FULLSCAN_PARTIAL_RETRY_TTL_S` | 86400 | Expiry of the per-company retry counter (Redis key prefix `REDIS_FULLSCAN_PARTIAL_PREFIX`); cleared when a scan completes |
 | `AUDIT_*` | see `config.py` | Thresholds for `scripts/audit_fetch_health.py` (read-only under-fetch audit) |
 | `PROBE_MAX_CALLS`, `PROBE_MAX_SCALARS` | 4, 60 | Responses / scalar fields recorded per company by `scripts/probe_feeder_totals.py` |
 | `FETCH_TOLERANCE_PCT` | 5 | Percent shortfall vs the ATS-reported total still counted as a complete fetch (0 for exact feed-count totals, e.g. SuccessFactors) |

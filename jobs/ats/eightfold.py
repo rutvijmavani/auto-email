@@ -237,7 +237,7 @@ def fetch_jobs(slug_info, company):
             stop_reason = STOP_REPEAT_PAGE
             break
 
-        if start >= total:
+        if total and start >= total:
             break
     else:
         stop_reason = STOP_PAGE_CAP

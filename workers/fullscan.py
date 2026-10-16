@@ -131,6 +131,9 @@ from config import (
     STREAM_CONSUMER_GROUP,
     STREAM_BLOCK_MS,
     WARMING_POLLS_COUNT,
+    REDIS_FULLSCAN_PARTIAL_PREFIX,
+    FULLSCAN_PARTIAL_MAX_RETRIES,
+    FULLSCAN_PARTIAL_RETRY_TTL_S,
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import Heartbeat
@@ -378,6 +381,33 @@ def _release_lock(company: str, r) -> None:
         current = current.decode()
     if current == WORKER_ID:
         r.delete(key)
+
+
+def _partial_retry_allowed(r, company: str) -> bool:
+    """
+    Count one more request_failed fetch for `company`; True while it is within FULLSCAN_PARTIAL_MAX_RETRIES.
+    Past the budget the scan completes with its incomplete verdict instead of retrying hourly forever.
+    A Redis failure allows the retry (the previous behaviour).
+    """
+    key = f"{REDIS_FULLSCAN_PARTIAL_PREFIX}:{company}"
+    try:
+        n = int(r.incr(key))
+        r.expire(key, FULLSCAN_PARTIAL_RETRY_TTL_S)
+    except Exception as exc:
+        logger.warning("fullscan partial-retry counter failed for %s: %s", company, exc)
+        return True
+    if n > FULLSCAN_PARTIAL_MAX_RETRIES:
+        logger.warning("fullscan %s: request_failed %d times in a row — completing with incomplete verdict", company, n)
+        return False
+    return True
+
+
+def _clear_partial_retries(r, company: str) -> None:
+    """Reset the request_failed retry counter after a scan completes."""
+    try:
+        r.delete(f"{REDIS_FULLSCAN_PARTIAL_PREFIX}:{company}")
+    except Exception as exc:
+        logger.warning("fullscan partial-retry counter clear failed for %s: %s", company, exc)
 
 
 def _defer_adaptive_first(company: str, r) -> None:
@@ -1105,7 +1135,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         elif _report.complete is False and _report.stop_reason == STOP_REQUEST_FAILED:
             # Only a transient failure is worth the hourly retry; structural incompleteness (page cap,
             # repeat page, shortfall) would loop forever, so it completes normally with its verdict recorded.
-            _partial_fetch = True
+            # A failure that never clears gets the same treatment once the retry budget is spent.
+            _partial_fetch = _partial_retry_allowed(r, company)
         record_scan(
             company, platform, SOURCE_FULLSCAN, _report,
             raw_count=len(raw_jobs), valid_count=len(valid_jobs),
@@ -1365,6 +1396,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # Capture whether this is the first full scan BEFORE updating DB
             # (last_poll_at IS NULL = company has never had an adaptive scan).
             is_first_fullscan = (fs_state.get("last_poll_at") is None)
+
+            # Scan completed — a later transient failure gets a fresh retry budget.
+            _clear_partial_retries(r, company)
 
             # Promote NEW bloom → OLD (DEL old, RENAME new → old, set TTL).
             # The promoted OLD bloom now reflects the complete current board

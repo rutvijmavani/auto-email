@@ -1055,7 +1055,6 @@ def _process_company(company_row, position, total, _r=None):
         _scan_complete = False
         logger.warning("%s: fetch incomplete (stop=%s, fetched=%d, reported=%s) — absence tracking skipped",
                        company, _report.stop_reason, _report.fetched_distinct, _report.reported_total)
-    record_scan(company, platform, SOURCE_MONITOR, _report, raw_count=len(raw_jobs))
 
     # Filter out entries missing job_url before processing
     initial_count = len(raw_jobs)
@@ -1087,6 +1086,17 @@ def _process_company(company_row, position, total, _r=None):
                          len(missing_ids), company)
 
     if not raw_jobs:
+        record_scan(company, platform, SOURCE_MONITOR, _report, raw_count=initial_count,
+                    valid_count=0, matched_count=0)
+        if _report.complete is False:
+            # An incomplete fetch that returned nothing is a failed scan, not an empty board:
+            # it must not advance the empty-days counter that drives re-detection.
+            logger.warning("No usable jobs for %r and the fetch was incomplete (stop=%s) — scan failed",
+                           company, _report.stop_reason)
+            result["failed"]       = 1
+            result["failure_name"] = company
+            print(f"  [{position}/{total}] {company} — fetch incomplete")
+            return result
         logger.info("No jobs returned for %r", company)
         update_company_check(company, found_jobs=False)
         # Re-check threshold with the just-incremented count — the pre-run check at the
@@ -1117,6 +1127,8 @@ def _process_company(company_row, position, total, _r=None):
     logger.debug("Filter: %d raw → %d matched for %r",
                  len(raw_jobs), len(matched), company)
     result["matched"] = len(matched)
+    record_scan(company, platform, SOURCE_MONITOR, _report, raw_count=initial_count,
+                valid_count=len(raw_jobs), matched_count=len(matched))
 
     is_first_scan = company_row.get("first_scanned_at") is None
     if is_first_scan:

@@ -52,6 +52,13 @@ def test_eightfold_failed_page_warns_and_keeps_partial(caplog):
     assert any("request_failed" in r.getMessage() for r in caplog.records)
 
 
+def test_eightfold_unreported_total_keeps_paging_to_empty_page():
+    # total=0 means "count not reported" — must not end the loop after the first page
+    real = _ef_pages(35)
+    jobs = _ef_run(lambda s, sl, d, b, start, t, p: (real(s, sl, d, b, start, t, p)[0], 0, 200))
+    assert len(jobs) == 35
+
+
 def test_eightfold_repeated_page_stops_without_duplicates():
     same = [_pos(i + 1) for i in range(10)]
     jobs = _ef_run(lambda *a: (same, 100, 200))

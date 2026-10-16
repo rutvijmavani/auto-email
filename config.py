@@ -841,6 +841,11 @@ INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2× max scan timeout
 # ── Full scan (Section 9) ─────────────────────────────────────────────────────
 FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
 FULLSCAN_BLOOM_ERROR_RATE      = 0.001      # 0.1% false positive rate
+# Hourly retries after a fetch that ended request_failed. Past the limit the scan completes normally with its
+# incomplete verdict recorded, so a board that always fails mid-way is not retried forever.
+REDIS_FULLSCAN_PARTIAL_PREFIX  = "fullscan:partial_retries"   # key: {prefix}:{company}
+FULLSCAN_PARTIAL_MAX_RETRIES   = int(os.getenv("FULLSCAN_PARTIAL_MAX_RETRIES", "3"))
+FULLSCAN_PARTIAL_RETRY_TTL_S   = int(os.getenv("FULLSCAN_PARTIAL_RETRY_TTL_S", str(24 * 3600)))   # counter resets after a quiet day
 
 # ── Adaptive seen cache (Section 12 / 13) ────────────────────────────────────
 # Per-company Redis SET tracking all job IDs touched by adaptive scan today.
