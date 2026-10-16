@@ -51,7 +51,7 @@ from jobs.ats_detector import (
 )
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
-from jobs.ats.fetch_report import STOP_REQUEST_FAILED, failed, report_of
+from jobs.ats.fetch_report import STOP_NO_CONFIG, STOP_REQUEST_FAILED, failed, report_of
 from db.scan_health import SOURCE_MONITOR, record_scan
 from jobs.job_filter import (
     filter_jobs, filter_jobs_title_only, is_us_location,
@@ -1088,9 +1088,11 @@ def _process_company(company_row, position, total, _r=None):
     if not raw_jobs:
         record_scan(company, platform, SOURCE_MONITOR, _report, raw_count=initial_count,
                     valid_count=0, matched_count=0)
-        if _report.complete is False:
+        if _report.complete is False and _report.stop_reason != STOP_NO_CONFIG:
             # An incomplete fetch that returned nothing is a failed scan, not an empty board:
             # it must not advance the empty-days counter that drives re-detection.
+            # no_config (unusable slug / undiscoverable target) is the exception — that is exactly
+            # what re-detection repairs, so it continues down the empty-results path.
             logger.warning("No usable jobs for %r and the fetch was incomplete (stop=%s) — scan failed",
                            company, _report.stop_reason)
             result["failed"]       = 1

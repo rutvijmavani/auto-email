@@ -209,7 +209,8 @@ def fetch_jobs(slug_info, company):
             pages            = 1,
             fetched_distinct = count_distinct(out),
             unusable         = len(jobs) - len(out),
-            reported_total   = counts["raw"],
+            # rows dropped for lacking a JobTitle are deliberate, not parse loss
+            reported_total   = counts["raw"] - (len(jobs) - len(out)),
             total_source     = TOTAL_FEED_COUNT,
         ))
 

@@ -57,6 +57,14 @@ class TestSuccessFactorsParsing(unittest.TestCase):
         self.assertEqual(jobs.report.fetched_distinct, 2)
         self.assertEqual(jobs.report.unusable, 1)
 
+    def test_title_less_rows_are_not_a_shortfall(self):
+        feed = ('<?xml version="1.0" encoding="UTF-8"?><Jobs>'
+                + _job(1) + _job(2) + "<Job><ReqId>9</ReqId></Job></Jobs>")
+        with patch.object(sf, "fetch_html", return_value=_resp(feed)):
+            jobs = sf.fetch_jobs(SLUG, "Capgemini")
+        self.assertEqual(jobs.report.reported_total, 2)
+        self.assertTrue(jobs.report.complete)
+
     def test_unnamed_tags_do_not_truncate_detect_sample(self):
         feed = _feed(5, extra="<>123</>")
         with patch.object(sf, "fetch_html", return_value=_resp(feed)):
