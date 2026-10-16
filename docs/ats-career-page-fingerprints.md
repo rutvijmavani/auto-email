@@ -806,6 +806,20 @@ https://careers.{company}.com/...                         ← custom domain, met
 
 ---
 
+### Paradox (Olivia) — host-aware, no keyword
+
+**Invariant:** none — tenants live on the company's own domain (e.g. `careers.fedex.com`), so there is no URL regex and it is NOT in `ATS_KEYWORDS`.
+
+**Fingerprint:** the page embeds `window.__PRELOAD_STATE__ = {...}` whose JSON holds a `jobSearch` object. Both are required (`paradox.has_paradox_state`). The `paradox.ai` chat widget alone (Cinemark, Chipotle) is NOT a Paradox careers site.
+
+**Slug:** `{"host": "<page hostname>"}` — taken from the final URL of the page that carried the state.
+
+**Where checked:** `career_page._scan_html(page_url=...)` (phase 3/6, `prospective_form_sync`) and `career_detector._detect_paradox` (phase 7). Tried LAST so no existing platform is relabelled.
+
+**Confirmed examples:** FedEx (`careers.fedex.com`).
+
+---
+
 <!-- Add platforms below in this format:
 
 ### {Platform Name}

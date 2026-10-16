@@ -447,6 +447,7 @@ class TestRequiredDetailKeysConsistency(unittest.TestCase):
         "talentbrew":      [],
         "custom":          [],
         "eightfold":       [],
+        "paradox":         [],
     }
 
     def test_required_keys_platforms_exist_in_forwarding_table(self):

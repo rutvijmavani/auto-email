@@ -122,6 +122,15 @@ ORACLE_HCM_MAX_PAGES        = int(os.getenv("ORACLE_HCM_MAX_PAGES", "100"))     
 # jobs/ats/eightfold.py — offset paging, the server returns ~10 rows/page whatever num= says
 EIGHTFOLD_MAX_PAGES         = int(os.getenv("EIGHTFOLD_MAX_PAGES", "5000"))      # x ~10 per page = ~50,000 jobs (Starbucks ~21,500 today); hitting it = incomplete
 
+# jobs/ats/paradox.py — Paradox (Olivia) careers sites: /jobs/page/N HTML with an embedded __PRELOAD_STATE__ JSON
+PARADOX_PAGE_SIZE           = int(os.getenv("PARADOX_PAGE_SIZE", "100"))         # honored only for 50/100 (FedEx); other values silently fall back to 25
+PARADOX_MAX_PAGES           = int(os.getenv("PARADOX_MAX_PAGES", "200"))         # x 100 per page = 20,000 jobs (FedEx ~4,650 = 47 pages); hitting it = incomplete
+PARADOX_TIME_BUDGET_S       = int(os.getenv("PARADOX_TIME_BUDGET_S", "900"))     # wall-clock ceiling on one listing crawl (FedEx ~230s); exceeding it = incomplete (page_cap)
+PARADOX_REQUEST_TIMEOUT_S   = int(os.getenv("PARADOX_REQUEST_TIMEOUT_S", "30"))  # per-request read timeout (pages are ~500 KB)
+PARADOX_PAGE_RETRIES        = int(os.getenv("PARADOX_PAGE_RETRIES", "2"))        # extra tries per page (fresh warmed session each) before the crawl fails
+PARADOX_RETRY_WAIT_S        = float(os.getenv("PARADOX_RETRY_WAIT_S", "2"))      # pause x attempt number before re-warming and retrying a failed page
+PARADOX_IMPERSONATE        = os.getenv("PARADOX_IMPERSONATE", "chrome146")      # curl_cffi browser profile; empty = plain requests only
+
 # jobs/ats/jobvite.py — unfiltered /search?p=N paging (50 rows/page) + XML-feed completeness check
 JOBVITE_MAX_PAGES             = int(os.getenv("JOBVITE_MAX_PAGES", "200"))            # x 50 per page = 10,000 jobs; hitting it = incomplete
 JOBVITE_FEED_VERIFY_INTERVAL_H = int(os.getenv("JOBVITE_FEED_VERIFY_INTERVAL_H", "24"))  # feed cross-check at most once per company per N hours (Redis gate)
