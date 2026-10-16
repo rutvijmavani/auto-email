@@ -325,6 +325,37 @@ https://docs.google.com/spreadsheets/d/SHEET_ID_HERE/edit
 
 ---
 
+## ATS Feeder Completeness Settings
+
+All env-overridable in `config.py`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `JIBE_MAX_PAGES` | 200 | Page cap for Jibe (`page=N`, 100 jobs/page); a WARNING is logged if hit |
+| `ORACLE_HCM_MAX_PAGES` | 100 | Page cap for Oracle HCM (200 rows/page = 20,000 jobs); a WARNING is logged if hit |
+| `EIGHTFOLD_MAX_PAGES` | 5000 | Page cap for Eightfold (server returns ~10 rows/page = ~50,000 jobs); a WARNING is logged if hit |
+| `JOBVITE_MAX_PAGES` | 200 | Page cap for Jobvite unfiltered `/search?p=N` (50/page); hitting it = incomplete |
+| `JOBVITE_FEED_VERIFY_INTERVAL_H` | 24 | Feed cross-check at most once per company per N hours (Redis gate) |
+| `JOBVITE_FEED_MAX_ATTEMPTS` | 3 | Tries per feed/redirect request answered with 429 |
+| `JOBVITE_FEED_DEFAULT_WAIT_S` | 30 | Wait after a 429 without `Retry-After` |
+| `JOBVITE_FEED_MAX_WAIT_S` | 120 | Ceiling on a server-supplied `Retry-After` |
+| `JOBVITE_FEED_TIMEOUT_S` | 120 | Read timeout for feed requests (feeds 25 KB – 6.6 MB) |
+| `JOBVITE_FEED_TRACE_MAX` | 300 | Max feed-only jobs redirect-traced per check; rest = unresolved |
+| `WORKDAY_PAGE_SIZE` | 20 | Jobs per Workday request |
+| `WORKDAY_RESULT_CAP` | 2000 | Workday's per-query result cap (used in warnings) |
+| `WORKDAY_FACET_SPLIT_AT` | 1900 | Page-1 total at/above which the board is fetched one facet value at a time |
+| `WORKDAY_SPLIT_FACETS` | `jobFamilyGroup,timeType,workerSubType,locations` | Facets tried in order when splitting |
+| `FULLSCAN_PARTIAL_MAX_RETRIES` | 3 | Hourly fullscan retries after a `request_failed` fetch; past this the scan completes with its incomplete verdict recorded |
+| `FULLSCAN_PARTIAL_RETRY_TTL_S` | 86400 | Expiry of the per-company retry counter (Redis key prefix `REDIS_FULLSCAN_PARTIAL_PREFIX`); cleared when a scan completes |
+| `AUDIT_*` | see `config.py` | Thresholds for `scripts/audit_fetch_health.py` (read-only under-fetch audit) |
+| `PROBE_MAX_CALLS`, `PROBE_MAX_SCALARS` | 4, 60 | Responses / scalar fields recorded per company by `scripts/probe_feeder_totals.py` |
+| `FETCH_TOLERANCE_PCT` | 5 | Percent shortfall vs the ATS-reported total still counted as a complete fetch (0 for exact feed-count totals, e.g. SuccessFactors) |
+| `FETCH_SERVER_SHORT_MIN_PCT` | 50 | For advisory totals (Taleo): fetched ≥ this % of the total and a clean stop → `complete=True, server_short=True` |
+| `RETENTION_SCAN_HEALTH_DAYS` | 90 | Days of `scan_health` rows kept (one row per scan/fullscan/monitor fetch) |
+| `MCLOUD_*` | see `config.py` | Settings for `scripts/probe_mcloud_taleo.py` (Taleo m-cloud probe) |
+
+---
+
 ## Full config.py Reference
 
 ```python

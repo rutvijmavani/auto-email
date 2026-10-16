@@ -29,7 +29,7 @@ EMAIL        = os.getenv("NJIT_CAREERSHIFT_EMAIL")
 PASSWORD     = os.getenv("NJIT_CAREERSHIFT_PASSWORD")
 SESSION_FILE = "./data/careershift_session.json"
 
-CAREERSHIFT_NJIT_URL  = "https://www.careershift.com/?sc=njit"
+CAREERSHIFT_NJIT_URL  = "https://njit.careershift.com/signin/njit"
 CAREERSHIFT_DASHBOARD = "https://www.careershift.com/App/Dashboard/Overview"
 
 

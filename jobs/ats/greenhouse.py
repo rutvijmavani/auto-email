@@ -5,6 +5,10 @@
 import html as _html
 
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED,
+    STOP_SINGLE_RESPONSE, TOTAL_ATS, attach, count_distinct,
+)
 from jobs.utils import clean_html
 
 
@@ -46,6 +50,11 @@ def detect(company):
     return None, None
 
 
+def _key(job):
+    """Identity of a raw row for repeat-page detection: id, else url."""
+    return job.get("id") or job.get("absolute_url")
+
+
 def fetch_jobs(slug, company):
     """
     Fetch all jobs for company from Greenhouse.
@@ -54,24 +63,43 @@ def fetch_jobs(slug, company):
     url = BASE_URL.format(slug=slug)
     # Fetch all pages
     all_jobs = []
-    page = 1
+    seen     = set()
+    page     = 1
+    total    = None
+    stop     = STOP_ALL_PAGES
     while True:
         data = fetch_json(url, params={"content": "true", "page": page},
                           platform="greenhouse")  # tracked for api_health
         if not data:
+            stop = STOP_REQUEST_FAILED      # an empty board is still a dict, so falsy means the call failed
             break
         jobs = data.get("jobs", [])
         if not jobs:
+            stop = STOP_EMPTY_PAGE
             break
-        all_jobs.extend(jobs)
-        # Greenhouse meta has total count
-        meta = data.get("meta", {})
-        total = meta.get("total", 0)
-        if len(all_jobs) >= total or len(jobs) == 0:
+        new = [j for j in jobs if _key(j) not in seen]
+        if not new:
+            stop = STOP_REPEAT_PAGE         # the board ignored `page` and sent the same rows again
+            break
+        seen.update(_key(j) for j in new)
+        all_jobs.extend(new)
+        # Greenhouse meta has total count (live-confirmed: the whole board arrives on page 1)
+        total = (data.get("meta") or {}).get("total")
+        if total is None or len(all_jobs) >= total:
+            stop = STOP_ALL_PAGES if total is not None else STOP_SINGLE_RESPONSE
             break
         page += 1
 
-    return [_normalize(j, company) for j in all_jobs if j.get("title")]
+    result = [_normalize(j, company) for j in all_jobs if j.get("title")]
+    return attach(result, FetchReport(
+        stop_reason      = stop,
+        pages            = page,
+        fetched_distinct = count_distinct(result),
+        unusable         = len(all_jobs) - len(result),
+        reported_total   = total if isinstance(total, int) else None,
+        total_source     = TOTAL_ATS if isinstance(total, int) else None,
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 def _normalize(job, company):

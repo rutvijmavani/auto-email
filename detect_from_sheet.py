@@ -192,7 +192,28 @@ def process_sheet(dry_run=False, apply_db=False):
 
             print(f"  [MATCH] {company:<35} {p:<15} {slug[:40]}")
 
+            # A pattern can match a platform but yield a slug the monitor cannot use (a bare SuccessFactors
+            # slug lacks dc/region). Retrying that every run never helps — send it to manual completion.
+            from db.company_ats_admin import validate_platform_slug
+            _, slug_err = validate_platform_slug(p, slug)
+            if slug_err:
+                matched -= 1
+                print(f"    [MANUAL] {company}: {slug_err}")
+                if not dry_run:
+                    updates.append({
+                        "row":      i,
+                        "platform": "",
+                        "slug":     "",
+                        "status":   "manual",
+                        "notes":    f"Matched {p} but slug is incomplete — {slug_err}",
+                    })
+                continue
+
             if not dry_run:
+                # A failed DB write leaves the sheet row pending so the next run retries it.
+                if apply_db and not _apply_to_db(company, p, slug):
+                    print(f"    [PENDING] {company}: DB write failed, sheet row left unchanged")
+                    continue
                 updates.append({
                     "row":      i,
                     "platform": p,
@@ -200,9 +221,6 @@ def process_sheet(dry_run=False, apply_db=False):
                     "status":   "auto",
                     "notes":    note,
                 })
-
-                if apply_db:
-                    _apply_to_db(company, p, slug)
         else:
             print(f"  [NO MATCH] {company:<35} URL: {job_url[:60]}")
             if not dry_run:
@@ -240,13 +258,16 @@ def process_sheet(dry_run=False, apply_db=False):
 
 
 def _apply_to_db(company, platform, slug):
-    """Apply detected ATS to pipeline DB."""
+    """Apply detected ATS to pipeline DB. Returns True only when the override was saved."""
     try:
         from jobs.ats_detector import override_ats
-        override_ats(company, platform, slug)
-        print(f"    [DB] {company} → {platform}")
+        if override_ats(company, platform, slug):
+            print(f"    [DB] {company} → {platform}")
+            return True
+        print(f"    [DB SKIPPED] {company}: override not saved for {platform}")
     except Exception as e:
         print(f"    [DB ERROR] {company}: {e}")
+    return False
 
 
 def list_pending():

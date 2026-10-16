@@ -29,6 +29,9 @@ import html as html_lib
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, attach, count_distinct, failed,
+)
 
 FEED_URL = "https://www.google.com/about/careers/applications/jobs/feed.xml"
 
@@ -59,10 +62,10 @@ def fetch_jobs(slug_info, company):
     """
     resp = fetch_html(FEED_URL, platform="google")
     if resp is None:
-        return []
+        return failed(STOP_REQUEST_FAILED, "feed request failed")
 
     if not resp.text.strip().startswith("<?xml"):
-        return []
+        return failed(STOP_REQUEST_FAILED, "feed response is not XML")
 
     soup = BeautifulSoup(resp.text, "xml")
     jobs = soup.find_all("job")
@@ -73,7 +76,14 @@ def fetch_jobs(slug_info, company):
         if normalized:
             result.append(normalized)
 
-    return result
+    # One global feed, no total field: single_response, so complete stays unknown. `unusable` counts
+    # feed entries _normalize dropped (it applies the employer filter too, so a gap here is expected).
+    return attach(result, FetchReport(
+        stop_reason      = STOP_SINGLE_RESPONSE,
+        pages            = 1,
+        fetched_distinct = count_distinct(result),
+        unusable         = len(jobs) - len(result),
+    ))
 
 
 def _normalize(job, company):

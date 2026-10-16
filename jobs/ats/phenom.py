@@ -32,6 +32,9 @@ from datetime import datetime
 import html
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match, country_to_alpha2, alpha2_to_country_name
+from jobs.ats.fetch_report import (
+    STOP_NO_CONFIG, attach, check_sitemap_body, failed, new_sitemap_stats, sitemap_report,
+)
 
 # ─────────────────────────────────────────
 # CONSTANTS
@@ -134,18 +137,18 @@ def fetch_jobs(slug_info, company):
         All fields filled by fetch_job_detail().
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
 
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     base    = slug_info.get("base", "")
     sitemap = slug_info.get("sitemap", "sitemap.xml")
     if not base:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no base")
 
     sitemap_url = f"{base}/{sitemap}"
     # _fetch_all_job_urls handles:
@@ -154,8 +157,10 @@ def fetch_jobs(slug_info, company):
     #   • sitemap_index.xml fallback when sitemap.xml yields nothing
     #     (Bright Horizons: sitemap.xml is absent but sitemap_index.xml
     #      points to sitemap1.xml, sitemap2.xml, … with all job URLs)
-    job_urls = _fetch_all_job_urls(sitemap_url)
-    return _urls_to_stubs(job_urls, slug_info, company)
+    stats    = new_sitemap_stats()
+    job_urls = _fetch_all_job_urls(sitemap_url, stats)
+    stubs    = _urls_to_stubs(job_urls, slug_info, company)
+    return attach(stubs, sitemap_report(stats, stubs, unusable=len(job_urls) - len(stubs)))
 
 
 # ─────────────────────────────────────────
@@ -229,7 +234,7 @@ def fetch_job_detail(job):
 # HELPERS — SITEMAP FETCHING
 # ─────────────────────────────────────────
 
-def _follow_sitemap(sitemap_url, depth=0, _seen=None):
+def _follow_sitemap(sitemap_url, depth=0, _seen=None, _stats=None):
     """
     Recursively fetch all <loc> entries from a sitemap or sitemap index.
 
@@ -245,6 +250,8 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
     Returns a flat list of URL strings (all <loc> leaves).
     """
     if depth > 3:
+        if _stats is not None:
+            _stats["too_deep"] += 1
         return []
     if _seen is None:
         _seen = set()
@@ -252,12 +259,18 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
         return []
     _seen.add(sitemap_url)
 
+    if _stats is not None:
+        _stats["files"] += 1
     resp = fetch_html(sitemap_url, platform="phenom", timeout=(10, None))
     if resp is None:
+        if _stats is not None:
+            _stats["failed"] += 1
         return []
 
     # xml parser handles both <sitemapindex> and <urlset> correctly
     soup = BeautifulSoup(resp.text, "xml")
+    if _stats is not None:
+        check_sitemap_body(resp, _stats, soup=soup)
 
     # Sitemap index: has <sitemap> child elements, each with a <loc>
     sub_tags = soup.find_all("sitemap")
@@ -267,7 +280,7 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
             loc_tag = tag.find("loc")
             if loc_tag and loc_tag.text.strip():
                 all_locs.extend(
-                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen)
+                    _follow_sitemap(loc_tag.text.strip(), depth + 1, _seen, _stats)
                 )
         return all_locs
 
@@ -275,7 +288,7 @@ def _follow_sitemap(sitemap_url, depth=0, _seen=None):
     return [loc.text.strip() for loc in soup.find_all("loc") if loc.text.strip()]
 
 
-def _fetch_all_job_urls(base_sitemap_url):
+def _fetch_all_job_urls(base_sitemap_url, stats=None):
     """
     Fetch all job URLs from a sitemap, with sitemap_index.xml fallback.
 
@@ -286,7 +299,7 @@ def _fetch_all_job_urls(base_sitemap_url):
 
     Returns flat list of job URL strings.
     """
-    locs = _follow_sitemap(base_sitemap_url)
+    locs = _follow_sitemap(base_sitemap_url, _stats=stats)
     job_urls = [u for u in locs if JOB_URL_RE.search(u)]
 
     if not job_urls:
@@ -294,8 +307,13 @@ def _fetch_all_job_urls(base_sitemap_url):
         index_url = re.sub(r"sitemap[^/]*\.xml$", "sitemap_index.xml",
                            base_sitemap_url)
         if index_url != base_sitemap_url:
-            locs = _follow_sitemap(index_url)
+            fb_stats = new_sitemap_stats() if stats is not None else None
+            locs = _follow_sitemap(index_url, _stats=fb_stats)
             job_urls = [u for u in locs if JOB_URL_RE.search(u)]
+            if job_urls and stats is not None:
+                # the fallback is the real entry point; the primary's 404 is not a failure of the read
+                stats.clear()
+                stats.update(fb_stats)
 
     return job_urls
 

@@ -25,6 +25,10 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import alpha2_to_country_name
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
+    attach, count_distinct, failed,
+)
 
 HEADERS = {
     "User-Agent": (
@@ -83,7 +87,7 @@ def fetch_jobs(slug, company):
         We probe both variants on page 0 and use whichever responds with 200.
     """
     if not slug:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug")
 
     # Normalise to bare slug regardless of how it was stored
     bare_slug = slug[len("careers-"):] if slug.startswith("careers-") else slug
@@ -91,25 +95,48 @@ def fetch_jobs(slug, company):
     # Probe both URL formats — use whichever responds
     base_url = _resolve_base_url(bare_slug, company)
     if base_url is None:
-        return []  # neither URL variant responded — company not on iCIMS
+        # neither URL variant responded — company not on iCIMS
+        return failed(STOP_NO_CONFIG, "no iCIMS URL variant responded")
 
     all_jobs = []
     seen_ids = set()
+    pages    = 0
+    stop     = STOP_PAGE_CAP     # the loop ran all MAX_PAGES without reaching the end
+
+    info     = {}                # _fetch_listing_page fills "pages_total" from the "Page 1 of N" header
 
     for page in range(MAX_PAGES):
         url  = f"{base_url}/jobs/search?pr={page}&in_iframe=1"
-        jobs = _fetch_listing_page(url, base_url, company, seen_ids)
+        jobs = _fetch_listing_page(url, base_url, company, seen_ids, info=info)
 
         if jobs is None:
+            stop = STOP_REQUEST_FAILED
             break  # network/HTTP error — stop pagination
 
         if len(jobs) == 0:
+            stop = STOP_EMPTY_PAGE
             break  # genuine end of results
 
+        pages += 1               # pages that returned jobs, comparable to the board's "of N"
         all_jobs.extend(jobs)
         time.sleep(PAGE_DELAY)
 
-    return all_jobs
+    # iCIMS states its page count, not its job count ("Search Results Page 1 of N", live-checked 2026-10-15).
+    # A clean stop short of page N, or the MAX_PAGES cap with N beyond it, is recorded as incomplete; with
+    # no header found a clean stop stays unknown.
+    pages_total = info.get("pages_total")
+    note = ""
+    if pages_total is not None and pages < pages_total:
+        note = f"read {pages} of {pages_total} pages"
+    elif stop == STOP_PAGE_CAP and pages_total is not None:
+        stop = STOP_ALL_PAGES    # the board ends exactly at the cap: every reported page was read
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(all_jobs),
+        reported_pages   = pages_total,
+        note             = note,
+    ))
 
 
 def _resolve_base_url(bare_slug, company):
@@ -148,9 +175,22 @@ def _resolve_base_url(bare_slug, company):
     return None
 
 
-def _fetch_listing_page(url, base_url, company, seen_ids):
+_PAGE_OF_RE = re.compile(r"Page\s+\d+\s+of\s+(\d+)", re.IGNORECASE)
+
+
+def _page_total(soup):
+    """The board's page count from the "Search Results Page 1 of N" header, or None when absent."""
+    header = soup.select_one(".iCIMS_SearchResultsHeader") or soup.select_one(".iCIMS_Paging")
+    if header is None:
+        return None
+    m = _PAGE_OF_RE.search(header.get_text(" ", strip=True))
+    return int(m.group(1)) if m else None
+
+
+def _fetch_listing_page(url, base_url, company, seen_ids, info=None):
     """
-    Fetch one listing page and extract job stubs.
+    Fetch one listing page and extract job stubs. When `info` is given, the board's page count is stored in
+    info["pages_total"] (first page that shows it wins).
 
     Returns:
         list of job dicts  — page fetched (may be empty = end of results)
@@ -187,6 +227,11 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
 
         soup = BeautifulSoup(resp.text, "html.parser")
         anchors = soup.select("a.iCIMS_Anchor")
+
+        if info is not None and "pages_total" not in info:
+            total = _page_total(soup)
+            if total is not None:
+                info["pages_total"] = total
 
         if not anchors:
             return []   # genuine empty page = end of results
@@ -231,12 +276,12 @@ def _fetch_listing_page(url, base_url, company, seen_ids):
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return []
+        return None   # an error, not an end of results: [] here made a timed-out page look like the last one
     except Exception:
         elapsed_ms = int(time.time() * 1000) - start_ms
         # status_code=0 is a sentinel for non-HTTP errors (timeout, connection error, etc.)
         _track(0, elapsed_ms)
-        return []
+        return None
 
 
 def fetch_job_detail(job):

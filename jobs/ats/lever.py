@@ -3,6 +3,9 @@
 
 from datetime import datetime
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, attach, count_distinct,
+)
 
 
 BASE_URL = "https://api.lever.co/v0/postings/{slug}"
@@ -39,9 +42,17 @@ def fetch_jobs(slug, company):
     data = fetch_json(BASE_URL.format(slug=slug),
                       params={"mode": "json"},
                       platform="lever")  # tracked for api_health
-    if not data or not isinstance(data, list):
-        return []
-    return [_normalize(j, company) for j in data if j.get("text")]
+    if not isinstance(data, list):
+        # None = the call failed; a non-list body is not a Lever board. An empty list is a valid empty board.
+        return attach([], FetchReport(stop_reason=STOP_REQUEST_FAILED, pages=1))
+    result = [_normalize(j, company) for j in data if j.get("text")]
+    # The whole board arrives in one response and Lever reports no total, so complete stays unknown.
+    return attach(result, FetchReport(
+        stop_reason      = STOP_SINGLE_RESPONSE,
+        pages            = 1,
+        fetched_distinct = count_distinct(result),
+        unusable         = len(data) - len(result),
+    ))
 
 
 def _normalize(job, company):

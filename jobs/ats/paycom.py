@@ -33,6 +33,10 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE, TOTAL_ATS, attach, count_distinct, failed,
+)
+
 logger = logging.getLogger(__name__)
 
 _TAKE = 100  # jobs per listing request
@@ -69,24 +73,46 @@ def fetch_jobs(slug, company):
     """
     host, key = _parse_slug(slug)
     if not host or not key:
-        return []
+        return failed(STOP_NO_CONFIG, "slug has no host/key")
 
     session, jwt, api_base = _get_session(host, key)
     if not jwt:
         raise RuntimeError(f"paycom: failed to obtain JWT for {host}/{key}")
 
     previews = []
+    seen = set()
     skip = 0
+    pages = 0
+    # _search_page raises on any HTTP/parse failure, so the caller sees a failed fetch, never a short list.
+    stop = STOP_EMPTY_PAGE
+    info = {}                            # _search_page fills "total" from jobPostingPreviewsCount
     while True:
-        batch = _search_page(session, jwt, api_base, host, key, skip)
+        batch = _search_page(session, jwt, api_base, host, key, skip, info=info)
         if not batch:
             break
-        previews.extend(batch)
-        if len(batch) < _TAKE:
+        pages += 1
+        new = [p for p in batch if p.get("jobId") not in seen]
+        if not new:
+            stop = STOP_REPEAT_PAGE      # `skip` ignored — the same page again (would otherwise loop forever)
             break
+        seen.update(p.get("jobId") for p in new)
+        previews.extend(new)
+        if len(batch) < _TAKE:
+            break                        # a short page is the server's last
         skip += _TAKE
 
-    return [_preview_to_stub(p, host, key, company) for p in previews]
+    stubs = [_preview_to_stub(p, host, key, company) for p in previews]
+    # Every search response carries `jobPostingPreviewsCount` (live 2026-10-15: 105 = 100 + 5, 3 = 3), the
+    # board's job total; without it (field absent/non-int) complete stays unknown on a clean stop.
+    total = info.get("total")
+    return attach(stubs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(stubs),
+        reported_total   = total,
+        total_source     = TOTAL_ATS if total is not None else None,
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 # ─────────────────────────────────────────
@@ -234,8 +260,11 @@ def _api_headers(jwt: str, host: str, key: str, path_suffix: str) -> dict:
 # ─────────────────────────────────────────
 
 def _search_page(session, jwt: str, api_base: str,
-                 host: str, key: str, skip: int) -> list:
-    """POST the listing search endpoint; return raw preview dicts."""
+                 host: str, key: str, skip: int, info: dict = None) -> list:
+    """
+    POST the listing search endpoint; return raw preview dicts. When `info` is given, the board's job total
+    (`jobPostingPreviewsCount`, an int ≥ 0) is stored in info["total"] — first page that carries it wins.
+    """
     body = {
         "skip": skip,
         "take": _TAKE,
@@ -261,7 +290,12 @@ def _search_page(session, jwt: str, api_base: str,
             timeout=20,
         )
         resp.raise_for_status()
-        return resp.json().get("jobPostingPreviews", [])
+        data = resp.json()
+        count = data.get("jobPostingPreviewsCount")
+        if info is not None and "total" not in info and isinstance(count, int) \
+                and not isinstance(count, bool) and count >= 0:
+            info["total"] = count
+        return data.get("jobPostingPreviews", [])
     except Exception as exc:
         logger.warning("paycom search failed skip=%s", skip, exc_info=True)
         raise RuntimeError(f"paycom search failed (skip={skip})") from exc

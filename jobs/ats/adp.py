@@ -32,6 +32,10 @@ import json
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import slugify, validate_company_match, alpha3_to_alpha2
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    STOP_REQUEST_FAILED, TOTAL_ATS, attach, count_distinct, failed,
+)
 from logger import get_logger
 
 try:
@@ -162,7 +166,7 @@ def fetch_jobs(slug, company):
         List of normalized job dicts — all fields populated at listing level.
     """
     if not slug:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug")
 
     if isinstance(slug, str) and slug.strip().startswith("{"):
         try:
@@ -178,35 +182,56 @@ def fetch_jobs(slug, company):
     cfg = _fetch_config(slug, session=session)
     if not cfg:
         logger.warning("adp: config fetch failed for slug=%r", slug)
-        return []
+        return failed(STOP_REQUEST_FAILED, "config fetch failed")
 
     # Step 2: paginate
     all_jobs = []
     seen_ids = set()
     offset   = 0
     total    = None
+    raw_rows = 0
+    pages    = 0
+    stop     = STOP_PAGE_CAP     # set by the for/else below when the loop is never broken
 
     for _ in range(MAX_PAGES):
         reqs, page_total = _fetch_reqs(slug, cfg, offset, session=session)
 
         if reqs is None:   # request failed
+            stop = STOP_REQUEST_FAILED
             break
+        pages += 1
         if not reqs:       # empty page — done
+            stop = STOP_EMPTY_PAGE
             break
 
-        if total is None:
+        # `count` of 0/absent is "no total", not "zero jobs" — keep paging until the server runs dry
+        if total is None and page_total:
             total = page_total
 
+        raw_rows += len(reqs)
+        before = len(all_jobs)
         for job in _parse_reqs(reqs, slug, company):
             if job["job_id"] not in seen_ids:
                 seen_ids.add(job["job_id"])
                 all_jobs.append(job)
+        if len(all_jobs) == before:
+            stop = STOP_REPEAT_PAGE   # a page of nothing new: $skip ignored, or every row unusable
+            break
 
         offset += len(reqs)
         if total is not None and offset >= total:
+            stop = STOP_ALL_PAGES
             break
 
-    return all_jobs
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop,
+        pages            = pages,
+        fetched_distinct = count_distinct(all_jobs),
+        unusable         = raw_rows - len(all_jobs),
+        reported_total   = total,
+        total_source     = TOTAL_ATS if total is not None else None,
+        repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,
+    ))
 
 
 # ─────────────────────────────────────────

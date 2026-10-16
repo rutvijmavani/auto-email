@@ -19,7 +19,7 @@ import json
 from config import DISCOVERY_REDETECT, ENRICHMENT_ON_DEMAND
 from db.connection import get_conn
 from jobs.ats.patterns import match_ats_pattern
-from jobs.ats.registry import ATS_REGISTRY
+from jobs.ats.registry import ATS_REGISTRY, SLUG_REQUIRED_KEYS
 
 # Platforms that cannot be written from the Discover page.
 _EXCLUDED_PLATFORMS = frozenset({"custom"})
@@ -34,9 +34,10 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
     """Return (clean_slug, error). Exactly one of the two is None.
 
     string platforms: any non-empty text.
-    json platforms:   must parse to a non-empty JSON object — _parse_slug silently
-                      swaps a malformed JSON slug for defaults (wrong tenant scanned
-                      with no error), so reject it here instead.
+    json platforms:   must parse to a JSON object holding every key the platform's
+                      fetch_jobs needs (registry.SLUG_REQUIRED_KEYS) — _parse_slug
+                      silently swaps a malformed JSON slug for defaults and a slug
+                      missing a key scans nothing, so reject both here instead.
     """
     platform = (platform or "").strip()
     if platform in _EXCLUDED_PLATFORMS:
@@ -52,14 +53,17 @@ def validate_platform_slug(platform: str, slug: str) -> "tuple[str | None, str |
             obj = json.loads(slug)
         except (json.JSONDecodeError, TypeError):
             return None, f"{platform} slug must be a JSON object, e.g. {{\"slug\": \"acme\"}}."
-        if not isinstance(obj, dict) or not obj:
-            return None, f"{platform} slug must be a non-empty JSON object."
-        if platform == "workday" and not obj.get("slug"):
-            return None, "workday slug JSON needs a \"slug\" key."
-        if platform == "successfactors" and not all(obj.get(k) for k in ("slug", "dc", "region")):
-            # fetch_jobs silently returns [] without all three — a row saved like
+        required = SLUG_REQUIRED_KEYS.get(platform, ())
+        if not isinstance(obj, dict):
+            return None, f"{platform} slug must be a JSON object."
+        missing = [k for k in required
+                   if not isinstance(obj.get(k), str) or not obj[k].strip()]
+        if missing:
+            # fetch_jobs silently returns [] (or raises) without these — a row saved like
             # that would look enabled but never scan.
-            return None, "successfactors slug JSON needs \"slug\", \"dc\" and \"region\"."
+            return None, (f"{platform} slug JSON needs "
+                          + ", ".join(f'"{k}"' for k in required)
+                          + f" (missing: {', '.join(missing)}).")
     return slug, None
 
 

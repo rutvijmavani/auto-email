@@ -314,16 +314,46 @@ def is_supported(platform: str) -> bool:
 import json as _json
 
 
+# Keys each json-slug platform's fetch_jobs cannot run without. Anything else has a default or is
+# auto-discovered at fetch time (oracle_hcm site, talentbrew tenant_id, taleo portal_id, workday path,
+# phenom sitemap, avature path). Checked when a slug is written by hand (--override, Discover edit):
+# a slug missing one of these is stored fine and then silently scans nothing.
+SLUG_REQUIRED_KEYS = {
+    "workday":        ("slug", "wd"),
+    "oracle_hcm":     ("slug",),
+    "successfactors": ("slug", "dc", "region"),
+    "avature":        ("base",),
+    "phenom":         ("base",),
+    "talentbrew":     ("base",),
+    "sitemap":        ("url",),
+    "taleo":          ("company",),
+    "eightfold":      ("slug",),
+    "paycom":         ("host", "key"),
+    "google":         (),            # one global feed — the slug is ignored
+}
+
+
 def parse_slug(platform: str, slug: str, config: dict):
     """
     Parse the raw DB slug into the form each ATS module expects.
 
-    slug_type="string" → pass as-is (str)
+    slug_type="string" → the bare slug (str). `override_ats` stores manual overrides as a JSON blob
+                         {"_manual": true, "_platform": ..., "slug": "acme"} (the _manual flag stops
+                         re-detection), so a blob is unwrapped to its "slug" value here — passing it
+                         through would put the whole JSON into the ATS URL.
     slug_type="json"   → json.loads(slug); platform-specific defaults on error.
 
     Returns a string or dict.
     """
     if config.get("slug_type") != "json":
+        if isinstance(slug, str) and slug.lstrip().startswith("{"):
+            try:
+                blob = _json.loads(slug)
+            except (_json.JSONDecodeError, TypeError):
+                return slug
+            inner = blob.get("slug") if isinstance(blob, dict) else None
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
         return slug
     try:
         slug_info = _json.loads(slug)

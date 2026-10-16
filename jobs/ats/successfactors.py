@@ -39,6 +39,10 @@ import html as html_lib
 from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_NO_CONFIG, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, TOTAL_FEED_COUNT,
+    attach, check_sitemap_body, count_distinct, failed, new_sitemap_stats,
+)
 from logger import get_logger
 
 logger = get_logger(__name__)
@@ -140,22 +144,24 @@ def fetch_jobs(slug_info, company):
     Returns:
         List of normalized job dicts with all fields populated.
         posted_at and description filled from XML — no detail fetch needed.
+        Carries a FetchReport (jobs/ats/fetch_report.py): reported_total is the feed's own raw <Job>
+        count, so a parse that loses jobs (Capgemini once kept 1 of ~1537) is complete=False.
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
 
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     slug   = slug_info.get("slug", "")
     dc     = slug_info.get("dc", "")
     region = slug_info.get("region", "")
 
     if not all([slug, dc, region]):
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info lacks slug/dc/region")
 
     # Use stored path if present; default to /career for backwards compat.
     # Self-healing: if the primary path returns HTML (wrong variant), retry
@@ -185,15 +191,30 @@ def fetch_jobs(slug_info, company):
         if not resp.text.strip().startswith("<?xml"):
             continue
 
-        jobs = _parse_jobs(resp.text, f"{company} ({slug})")
+        counts = {}
+        jobs   = _parse_jobs(resp.text, f"{company} ({slug})", counts)
 
         # Pass the path that actually worked so _normalize builds correct job URLs.
         # This ensures SAP (path stored) and new slugs (no path stored) both get
         # correct URLs — whichever path variant returned valid XML is used.
         effective = {**slug_info, "path": try_path}
-        return [_normalize(j, company, effective) for j in jobs if j.find("JobTitle")]
+        out = [_normalize(j, company, effective) for j in jobs if j.find("JobTitle")]
+        # a feed cut off mid-download still parses, to fewer jobs — with a raw count taken from the same
+        # cut text, so only the closed root / declared size can expose it
+        file_stats = new_sitemap_stats()
+        whole = check_sitemap_body(resp, file_stats)
+        return attach(out, FetchReport(
+            stop_reason      = STOP_SINGLE_RESPONSE if whole else STOP_REQUEST_FAILED,
+            note             = "; ".join(file_stats.get("problems", [])[:3]),
+            pages            = 1,
+            fetched_distinct = count_distinct(out),
+            unusable         = len(jobs) - len(out),
+            # rows dropped for lacking a JobTitle are deliberate, not parse loss
+            reported_total   = counts["raw"] - (len(jobs) - len(out)),
+            total_source     = TOTAL_FEED_COUNT,
+        ))
 
-    return []
+    return failed(STOP_REQUEST_FAILED, "no XML feed on /career or /careers")
 
 
 # ─────────────────────────────────────────
@@ -207,17 +228,20 @@ _UNNAMED_TAG_RE = re.compile(r"<>[^<]*</>")
 _JOB_OPEN_RE    = re.compile(r"<Job[>\s]")
 
 
-def _parse_jobs(xml_text, label):
+def _parse_jobs(xml_text, label, counts=None):
     """
     Parse a SuccessFactors feed into its <Job> elements.
 
     Strips unnamed tags first, then warns when fewer <Job> elements were parsed
     than the feed contains — a silent truncation would otherwise look like a
-    healthy board with one job.
+    healthy board with one job. When `counts` is a dict it receives "raw" (the
+    <Job> tags the feed holds) for the completeness report.
     """
     cleaned = _UNNAMED_TAG_RE.sub("", xml_text)
     jobs    = BeautifulSoup(cleaned, "xml").find_all("Job")
     raw_cnt = len(_JOB_OPEN_RE.findall(cleaned))
+    if counts is not None:
+        counts["raw"] = raw_cnt
     if len(jobs) < raw_cnt:
         logger.warning(
             "successfactors [%s]: parsed %d of %d <Job> elements — "

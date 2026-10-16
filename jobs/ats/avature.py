@@ -39,6 +39,10 @@ from datetime import datetime
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    STOP_EMPTY_PAGE, STOP_NO_CONFIG, FetchReport, attach, check_sitemap_body, count_distinct, failed,
+    new_sitemap_stats, sitemap_report,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,27 +196,30 @@ def fetch_jobs(slug_info, company):
                                on whatever was collected.
     """
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
 
     # Handle both dict (new) and JSON string (stored in DB)
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     base    = slug_info.get("base", "")
     path    = slug_info.get("path", "careers")
     if not base:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no base")
 
     sitemap_url = f"{base}/{path}/sitemap.xml"
     # (connect_timeout=10, read_timeout=None) — see talentbrew.py for rationale.
     resp        = fetch_html(sitemap_url, platform="avature",
                              timeout=(10, None))
 
+    stats = new_sitemap_stats()
+    stats["files"] = 1
     if resp is not None:
         soup     = BeautifulSoup(resp.text, "xml")
+        check_sitemap_body(resp, stats, soup=soup)
         job_urls = _extract_job_urls(soup)
     else:
         job_urls = []
@@ -222,7 +229,8 @@ def fetch_jobs(slug_info, company):
         # Fall back to SearchJobs pagination endpoint
         return _fetch_via_search(slug_info, company)
 
-    return _urls_to_stubs(job_urls, slug_info, company)
+    stubs = _urls_to_stubs(job_urls, slug_info, company)
+    return attach(stubs, sitemap_report(stats, stubs, unusable=len(job_urls) - len(stubs)))
 
 
 # ─────────────────────────────────────────
@@ -320,7 +328,7 @@ def _fetch_via_search(slug_info, company):
     base = slug_info.get("base", "")
     path = slug_info.get("path", "careers")
     if not base:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no base")
 
     all_urls = []
     seen_ids = set()
@@ -353,7 +361,15 @@ def _fetch_via_search(slug_info, company):
         page += 1
         time.sleep(0.5)
 
-    return _urls_to_stubs(all_urls, slug_info, company)
+    # SearchJobs shows no total; a page with nothing new is its only end signal, so a clean read is
+    # recorded empty_page and complete stays unknown. A mid-pagination failure raised above.
+    stubs = _urls_to_stubs(all_urls, slug_info, company)
+    return attach(stubs, FetchReport(
+        stop_reason      = STOP_EMPTY_PAGE,
+        pages            = page + 1,
+        fetched_distinct = count_distinct(stubs),
+        unusable         = len(all_urls) - len(stubs),
+    ))
 
 
 def _anchors_to_urls(soup, page_url):

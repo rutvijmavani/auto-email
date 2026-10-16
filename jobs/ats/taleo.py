@@ -52,6 +52,12 @@ SECTIONS = ["ex", "ext", "cs", "2", "1", "campus", "external"]
 
 DATE_FORMATS = ["%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]
 
+# Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
+from jobs.ats.fetch_report import (  # noqa: E402
+    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE,
+    STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
+)
+
 
 # ─────────────────────────────────────────
 # SESSION
@@ -70,27 +76,27 @@ def _make_session():
 
 def fetch_jobs(slug_info, company):
     if not slug_info:
-        return []
+        return failed(STOP_NO_CONFIG, "empty slug_info")
     if isinstance(slug_info, str):
         try:
             slug_info = json.loads(slug_info)
         except (json.JSONDecodeError, TypeError):
             logger.error("taleo: invalid slug_info JSON")
-            return []
+            return failed(STOP_NO_CONFIG, "slug_info is not valid JSON")
 
     taleo_company = slug_info.get("company", "")
     portal_id     = slug_info.get("portal_id", "")
     section       = slug_info.get("section", "ex")
 
     if not taleo_company:
-        return []
+        return failed(STOP_NO_CONFIG, "slug_info has no company")
 
     if not portal_id:
         portal_id, section = _discover_portal_id(
             taleo_company, slug_info.get("section", ""),
         )
         if not portal_id:
-            return []
+            return failed(STOP_NO_CONFIG, "portal_id not discoverable")
         slug_info["portal_id"] = portal_id
         slug_info["section"]   = section
 
@@ -125,10 +131,10 @@ def fetch_jobs(slug_info, company):
     except requests.HTTPError as e:
         logger.error("taleo: HTTP %s page 1 for %s",
                      e.response.status_code, taleo_company)
-        return []
+        return failed(STOP_REQUEST_FAILED, f"page 1 HTTP {e.response.status_code}")
     except (requests.RequestException, ValueError) as e:
         logger.error("taleo: page 1 error for %s: %s", taleo_company, e)
-        return []
+        return failed(STOP_REQUEST_FAILED, "page 1 error")
 
     # ── Extract pagination metadata ───────────────────────────────
     paging      = data.get("pagingData", {})
@@ -136,8 +142,8 @@ def fetch_jobs(slug_info, company):
     page_size   = int(paging.get("pageSize",   25))
     total_pages = math.ceil(total / page_size) if total and page_size else 1
 
-    print(f"  [taleo] {taleo_company}: "
-          f"{total} jobs across {total_pages} pages", flush=True)
+    logger.info("taleo: %s reports %d jobs across %d pages",
+                taleo_company, total, total_pages)
 
     # ── Parse all pages ───────────────────────────────────────────
     all_jobs = []
@@ -201,14 +207,31 @@ def fetch_jobs(slug_info, company):
             })
         return jobs
 
-    # Add page 1 results
-    all_jobs.extend(parse_page(data, 1))
-    print(f"  [taleo] page 1/{total_pages} — {len(all_jobs)} jobs so far",
-          flush=True)
+    # Distinct ids only — a repeated row must not inflate the count that is
+    # compared against the server's totalCount.
+    seen_ids    = set()
+    all_jobs    = []
+    stop_reason = STOP_ALL_PAGES
+    pages       = 1
+
+    def add_page(page_jobs):
+        """Append unseen jobs; return how many were new."""
+        new = 0
+        for j in page_jobs:
+            if j["job_id"] in seen_ids:
+                continue
+            seen_ids.add(j["job_id"])
+            all_jobs.append(j)
+            new += 1
+        return new
+
+    add_page(parse_page(data, 1))
+    logger.debug("taleo: %s page 1/%d — %d distinct so far",
+                 taleo_company, total_pages, len(all_jobs))
 
     # Fetch remaining pages 2..total_pages
     for page in range(2, total_pages + 1):
-        print(f"  [taleo] page {page}/{total_pages}...", flush=True)
+        pages += 1
         try:
             resp = session.post(
                 search_url,
@@ -216,29 +239,50 @@ def fetch_jobs(slug_info, company):
                 timeout=15,
             )
             resp.raise_for_status()
-            data     = resp.json()
+            data      = resp.json()
             page_jobs = parse_page(data, page)
 
             if not page_jobs:
-                print(f"  [taleo] page {page} empty — stopping early",
-                      flush=True)
+                stop_reason = STOP_EMPTY_PAGE
                 break
 
-            all_jobs.extend(page_jobs)
+            if add_page(page_jobs) == 0:
+                stop_reason = STOP_REPEAT_PAGE
+                break
 
         except requests.HTTPError as e:
             logger.error("taleo: HTTP %s page %d for %s",
                          e.response.status_code, page, taleo_company)
+            stop_reason = STOP_REQUEST_FAILED
             break
         except (requests.RequestException, ValueError) as e:
             logger.error("taleo: page %d error for %s: %s",
                          page, taleo_company, e)
+            stop_reason = STOP_REQUEST_FAILED
             break
 
-    logger.info("taleo: fetched %d/%d jobs for %s",
-                len(all_jobs), total, taleo_company)
-    print(f"  [taleo] done — {len(all_jobs)}/{total} jobs", flush=True)
-    return all_jobs
+    if len(all_jobs) < total:
+        # Taleo's own list API can return fewer rows than totalCount no matter
+        # the sort or facet filter (utsw: 506 of 649, probed 2026-10-14), so a
+        # shortfall with a clean stop is the server's, not ours.
+        logger.warning(
+            "taleo: %s fetched %d distinct of %d reported (stop=%s)",
+            taleo_company, len(all_jobs), total, stop_reason,
+        )
+    else:
+        logger.info("taleo: fetched %d/%d jobs for %s (stop=%s)",
+                    len(all_jobs), total, taleo_company, stop_reason)
+    # totalCount is advisory: the server serves fewer rows than it counts on some tenants (utsw), so a
+    # clean-stop shortfall above FETCH_SERVER_SHORT_MIN_PCT is recorded as server_short, not incomplete.
+    return attach(all_jobs, FetchReport(
+        stop_reason      = stop_reason,
+        pages            = pages,
+        fetched_distinct = len(seen_ids),
+        reported_total   = total or None,
+        total_source     = TOTAL_ATS if total else None,
+        repeated_pages   = 1 if stop_reason == STOP_REPEAT_PAGE else 0,
+        advisory_total   = True,
+    ))
 
 # ─────────────────────────────────────────
 # FETCH JOB DETAIL

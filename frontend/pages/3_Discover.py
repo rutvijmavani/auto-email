@@ -21,6 +21,7 @@ import streamlit as st
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from db.connection import get_conn
 from db.prospective import add_prospective_company
+from db import company_health, discover_priority
 from db.company_ats_admin import (
     editable_platforms,
     insert_company_ats_row,
@@ -29,6 +30,7 @@ from db.company_ats_admin import (
     update_company_ats_row,
 )
 from frontend.db_utils import query as _query, SOURCE_LABELS as _SOURCE_LABELS
+from config import HEAD_CHECK_CACHE_TTL_S, HEAD_CHECK_ON_DEMAND
 from workers.redis_client import get_redis as _get_redis
 from jobs.http_safe import make_safe_session as _make_safe_session, is_private_host as _is_private_host
 
@@ -80,6 +82,24 @@ def _careers_head_ok(url: str) -> bool:
         return False
 
 
+def _queue_dead_careers_recheck(fein: str) -> None:
+    """A failed careers check was display-only; hand it to head_check_worker (on_demand) so a
+    dead URL is re-enriched/re-discovered like the extension's /verify-company does. Shares that
+    endpoint's cooldown key so repeated page views don't re-queue the same FEIN."""
+    try:
+        r = _get_redis()
+        if r.set(f"verify_company:cooldown:{fein}", 1, nx=True, ex=HEAD_CHECK_CACHE_TTL_S):
+            try:
+                r.lpush(HEAD_CHECK_ON_DEMAND,
+                        json.dumps({"fein": fein, "trigger": "on_demand", "source": None}))
+                log.info("discover: dead careers URL fein=%s → head_check:on_demand", fein)
+            except Exception:
+                r.delete(f"verify_company:cooldown:{fein}")
+                raise
+    except Exception as exc:
+        log.warning("discover: failed to queue head check fein=%s: %s", fein, exc)
+
+
 def _trigger_careers_check(url: str, fein: str) -> None:
     """Submit a background HEAD check if one isn't already running for this FEIN.
 
@@ -106,6 +126,8 @@ def _trigger_careers_check(url: str, fein: str) -> None:
                 )
             except Exception as _re:
                 log.debug("discover: Redis head_check write failed fein=%s: %s", fein, _re)
+            if not ok:
+                _queue_dead_careers_recheck(fein)
         finally:
             with _DISCOVER_LOCK:
                 _DISCOVER_INFLIGHT.discard((fein, url))
@@ -174,6 +196,18 @@ SORT_PETITIONS     = "Petition count ↓"
 FILTER_ANY, FILTER_HAS, FILTER_MISSING = "Any", "Has", "Missing"
 _FILTER_OPTIONS = [FILTER_ANY, FILTER_HAS, FILTER_MISSING]
 
+# Fetch-health filter (company_health, keyed 'ca:{company_ats.id}'). "Problem" = non-ok and not yet marked expected.
+HEALTH_ANY, HEALTH_PROBLEM, HEALTH_FAILING, HEALTH_SUSPECT, HEALTH_EXPECTED = (
+    "Any", "Problem (suspect or failing)", "Failing", "Suspect", "Expected (silenced)")
+_HEALTH_OPTIONS = [HEALTH_ANY, HEALTH_PROBLEM, HEALTH_FAILING, HEALTH_SUSPECT, HEALTH_EXPECTED]
+_HEALTH_CONDITION = {
+    HEALTH_PROBLEM:  "ch.state <> 'ok' AND ch.expected_state IS DISTINCT FROM ch.state",
+    HEALTH_FAILING:  "ch.state = 'failing'",
+    HEALTH_SUSPECT:  "ch.state = 'suspect'",
+    HEALTH_EXPECTED: "ch.expected_state = ch.state",
+}
+_HEALTH_ICON = {"ok": "🟢", "suspect": "🟠", "failing": "🔴"}
+
 
 def _normalize_soc_prefix(raw: str) -> str:
     """'15-1252.00' -> '15-1252'. DOL stores the same occupation with and without the
@@ -182,6 +216,25 @@ def _normalize_soc_prefix(raw: str) -> str:
     if v.endswith(".00"):
         v = v[:-3]
     return v
+
+
+# Personal priority flag (db/discover_priority.py). "unreviewed" = no row.
+_PRIORITY_ICON  = {"high": "⭐", "maybe": "🤔", "skip": "🚫"}
+_PRIORITY_LABEL = {"high": "⭐ High", "maybe": "🤔 Maybe", "skip": "🚫 Skip", "unreviewed": "Unreviewed"}
+_PRIORITY_ALL   = ("unreviewed", "high", "maybe", "skip")
+
+
+@st.cache_data(ttl=300)
+def load_priority_counts() -> dict:
+    """Counts per flag over all employers; unreviewed = employers with no flag row."""
+    flagged = _query("SELECT level, COUNT(*) AS n FROM discover_priority GROUP BY level")
+    counts = {lvl: 0 for lvl in _PRIORITY_ALL}
+    for _, r in flagged.iterrows():
+        if r["level"] in counts:
+            counts[r["level"]] = int(r["n"])
+    total = _query("SELECT COUNT(*) AS n FROM dol_h1b_employers")
+    counts["unreviewed"] = max(0, int(total.iloc[0]["n"]) - counts["high"] - counts["maybe"] - counts["skip"])
+    return counts
 
 
 @st.cache_data(ttl=300)
@@ -198,9 +251,30 @@ def load_employers(
     ats_filter: str = FILTER_ANY,
     careers_filter: str = FILTER_ANY,
     pd_filter: str = FILTER_ANY,
+    health_filter: str = HEALTH_ANY,
+    priority_filter: tuple = _PRIORITY_ALL,
 ) -> pd.DataFrame:
     clauses: list[str] = []
     params: list = []
+
+    # Priority flag filter: all four selected = no restriction (also keeps rows whose level is unexpected).
+    _levels = [lv for lv in priority_filter if lv in _PRIORITY_ALL]
+    if _levels and len(_levels) < len(_PRIORITY_ALL):
+        _stored = [lv for lv in _levels if lv != "unreviewed"]
+        _parts = []
+        if _stored:
+            _parts.append("p.level = ANY(%s)")
+            params.append(_stored)
+        if "unreviewed" in _levels:
+            _parts.append("p.level IS NULL")
+        clauses.append("(" + " OR ".join(_parts) + ")")
+
+    if health_filter in _HEALTH_CONDITION:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM company_ats ca JOIN company_health ch "
+            "ON ch.company_key = 'ca:' || ca.id::text "
+            f"WHERE ca.employer_fein = e.employer_fein AND {_HEALTH_CONDITION[health_filter]})"
+        )
 
     # Data-completeness filters (ATS / careers page / public domain). Each is independent, so the three
     # tri-state selectors cover every has/missing combination. "ATS" = an ATS detected in h1b_ats_discovery
@@ -287,8 +361,14 @@ def load_employers(
                      (SELECT ca.platform FROM company_ats ca
                       WHERE ca.employer_fein = e.employer_fein
                       ORDER BY ca.priority DESC LIMIT 1)) AS ats_platform,
+            (SELECT ch.state FROM company_ats ca JOIN company_health ch
+               ON ch.company_key = 'ca:' || ca.id::text
+              WHERE ca.employer_fein = e.employer_fein
+              ORDER BY CASE ch.state WHEN 'failing' THEN 0 WHEN 'suspect' THEN 1 ELSE 2 END
+              LIMIT 1) AS fetch_health,
             f.careers_url,
             f.public_domain,
+            p.level AS priority_level,
             e.employer_fein,
             e.employer_name,
             e.employer_city,
@@ -307,6 +387,7 @@ def load_employers(
         LEFT JOIN uscis_petition_counts u ON u.employer_fein = e.employer_fein
         LEFT JOIN fein_domain_map f       ON f.employer_fein = e.employer_fein
         LEFT JOIN h1b_ats_discovery h     ON h.employer_fein = e.employer_fein
+        LEFT JOIN discover_priority p     ON p.employer_fein = e.employer_fein
         {soc_join}
         {where}
         ORDER BY {order}
@@ -496,6 +577,30 @@ def load_company_ats_entries(fein: str) -> list[dict]:
     return df.to_dict("records") if not df.empty else []
 
 
+@st.cache_data(ttl=60)
+def load_company_health(keys: tuple) -> dict:
+    """company_health rows for the given tracking keys ('ca:{id}'), as {company_key: row}."""
+    if not keys:
+        return {}
+    df = _query("SELECT * FROM company_health WHERE company_key = ANY(%s)", (list(keys),))
+    return {r["company_key"]: r for r in df.to_dict("records")} if not df.empty else {}
+
+
+def _health_detail(h: dict) -> str:
+    """One caption line for a company_health row: state, why, how long, and the count against its range."""
+    parts = [f"{_HEALTH_ICON.get(h['state'], '')} **{h['state']}**"]
+    if h.get("reason"):
+        parts.append(h["reason"])
+    if h.get("since") is not None and not pd.isna(h["since"]):
+        parts.append(f"since {pd.Timestamp(h['since']):%Y-%m-%d}")
+    if h.get("count") is not None and not pd.isna(h["count"]) and h.get("baseline") is not None and not pd.isna(h["baseline"]):
+        line = f"last full scan {int(h['count'])} jobs vs normal ~{h['baseline']:.0f}"
+        if h.get("flag_line") is not None and not pd.isna(h["flag_line"]):
+            line += f" (flagged below {h['flag_line']:.0f})"
+        parts.append(line)
+    return " · ".join(parts)
+
+
 @st.cache_data(ttl=300)
 def load_email_data(fein: str) -> dict | None:
     """Load email domain map + patterns for a FEIN. Returns None if no data."""
@@ -669,6 +774,16 @@ with st.sidebar:
     ats_filter     = st.selectbox("ATS", _FILTER_OPTIONS)
     careers_filter = st.selectbox("Career page", _FILTER_OPTIONS)
     pd_filter      = st.selectbox("Public domain", _FILTER_OPTIONS)
+    health_filter  = st.selectbox("Fetch health", _HEALTH_OPTIONS,
+                                  help="Verdict from the full scans: Suspect = the last scan fell below the company's "
+                                       "own normal range or did not finish; Failing = repeated bad scans or an empty "
+                                       "board. Expected = you marked it as real.")
+
+    priority_sel = st.multiselect(
+        "My flags", list(_PRIORITY_ALL), default=list(_PRIORITY_ALL),
+        format_func=lambda x: _PRIORITY_LABEL[x],
+        help="Your own High / Maybe / Skip marks. Pick Unreviewed to see only companies you have not looked at yet.",
+    )
 
     st.divider()
 
@@ -709,6 +824,8 @@ df = load_employers(
     ats_filter=ats_filter,
     careers_filter=careers_filter,
     pd_filter=pd_filter,
+    health_filter=health_filter,
+    priority_filter=tuple(priority_sel),
 )
 
 
@@ -716,6 +833,10 @@ df = load_employers(
 # Metrics
 # ─────────────────────────────────────────────────────────────────────────────
 
+_pc = load_priority_counts()
+st.caption(
+    f"My flags — ⭐ {_pc['high']:,} · 🤔 {_pc['maybe']:,} · 🚫 {_pc['skip']:,} · Unreviewed {_pc['unreviewed']:,}"
+)
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Employers shown", f"{len(df):,}")
 m2.metric("States", df["employer_state"].nunique() if not df.empty else 0)
@@ -752,11 +873,18 @@ if _soc_mode:
     )
 display = df[
     (["soc_filed", "soc_certified"] if _soc_mode else []) + [
-        "employer_name", "petition_count", "ats_platform", "careers_url", "public_domain",
+        "priority_level", "employer_name", "petition_count", "ats_platform", "fetch_health", "careers_url", "public_domain",
         "employer_city", "employer_state", "naics_code",
         "total_filed", "total_certified", "approval_rate", "h1b_dependent", "quarters_count",
     ]
 ].copy()
+
+# Rank 1..N in the table's current sort order (petition count by default), so you can see how far down the list you are.
+display.insert(0, "#", range(1, len(display) + 1))
+
+display["priority_level"] = display["priority_level"].map(_PRIORITY_ICON).fillna("")
+display["fetch_health"] = display["fetch_health"].map(
+    lambda s: f"{_HEALTH_ICON[s]} {s}" if s in _HEALTH_ICON else "")
 
 display["approval_rate"] = (display["approval_rate"] * 100).round(1)
 display["h1b_dependent"] = display["h1b_dependent"].map({True: "✓", False: "", None: ""}).fillna("")
@@ -764,9 +892,11 @@ display["h1b_dependent"] = display["h1b_dependent"].map({True: "✓", False: "",
 display.rename(columns={
     "soc_filed":       "SOC Filed",
     "soc_certified":   "SOC Certified",
+    "priority_level":  "Flag",
     "employer_name":   "Employer",
     "petition_count":  "Petitions",
     "ats_platform":    "ATS",
+    "fetch_health":    "Fetch",
     "careers_url":     "Career page",
     "public_domain":   "Public domain",
     "employer_city":   "City",
@@ -786,8 +916,10 @@ selected = st.dataframe(
     on_select="rerun",
     selection_mode="single-row",
     column_config={
+        "#":          st.column_config.NumberColumn("#", format="%d", width="small"),
+        "Flag":       st.column_config.TextColumn("Flag", width="small"),
         "Approval %": st.column_config.NumberColumn("Approval %", format="%.1f%%"),
-        "SOC Filed":     st.column_config.NumberColumn("SOC Filed",     format="%d"),
+        "SOC Filed":    st.column_config.NumberColumn("SOC Filed",     format="%d"),
         "SOC Certified": st.column_config.NumberColumn("SOC Certified", format="%d"),
         "Petitions":  st.column_config.NumberColumn("Petitions",  format="%d"),
         "Career page": st.column_config.LinkColumn("Career page"),
@@ -828,8 +960,26 @@ st.caption(
     f"  ·  NAICS: `{emp['naics_code'] or '—'}`"
 )
 
+_cur_level = emp["priority_level"] if emp["priority_level"] in _PRIORITY_ICON else None
+_flag_opts = ["high", "maybe", "skip", "clear"]
+_flag_label = {**_PRIORITY_LABEL, "clear": "Clear"}
+_new_level = st.radio(
+    "My flag", _flag_opts, index=_flag_opts.index(_cur_level) if _cur_level else None,
+    format_func=lambda x: _flag_label[x], horizontal=True, key=f"priority_{fein}",
+)
+# "clear" means no flag, so compare against None — otherwise the radio's stored "clear" would re-trigger forever.
+if _new_level is not None and (None if _new_level == "clear" else _new_level) != _cur_level:
+    _ok = (discover_priority.clear_level(fein) if _new_level == "clear"
+           else discover_priority.set_level(fein, _new_level))
+    if _ok:
+        load_employers.clear()
+        load_priority_counts.clear()
+        st.rerun()
+    else:
+        st.error("Could not save the flag.")
+
 disc = load_ats_discovery(fein)
-_canonical = (disc or {}).get("canonical_name") or None
+_canonical =(disc or {}).get("canonical_name") or None
 
 col_chart, col_meta = st.columns([3, 1])
 
@@ -1347,6 +1497,7 @@ if ca_entries:
         "These entries were discovered by the H-1B ATS pipeline. "
         "Toggle **Monitor** to start job tracking once you've confirmed the slug is correct."
     )
+    health_by_key = load_company_health(tuple(f"ca:{ca['id']}" for ca in ca_entries))
     for ca in ca_entries:
         ca_id       = ca["id"]
         ca_platform = ca.get("platform", "unknown")
@@ -1355,12 +1506,37 @@ if ca_entries:
         ca_monitored = bool(ca.get("is_monitored"))
         ca_status   = ca.get("status", "pending")
         ca_source   = ca.get("source", "")
+        ca_health   = health_by_key.get(f"ca:{ca_id}")
+        ca_problem  = bool(ca_health) and ca_health["state"] != "ok"
+        ca_expected = ca_problem and ca_health.get("expected_state") == ca_health["state"]
 
         badge = "🟢 Monitored" if ca_monitored else "⚪ Pending review"
+        if ca_problem:
+            badge += f"  {_HEALTH_ICON[ca_health['state']]} fetch {ca_health['state']}" + (" (expected)" if ca_expected else "")
         with st.expander(
             f"{badge}  ·  {ca_platform}  ·  `{ca_slug}`  ·  {ca_domain}",
-            expanded=not ca_monitored,
+            expanded=(not ca_monitored) or (ca_problem and not ca_expected),
         ):
+            if ca_health:
+                st.caption(_health_detail(ca_health))
+            if ca_problem:
+                if ca_expected:
+                    if st.button("Report this again", key=f"ca_unexpect_{ca_id}",
+                                 help="Undo 'Mark as expected' — the daily digest lists it again."):
+                        company_health.clear_expected(f"ca:{ca_id}")
+                        load_company_health.clear()
+                        load_employers.clear()
+                        st.rerun()
+                else:
+                    if st.button("Mark as expected", key=f"ca_expect_{ca_id}",
+                                 help="This is the real state of the board (it shrank, or the site changed). "
+                                      "The daily digest stops listing it; if the state changes again "
+                                      "(e.g. suspect → failing) it is reported again."):
+                        company_health.mark_expected(f"ca:{ca_id}")
+                        load_company_health.clear()
+                        load_employers.clear()
+                        st.rerun()
+
             info_cols = st.columns(3)
             info_cols[0].markdown(f"**Platform**\n\n{ca_platform}")
             info_cols[1].markdown(f"**Slug**\n\n`{ca_slug}`")

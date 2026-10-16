@@ -3,6 +3,9 @@
 
 from datetime import datetime
 from jobs.ats.base import fetch_json, slugify, validate_company_match
+from jobs.ats.fetch_report import (
+    FetchReport, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, attach, count_distinct,
+)
 
 
 BASE_URL = "https://api.ashbyhq.com/posting-api/job-board/{slug}"
@@ -36,10 +39,17 @@ def fetch_jobs(slug, company):
     """
     data = fetch_json(BASE_URL.format(slug=slug),
                       platform="ashby")  # tracked for api_health
-    if not data:
-        return []
-    jobs = data.get("jobs", [])
-    return [_normalize(j, company) for j in jobs if j.get("title")]
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return attach([], FetchReport(stop_reason=STOP_REQUEST_FAILED, pages=1))
+    jobs   = data["jobs"]
+    result = [_normalize(j, company) for j in jobs if j.get("title")]
+    # The whole board arrives in one response and Ashby reports no total, so complete stays unknown.
+    return attach(result, FetchReport(
+        stop_reason      = STOP_SINGLE_RESPONSE,
+        pages            = 1,
+        fetched_distinct = count_distinct(result),
+        unusable         = len(jobs) - len(result),
+    ))
 
 
 def _normalize(job, company):

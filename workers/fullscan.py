@@ -109,6 +109,8 @@ from config import (
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_FULLSCAN,
     REDIS_CYCLE_START,
+    REDIS_FEED_VERIFY_PREFIX,
+    JOBVITE_FEED_VERIFY_INTERVAL_H,
     REDIS_DB_MAINTENANCE,
     REDIS_INFLIGHT_FULLSCAN,
     REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
@@ -129,6 +131,9 @@ from config import (
     STREAM_CONSUMER_GROUP,
     STREAM_BLOCK_MS,
     WARMING_POLLS_COUNT,
+    REDIS_FULLSCAN_PARTIAL_PREFIX,
+    FULLSCAN_PARTIAL_MAX_RETRIES,
+    FULLSCAN_PARTIAL_RETRY_TTL_S,
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import Heartbeat
@@ -140,6 +145,8 @@ from workers.paginator import should_continue_paginating, estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
+from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
+from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
 from jobs.job_filter import filter_jobs, filter_jobs_title_only
 from db.db import init_db, get_conn
@@ -374,6 +381,33 @@ def _release_lock(company: str, r) -> None:
         current = current.decode()
     if current == WORKER_ID:
         r.delete(key)
+
+
+def _partial_retry_allowed(r, company: str) -> bool:
+    """
+    Count one more request_failed fetch for `company`; True while it is within FULLSCAN_PARTIAL_MAX_RETRIES.
+    Past the budget the scan completes with its incomplete verdict instead of retrying hourly forever.
+    A Redis failure allows the retry (the previous behaviour).
+    """
+    key = f"{REDIS_FULLSCAN_PARTIAL_PREFIX}:{company}"
+    try:
+        n = int(r.incr(key))
+        r.expire(key, FULLSCAN_PARTIAL_RETRY_TTL_S)
+    except Exception as exc:
+        logger.warning("fullscan partial-retry counter failed for %s: %s", company, exc)
+        return True
+    if n > FULLSCAN_PARTIAL_MAX_RETRIES:
+        logger.warning("fullscan %s: request_failed %d times in a row — completing with incomplete verdict", company, n)
+        return False
+    return True
+
+
+def _clear_partial_retries(r, company: str) -> None:
+    """Reset the request_failed retry counter after a scan completes."""
+    try:
+        r.delete(f"{REDIS_FULLSCAN_PARTIAL_PREFIX}:{company}")
+    except Exception as exc:
+        logger.warning("fullscan partial-retry counter clear failed for %s: %s", company, exc)
 
 
 def _defer_adaptive_first(company: str, r) -> None:
@@ -764,6 +798,54 @@ def _build_detail_payload(
 
 
 # ─────────────────────────────────────────
+# JOBVITE COMPLETENESS (feed cross-check)
+# ─────────────────────────────────────────
+
+def _record_fetch_failure(platform: str, company: str, exc: Exception, start_mono: float) -> None:
+    """
+    A fullscan whose fetch raised produces no jobs and so no completeness report; record it as a
+    failed scan so the health verdict sees the company failing instead of silently skipping it.
+    """
+    record_scan(
+        company, platform, SOURCE_FULLSCAN,
+        FetchReport(stop_reason=STOP_REQUEST_FAILED).finalize(),
+        duration_ms=int((time.monotonic() - start_mono) * 1000),
+        error=f"{type(exc).__name__}: {exc}",
+    )
+
+
+def _verify_jobvite_feed(company: str, r, slug_info, valid_jobs: list,
+                         stop_reason: str = STOP_EMPTY_PAGE) -> None:
+    """
+    After a finished Jobvite full scan, cross-check the fetched board against the
+    account XML feed — at most once per JOBVITE_FEED_VERIFY_INTERVAL_H per company
+    (Redis SET NX gate). Logs the verdict and stores it on the scan's scan_health row;
+    never raises, never blocks the scan result.
+    """
+    gate = f"{REDIS_FEED_VERIFY_PREFIX}:{company}"
+    try:
+        if not r.set(gate, "1", nx=True, ex=JOBVITE_FEED_VERIFY_INTERVAL_H * 3600):
+            return
+        from jobs.ats import jobvite
+        # progress:<company> has a short TTL and the trace can run for JOBVITE_FEED_TRACE_BUDGET_S, so refresh it
+        verdict = jobvite.verify_fetch(
+            slug_info, valid_jobs, stop_reason,
+            on_progress=lambda: set_progress(company, "fullscan_jobvite_verify"),
+        )
+        annotate_latest(company, SOURCE_FULLSCAN, verdict["status"])
+        log = logger.info if verdict["status"] == "verified" else logger.warning
+        log("fullscan [%s]: jobvite feed check %s — %s %s", company,
+            verdict["status"], verdict["reason"],
+            verdict.get("missing", [])[:10])
+    except Exception as exc:
+        logger.warning("fullscan [%s]: jobvite feed check failed: %s", company, exc)
+        try:
+            r.delete(gate)   # release the gate so a later fullscan can retry the check
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────
 # CORE: run one full scan
 # ─────────────────────────────────────────
 
@@ -979,6 +1061,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             return result
         except IncompleteSearchError as exc:
             if not exc.stubs:
+                _record_fetch_failure(platform, company, exc, start_mono)
                 raise
             logger.warning(
                 "fullscan [%s]: avature partial fetch for %r — %d stubs "
@@ -987,6 +1070,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             )
             raw_jobs = exc.stubs
             _partial_fetch = True
+        except Exception as exc:
+            _record_fetch_failure(platform, company, exc, start_mono)
+            raise
         set_progress(company, "fullscan_processing")
 
         # ── Persist slug_info mutations made in-place by ATS modules ──────────
@@ -1038,6 +1124,27 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             )
 
         result["fetched"] = len(valid_jobs)
+
+        # Completeness verdict of this fetch (jobs/ats/fetch_report.py): recorded, and an incomplete
+        # fetch is treated like Avature's partial one so nothing downstream reads it as the full board.
+        _report = report_of(raw_jobs)
+        if _partial_fetch:
+            _report.complete    = False
+            _report.stop_reason = STOP_REQUEST_FAILED
+            _report.note        = _report.note or "avature partial fetch"
+        elif _report.complete is False and _report.stop_reason == STOP_REQUEST_FAILED:
+            # Only a transient failure is worth the hourly retry; structural incompleteness (page cap,
+            # repeat page, shortfall) would loop forever, so it completes normally with its verdict recorded.
+            # A failure that never clears gets the same treatment once the retry budget is spent.
+            _partial_fetch = _partial_retry_allowed(r, company)
+        record_scan(
+            company, platform, SOURCE_FULLSCAN, _report,
+            raw_count=len(raw_jobs), valid_count=len(valid_jobs),
+            duration_ms=int((time.monotonic() - start_mono) * 1000),
+        )
+
+        if platform == "jobvite" and not _partial_fetch:
+            _verify_jobvite_feed(company, r, slug_info, valid_jobs, _report.stop_reason)
 
         # ── 8. Apply listing-level title filter (same as scan_worker) ─────────
         listing_filter = config.get("listing_filter", "full")
@@ -1289,6 +1396,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # Capture whether this is the first full scan BEFORE updating DB
             # (last_poll_at IS NULL = company has never had an adaptive scan).
             is_first_fullscan = (fs_state.get("last_poll_at") is None)
+
+            # Scan completed — a later transient failure gets a fresh retry budget.
+            _clear_partial_retries(r, company)
 
             # Promote NEW bloom → OLD (DEL old, RENAME new → old, set TTL).
             # The promoted OLD bloom now reflects the complete current board

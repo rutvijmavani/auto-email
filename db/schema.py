@@ -35,6 +35,7 @@ from config import (
     RETENTION_COVERAGE_STATS,
     RETENTION_API_HEALTH,
     RETENTION_PIPELINE_ALERTS,
+    RETENTION_SCAN_HEALTH_DAYS,
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
     RETENTION_ENRICHMENT_METRICS_DAYS,
@@ -199,6 +200,12 @@ def _cleanup_external_api_health(c):
     """external_api_health — same retention cadence as api_health (docs/enrichment_discovery_design.md §11)."""
     cutoff = (datetime.now() - timedelta(days=RETENTION_EXTERNAL_API_HEALTH)).strftime("%Y-%m-%d")
     c.execute("DELETE FROM external_api_health WHERE date < %s", (cutoff,))
+
+
+def _cleanup_scan_health(c):
+    """scan_health — per-scan completeness verdicts, kept RETENTION_SCAN_HEALTH_DAYS days."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_SCAN_HEALTH_DAYS)).isoformat()
+    c.execute("DELETE FROM scan_health WHERE scanned_at < %s", (cutoff,))
 
 
 def _cleanup_worker_scaling_events(c):
@@ -716,6 +723,94 @@ def init_db():
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_external_api_health_date_service
         ON external_api_health(date, service)
+    """)
+
+    # scan_health: one row per company fetch — the completeness verdict of jobs/ats/fetch_report.py
+    # (written by db/scan_health.py::record_scan from scan_worker / fullscan / job_monitor).
+    # complete: TRUE = read to the end and distinct >= reported total (less tolerance);
+    #           FALSE = ended abnormally or short of the total; NULL = unknown (no total to compare).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scan_health (
+            id               BIGSERIAL PRIMARY KEY,
+            scanned_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            company_key      TEXT    NOT NULL,
+            platform         TEXT,
+            source           TEXT,               -- 'scan' | 'fullscan' | 'monitor'
+            stop_reason      TEXT,
+            complete         BOOLEAN,
+            server_short     BOOLEAN DEFAULT FALSE,
+            pages            INTEGER DEFAULT 0,
+            fetched_distinct INTEGER DEFAULT 0,
+            unusable         INTEGER DEFAULT 0,
+            reported_total   INTEGER,
+            total_source     TEXT,
+            raw_count        INTEGER DEFAULT 0,  -- rows the feeder returned
+            valid_count      INTEGER DEFAULT 0,  -- rows with job_url and job_id
+            matched_count    INTEGER,            -- rows passing the title filter (NULL when the caller does not filter)
+            duration_ms      INTEGER DEFAULT 0,
+            error            TEXT,
+            note             TEXT,
+            feed_status      TEXT                -- Jobvite XML feed cross-check verdict
+        )
+    """)
+
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_company_time
+        ON scan_health(company_key, scanned_at DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_time
+        ON scan_health(scanned_at)
+    """)
+    # source-filtered reads of db/company_health.py: _own_rows (one company's recent rows of one source)
+    # and _peer_spread (same-platform peers' recent rows)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_company_source_time
+        ON scan_health(company_key, source, scanned_at DESC, id DESC)
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_scan_health_source_platform
+        ON scan_health(source, platform, company_key, scanned_at DESC)
+    """)
+
+    # company_health: one row per company — the verdict of jobs/health_verdict.py over its fullscan
+    # scan_health rows (written by db/company_health.py::refresh after each fullscan). The daily digest
+    # reads it; reported_state/reported_at record what the last digest already told the user.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS company_health (
+            company_key    TEXT PRIMARY KEY,
+            platform       TEXT,
+            state          TEXT NOT NULL,       -- 'ok' | 'suspect' | 'failing'
+            reason         TEXT,
+            since          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,   -- when `state` last changed
+            last_scan_at   TIMESTAMP,
+            count          INTEGER,
+            baseline       DOUBLE PRECISION,    -- median of the good fullscans used
+            spread         DOUBLE PRECISION,
+            flag_line      DOUBLE PRECISION,
+            band_from      TEXT,                -- 'own' | 'peers'
+            reported_state TEXT,
+            reported_at    TIMESTAMP,
+            expected_state TEXT,                -- state the user marked "expected" in Discover; silences the digest while state stays equal
+            expected_at    TIMESTAMP
+        )
+    """)
+    for _col in ("expected_state TEXT", "expected_at TIMESTAMP"):
+        c.execute(f"ALTER TABLE company_health ADD COLUMN IF NOT EXISTS {_col}")
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_company_health_state
+        ON company_health(state)
+    """)
+
+    # discover_priority: the user's personal High/Maybe/Skip flag per employer FEIN, set from the
+    # Discover page (frontend/pages/3_Discover.py). No row = unreviewed. Standalone table so it
+    # cannot affect monitoring or the pipeline.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS discover_priority (
+            employer_fein TEXT PRIMARY KEY,
+            level         TEXT NOT NULL,
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
 
     # pd_probe_observation: latest public-domain probe result per domain — the evidence
@@ -2109,6 +2204,7 @@ def init_db():
     _cleanup_coverage_stats(c)
     _cleanup_api_health(c)
     _cleanup_external_api_health(c)
+    _cleanup_scan_health(c)
     _cleanup_worker_scaling_events(c)
     _cleanup_pipeline_alerts(c)
     _cleanup_mark_resolved_diagnostics(c)
