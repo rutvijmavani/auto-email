@@ -4,3 +4,4 @@
 # behavior in particular). See scripts/mobile_relay_socks5.py's docstring for
 # the launcher's role (docs/discovery-pipeline-hardening.md Part 3).
 scripts/run_mobile_relay_loop.bat text eol=crlf
+graphify-out/graph.json merge=graphify
