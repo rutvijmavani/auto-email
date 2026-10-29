@@ -142,7 +142,7 @@ flags. A proper fix (P90 of company delays instead of max) is left for a future 
 - Fullscan: **7200s (2h)** — fullscan interval is 24h. Being 2h late = 8% of interval. 300s was 0.3% and meaningless.
 
 **Key capacity insight (2026-07-20):**
-With real est_fetch_s values (P75), 2 scan workers can serve ~3 scans/min vs 0.32 scans/min needed (155 companies ÷ 8h avg interval). The current 10 scan workers are the startup default from `calculate_worker_counts()` — the manager's scale-down logic will right-size to 2–3 workers once deployed.
+With real est_fetch_s values (P75), 2 scan workers can serve ~3 scans/min vs 0.32 scans/min needed (155 companies ÷ 8h avg interval). The 10 scan workers in this example were the old startup default from `calculate_worker_counts()` (deleted 2026-10-29; pools now start at `WORKER_FLOOR`).
 
 ### 4.2 — What every worker publishes each cycle
 
@@ -179,6 +179,21 @@ workers_target    = math.ceil(drain_rate * est_fetch_s)
 if actual_delay_s > DELAY_WARN_S:                          # already past WARN → amplify
     workers_target = math.ceil(workers_target * (actual_delay_s / DELAY_WARN_S))
 workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
+
+# >>> SCAN AND FULLSCAN (changed 2026-10-29): the block above is the DETAIL formula only.
+# Scan and fullscan replace lines 171-174 with work-seconds from per-company data:
+#   needed  = ceil( backlog + steady )
+#   backlog = sum over late companies c of min( d_c / H , 1 )     # H = pool delay_warn_s (fixed, not time_left)
+#   steady  = ( sum over ALL companies c of d_c / (d_c + T_c) ) / MANAGER_SCALE_UP_UTIL
+# d_c = DB EMA (avg_scan_duration_s / avg_fullscan_duration_s); T_c = current_interval_s (scan) or
+# full_scan_interval_s (fullscan); next run = completion + interval, so steady load is d/(d+T).
+# A late company with no entry uses fetch_p75; unknown is never 0. The delay multiplier, clamp,
+# urgent / scale-up / scale-down gates, _needed_workers pre-clamp record and Layer 1/2 are unchanged.
+# Data: workers/company_load.py (Redis hash per pool, updated by Lua after each scan, rebuilt nightly in
+# _midnight_recompute with RENAME + ~25 h TTL, rebuilt from the DB when missing). Late names come from
+# manager._get_scan_pool_metrics (overdue ZSET members + undelivered stream entries, no cap).
+# If the late list or table is unreadable the pool keeps its last work-based need (_last_work_need).
+# Full text: docs/scan-fullscan-sizing-plan.md.
 
 # ── Urgent (1 cycle) — fires on either condition, only when understaffed ───
 # Demand trigger requires BOTH: approaching ceiling AND exceeding historical norm.
@@ -852,7 +867,7 @@ Manager owns detail worker restarts. Scan and fullscan restarts stay in watchdog
 ### What moves to the manager
 
 Current responsibilities that belong to the manager:
-- Layer 3 slow throughput check (currently in `scheduler.py _slow_throughput_check_loop`) — **eliminated as a 30-min loop; replaced by manager's 30–60s cycle**
+- Layer 3 slow throughput check (was `scheduler.py _slow_throughput_check_loop`) — **DELETED 2026-10-29 (it was never started); replaced by manager's 30–60s cycle. Its Redis-memory (CRITICAL at `REDIS_MEMORY_ALERT_PCT`) and detail:adaptive queue-depth (WARNING after `DETAIL_QUEUE_ALERT_CYCLES` checks above `DETAIL_QUEUE_HIGH_WATERMARK`) alerts now run in `manager._check_health_alerts`, throttled by `WORKER_SLOW_CHECK_INTERVAL_S`. `_remaining_work_minimum` (dynamic floor, only caller was that loop) deleted too.**
 - Detail queue CRITICAL/WARN detection (currently in `watchdog.py`)
 - Worker add/remove decisions for both scan and detail pools
 
@@ -2325,11 +2340,11 @@ Self-adjusting: as actual_delay rises, time_left shrinks → backpressure_depth 
 
 See Section 5 for the updated manager stall-confirmation block.
 
-**5. `calculate_worker_counts()` at startup (resolved — 2026-07-21)**
+**5. Startup worker count (resolved — 2026-10-29, reverses the 2026-07-21 decision)**
 
-Keep `calculate_worker_counts()` as the startup seed; manager takes over from cycle 1 onward.
+`calculate_worker_counts()` is deleted. The scheduler starts every pool at `WORKER_FLOOR` and the manager owns all later sizing (the scheduler only executes spawns).
 
-Rationale: cold-starting at `WORKER_FLOOR=2` under an existing backlog causes a 2+ minute gap before the manager scales up to the correct level. The existing function uses 30-day `api_health` history and produces a good initial estimate at zero extra complexity. Manager cycle 1 immediately re-evaluates and adjusts from there.
+Rationale: the manager is the only owner of worker counts. The 2026-07-21 concern (a gap at the floor under an existing backlog) is covered by the urgent step, which spawns straight to the target in one cycle when delay >= 0.75*warn or the demand trigger holds. A mildly behind pool takes the slower scale-up (+1 per 2 cycles); not measured on the VM.
 
 **6. Deploy order (resolved — 2026-07-21)**
 
@@ -2868,7 +2883,7 @@ Remove the gate and the old function together after manager has been running for
    the race conditions in §16.7 items 1 and 2.
 
 6. **Delete old loops from scheduler.py** — `_fast_error_check_loop`, `_slow_throughput_check_loop`,
-   `calculate_worker_counts`. Gate the last one with the Redis exists check first.
+   `calculate_worker_counts` (done 2026-10-29: pools start at `WORKER_FLOOR`, no gate).
 
 7. **Add Layer 1 (midnight recompute + Phase 4)** — once Layer 0 has accumulated 7 days of
    `daily_peak:running` data.
