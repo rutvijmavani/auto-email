@@ -138,7 +138,7 @@ from config import (
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import BusyMeter, Heartbeat
 from workers.queue_stamp import stamp_queued_at, count_arrival
-from workers import progress
+from workers import company_load, progress
 from workers.scheduler import (
     set_heartbeat, clear_heartbeat, set_progress, clear_reaped,
     _pick_schedule_time, _next_digest_deadline, _atomic_schedule,
@@ -1458,6 +1458,11 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             )
 
             if db_ok:
+                # Fullscan sizing table (workers/company_load.py): d is the EMA just
+                # persisted, T the stored full_scan_interval_s (the column the
+                # nightly rebuild reads, so event and rebuild totals agree).
+                company_load.update(r, "fullscan", company, updated_avg_duration, interval_s)
+
                 result["outcome"]      = "completed"
                 result["success"]      = True
                 result["duration_ms"]  = int(duration_s * 1000)

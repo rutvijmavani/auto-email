@@ -55,6 +55,7 @@ import workers.manager as mgr
 
 def _reset_cycle_state():
     """Reset all hysteresis counters and urgent flags to zero/False."""
+    mgr._last_work_need.clear()   # scan pools keep the last need when work is unknown
     for pool in ("scan", "detail", "fullscan"):
         mgr._scale_up_cycles[pool]   = 0
         mgr._scale_down_cycles[pool] = 0

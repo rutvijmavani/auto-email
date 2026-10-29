@@ -37,7 +37,8 @@ from logger import get_logger, init_logging
 from workers.redis_client import get_redis
 from workers import db_capacity
 from workers.queue_stamp import payload_wait_s
-from workers.stream_backlog import stream_backlog
+from workers.stream_backlog import stream_backlog, waiting_companies
+from workers import company_load
 from config import (
     WORKER_FLOOR,
     MONITOR_MAX_WORKERS,
@@ -47,6 +48,14 @@ from config import (
     MANAGER_RECOMPUTE_TZ,
     POOL_CEIL_DIVISOR,
     BOOTSTRAP_BUFFER,
+    MANAGER_SCALE_UP_UTIL,
+    MANAGER_SCALE_DOWN_UTIL,
+    WORKER_SLOW_CHECK_INTERVAL_S,
+    DETAIL_QUEUE_HIGH_WATERMARK,
+    DETAIL_QUEUE_ALERT_CYCLES,
+    REDIS_MEMORY_ALERT_PCT,
+    SCAN_DELAY_WARN_MIN_S,
+    FULLSCAN_DELAY_WARN_MIN_S,
     SERVICE_TIME_WINDOW_CYCLES,
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
@@ -152,6 +161,7 @@ _NO_RATE = object()                # _fire_lever1: caller gave no inflow rate
 _cycle_arrival_rate:   dict = {}   # pool -> organic arrivals/s this cycle (None = unknown)
 _cycle_service_s:      dict = {}   # pool -> real service time s this cycle (None = unknown)
 _needed_workers:       dict = {}   # pool -> uncapped workers the formula asked for
+_last_work_need:       dict = {}   # scan pools -> last need from per-company work (kept while unreadable)
 _lever1_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _reintro_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 
@@ -220,7 +230,7 @@ def _compute_scaling_params() -> dict:
             """)
             row = cur.fetchone()
             if row and row["value"] is not None:
-                params["scan"]["delay_warn_s"] = max(300, int(row["value"]))
+                params["scan"]["delay_warn_s"] = max(SCAN_DELAY_WARN_MIN_S, int(row["value"]))
 
             # fullscan DELAY_WARN_S: avg(full_scan_interval_s) × 0.10
             cur.execute("""
@@ -230,7 +240,7 @@ def _compute_scaling_params() -> dict:
             """)
             row = cur.fetchone()
             if row and row["value"] is not None:
-                params["fullscan"]["delay_warn_s"] = max(600, int(row["value"]))
+                params["fullscan"]["delay_warn_s"] = max(FULLSCAN_DELAY_WARN_MIN_S, int(row["value"]))
 
         params["computed_at"] = datetime.now(timezone.utc).isoformat()
         logger.info(
@@ -468,6 +478,18 @@ def _get_scan_pool_metrics(r, zset_key: str, stream_key: str, now: float,
         logger.warning("manager: stream backlog unreadable for %s: %s", stream_key, exc)
         waiting, stream_age = None, None
 
+    # Names of every late company, no cap: the sizing formula weighs each by its
+    # own duration (workers/company_load.py).  None = unreadable (unknown, not
+    # empty).  A company in both places counts once.
+    late_names = None
+    try:
+        names = set(r.zrangebyscore(zset_key, "-inf", now))
+        if waiting is not None:
+            names.update(waiting_companies(r, stream_key, STREAM_CONSUMER_GROUP))
+            late_names = sorted(names)
+    except Exception as exc:
+        logger.warning("manager: late company names unreadable for %s: %s", zset_key, exc)
+
     return {
         "depth":          overdue + (waiting or 0),
         "delay_s":        max(zset_delay, stream_age or 0.0),
@@ -475,6 +497,120 @@ def _get_scan_pool_metrics(r, zset_key: str, stream_key: str, now: float,
         "zset_delay_s":   zset_delay,
         "stream_waiting": waiting,
         "stream_age_s":   stream_age,
+        "late_names":     late_names,
+    }
+
+
+_SCAN_TYPE_POOLS = ("scan", "fullscan")
+
+# Health alerts (moved here from the removed scheduler slow-throughput loop, which
+# nothing ever started).  Run every WORKER_SLOW_CHECK_INTERVAL_S, so the detail
+# queue alert still means DETAIL_QUEUE_ALERT_CYCLES x that interval.
+_last_health_check_ts: float = 0.0
+_detail_alert_streak:  int   = 0
+
+
+def _check_health_alerts(r, now: float) -> None:
+    """
+    Redis memory alert (CRITICAL at REDIS_MEMORY_ALERT_PCT of maxmemory; under
+    noeviction a full Redis rejects writes and queue entries are lost) and detail
+    queue depth alert (WARNING once detail:adaptive stays above
+    DETAIL_QUEUE_HIGH_WATERMARK for DETAIL_QUEUE_ALERT_CYCLES checks).  Throttled
+    to one check per WORKER_SLOW_CHECK_INTERVAL_S; create_alert dedups repeats.
+    """
+    global _last_health_check_ts, _detail_alert_streak
+    if now - _last_health_check_ts < WORKER_SLOW_CHECK_INTERVAL_S:
+        return
+    _last_health_check_ts = now
+
+    from db.pipeline_alerts import (
+        create_alert, ALERT_REDIS_MEMORY, ALERT_DETAIL_QUEUE_DEPTH, CRITICAL, WARNING,
+    )
+
+    try:
+        mem_info = r.info("memory")
+        used_mem = mem_info.get("used_memory", 0)
+        max_mem  = mem_info.get("maxmemory", 0)
+        if max_mem and max_mem > 0:        # maxmemory=0 means no limit configured
+            used_pct = int(100 * used_mem / max_mem)
+            if used_pct >= REDIS_MEMORY_ALERT_PCT:
+                alert_id = create_alert(
+                    alert_type = ALERT_REDIS_MEMORY,
+                    severity   = CRITICAL,
+                    value      = float(used_pct),
+                    threshold  = float(REDIS_MEMORY_ALERT_PCT),
+                    message    = (
+                        f"Redis memory at {used_pct}% of maxmemory "
+                        f"({used_mem // 1024 // 1024} MB / {max_mem // 1024 // 1024} MB) — "
+                        f"noeviction policy will block writes at 100%"
+                    ),
+                )
+                if alert_id:
+                    logger.critical(
+                        "manager: REDIS MEMORY alert used=%dMB max=%dMB pct=%d%% (alert_id=%s)",
+                        used_mem // 1024 // 1024, max_mem // 1024 // 1024, used_pct, alert_id,
+                    )
+    except Exception as exc:
+        logger.error("manager: redis memory check failed: %s", exc)
+
+    try:
+        detail_depth = r.llen(REDIS_DETAIL_ADAPTIVE)
+        if detail_depth > DETAIL_QUEUE_HIGH_WATERMARK:
+            _detail_alert_streak += 1
+            if _detail_alert_streak >= DETAIL_QUEUE_ALERT_CYCLES:
+                alert_id = create_alert(
+                    alert_type = ALERT_DETAIL_QUEUE_DEPTH,
+                    severity   = WARNING,
+                    value      = float(detail_depth),
+                    threshold  = float(DETAIL_QUEUE_HIGH_WATERMARK),
+                    message    = (
+                        f"detail:adaptive queue depth {detail_depth} has exceeded "
+                        f"watermark {DETAIL_QUEUE_HIGH_WATERMARK} for "
+                        f"{_detail_alert_streak} consecutive checks "
+                        f"({_detail_alert_streak * WORKER_SLOW_CHECK_INTERVAL_S // 60} min)"
+                    ),
+                )
+                if alert_id:
+                    logger.warning(
+                        "manager: DETAIL QUEUE DEPTH alert depth=%d watermark=%d "
+                        "checks=%d (alert_id=%s)",
+                        detail_depth, DETAIL_QUEUE_HIGH_WATERMARK,
+                        _detail_alert_streak, alert_id,
+                    )
+        else:
+            _detail_alert_streak = 0
+    except Exception as exc:
+        logger.error("manager: detail queue alert check failed: %s", exc)
+
+
+def _scan_pool_work(r, pool: str, metrics: dict, params: dict) -> "dict | None":
+    """
+    Workers a scan-type pool needs, from per-company work (company_load.py):
+
+      backlog = sum over late companies of min(d / H, 1)     H = delay_warn_s
+      steady  = (sum over all companies of d / (d + T)) / MANAGER_SCALE_UP_UTIL
+
+    d is a company's averaged duration (fetch_p75 when it has no entry), T its
+    interval.  Returns None when the late list or the table cannot be read; the
+    caller then keeps the last need, never a zero.
+    """
+    names = metrics.get("late_names")
+    if names is None:
+        return None
+    fetch_p75    = params.get("fetch_p75",    _FALLBACK_PARAMS[pool]["fetch_p75"])
+    delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
+    try:
+        steady_load = company_load.steady_load(r, pool, fetch_p75)
+        if steady_load is None:
+            return None
+        durations = company_load.durations(r, pool, names, fetch_p75)
+    except Exception as exc:
+        logger.error("manager [%s]: company load unreadable: %s", pool, exc)
+        return None
+    return {
+        "backlog": company_load.backlog_term(durations, delay_warn_s),
+        "steady":  steady_load / MANAGER_SCALE_UP_UTIL,
+        "late":    len(names),
     }
 
 
@@ -870,6 +1006,23 @@ def _midnight_recompute(r, pools: list[str]) -> None:
                 "manager: nightly peak record [%s] failed: %s", pool, exc, exc_info=True,
             )
 
+    # Per-company sizing tables: rebuilt from the DB so the event-built copy cannot
+    # drift.  A failed rebuild keeps the old table (RENAME never ran) and its TTL.
+    try:
+        params_now = _load_scaling_params(r)
+    except Exception as exc:
+        logger.error("manager: nightly company load: scaling params unreadable: %s", exc)
+        params_now = {}
+    for pool in _SCAN_TYPE_POOLS:
+        try:
+            default_d = params_now.get(pool, _FALLBACK_PARAMS[pool])["fetch_p75"]
+            company_load.rebuild(r, pool, default_d)
+        except Exception as exc:
+            logger.error(
+                "manager: nightly company load rebuild [%s] failed: %s", pool, exc,
+                exc_info=True,
+            )
+
     try:
         plan = _plan_ceilings(r, pools)
         _store_plan(r, plan)
@@ -888,7 +1041,7 @@ def _emergency_recalc(r, pool: str, pools: list[str]) -> bool:
     Emergency Layer 1 recalculation, run when a pool is at its ceiling and delay
     is rising: the nightly formula again, with today's observed peak included.
     Raises only this pool's ceiling, and only by spare slots (or by a budget
-    raise toward PROBE).  Returns True if the ceiling changed.
+    raise toward the Postgres seat cap).  Returns True if the ceiling changed.
     """
     plan = _plan_ceilings(r, pools, include_today=True)
     if plan["total"] > _get_db_total(r):
@@ -1005,6 +1158,7 @@ def _run_pool_cycle(
     peak_nd: int,
     service_s: "float | None" = None,
     arrival_rate: "float | None" = None,
+    work: "dict | None" = None,
 ) -> tuple[str, int]:
     """
     Run one Layer 0 cycle for a single pool.  Returns a decision string.
@@ -1033,10 +1187,20 @@ def _run_pool_cycle(
     # service time s.  s is measured from the heartbeats (_get_pool_service_time);
     # fetch_p75 is only the fallback while it is unknown.  lambda is only counted
     # where an arrival counter exists (detail); elsewhere the formula is the doc's.
-    s_used         = service_s if service_s else fetch_p75
-    time_left      = max(delay_warn_s - delay_s, 1)
-    drain_rate     = depth / time_left + (arrival_rate or 0.0)
-    workers_target = math.ceil(drain_rate * s_used)
+    # Scan and fullscan are sized from per-company work instead (work =
+    # _scan_pool_work): backlog + steady, see docs/scan-fullscan-sizing-plan.md.
+    # When that is unknown this cycle the last computed need stays; only a pool
+    # that never had one falls through to the formula above.
+    if work is not None:
+        workers_target = math.ceil(work["backlog"] + work["steady"])
+        _last_work_need[pool] = workers_target
+    elif pool in _last_work_need:
+        workers_target = _last_work_need[pool]
+    else:
+        s_used         = service_s if service_s else fetch_p75
+        time_left      = max(delay_warn_s - delay_s, 1)
+        drain_rate     = depth / time_left + (arrival_rate or 0.0)
+        workers_target = math.ceil(drain_rate * s_used)
 
     if delay_s > delay_warn_s:
         workers_target = math.ceil(workers_target * (delay_s / delay_warn_s))
@@ -1084,7 +1248,7 @@ def _run_pool_cycle(
 
     # ── Normal scale-up: util > 80% AND delay building AND understaffed ───────
     # Uses effective_target so a pool that lent workers doesn't see a false deficit.
-    elif (pool_utilization > 0.80
+    elif (pool_utilization > MANAGER_SCALE_UP_UTIL
           and delay_s > delay_warn_s * 0.5
           and effective_target > n_workers):
         _scale_up_cycles[pool]   += 1
@@ -1106,7 +1270,7 @@ def _run_pool_cycle(
     # ── Normal scale-down: util < 50% AND delay low AND overstaffed ──────────
     # Uses effective_target so a pool that received borrowed workers doesn't
     # immediately scale them back down.
-    elif (pool_utilization < 0.50
+    elif (pool_utilization < MANAGER_SCALE_DOWN_UTIL
           and delay_s < delay_warn_s * 0.25
           and effective_target <= n_workers - 1):
         _scale_down_cycles[pool] += 1
@@ -1554,7 +1718,7 @@ def _check_layer2(
     # Once the pool is at its ceiling with delay above warn and rising, each
     # cycle takes the first step that yields capacity:
     #   emergency recalc of its own ceiling → borrow (lendable, buffer, one
-    #   headroom seat) → raise the worker budget toward PROBE → Lever 1.
+    #   headroom seat) → raise the worker budget toward the Postgres seat cap → Lever 1.
     # The main loop reads the arrival counter and the service-time window once per
     # cycle; a second read here would measure a near-zero interval.
     if pool in _cycle_arrival_rate:
@@ -2085,20 +2249,31 @@ def run_manager() -> None:
                     _cycle_service_s[pool]    = service_s
                     _cycle_arrival_rate[pool] = arrival_rate
 
+                    work = None
+                    if pool in _SCAN_TYPE_POOLS:
+                        _t0  = time.monotonic()
+                        work = _scan_pool_work(r, pool, queue_data.get(pool, {}), params)
+                        _work_ms = (time.monotonic() - _t0) * 1000
+
                     decision, workers_target = _run_pool_cycle(
                         r, pool, n_workers, pool_busy_ms,
                         depth, delay_s, params, worker_ceil, peak_nd,
-                        service_s, arrival_rate,
+                        service_s, arrival_rate, work,
                     )
                     all_workers_targets[pool] = workers_target
                     needed = _needed_workers.get(pool, workers_target)
                     logger.info(
                         "manager [%s]: n=%d needed=%d target=%d ceil=%d depth=%d "
-                        "delay=%.0fs lambda=%s s=%s → %s",
+                        "delay=%.0fs lambda=%s s=%s%s → %s",
                         pool, n_workers, needed, workers_target, worker_ceil, depth,
                         delay_s,
                         "n/a" if arrival_rate is None else f"{arrival_rate:.3f}/s",
                         "n/a" if service_s is None else f"{service_s:.2f}s",
+                        "" if pool not in _SCAN_TYPE_POOLS else (
+                            " work=unknown" if work is None else
+                            f" late={work['late']} backlog={work['backlog']:.2f} "
+                            f"steady={work['steady']:.2f} read={_work_ms:.0f}ms"
+                        ),
                         decision,
                     )
 
@@ -2121,6 +2296,8 @@ def run_manager() -> None:
                         )
                     except Exception:
                         pass
+
+                _check_health_alerts(r, time.time())
 
                 # ── Layer 2 check (after all Layer 0 decisions are made) ───────
                 for pool in pools:

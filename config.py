@@ -768,14 +768,11 @@ CONCURRENCY_SPIKE_FACTOR_THRESHOLD = 5.0   # spike_factor > this → concurrency
 
 # ── Dynamic worker pools (Section 9) ──────────────────────────────────────────
 # Scheduler manages scan + detail worker processes via multiprocessing.Process.
-# Both pool sizes are calculated at 7 AM from historical api_health averages.
+# Every pool starts at WORKER_FLOOR; workers/manager.py owns all later sizing.
 # MONITOR_MAX_WORKERS is the cold-start fallback ceiling only (day 1, no history).
 WORKER_SHUTDOWN_TIMEOUT_S         = 30     # seconds before forced SIGKILL on shutdown
 WORKER_FAST_CHECK_INTERVAL_S      = 300    # 5 min — error-triggered worker reduction
 WORKER_SLOW_CHECK_INTERVAL_S      = 1800   # 30 min — throughput-driven scaling
-WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of post-fullscan remaining DB pool for scan workers
-WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of post-fullscan remaining DB pool for detail workers
-WORKER_POOL_FULLSCAN_FRACTION     = 0.25   # 25% of DB pool removed first; remainder split 60/40 between scan+detail
 WORKER_FLOOR                      = 2      # minimum workers per pool (redundancy)
 WORKER_DEPRIORITISE_SECS          = 300    # seconds to push erroring platform's
                                            # companies forward in poll:adaptive
@@ -841,6 +838,21 @@ MANAGER_RECOMPUTE_TZ              = os.getenv("MANAGER_RECOMPUTE_TZ", "America/N
 POOL_CEIL_DIVISOR                 = {"scan": 2, "detail": 3, "fullscan": 5}
 # Safety buffer assumed for a pool still in bootstrap (no 28-day history yet).
 BOOTSTRAP_BUFFER                  = 2
+
+# Layer 0 utilization gates: scale-up fires above SCALE_UP_UTIL, scale-down below
+# SCALE_DOWN_UTIL.  Scan/fullscan size their steady load so it runs at SCALE_UP_UTIL
+# (one value for gate and sizing, no slack-free 100% target).
+MANAGER_SCALE_UP_UTIL             = float(os.getenv("MANAGER_SCALE_UP_UTIL", "0.80"))
+MANAGER_SCALE_DOWN_UTIL           = float(os.getenv("MANAGER_SCALE_DOWN_UTIL", "0.50"))
+
+# Lowest delay_warn_s the manager derives for the scan / fullscan pools
+# (scan: 10% of P10 current_interval_s, fullscan: 10% of AVG full_scan_interval_s).
+SCAN_DELAY_WARN_MIN_S             = int(os.getenv("SCAN_DELAY_WARN_MIN_S", "300"))
+FULLSCAN_DELAY_WARN_MIN_S         = int(os.getenv("FULLSCAN_DELAY_WARN_MIN_S", "600"))
+
+# Per-company load table (workers/company_load.py): replaced by the nightly rebuild,
+# so it expires one hour after the recompute period if that rebuild stops running.
+COMPANY_LOAD_TTL_S                = int(os.getenv("COMPANY_LOAD_TTL_S", str(25 * 3600)))
 
 # ── Phase 10 — Adaptive protection + resilience hardening (Section 18) ────────
 #

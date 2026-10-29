@@ -46,7 +46,7 @@ from workers.adaptive import (
 from workers.http_client import discover_workday_dc_keys, seed_concurrency_limits
 from workers.rebuild import rebuild_redis
 from workers.stream_backlog import trim_delivered
-from workers import progress
+from workers import company_load, progress
 from db.db import get_conn, init_db
 from config import (
     REDIS_POLL_ADAPTIVE,
@@ -748,7 +748,8 @@ def on_adaptive_complete(company: str, new_jobs: int,
                    last_full_scan_at, full_scan_interval_s,
                    consecutive_errors, last_success_at,
                    warming_polls_remaining,
-                   next_full_scan_at, avg_fullscan_duration_s
+                   next_full_scan_at, avg_fullscan_duration_s,
+                   avg_scan_duration_s
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
@@ -830,6 +831,12 @@ def on_adaptive_complete(company: str, new_jobs: int,
         conn.commit()
     finally:
         conn.close()
+
+    # Scan sizing table (workers/company_load.py): d is the EMA scan_worker already
+    # persisted for this run, T the interval just stored.  A failed run changes
+    # neither, so nothing to write.
+    if success:
+        company_load.update(r, "scan", company, row["avg_scan_duration_s"], interval)
 
     if success and warming is not None:
         remaining_after = (warming - 1) if warming > 1 else 0
@@ -1894,141 +1901,6 @@ def _get_pool_snapshot() -> tuple:
         return len(_scan_pool), len(_detail_pool)
 
 
-def calculate_worker_counts(r) -> tuple:
-    """
-    Calculate required scan and detail worker counts from 30-day api_health history.
-
-    Called at scheduler startup.  Queries historical
-    average response times and today's expected workload to give a data-driven
-    starting point.  The three monitoring layers (liveness, fast error, slow
-    throughput) then fine-tune the counts throughout the day.
-
-    Formula (Section 9):
-        scan_workers_needed   = ceil(scan_polls_today × avg_listing_scan_s / window_s)
-        detail_workers_needed = ceil(expected_new_jobs × avg_detail_fetch_s / window_s)
-
-    Both counts are clamped to [WORKER_FLOOR, db_pool_ceil].
-
-    Returns:
-        (scan_count, detail_count) — both ints >= WORKER_FLOOR
-    """
-    window_s = 23 * 3600   # 23-hour working window
-
-    # Ceilings are owned by the manager (Layer 1 plan + borrowed seats)
-    scan_ceil   = _manager_ceiling(r, "scan")
-    detail_ceil = _manager_ceiling(r, "detail")
-
-    # Number of companies registered for adaptive polling today
-    scan_polls_today = max(1, r.zcard(REDIS_POLL_ADAPTIVE))
-
-    # ── Average listing scan time ─────────────────────────────────────────────
-    avg_listing_scan_s = 3.0   # fallback: 3s per listing scan
-    try:
-        from db.api_health import query_30day_avg_response_ms
-        ms_samples = []
-        for platform in ("greenhouse", "lever", "ashby", "workday", "smartrecruiters"):
-            ms = query_30day_avg_response_ms(platform)
-            if ms > 0:
-                ms_samples.append(ms)
-        if ms_samples:
-            avg_listing_scan_s = (sum(ms_samples) / len(ms_samples)) / 1000.0
-    except Exception as exc:
-        logger.warning(
-            "calculate_worker_counts: avg_listing_scan query failed: %s — "
-            "using %.1fs fallback", exc, avg_listing_scan_s,
-        )
-
-    # ── Expected new jobs per day ─────────────────────────────────────────────
-    expected_new_jobs = float(scan_polls_today) * 2.0   # fallback: 2 per company
-    try:
-        conn = get_conn()
-        try:
-            row = conn.execute("""
-                SELECT COUNT(*)::float / 30.0 AS daily_avg
-                FROM job_postings
-                WHERE created_at >= NOW() - INTERVAL '30 days'
-            """).fetchone()
-        finally:
-            conn.close()
-        if row and row["daily_avg"]:
-            expected_new_jobs = max(1.0, float(row["daily_avg"]))
-    except Exception as exc:
-        logger.warning(
-            "calculate_worker_counts: expected_new_jobs query failed: %s — "
-            "using %.0f fallback", exc, expected_new_jobs,
-        )
-
-    # ── Average detail fetch time (Mode B platforms) ──────────────────────────
-    avg_detail_fetch_s = 2.0   # fallback: 2s per detail fetch
-    try:
-        from db.api_health import query_30day_avg_response_ms
-        mode_b_samples = []
-        for platform in ("workday", "icims", "jobvite"):
-            ms = query_30day_avg_response_ms(platform)
-            if ms > 0:
-                mode_b_samples.append(ms)
-        if mode_b_samples:
-            avg_detail_fetch_s = (sum(mode_b_samples) / len(mode_b_samples)) / 1000.0
-    except Exception as exc:
-        logger.warning(
-            "calculate_worker_counts: avg_detail_fetch query failed: %s — "
-            "using %.1fs fallback", exc, avg_detail_fetch_s,
-        )
-
-    # ── Apply formula ─────────────────────────────────────────────────────────
-    scan_workers_needed   = math.ceil(
-        (scan_polls_today * avg_listing_scan_s) / window_s
-    )
-    detail_workers_needed = math.ceil(
-        (expected_new_jobs * avg_detail_fetch_s) / window_s
-    )
-
-    scan_count   = max(WORKER_FLOOR, min(scan_workers_needed, scan_ceil))
-    detail_count = max(WORKER_FLOOR, min(detail_workers_needed, detail_ceil))
-
-    logger.info(
-        "calculate_worker_counts: polls=%d avg_scan=%.2fs "
-        "expected_new_jobs=%.0f avg_detail=%.2fs "
-        "→ scan=%d (ceil=%d) detail=%d (ceil=%d)",
-        scan_polls_today, avg_listing_scan_s,
-        expected_new_jobs, avg_detail_fetch_s,
-        scan_count, scan_ceil, detail_count, detail_ceil,
-    )
-    return scan_count, detail_count
-
-
-def _remaining_work_minimum(r) -> int:
-    """
-    Compute the minimum scan workers needed to finish today's remaining companies.
-
-    Dynamic floor that shrinks as the day progresses so we never reduce the
-    scan pool below what's required to drain the queue before midnight.
-
-    Formula (Section 9):
-        min_workers = ceil((remaining_companies × avg_listing_scan_s) / remaining_window_s)
-
-    Returns WORKER_FLOOR if cycle_start is unknown or the day window has ended.
-    """
-    cycle_start = get_cycle_start()
-    if cycle_start is None:
-        return WORKER_FLOOR
-
-    now             = time.time()
-    cycle_end       = cycle_start + 23 * 3600
-    remaining_s     = max(300.0, cycle_end - now)   # at least 5 min — avoids ÷0
-
-    # Companies still in the adaptive queue (includes those due later today)
-    remaining       = r.zcount(REDIS_POLL_ADAPTIVE, now, cycle_end + 3600)
-
-    if not remaining:
-        return WORKER_FLOOR
-
-    avg_scan_s = 3.0   # consistent with calculate_worker_counts fallback
-    return max(WORKER_FLOOR, math.ceil(
-        (remaining * avg_scan_s) / remaining_s
-    ))
-
-
 # ── Process target functions ──────────────────────────────────────────────────
 
 def _reset_inherited_db_pool() -> None:
@@ -3051,267 +2923,6 @@ def _ceiling_decay_loop() -> None:
             time.sleep(60)
 
 
-# NO-OP / DEAD CODE: nothing starts this loop (see the thread list in run_scheduler;
-# "_slow_throughput_check_loop removed — replaced by workers/manager.py (Layer 0)").
-# workers/manager.py is the only scaling actor and the sole ceiling owner. Do NOT
-# start this thread: it would add/remove workers as a second decision-maker.
-def _slow_throughput_check_loop() -> None:
-    """
-    Layer 3: slow throughput monitor (NOT RUNNING — see the no-op note above) — runs every WORKER_SLOW_CHECK_INTERVAL_S (30 min).
-
-    Phase 10 additions:
-      - Checks worker:scaling_lock:{platform} before adding workers — prevents
-        this loop from undoing a deliberate fast_error reduction.
-      - Learned ceiling decay: MOVED to standalone _ceiling_decay_loop() thread.
-      - Emits record_scaling_event for every worker add/remove.
-
-    Cascade logic (Section 9):
-        1. detail queue > HIGH_WATERMARK  → add detail worker (up to detail_ceil)
-        2. detail queue > HIGH_WATERMARK AND detail at ceil  → block scan growth;
-           if queue still growing (2nd consecutive check) → remove scan worker
-        3. detail queue healthy AND scan backlog  → add scan worker (up to scan_ceil)
-        4. Queues draining AND scan pool > dynamic_floor  → remove scan worker
-
-    DB pool ceiling is recalculated on every check to account for pool changes.
-    """
-    global _hysteresis
-
-    from db.api_health import record_scaling_event
-
-    r = get_redis()
-    logger.info("slow_throughput_check_loop: started")
-
-    while True:
-        try:
-            time.sleep(WORKER_SLOW_CHECK_INTERVAL_S)
-
-            detail_depth  = r.llen(REDIS_DETAIL_ADAPTIVE)
-            scan_backlog  = r.zcard(REDIS_POLL_ADAPTIVE)
-            n_scan, n_detail = _get_pool_snapshot()
-            n_fullscan       = _get_fullscan_pool_size()
-
-            scan_ceil     = _manager_ceiling(r, "scan")
-            detail_ceil   = _manager_ceiling(r, "detail")
-            dynamic_floor = _remaining_work_minimum(r)
-
-            # ── Phase 11: Redis memory alert ──────────────────────────────────
-            # Check used_memory vs maxmemory on every slow-check cycle.
-            # Under noeviction policy a full Redis stops accepting writes —
-            # poll queues and seen-sets would silently drop entries.
-            # maxmemory=0 means no limit is configured — skip check.
-            try:
-                mem_info   = r.info("memory")
-                used_mem   = mem_info.get("used_memory", 0)
-                max_mem    = mem_info.get("maxmemory", 0)
-                if max_mem and max_mem > 0:
-                    used_pct = int(100 * used_mem / max_mem)
-                    if used_pct >= REDIS_MEMORY_ALERT_PCT:
-                        from db.pipeline_alerts import (
-                            create_alert, ALERT_REDIS_MEMORY, CRITICAL,
-                        )
-                        alert_id = create_alert(
-                            alert_type = ALERT_REDIS_MEMORY,
-                            severity   = CRITICAL,
-                            value      = float(used_pct),
-                            threshold  = float(REDIS_MEMORY_ALERT_PCT),
-                            message    = (
-                                f"Redis memory at {used_pct}% of maxmemory "
-                                f"({used_mem // 1024 // 1024} MB / "
-                                f"{max_mem // 1024 // 1024} MB) — "
-                                f"noeviction policy will block writes at 100%"
-                            ),
-                        )
-                        if alert_id:
-                            logger.critical(
-                                "slow_throughput: REDIS MEMORY alert "
-                                "used=%dMB max=%dMB pct=%d%% (alert_id=%s)",
-                                used_mem // 1024 // 1024,
-                                max_mem  // 1024 // 1024,
-                                used_pct, alert_id,
-                            )
-            except Exception as exc:
-                logger.debug("slow_throughput: redis memory check failed: %s", exc)
-
-            # ── Phase 11: detail queue depth alert ────────────────────────────
-            # Track how many consecutive slow-check cycles the queue has stayed
-            # above the watermark.  If it hasn't drained in DETAIL_QUEUE_ALERT_CYCLES
-            # cycles (default 3 × 30 min = 90 min), something is stuck.
-            if detail_depth > DETAIL_QUEUE_HIGH_WATERMARK:
-                _hysteresis["detail_alert"] += 1
-                if _hysteresis["detail_alert"] >= DETAIL_QUEUE_ALERT_CYCLES:
-                    try:
-                        from db.pipeline_alerts import (
-                            create_alert, ALERT_DETAIL_QUEUE_DEPTH, WARNING,
-                        )
-                        alert_id = create_alert(
-                            alert_type = ALERT_DETAIL_QUEUE_DEPTH,
-                            severity   = WARNING,
-                            value      = float(detail_depth),
-                            threshold  = float(DETAIL_QUEUE_HIGH_WATERMARK),
-                            message    = (
-                                f"detail:adaptive queue depth {detail_depth} "
-                                f"has exceeded watermark {DETAIL_QUEUE_HIGH_WATERMARK} "
-                                f"for {_hysteresis['detail_alert']} consecutive "
-                                f"slow-check cycles "
-                                f"({_hysteresis['detail_alert'] * WORKER_SLOW_CHECK_INTERVAL_S // 60} min)"
-                            ),
-                        )
-                        if alert_id:
-                            logger.warning(
-                                "slow_throughput: DETAIL QUEUE DEPTH alert "
-                                "depth=%d watermark=%d cycles=%d (alert_id=%s)",
-                                detail_depth, DETAIL_QUEUE_HIGH_WATERMARK,
-                                _hysteresis["detail_alert"], alert_id,
-                            )
-                    except Exception as exc:
-                        logger.debug(
-                            "slow_throughput: detail queue alert failed: %s", exc
-                        )
-            else:
-                _hysteresis["detail_alert"] = 0
-
-            # ── Detail cascade ─────────────────────────────────────────────────
-            if detail_depth > DETAIL_QUEUE_HIGH_WATERMARK:
-                _hysteresis["detail_add"]    += 1
-                _hysteresis["detail_remove"]  = 0
-
-                if _hysteresis["detail_add"] >= 2:
-                    if n_detail < detail_ceil:
-                        if _add_one_worker("detail", detail_ceil):
-                            n_scan_a, n_detail_a = _get_pool_snapshot()
-                            logger.info(
-                                "slow_throughput: detail_queue=%d > watermark=%d "
-                                "→ added detail_worker (pool now %d)",
-                                detail_depth, DETAIL_QUEUE_HIGH_WATERMARK, n_detail_a,
-                            )
-                            record_scaling_event(
-                                "worker_add",
-                                trigger_layer="slow_throughput",
-                                worker_type="detail",
-                                scan_workers_before=n_scan,
-                                scan_workers_after=n_scan_a,
-                                detail_workers_before=n_detail,
-                                detail_workers_after=n_detail_a,
-                                detail_queue_depth=detail_depth,
-                                scan_queue_depth=scan_backlog,
-                            )
-                            _hysteresis["detail_add"] = 0
-                    else:
-                        # detail at ceiling — cascade: shed a scan worker
-                        _hysteresis["scan_remove"] += 1
-                        _hysteresis["scan_add"]     = 0
-
-                        if _hysteresis["scan_remove"] >= 2:
-                            if _remove_one_worker("scan", dynamic_floor):
-                                n_scan_a, n_detail_a = _get_pool_snapshot()
-                                logger.info(
-                                    "slow_throughput: detail at ceil=%d queue=%d "
-                                    "→ removed scan_worker to free capacity "
-                                    "(pool now %d)",
-                                    detail_ceil, detail_depth, n_scan_a,
-                                )
-                                record_scaling_event(
-                                    "worker_remove",
-                                    trigger_layer="cascade",
-                                    worker_type="scan",
-                                    scan_workers_before=n_scan,
-                                    scan_workers_after=n_scan_a,
-                                    detail_workers_before=n_detail,
-                                    detail_workers_after=n_detail_a,
-                                    detail_queue_depth=detail_depth,
-                                    scan_queue_depth=scan_backlog,
-                                    notes=f"detail_ceil={detail_ceil}",
-                                )
-                                _hysteresis["scan_remove"] = 0
-            else:
-                _hysteresis["detail_add"] = 0
-
-                # ── Scan growth (respects scaling lock) ────────────────────────
-                if scan_backlog > 0 and n_scan < scan_ceil:
-                    # Check if any platform has an active scaling lock
-                    any_locked = any(
-                        r.exists(f"worker:scaling_lock:{p}")
-                        for p in MONITOR_PLATFORM_CONCURRENCY
-                    )
-                    if any_locked:
-                        logger.debug(
-                            "slow_throughput: scan growth suppressed — "
-                            "active scaling lock present"
-                        )
-                        _hysteresis["scan_add"] = 0
-                    else:
-                        _hysteresis["scan_add"]    += 1
-                        _hysteresis["scan_remove"]  = 0
-
-                        if _hysteresis["scan_add"] >= 2:
-                            if _add_one_worker("scan", scan_ceil):
-                                n_scan_a, n_detail_a = _get_pool_snapshot()
-                                logger.info(
-                                    "slow_throughput: scan_backlog=%d detail healthy "
-                                    "→ added scan_worker (pool now %d)",
-                                    scan_backlog, n_scan_a,
-                                )
-                                record_scaling_event(
-                                    "worker_add",
-                                    trigger_layer="slow_throughput",
-                                    worker_type="scan",
-                                    scan_workers_before=n_scan,
-                                    scan_workers_after=n_scan_a,
-                                    detail_workers_before=n_detail,
-                                    detail_workers_after=n_detail_a,
-                                    detail_queue_depth=detail_depth,
-                                    scan_queue_depth=scan_backlog,
-                                )
-                                _hysteresis["scan_add"] = 0
-                else:
-                    _hysteresis["scan_add"] = 0
-
-                    # ── Idle contraction ───────────────────────────────────────
-                    if n_scan > dynamic_floor:
-                        _hysteresis["scan_remove"] += 1
-
-                        if _hysteresis["scan_remove"] >= 2:
-                            if _remove_one_worker("scan", dynamic_floor):
-                                n_scan_a, n_detail_a = _get_pool_snapshot()
-                                logger.info(
-                                    "slow_throughput: scan_pool=%d > "
-                                    "dynamic_floor=%d queues draining "
-                                    "→ removed scan_worker (pool now %d)",
-                                    n_scan, dynamic_floor, n_scan_a,
-                                )
-                                record_scaling_event(
-                                    "worker_remove",
-                                    trigger_layer="slow_throughput",
-                                    worker_type="scan",
-                                    scan_workers_before=n_scan,
-                                    scan_workers_after=n_scan_a,
-                                    detail_workers_before=n_detail,
-                                    detail_workers_after=n_detail_a,
-                                    detail_queue_depth=detail_depth,
-                                    scan_queue_depth=scan_backlog,
-                                    notes=f"dynamic_floor={dynamic_floor} idle_contraction",
-                                )
-                                _hysteresis["scan_remove"] = 0
-                    else:
-                        _hysteresis["scan_remove"] = 0
-
-            # Fullscan stream-lag scaling removed: the manager now reads the
-            # stream backlog itself (workers/stream_backlog.stream_backlog).
-            logger.debug(
-                "slow_throughput: scan=%d/%d detail=%d/%d fullscan=%d "
-                "detail_q=%d scan_backlog=%d dynamic_floor=%d",
-                n_scan, scan_ceil, n_detail, detail_ceil, n_fullscan,
-                detail_depth, scan_backlog, dynamic_floor,
-            )
-
-        except KeyboardInterrupt:
-            logger.info("slow_throughput_check_loop: stopping")
-            break
-        except Exception as exc:
-            logger.error("slow_throughput_check_loop: error: %s", exc, exc_info=True)
-            time.sleep(120)
-
-
 def _shutdown_worker_pools() -> None:
     """
     Gracefully stop all worker processes (called at KeyboardInterrupt).
@@ -3442,23 +3053,11 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
             "-- workers will self-seed on first request", exc,
         )
 
-    # ── Calculate initial worker counts ──────────────────────────────────────
-    try:
-        scan_count, detail_count = calculate_worker_counts(r)
-    except Exception as exc:
-        logger.warning(
-            "scheduler: calculate_worker_counts failed: %s "
-            "— falling back to MONITOR_MAX_WORKERS / 2", exc,
-        )
-        half = max(WORKER_FLOOR, MONITOR_MAX_WORKERS // 2)
-        scan_count = detail_count = half
-
     # ── Spawn worker pools ────────────────────────────────────────────────────
-    # Fullscan workers: floor at WORKER_FLOOR, cap at same ceiling as scan pool.
-    # Start fullscan workers at the floor; manager.py Layer 0 scales
-    # up when delay exceeds DELAY_WARN threshold and scales back down
-    # when utilization drops below 50% for 5 consecutive cycles.
-    fullscan_count = WORKER_FLOOR
+    # Every pool starts at WORKER_FLOOR.  The scheduler only executes: the
+    # worker count is owned by manager.py (Layer 0 scales up when delay exceeds
+    # DELAY_WARN and back down when utilization drops below 50% for 5 cycles).
+    scan_count = detail_count = fullscan_count = WORKER_FLOOR
 
     global _scan_pool, _detail_pool
     _fullscan_pool: list = []

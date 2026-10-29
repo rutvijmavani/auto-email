@@ -78,6 +78,21 @@ def stream_backlog(r, stream_key: str, group: str, now_ts: float = None):
     return waiting, oldest_wait_s
 
 
+def waiting_companies(r, stream_key: str, group: str) -> list:
+    """
+    Company names of the entries no worker has taken (same entries stream_backlog
+    counts).  Reads them all, no cap; raises on a Redis error or a missing group.
+    """
+    g = _group_info(r, stream_key, group)
+    if g is None:
+        raise RuntimeError(f"consumer group {group!r} missing on {stream_key!r}")
+    last_id = _s(g.get("last-delivered-id", "0-0"))
+    entries = r.xrange(stream_key, min=f"({last_id}", max="+")
+    return [_s(fields.get("company") or fields.get(b"company", b""))
+            for _, fields in entries
+            if fields.get("company") or fields.get(b"company")]
+
+
 def trim_delivered(r, stream_key: str, group: str) -> int:
     """
     Delete entries every consumer is done with; return how many were deleted.

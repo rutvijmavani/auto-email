@@ -470,8 +470,8 @@ def query_30day_avg_response_ms(platform: str) -> float:
     """
     Compute the 30-day average response time (ms) for a platform.
 
-    Used by calculate_worker_counts() in scheduler.py to estimate per-request
-    duration when computing how many workers are needed at cycle start.
+    No caller since scheduler.calculate_worker_counts() was deleted
+    (2026-10-29); kept as a query helper.
 
     Returns 0.0 if no data exists (caller uses a hardcoded fallback constant).
     """
