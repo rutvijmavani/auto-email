@@ -202,6 +202,7 @@ class TestDeadlock2_ScanBorrowsFromFullscan(unittest.TestCase):
             "manager:lever1:scan:active": "1",
             "manager:snapshot:scan:D":    "80",
             "manager:snapshot:scan:R":    "0",
+            "manager:worker_ceil:fullscan": "8",   # fullscan holds 8 seats, needs 5
         })
 
     def test_borrow_from_fullscan(self):
@@ -281,13 +282,17 @@ class TestDeadlock4_FullscanDetailAllowed(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDeadlock5_BorrowPriority(unittest.TestCase):
-    """Both scan and fullscan have lendable workers; Phase 1 takes from both."""
+    """Both scan and fullscan have lendable workers; the lendable stage takes from both."""
 
     def setUp(self):
         _reset_state("detail", "scan", "fullscan")
 
-    def test_scan_taken_first_when_both_lendable(self):
-        r = _make_redis({"manager:lever1:detail:active": "1"})
+    def test_all_lendable_taken_from_both_sources(self):
+        r = _make_redis({
+            "manager:lever1:detail:active": "1",
+            "manager:worker_ceil:scan":     "8",
+            "manager:worker_ceil:fullscan": "7",
+        })
         pool_sizes      = {"scan": 8, "detail": _CEIL, "fullscan": 7}
         workers_targets = {"scan": 5, "detail": _CEIL, "fullscan": 5}
         result = _attempt_borrow(r, "detail", pool_sizes, workers_targets)
@@ -295,7 +300,7 @@ class TestDeadlock5_BorrowPriority(unittest.TestCase):
         scan_borrow = r._store.get("manager:borrow:scan:detail")
         self.assertIsNotNone(scan_borrow)
         self.assertEqual(int(scan_borrow), 3)   # all 3 lendable from scan taken
-        # Phase 1 continues to fullscan (2 lendable = 7 - max(5, WORKER_FLOOR))
+        # fullscan lends 2 = 7 - max(5, WORKER_FLOOR)
         fullscan_borrow = r._store.get("manager:borrow:fullscan:detail")
         self.assertIsNotNone(fullscan_borrow)
         self.assertEqual(int(fullscan_borrow), 2)
@@ -408,11 +413,14 @@ class TestDeadlock9_BorrowAccumulation(unittest.TestCase):
 class TestDeadlock10_RecoveryIntegration(unittest.TestCase):
     """
     lever1 was active with an active borrow.
-    After LEVER1_STABLE_REQUIRED stable cycles: lever1 cleared, borrows deleted, re-intro started.
+    After LEVER1_STABLE_REQUIRED stable cycles: lever1 cleared and re-intro started.
+    The borrow is returned separately, once both pools stay calm for
+    LEVER1_STABLE_REQUIRED cycles (_maybe_return_borrows).
     """
 
     def setUp(self):
         _reset_state("detail", "scan", "fullscan")
+        mgr._borrow_stable_cycles.clear()
 
     def test_full_recovery_path(self):
         r = _make_redis({
@@ -422,13 +430,69 @@ class TestDeadlock10_RecoveryIntegration(unittest.TestCase):
             "manager:snapshot:detail:R":    "0",
         })
         stable_delay = _PARAMS["delay_warn_s"] * RECOVERY_STABILITY_RATIO * 0.5
+        delays = {"scan": stable_delay, "detail": stable_delay, "fullscan": stable_delay}
+        warns  = {p: _PARAMS["delay_warn_s"] for p in delays}
 
         for _ in range(LEVER1_STABLE_REQUIRED):
             _run(r, "detail", delay_s=stable_delay, n_workers=6)
 
         self.assertFalse(_get_lever1_active(r, "detail"), "lever1 must be lifted")
-        self.assertIsNone(r._store.get("manager:borrow:scan:detail"),  "borrow must be cleared")
         self.assertTrue(_is_reintro_active(r, "detail"),               "re-intro must be active")
+        self.assertEqual(r._store.get("manager:borrow:scan:detail"), "2",
+                         "lifting Lever 1 alone must not return the seats")
+
+        for _ in range(LEVER1_STABLE_REQUIRED):
+            mgr._maybe_return_borrows(r, delays, warns)
+        self.assertIsNone(r._store.get("manager:borrow:scan:detail"),  "borrow must be cleared")
+
+    def test_borrow_kept_while_a_pool_is_not_calm(self):
+        r = _make_redis({"manager:borrow:scan:detail": "2"})
+        warn = _PARAMS["delay_warn_s"]
+        calm = warn * RECOVERY_STABILITY_RATIO * 0.5
+        delays = {"scan": calm, "detail": warn, "fullscan": calm}
+        warns  = {p: warn for p in delays}
+        for _ in range(LEVER1_STABLE_REQUIRED + 2):
+            mgr._maybe_return_borrows(r, delays, warns)
+        self.assertEqual(r._store.get("manager:borrow:scan:detail"), "2")
+
+    def test_df_detail_resolves_seats_handed_to_fullscan(self):
+        # detail borrowed 2 from scan; detail and scan are calm, fullscan still struggling
+        r = _make_redis({"manager:borrow:scan:detail": "2"})
+        warn = _PARAMS["delay_warn_s"]
+        calm = warn * RECOVERY_STABILITY_RATIO * 0.5
+        delays = {"scan": calm, "detail": calm, "fullscan": warn * 2}
+        warns  = {p: warn for p in delays}
+        for _ in range(LEVER1_STABLE_REQUIRED):
+            mgr._maybe_return_borrows(r, delays, warns)
+        self.assertIsNone(r._store.get("manager:borrow:scan:detail"))
+        self.assertEqual(r._store.get("manager:borrow:scan:fullscan"), "2",
+                         "seats go to the struggling pool, not back to scan")
+
+    def test_handed_seats_return_once_everyone_is_calm(self):
+        r = _make_redis({"manager:borrow:scan:detail": "2"})
+        warn = _PARAMS["delay_warn_s"]
+        calm = warn * RECOVERY_STABILITY_RATIO * 0.5
+        warns = {p: warn for p in ("scan", "detail", "fullscan")}
+        struggling = {"scan": calm, "detail": calm, "fullscan": warn * 2}
+        for _ in range(LEVER1_STABLE_REQUIRED):
+            mgr._maybe_return_borrows(r, struggling, warns)
+        all_calm = {p: calm for p in warns}
+        for _ in range(LEVER1_STABLE_REQUIRED):
+            mgr._maybe_return_borrows(r, all_calm, warns)
+        self.assertIsNone(r._store.get("manager:borrow:scan:fullscan"))
+        self.assertIsNone(r._store.get("manager:borrow:scan:detail"))
+
+    def test_no_handoff_when_other_pool_only_above_calm(self):
+        # fullscan is above the calm level but under warn: not struggling → return
+        r = _make_redis({"manager:borrow:scan:detail": "2"})
+        warn = _PARAMS["delay_warn_s"]
+        calm = warn * RECOVERY_STABILITY_RATIO * 0.5
+        delays = {"scan": calm, "detail": calm, "fullscan": warn * 0.5}
+        warns  = {p: warn for p in delays}
+        for _ in range(LEVER1_STABLE_REQUIRED):
+            mgr._maybe_return_borrows(r, delays, warns)
+        self.assertIsNone(r._store.get("manager:borrow:scan:detail"))
+        self.assertIsNone(r._store.get("manager:borrow:scan:fullscan"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,13 +503,13 @@ class TestDeadlock11_NoCapacityAnywhere(unittest.TestCase):
     """All pools at exact target with nothing to lend → returns False, no keys written."""
 
     def test_returns_false(self):
-        r = _make_redis()
+        r = _make_redis({f"manager:worker_ceil:{p}": "5" for p in ("scan", "detail", "fullscan")})
         pool_sizes      = {"scan": 5, "detail": 5, "fullscan": 5}
         workers_targets = {"scan": 5, "detail": 5, "fullscan": 5}
         self.assertFalse(_attempt_borrow(r, "detail", pool_sizes, workers_targets))
 
     def test_no_borrow_keys_written(self):
-        r = _make_redis()
+        r = _make_redis({f"manager:worker_ceil:{p}": "2" for p in ("scan", "detail", "fullscan")})
         pool_sizes      = {"scan": 2, "detail": 2, "fullscan": 2}
         workers_targets = {"scan": 2, "detail": 2, "fullscan": 2}
         _attempt_borrow(r, "detail", pool_sizes, workers_targets)

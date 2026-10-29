@@ -16,7 +16,7 @@ _midnight_recompute() — formula mode (>= 28 daily_peak records):
   · growth_buffer > 0 when recent demand exceeds baseline
   · growth_buffer = 0 when demand is shrinking (negative rate clamped)
   · growth_buffer = 0 when fewer than 7 recent records
-  · volatility_buffer from stdev × 0.25, ceiling applied
+  · volatility_buffer = ceil(stdev), ceiling planned (uncapped ideal)
   · buffer = max(growth_buffer, volatility_buffer)
   · peaks beyond 28-day window are excluded (natural decay)
 """
@@ -132,7 +132,10 @@ class _FakePipeline:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _today_utc():
-    return datetime.now(timezone.utc).date()
+    """Date label of today's record: the nightly recompute's local (ET) date."""
+    from zoneinfo import ZoneInfo
+    from config import MANAGER_RECOMPUTE_TZ
+    return datetime.now(ZoneInfo(MANAGER_RECOMPUTE_TZ)).date()
 
 
 def _set_peak(r, pool, date_obj, value):
@@ -222,11 +225,18 @@ class TestMidnightRecomputeBootstrap(unittest.TestCase):
         """running_peak=0 → WORKER_FLOOR stored, never literal 0."""
         today = _today_utc().strftime("%Y-%m-%d")
         r = _FakeRedis()
-        # running peak missing → treated as 0 → max(0, WORKER_FLOOR) = WORKER_FLOOR
+        _set_running(r, "detail", 0)
         self._run(r)
         today_key = f"manager:pool:detail:daily_peak:{today}"
         stored = int(r.read(today_key))
         self.assertGreaterEqual(stored, WORKER_FLOOR)
+
+    def test_missing_running_writes_no_record(self):
+        """A missing running peak (e.g. key lost) must not write a floor record."""
+        today = _today_utc().strftime("%Y-%m-%d")
+        r = _FakeRedis()
+        self._run(r)
+        self.assertIsNone(r.read(f"manager:pool:detail:daily_peak:{today}"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,7 +270,7 @@ class TestMidnightRecomputeSwitchover(unittest.TestCase):
         # 27 pre-existing → today makes 28 total → formula mode
         _populate_peaks(r, "detail", 27, peak_value=5)
         _midnight_recompute(r, ["detail"])
-        expected_formula = max(WORKER_FLOOR, min(5, MONITOR_MAX_WORKERS))
+        expected_formula = max(WORKER_FLOOR, 5)
         self.assertEqual(_get_ceil(r, "detail"), expected_formula,
                          "28 records: formula ceil = peak_nd=5 with zero buffer")
 
@@ -313,9 +323,9 @@ class TestGrowthBuffer(unittest.TestCase):
             g_buf = math.ceil(peak_nd * rate)
         else:
             g_buf = 0
-        v_buf = math.ceil(statistics.stdev(all_28) * 0.25) if len(all_28) >= 3 else 0
+        v_buf = math.ceil(statistics.stdev(all_28)) if len(all_28) >= 3 else 0
         buf   = max(g_buf, v_buf)
-        return max(WORKER_FLOOR, min(peak_nd + buf, MONITOR_MAX_WORKERS))
+        return max(WORKER_FLOOR, peak_nd + buf)
 
     def test_growth_buffer_positive_when_growing(self):
         """peak_7d > baseline → growth_buffer > 0 → ceil > peak_nd."""
@@ -339,8 +349,8 @@ class TestGrowthBuffer(unittest.TestCase):
         # Ceiling should not exceed peak_nd + vol_buffer (growth contributes 0)
         all_28   = recent + baseline
         peak_nd  = max(all_28)
-        vol_buf  = math.ceil(statistics.stdev(all_28) * 0.25)
-        self.assertLessEqual(ceil_, max(WORKER_FLOOR, min(peak_nd + vol_buf, MONITOR_MAX_WORKERS)))
+        vol_buf  = math.ceil(statistics.stdev(all_28))
+        self.assertLessEqual(ceil_, max(WORKER_FLOOR, peak_nd + vol_buf))
 
     def test_growth_buffer_zero_with_equal_peaks(self):
         """All peaks identical → growth_rate = 0 → growth_buffer = 0, vol = 0."""
@@ -349,7 +359,7 @@ class TestGrowthBuffer(unittest.TestCase):
 
         ceil_    = self._compute(recent, baseline)
         # stdev = 0 → buf = 0 → ceil = peak_nd = 5
-        expected = max(WORKER_FLOOR, min(5, MONITOR_MAX_WORKERS))
+        expected = max(WORKER_FLOOR, 5)
         self.assertEqual(ceil_, expected)
 
 
@@ -360,7 +370,7 @@ class TestGrowthBuffer(unittest.TestCase):
 class TestVolatilityBuffer(unittest.TestCase):
 
     def test_volatility_buffer_with_variable_peaks(self):
-        """ceil(stdev × 0.25) contributes to ceiling when peaks vary."""
+        """ceil(stdev) contributes to ceiling when peaks vary."""
         today = _today_utc()
         r = _FakeRedis()
         # Use running = 10 (today's value) + 27 pre-existing of alternating 2 and 10
@@ -376,8 +386,8 @@ class TestVolatilityBuffer(unittest.TestCase):
         all_peaks = all_peaks[:28]
         peak_nd   = max(all_peaks)
         std       = statistics.stdev(all_peaks)
-        vol_buf   = math.ceil(std * 0.25)
-        expected  = max(WORKER_FLOOR, min(peak_nd + vol_buf, MONITOR_MAX_WORKERS))
+        vol_buf   = math.ceil(std)
+        expected  = max(WORKER_FLOOR, peak_nd + vol_buf)
         self.assertEqual(ceil_, expected)
 
     def test_volatility_zero_with_uniform_peaks(self):
@@ -389,7 +399,7 @@ class TestVolatilityBuffer(unittest.TestCase):
             _set_peak(r, "detail", today - timedelta(days=i), 6)
 
         _midnight_recompute(r, ["detail"])
-        self.assertEqual(_get_ceil(r, "detail"), max(WORKER_FLOOR, min(6, MONITOR_MAX_WORKERS)))
+        self.assertEqual(_get_ceil(r, "detail"), max(WORKER_FLOOR, 6))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,9 +427,9 @@ class TestBufferIsMax(unittest.TestCase):
         baseline_val = max([5]*21)
         weekly_growth = max(0.0, (20 - baseline_val) / baseline_val / 3)
         growth_buf = math.ceil(peak_nd * weekly_growth)
-        vol_buf    = math.ceil(statistics.stdev(all_28) * 0.25)
+        vol_buf    = math.ceil(statistics.stdev(all_28))
         buf        = max(growth_buf, vol_buf)
-        expected   = max(WORKER_FLOOR, min(peak_nd + buf, MONITOR_MAX_WORKERS))
+        expected   = max(WORKER_FLOOR, peak_nd + buf)
         self.assertEqual(ceil_, expected)
 
 
@@ -450,7 +460,7 @@ class TestNaturalDecay(unittest.TestCase):
 
         # All 28 values in the window are 5 (today + 27 days) → peak_nd = 5
         # buffer = 0 (uniform) → ceil = max(WORKER_FLOOR, 5)
-        expected = max(WORKER_FLOOR, min(5, MONITOR_MAX_WORKERS))
+        expected = max(WORKER_FLOOR, 5)
         self.assertEqual(ceil_, expected,
                          "spike from day 29 must not influence the ceiling")
 
@@ -475,7 +485,7 @@ class TestNaturalDecay(unittest.TestCase):
         ceil_ = _get_ceil(r, "detail")
 
         # Only [today(5), days1-27(5)] = 28 uniform fives → peak_nd=5, buffer=0
-        expected = max(WORKER_FLOOR, min(5, MONITOR_MAX_WORKERS))
+        expected = max(WORKER_FLOOR, 5)
         self.assertEqual(ceil_, expected,
                          "records from day 29+ must be excluded from the window")
 

@@ -112,7 +112,9 @@ from config import (
     REDIS_INFLIGHT_PREFIX,
 )
 from workers.redis_client import get_redis, ping
-from workers.heartbeat import Heartbeat
+from workers.heartbeat import BusyMeter, Heartbeat
+from workers.queue_stamp import stamp_queued_at, count_arrival
+from workers import progress
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
 from workers.http_client import set_request_context, CeilingExceeded
 from workers.paginator import estimate_scan_depth
@@ -198,9 +200,13 @@ def _get_backoff_delay(r, company: str, op_type: str) -> int:
     if count == 1:
         r.expire(key, 86400)               # first failure → set 24h TTL
 
-    retry_count = count - 1               # 0-based retry index
+    return backoff_delay_for(count - 1)   # 0-based retry index
+
+
+def backoff_delay_for(retry_count: int) -> int:
+    """Backoff delay (s) for a 0-based retry index; retry 5+ gives up for today."""
     if retry_count >= 5:
-        return WORKER_BACKOFF_GIVEUP_S    # give up for today
+        return WORKER_BACKOFF_GIVEUP_S
 
     return min(WORKER_BACKOFF_BASE_S * (2 ** retry_count), WORKER_BACKOFF_CAP_S)
 
@@ -571,7 +577,9 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                         adaptive_skipped += 1
                         continue  # do not mark adaptive_seen
                     else:
-                        r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
+                        r.lpush(REDIS_DETAIL_ADAPTIVE,
+                                json.dumps(stamp_queued_at(detail_payload)))
+                        count_arrival(r, REDIS_DETAIL_ADAPTIVE)
                         new_count += 1
                         _reintro_detail_count += 1
                         # Mark seen only after successful push.  When held (Lever 1
@@ -726,7 +734,9 @@ def _handle_first_scan(
                         display_name, platform, job, found_by="first_scan_fresh",
                         detail_payload=detail_payload,
                     ):
-                        r.lpush(REDIS_DETAIL_ADAPTIVE, json.dumps(detail_payload))
+                        r.lpush(REDIS_DETAIL_ADAPTIVE,
+                                json.dumps(stamp_queued_at(detail_payload)))
+                        count_arrival(r, REDIS_DETAIL_ADAPTIVE)
                         fresh_queued += 1
                 # Always mark in adaptive_seen — repeat adaptive scans today
                 # must not re-check this job regardless of whether it was a
@@ -951,17 +961,19 @@ def run_worker(once: bool = False, shutdown_event=None,
     # Daemon thread writes worker:alive:scan_worker every 10s, independent of
     # how long each listing scan takes (Workday scans can exceed 60s).
     # daemon=True means the thread dies with the process — no ghost heartbeats.
+    # Busy time for the manager's utilization signal rides in the heartbeat:
+    # _busy.begin()/end() bracket each listing scan.
     _hw = {"count": 0}
-    _hb = Heartbeat(r, "scan_worker", lambda: _hw["count"]).start()
-
-    # ── Busy-time tracking for manager.py utilization signal ─────────────────
-    _BUSY_CYCLE_S  = 60
-    _busy_ms_acc   = 0
-    _busy_window_t = time.monotonic()
-    _own_pid       = os.getpid()
+    _busy = BusyMeter()
+    _hb = Heartbeat(r, "scan_worker", lambda: _hw["count"], busy_meter=_busy).start()
+    # Progress reports (worker:cur:{consumer}): checkpoints installed at the
+    # transport layer, so no ATS module needs to know about them.
+    progress.bind(r, _CONSUMER_NAME)
+    progress.install()
 
     while True:
         try:
+            progress.end()   # idempotent: clears the previous message on every path
             # ── Shutdown check (idle) ─────────────────────────────────────────
             if shutdown_event is not None and shutdown_event.is_set():
                 logger.info("scan_worker: shutdown event set (idle) — exiting")
@@ -995,6 +1007,7 @@ def run_worker(once: bool = False, shutdown_event=None,
             scan_context = fields.get("context", "normal")
             enqueued_at  = fields.get("enqueued_at", "")
             request_id   = fields.get("request_id", f"adp-{int(time.time())}")
+            progress.begin(msg_id, dc_key)
 
             # ── Shutdown checkpoint (after XREADGROUP, before scan) ───────────
             # Message is in PEL — don't XACK. scheduler's XAUTOCLAIM will
@@ -1017,7 +1030,11 @@ def run_worker(once: bool = False, shutdown_event=None,
             }
 
             # ── Run listing scan ──────────────────────────────────────────────
-            result = _run_listing_scan(payload, shutdown_event=shutdown_event)
+            _busy.begin()
+            try:
+                result = _run_listing_scan(payload, shutdown_event=shutdown_event)
+            finally:
+                _busy.end()
 
             # ── Inline completion handler (replaces result_consumer_loop) ─────
             # Guards:
@@ -1071,19 +1088,7 @@ def run_worker(once: bool = False, shutdown_event=None,
                         company, oac_exc, exc_info=True,
                     )
 
-            # ── Publish busy_ms for manager.py utilization ───────────────────
-            _elapsed_ms = result.get("duration_ms", 0)
-            _now_m = time.monotonic()
-            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
-                _busy_ms_acc   = 0
-                _busy_window_t = _now_m
-            _busy_ms_acc += _elapsed_ms
-            try:
-                r.set(f"worker:scan:busy_ms:{_own_pid}", _busy_ms_acc,
-                      ex=_BUSY_CYCLE_S * 2)
-            except Exception:
-                pass
-
+            progress.end()
             _hw["count"] += 1
             status = "OK" if result["success"] else "FAIL"
             first  = " [first-scan]" if result.get("first_scan") else ""

@@ -604,8 +604,6 @@ REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currentl
                                                    # written at scan start, removed on completion/error
                                                    # read by _get_worker_missed_companies() to exclude
                                                    # in-progress scans from fallback re-fetch
-INFLIGHT_FULLSCAN_STALE_S = 7200                   # 2 h — entries older than this are considered
-                                                   # abandoned (used by health_check and job_monitor)
 REDIS_INFLIGHT_FULLSCAN_DC_PREFIX  = "inflight:fullscans"           # ZSET per-DC fullscan concurrency
                                                                     # key: {prefix}:{dc_key}, member: company
 WORKER_CURRENT_JOB_FULLSCAN_PREFIX = "worker:current_job:fullscan" # STRING per-worker pid
@@ -694,7 +692,6 @@ COMPANY_REGISTRATION_MARKER_TTL_S     = int(os.getenv("COMPANY_REGISTRATION_MARK
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan
 SCHEDULER_FULL_SCAN_INTERVAL_S = 86400      # default full scan every 24h
 SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
-SCHEDULER_FULL_SCAN_LOCK_TTL   = 3600       # full scan exclusive lock TTL
 SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 
 # ── Detail queue backpressure (Section 15) ────────────────────────────────────
@@ -812,10 +809,38 @@ DETAIL_QUEUE_ALERT_CYCLES         = 3
 # new entries, silently dropping jobs.  0 = Redis has no maxmemory limit set.
 REDIS_MEMORY_ALERT_PCT            = 80
 
-# DB connection pool size (must match maxconn in db/connection.py).
-# Used by scheduler.py to compute the combined worker ceiling:
-#   scan_ceil + detail_ceil ≤ DB_POOL_MAXCONN - 3 (3 reserved for scheduler)
-DB_POOL_MAXCONN                   = 25
+# Per-process DB connection pool (db/connection.py): every process opens
+# DB_POOL_MINCONN connections at once and may grow to DB_POOL_PROCESS_MAXCONN.
+# This is a per-process limit only; it is not the manager's worker budget.
+DB_POOL_PROCESS_MAXCONN           = int(os.getenv("DB_POOL_PROCESS_MAXCONN", "25"))
+DB_POOL_MINCONN                   = int(os.getenv("DB_POOL_MINCONN", "2"))
+
+# Worker seats the manager starts with, counted in workers (not connections).
+# The manager raises it when pools are short, never past what Postgres can host.
+WORKER_SEAT_BUDGET                = int(os.getenv("WORKER_SEAT_BUDGET", "22"))
+
+# Capacity overflow (docs/scaling-redesign.md Layer 2): the raise step is counted
+# in connections; the manager turns it into seats with the live connections per
+# worker.  The ceiling is read from Postgres each cycle (workers/db_capacity.py):
+# max_connections - superuser_reserved_connections - DB_CAPACITY_MARGIN, minus the
+# connections held by non-worker processes.
+DB_POOL_RAISE_STEP                = int(os.getenv("DB_POOL_RAISE_STEP", "5"))
+DB_CAPACITY_MARGIN                = int(os.getenv("DB_CAPACITY_MARGIN", "10"))
+
+# Layer 0 target: real per-job service time s = busy time / jobs finished,
+# summed over this many manager cycles (one cycle is too noisy).
+SERVICE_TIME_WINDOW_CYCLES        = int(os.getenv("SERVICE_TIME_WINDOW_CYCLES", "5"))
+
+# Layer 1 nightly recompute: runs once per local day from this hour on, and the
+# daily_peak record is labelled with that local date.
+MANAGER_RECOMPUTE_HOUR            = int(os.getenv("MANAGER_RECOMPUTE_HOUR", "23"))
+MANAGER_RECOMPUTE_TZ              = os.getenv("MANAGER_RECOMPUTE_TZ", "America/New_York")
+
+# Per-pool soft ceiling = (budget - reserved) // divisor (Phase 2 of the ceiling
+# plan); spare slots then fill shortages in priority order (Phase 4).
+POOL_CEIL_DIVISOR                 = {"scan": 2, "detail": 3, "fullscan": 5}
+# Safety buffer assumed for a pool still in bootstrap (no 28-day history yet).
+BOOTSTRAP_BUFFER                  = 2
 
 # ── Phase 10 — Adaptive protection + resilience hardening (Section 18) ────────
 #
@@ -845,10 +870,9 @@ WORKER_CONSEC_REDUCTIONS_TTL       = 3600    # TTL for consec_reductions counter
 WORKER_SCALING_LOCK_TTL            = 1800    # 30 min = WORKER_SLOW_CHECK_INTERVAL_S
 
 # Per-DC in-flight scan tracking (drift-proof ZSET).
-# Score = dispatch timestamp.  Entries older than INFLIGHT_STALE_WINDOW_S are
-# removed before ZCARD to prevent drift from crashed workers.
+# Score = dispatch timestamp.  Entries are released by completion, the reaper
+# (claim_stale_work) and sweep_inflight — never by age.
 REDIS_INFLIGHT_PREFIX              = "inflight:scans"  # key: {prefix}:{dc_key}
-INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2× max scan timeout
 
 # ── Full scan (Section 9) ─────────────────────────────────────────────────────
 FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
@@ -879,11 +903,28 @@ STREAM_CONSUMER_GROUP   = "scan-workers"        # shared consumer group for all 
 STREAM_BLOCK_MS         = 500                   # XREADGROUP BLOCK timeout (ms)
                                                 # Short (0.5s) so workers check
                                                 # pause_event within ~1s of signal.
-STREAM_MAXLEN_ADAPTIVE  = 1000                  # XADD MAXLEN ~ (trimmed approximately)
-STREAM_MAXLEN_FULLSCAN  = 500                   # lower — fullscans are slower
-MAX_STREAM_REDELIVERIES = 5                     # XAUTOCLAIM: after this many
-                                                # redeliveries → dead-letter to ZSET
-                                                # with exponential backoff
+                                                # No MAXLEN: a count cap deletes entries
+                                                # no worker has taken (company already
+                                                # ZREM'd → lost).  The scheduler trims
+                                                # delivered entries only (stream_backlog).
+MAX_STREAM_REDELIVERIES = 5                     # reaps of one company (reaped:{op}:{company},
+                                                # reset on a successful scan) after which
+                                                # the reap logs a repeat-offender warning;
+                                                # the backoff itself grows from reap 1
+REDIS_REAPED_PREFIX     = "reaped"              # key: {prefix}:{op}:{company} — reaps since last success
+REDIS_INFLIGHT_MSG_PREFIX = "inflight:msg"      # key: {prefix}:{op}:{company} — stream id of the
+                                                # dispatched message holding the inflight slot
+
+# Worker progress reports (workers/progress.py): while a worker holds a stream
+# message it publishes worker:cur:{consumer} = {msg_id, alive_until}.  The deadline
+# after each checkpoint is the longest silent gap ever seen between checkpoints for
+# that dc_key (high-water mark in the progress:gap hash) x PROGRESS_GAP_FACTOR,
+# never below PROGRESS_COLD_GAP_S (also the allowance before any gap is learned and
+# for an HTTP read with no timeout).  Past alive_until the owner counts as stalled.
+PROGRESS_GAP_FACTOR     = float(os.getenv("PROGRESS_GAP_FACTOR", "3"))
+PROGRESS_COLD_GAP_S     = int(os.getenv("PROGRESS_COLD_GAP_S", "600"))
+REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
+REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
 
 # ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
 # NEW companies do their first full scan, then WARMING: 3 adaptive polls at a

@@ -50,7 +50,6 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from config import INFLIGHT_FULLSCAN_STALE_S
 try:
     from workers.watchdog import (
         HEARTBEAT_DEAD_AFTER as _HEARTBEAT_DEAD_AFTER,
@@ -107,7 +106,6 @@ def _row(level: str, label: str, detail: str) -> None:
 # CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INFLIGHT_STALE_S = INFLIGHT_FULLSCAN_STALE_S   # imported from config; matches job_monitor.py
 
 
 def _ats_lanes() -> list:
@@ -698,10 +696,7 @@ def run_health_check() -> int:
         # so the health check matches the contract used by the monitor layer.
         inflight_names: set = set()
         try:
-            _stale_cutoff = now - _INFLIGHT_STALE_S
-            _raw_inflight = r.zrangebyscore(
-                REDIS_INFLIGHT_FULLSCAN, _stale_cutoff, "+inf"
-            )
+            _raw_inflight = r.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)
             inflight_names = {
                 (c.decode() if isinstance(c, bytes) else c)
                 for c in (_raw_inflight or [])
@@ -918,21 +913,6 @@ def run_health_check() -> int:
                 conn.close()
             except Exception:
                 pass
-
-    # ── HUNG WORKERS ─────────────────────────────────────────────────────────
-    _section("HUNG WORKERS  (heartbeat alive, no progress update)")
-    try:
-        from workers.watchdog import check_hung_workers
-        _hung_issues = check_hung_workers(r)
-        if _hung_issues:
-            for _hi in _hung_issues:
-                _row(_hi.level, "hung workers", _hi.message)
-                warnings += 1
-        else:
-            _row("OK", "hung workers", "none detected")
-    except Exception as _hung_err:
-        _row("DEGRADED", "hung workers", f"Redis scan error: {_hung_err}")
-        warnings += 1
 
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print(f"\n  {'─' * 60}")

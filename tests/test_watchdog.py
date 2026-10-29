@@ -7,7 +7,6 @@ PEL consumer-PID checking, and stall-signal logic.
 Phase 3 update
 ──────────────
 Several functions were refactored or replaced in Phase 3:
-  - check_hung_workers(r) now takes `r` as argument and returns Issue objects
   - check_pel_stats() was replaced by _check_pel_health() (private helper inside
     check_queue_health) with PID-based consumer liveness
   - check_queue_health() now uses velocity/delta tracking across cycles instead
@@ -137,74 +136,6 @@ def _make_redis(**overrides):
     return r
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TestCheckHungWorkers
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestCheckHungWorkers(unittest.TestCase):
-    """check_hung_workers(r) — heartbeat-alive but no progress key = hung."""
-
-    def _run(self, alive_heartbeats=None, progress_exists=None):
-        r = MagicMock()
-        hb_keys = [f"heartbeat:{c}".encode() for c in (alive_heartbeats or [])]
-        r.scan.side_effect = [(0, hb_keys)]
-
-        progress_map = progress_exists or {}
-        def _exists(key):
-            if key.startswith("progress:"):
-                return int(progress_map.get(key.split(":", 1)[1], False))
-            return 0
-        r.exists.side_effect = _exists
-
-        from workers.watchdog import check_hung_workers
-        return check_hung_workers(r)
-
-    def test_no_heartbeats_returns_empty(self):
-        """No heartbeat keys → empty list."""
-        self.assertEqual(self._run(alive_heartbeats=[]), [])
-
-    def test_alive_with_progress_not_hung(self):
-        """Heartbeat + progress key → not hung → empty list."""
-        result = self._run(
-            alive_heartbeats=["CompanyA"],
-            progress_exists={"CompanyA": True},
-        )
-        self.assertEqual(result, [])
-
-    def test_alive_without_progress_returns_warning_issue(self):
-        """Heartbeat alive, progress key gone → WARNING Issue returned."""
-        from workers.watchdog import Issue
-        result = self._run(
-            alive_heartbeats=["CompanyA"],
-            progress_exists={"CompanyA": False},
-        )
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].level, Issue.WARNING)
-
-    def test_issue_mentions_company_name(self):
-        """Warning message includes the hung company name."""
-        result = self._run(
-            alive_heartbeats=["MyCompany"],
-            progress_exists={"MyCompany": False},
-        )
-        self.assertTrue(
-            any("MyCompany" in str(i) for i in result),
-            "Expected 'MyCompany' in issue output",
-        )
-
-    def test_multiple_only_hung_ones_flagged(self):
-        """Only companies with missing progress appear in warning."""
-        from workers.watchdog import Issue
-        result = self._run(
-            alive_heartbeats=["Co1", "Co2", "Co3"],
-            progress_exists={"Co1": True, "Co2": False, "Co3": True},
-        )
-        self.assertEqual(len(result), 1)
-        self.assertIn("Co2", str(result[0]))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TestWatchdogConstants
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestWatchdogConstants(unittest.TestCase):

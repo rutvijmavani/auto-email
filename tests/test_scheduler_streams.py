@@ -4,7 +4,7 @@ tests/test_scheduler_streams.py
 Tests for the stream-based additions to workers/scheduler.py:
     · _init_consumer_group(r, stream_key, group)
     · _get_stream_pending_count(r, stream_key, group)
-    · claim_stale_work(r, stream_key, group, consumer, p95_ms, op_type)
+    · claim_stale_work(r, stream_key, group, op_type)
     · on_adaptive_complete() — WARMING lifecycle
     · _bootstrap_warming(company, r, now)
 
@@ -179,168 +179,176 @@ class TestGetStreamPendingCount(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers for claim_stale_work tests
+# TestClaimStaleWork — owner-state reaper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_autoclaim_result(claimed_entries):
-    """Build xautoclaim return: (next_cursor, [(msg_id, fields), ...], [])"""
-    return ("0-0", claimed_entries, [])
+class _ReapRedis:
+    """Minimal Redis double for claim_stale_work: PEL, stream, heartbeats, cur keys."""
 
+    def __init__(self, pel, fields=None, alive=(), cur=None):
+        self.pel = pel                      # [(msg_id, consumer)]
+        self.fields = fields or {}          # msg_id -> stream fields
+        self.alive = set(alive)             # heartbeat keys that exist
+        self.cur = cur or {}                # consumer -> {"msg_id", "alive_until"}
+        self.acked, self.zadds, self.zrems, self.deleted = [], [], [], []
+        self.counters = {}
 
-def _make_pending_entry(msg_id, times_delivered):
-    return [{
-        "message_id":           msg_id,
-        "consumer":             b"worker-1",
-        "time_since_delivered": 600_000,
-        "times_delivered":      times_delivered,
-    }]
+    def xpending_range(self, stream, group, min="-", max="+", count=100):
+        return [{"message_id": m, "consumer": c, "time_since_delivered": 0,
+                 "times_delivered": 1} for m, c in self.pel]
 
+    def exists(self, key):
+        return key in self.alive
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TestClaimStaleWork
-# ─────────────────────────────────────────────────────────────────────────────
+    def get(self, key):
+        import json
+        cons = key[len("worker:cur:"):] if key.startswith("worker:cur:") else None
+        return json.dumps(self.cur[cons]) if cons in self.cur else None
+
+    def xrange(self, stream, min, max, count=1):
+        return [(min, self.fields[min])] if min in self.fields else []
+
+    def xack(self, stream, group, msg_id):
+        self.acked.append(msg_id)
+        self.pel = [(m, c) for m, c in self.pel if m != msg_id]
+
+    def incr(self, key):
+        self.counters[key] = self.counters.get(key, 0) + 1
+        return self.counters[key]
+
+    def expire(self, *a):
+        pass
+
+    def zadd(self, key, mapping, **kw):
+        self.zadds.append((key, mapping, kw))
+
+    def zrem(self, key, member):
+        self.zrems.append((key, member))
+
+    def delete(self, key):
+        self.deleted.append(key)
+
 
 class TestClaimStaleWork(unittest.TestCase):
 
-    def _run(self, r, p95_ms=10_000, op_type="scan", consumer="sched-0"):
-        from workers.scheduler import claim_stale_work
-        with patch("workers.scan_worker._get_backoff_delay", return_value=300):
-            claim_stale_work(r, REDIS_STREAM_ADAPTIVE,
-                             STREAM_CONSUMER_GROUP, consumer,
-                             p95_ms, op_type)
+    HOST, PID = "vm1", 4242
+    CONSUMER = "worker-vm1-4242"
+    HB = "worker:alive:scan_worker:vm1:4242"
 
-    def test_xautoclaim_raises_returns_early(self):
-        """xautoclaim raises → returns without crash."""
-        r = MagicMock()
-        r.xautoclaim.side_effect = Exception("NOGROUP")
-        self._run(r)   # must not raise
+    def setUp(self):
+        import workers.scheduler as sch
+        sch._reap_seen.clear()
+        self.sch = sch
 
-    def test_xautoclaim_returns_none_returns_early(self):
-        """xautoclaim returns None → returns early."""
-        r = MagicMock()
-        r.xautoclaim.return_value = None
+    def _run(self, r, stream=REDIS_STREAM_ADAPTIVE, op="scan", times=2):
+        for _ in range(times):
+            self.sch.claim_stale_work(r, stream, STREAM_CONSUMER_GROUP, op)
+
+    def _redis(self, **kw):
+        return _ReapRedis([("1-0", self.CONSUMER)],
+                          fields={"1-0": {"company": "Stripe", "dc_key": "greenhouse"}}, **kw)
+
+    def test_running_owner_is_left_alone(self):
+        r = self._redis(alive=[self.HB],
+                        cur={self.CONSUMER: {"msg_id": "1-0", "alive_until": time.time() + 500}})
+        self._run(r, times=5)
+        self.assertEqual(r.acked, [])
+        self.assertEqual(r.zadds, [])
+
+    def test_dead_owner_reaped_on_second_sighting_only(self):
+        r = self._redis()                       # no heartbeat key → DEAD
+        self._run(r, times=1)
+        self.assertEqual(r.acked, [])
+        self._run(r, times=1)
+        self.assertEqual(r.acked, ["1-0"])
+
+    def test_reap_reschedules_with_backoff_gt_and_releases_slot(self):
+        r = self._redis()
         self._run(r)
-        r.xack.assert_not_called()
+        key, mapping, kw = r.zadds[0]
+        self.assertEqual(key, REDIS_POLL_ADAPTIVE)
+        self.assertGreater(mapping["Stripe"], time.time())
+        self.assertTrue(kw.get("gt"))
+        self.assertIn(("inflight:scans:greenhouse", "Stripe"), r.zrems)
+        self.assertIn("inflight:msg:scan:Stripe", r.deleted)
 
-    def test_empty_claimed_list_returns_early(self):
-        """xautoclaim returns empty claimed list → no xack, no zadd."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result([])
+    def test_abandoned_owner_reaped(self):
+        r = self._redis(alive=[self.HB],
+                        cur={self.CONSUMER: {"msg_id": "9-9", "alive_until": time.time() + 500}})
         self._run(r)
-        r.xack.assert_not_called()
-        r.zadd.assert_not_called()
+        self.assertEqual(r.acked, ["1-0"])
 
-    def test_empty_fields_dict_xacks_and_skips(self):
-        """Claimed message with empty fields dict → XACK called, no zadd."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result([(b"1-0", {})])
-        r.xpending_range.return_value = _make_pending_entry(b"1-0", 1)
+    def test_owner_without_cur_report_reaped(self):
+        r = self._redis(alive=[self.HB])
         self._run(r)
-        r.xack.assert_called_once()
-        r.zadd.assert_not_called()
+        self.assertEqual(r.acked, ["1-0"])
 
-    def test_no_company_field_xacks_and_skips(self):
-        """Message with no 'company' field → XACK called, no dead-letter."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result(
-            [(b"2-0", {"dc_key": "greenhouse"})]
-        )
+    def test_stalled_owner_killed_then_reaped(self):
+        r = self._redis(alive=[self.HB],
+                        cur={self.CONSUMER: {"msg_id": "1-0", "alive_until": time.time() - 5}})
+        with patch("socket.gethostname", return_value=self.HOST), \
+                patch("os.kill") as kill:
+            self._run(r)
+        kill.assert_called_once()
+        self.assertEqual(kill.call_args[0][0], self.PID)
+        self.assertEqual(r.acked, ["1-0"])
+
+    def test_state_change_between_sightings_restarts_confirmation(self):
+        r = self._redis()                       # DEAD on first sighting
+        self._run(r, times=1)
+        r.alive.add(self.HB)                    # now alive, no report → ABANDONED
+        self._run(r, times=1)
+        self.assertEqual(r.acked, [])
+        self._run(r, times=1)
+        self.assertEqual(r.acked, ["1-0"])
+
+    def test_entry_without_company_acked_without_reschedule(self):
+        r = _ReapRedis([("2-0", self.CONSUMER)], fields={"2-0": {"dc_key": "x"}})
         self._run(r)
-        r.xack.assert_called_once()
-        r.zadd.assert_not_called()
+        self.assertEqual(r.acked, ["2-0"])
+        self.assertEqual(r.zadds, [])
 
-    def test_under_redelivery_limit_no_xack_no_zadd(self):
-        """delivery_count < MAX_STREAM_REDELIVERIES → no xack, no zadd."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result(
-            [(b"3-0", {"company": "Stripe"})]
-        )
-        r.xpending_range.return_value = _make_pending_entry(
-            b"3-0", MAX_STREAM_REDELIVERIES - 1
-        )
+    def test_trimmed_entry_acked_without_reschedule(self):
+        r = _ReapRedis([("3-0", self.CONSUMER)])
         self._run(r)
-        r.xack.assert_not_called()
-        r.zadd.assert_not_called()
+        self.assertEqual(r.acked, ["3-0"])
+        self.assertEqual(r.zadds, [])
 
-    def test_at_redelivery_limit_dead_letters_to_adaptive(self):
-        """delivery_count == MAX_STREAM_REDELIVERIES → zadd to REDIS_POLL_ADAPTIVE + xack."""
+    def test_repeat_reaps_back_off_longer(self):
+        r = self._redis()
+        delays = []
+        for _ in range(3):
+            r.pel = [("1-0", self.CONSUMER)]
+            self.sch._reap_seen.clear()
+            before = len(r.zadds)
+            self._run(r)
+            delays.append(r.zadds[before][1]["Stripe"] - time.time())
+        self.assertLess(delays[0], delays[1])
+        self.assertLess(delays[1], delays[2])
+
+    def test_fullscan_uses_fullscan_queue_and_slots(self):
+        r = _ReapRedis([("4-0", "worker-vm1-4242")],
+                       fields={"4-0": {"company": "ScanCo", "dc_key": "workday_a"}})
+        self._run(r, stream=REDIS_STREAM_FULLSCAN, op="fullscan")
+        self.assertEqual(r.zadds[0][0], REDIS_POLL_FULLSCAN)
+        self.assertIn(("inflight:fullscans:workday_a", "ScanCo"), r.zrems)
+        self.assertIn(("inflight:fullscan", "ScanCo"), r.zrems)
+
+    def test_xpending_error_returns_quietly(self):
         r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result(
-            [(b"4-0", {"company": "DeadCo"})]
-        )
-        r.xpending_range.return_value = _make_pending_entry(
-            b"4-0", MAX_STREAM_REDELIVERIES
-        )
-        self._run(r, op_type="scan")
-        r.zadd.assert_called_once()
-        zadd_key = r.zadd.call_args[0][0]
-        self.assertEqual(zadd_key, REDIS_POLL_ADAPTIVE)
-        r.xack.assert_called_once()
+        r.xpending_range.side_effect = Exception("NOGROUP")
+        self.sch.claim_stale_work(r, REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP)
 
-    def test_fullscan_dead_letters_to_fullscan_queue(self):
-        """op_type='fullscan' → dead-letter goes to REDIS_POLL_FULLSCAN."""
+    def test_clear_reaped_deletes_counter(self):
         r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result(
-            [(b"5-0", {"company": "ScanCo"})]
-        )
-        r.xpending_range.return_value = _make_pending_entry(
-            b"5-0", MAX_STREAM_REDELIVERIES
-        )
-        with patch("workers.scan_worker._get_backoff_delay", return_value=300):
-            from workers.scheduler import claim_stale_work
-            claim_stale_work(r, REDIS_STREAM_FULLSCAN,
-                             STREAM_CONSUMER_GROUP, "sched-0",
-                             10_000, "fullscan")
-        zadd_key = r.zadd.call_args[0][0]
-        self.assertEqual(zadd_key, REDIS_POLL_FULLSCAN)
+        self.sch.clear_reaped(r, "scan", "Stripe")
+        r.delete.assert_called_once_with("reaped:scan:Stripe")
 
-    def test_idle_ms_floor_applied(self):
-        """p95_ms=50000 → min_idle_time=300000 (floor of 300s applied, not 150s)."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result([])
-        self._run(r, p95_ms=50_000)
-        call_kwargs = r.xautoclaim.call_args[1]
-        self.assertEqual(call_kwargs["min_idle_time"], 300_000)
-
-    def test_idle_ms_scale_applied(self):
-        """p95_ms=200000 → min_idle_time=600000 (3× exceeds floor)."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result([])
-        self._run(r, p95_ms=200_000)
-        call_kwargs = r.xautoclaim.call_args[1]
-        self.assertEqual(call_kwargs["min_idle_time"], 600_000)
-
-    def test_xpending_range_raises_no_dead_letter(self):
-        """xpending_range raises → delivery_count=0, no dead-letter."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result(
-            [(b"6-0", {"company": "RisCo"})]
-        )
-        r.xpending_range.side_effect = Exception("timeout")
-        self._run(r)
-        r.zadd.assert_not_called()
-
-    def test_multiple_messages_processed_independently(self):
-        """Multiple claimed messages → each checked for redelivery count."""
-        r = MagicMock()
-        r.xautoclaim.return_value = _make_autoclaim_result([
-            (b"7-0", {"company": "Co1"}),
-            (b"8-0", {"company": "Co2"}),
-        ])
-
-        call_count = [0]
-
-        def _pending_range(stream, group, min, max, count):
-            call_count[0] += 1
-            return _make_pending_entry(min, 0)   # below limit
-
-        r.xpending_range.side_effect = _pending_range
-        self._run(r)
-        self.assertEqual(call_count[0], 2)   # called once per message
+    def test_split_consumer(self):
+        self.assertEqual(self.sch._split_consumer("worker-my-host-12"), ("my-host", 12))
+        self.assertEqual(self.sch._split_consumer("scheduler-h-1"), (None, None))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers for on_adaptive_complete WARMING tests
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_poll_stats_row(warming_polls_remaining=None,

@@ -307,9 +307,8 @@ class TestAcquireReleaseLock(unittest.TestCase):
         result = _acquire_lock("TestCo", r)
         self.assertFalse(result)
 
-    def test_acquire_uses_nx_and_ex_flags(self):
-        """_acquire_lock uses nx=True and ex=TTL."""
-        from config import SCHEDULER_FULL_SCAN_LOCK_TTL
+    def test_acquire_uses_nx_without_ttl(self):
+        """_acquire_lock is a lease: nx=True and no expiry."""
         r = MagicMock()
         r.set.return_value = True
         from workers.fullscan import _acquire_lock
@@ -317,7 +316,7 @@ class TestAcquireReleaseLock(unittest.TestCase):
         r.set.assert_called_once()
         kwargs = r.set.call_args[1]
         self.assertTrue(kwargs.get("nx"))
-        self.assertEqual(kwargs.get("ex"), SCHEDULER_FULL_SCAN_LOCK_TTL)
+        self.assertNotIn("ex", kwargs)
 
     def test_acquire_lock_key_format(self):
         """Lock key is fullscan:lock:{company}."""

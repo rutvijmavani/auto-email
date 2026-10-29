@@ -114,10 +114,10 @@ from config import (
     REDIS_DB_MAINTENANCE,
     REDIS_INFLIGHT_FULLSCAN,
     REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
+    REDIS_INFLIGHT_MSG_PREFIX,
     WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
     WORKER_CURRENT_JOB_FULLSCAN_TTL,
     WORKER_BLOCK_SECS,
-    SCHEDULER_FULL_SCAN_LOCK_TTL,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_HEARTBEAT_TTL,
@@ -136,9 +136,11 @@ from config import (
     FULLSCAN_PARTIAL_RETRY_TTL_S,
 )
 from workers.redis_client import get_redis, ping
-from workers.heartbeat import Heartbeat
+from workers.heartbeat import BusyMeter, Heartbeat
+from workers.queue_stamp import stamp_queued_at, count_arrival
+from workers import progress
 from workers.scheduler import (
-    set_heartbeat, clear_heartbeat, set_progress,
+    set_heartbeat, clear_heartbeat, set_progress, clear_reaped,
     _pick_schedule_time, _next_digest_deadline, _atomic_schedule,
 )
 from workers.paginator import should_continue_paginating, estimate_scan_depth
@@ -359,14 +361,16 @@ def _acquire_lock(company: str, r) -> bool:
     """
     Acquire exclusive full-scan lock for company.
 
-    Uses SET NX EX to prevent two fullscan workers from scanning the same
+    Uses SET NX to prevent two fullscan workers from scanning the same
     company simultaneously (possible if worker restarts or two processes run).
+    The lock has no TTL: it is a lease held while the owner works, and the
+    scheduler's reaper / sweep_inflight delete it when the owner is gone.
 
     Returns True if lock acquired, False if already held.
     """
     key = f"fullscan:lock:{company}"
     return bool(
-        r.set(key, WORKER_ID, nx=True, ex=SCHEDULER_FULL_SCAN_LOCK_TTL)
+        r.set(key, WORKER_ID, nx=True)
     )
 
 
@@ -1301,7 +1305,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                                 company, job.get("job_id"),
                             )
                         else:
-                            r.lpush(REDIS_DETAIL_FULLSCAN, json.dumps(detail_payload))
+                            r.lpush(REDIS_DETAIL_FULLSCAN,
+                                    json.dumps(stamp_queued_at(detail_payload)))
+                            count_arrival(r, REDIS_DETAIL_FULLSCAN)
                             new_count += 1
                             _reintro_detail_count += 1
 
@@ -1541,6 +1547,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
     finally:
         try:
             r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
+            r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:fullscan:{company}")
         except Exception as exc:
             logger.debug("fullscan [%s]: inflight ZREM failed (non-fatal): %s", company, exc)
         if dc_key:
@@ -1655,18 +1662,19 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     # writes would need to accumulate for ~3 minutes, which only happens if
     # the process truly exited (daemon thread dies with the process → key TTL
     # runs out → watchdog correctly detects the dead worker).
+    # Busy time for the manager's utilization signal rides in the heartbeat:
+    # _busy.begin()/end() bracket each full scan.
     _hw = {"count": 0}
+    _busy = BusyMeter()
     _hb = Heartbeat(r, "fullscan_worker", lambda: _hw["count"],
-                    interval_s=60).start()
-
-    # ── Busy-time tracking for manager.py utilization signal ─────────────────
-    _BUSY_CYCLE_S  = 60
-    _busy_ms_acc   = 0
-    _busy_window_t = time.monotonic()
-    _own_pid       = os.getpid()
+                    interval_s=60, busy_meter=_busy).start()
+    # Progress reports (worker:cur:{consumer}), checkpoints at the transport layer.
+    progress.bind(r, _CONSUMER_NAME)
+    progress.install()
 
     while True:
         try:
+            progress.end()   # idempotent: clears the previous message on every path
             if shutdown_event and shutdown_event.is_set():
                 logger.info("fullscan: shutdown_event set — stopping cleanly")
                 break
@@ -1711,28 +1719,23 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 continue
 
             dc_key = fields.get("dc_key", "")
+            progress.begin(msg_id, dc_key)
 
             # ── Run full scan ─────────────────────────────────────────────────
-            result    = _run_fullscan(company, r, skip_lock=skip_lock,
-                                      dc_key=dc_key,
-                                      shutdown_event=shutdown_event)
-
-            # ── Publish busy_ms for manager.py utilization ───────────────────
-            _elapsed_ms = result.get("duration_ms", 0)
-            _now_m = time.monotonic()
-            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
-                _busy_ms_acc   = 0
-                _busy_window_t = _now_m
-            _busy_ms_acc += _elapsed_ms
+            _busy.begin()
             try:
-                r.set(f"worker:fullscan:busy_ms:{_own_pid}", _busy_ms_acc,
-                      ex=_BUSY_CYCLE_S * 2)
-            except Exception:
-                pass
+                result = _run_fullscan(company, r, skip_lock=skip_lock,
+                                       dc_key=dc_key,
+                                       shutdown_event=shutdown_event)
+            finally:
+                _busy.end()
 
+            progress.end()
             _hw["count"] += 1
 
             outcome = result["outcome"]
+            if outcome == "completed":
+                clear_reaped(r, "fullscan", company)
 
             # ── XACK: remove from PEL (work complete) ────────────────────────
             # Skip XACK on shutdown so the message stays in the PEL for

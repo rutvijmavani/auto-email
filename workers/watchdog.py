@@ -79,6 +79,7 @@ from email.mime.text import MIMEText
 from typing import Optional
 
 from workers.redis_client import get_redis, ping
+from workers.queue_stamp import payload_wait_s
 from config import (
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
@@ -899,12 +900,7 @@ def _detail_queue_delay_s(r, queue_key: str) -> float | None:
         raw = r.lindex(queue_key, -1)
         if not raw:
             return None
-        payload = json.loads(raw)
-        enqueued_at = payload.get("enqueued_at")
-        if not enqueued_at:
-            return None
-        enqueued_ts = datetime.fromisoformat(enqueued_at).timestamp()
-        return max(time.time() - enqueued_ts, 0.0)
+        return payload_wait_s(raw, time.time())
     except Exception:
         return None
 
@@ -1706,25 +1702,6 @@ def check_redis_persistence(r) -> list:
     return []
 
 
-def check_hung_workers(r) -> list:
-    hung = []
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-        for key in keys:
-            ks      = key.decode() if isinstance(key, bytes) else key
-            company = ks.split(":", 1)[1]
-            if not r.exists(f"progress:{company}"):
-                hung.append(company)
-        if cursor == 0:
-            break
-    if hung:
-        return [Issue(Issue.WARNING, "hung_workers",
-            f"{len(hung)} scan(s) may be hung: "
-            f"{', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")]
-    return []
-
-
 def check_systemd_services() -> list:
     """
     Directly query systemd for the state of both pipeline units.
@@ -1821,7 +1798,6 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     issues.extend(check_queue_health(r, persist_snapshot=persist_snapshot))
     issues.extend(check_bloom_health(r))
     issues.extend(check_coverage(r))
-    issues.extend(check_hung_workers(r))
     issues.extend(check_redis_persistence(r))
     _check_unmatched_emails(issues)
     return issues

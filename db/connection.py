@@ -26,6 +26,8 @@ import psycopg2.extras
 import psycopg2.pool
 from dotenv import load_dotenv
 
+from config import DB_POOL_PROCESS_MAXCONN, DB_POOL_MINCONN
+
 try:
     load_dotenv()   # no-op if env vars already set; loads .env on first import
 except AssertionError:
@@ -86,9 +88,12 @@ def _get_pool() -> "psycopg2.pool.ThreadedConnectionPool":
         with _pool_lock:
             if _self._pool is None:
                 _self._pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=2,
-                    maxconn=25,
+                    minconn=DB_POOL_MINCONN,
+                    maxconn=DB_POOL_PROCESS_MAXCONN,
                     dsn=_self.DATABASE_URL,
+                    # lets pg_stat_activity attribute each connection to its
+                    # process (workers/db_capacity.py)
+                    application_name=f"pid{os.getpid()}",
                 )
     return _self._pool
 

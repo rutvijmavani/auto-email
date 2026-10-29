@@ -2913,7 +2913,7 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
     def _simple_run(self, companies, scan_map, inflight=None, redis_error=False):
         """
         Simpler runner: directly patches the Redis call inside
-        _get_worker_missed_companies using zrangebyscore.
+        _get_worker_missed_companies using zrange.
         """
         from datetime import datetime, timezone, timedelta
 
@@ -2933,9 +2933,9 @@ class TestInflightExclusionFromMissed(unittest.TestCase):
 
         mock_redis = MagicMock()
         if redis_error:
-            mock_redis.zrangebyscore.side_effect = ConnectionError("Redis down")
+            mock_redis.zrange.side_effect = ConnectionError("Redis down")
         else:
-            mock_redis.zrangebyscore.return_value = inflight_encoded
+            mock_redis.zrange.return_value = inflight_encoded
 
         with patch("db.db.get_conn", return_value=mock_conn):
             with patch("redis.from_url", return_value=mock_redis):
@@ -3047,7 +3047,7 @@ class TestInFlightWait(unittest.TestCase):
         import jobs.job_monitor as jm
 
         mock_r = MagicMock()
-        mock_r.zrangebyscore.return_value = []   # Acme gone from ZSET immediately
+        mock_r.zrange.return_value = []   # Acme gone from ZSET immediately
 
         mock_conn = MagicMock()
         mock_conn.execute.return_value.fetchall.return_value = [{"company": "Acme"}]
@@ -3077,7 +3077,7 @@ class TestInFlightWait(unittest.TestCase):
         import jobs.job_monitor as jm
 
         mock_r = MagicMock()
-        mock_r.zrangebyscore.return_value = []   # Acme disappears from ZSET
+        mock_r.zrange.return_value = []   # Acme disappears from ZSET
 
         mock_conn = MagicMock()
         mock_conn.execute.return_value.fetchall.return_value = []  # not confirmed in DB

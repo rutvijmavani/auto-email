@@ -26,6 +26,7 @@ import time
 from logger import get_logger
 
 from workers.redis_client import get_redis
+from workers.queue_stamp import stamp_queued_at, count_arrival
 from db.db import get_conn, init_db, get_monitorable_companies
 from config import (
     REDIS_POLL_ADAPTIVE,
@@ -371,14 +372,37 @@ def rebuild_detail_queue() -> int:
     finally:
         conn.close()
 
+    # first_seen is a DATE, so same-day rows tie in SQL.  Break the tie by the
+    # build time stored in the payload (enqueued_at) so the oldest job is
+    # pushed first and served first.  Rows without a stored payload keep SQL order.
+    def _built_at(row) -> str:
+        stored = row["detail_payload"]
+        try:
+            if isinstance(stored, str):
+                stored = json.loads(stored)
+            return (stored or {}).get("enqueued_at") or ""
+        except Exception:
+            return ""
+
+    rows = sorted(rows, key=lambda row: (row["first_seen"], _built_at(row)))
+
     skipped = 0
     count = 0
     for row in rows:
         stored = row["detail_payload"]
         if stored:
-            # Full payload persisted at scan time — push it verbatim so
-            # detail_worker gets every platform-specific key it needs.
-            payload = json.dumps(stored) if isinstance(stored, dict) else stored
+            # Full payload persisted at scan time — push it so detail_worker
+            # gets every platform-specific key it needs.  queued_at is never
+            # persisted, so the push adds a fresh one (enqueued_at stays).
+            if isinstance(stored, str):
+                try:
+                    stored = json.loads(stored)
+                except Exception:
+                    stored = None
+            if isinstance(stored, dict):
+                payload = json.dumps(stamp_queued_at(stored))
+            else:
+                payload = row["detail_payload"]
         elif row["ats_platform"] in _REBUILD_SKIP_PLATFORMS:
             # Old row (pre detail_payload column) for a platform that needs
             # ephemeral keys we can't reconstruct.  Skip; next scan re-queues
@@ -387,14 +411,15 @@ def rebuild_detail_queue() -> int:
             continue
         else:
             # Old row for a platform whose minimal payload is sufficient.
-            payload = json.dumps({
+            payload = json.dumps(stamp_queued_at({
                 "company":      row["company"],
                 "job_url":      row["job_url"],
                 "job_id":       row["job_id"],
                 "ats_platform": row["ats_platform"],
                 "found_by":     "rebuild",
-            })
+            }))
         r.lpush(REDIS_DETAIL_ADAPTIVE, payload)
+        count_arrival(r, REDIS_DETAIL_ADAPTIVE, "rebuild")
         count += 1
 
     if count or skipped:

@@ -1254,6 +1254,8 @@ Layer 1 sets these ceilings at midnight and hands them to Layer 0 as `worker_cei
 
 #### When ceiling blocks the ideal target — structural borrowing
 
+> **Superseded units (2026-10-29):** the examples in this Phase 4 section and in the Layer 2 examples below use the old numbers (`DB_POOL_MAXCONN=25`, 3 reserved, `PROBE=60`). The implementation counts worker seats (`WORKER_SEAT_BUDGET`, no reserved subtraction) and takes the ceiling live from Postgres — see "Capacity overflow".
+
 Ceilings are soft per-pool fractions of `DB_POOL_MAXCONN`, not hard walls. If one pool's ceiling is not fully used, those slots are available to any other pool that needs more than its own ceiling allows. Phase 4 runs once daily as part of Layer 1 recompute, immediately after Step 5, to set the final `worker_ceil` values:
 
 ```
@@ -1602,35 +1604,40 @@ not the suppressed inflow after backpressure.
 
 #### Capacity overflow: when required workers exceed total available
 
-Scenario: `true_required_workers(pool) + targets(other pools) > workers derivable from DB_POOL_MAXCONN`.
+Scenario: `true_required_workers(pool) + targets(other pools) > worker seats the manager holds`.
 
-**Manager has two limits, not one:**
+**The budget is counted in worker seats; the hard limit is Postgres connections.** A worker process opens `DB_POOL_MINCONN` (2) connections as soon as it touches the DB, so one seat costs ~2 connections, and manager, watchdog, h1b_llm and streamlit hold 2 each outside the workers. The manager reads all of this live each cycle (`workers/db_capacity.py`, no remembered numbers):
 
 ```
-DB_POOL_MAXCONN        = 25     ← current operating limit (what workers use now)
-DB_POOL_MAXCONN_PROBE  = 60     ← server's confirmed safe ceiling (set by operator once)
+cap        = max_connections − superuser_reserved_connections − DB_CAPACITY_MARGIN   (SHOW, live)
+non_worker = connections held by processes that are not live workers
+per_worker = most connections any live worker process holds right now
+seat cap   = (cap − non_worker) // per_worker
 
-Manager can autonomously raise DB_POOL_MAXCONN up to PROBE ceiling.
-Above PROBE → alert only, operator action required.
+WORKER_SEAT_BUDGET (22) = seats the manager starts with
+DB_POOL_RAISE_STEP (5)  = raise step, in CONNECTIONS → max(1, 5 // per_worker) seats (2 today)
+DB_POOL_PROCESS_MAXCONN = per-process pool cap (db/connection.py), unrelated to the budget
 ```
 
-Raising `DB_POOL_MAXCONN` is not free — it opens more connections to Postgres. Raising blindly past the server's `max_connections` kills the database for everything (API, workers, all of it). `DB_POOL_MAXCONN_PROBE` is the operator-confirmed ceiling beyond which no autonomous action is taken.
+Each process labels its connections `application_name = "pid<PID>"` (db/connection.py), so `pg_stat_activity` attributes every connection to its process; live worker PIDs come from the `worker:alive:*` heartbeats. If Postgres cannot be queried, the manager stops raising and logs an error rather than guess.
+
+Measured 2026-10-19..21 (48 h sampler, `~/diag/conn_census.log`): peak 39 of 100 connections, 34 from the app; ss attribution on 2026-10-29: every pool-holding process held exactly 2.
 
 **Overflow resolution steps:**
 
 ```
-Step 1: Is DB_POOL_MAXCONN < DB_POOL_MAXCONN_PROBE?
-        YES → raise DB_POOL_MAXCONN in increments of 5
+Step 1: Are worker seats < the live Postgres seat cap?
+        YES → raise the seats by the raise step (DB_POOL_RAISE_STEP connections)
               recompute ceilings, re-check if requirement is now met
-              repeat until met or PROBE ceiling reached
+              repeat until met or the seat cap is reached
         NO  → requirement cannot be met autonomously
               → alert: "need X workers total, server ceiling is Y"
               → operator decides: upgrade server, add read replica, or accept shortage
 
-Step 2: If at PROBE ceiling and still short (not all pools can be satisfied):
+Step 2: If at the seat cap and still short (not all pools can be satisfied):
         Allocate in priority order — higher-priority pool gets its full requirement first:
 
-        available = DB_POOL_MAXCONN_PROBE − 3    (reserve 3 for watchdog/scheduler/API)
+        available = seat cap                      (non-worker connections are already subtracted in it)
 
         detail_allocation  = min(true_required(detail),  detail_ceil_at_probe)
         scan_allocation    = min(true_required(scan),    min(scan_ceil_at_probe,   available − detail_allocation))
@@ -1663,6 +1670,31 @@ buffer)                         each move       if the deadlock resolved. Stop t
                                                 many workers from scan to fix fullscan
                                                 could deadlock scan next cycle.
 ```
+
+**As implemented (workers/manager.py `_attempt_borrow`).** Borrowing moves *ceiling seats* (`manager:borrow:{src}:{tgt}`, no TTL), not targets; the manager is the sole ceiling owner and the scheduler applies `_get_worker_ceil` without its own clamp. Per cycle, once a pool sits at its ceiling with delay above warn and rising (3 of 4 cycles), the first step that yields capacity wins:
+
+```
+1. Layer 0 grows to the pool's ceiling
+2. Emergency recalc of the pool's own ceiling (today's peak included)
+3. Lendable workers (above target)                       ALL AT ONCE
+4. Buffer seats  (ceiling − peak_Nd)                     ALL AT ONCE
+5. Peak-headroom seats (peak_Nd − target)                ONE PER CYCLE, check each cycle
+6. Raise the worker budget by DB_POOL_RAISE_STEP toward the live Postgres seat cap
+7. Lever 1 — last resort, only when 2-6 yield nothing
+```
+
+Source order is fullscan, then scan, then detail. Lifting Lever 1 does not return seats; `_maybe_return_borrows` returns a borrow when both pools involved stay below warn × 0.25 for 3 consecutive cycles. The nightly recompute runs at `MANAGER_RECOMPUTE_HOUR` (23:00 America/New_York), guarded by the Redis key `manager:last_recompute_date`.
+
+**Stage B inputs (as implemented).**
+
+- Target workers = `ceil((depth / time_left + λ) × s)`, scaled by delay / warn when over warn. λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over `SERVICE_TIME_WINDOW_CYCLES` (5) cycles (`_get_pool_service_time`); `fetch_p75` is only the fallback while `s` is unknown.
+- The needed worker count is recorded **before** the ceiling clamp (`_needed_workers`), capped at what the DB budget can host, and that is what feeds the running daily peak — a surge is recorded at its real size, not at the ceiling.
+- The `manager:snapshot:{pool}:D/R` keys are gone: Lever 1 no longer writes a snapshot and the learning loop no longer reads one; the needed count is computed live.
+- Lever 1 fires only when the chain is exhausted **and** λ × s > n (or λ / s unknown). If λ × s ≤ n the backlog is draining and an INFO line says so. The lift stays delay-based, because under Lever 1 the arrival counters measure post-halt inflow (≈ 0), so a "λ × s < n" lift would release it immediately.
+- One INFO line per pool per cycle: n, needed, target, ceiling, depth, delay, λ, s, decision.
+- Detail jobs log `fetch_ms` (time inside `fetch_job_detail`) and `db_ms` (sum of the job's DB calls) next to the total, so the heartbeat service time can be split into network and database.
+- Handoff: when a borrow is due back (both pools calm for 3 cycles) but a third pool's delay is above its warn, `_maybe_return_borrows` re-points the seats to that pool (`manager:borrow:{src}:{heir}`) instead of returning them; they return once the heir is calm too. Seats are conserved, so the lender and the budget are unaffected.
+- `DB_POOL_PROCESS_MAXCONN` / `DB_POOL_MINCONN` (config.py, env-overridable) build every process's pool in `db/connection.py`; the hardcoded 25 / 2 are gone. The manager's budget is separate: `WORKER_SEAT_BUDGET` in seats, ceiling read live from Postgres (see Capacity overflow).
 
 **Detail's buffer is protected by default.** Never take from detail's unused capacity for scan or fullscan unless detail's inflow is already halted (backpressure active). Detail inflow halted = detail queue won't grow while you borrow from it.
 
@@ -2741,8 +2773,8 @@ When `workers/manager.py` is introduced, these are the ONLY changes needed in `s
 | `CONCURRENCY_ERROR_RATE_REDUCE` | http_client.py + scheduler.py | Split: http_client keeps it; scheduler's use moves to manager |
 | `WORKER_SCALING_LOCK_TTL` | scheduler.py | Delete — lock concept replaced by manager state |
 | `WORKER_OUTAGE_TTL_S` | scheduler.py | Move to manager.py (manager declares outage) |
-| `DB_POOL_MAXCONN` | connection.py + scheduler.py | Stays in connection.py; manager reads it via import |
-| `DB_POOL_MAXCONN_PROBE` | *(not yet in config)* | Add to config.py — operator-set ceiling for autonomous raise |
+| `DB_POOL_PROCESS_MAXCONN` | connection.py | Per-process pool cap only |
+| `WORKER_SEAT_BUDGET` | manager.py | Worker seats at start; raised toward the live Postgres seat cap |
 | `WORKER_FAST_CHECK_INTERVAL_S` | scheduler.py | Delete |
 | `RECOVERY_STABILITY_RATIO` | *(not yet in config)* | Add to config.py: `0.25` |
 | All constants for delay/backpressure | *(not yet in config)* | Add to config.py as part of manager implementation |

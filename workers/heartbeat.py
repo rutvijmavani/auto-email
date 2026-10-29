@@ -47,6 +47,43 @@ logger = get_logger(__name__)
 _HOSTNAME = socket.gethostname()   # resolved once at import time; stable for process lifetime
 
 
+class BusyMeter:
+    """
+    Cumulative busy-time odometer for one worker, read by the heartbeat thread.
+
+    The main loop brackets each job with begin() / end(); the heartbeat thread
+    calls snapshot().  total_ms and since are kept together under one lock so a
+    snapshot can never mix the two (a job ending between two separate reads
+    would otherwise be counted twice or not at all).
+
+    total_ms  grows only when a job ends and is never reset.
+    since     is the wall-clock start of the job in progress, None when idle —
+              it lets the manager count a long job (a multi-hour scan) while it
+              is still running instead of only after it ends.
+    Both use time.time(), the same clock as the heartbeat's ts.
+    """
+
+    def __init__(self) -> None:
+        self._lock     = threading.Lock()
+        self._total_ms = 0.0
+        self._since    = None
+
+    def begin(self) -> None:
+        with self._lock:
+            self._since = time.time()
+
+    def end(self) -> None:
+        with self._lock:
+            if self._since is not None:
+                self._total_ms += max(time.time() - self._since, 0.0) * 1000.0
+                self._since = None
+
+    def snapshot(self) -> tuple:
+        """Return (total_ms, since_or_None) as one consistent pair."""
+        with self._lock:
+            return int(self._total_ms), self._since
+
+
 class Heartbeat:
     """
     Daemon thread that writes worker:alive:{worker_type}:{hostname}:{pid}
@@ -69,6 +106,9 @@ class Heartbeat:
                           lambda: _hw["count"]
         interval_s:   Seconds between writes (default 10).
                       fullscan_worker should use 60 — scans take minutes.
+        busy_meter:   Optional BusyMeter.  When given, every write carries
+                      busy_ms (cumulative) and busy_since (job start or null)
+                      so the manager can derive utilization from heartbeats.
     """
 
     def __init__(
@@ -78,6 +118,7 @@ class Heartbeat:
         get_count,
         *,
         interval_s: int = 10,
+        busy_meter=None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError(
@@ -87,6 +128,7 @@ class Heartbeat:
         self._r           = r
         self._worker_type = worker_type
         self._get_count   = get_count
+        self._busy_meter  = busy_meter
         self._interval_s  = interval_s
         self._ttl_s       = interval_s * 3   # 3× safety margin
         self._stop        = threading.Event()
@@ -141,13 +183,16 @@ class Heartbeat:
     def _write(self) -> None:
         """Write one heartbeat key to Redis.  Swallows all exceptions."""
         try:
+            payload = {
+                "pid":       os.getpid(),
+                "ts":        time.time(),
+                "processed": self._get_count(),
+            }
+            if self._busy_meter is not None:
+                payload["busy_ms"], payload["busy_since"] = self._busy_meter.snapshot()
             self._r.set(
                 f"worker:alive:{self._worker_type}:{_HOSTNAME}:{os.getpid()}",
-                json.dumps({
-                    "pid":       os.getpid(),
-                    "ts":        time.time(),
-                    "processed": self._get_count(),
-                }),
+                json.dumps(payload),
                 ex=self._ttl_s,
             )
         except Exception as exc:

@@ -1357,11 +1357,11 @@ The correct isolation: track **in-flight scans per platform/DC** and throttle at
 
 **In-flight tracking — two ZSET keys (one per scan type)**
 
-Adaptive and fullscan workers share the same learned ceiling per DC key but use **separate ZSET keys** to track their inflight slots. This is necessary because the two scan types have very different durations — a 10-minute stale window that prunes abandoned adaptive slots would prune active fullscan slots mid-scan (full scans take 20–30 min).
+Adaptive and fullscan workers share the same learned ceiling per DC key but use **separate ZSET keys** to track their inflight slots. Slots are never pruned by age: a slot is released by the worker on completion, by `claim_stale_work` when it reaps the message, and by `sweep_inflight` when the stream message recorded in `inflight:msg:{op}:{company}` is gone (delivered and acknowledged, or never stored).
 
 ```text
-inflight:scans:{dc_key}      — adaptive scan inflight  (stale window: INFLIGHT_STALE_WINDOW_S = 10 min)
-inflight:fullscans:{dc_key}  — fullscan inflight        (stale window: INFLIGHT_FULLSCAN_STALE_S  = 2 h)
+inflight:scans:{dc_key}      — adaptive scan inflight  (released by completion / reaper / sweep_inflight)
+inflight:fullscans:{dc_key}  — fullscan inflight        (released by completion / reaper / sweep_inflight)
 ```
 
 Both counts are summed before comparing to the ceiling. Neither scan type can proceed if their combined total hits the limit.
@@ -1372,11 +1372,7 @@ Both counts are summed before comparing to the ceiling. Neither scan type can pr
 ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
 if ceiling_raw:
     inflight_key = f"inflight:scans:{dc_key}"
-    r.zremrangebyscore(inflight_key, 0, now - INFLIGHT_STALE_WINDOW_S)  # prune stale adaptive
-    # inflight:fullscans:{dc_key} is NOT pruned here: fullscan slots have a
-    # 2 h stale window (INFLIGHT_FULLSCAN_STALE_S) so pruning with the 10 min
-    # adaptive window would remove active fullscan slots mid-scan.  Stale
-    # fullscan entries are pruned atomically inside the Lua dispatch script.
+    # No age-based pruning: leaked slots are freed by sweep_inflight each tick.
     pending_count = (
         r.zcard(inflight_key)
         + r.zcard(f"inflight:fullscans:{dc_key}")   # fullscan slots count toward ceiling too
@@ -1883,9 +1879,9 @@ Member: company name
 
 Written by fullscan_loop's Lua script at dispatch time (atomically with ceiling check).
 ZREM'd by _run_fullscan() finally block on all exit paths.
-ZREMRANGEBYSCORE prunes entries older than INFLIGHT_FULLSCAN_STALE_S (2 h) — backstop for
-hard crashes where the finally block and _replace_dead_workers() both failed.
-Stale window is 2h (not 10min like adaptive) because full scans run 20–30 min.
+sweep_inflight() (scheduler, every tick) releases entries whose stream message is gone — backstop for
+hard crashes where the finally block and _replace_dead_workers() both failed. No age-based pruning.
+The fullscan:lock:{company} key has no TTL; it is a lease deleted by the owner, the reaper or the sweep.
 
 Key: "worker:current_job:fullscan:{pid}"   e.g. worker:current_job:fullscan:12345
 Type: String
@@ -1909,7 +1905,7 @@ Type: List
 
 LPUSH queue:detail:adaptive {job_json}    — push from adaptive listing scan
 LPUSH queue:detail:fullscan {job_json}    — push from full scan
-BRPOP queue:detail:adaptive 0.1           — workers drain adaptive first
+BRPOP queue:detail:adaptive 0.1           — workers serve the older tail first (see Two-tier detail queue note)
 BRPOP queue:detail:fullscan 5             — then fullscan queue
 ```
 
@@ -3940,7 +3936,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Tier 2:** Full scan. Exhaustive, own schedule, separate Redis ZSET. Safety net for what Tier 1 missed.
 
-**Two-tier detail queue:** `queue:detail:adaptive` (high priority) and `queue:detail:fullscan` (low priority). Workers drain adaptive first.
+**Two-tier detail queue:** `queue:detail:adaptive` (high priority) and `queue:detail:fullscan` (low priority). Workers serve whichever queue's oldest item (tail) has waited longer, by `queued_at` (changed from strict adaptive-first so a busy adaptive queue cannot starve fullscan; the manager delay is the older tail's age).
 
 **Pace mismatch:** The condition where scan workers produce new jobs into `queue:detail:adaptive` faster than detail workers can drain it. Resolved by the slow throughput check cascade: add detail workers first; if detail pool is at ceiling, stop adding scan workers; if detail queue still growing, reduce scan workers.
 

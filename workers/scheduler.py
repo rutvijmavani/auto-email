@@ -45,6 +45,8 @@ from workers.adaptive import (
 )
 from workers.http_client import discover_workday_dc_keys, seed_concurrency_limits
 from workers.rebuild import rebuild_redis
+from workers.stream_backlog import trim_delivered
+from workers import progress
 from db.db import get_conn, init_db
 from config import (
     REDIS_POLL_ADAPTIVE,
@@ -65,7 +67,6 @@ from config import (
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
     SCHEDULER_HEARTBEAT_TTL,
-    SCHEDULER_FULL_SCAN_LOCK_TTL,
     DETAIL_QUEUE_MAX_ADAPTIVE,
     ADAPTIVE_CALIBRATION_LOOKBACK_DAYS,
     ADAPTIVE_MIN_COMPANIES_CALIBRATE,
@@ -76,13 +77,9 @@ from config import (
     CONCURRENCY_FLOOR_DEFAULT,
     WORKER_SHUTDOWN_TIMEOUT_S,
     WORKER_SLOW_CHECK_INTERVAL_S,
-    WORKER_POOL_SCAN_FRACTION,
-    WORKER_POOL_DETAIL_FRACTION,
-    WORKER_POOL_FULLSCAN_FRACTION,
     WORKER_FLOOR,
     WORKER_DEPRIORITISE_SECS,
     DETAIL_QUEUE_HIGH_WATERMARK,
-    DB_POOL_MAXCONN,
     # Phase 11
     WORKER_ERROR_STREAK_THRESHOLD,
     DETAIL_QUEUE_ALERT_CYCLES,
@@ -96,18 +93,17 @@ from config import (
     WORKER_CONSEC_REDUCTIONS_TTL,
     WORKER_SCALING_LOCK_TTL,
     REDIS_INFLIGHT_PREFIX,
-    INFLIGHT_STALE_WINDOW_S,
     REDIS_INFLIGHT_FULLSCAN,
     REDIS_INFLIGHT_FULLSCAN_DC_PREFIX,
     WORKER_CURRENT_JOB_FULLSCAN_PREFIX,
-    INFLIGHT_FULLSCAN_STALE_S,
     # Stream-based two-layer scheduler (Section 5 / 9 redesign)
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
     STREAM_CONSUMER_GROUP,
-    STREAM_MAXLEN_ADAPTIVE,
-    STREAM_MAXLEN_FULLSCAN,
     MAX_STREAM_REDELIVERIES,
+    REDIS_REAPED_PREFIX,
+    REDIS_INFLIGHT_MSG_PREFIX,
+    REDIS_WORKER_CUR_PREFIX,
     # WARMING lifecycle
     WARMING_POLLS_COUNT,
     WARMING_INTERVAL_S,
@@ -261,131 +257,213 @@ def _get_stream_undelivered_companies(r, stream_key: str,
         return None
 
 
-def _get_stream_undelivered_count(r, stream_key: str,
-                                   group: str = STREAM_CONSUMER_GROUP) -> int:
-    """Return the count of messages in the stream not yet delivered to any consumer.
-
-    Uses XINFO GROUPS `lag` (Redis 7.0+) which counts only undelivered entries,
-    excluding acknowledged history that XLEN would include.  Falls back to
-    XLEN - PEL for Redis < 7.0.
-    """
+def _trim_stream(r, stream_key: str) -> None:
+    """Delete delivered stream entries (no MAXLEN); a failure never blocks dispatch."""
     try:
-        for g in r.xinfo_groups(stream_key):
-            name = g.get("name", b"")
-            if isinstance(name, bytes):
-                name = name.decode()
-            if name == group:
-                lag = g.get("lag")
-                if lag is not None:
-                    return int(lag)
-                xlen = r.xlen(stream_key)
-                pel  = _get_stream_pending_count(r, stream_key, group)
-                return max(0, xlen - pel)
-        return 0
-    except Exception:
-        xlen = r.xlen(stream_key)
-        pel  = _get_stream_pending_count(r, stream_key, group)
-        return max(0, xlen - pel)
+        trim_delivered(r, stream_key, STREAM_CONSUMER_GROUP)
+    except Exception as exc:
+        logger.warning("stream: trim failed for %r: %s", stream_key, exc)
 
 
-def claim_stale_work(r, stream_key: str, group: str,
-                     consumer: str, p95_ms: int,
-                     op_type: str = "scan") -> None:
+# Owner states of a pending stream entry (see workers/progress.py):
+#   RUNNING    owner alive, its worker:cur names this message, deadline not passed
+#   STALLED    owner alive, worker:cur names this message, deadline passed
+#   ABANDONED  owner alive, but it is not working on this message
+#   DEAD       owner has no heartbeat key (or is not a worker consumer)
+# Everything except RUNNING is reaped once seen in the same state on two
+# consecutive calls (a message just read, or just finished and not yet XACK'd,
+# is momentarily ABANDONED).
+_OWNER_RUNNING, _OWNER_STALLED, _OWNER_ABANDONED, _OWNER_DEAD = (
+    "running", "stalled", "abandoned", "dead")
+
+_reap_seen: dict = {}     # (stream_key, msg_id) -> state seen on the previous call
+
+_STREAM_WORKER_TYPE = {
+    REDIS_STREAM_ADAPTIVE: "scan_worker",
+    REDIS_STREAM_FULLSCAN: "fullscan_worker",
+}
+
+
+def _s(v) -> str:
+    return v.decode() if isinstance(v, bytes) else str(v)
+
+
+def _split_consumer(consumer: str):
+    """'worker-{host}-{pid}' -> (host, pid); (None, None) for any other consumer."""
+    if not consumer.startswith("worker-"):
+        return None, None
+    host, _, pid = consumer[len("worker-"):].rpartition("-")
+    if not host or not pid.isdigit():
+        return None, None
+    return host, int(pid)
+
+
+def _owner_state(r, stream_key: str, consumer: str, msg_id: str, now: float) -> str:
+    host, pid = _split_consumer(consumer)
+    if host is None:
+        return _OWNER_DEAD
+    worker_type = _STREAM_WORKER_TYPE.get(stream_key, "scan_worker")
+    if not r.exists(f"worker:alive:{worker_type}:{host}:{pid}"):
+        return _OWNER_DEAD
+    raw = r.get(f"{REDIS_WORKER_CUR_PREFIX}:{consumer}")
+    try:
+        cur = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        cur = None
+    if not cur or cur.get("msg_id") != msg_id:
+        return _OWNER_ABANDONED
+    return _OWNER_RUNNING if now <= float(cur.get("alive_until", 0)) else _OWNER_STALLED
+
+
+def _kill_stalled_worker(r, consumer: str) -> None:
+    """Terminate a stalled worker on this host; the pool respawns it."""
+    host, pid = _split_consumer(consumer)
+    if host is None:
+        return
+    import socket as _socket
+    progress.terminate(r, consumer, host, pid, _socket.gethostname())
+
+
+def clear_reaped(r, op_type: str, company: str) -> None:
+    """A scan of this company succeeded: its reap history starts over."""
+    r.delete(f"{REDIS_REAPED_PREFIX}:{op_type}:{company}")
+
+
+def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> None:
     """
-    Reclaim messages stuck in the PEL (worker died mid-scan).
+    Reap pending stream entries whose owner is not actively working on them.
 
-    Called from the scheduler dispatch loops on every tick.  Uses XAUTOCLAIM
-    with an idle timeout of max(p95_ms × 3, 300_000 ms) — self-calibrating so
-    fast scans are reclaimed quickly and slow scans are given proper time.
+    Called from the scheduler dispatch loops on every tick.  For each PEL entry
+    the owner's state is read from its heartbeat key and worker:cur report (no
+    idle window): RUNNING entries are left alone however long they take; every
+    other state is reaped after two consecutive sightings.
 
-    Dead-letter logic (Section 9 — Fix 2):
-        After MAX_STREAM_REDELIVERIES failed redeliveries, the company is moved
-        to poll:adaptive or poll:fullscan with exponential backoff, and the
-        stream message is XACK'd to remove it from the PEL.
+    Reap = XACK + ZADD GT into the poll ZSET (an existing, later schedule wins) at now + backoff, where the backoff grows from the first reap
+    (reaped:{op}:{company}, cleared by clear_reaped on a successful scan).  The
+    company's inflight slot is released.  A STALLED owner is terminated first.
 
     Args:
         r:           Redis client
         stream_key:  Stream to inspect (e.g. REDIS_STREAM_ADAPTIVE)
         group:       Consumer group name
-        consumer:    This scheduler instance's consumer name (for XAUTOCLAIM)
-        p95_ms:      p95 scan duration in ms (from api_health); drives idle timeout
-        op_type:     "scan" | "fullscan" — controls which ZSET to use for backoff
+        op_type:     "scan" | "fullscan" — which ZSET / counter family to use
     """
-    from workers.scan_worker import _get_backoff_delay   # hoisted — used in dead-letter path
-    idle_ms = min(max((p95_ms or 0) * 3, 300_000), 600_000)   # 5–10 min; capped so deploy restarts don't leave PEL stuck for hours
+    from workers.scan_worker import backoff_delay_for
 
     try:
-        # XAUTOCLAIM: returns (next_start_id, [(msg_id, fields), ...], [deleted_ids])
-        autoclaim_result = r.xautoclaim(
-            stream_key, group, consumer,
-            min_idle_time=idle_ms,
-            start_id="0-0",
-            count=10,
-        )
+        pending = r.xpending_range(stream_key, group, min="-", max="+", count=100)
     except Exception as exc:
-        logger.debug("claim_stale_work: xautoclaim error on %r: %s", stream_key, exc)
+        logger.debug("claim_stale_work: xpending error on %r: %s", stream_key, exc)
         return
 
-    # redis-py returns (next_cursor, [(msg_id, fields), ...], [deleted_ids])
-    # The third element (deleted IDs) is present in Redis 7+ when PEL entries
-    # refer to stream messages that have been trimmed or explicitly deleted.
-    if not autoclaim_result or len(autoclaim_result) < 2:
-        return
+    now = time.time()
+    seen_now = {}
+    for entry in pending:
+        msg_id = _s(entry["message_id"])
+        consumer = _s(entry["consumer"])
+        state = _owner_state(r, stream_key, consumer, msg_id, now)
+        if state == _OWNER_RUNNING:
+            continue
+        key = (stream_key, msg_id)
+        seen_now[key] = state
+        if _reap_seen.get(key) != state:
+            continue                       # first sighting in this state — confirm next call
 
-    # Log deleted PEL entries so operators know work was lost from the stream.
-    if len(autoclaim_result) >= 3 and autoclaim_result[2]:
-        deleted_ids = autoclaim_result[2]
-        logger.warning(
-            "claim_stale_work: %d PEL entry(ies) on %r have no backing stream "
-            "message (deleted/trimmed) — work is unrecoverable: %s",
-            len(deleted_ids), stream_key, deleted_ids,
+        if state == _OWNER_STALLED:
+            _kill_stalled_worker(r, consumer)
+
+        msgs = r.xrange(stream_key, min=msg_id, max=msg_id, count=1)
+        fields = msgs[0][1] if msgs else None
+        company = _s(fields.get("company", "")) if fields else ""
+        r.xack(stream_key, group, msg_id)
+        if not company:
+            logger.warning("claim_stale_work: %r entry %s has no company (%s) — acked",
+                           stream_key, msg_id, state)
+            continue
+
+        reaps = r.incr(f"{REDIS_REAPED_PREFIX}:{op_type}:{company}")
+        if reaps == 1:
+            r.expire(f"{REDIS_REAPED_PREFIX}:{op_type}:{company}", 86400)
+        delay = backoff_delay_for(reaps - 1)
+        target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
+        r.zadd(target_zset, {company: now + delay}, gt=True)
+        _release_inflight(r, op_type, company, _s(fields.get("dc_key", "")))
+        logger.log(
+            logging.WARNING if reaps >= MAX_STREAM_REDELIVERIES else logging.INFO,
+            "claim_stale_work: reaped %r from %s (owner %s %s, reap #%d) → backoff +%ds in %s",
+            company, stream_key, consumer, state, reaps, delay, target_zset,
         )
 
-    claimed = autoclaim_result[1]
-    if not claimed:
+    _reap_seen.clear()
+    _reap_seen.update(seen_now)
+
+
+def _release_inflight(r, op_type: str, company: str, dc_key: str) -> None:
+    """Free the company's inflight slot(s) and stored stream id."""
+    if not dc_key:
+        dc_key = _get_dc_key_for_company(company)
+    r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
+    if op_type == "fullscan":
+        r.zrem(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company)
+        r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
+        r.delete(f"fullscan:lock:{company}")     # lease of the reaped owner
+    else:
+        r.zrem(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", company)
+
+
+def _id_key(msg_id: str) -> tuple:
+    ms, _, seq = msg_id.partition("-")
+    return int(ms), int(seq or 0)
+
+
+def sweep_inflight(r, op_type: str, stream_key: str, group: str) -> None:
+    """
+    Release inflight slots whose stream message no longer exists.
+
+    A slot is live while its message (stored in inflight:msg:{op}:{company}) is
+    undelivered or still pending; a pending message whose owner stopped working
+    is released by claim_stale_work.  A slot with no stored id, or whose message
+    was delivered and acknowledged without the worker releasing the slot, is a
+    leak and is freed here.  Replaces the fixed-age ZREMRANGEBYSCORE pruning.
+    """
+    try:
+        last = next((_s(g.get("last-delivered-id", "0-0")) for g in r.xinfo_groups(stream_key)
+                     if _s(g.get("name")) == group), None)
+    except Exception as exc:
+        logger.debug("sweep_inflight: xinfo error on %r: %s", stream_key, exc)
         return
+    if last is None:
+        return
+    last_key = _id_key(last)
 
-    for msg_id, fields in claimed:
-        if msg_id is None:
-            # Redis 7+ returns (None, None) for PEL entries whose backing stream
-            # message was trimmed/deleted.  These are already reported in
-            # deleted_ids above; skip silently rather than xack with None.
-            continue
-        if not fields:
-            r.xack(stream_key, group, msg_id)   # malformed — remove from PEL
-            continue
-        company = fields.get("company", "")
-        if not company:
-            r.xack(stream_key, group, msg_id)
-            continue
+    if op_type == "fullscan":
+        pattern = f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:*"
+    else:
+        pattern = f"{REDIS_INFLIGHT_PREFIX}:*"
+    slots = []                                  # (zset_key, company)
+    for zkey in r.scan_iter(match=pattern):
+        zkey = _s(zkey)
+        slots += [(zkey, _s(c)) for c in r.zrange(zkey, 0, -1)]
+    if op_type == "fullscan":
+        slots += [(REDIS_INFLIGHT_FULLSCAN, _s(c)) for c in r.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)]
 
-        # Check redelivery count from PEL
-        try:
-            pending = r.xpending_range(stream_key, group,
-                                       min=msg_id, max=msg_id, count=1)
-            delivery_count = pending[0]["times_delivered"] if pending else 0
-        except Exception:
-            delivery_count = 0
-
-        if delivery_count >= MAX_STREAM_REDELIVERIES:
-            # Dead-letter: move company to scheduling ZSET with backoff, XACK stream
-            delay = _get_backoff_delay(r, company, op_type)
-            target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
-            r.zadd(target_zset, {company: time.time() + delay})
-            r.xack(stream_key, group, msg_id)
-            logger.warning(
-                "claim_stale_work: dead-letter %r after %d redeliveries "
-                "(op=%s) → backoff +%ds in %s",
-                company, delivery_count, op_type, delay, target_zset,
-            )
-        else:
-            # Still within retry budget — XAUTOCLAIM transferred ownership.
-            # Worker will pick it up on next XREADGROUP call.
-            logger.info(
-                "claim_stale_work: reclaimed stale %r from %s "
-                "(delivery_count=%d idle_ms=%d)",
-                company, stream_key, delivery_count, idle_ms,
-            )
+    for zkey, company in slots:
+        raw = r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
+        live = False
+        if raw:
+            msg_id = _s(raw)
+            if _id_key(msg_id) > last_key:
+                live = True                      # not delivered yet
+            else:
+                live = bool(r.xpending_range(stream_key, group, min=msg_id, max=msg_id, count=1))
+        if live:
+            continue
+        r.zrem(zkey, company)
+        r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
+        if op_type == "fullscan":
+            r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
+            r.delete(f"fullscan:lock:{company}")
+        logger.warning("sweep_inflight: released leaked %s slot %s for %r", op_type, zkey, company)
 
 
 # ─────────────────────────────────────────
@@ -585,6 +663,7 @@ def clear_heartbeat(company: str) -> None:
 def set_progress(company: str, step: str, ttl: int = 120) -> None:
     """Update progress heartbeat for hung worker detection."""
     get_redis().set(f"progress:{company}", step, ex=ttl)
+    progress.touch()   # phase marker is also a checkpoint of the worker's progress report
 
 
 # ─────────────────────────────────────────
@@ -615,6 +694,9 @@ def on_adaptive_complete(company: str, new_jobs: int,
     # ── Phase 10: release inflight slot ──────────────────────────────────────
     dc_key = _get_dc_key_for_company(company)
     r.zrem(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", company)
+    r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")
+    if success:
+        clear_reaped(r, "scan", company)
 
     # ── Phase 10: canary recovery detection ──────────────────────────────────
     # Check if this company was the canary probe for its platform.  If so,
@@ -1033,28 +1115,26 @@ return 0
 #
 # Counts adaptive and fullscan inflight for the same DC key together so both
 # scan types share the learned ceiling.  Uses separate ZSET keys so each type
-# can have its own stale window (adaptive = 10 min; fullscan = 2 h).
+# can be released independently.  Nothing is pruned by age here: slots are
+# released by the worker on completion, by claim_stale_work when it reaps a
+# message, and by sweep_inflight when the message no longer exists.
 #
 # Returns 1 if slot was claimed, 0 if ceiling was hit (caller should re-queue).
 #
 # KEYS[1] = inflight:scans:{dc_key}      — adaptive inflight ZSET
 # KEYS[2] = inflight:fullscans:{dc_key}  — fullscan inflight ZSET
 # ARGV[1] = ceiling (int)
-# ARGV[2] = adaptive stale cutoff (epoch seconds, entries older than this pruned)
-# ARGV[3] = fullscan stale cutoff (epoch seconds)
-# ARGV[4] = company (member to ZADD on success)
-# ARGV[5] = now (score for ZADD)
+# ARGV[2] = company (member to ZADD on success)
+# ARGV[3] = now (score for ZADD)
 _FULLSCAN_INFLIGHT_CLAIM_LUA = """
-if redis.call('ZSCORE', KEYS[2], ARGV[4]) then
+if redis.call('ZSCORE', KEYS[2], ARGV[2]) then
     return 0
 end
-redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[2])
-redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, ARGV[3])
 local total = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
 if total >= tonumber(ARGV[1]) then
     return 0
 end
-redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
 return 1
 """
 
@@ -1245,6 +1325,10 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
     )
 
 
+# loop -> (up_since, last_write_ts, last_ttl) of the current heartbeat run
+_hb_run: dict = {}
+
+
 def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30) -> None:
     """Write per-loop liveness key so a hung loop is detected independently.
 
@@ -1253,11 +1337,21 @@ def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30) -> 
     even while the other loop keeps the process alive.
     ttl defaults to 30s (loop rewrites every 1s tick); pass _SCHEDULER_STARTUP_HB_TTL
     for the initial write before the loop starts.
+
+    up_since is the start of the current unbroken run of heartbeats: it resets when
+    the previous write is older than that write's own ttl (the key had expired, so
+    the loop was down or hung).  The manager caps the poll-ZSET delay at
+    now - up_since so downtime before dispatch resumed is never counted as delay.
     """
+    now = time.time()
+    prev = _hb_run.get(loop)
+    up_since = prev[0] if prev and now - prev[1] <= prev[2] else now
+    _hb_run[loop] = (up_since, now, ttl)
     try:
         r.set(f"worker:alive:scheduler:{loop}", json.dumps({
             "pid":        os.getpid(),
-            "ts":         time.time(),
+            "ts":         now,
+            "up_since":   up_since,
             "dispatched": dispatched,
         }), ex=ttl)
     except Exception as _hb_err:
@@ -1297,10 +1391,6 @@ def adaptive_loop() -> None:
     _init_consumer_group(r, REDIS_STREAM_ADAPTIVE)
     logger.info("adaptive_loop: started (stream=%s)", REDIS_STREAM_ADAPTIVE)
 
-    # Stable consumer name for XAUTOCLAIM (scheduler is its own consumer)
-    import socket as _socket
-    scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
-
     _hw_dispatched = 0   # total adaptive dispatches — reported in heartbeat
 
     while True:
@@ -1331,17 +1421,12 @@ def adaptive_loop() -> None:
             # ── Layer 2 re-intro: trickle dispatch during post-Lever-1 recovery ─
             _reintro_scan = bool(r.exists("manager:reintro:scan:active"))
 
-            # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
-            # p95 listing scan time (5-min cached from api_health)
-            try:
-                from db.api_health import query_p95_response_ms
-                p95_ms = query_p95_response_ms("listing_scan") or 30_000
-            except Exception:
-                p95_ms = 30_000
+            # ── Reap pending messages whose owner is not working on them ──────
             claim_stale_work(
-                r, REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP,
-                scheduler_consumer, p95_ms, op_type="scan",
+                r, REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, op_type="scan",
             )
+            sweep_inflight(r, "scan", REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP)
+            _trim_stream(r, REDIS_STREAM_ADAPTIVE)
 
             # ── Two-layer dispatch ────────────────────────────────────────────
             # Non-destructive read: ZRANGEBYSCORE, then XADD, then ZREM.
@@ -1366,6 +1451,13 @@ def adaptive_loop() -> None:
                 # ── Phase 10: outage mode check ───────────────────────────────
                 dc_key   = _get_dc_key_for_company(company)
                 platform = dc_key.split("_")[0] if "_" in dc_key else dc_key
+
+                # ── Already scanning: never dispatch a second copy ────────────
+                # The inflight slot is released by the scan's completion or by
+                # the reaper, both of which reschedule the company.
+                if r.zscore(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", company) is not None:
+                    logger.debug("adaptive_loop: %r already in flight — skipped", company)
+                    continue
 
                 outage_key = f"worker:outage:{platform}"
                 if r.exists(outage_key):
@@ -1408,16 +1500,10 @@ def adaptive_loop() -> None:
                 ceiling_raw = r.get(f"worker:ceil:learned:{dc_key}")
                 if ceiling_raw:
                     inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
-                    # Remove stale entries before counting
-                    stale_cutoff = now - INFLIGHT_STALE_WINDOW_S
-                    r.zremrangebyscore(inflight_key, 0, stale_cutoff)
                     # Count adaptive + fullscan inflight together — both share the
-                    # same DC ceiling.  Prune each ZSET with its own stale window
-                    # before counting so dead workers don't inflate pending_count.
+                    # same DC ceiling.  Slots are released by completion, the reaper
+                    # and sweep_inflight, never by age.
                     _fullscan_inflight_key = f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}"
-                    r.zremrangebyscore(
-                        _fullscan_inflight_key, 0, now - INFLIGHT_FULLSCAN_STALE_S
-                    )
                     pending_count = (
                         r.zcard(inflight_key)
                         + r.zcard(_fullscan_inflight_key)
@@ -1446,7 +1532,7 @@ def adaptive_loop() -> None:
                 _adaptive_inflight_key = f"{REDIS_INFLIGHT_PREFIX}:{dc_key}"
                 r.zadd(_adaptive_inflight_key, {company: now})
                 try:
-                    r.xadd(
+                    _stream_id = r.xadd(
                         REDIS_STREAM_ADAPTIVE,
                         {
                             "company":     company,
@@ -1456,8 +1542,6 @@ def adaptive_loop() -> None:
                             "enqueued_at": datetime.utcnow().isoformat(),
                             "request_id":  f"adp-{int(now)}",
                         },
-                        maxlen=STREAM_MAXLEN_ADAPTIVE,
-                        approximate=True,
                     )
                 except Exception as _xadd_err:
                     r.zrem(_adaptive_inflight_key, company)
@@ -1468,6 +1552,7 @@ def adaptive_loop() -> None:
                     )
                     r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 60})
                     continue
+                r.set(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}", _stream_id)
                 r.zrem(REDIS_POLL_ADAPTIVE, company)
                 _hw_dispatched += 1
 
@@ -1524,8 +1609,6 @@ def fullscan_loop() -> None:
     _init_consumer_group(r, REDIS_STREAM_FULLSCAN)
     logger.info("fullscan_loop: started (stream=%s)", REDIS_STREAM_FULLSCAN)
 
-    import socket as _socket
-    scheduler_consumer = f"scheduler-{_socket.gethostname()}-{os.getpid()}"
 
     _hw_dispatched = 0   # total fullscan dispatches — reported in heartbeat
 
@@ -1556,16 +1639,12 @@ def fullscan_loop() -> None:
             # ── Layer 2 re-intro: trickle dispatch during post-Lever-1 recovery ─
             _reintro_fullscan = bool(r.exists("manager:reintro:fullscan:active"))
 
-            # ── Reclaim stale stream messages (XAUTOCLAIM) ────────────────────
-            try:
-                from db.api_health import query_p95_response_ms
-                p95_ms = query_p95_response_ms("full_scan") or 120_000
-            except Exception:
-                p95_ms = 120_000
+            # ── Reap pending messages whose owner is not working on them ──────
             claim_stale_work(
-                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
-                scheduler_consumer, p95_ms, op_type="fullscan",
+                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, op_type="fullscan",
             )
+            sweep_inflight(r, "fullscan", REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP)
+            _trim_stream(r, REDIS_STREAM_FULLSCAN)
 
             # ── Two-layer dispatch ────────────────────────────────────────────
             due = r.zrangebyscore(REDIS_POLL_FULLSCAN, "-inf", now,
@@ -1589,6 +1668,12 @@ def fullscan_loop() -> None:
 
                 dc_key = _get_dc_key_for_company(company)
 
+                # ── Already scanning: never dispatch a second copy ────────────
+                if (r.zscore(f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}", company) is not None
+                        or r.zscore(REDIS_INFLIGHT_FULLSCAN, company) is not None):
+                    logger.debug("fullscan_loop: %r already in flight — skipped", company)
+                    continue
+
                 # ── Phase 10: per-DC learned ceiling throttle (atomic) ────────
                 # Fullscan and adaptive workers share the same learned ceiling for
                 # a DC key.  Use a Lua script so check + slot claim is atomic —
@@ -1602,8 +1687,6 @@ def fullscan_loop() -> None:
                         f"{REDIS_INFLIGHT_PREFIX}:{dc_key}",
                         f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
                         int(ceiling_raw),
-                        _now_ts - INFLIGHT_STALE_WINDOW_S,
-                        _now_ts - INFLIGHT_FULLSCAN_STALE_S,
                         company,
                         _now_ts,
                     )
@@ -1616,7 +1699,7 @@ def fullscan_loop() -> None:
                         continue
 
                 try:
-                    r.xadd(
+                    _stream_id = r.xadd(
                         REDIS_STREAM_FULLSCAN,
                         {
                             "company":     company,
@@ -1626,8 +1709,6 @@ def fullscan_loop() -> None:
                             "enqueued_at": datetime.utcnow().isoformat(),
                             "request_id":  f"full-{int(now)}",
                         },
-                        maxlen=STREAM_MAXLEN_FULLSCAN,
-                        approximate=True,
                     )
                 except Exception as _xadd_exc:
                     # XADD failed — if the Lua script claimed a DC inflight slot
@@ -1658,6 +1739,7 @@ def fullscan_loop() -> None:
                         f"{REDIS_INFLIGHT_FULLSCAN_DC_PREFIX}:{dc_key}",
                         {company: time.time()},
                     )
+                r.set(f"{REDIS_INFLIGHT_MSG_PREFIX}:fullscan:{company}", _stream_id)
                 r.zrem(REDIS_POLL_FULLSCAN, company)
                 _hw_dispatched += 1
 
@@ -1832,12 +1914,9 @@ def calculate_worker_counts(r) -> tuple:
     """
     window_s = 23 * 3600   # 23-hour working window
 
-    # DB pool ceiling: subtract fullscan reservation first, then split remainder 60/40
-    db_budget       = DB_POOL_MAXCONN - 3   # 3 reserved for scheduler + maintenance
-    fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
-    remaining       = max(0, db_budget - fullscan_budget)
-    scan_ceil       = max(WORKER_FLOOR, int(remaining * WORKER_POOL_SCAN_FRACTION))
-    detail_ceil     = max(WORKER_FLOOR, int(remaining * WORKER_POOL_DETAIL_FRACTION))
+    # Ceilings are owned by the manager (Layer 1 plan + borrowed seats)
+    scan_ceil   = _manager_ceiling(r, "scan")
+    detail_ceil = _manager_ceiling(r, "detail")
 
     # Number of companies registered for adaptive polling today
     scan_polls_today = max(1, r.zcard(REDIS_POLL_ADAPTIVE))
@@ -2083,6 +2162,28 @@ def _spawn_worker(worker_type: str) -> tuple:
     return proc, shutdown_event
 
 
+def _worker_consumer(worker_type: str, pid: int) -> str:
+    """The progress-report consumer name a pool worker publishes under."""
+    import socket as _socket
+    host = _socket.gethostname()
+    if worker_type == "detail":
+        return f"detail_worker:{host}:{pid}"
+    return f"worker-{host}-{pid}"
+
+
+def _stalled_pids(r, worker_type: str, pool: list) -> set:
+    """PIDs in the pool whose progress deadline has passed (hung, not merely slow)."""
+    stalled = set()
+    for proc, _event in list(pool):
+        try:
+            if proc.is_alive() and progress.is_stalled(
+                    r, _worker_consumer(worker_type, proc.pid)):
+                stalled.add(proc.pid)
+        except Exception:
+            continue
+    return stalled
+
+
 def _write_scheduler_health() -> None:
     """
     Publish current pool state and consecutive-death counters to Redis as
@@ -2104,21 +2205,27 @@ def _write_scheduler_health() -> None:
     """
     try:
         _fp = globals().get("_fullscan_pool_ref", [])
+        _r = get_redis()
+        _st = {
+            "scan":     len(_stalled_pids(_r, "scan", _scan_pool)),
+            "detail":   len(_stalled_pids(_r, "detail", _detail_pool)),
+            "fullscan": len(_stalled_pids(_r, "fullscan", _fp)),
+        }
         payload = {
             "ts": time.time(),
             "pool": {
                 "scan": {
-                    "alive":              len(_scan_pool),
+                    "alive":              len(_scan_pool) - _st["scan"],
                     "consecutive_deaths": _consecutive_deaths["scan"],
                     "total_replacements": _total_replacements["scan"],
                 },
                 "detail": {
-                    "alive":              len(_detail_pool),
+                    "alive":              len(_detail_pool) - _st["detail"],
                     "consecutive_deaths": _consecutive_deaths["detail"],
                     "total_replacements": _total_replacements["detail"],
                 },
                 "fullscan": {
-                    "alive":              len(_fp),
+                    "alive":              len(_fp) - _st["fullscan"],
                     "consecutive_deaths": _consecutive_deaths["fullscan"],
                     "total_replacements": _total_replacements["fullscan"],
                 },
@@ -2149,6 +2256,19 @@ def _replace_dead_workers() -> None:
     _fullscan_pool = globals().get("_fullscan_pool_ref", [])
     replacements: list = []   # (ptype, old_pid, exitcode) — collected under lock
 
+    # A worker past its progress deadline is hung even though its process lives;
+    # it is killed and replaced like a crashed one.  Redis is read before the lock.
+    stalled: set = set()
+    try:
+        _sr = get_redis()
+        with _pool_lock:
+            _snap = [("scan", list(_scan_pool)), ("detail", list(_detail_pool)),
+                     ("fullscan", list(_fullscan_pool))]
+        for _pt, _pl in _snap:
+            stalled |= _stalled_pids(_sr, _pt, _pl)
+    except Exception as exc:
+        logger.warning("scheduler: stalled-worker check failed: %s", exc)
+
     with _pool_lock:
         for pool, ptype in (
             (_scan_pool,     "scan"),
@@ -2156,6 +2276,17 @@ def _replace_dead_workers() -> None:
             (_fullscan_pool, "fullscan"),
         ):
             for i, (proc, event) in enumerate(pool):
+                if proc.pid in stalled and proc.is_alive():
+                    logger.warning(
+                        "scheduler: %s_worker pid=%d past its progress deadline "
+                        "— killing", ptype, proc.pid)
+                    try:
+                        get_redis().delete(
+                            f"{REDIS_WORKER_CUR_PREFIX}:{_worker_consumer(ptype, proc.pid)}")
+                    except Exception:
+                        pass
+                    proc.kill()
+                    proc.join(timeout=2)
                 if not proc.is_alive():
                     logger.warning(
                         "scheduler: %s_worker pid=%d died unexpectedly "
@@ -2275,6 +2406,12 @@ def _replace_dead_workers() -> None:
                 )
 
 
+def _manager_ceiling(r, pool: str) -> int:
+    """Worker ceiling of a pool as the manager currently holds it (base - lent + borrowed)."""
+    from workers.manager import _get_worker_ceil
+    return _get_worker_ceil(r, pool)
+
+
 def _add_one_worker(worker_type: str, ceil_: int) -> bool:
     """
     Add one worker to the given pool if below its ceiling.
@@ -2326,10 +2463,23 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
     else:
         pool = _scan_pool if worker_type == "scan" else _detail_pool
 
+    # Redis is read before taking the lock; a stalled worker is removed first.
+    try:
+        with _pool_lock:
+            _snap = list(pool)
+        _sp = _stalled_pids(get_redis(), worker_type, _snap)
+    except Exception:
+        _sp = set()
+
     with _pool_lock:
         if len(pool) <= floor_:
             return False
-        proc, event = pool.pop()
+        _idx = len(pool) - 1
+        for _i in range(len(pool) - 1, -1, -1):
+            if pool[_i][0].pid in _sp:
+                _idx = _i
+                break
+        proc, event = pool.pop(_idx)
         _worker_spawn_times.pop(proc.pid, None)   # prevent stale entry accumulation
 
     event.set()
@@ -2745,7 +2895,7 @@ def _manager_cmds_loop() -> None:
     Zero-risk when manager.py is not running: the list stays empty, BLPOP
     returns None every 5s, loop sleeps and tries again.  No state is changed.
     """
-    from config import WORKER_OUTAGE_TTL_S, WORKER_FLOOR, DB_POOL_MAXCONN
+    from config import WORKER_OUTAGE_TTL_S, WORKER_FLOOR
 
     r = get_redis()
     logger.info("manager_cmds_loop: started — listening on manager:cmds")
@@ -2769,15 +2919,10 @@ def _manager_cmds_loop() -> None:
                     logger.warning("manager_cmds: bad target command %r", cmd)
                     continue
 
-                # Derive ceiling from DB pool budget (same formula as slow_throughput)
-                db_budget = DB_POOL_MAXCONN - 3
-                ceil_map = {
-                    "scan":     max(WORKER_FLOOR, db_budget // 2),
-                    "detail":   max(WORKER_FLOOR, db_budget // 3),
-                    "fullscan": max(WORKER_FLOOR, db_budget // 5),
-                }
-                ceil_ = ceil_map.get(pool, WORKER_FLOOR)
-                target = max(WORKER_FLOOR, min(target, ceil_))
+                # The manager owns the ceilings (it already clamps the target to
+                # the pool's ceiling plus borrowed seats); the scheduler only
+                # applies the number it is given.
+                target = max(WORKER_FLOOR, target)
 
                 if pool in ("scan", "detail", "fullscan"):
                     if pool == "fullscan":
@@ -2788,7 +2933,7 @@ def _manager_cmds_loop() -> None:
 
                     if target > current:
                         for _ in range(target - current):
-                            _add_one_worker(pool, ceil_)
+                            _add_one_worker(pool, target)
                     elif target < current:
                         for _ in range(current - target):
                             _remove_one_worker(pool, WORKER_FLOOR)
@@ -2906,9 +3051,13 @@ def _ceiling_decay_loop() -> None:
             time.sleep(60)
 
 
+# NO-OP / DEAD CODE: nothing starts this loop (see the thread list in run_scheduler;
+# "_slow_throughput_check_loop removed — replaced by workers/manager.py (Layer 0)").
+# workers/manager.py is the only scaling actor and the sole ceiling owner. Do NOT
+# start this thread: it would add/remove workers as a second decision-maker.
 def _slow_throughput_check_loop() -> None:
     """
-    Layer 3: slow throughput monitor — runs every WORKER_SLOW_CHECK_INTERVAL_S (30 min).
+    Layer 3: slow throughput monitor (NOT RUNNING — see the no-op note above) — runs every WORKER_SLOW_CHECK_INTERVAL_S (30 min).
 
     Phase 10 additions:
       - Checks worker:scaling_lock:{platform} before adding workers — prevents
@@ -2941,11 +3090,8 @@ def _slow_throughput_check_loop() -> None:
             n_scan, n_detail = _get_pool_snapshot()
             n_fullscan       = _get_fullscan_pool_size()
 
-            db_budget        = DB_POOL_MAXCONN - 3
-            _fullscan_budget = max(WORKER_FLOOR, int(db_budget * WORKER_POOL_FULLSCAN_FRACTION))
-            _remaining       = max(0, db_budget - _fullscan_budget)
-            scan_ceil        = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_SCAN_FRACTION))
-            detail_ceil      = max(WORKER_FLOOR, int(_remaining * WORKER_POOL_DETAIL_FRACTION))
+            scan_ceil     = _manager_ceiling(r, "scan")
+            detail_ceil   = _manager_ceiling(r, "detail")
             dynamic_floor = _remaining_work_minimum(r)
 
             # ── Phase 11: Redis memory alert ──────────────────────────────────
@@ -3149,81 +3295,13 @@ def _slow_throughput_check_loop() -> None:
                     else:
                         _hysteresis["scan_remove"] = 0
 
-            # ── Fullscan scaling (independent of scan/detail cascade) ──────────
-            # Scale up whenever there is any undelivered fullscan work (lag > 0),
-            # not only when lag exceeds current worker count — workers may all be
-            # busy on long scans while new companies queue up behind them.
-            # Scale down when the stream is idle and pool is above the floor.
-            # Uses the same 2-consecutive-check hysteresis as scan/detail.
-            fullscan_stream_depth = _get_stream_undelivered_count(
-                r, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP,
-            )
-            fullscan_ceil = _fullscan_budget
-
-            if fullscan_stream_depth > 0:
-                _hysteresis["fullscan_add"]    += 1
-                _hysteresis["fullscan_remove"]  = 0
-
-                if _hysteresis["fullscan_add"] >= 2:
-                    if _add_one_worker("fullscan", fullscan_ceil):
-                        n_fullscan_a = _get_fullscan_pool_size()
-                        logger.info(
-                            "slow_throughput: fullscan_stream_depth=%d > "
-                            "n_fullscan=%d → added fullscan_worker (pool now %d)",
-                            fullscan_stream_depth, n_fullscan, n_fullscan_a,
-                        )
-                        record_scaling_event(
-                            "worker_add",
-                            trigger_layer="slow_throughput",
-                            worker_type="fullscan",
-                            scan_workers_before=n_scan,
-                            scan_workers_after=n_scan,
-                            detail_workers_before=n_detail,
-                            detail_workers_after=n_detail,
-                            notes=(
-                                f"fullscan pool {n_fullscan} → {n_fullscan_a} "
-                                f"stream_depth={fullscan_stream_depth} "
-                                f"fullscan_ceil={fullscan_ceil}"
-                            ),
-                        )
-                        _hysteresis["fullscan_add"] = 0
-            elif (fullscan_stream_depth == 0
-                  and _get_stream_pending_count(r, REDIS_STREAM_FULLSCAN) == 0
-                  and n_fullscan > WORKER_FLOOR):
-                _hysteresis["fullscan_remove"] += 1
-                _hysteresis["fullscan_add"]     = 0
-
-                if _hysteresis["fullscan_remove"] >= 2:
-                    if _remove_one_worker("fullscan", WORKER_FLOOR):
-                        n_fullscan_a = _get_fullscan_pool_size()
-                        logger.info(
-                            "slow_throughput: fullscan stream idle, pool=%d > "
-                            "floor=%d → removed fullscan_worker (pool now %d)",
-                            n_fullscan, WORKER_FLOOR, n_fullscan_a,
-                        )
-                        record_scaling_event(
-                            "worker_remove",
-                            trigger_layer="slow_throughput",
-                            worker_type="fullscan",
-                            scan_workers_before=n_scan,
-                            scan_workers_after=n_scan,
-                            detail_workers_before=n_detail,
-                            detail_workers_after=n_detail,
-                            notes=(
-                                f"fullscan pool {n_fullscan} → {n_fullscan_a} "
-                                f"stream idle fullscan_ceil={fullscan_ceil}"
-                            ),
-                        )
-                        _hysteresis["fullscan_remove"] = 0
-            else:
-                _hysteresis["fullscan_add"]    = 0
-                _hysteresis["fullscan_remove"] = 0
-
+            # Fullscan stream-lag scaling removed: the manager now reads the
+            # stream backlog itself (workers/stream_backlog.stream_backlog).
             logger.debug(
-                "slow_throughput: scan=%d/%d detail=%d/%d fullscan=%d/%d "
-                "detail_q=%d scan_backlog=%d fullscan_stream=%d dynamic_floor=%d",
-                n_scan, scan_ceil, n_detail, detail_ceil, n_fullscan, fullscan_ceil,
-                detail_depth, scan_backlog, fullscan_stream_depth, dynamic_floor,
+                "slow_throughput: scan=%d/%d detail=%d/%d fullscan=%d "
+                "detail_q=%d scan_backlog=%d dynamic_floor=%d",
+                n_scan, scan_ceil, n_detail, detail_ceil, n_fullscan,
+                detail_depth, scan_backlog, dynamic_floor,
             )
 
         except KeyboardInterrupt:

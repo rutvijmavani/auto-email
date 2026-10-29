@@ -777,23 +777,15 @@ def stage_watchdog():
     # in the two-layer scheduler redesign (Section 5).  PEL + claim_stale_work()
     # (XAUTOCLAIM) in scheduler.py owns crash-recovery for scan workers.
     # The watchdog now covers:
-    #   1. Hung-worker detection via heartbeat:{company} + progress:{company}
-    #   2. Stream PEL observability via XPENDING (informational; no recovery)
+    #   1. Stream PEL observability via XPENDING (informational; no recovery)
 
-    from workers.watchdog import check_hung_workers, check_pel_stats
+    from workers.watchdog import check_pel_stats
     from workers.redis_client import get_redis
     from config import REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN
 
     r = get_redis()
 
-    # ── 1. Hung-worker detection ──────────────────────────────────────────────
-    info("Running check_hung_workers()...")
-    hung = check_hung_workers()
-    ok(f"check_hung_workers returned {len(hung)} hung workers (expected 0 in clean state)")
-    if hung:
-        warn(f"Hung workers detected: {hung}")
-
-    # ── 2. Stream PEL stats ───────────────────────────────────────────────────
+    # ── Stream PEL stats ───────────────────────────────────────────────────
     info("Running check_pel_stats()...")
     pel = check_pel_stats()
 
