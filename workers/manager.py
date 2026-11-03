@@ -808,7 +808,11 @@ def _count_daily_peak_records(r, pool: str) -> int:
     return count
 
 
-_POOL_PRIORITY: tuple = ("detail", "scan", "fullscan")   # shortage / spare priority
+_POOL_PRIORITY: tuple = ("detail", "scan", "fullscan")   # pool iteration order (borrow / handoff)
+# Spare-seat fill when targets exceed the seats (design 5.1, decided 2026-10-31):
+# scan finds new jobs fastest, fullscan is the slower re-check, detail only
+# consumes what they feed it, so detail is served last.
+_SEAT_FILL_ORDER: tuple = ("scan", "fullscan", "detail")
 
 
 def _decode(val):
@@ -978,7 +982,7 @@ def _plan_ceilings(r, pools: list[str], include_today: bool = False) -> dict:
       1. ideal(pool)  = peak_Nd + buffer, no ceiling applied
       2. actual(pool) = min(ideal, soft ceiling)
       3. spare        = total - reserved - sum(actual)
-      4. shortages are filled from spare in priority order detail, scan, fullscan
+      4. shortages are filled from spare in priority order scan, fullscan, detail
     A pool still short after that raises the total by the raise step (seats)
     toward the live Postgres seat cap and the phases run again; at the cap the
     remaining shortage is returned (the caller alerts).  Pools still in bootstrap never
@@ -1007,7 +1011,7 @@ def _plan_ceilings(r, pools: list[str], include_today: bool = False) -> dict:
             for p in pools
         }
         spare = total - sum(actual.values())
-        for p in _POOL_PRIORITY:
+        for p in _SEAT_FILL_ORDER:
             if p not in pools:
                 continue
             grant = min(max(0, ideals[p][0] - actual[p]), max(0, spare))

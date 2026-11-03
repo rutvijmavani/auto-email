@@ -1,6 +1,6 @@
 # Detail pool ceiling, delay threshold and Lever 1 trigger (TH) — design
 
-Status: DESIGN AGREED 2026-11-02 (user: "entire design discussed"); nothing implemented. Blast radius and implementation steps are in section 10. Written 2026-10-31 from the TH discussion.
+Status: DESIGN AGREED 2026-11-02 (user: "entire design discussed"); BUILT 2026-11-02/03 (steps 1-12 of 10.2, commit 8a9d8ca and later), not deployed. Not built: D4 (section 7), alert email (3.5, deferred). The "not built" labels below are the original design-time status. Blast radius and implementation steps are in section 10. Written 2026-10-31 from the TH discussion.
 Format per bug: 1 bug detail, 2 how it behaves today (evidence), 3 proposed solution.
 Related: `docs/scaling-redesign.md`, `docs/scan-fullscan-sizing-plan.md`.
 Memory: `project_fullscan_requeue_finding_2026_10_30.md`, `project_bug_triage_2026_10_28.md`.
@@ -93,7 +93,7 @@ Symbols: A = jobs arriving in one slice, s = seconds per job, u = target utilisa
 ### 3.5 Reducing the level (p ladder) and D bound
 
 - Ladder (changed by the user 2026-11-01): start at p99 and step down by 1 (p99 -> p98 -> ... -> p75), stopping at the first p whose `ceil(P_p)` fits `C_avail`; restarts at p99 every night. The old 5-point steps and "step only when ceil drops strictly" are dropped (the stop-at-first-fit rule covers it). Alert thresholds below (p80 / p75) were written for the old ladder and are to be redone, ideally on the per-job on-time share.
-- If p95 and p90 are close (flat distribution), stepping gives no relief and a missing worker uncovers most slices at once. Then do not step: raise the capacity alert immediately.
+- DROPPED 2026-11-03 (user): the "flat distribution, do not step" rule. A curve can start below a flat stretch, and only stepping shows whether a lower level helps, so the ladder always runs down to the floor (p75). Original text: if p95 and p90 are close (flat distribution), stepping gives no relief and a missing worker uncovers most slices at once.
 - Continuous equivalent (preferred): `C = min(ceil(P_95), C_avail)`; report the effective p (highest p with `ceil(P_p) <= C`) and `D = A_95 x s / C`.
 - D can reach hours when capacity is the limit (A=1266, s=7): C=3 -> 49 min, C=2 -> 74 min, C=1 -> 2.5 h. Two different delays: the design delay at the covered level `D_p = A_p x s / C` (stays about 20 min as p steps down because C shrinks with A_p) and the cost of degrading, the delay a normal p95 slice now suffers `A_95 x s / C` (C=2 -> 74 min). A hardcoded `D_max` was rejected by the user (2026-10-31); the token bucket in 3.6 bounds the queue wait by construction instead.
 - Alerts (DECIDED 2026-11-02, replaces the old p80/p75 text): notify by EMAIL at every 5-point step down (effective p = 95, 90, 85, 80), CRITICAL below p75 or when the chain is exhausted (held backlog growing, delay rising, at ceiling, nothing to borrow; this replaces detail Lever 1). The user does not read logs daily, so email must be built (alerts are log-only today); DEFERRED 2026-11-02 by the user: email is an add-on, designed AFTER all bugs are fixed; until then these alerts are log-only. Findings for that later design: manager alerts go to `pipeline_alerts` and are only emailed by `run_pipeline_alert_report` after `--find-only`/`--monitor-jobs` (pipeline.py:273,1022,1075), dedup is per type for 24 h (config.py:379), and the only immediate sender is the watchdog's `_send_email` (watchdog.py:414, Redis NX dedup, Gmail SMTP). A shared sender, a per-rung dedup key, a critical repeat interval and a recovery mail were proposed, not agreed.
@@ -147,7 +147,7 @@ Not needed for detail in the new design (detail takes the remainder). It stays o
 
 ## 5. Open decisions
 
-1. DECIDED 2026-10-31: when the pools' targets exceed the seats, the order is scan, then fullscan, then detail (detail last). Replaces the current `_POOL_PRIORITY = ("detail","scan","fullscan")` at `manager.py:765`. Reason: scan finds new jobs fastest, fullscan is the slower re-check, and detail only consumes what they feed it.
+1. DECIDED 2026-10-31: when the pools' targets exceed the seats, the order is scan, then fullscan, then detail (detail last). Replaces the current `_POOL_PRIORITY = ("detail","scan","fullscan")` at `manager.py:765`. BUILT 2026-11-03: new `_SEAT_FILL_ORDER = ("scan","fullscan","detail")` drives the spare-seat fill in `_plan_ceilings`; `_POOL_PRIORITY` stays as the pool iteration order for borrow/handoff code (borrow sources keep `_BORROW_SOURCE_ORDER`). Reason: scan finds new jobs fastest, fullscan is the slower re-check, and detail only consumes what they feed it.
 2. DECIDED 2026-11-02: T = 30 minutes (config.py env var). Window length T (bucket size). D is about u x T (21 min vs 24 min at T=30 min; ceil rounding makes it slightly smaller), so T is the delay the system accepts, a policy input, not a data-resolution choice. Store arrival deltas at 1-minute resolution (28 d x 1440 = 40,320 rows per queue) and evaluate sliding windows of length T (fixed 30-min buckets split a burst across a boundary and understate A_p). `D_max` dropped. Looked up 2026-10-31: the 7 AM digest takes every `status='new'` row (`db/job_monitor.py:135`), so a job whose detail ends after 7:00 rides the next day's digest; the frontend shows new/digested as soon as detail completes; discovery lag is 3-12 h poll intervals (`config.py:630-641`). Agreed in principle: express the policy as the share of jobs allowed to slip one digest (about D / 24 h if arrivals were even: 21 min about 1.5%, 30 min about 2%, 2 h about 8%), as a config.py setting. The number itself is NOT decided; measure the real share from the per-minute table.
 3. SUPERSEDED by section 9.0 (rolling window of 5 valid cycles with busy-second carry; no last-good s). Original text kept for the evidence: `s` = 7 s is only an example number I assumed, not from code. Verified 2026-10-31: the runtime `s` is measured live, `_get_pool_service_time` (`manager.py:377-426`) = sum(busy_ms delta) / sum(processed delta) over the heartbeats and the last `SERVICE_TIME_WINDOW_CYCLES` cycles; it is used at `:1199` and `:2245-2247`; `fetch_p75` (30-day p75 of `api_health` ms per request, `:185-196`, cold fallback 1.5 s at `:114`) is only the fallback while `s` is unknown. For the nightly ceiling to use a measured `s` too, the per-minute row would need busy seconds and jobs done next to arrivals (to decide). `u` = 0.80 is still a design input. User preference 2026-11-01: use the live measured `s` for the nightly ceiling instead of storing busy/done per minute (less exact, simpler, same measure as the runtime sizing). Caveat verified in code: `_get_pool_service_time` returns None when no job finished inside its window (`manager.py:424-425`), which can happen at the nightly recompute while idle, so the ceiling needs a retained last-known-good `s` (not the cold 1.5 s fallback).
 4a. SUPERSEDED by 9.2 (W_max is a typed number, 120 min). Kept as background only. Policy measured per job: share of jobs on time = sum(min(A, A_p)) / sum(A) over all windows (A = jobs in one window, A_p = covered window size at level p; only the part of a window above A_p waits longer than D). Example, 10 windows 50,50,60,60,70,80,90,100,200,1000: p90 covers 9 of 10 windows (A_p = 200) but only 960 / 1760 = 55% of the jobs. The min(A, A_p) formula ignores backlog carried into the next window; the middle way between "size for p95" and "size for the top bucket" is to simulate the history with a FIFO backlog for each candidate C (B_t = max(0, B_(t-1) + A_t - K) with K = jobs one pool of C workers finishes per window) and tabulate C against on-time share, average utilisation and drain time of the biggest burst; the ceiling is the smallest C that meets the policy target, capped at C_avail (proposed 2026-11-01, not agreed). The replay on the current data is not trusted (polluted by the D4 re-queues); recompute on clean data.
@@ -168,7 +168,7 @@ Options to evaluate in the 1-2-3 format before any code:
 - Prove first that the same job ids recur (counts only so far).
 - After the fix re-measure arrivals; the TH ceiling is derived from the post-fix data.
 
-## 8. Capacity chain order and borrow reclaim (AGREED 2026-11-01, not built)
+## 8. Capacity chain order and borrow reclaim (AGREED 2026-11-01; BUILT in step 8, RMIDLE in step 10)
 
 **1. Bug.** A lender cannot take back seats it lent. `_maybe_return_borrows` (`manager.py:1657-1663`) returns a borrow only when BOTH pools are calm for 3 cycles, and a starved lender is never calm. The borrow key has no TTL. One pool's slowdown spreads to a second pool, worst for detail (detail lends only while its Lever 1 is on, and `LEVER1_MAX_HOLD_S["detail"]` is None, L1NOMAX).
 
@@ -182,7 +182,7 @@ Options to evaluate in the 1-2-3 format before any code:
 - Removal is graceful (`_remove_one_worker` sets the shutdown event, pops the entry from the pool list at once so the lender can spawn in the same cycle). In-flight work on shutdown: detail checks the event only between jobs (`detail_worker.py:1169,1189`), a popped but unstarted job is put back atomically, a started job finishes; scan discards a finished fetch and re-queues the company with backoff (`scan_worker.py:421-432`) or leaves the stream message in the PEL; fullscan writes a checkpoint and resumes (`fullscan.py:1188-1219`). Nothing is lost; scan wastes one fetch. While the old worker finishes its job both workers run, so DB connections briefly exceed the seats (absorbed by DB_CAPACITY_MARGIN).
 - STANDING RULE (user, 2026-11-01), bug RMIDLE: when a pool is shrunk (reclaim, scale-down, any `{pool}:target:{n}` below the current size), `_remove_one_worker` (`scheduler.py:2315-2364`) removes a stalled worker first, then an IDLE one, and a worker with a job in progress only when no idle one is left. Today it takes the last entry unless one is stalled. Idle is readable from the heartbeat key `worker:alive:{type}_worker:{host}:{pid}`: `busy_since` is null when no job is running (`heartbeat.py:50-84,192`; written every 10 s, fullscan every 60 s, so the reading can be stale and then costs no more than today). Among busy workers: the one whose job started most recently (least work thrown away) — AGREED 2026-11-02. SEATCAP-DROP (the seat total is only ever raised, never lowered when the live cap falls) is a mechanical fix.
 
-## 9. Held-job marker and drainer (DESIGN FOR APPROVAL 2026-11-02, not built)
+## 9. Held-job marker and drainer (AGREED 2026-11-02; BUILT in steps 2, 7, 9)
 
 **1. Bug.** A job that is "held" is lost until the next scheduler restart (F-HOLDORPHAN / HO / RI2), and a held job is not counted or visible as held.
 
@@ -206,7 +206,7 @@ Options to evaluate in the 1-2-3 format before any code:
 - AGREED 2026-11-02, detail Lever 1 is REMOVED (scan and fullscan keep theirs). The bucket and drainer are the permanent admission gate. Its "ran out of options" role becomes an ALERT, raised when held jobs are still growing AND queue delay is still rising AND the pool is at its ceiling AND nothing is left to borrow. Knock-on, to design next: the detail lender gate at `manager.py:1528` (detail lends only while its Lever 1 is active) goes away and is replaced by "detail lends only when its delay and held jobs are under control".
 - DECIDED 2026-11-02: the backfill is 9.3 option C; the first-scan path (`scan_worker.py:733`) also goes through the drainer (9.0).
 
-### 9.1 Detail lender gate (AGREED 2026-11-02, not built)
+### 9.1 Detail lender gate (AGREED 2026-11-02; BUILT in step 8)
 
 **1. Bug.** `_borrow_seats` (`manager.py:1528`) lets detail lend only while its own Lever 1 is active. With detail Lever 1 removed that test is always false, so detail would never lend. Even today the test is odd: Lever 1 fires only after the chain found nothing (`:1745`), so detail lends only after it was itself overloaded.
 
@@ -219,7 +219,7 @@ Options to evaluate in the 1-2-3 format before any code:
 - If detail then becomes short, the agreed reclaim rule (section 8) takes the seats back one per cycle, and a short lender has no free seats, so there is no ping-pong.
 - Same change removes the detail branch of `_fire_lever1` in `_check_layer2` (`:1745-1750`): for detail, an exhausted chain raises the alert from section 9 instead.
 
-### 9.2 Longest acceptable wait W_max (DECIDED 2026-11-02 by user: a typed number, 120 minutes; not built)
+### 9.2 Longest acceptable wait W_max (DECIDED 2026-11-02 by user: a typed number, 120 minutes; BUILT in steps 1 and 6)
 
 DECISION (supersedes the share-based proposal below): `W_max` is a plain config.py env var, `DETAIL_MAX_WAIT_MIN`, default 120. Reason (user): anything derived from history gives no guarantee for today, and a share is not intuitive. The share/minute conversion below is kept only as the rough scale of what 120 min costs (about 8% of jobs if arrivals were even). Uses (a)-(c) below are unchanged.
 
@@ -234,7 +234,7 @@ DECISION (supersedes the share-based proposal below): `W_max` is a plain config.
 - Uses: (a) nightly, simulated drain time of the biggest backlog on the chosen rung > W_max gives an alert (not a change of C); (b) the design delay D must be <= W_max, else the nightly run alerts that the sizing itself breaks the policy; (c) the live shortfall chain keeps using the derived D, not W_max.
 - Recommended default 0.05 (judgement, not code-verified): a 1 h detail wait is small next to the 3-12 h discovery lag. The user decides the number.
 
-### 9.0 Decisions of 2026-11-02 (agreed, not built)
+### 9.0 Decisions of 2026-11-02 (agreed; BUILT)
 
 - ALL pending detail fetches go through the drainer, irrespective of where they came from: scan adaptive (`scan_worker.py:569`), first scan (`scan_worker.py:733`), fullscan (`fullscan.py:1289`), rebuild, and any future producer. No code path pushes a detail job to Redis directly; the drainer is the only writer of `queue:detail:*` payloads.
 - The literal detail depth gates are removed (`DETAIL_QUEUE_MAX_ADAPTIVE` 5000, `DETAIL_QUEUE_MAX_FULLSCAN` 2000, `scheduler.py:1450`, `fullscan.py:1179`): extra jobs wait as held rows in the database. Closes BI, BP23, BPL, F-BPCHUNK.
@@ -243,7 +243,7 @@ DECISION (supersedes the share-based proposal below): `W_max` is a plain config.
 - Service time `s` (AGREED 2026-11-02, replaces the "last-good s" idea): the rolling window holds the last `SERVICE_TIME_WINDOW_CYCLES` (5) VALID cycles, each stored as (busy seconds, jobs finished). A cycle with 0 jobs finished is not valid: it is skipped, takes no slot, and the window is unchanged. Its busy seconds are carried forward and added to the next valid cycle (otherwise a long job spanning cycles makes `s` read low). `s` = sum(busy) / sum(finished) over the window. The window and the carried busy seconds are saved in Redis so a manager restart does not empty them. Before 5 valid cycles exist, use what exists; with none, fall back to the cold `fetch_p75`. Change point: `_get_pool_service_time` (manager.py:377-426), which today appends every cycle and returns None when the window has no finished job.
 - RMIDLE tie-break among busy workers agreed: remove the one whose job started most recently.
 
-### 9.3 `pushed_at` backfill at deploy (AGREED 2026-11-02: option C; not built)
+### 9.3 `pushed_at` backfill at deploy (AGREED 2026-11-02: option C; BUILT as `scripts/backfill_detail_pushed_at.py`)
 
 **1. Bug.** The new column starts NULL on every existing row, and NULL means "held". At deploy there are `pending_detail` rows in three states, and the column cannot tell them apart: (a) already in a Redis detail queue, (b) being processed, (c) held and orphaned by the old hold branches (never queued).
 
@@ -256,7 +256,7 @@ DECISION (supersedes the share-based proposal below): `W_max` is a plain config.
 - Column add is nullable with no default, so it is instant in Postgres; the partial index is on a small set.
 - In all options `rebuild_detail_queue` is changed to push only rows with `pushed_at` set (it does not fix RBDUP).
 
-## 10. Blast radius and implementation steps (reviewed 2026-11-02, nothing built)
+## 10. Blast radius and implementation steps (reviewed 2026-11-02; all steps built, see the per-step notes)
 
 ### 10.1 Blast radius (what each agreed change touches; code-verified by reading)
 
