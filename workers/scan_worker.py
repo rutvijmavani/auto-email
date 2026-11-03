@@ -97,7 +97,6 @@ from config import (
     WORKER_BLOCK_SECS,
     REDIS_DETAIL_ADAPTIVE,
     REDIS_POLL_ADAPTIVE,
-    DETAIL_QUEUE_MAX_ADAPTIVE,
     JOB_MONITOR_DAYS_FRESH,
     REDIS_BACKOFF_PREFIX,
     WORKER_BACKOFF_BASE_S,
@@ -113,7 +112,7 @@ from config import (
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import BusyMeter, Heartbeat
-from workers.queue_stamp import stamp_queued_at, count_arrival
+from workers.queue_stamp import count_arrival
 from workers import progress
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
 from workers.http_client import set_request_context, CeilingExceeded
@@ -512,26 +511,6 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         new_count        = 0
         adaptive_skipped = 0
 
-        # ── Layer 2 Lever 1: manager signals that detail queue is overloaded ──
-        # When manager:lever1:detail:active is set, hold all pushes to
-        # queue:detail:adaptive.  Scan processing (title matching, DB checks)
-        # still runs so scan is XACKed normally.  Jobs not pushed here will be
-        # re-discovered next time this company is scanned (adaptive_seen is not
-        # updated for held jobs, so they register as new again on the next cycle).
-        _lever1_detail_active = bool(r.exists("manager:lever1:detail:active"))
-        _reintro_detail_active = (
-            not _lever1_detail_active
-            and bool(r.exists("manager:reintro:detail:active"))
-        )
-        _reintro_detail_count = 0   # pushes this cycle during re-intro
-        _REINTRO_DETAIL_BATCH_MAX = 3
-        if _lever1_detail_active:
-            logger.warning(
-                "scan_worker [%s]: Layer 2 Lever 1 active — "
-                "holding %d matched jobs; will re-discover on next scan cycle",
-                request_id, len(title_matched),
-            )
-
         for job in title_matched:
             job_id = job.get("job_id")
             if not job_id:
@@ -568,23 +547,12 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             else:
                 if save_pending_detail(display_name, platform, job,
                                        detail_payload=detail_payload):
-                    if _lever1_detail_active:
-                        adaptive_skipped += 1
-                        continue  # held — do not mark adaptive_seen
-                    elif (_reintro_detail_active
-                          and _reintro_detail_count >= _REINTRO_DETAIL_BATCH_MAX):
-                        # Re-intro trickle: held for this cycle; re-discovered next scan.
-                        adaptive_skipped += 1
-                        continue  # do not mark adaptive_seen
-                    else:
-                        r.lpush(REDIS_DETAIL_ADAPTIVE,
-                                json.dumps(stamp_queued_at(detail_payload)))
-                        count_arrival(r, REDIS_DETAIL_ADAPTIVE)
-                        new_count += 1
-                        _reintro_detail_count += 1
-                        # Mark seen only after successful push.  When held (Lever 1
-                        # or re-intro), don't mark — job must be re-discovered.
-                        r.sadd(adaptive_seen_key, job_id)
+                    # Save only: the detail drainer releases the held row to the
+                    # queue at the bucket rate (pushed_at NULL = held).
+                    count_arrival(r, REDIS_DETAIL_ADAPTIVE)
+                    new_count += 1
+                    # The row is safe in the DB, so mark seen now.
+                    r.sadd(adaptive_seen_key, job_id)
 
         # Refresh adaptive_seen TTL after each adaptive scan so it stays alive
         # until the next full scan (which will DEL it explicitly).
@@ -734,8 +702,6 @@ def _handle_first_scan(
                         display_name, platform, job, found_by="first_scan_fresh",
                         detail_payload=detail_payload,
                     ):
-                        r.lpush(REDIS_DETAIL_ADAPTIVE,
-                                json.dumps(stamp_queued_at(detail_payload)))
                         count_arrival(r, REDIS_DETAIL_ADAPTIVE)
                         fresh_queued += 1
                 # Always mark in adaptive_seen — repeat adaptive scans today

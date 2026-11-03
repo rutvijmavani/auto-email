@@ -123,7 +123,6 @@ from config import (
     SCHEDULER_HEARTBEAT_TTL,
     FULLSCAN_BLOOM_TTL,
     FULLSCAN_BLOOM_ERROR_RATE,
-    DETAIL_QUEUE_MAX_FULLSCAN,
     REDIS_ADAPTIVE_SEEN_PREFIX,
     ADAPTIVE_SEEN_TTL,
     # Stream-based delivery (two-layer scheduler redesign)
@@ -137,7 +136,7 @@ from config import (
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import BusyMeter, Heartbeat
-from workers.queue_stamp import stamp_queued_at, count_arrival
+from workers.queue_stamp import count_arrival
 from workers import company_load, progress
 from workers.scheduler import (
     set_heartbeat, clear_heartbeat, set_progress, clear_reaped,
@@ -1166,42 +1165,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         paused        = False
         early_exit    = False
         overlap_pages = 0
-        _reintro_detail_active = bool(r.exists("manager:reintro:detail:active"))
-        _reintro_detail_count  = 0
-        _REINTRO_DETAIL_BATCH_MAX = 3
-
-        # Backpressure: check detail queue depth before starting.
-        # Cast to int explicitly — r.llen() always returns int in production,
-        # but an explicit cast guards against unexpected return types (e.g. in
-        # tests) and keeps the %d log format safe.
-        _backpressure_wait_s = 0   # tracked so the EMA excludes idle wait time
-        queue_depth = int(r.llen(REDIS_DETAIL_FULLSCAN) or 0)
-        if queue_depth > DETAIL_QUEUE_MAX_FULLSCAN:
-            logger.warning(
-                "fullscan [%s]: detail queue backpressure "
-                "(depth=%d > max=%d) — pausing until queue drains",
-                company, queue_depth, DETAIL_QUEUE_MAX_FULLSCAN,
-            )
-            waited = 0
-            while (int(r.llen(REDIS_DETAIL_FULLSCAN) or 0) > DETAIL_QUEUE_MAX_FULLSCAN
-                   and waited < 300):
-                if shutdown_event and shutdown_event.is_set():
-                    logger.info("fullscan [%s]: shutdown during backpressure wait", company)
-                    try:
-                        _write_checkpoint(company, page_num)
-                    except Exception as _ckpt_err:
-                        logger.warning(
-                            "fullscan [%s]: checkpoint write failed during backpressure shutdown: %s",
-                            company, _ckpt_err,
-                        )
-                    result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
-                    result["outcome"] = "shutdown"
-                    return result
-                time.sleep(10)
-                waited += 10
-                if _is_paused(r):
-                    break
-            _backpressure_wait_s = waited
 
         # Chunk the flat job list to simulate page-level pause checks.
         # Phase 7 will replace this outer loop with actual paginated HTTP fetches.
@@ -1290,26 +1253,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                         display_name, platform, job, found_by="tier2_fullscan",
                         detail_payload=detail_payload,
                     ):
-                        # Layer 2 Lever 1: skip push when detail backpressure active.
-                        # Job will be re-discovered on next fullscan cycle.
-                        if r.exists("manager:lever1:detail:active"):
-                            logger.debug(
-                                "fullscan [%s]: Lever 1 active — held job %s",
-                                company, job.get("job_id"),
-                            )
-                        elif (_reintro_detail_active
-                              and _reintro_detail_count >= _REINTRO_DETAIL_BATCH_MAX):
-                            # Re-intro trickle: held for this company; re-discovered next scan.
-                            logger.debug(
-                                "fullscan [%s]: re-intro rate limit — held job %s",
-                                company, job.get("job_id"),
-                            )
-                        else:
-                            r.lpush(REDIS_DETAIL_FULLSCAN,
-                                    json.dumps(stamp_queued_at(detail_payload)))
-                            count_arrival(r, REDIS_DETAIL_FULLSCAN)
-                            new_count += 1
-                            _reintro_detail_count += 1
+                        # Save only: the detail drainer releases the held row to
+                        # the queue at the bucket rate (pushed_at NULL = held).
+                        count_arrival(r, REDIS_DETAIL_FULLSCAN)
+                        new_count += 1
 
                 # ALL fetched jobs go into NEW bloom regardless of outcome —
                 # this ensures closed/filled jobs fall out naturally next cycle.
@@ -1426,9 +1373,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             #   Day 2: midpoints now spread across the window -> gaps rebalance further
             #   Day 3+: stable maximum-spread distribution maintained automatically
             avg_duration_s = fs_state.get("avg_fullscan_duration_s", _AVG_DURATION_SEED)
-            # Exclude backpressure idle time so queue saturation events don't
-            # inflate the EMA and cause unnecessary scheduling pessimism.
-            duration_s = max(0.0, time.monotonic() - start_mono - _backpressure_wait_s)
+            duration_s = max(0.0, time.monotonic() - start_mono)
 
             # Compute the updated EMA using the module-level _EMA_ALPHA so the
             # deadline guard in _pick_schedule_time reflects current performance.

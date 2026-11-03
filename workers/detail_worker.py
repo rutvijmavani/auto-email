@@ -896,13 +896,14 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                 company, job_id,
             )
 
-        result["outcome"]     = "new"
+        result["outcome"]     = "new" if updated else "noop"
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
 
-        logger.info(
-            "detail_worker: NEW job | company=%r | %s | %s",
-            company, job.get("title"), job.get("location"),
-        )
+        if updated:
+            logger.info(
+                "detail_worker: NEW job | company=%r | %s | %s",
+                company, job.get("title"), job.get("location"),
+            )
 
     except ContentHashConflict:
         # A different job already stored this exact content — permanent duplicate.
@@ -1382,13 +1383,12 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]
-            icon    = {"new": "[NEW]", "filtered": "[skip]", "error": "[ERR]"}.get(
-                outcome, "[?]"
-            )
+            icon    = {"new": "[NEW]", "filtered": "[skip]", "duplicate": "[dup]",
+                       "noop": "[skip]", "error": "[ERR]"}.get(outcome, "[?]")
             logger.info(
-                "%s [%s] %s %s (%dms fetch=%dms db=%dms)",
+                "%s [%s] %s %s outcome=%s (%dms fetch=%dms db=%dms)",
                 icon, tier, result["company"],
-                result.get("job_id", "?"), result["duration_ms"],
+                result.get("job_id", "?"), outcome, result["duration_ms"],
                 result.get("fetch_ms", 0), getattr(_timing, "db_ms", 0),
             )
 

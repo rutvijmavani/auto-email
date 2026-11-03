@@ -363,6 +363,7 @@ def _make_poll_stats_row(warming_polls_remaining=None,
         "consecutive_errors":     consecutive_errors,
         "last_success_at":        None,
         "warming_polls_remaining": warming_polls_remaining,
+        "avg_scan_duration_s":    None,
     }
 
 

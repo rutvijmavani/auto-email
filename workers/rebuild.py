@@ -26,12 +26,12 @@ import time
 from logger import get_logger
 
 from workers.redis_client import get_redis
-from workers.queue_stamp import stamp_queued_at, count_arrival
+from workers.queue_stamp import count_arrival
+from workers.detail_payload import build_detail_push
 from db.db import get_conn, init_db, get_monitorable_companies
 from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
-    REDIS_DETAIL_ADAPTIVE,
     REDIS_CYCLE_START,
     WORKER_FLOOR,
     STARTUP_AVG_SCAN_TIME_S,
@@ -39,17 +39,6 @@ from config import (
 )
 
 logger = get_logger(__name__)
-
-# Platforms whose detail payloads require ephemeral keys extracted from the
-# listing-scan API response (_slug, _wd, _path, _base_url, etc.). job_postings
-# only stores job_url/job_id — rebuild cannot reconstruct those keys. Skip
-# these during rebuild; their pending_detail rows will be re-discovered on the
-# next adaptive/fullscan cycle.  Keep in sync with _REQUIRED_DETAIL_KEYS in
-# workers/detail_worker.py.
-_REBUILD_SKIP_PLATFORMS = frozenset({
-    "workday", "taleo", "smartrecruiters", "icims", "jobvite",
-})
-
 
 # ─────────────────────────────────────────
 # CYCLE BOUNDARY HELPER
@@ -352,10 +341,15 @@ def rebuild_poll_queues() -> dict:
 
 def rebuild_detail_queue() -> int:
     """
-    Rebuild queue:detail:adaptive from job_postings WHERE status='pending_detail'.
+    Rebuild queue:detail:adaptive / queue:detail:fullscan (by found_by) from
+    job_postings WHERE status='pending_detail'.
 
     These are jobs whose ID was found by a listing scan but whose detail
     page was not yet fetched before the last restart.
+
+    Only rows the drainer already released (pushed_at set) are pushed: that
+    re-queues a job whose Redis push was lost.  Held rows (pushed_at NULL) belong
+    to the drainer, which releases them at the bucket rate.
 
     Returns count of jobs re-queued.
     """
@@ -364,9 +358,11 @@ def rebuild_detail_queue() -> int:
     conn = get_conn()
     try:
         rows = conn.execute("""
-            SELECT company, job_url, job_id, ats_platform, detail_payload
+            SELECT company, job_url, job_id, ats_platform, detail_payload,
+                   found_by, first_seen
             FROM job_postings
             WHERE status = 'pending_detail'
+              AND pushed_at IS NOT NULL
             ORDER BY first_seen ASC
         """).fetchall()
     finally:
@@ -389,37 +385,17 @@ def rebuild_detail_queue() -> int:
     skipped = 0
     count = 0
     for row in rows:
-        stored = row["detail_payload"]
-        if stored:
-            # Full payload persisted at scan time — push it so detail_worker
-            # gets every platform-specific key it needs.  queued_at is never
-            # persisted, so the push adds a fresh one (enqueued_at stays).
-            if isinstance(stored, str):
-                try:
-                    stored = json.loads(stored)
-                except Exception:
-                    stored = None
-            if isinstance(stored, dict):
-                payload = json.dumps(stamp_queued_at(stored))
-            else:
-                payload = row["detail_payload"]
-        elif row["ats_platform"] in _REBUILD_SKIP_PLATFORMS:
-            # Old row (pre detail_payload column) for a platform that needs
-            # ephemeral keys we can't reconstruct.  Skip; next scan re-queues
-            # with a complete payload.
+        # build_detail_push picks the queue from the row's found_by (fullscan
+        # finds go back to the fullscan queue) and returns None for old rows of
+        # platforms that need ephemeral keys we can't reconstruct; the next scan
+        # re-queues those with a complete payload.
+        push = build_detail_push(row)
+        if push is None:
             skipped += 1
             continue
-        else:
-            # Old row for a platform whose minimal payload is sufficient.
-            payload = json.dumps(stamp_queued_at({
-                "company":      row["company"],
-                "job_url":      row["job_url"],
-                "job_id":       row["job_id"],
-                "ats_platform": row["ats_platform"],
-                "found_by":     "rebuild",
-            }))
-        r.lpush(REDIS_DETAIL_ADAPTIVE, payload)
-        count_arrival(r, REDIS_DETAIL_ADAPTIVE, "rebuild")
+        queue, payload = push
+        r.lpush(queue, payload)
+        count_arrival(r, queue, "rebuild")
         count += 1
 
     if count or skipped:

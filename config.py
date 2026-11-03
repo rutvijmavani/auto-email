@@ -694,10 +694,6 @@ SCHEDULER_FULL_SCAN_INTERVAL_S = 86400      # default full scan every 24h
 SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
 SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 
-# ── Detail queue backpressure (Section 15) ────────────────────────────────────
-DETAIL_QUEUE_MAX_ADAPTIVE      = 5000       # pause listing scan if adaptive queue > this
-DETAIL_QUEUE_MAX_FULLSCAN      = 2000       # pause full scan if fullscan queue > this
-
 # ── Smart early exit (Section 11) ─────────────────────────────────────────────
 PAGINATOR_OVERLAP_THRESHOLD    = 0.80       # 80% of page already seen → overlap
 PAGINATOR_CONFIRM_PAGES        = 2          # consecutive overlap pages to stop
@@ -778,7 +774,6 @@ WORKER_DEPRIORITISE_SECS          = 300    # seconds to push erroring platform's
                                            # companies forward in poll:adaptive
 DETAIL_QUEUE_HIGH_WATERMARK       = 1000   # cascade trigger — detail queue above this
                                            # → stop adding scan workers, drain first
-                                           # (hard emergency brake is DETAIL_QUEUE_MAX_ADAPTIVE=5000)
 
 # ── Phase 11 — Monitoring and alerting thresholds ────────────────────────────
 
@@ -849,6 +844,28 @@ MANAGER_SCALE_DOWN_UTIL           = float(os.getenv("MANAGER_SCALE_DOWN_UTIL", "
 # (scan: 10% of P10 current_interval_s, fullscan: 10% of AVG full_scan_interval_s).
 SCAN_DELAY_WARN_MIN_S             = int(os.getenv("SCAN_DELAY_WARN_MIN_S", "300"))
 FULLSCAN_DELAY_WARN_MIN_S         = int(os.getenv("FULLSCAN_DELAY_WARN_MIN_S", "600"))
+
+# Detail pool ceiling and admission (docs/detail-pool-ceiling-th-design.md).
+# Window T over which arrivals are summed (bucket size); the design delay D
+# follows from it.  Utilisation u reuses MANAGER_SCALE_UP_UTIL.
+DETAIL_BUCKET_WINDOW_MIN          = int(os.getenv("DETAIL_BUCKET_WINDOW_MIN", "30"))
+# Per-minute arrivals history the nightly ceiling is computed from; used once at
+# least DETAIL_ARRIVALS_MIN_HOURS of rows exist, bootstrap defaults before that.
+DETAIL_ARRIVALS_HISTORY_DAYS      = int(os.getenv("DETAIL_ARRIVALS_HISTORY_DAYS", "28"))
+DETAIL_ARRIVALS_MIN_HOURS         = int(os.getenv("DETAIL_ARRIVALS_MIN_HOURS", "24"))
+# Coverage ladder: start at START_PCT and step down by 1 to the first level whose
+# ceiling fits the seats left for detail; below FLOOR_PCT the alert is critical.
+DETAIL_COVERAGE_START_PCT         = int(os.getenv("DETAIL_COVERAGE_START_PCT", "99"))
+DETAIL_COVERAGE_FLOOR_PCT         = int(os.getenv("DETAIL_COVERAGE_FLOOR_PCT", "75"))
+# Longest acceptable detail wait; the nightly run alerts when the design delay or
+# the simulated drain time of the biggest backlog exceeds it.
+DETAIL_MAX_WAIT_MIN               = int(os.getenv("DETAIL_MAX_WAIT_MIN", "120"))
+# Detail drainer wakes every k x tick with k = ceil(DRAIN_MIN_WAKE_S / tick), so
+# one wake releases a whole number of tokens.
+DRAIN_MIN_WAKE_S                  = float(os.getenv("DRAIN_MIN_WAKE_S", "1"))
+# Lifetime of the drainer's heartbeat key (at least 3 wakes); the watchdog alerts
+# when it is missing or stale.
+DRAIN_HEARTBEAT_TTL_S             = int(os.getenv("DRAIN_HEARTBEAT_TTL_S", "30"))
 
 # Per-company load table (workers/company_load.py): replaced by the nightly rebuild,
 # so it expires one hour after the recompute period if that rebuild stops running.

@@ -21,7 +21,7 @@ Scenario coverage:
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -130,6 +130,7 @@ def _make_redis(data=None):
 
 
 def _reset_state(*pools):
+    mgr._detail_calm["cycles"] = 0
     for p in pools:
         mgr._lever1_stable_cycles[p]  = 0
         mgr._reintro_stable_cycles[p] = 0
@@ -149,7 +150,9 @@ def _run(r, pool, delay_s, n_workers=_CEIL,
          pool_sizes=None, workers_targets=None, depth=50):
     ps  = pool_sizes      or {"scan": _CEIL, "detail": _CEIL, "fullscan": _CEIL}
     wts = workers_targets or {"scan": _CEIL, "detail": _CEIL, "fullscan": _CEIL}
-    _check_layer2(r, pool, n_workers, delay_s, depth, _PARAMS, _CEIL, ps, wts)
+    # These scenarios test borrowing, which follows the seat raise in the chain.
+    with patch.object(mgr, "_raise_db_total", return_value=False):
+        _check_layer2(r, pool, n_workers, delay_s, depth, _PARAMS, _CEIL, ps, wts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,7 +267,8 @@ class TestDeadlock4_FullscanDetailAllowed(unittest.TestCase):
             "manager:snapshot:fullscan:R":    "0",
         })
 
-    def test_detail_lends_when_lever1_active(self):
+    def test_detail_lends_when_calm(self):
+        mgr._detail_calm["cycles"] = LEVER1_STABLE_REQUIRED
         warn = _PARAMS["delay_warn_s"]
         _prefill_delay_history(self.r, "fullscan", [warn+10, warn+30, warn+60, warn+90])
         # scan at target (no lendable), detail has 3 lendable
@@ -273,7 +277,7 @@ class TestDeadlock4_FullscanDetailAllowed(unittest.TestCase):
         _run(self.r, "fullscan", delay_s=warn + 100, n_workers=_CEIL,
              pool_sizes=pool_sizes, workers_targets=workers_targets)
         detail_borrow = self.r._store.get("manager:borrow:detail:fullscan")
-        self.assertIsNotNone(detail_borrow, "detail must lend when its Lever 1 active")
+        self.assertIsNotNone(detail_borrow, "detail must lend when calm")
         self.assertGreater(int(detail_borrow), 0)
 
 
@@ -424,7 +428,7 @@ class TestDeadlock10_RecoveryIntegration(unittest.TestCase):
 
     def test_full_recovery_path(self):
         r = _make_redis({
-            "manager:lever1:detail:active": "1",
+            "manager:lever1:scan:active":   "1",
             "manager:borrow:scan:detail":   "2",
             "manager:snapshot:detail:D":    "60",
             "manager:snapshot:detail:R":    "0",
@@ -434,10 +438,10 @@ class TestDeadlock10_RecoveryIntegration(unittest.TestCase):
         warns  = {p: _PARAMS["delay_warn_s"] for p in delays}
 
         for _ in range(LEVER1_STABLE_REQUIRED):
-            _run(r, "detail", delay_s=stable_delay, n_workers=6)
+            _run(r, "scan", delay_s=stable_delay, n_workers=6)
 
-        self.assertFalse(_get_lever1_active(r, "detail"), "lever1 must be lifted")
-        self.assertTrue(_is_reintro_active(r, "detail"),               "re-intro must be active")
+        self.assertFalse(_get_lever1_active(r, "scan"), "lever1 must be lifted")
+        self.assertTrue(_is_reintro_active(r, "scan"),                 "re-intro must be active")
         self.assertEqual(r._store.get("manager:borrow:scan:detail"), "2",
                          "lifting Lever 1 alone must not return the seats")
 

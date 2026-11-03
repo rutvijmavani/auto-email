@@ -1189,12 +1189,32 @@ def init_db():
         ("last_polled",     "TIMESTAMP"),
         ("_country_code",   "CHAR(2)"),
         ("detail_payload",  "JSONB"),
+        # NULL on a pending_detail row = held at the detail token bucket (not yet
+        # in a Redis detail queue); set by the drainer when it releases the row.
+        ("pushed_at",       "TIMESTAMP"),
     ]:
         c.execute(f"ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS {col} {defn}")
 
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_job_postings_company_jobid
         ON job_postings (company, job_id)
+    """)
+
+    # Held backlog, in release order (created_at, id): the drainer's SELECT and the
+    # held count both use exactly this predicate.
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_postings_held
+        ON job_postings (created_at, id)
+        WHERE status = 'pending_detail' AND pushed_at IS NULL
+    """)
+
+    # New jobs discovered per minute (scans + fullscans, counted at discovery);
+    # the nightly detail ceiling is computed from this table.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS detail_arrivals (
+            minute    TIMESTAMP PRIMARY KEY,
+            arrivals  INTEGER NOT NULL
+        )
     """)
 
     # prospective_companies: all ATS detection columns (safe to re-run)

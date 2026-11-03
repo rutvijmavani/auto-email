@@ -68,12 +68,14 @@ class TestRebuildStamp(unittest.TestCase):
         older = {"job_id": "old", "enqueued_at": "2026-10-01T02:00:00+00:00"}
         rows = [
             {"company": "A", "job_url": "u1", "job_id": "new",
-             "ats_platform": "greenhouse", "detail_payload": newer, "first_seen": day},
+             "ats_platform": "greenhouse", "detail_payload": newer, "first_seen": day,
+             "found_by": "tier1_adaptive"},
             {"company": "A", "job_url": "u2", "job_id": "old",
              "ats_platform": "greenhouse", "detail_payload": json.dumps(older),
-             "first_seen": day},
+             "first_seen": day, "found_by": "tier1_adaptive"},
             {"company": "B", "job_url": "u3", "job_id": "legacy",
-             "ats_platform": "greenhouse", "detail_payload": None, "first_seen": day},
+             "ats_platform": "greenhouse", "detail_payload": None, "first_seen": day,
+             "found_by": None},
         ]
         count, pushed = self._run_rebuild(rows)
         self.assertEqual(count, 3)

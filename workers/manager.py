@@ -27,7 +27,7 @@ import math
 import os
 import socket
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 _HOSTNAME = socket.gethostname()
@@ -39,9 +39,10 @@ from workers import db_capacity
 from workers.queue_stamp import payload_wait_s
 from workers.stream_backlog import stream_backlog, waiting_companies
 from workers import company_load
+from workers import detail_ceiling
+from workers.detail_drainer import BUCKET_PARAMS_KEY, HELD_KEY
 from config import (
     WORKER_FLOOR,
-    MONITOR_MAX_WORKERS,
     WORKER_SEAT_BUDGET,
     DB_POOL_RAISE_STEP,
     MANAGER_RECOMPUTE_HOUR,
@@ -57,6 +58,12 @@ from config import (
     SCAN_DELAY_WARN_MIN_S,
     FULLSCAN_DELAY_WARN_MIN_S,
     SERVICE_TIME_WINDOW_CYCLES,
+    DETAIL_BUCKET_WINDOW_MIN,
+    DETAIL_ARRIVALS_HISTORY_DAYS,
+    DETAIL_ARRIVALS_MIN_HOURS,
+    DETAIL_COVERAGE_START_PCT,
+    DETAIL_COVERAGE_FLOOR_PCT,
+    DETAIL_MAX_WAIT_MIN,
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_ADAPTIVE,
@@ -131,7 +138,6 @@ DEADLOCK_HISTORY_CYCLES  = 4      # rolling window for 3-of-4 check
 DEADLOCK_RISING_MIN      = 3      # min cycles above WARN in window
 LEVER1_STABLE_REQUIRED   = 3      # consecutive stable cycles to lift Lever 1
 REINTRO_STABLE_REQUIRED   = 2      # consecutive stable cycles to end re-introduction
-REINTRO_DETAIL_BATCH_MAX  = 3      # max detail jobs pushed per scan/fullscan cycle during re-intro
 
 # ── Lever 1 max hold times (seconds) ──────────────────────────────────────────
 # For "scan" and "fullscan" pools, Lever 1 prevents scheduler dispatch, which
@@ -140,13 +146,11 @@ REINTRO_DETAIL_BATCH_MAX  = 3      # max detail jobs pushed per scan/fullscan cy
 # hold ensures Lever 1 auto-lifts after this duration even if delay_s hasn't
 # returned to stable.  If conditions still warrant it, the manager re-fires
 # within one cycle (60s) automatically.
-# "detail" has no limit: its queue drains naturally under Lever 1 (workers
-# pull from the list, inflow is halted, delay_s decreases organically).
+# "detail" has no Lever 1 (producers are save-only; the drainer paces the queue).
 # fired_at is stored in Redis (not in-memory) so the age survives restarts.
 LEVER1_MAX_HOLD_S: dict = {
     "scan":     300,   # 5 min
     "fullscan": 600,   # 10 min
-    "detail":   None,  # no limit — recovers naturally
 }
 
 # ── Layer 2 in-memory state (survives individual cycle failures; Redis holds ───
@@ -164,6 +168,10 @@ _needed_workers:       dict = {}   # pool -> uncapped workers the formula asked 
 _last_work_need:       dict = {}   # scan pools -> last need from per-company work (kept while unreadable)
 _lever1_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _reintro_stable_cycles: dict = {"scan": 0, "detail": 0, "fullscan": 0}
+# Consecutive cycles detail was calm (queue delay and oldest held job both under
+# warn x RECOVERY_STABILITY_RATIO): the gate for lending detail seats (9.1 of
+# docs/detail-pool-ceiling-th-design.md).  In memory: a restart waits 3 cycles.
+_detail_calm: dict = {"cycles": 0}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,20 +379,26 @@ def _get_pool_busy_ms(r, pool: str) -> int:
 
 # (pool, heartbeat key) -> (busy total ms, processed count) at the previous call
 _prev_svc_snap: dict = {}
-# pool -> last SERVICE_TIME_WINDOW_CYCLES of (busy seconds, jobs finished)
-_svc_window: dict = {}
+# The window and the busy-second carry live in Redis (manager:svc_window:<pool>),
+# so a manager restart keeps s.  A stale window expires after this long and s
+# falls back to fetch_p75 until new samples arrive.
+_SVC_STATE_TTL_S = 3600
 
 
 def _get_pool_service_time(r, pool: str) -> "float | None":
     """
-    Seconds of worker time per finished job, summed over the last
-    SERVICE_TIME_WINDOW_CYCLES calls: sum(busy delta) / sum(processed delta)
-    across the pool's heartbeats (busy_ms odometer, in-progress job counted;
-    processed = jobs finished).  This is the service time the pool really
-    pays per job, including the DB and queue work around the fetch.
+    Seconds of worker time per finished job over the last
+    SERVICE_TIME_WINDOW_CYCLES valid cycles: sum(busy delta) / sum(processed
+    delta) across the pool's heartbeats (busy_ms odometer, in-progress job
+    counted; processed = jobs finished).  This is the service time the pool
+    really pays per job, including the DB and queue work around the fetch.
 
-    None while unknown: first call, no job finished inside the window, or no
-    heartbeat carries both fields.  Callers then fall back to fetch_p75.
+    A cycle in which no job finished is skipped, not averaged in; its busy
+    seconds are carried into the next cycle that finishes jobs.  The window
+    and the carry are kept in Redis.
+
+    None while unknown: first call, no job has finished yet, or no heartbeat
+    carries both fields.  Callers then fall back to fetch_p75.
     A worker seen for the first time, or whose counters went backwards
     (restart), contributes nothing for that call.
     """
@@ -418,13 +432,44 @@ def _get_pool_service_time(r, pool: str) -> "float | None":
         return None
     for snap_key in [k for k in _prev_svc_snap if k[0] == pool and k not in seen]:
         del _prev_svc_snap[snap_key]
-    window = _svc_window.setdefault(pool, [])
-    window.append((busy_s, done))
-    del window[:-max(SERVICE_TIME_WINDOW_CYCLES, 1)]
+    key = f"manager:svc_window:{pool}"
+    try:
+        raw = r.get(key)
+        state = json.loads(raw) if raw else {}
+        window = [(float(b), int(d)) for b, d in state.get("window", [])]
+        busy_s += float(state.get("carry", 0.0))
+        if done > 0:
+            window.append((busy_s, done))
+            del window[:-max(SERVICE_TIME_WINDOW_CYCLES, 1)]
+            busy_s = 0.0
+        # A cycle that finished nothing is not a valid sample: its busy seconds
+        # wait in the carry and are charged to the next cycle that finishes jobs.
+        r.set(key, json.dumps({"window": window, "carry": busy_s}),
+              ex=_SVC_STATE_TTL_S)
+    except Exception as exc:
+        logger.debug("manager: service time state failed [%s]: %s", pool, exc)
+        return None
+    return _window_service_time(window)
+
+
+def _window_service_time(window) -> "float | None":
+    """sum(busy) / sum(finished) over a window of (busy seconds, jobs finished); None if no job."""
     total_done = sum(d for _, d in window)
     if total_done <= 0:
         return None
     return sum(b for b, _ in window) / total_done
+
+
+def _stored_service_time(r, pool: str) -> "float | None":
+    """s from the saved window without advancing it (the nightly ceiling); None if unknown."""
+    try:
+        raw = r.get(f"manager:svc_window:{pool}")
+        state = json.loads(raw) if raw else {}
+        return _window_service_time(
+            [(float(b), int(d)) for b, d in state.get("window", [])])
+    except Exception as exc:
+        logger.debug("manager: stored service time unreadable [%s]: %s", pool, exc)
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +845,33 @@ def _get_db_total(r) -> int:
 _capacity_cache: dict = {"at": 0.0, "probe": None}
 
 
+def _drop_db_total(r) -> bool:
+    """
+    SEATCAP-DROP: lower the raised worker-seat total when the live Postgres seat
+    cap has fallen below it (the total is otherwise only ever raised).  The total
+    never goes under WORKER_SEAT_BUDGET; at the budget the raised value is removed.
+    A failed probe changes nothing.  Pool ceilings are re-fitted by the next plan.
+    Returns True if the total was lowered.
+    """
+    p = _db_capacity(r)
+    if not p:
+        return False
+    total = _get_db_total(r)
+    cap = p["seat_cap"]
+    if total <= WORKER_SEAT_BUDGET or total <= cap:
+        return False
+    new_total = max(cap, WORKER_SEAT_BUDGET)
+    if new_total <= WORKER_SEAT_BUDGET:
+        r.delete("manager:db_pool_maxconn")
+    else:
+        r.set("manager:db_pool_maxconn", new_total)
+    logger.warning(
+        "manager: worker seats lowered %d → %d (Postgres seat cap fell to %d)",
+        total, new_total, cap,
+    )
+    return True
+
+
 def _db_capacity(r) -> "dict | None":
     """Live Postgres capacity (workers/db_capacity.probe), re-read at most once per cycle."""
     now = time.monotonic()
@@ -981,6 +1053,72 @@ def _store_plan(r, plan: dict, only: "str | None" = None) -> None:
             )
 
 
+_DETAIL_PLAN_KEY = "manager:detail_plan"
+
+
+def _plan_detail_nightly(r, params: dict) -> "dict | None":
+    """
+    Detail ceiling from the arrival history (workers/detail_ceiling.py), sized
+    after scan and fullscan.  Stored as JSON in manager:detail_plan and logged;
+    then applied: scan and fullscan ceilings (_store_plan), the detail ceiling
+    (manager:worker_ceil:detail) and, when the plan needs more seats than are
+    set, manager:db_pool_maxconn.  Returns None while
+    fewer than DETAIL_ARRIVALS_MIN_HOURS of history exist (bootstrap ceiling
+    stands) or when the history cannot be read.
+    """
+    from db.db import get_conn
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT minute, arrivals FROM detail_arrivals "
+            "WHERE minute >= NOW() - (%s * INTERVAL '1 day') ORDER BY minute",
+            (DETAIL_ARRIVALS_HISTORY_DAYS,),
+        )
+        rows = [(x["minute"], x["arrivals"]) for x in cur.fetchall()]
+    if not rows or rows[-1][0] - rows[0][0] < timedelta(hours=DETAIL_ARRIVALS_MIN_HOURS):
+        logger.info(
+            "manager: detail ceiling — under %dh of arrival history, bootstrap ceiling stands",
+            DETAIL_ARRIVALS_MIN_HOURS,
+        )
+        return None
+
+    s = _stored_service_time(r, "detail")
+    s_src = "window"
+    if s is None:
+        s = params.get("detail", _FALLBACK_PARAMS["detail"])["fetch_p75"]
+        s_src = "fetch_p75"
+
+    first = _plan_ceilings(r, ["scan", "fullscan"])      # scan and fullscan first
+    others = sum(v["ceil"] for v in first["pools"].values())
+    plan = detail_ceiling.plan_detail_ceiling(
+        detail_ceiling.dense_series(rows), s,
+        u=MANAGER_SCALE_UP_UTIL, window_min=DETAIL_BUCKET_WINDOW_MIN,
+        start_pct=DETAIL_COVERAGE_START_PCT, floor_pct=DETAIL_COVERAGE_FLOOR_PCT,
+        max_wait_min=DETAIL_MAX_WAIT_MIN, others=others, total=first["total"],
+        cap=_seat_cap(r), step=_raise_step_seats(r), floor_workers=WORKER_FLOOR,
+    )
+    if plan is None:
+        return None
+    plan["s"] = s
+    plan["s_src"] = s_src
+    plan["others"] = others
+    r.set(_DETAIL_PLAN_KEY, json.dumps(plan), ex=30 * 3600)
+    _store_plan(r, first)
+    r.set("manager:worker_ceil:detail", plan["ceil"])
+    if plan["total"] > _get_db_total(r):
+        r.set("manager:db_pool_maxconn", plan["total"])
+    logger.info(
+        "manager: detail ceiling plan ceil=%d covers=%s A=%.0f jobs/%dmin s=%.2fs (%s) "
+        "D=%.0fs seats=%d (scan+fullscan=%d, avail=%d) drain=%.0fmin",
+        plan["ceil"], f"p{plan['eff_pct']}" if plan["eff_pct"] else f"<p{DETAIL_COVERAGE_FLOOR_PCT}",
+        plan["a_p"], DETAIL_BUCKET_WINDOW_MIN, s, s_src, plan["d_s"], plan["total"],
+        others, plan["c_avail"], plan["drain_min"],
+    )
+    for alert in plan["alerts"]:
+        logger.error("manager: [Pipeline] %s", alert)
+    return plan
+
+
 def _midnight_recompute(r, pools: list[str]) -> None:
     """
     Layer 1 nightly recompute (MANAGER_RECOMPUTE_HOUR local time).
@@ -1034,6 +1172,12 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             )
     except Exception as exc:
         logger.error("manager: nightly recompute failed: %s", exc, exc_info=True)
+
+    if "detail" in pools:
+        try:
+            _plan_detail_nightly(r, params_now)
+        except Exception as exc:
+            logger.error("manager: nightly detail ceiling failed: %s", exc, exc_info=True)
 
 
 def _emergency_recalc(r, pool: str, pools: list[str]) -> bool:
@@ -1165,7 +1309,7 @@ def _run_pool_cycle(
 
     Decision modes:
       urgent        — delay >= WARN×0.75; spawn to workers_target in 1 cycle
-      urgent_release— workers confirmed online after urgent; lift throttle
+      urgent_release— workers confirmed online after urgent
       urgent_hold   — urgent active but still understaffed (at ceiling → Layer 2)
       scale_up      — util > 0.80 AND delay > WARN×0.5, 2 consecutive cycles
       scale_down    — util < 0.50 AND delay < WARN×0.25, 5 consecutive cycles
@@ -1198,12 +1342,11 @@ def _run_pool_cycle(
         workers_target = _last_work_need[pool]
     else:
         s_used         = service_s if service_s else fetch_p75
-        time_left      = max(delay_warn_s - delay_s, 1)
-        drain_rate     = depth / time_left + (arrival_rate or 0.0)
+        # Fixed horizon W = delay_warn_s: the queue is cleared within W whatever
+        # the current delay is.  Lateness is the urgent branch's job, not a
+        # multiplier here (it would count the same backlog twice).
+        drain_rate     = depth / delay_warn_s + (arrival_rate or 0.0)
         workers_target = math.ceil(drain_rate * s_used)
-
-    if delay_s > delay_warn_s:
-        workers_target = math.ceil(workers_target * (delay_s / delay_warn_s))
 
     _needed_workers[pool] = workers_target   # before the ceiling clamp: the real demand
     workers_target = max(WORKER_FLOOR, min(workers_target, worker_ceil))
@@ -1339,6 +1482,105 @@ def _is_deadlock_rising(delays: list, current_delay: float, delay_warn_s: float)
     return current_delay > delays[0]
 
 
+def _detail_design_delay(r) -> "float | None":
+    """
+    D, the design queue delay of the detail pool, from the nightly plan
+    (manager:detail_plan).  None while no plan exists (bootstrap): detail then
+    keeps its delay_warn_s from scaling_params.
+    """
+    raw = r.get(_DETAIL_PLAN_KEY)
+    if not raw:
+        return None
+    try:
+        d = float(json.loads(raw)["d_s"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    return d if 0 < d < math.inf else None
+
+
+def _cycle_params(r, scaling_params: dict) -> dict:
+    """scaling_params with detail's delay_warn_s replaced by D when a plan exists."""
+    d = _detail_design_delay(r)
+    if d is None:
+        return scaling_params
+    detail = dict(scaling_params.get("detail", _FALLBACK_PARAMS["detail"]))
+    detail["delay_warn_s"] = d
+    return {**scaling_params, "detail": detail}
+
+
+def _detail_n_bucket(r, target: int) -> int:
+    """
+    Seats the detail token bucket may use: the base ceiling, plus the borrowed
+    seats only for the part of the pool's (uncapped) demand `target` that the
+    base ceiling cannot cover.  Base 7, borrowed 3: target 10 -> 7, 8 -> 9,
+    <= 7 -> 10.  The live worker count and plain borrows do not widen it.
+    """
+    base = _get_base_ceil(r, "detail")
+    borrowed = _borrow_in(r, "detail")
+    return base + min(borrowed, max(0, base + borrowed - target))
+
+
+def _publish_detail_bucket(r, params: dict) -> None:
+    """
+    Write manager:detail_bucket {"n","s","d"} for the drainer (TTL 3 cycles):
+    n from _detail_n_bucket, s the detail service-time window (fetch_p75 until
+    one exists), d the plan's D (the bootstrap window x utilisation before).
+    """
+    base = _get_base_ceil(r, "detail")
+    target = _needed_workers.get("detail", base + _borrow_in(r, "detail"))
+    s = _stored_service_time(r, "detail")
+    if s is None:
+        s = params.get("detail", _FALLBACK_PARAMS["detail"])["fetch_p75"]
+    d = _detail_design_delay(r)
+    if d is None:
+        d = DETAIL_BUCKET_WINDOW_MIN * 60 * MANAGER_SCALE_UP_UTIL
+    r.set(
+        BUCKET_PARAMS_KEY,
+        json.dumps({"n": _detail_n_bucket(r, target), "s": s, "d": d}),
+        ex=MANAGER_CYCLE_S * 3,
+    )
+
+
+def _read_held(r) -> "tuple[int, float]":
+    """
+    (held count, oldest held age in s) from the drainer's drainer:detail:held.
+    A missing or stale record (older than 3 cycles) is no signal: (0, 0.0).
+    """
+    raw = r.get(HELD_KEY)
+    if not raw:
+        return 0, 0.0
+    try:
+        h = json.loads(raw)
+        if time.time() - float(h["ts"]) > MANAGER_CYCLE_S * 3:
+            return 0, 0.0
+        return int(h["count"]), float(h["oldest_age_s"])
+    except (ValueError, TypeError, KeyError):
+        return 0, 0.0
+
+
+def _is_held_growing(counts: list) -> bool:
+    """
+    True when the held backlog rose in at least DEADLOCK_RISING_MIN of the last
+    DEADLOCK_HISTORY_CYCLES cycles and is above the oldest sample (the shape of
+    _is_deadlock_rising).  `counts` is oldest -> newest.
+    """
+    if len(counts) < DEADLOCK_HISTORY_CYCLES + 1:
+        return False
+    window = counts[-(DEADLOCK_HISTORY_CYCLES + 1):]
+    rises = sum(1 for a, b in zip(window, window[1:]) if b > a)
+    return rises >= DEADLOCK_RISING_MIN and window[-1] > window[0]
+
+
+def _push_held_history(r, count: int) -> list:
+    """Redis list of the last DEADLOCK_HISTORY_CYCLES + 1 held counts, oldest -> newest."""
+    key = "manager:layer2:detail:held_history"
+    pipe = r.pipeline()
+    pipe.rpush(key, count)
+    pipe.ltrim(key, -(DEADLOCK_HISTORY_CYCLES + 1), -1)
+    pipe.lrange(key, 0, -1)
+    return [int(v) for v in pipe.execute()[2]]
+
+
 def _get_lever1_active(r, pool: str) -> bool:
     """True if Lever 1 backpressure is currently active for this pool."""
     return bool(r.exists(f"manager:lever1:{pool}:active"))
@@ -1374,6 +1616,48 @@ def _organic_inflow_rate(r, pool: str) -> "float | None":
     if elapsed <= 0 or total < prev_total:
         return None
     return (total - prev_total) / elapsed
+
+
+_ARRIVALS_LAST_KEY = "manager:arrivals:last"
+
+
+def _record_detail_arrivals(r) -> None:
+    """
+    Add this cycle's organic detail arrivals to detail_arrivals, one row per
+    minute (docs/detail-pool-ceiling-th-design.md 3.1).
+
+    The delta of the two signal:arrivals:*:organic counters since the previous
+    sample is added to the current database minute (upsert, so the several
+    cycles inside one minute accumulate; a quiet minute gets a 0 row).  The last
+    sample lives in Redis, so a manager restart loses nothing.  First sample and
+    a counter reset (negative delta, Redis restart) write nothing for that
+    cycle.  The table is the ceiling's input only: a failure is logged and
+    never stops the cycle.
+    """
+    try:
+        total = sum(
+            int(r.get(f"signal:arrivals:{q}:organic") or 0)
+            for q in (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN)
+        )
+        prev = r.get(_ARRIVALS_LAST_KEY)
+        r.set(_ARRIVALS_LAST_KEY, total)
+        if prev is None:
+            return
+        delta = total - int(prev)
+        if delta < 0:
+            return
+        from db.db import get_conn
+        with get_conn() as conn:
+            conn.cursor().execute(
+                "INSERT INTO detail_arrivals (minute, arrivals) "
+                "VALUES (date_trunc('minute', NOW()), %s) "
+                "ON CONFLICT (minute) DO UPDATE "
+                "SET arrivals = detail_arrivals.arrivals + EXCLUDED.arrivals",
+                (delta,),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("manager: detail arrivals not recorded: %s", exc)
 
 
 def _fire_lever1(r, pool: str, depth: int, prev_depth, inflow_rate=_NO_RATE) -> None:
@@ -1487,6 +1771,42 @@ def _record_borrow(r, source_pool: str, target_pool: str, count: int) -> None:
     )
 
 
+def _unrecord_borrow(r, source_pool: str, target_pool: str, count: int) -> None:
+    """Give back `count` of the seats source lent to target (key deleted at 0)."""
+    key = f"manager:borrow:{source_pool}:{target_pool}"
+    left = max(0, int(r.get(key) or 0) - count)
+    if left:
+        r.set(key, left)
+    else:
+        r.delete(key)
+        _borrow_stable_cycles.pop(key, None)
+    logger.warning(
+        "manager: RECLAIM %d seats %s <- %s (still lent: %d)",
+        count, source_pool, target_pool, left,
+    )
+
+
+def _reclaim_lent_seats(r, pool: str, pool_sizes: dict) -> bool:
+    """
+    Take back seats `pool` lent out, never more than it lent.  Seats the
+    borrower has not filled (size below its ceiling) return at once; seats in
+    use return ONE per cycle and the borrower shrinks by one worker.  One
+    borrower per cycle.  True if seats moved.
+    """
+    lent = {t: n for t in _POOL_PRIORITY
+            if t != pool and (n := _borrow_seats_of(r, pool, t)) > 0}
+    if not lent:
+        return False
+    idle = {t: min(n, max(0, _get_worker_ceil(r, t) - pool_sizes.get(t, 0)))
+            for t, n in lent.items()}
+    t = next((t for t in lent if idle[t] > 0), next(iter(lent)))
+    _unrecord_borrow(r, pool, t, idle[t] or 1)
+    new_ceil = max(_get_worker_ceil(r, t), WORKER_FLOOR)
+    if pool_sizes.get(t, 0) > new_ceil:
+        _send_cmd(r, f"{t}:target:{new_ceil}")
+    return True
+
+
 def _return_all_borrows(r, pool: str) -> None:
     """
     Return all borrowed workers for a pool (both as source and target).
@@ -1523,11 +1843,12 @@ def _borrow_seats(r, source: str, target_pool: str, pool_sizes: dict,
       lendable  — running workers above target (transient), capped at free
       buffer    — seats above the source's peak_Nd (the safety buffer), capped at free
       headroom  — free seats that are neither buffer nor lendable
-    Detail is protected: it gives seats only while its own Lever 1 has halted its
-    inflow, and towards fullscan only the workers it runs above target - 1.
+    Detail is protected: it gives seats only after LEVER1_STABLE_REQUIRED calm
+    cycles (queue delay and oldest held job under warn x RECOVERY_STABILITY_RATIO),
+    and towards fullscan only the workers it runs above target - 1.
     """
     none = {"free": 0, "lendable": 0, "buffer": 0, "headroom": 0}
-    if source == "detail" and not _get_lever1_active(r, "detail"):
+    if source == "detail" and _detail_calm["cycles"] < LEVER1_STABLE_REQUIRED:
         return none
     adj_ceil = _get_worker_ceil(r, source)
     src_tgt  = max(workers_targets.get(source, WORKER_FLOOR), WORKER_FLOOR)
@@ -1640,8 +1961,10 @@ _borrow_stable_cycles: dict = {}
 
 def _maybe_return_borrows(r, delays: dict, warns: dict) -> None:
     """
-    Return a borrow (source <-> target) once BOTH pools have run below
-    delay_warn × RECOVERY_STABILITY_RATIO for LEVER1_STABLE_REQUIRED cycles in a row.
+    Return a borrow (source -> target) once the BORROWER has run below
+    delay_warn × RECOVERY_STABILITY_RATIO for LEVER1_STABLE_REQUIRED cycles in a
+    row, whatever the lender's state (a lender that needs its seats sooner
+    reclaims them in _check_layer2).
     Borrow state lives in manager:borrow:* (no TTL), so it survives restarts.
 
     Handoff (docs/scaling-redesign.md, "Borrowed worker handoff"): when the seats
@@ -1656,10 +1979,7 @@ def _maybe_return_borrows(r, delays: dict, warns: dict) -> None:
             if src == tgt or not _borrow_seats_of(r, src, tgt):
                 continue
             k = f"manager:borrow:{src}:{tgt}"
-            calm = all(
-                delays.get(p, 0.0) < warns.get(p, 1e9) * RECOVERY_STABILITY_RATIO
-                for p in (src, tgt)
-            )
+            calm = delays.get(tgt, 0.0) < warns.get(tgt, 1e9) * RECOVERY_STABILITY_RATIO
             n = _borrow_stable_cycles.get(k, 0) + 1 if calm else 0
             _borrow_stable_cycles[k] = n
             if n < LEVER1_STABLE_REQUIRED:
@@ -1693,6 +2013,7 @@ def _check_layer2(
     worker_ceil:      int,
     pool_sizes:       dict,
     workers_targets:  dict,
+    held_growing:     bool = False,
 ) -> None:
     """
     Layer 2 check — runs after _run_pool_cycle for each pool every cycle.
@@ -1700,13 +2021,14 @@ def _check_layer2(
     Steps:
       1. Update delay history (4-cycle rolling window for 3-of-4 check).
       2. Capacity chain when the pool is at its ceiling with delay above warn
-         and rising (3 of last 4 cycles): emergency recalc → borrow → budget
-         raise; Lever 1 fires only when none of them yields capacity.
-         Snapshots D and R before Lever 1 acts (learning loop input).
+         and rising (3 of last 4 cycles), or (detail) its held backlog growing
+         (`held_growing`): emergency recalc (includes the seat raise) → seat
+         raise → reclaim own lent seats → borrow; Lever 1 fires only when none
+         of them yields capacity and lambda * s > n.
       3. Check Lever 1 lift: LEVER1_STABLE_REQUIRED consecutive cycles below
-         WARN × RECOVERY_STABILITY_RATIO.  On lift: compute true_required and
-         update today's daily_peak (learning loop).  Borrows are returned by
-         _maybe_return_borrows, not here.
+         WARN × RECOVERY_STABILITY_RATIO (or the pool's max hold).  The demand a
+         surge revealed is already in the daily peak (needed workers), so the lift
+         learns nothing.  Borrows are returned by _maybe_return_borrows, not here.
     """
     delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
 
@@ -1717,8 +2039,9 @@ def _check_layer2(
     # sampled every cycle (not only on fire) so the rate always spans one tick.
     # Once the pool is at its ceiling with delay above warn and rising, each
     # cycle takes the first step that yields capacity:
-    #   emergency recalc of its own ceiling → borrow (lendable, buffer, one
-    #   headroom seat) → raise the worker budget toward the Postgres seat cap → Lever 1.
+    #   emergency recalc of its own ceiling → raise the worker budget toward the
+    #   Postgres seat cap → reclaim own lent seats → borrow (lendable, buffer, one
+    #   headroom seat) → Lever 1.
     # The main loop reads the arrival counter and the service-time window once per
     # cycle; a second read here would measure a near-zero interval.
     if pool in _cycle_arrival_rate:
@@ -1726,29 +2049,39 @@ def _check_layer2(
     else:
         organic_rate = _organic_inflow_rate(r, pool)
     service_s = _cycle_service_s.pop(pool, None)
-    lever1_active = _get_lever1_active(r, pool)
-    if (delay_s > delay_warn_s
-            and n_workers + _get_pending_spawns(r, pool) >= worker_ceil
-            and _is_deadlock_rising(delays, delay_s, delay_warn_s)):
+    # Detail has no Lever 1 or re-introduction (a leftover flag is ignored).
+    lever1_active = pool != "detail" and _get_lever1_active(r, pool)
+    if (n_workers + _get_pending_spawns(r, pool) >= worker_ceil
+            and ((delay_s > delay_warn_s
+                  and _is_deadlock_rising(delays, delay_s, delay_warn_s))
+                 or held_growing)):
         gained = (_emergency_recalc(r, pool, list(BOOTSTRAP_CEIL))
-                  or _attempt_borrow(r, pool, pool_sizes, workers_targets)
-                  or _raise_db_total(r, pool))
+                  or _raise_db_total(r, pool)
+                  or _reclaim_lent_seats(r, pool, pool_sizes)
+                  or _attempt_borrow(r, pool, pool_sizes, workers_targets))
         # Lever 1 halts inflow, so it only helps when inflow is what overloads the
         # pool: lambda * s > n.  Unknown lambda or s (no arrival counter, no
         # finished job yet) is not evidence of safety, so Lever 1 may fire.
         overloaded = (organic_rate is None or service_s is None
                       or organic_rate * service_s > n_workers)
-        if not gained and not lever1_active and not overloaded:
+        if not gained and pool != "detail" and not lever1_active and not overloaded:
             logger.info(
                 "manager [%s]: chain exhausted but lambda*s=%.2f <= n=%d — "
                 "backlog is draining, Lever 1 not needed",
                 pool, organic_rate * service_s, n_workers,
             )
-        if not gained and not lever1_active and overloaded:
-            if pool == "detail":
-                _fire_lever1(r, pool, depth, _prev_depth.get(pool), organic_rate)
-            else:
-                _fire_lever1(r, pool, depth, _prev_depth.get(pool))
+        if not gained and pool == "detail":
+            # Detail has no Lever 1: producers are save-only and extra jobs wait
+            # as held rows, so there is no inflow to halt.  Chain exhausted at
+            # the ceiling with the backlog still growing is an operator alert.
+            logger.error(
+                "ALERT manager [detail]: capacity chain exhausted — at ceiling %d, "
+                "delay=%.0fs (warn %.0fs), held backlog growing=%s, nothing left to "
+                "borrow; held jobs keep waiting in the DB",
+                worker_ceil, delay_s, delay_warn_s, held_growing,
+            )
+        elif not gained and not lever1_active and overloaded:
+            _fire_lever1(r, pool, depth, _prev_depth.get(pool))
             lever1_active = True
 
     # 3. Lever 1 lift check
@@ -1790,7 +2123,7 @@ def _check_layer2(
             _reintro_stable_cycles[pool] = 0
 
     # 3b. Re-introduction phase tracking (runs only when Lever 1 is not active)
-    if not lever1_active and _is_reintro_active(r, pool):
+    if not lever1_active and pool != "detail" and _is_reintro_active(r, pool):
         stable_threshold = delay_warn_s * RECOVERY_STABILITY_RATIO
         if delay_s < stable_threshold:
             _reintro_stable_cycles[pool] = _reintro_stable_cycles.get(pool, 0) + 1
@@ -2156,8 +2489,12 @@ def run_manager() -> None:
     # If conditions still warrant Lever 1: leave it active and reset fired_at to
     # now so the max-hold clock starts fresh for this manager instance.
     _startup_queue = _get_queue_metrics(r)
+    # Detail has no Lever 1 or re-introduction any more: drop flags a prior
+    # (pre-cut-over) instance left behind, then skip it below.
+    r.delete("manager:lever1:detail:active", "manager:lever1:detail:fired_at",
+             "manager:reintro:detail:active")
     for _pool in pools:
-        if not _get_lever1_active(r, _pool):
+        if _pool == "detail" or not _get_lever1_active(r, _pool):
             continue
         _sp      = scaling_params.get(_pool, _FALLBACK_PARAMS[_pool])
         _warn    = _sp.get("delay_warn_s", _FALLBACK_PARAMS[_pool]["delay_warn_s"])
@@ -2222,6 +2559,9 @@ def run_manager() -> None:
                 # ── Refresh scaling params if TTL expired ─────────────────────
                 if not r.exists("manager:scaling_params"):
                     scaling_params = _load_scaling_params(r)
+                # Detail's delay_warn_s is D from the nightly plan once one exists.
+                cycle_params = _cycle_params(r, scaling_params)
+                _drop_db_total(r)
 
                 # ── Pool sizes + queue metrics ────────────────────────────────
                 pool_sizes  = _get_pool_sizes(r)
@@ -2237,7 +2577,7 @@ def run_manager() -> None:
                     pool_busy_ms = _get_pool_busy_ms(r, pool)
                     depth        = queue_data.get(pool, {}).get("depth", 0)
                     delay_s      = queue_data.get(pool, {}).get("delay_s", 0.0)
-                    params       = scaling_params.get(pool, _FALLBACK_PARAMS[pool])
+                    params       = cycle_params.get(pool, _FALLBACK_PARAMS[pool])
                     worker_ceil  = _get_worker_ceil(r, pool)
 
                     # peak_nd: today's running peak (proxy until 28 days accumulate)
@@ -2298,6 +2638,25 @@ def run_manager() -> None:
                         pass
 
                 _check_health_alerts(r, time.time())
+                _record_detail_arrivals(r)
+
+                # ── Detail bucket parameters + held-backlog signal ─────────────
+                held_growing = False
+                try:
+                    _publish_detail_bucket(r, cycle_params)
+                    held_count, held_age = _read_held(r)
+                    held_growing = _is_held_growing(_push_held_history(r, held_count))
+                    d_warn = cycle_params["detail"]["delay_warn_s"]
+                    calm_below = d_warn * RECOVERY_STABILITY_RATIO
+                    if (queue_data.get("detail", {}).get("delay_s", 0.0) < calm_below
+                            and held_age < calm_below):
+                        _detail_calm["cycles"] += 1
+                    else:
+                        _detail_calm["cycles"] = 0
+                except Exception as exc:
+                    _detail_calm["cycles"] = 0
+                    logger.error("manager: detail bucket/held update failed: %s", exc,
+                                 exc_info=True)
 
                 # ── Layer 2 check (after all Layer 0 decisions are made) ───────
                 for pool in pools:
@@ -2305,11 +2664,12 @@ def run_manager() -> None:
                         n_workers   = pool_sizes.get(pool, 0)
                         depth       = queue_data.get(pool, {}).get("depth", 0)
                         delay_s     = queue_data.get(pool, {}).get("delay_s", 0.0)
-                        params      = scaling_params.get(pool, _FALLBACK_PARAMS[pool])
+                        params      = cycle_params.get(pool, _FALLBACK_PARAMS[pool])
                         worker_ceil = _get_worker_ceil(r, pool)
                         _check_layer2(
                             r, pool, n_workers, delay_s, depth,
                             params, worker_ceil, pool_sizes, all_workers_targets,
+                            held_growing=(pool == "detail" and held_growing),
                         )
                     except Exception as exc:
                         logger.error(
@@ -2322,7 +2682,7 @@ def run_manager() -> None:
                     _maybe_return_borrows(
                         r,
                         {p: queue_data.get(p, {}).get("delay_s", 0.0) for p in pools},
-                        {p: scaling_params.get(p, _FALLBACK_PARAMS[p]).get(
+                        {p: cycle_params.get(p, _FALLBACK_PARAMS[p]).get(
                             "delay_warn_s", _FALLBACK_PARAMS[p]["delay_warn_s"])
                          for p in pools},
                     )

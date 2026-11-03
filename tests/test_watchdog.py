@@ -844,6 +844,64 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
                               backpressure_threshold_s=300.0, detail_proc=200)
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
 
+    def _head_snap(self, **extra):
+        snap = {
+            "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
+            "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
+            "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+        }
+        snap.update(extra)
+        return snap
+
+    def test_detail_head_moved_is_overloaded_not_stalled(self):
+        """Depth unchanged but the head changed: served, so no ERROR (report only)."""
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_head="old")
+        with patch("workers.watchdog._detail_queue_head", return_value="new"):
+            issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.WARNING)
+
+    def test_detail_head_unchanged_is_stalled_error(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_head="same")
+        with patch("workers.watchdog._detail_queue_head", return_value="same"):
+            issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def test_detail_head_previous_missing_falls_back_to_depth_delta(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_depth=80)       # depth fell 80 -> 60: draining
+        with patch("workers.watchdog._detail_queue_head", return_value="new"):
+            issues, _ = self._run(snap=snap, detail_adp=60, detail_adp_delay_s=60.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
+
+    def _held(self, oldest_id, ts=None):
+        return {"count": 5, "oldest_age_s": 120.0, "oldest_id": oldest_id,
+                "ts": self._NOW if ts is None else ts}
+
+    def test_held_oldest_unchanged_warns(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(held_head=7)
+        with patch("workers.watchdog._held_state", return_value=self._held(7)):
+            issues, _ = self._run(snap=snap)
+        self.assertEqual(self._level(issues, "detail held"), Issue.WARNING)
+
+    def test_held_oldest_changed_is_ok(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(held_head=7)
+        with patch("workers.watchdog._held_state", return_value=self._held(9)):
+            issues, _ = self._run(snap=snap)
+        self.assertEqual(self._level(issues, "detail held"), Issue.OK)
+
+    def test_held_absent_or_no_previous_reports_nothing(self):
+        with patch("workers.watchdog._held_state", return_value=None):
+            issues, _ = self._run(snap=self._head_snap(held_head=7))
+        self.assertIsNone(self._level(issues, "detail held"))
+        with patch("workers.watchdog._held_state", return_value=self._held(7)):
+            issues, _ = self._run(snap=self._head_snap())
+        self.assertIsNone(self._level(issues, "detail held"))
+
     def test_detail_queue_non_default_threshold_delay_just_over_is_error(self):
         """Non-default threshold: delay just above threshold → ERROR."""
         from workers.watchdog import Issue

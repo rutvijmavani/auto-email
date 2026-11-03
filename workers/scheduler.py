@@ -60,14 +60,12 @@ from config import (
     REDIS_BAND_THRESHOLDS,
     REDIS_CONCURRENCY_LIMIT_PREFIX,
     REDIS_DETAIL_FULLSCAN,
-    DETAIL_QUEUE_MAX_FULLSCAN,
     ADAPTIVE_DEFAULT_INTERVAL,
     SCAN_QUEUE,
     SCHEDULER_TICK_SECS,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
     SCHEDULER_HEARTBEAT_TTL,
-    DETAIL_QUEUE_MAX_ADAPTIVE,
     ADAPTIVE_CALIBRATION_LOOKBACK_DAYS,
     ADAPTIVE_MIN_COMPANIES_CALIBRATE,
     MONITOR_MAX_WORKERS,
@@ -1445,16 +1443,6 @@ def adaptive_loop() -> None:
                 # or outage `continue` branches don't let the 15s TTL expire.
                 _write_scheduler_heartbeat(r, "adaptive", _hw_dispatched)
 
-                # ── Backpressure: detail queue overloaded ─────────────────────
-                depth = r.llen(REDIS_DETAIL_ADAPTIVE)
-                if depth > DETAIL_QUEUE_MAX_ADAPTIVE:
-                    r.zadd(REDIS_POLL_ADAPTIVE, {company: now + 30})
-                    logger.debug(
-                        "adaptive_loop: backpressure company=%r queue_depth=%d",
-                        company, depth,
-                    )
-                    continue
-
                 # ── Phase 10: outage mode check ───────────────────────────────
                 dc_key   = _get_dc_key_for_company(company)
                 platform = dc_key.split("_")[0] if "_" in dc_key else dc_key
@@ -1661,17 +1649,6 @@ def fullscan_loop() -> None:
                 # Refresh mid-loop so a large due-list doesn't let the TTL
                 # expire between the top-of-loop write and the last dispatch.
                 _write_scheduler_heartbeat(r, "fullscan", _hw_dispatched)
-
-                # Backpressure: fullscan detail queue overloaded
-                depth = r.llen(REDIS_DETAIL_FULLSCAN)
-                if depth > DETAIL_QUEUE_MAX_FULLSCAN:
-                    r.zadd(REDIS_POLL_FULLSCAN, {company: now + 60})
-                    logger.debug(
-                        "fullscan_loop: backpressure company=%r "
-                        "fullscan_queue_depth=%d",
-                        company, depth,
-                    )
-                    continue
 
                 dc_key = _get_dc_key_for_company(company)
 
@@ -2312,11 +2289,50 @@ def _add_one_worker(worker_type: str, ceil_: int) -> bool:
     return True
 
 
+def _busy_since_by_pid(r, worker_type: str) -> dict:
+    """
+    pid -> busy_since (start of the job in progress, None when idle), read from the
+    local workers' heartbeats worker:alive:{type}_worker:{host}:{pid}.  A pid with
+    no readable heartbeat is absent (the reading is up to one beat old).
+    """
+    out = {}
+    for key in r.scan_iter(match=f"worker:alive:{worker_type}_worker:*", count=50):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            pid = int((key.decode() if isinstance(key, bytes) else key).rsplit(":", 1)[1])
+            out[pid] = json.loads(raw).get("busy_since")
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _pick_removal_index(pids: list, stalled: set, busy_since: dict) -> int:
+    """
+    Index of the worker to remove: a stalled one first, else an idle one, else the
+    busy one whose job started most recently.  Latest list entry wins ties; a pid
+    with no heartbeat reading counts as busy with the oldest start, so it is only
+    picked when nothing better exists.
+    """
+    for i in range(len(pids) - 1, -1, -1):
+        if pids[i] in stalled:
+            return i
+    for i in range(len(pids) - 1, -1, -1):
+        if pids[i] in busy_since and busy_since[pids[i]] is None:
+            return i
+    return max(
+        range(len(pids)),
+        key=lambda i: (busy_since.get(pids[i]) or 0.0, i),
+    )
+
+
 def _remove_one_worker(worker_type: str, floor_: int) -> bool:
     """
     Remove one worker from the given pool if above its floor.
 
-    Signals the LAST entry to finish its current job and exit cleanly.
+    Signals one entry to finish its current job and exit cleanly: a stalled
+    worker first, then an idle one, then the busy one whose job started last.
     The entry is removed from the pool list immediately so the liveness
     check doesn't spawn a replacement for it.
 
@@ -2335,22 +2351,21 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
     else:
         pool = _scan_pool if worker_type == "scan" else _detail_pool
 
-    # Redis is read before taking the lock; a stalled worker is removed first.
+    # Redis is read before taking the lock.  Order of removal: stalled, then idle,
+    # then busy (the job started most recently, so the least work is thrown away).
     try:
         with _pool_lock:
             _snap = list(pool)
-        _sp = _stalled_pids(get_redis(), worker_type, _snap)
+        _r = get_redis()
+        _sp = _stalled_pids(_r, worker_type, _snap)
+        _busy = _busy_since_by_pid(_r, worker_type)
     except Exception:
-        _sp = set()
+        _sp, _busy = set(), {}
 
     with _pool_lock:
         if len(pool) <= floor_:
             return False
-        _idx = len(pool) - 1
-        for _i in range(len(pool) - 1, -1, -1):
-            if pool[_i][0].pid in _sp:
-                _idx = _i
-                break
+        _idx = _pick_removal_index([p.pid for p, _e in pool], _sp, _busy)
         proc, event = pool.pop(_idx)
         _worker_spawn_times.pop(proc.pid, None)   # prevent stale entry accumulation
 

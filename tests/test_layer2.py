@@ -356,7 +356,8 @@ class TestAttemptBorrow(unittest.TestCase):
 
     def setUp(self):
         self.r = _make_redis()
-        # Reset lever1 state so detail can never lend unless its Lever 1 is active
+        # Detail lends only after LEVER1_STABLE_REQUIRED calm cycles
+        mgr._detail_calm["cycles"] = 0
         for pool in ("scan", "detail", "fullscan"):
             mgr._lever1_stable_cycles[pool] = 0
 
@@ -381,9 +382,9 @@ class TestAttemptBorrow(unittest.TestCase):
         borrow_key = self.r._store.get("manager:borrow:scan:fullscan")
         self.assertEqual(int(borrow_key), 2)
 
-    def test_does_not_borrow_from_detail_unless_lever1_active(self):
+    def test_does_not_borrow_from_detail_unless_calm(self):
         # fullscan deadlocked; scan has 0 lendable; detail has 2 lendable
-        # but detail Lever 1 is NOT active → detail must not be borrowed from
+        # but detail has not been calm for LEVER1_STABLE_REQUIRED cycles
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(scan=5, detail=6),
@@ -392,9 +393,9 @@ class TestAttemptBorrow(unittest.TestCase):
         detail_borrow = self.r._store.get("manager:borrow:detail:fullscan")
         self.assertIsNone(detail_borrow)
 
-    def test_borrows_from_detail_when_lever1_active(self):
-        # detail Lever 1 active → detail can be borrowed from
-        self.r._store["manager:lever1:detail:active"] = "1"
+    def test_borrows_from_detail_when_calm(self):
+        # detail calm for LEVER1_STABLE_REQUIRED cycles → detail can be borrowed from
+        mgr._detail_calm["cycles"] = mgr.LEVER1_STABLE_REQUIRED
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(scan=5, detail=6),
@@ -475,7 +476,6 @@ class TestNeededWorkersAndServiceTime(unittest.TestCase):
     def setUp(self):
         self.r = _make_redis()
         mgr._prev_svc_snap.clear()
-        mgr._svc_window.clear()
         self.params = {"fetch_p75": 40.0, "delay_warn_s": 1800.0}
 
     def _beat(self, key, ts, busy_ms, processed, since=None):
@@ -505,6 +505,29 @@ class TestNeededWorkersAndServiceTime(unittest.TestCase):
         self._beat(k, 160.0, 0, 0)
         self.assertIsNone(mgr._get_pool_service_time(self.r, "detail"))
 
+    def test_zero_finished_cycle_is_skipped_and_busy_carried(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 10_000, 5)                                   # 10 s busy, 5 done
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        # 30 s busy and nothing finished: not a sample, s unchanged
+        self._beat(k, 190.0, 40_000, 5)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        # 5 jobs finish in 10 s busy: the carried 30 s is charged to this cycle
+        self._beat(k, 220.0, 50_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), (10 + 40) / 10)
+
+    def test_window_survives_manager_restart(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 20_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        mgr._prev_svc_snap.clear()                                        # restart: odometers re-seen
+        self._beat(k, 220.0, 20_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+
     def test_service_time_window_keeps_last_cycles_only(self):
         k = "worker:alive:detail_worker:h:1"
         ts, busy, done = 100.0, 0, 0
@@ -516,6 +539,40 @@ class TestNeededWorkersAndServiceTime(unittest.TestCase):
             self._beat(k, ts, busy, done)
             s = mgr._get_pool_service_time(self.r, "detail")
         self.assertAlmostEqual(s, 1.0)
+
+    def _record(self, adaptive, fullscan):
+        from unittest.mock import MagicMock, patch
+        self.r._store["signal:arrivals:queue:detail:adaptive:organic"] = adaptive
+        self.r._store["signal:arrivals:queue:detail:fullscan:organic"] = fullscan
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        with patch("db.db.get_conn", return_value=conn), \
+             patch.object(mgr, "REDIS_DETAIL_ADAPTIVE", "queue:detail:adaptive"), \
+             patch.object(mgr, "REDIS_DETAIL_FULLSCAN", "queue:detail:fullscan"):
+            mgr._record_detail_arrivals(self.r)
+        return conn
+
+    def test_arrivals_first_sample_writes_nothing_then_delta_is_upserted(self):
+        conn = self._record(10, 5)
+        conn.cursor.return_value.execute.assert_not_called()
+        conn = self._record(14, 8)                       # +4 adaptive, +3 fullscan
+        args = conn.cursor.return_value.execute.call_args.args
+        self.assertEqual(args[1], (7,))
+        self.assertIn("ON CONFLICT (minute)", args[0])
+        conn.commit.assert_called_once()
+
+    def test_arrivals_counter_reset_skips_that_cycle_and_resumes(self):
+        self._record(10, 5)
+        conn = self._record(2, 1)                        # Redis restart: counter went back
+        conn.cursor.return_value.execute.assert_not_called()
+        conn = self._record(4, 1)                        # +2 from the new baseline
+        self.assertEqual(conn.cursor.return_value.execute.call_args.args[1], (2,))
+
+    def test_arrivals_write_failure_never_raises(self):
+        from unittest.mock import patch
+        self.r._store["manager:arrivals:last"] = 0
+        with patch("db.db.get_conn", side_effect=RuntimeError("db down")):
+            mgr._record_detail_arrivals(self.r)          # must not raise
 
     def test_target_uses_arrival_rate_and_service_time(self):
         # depth 0, lambda 2/s, s 3 s → ceil(2*3) = 6 workers needed
@@ -715,19 +772,32 @@ class TestCheckLayer2Integration(unittest.TestCase):
         )
         self.assertFalse(mgr._get_lever1_active(self.r, "detail"))
 
-    def test_lever1_fires_when_arrivals_exceed_workers(self):
-        # lambda * s = 8/s * 2s = 16 > n=10
+    def test_detail_never_fires_lever1_and_alerts_when_chain_exhausted(self):
+        # lambda * s = 8/s * 2s = 16 > n=10: Lever 1 would fire for scan/fullscan,
+        # but detail has none (save-only producers) — it raises an ALERT instead.
         self._exhaust_chain_for("detail")
         mgr._cycle_arrival_rate["detail"] = 8.0
         mgr._cycle_service_s["detail"] = 2.0
         self._rising_history("detail")
+        with self.assertLogs("workers.manager", level="ERROR") as logs:
+            mgr._check_layer2(
+                self.r, "detail",
+                n_workers=10, delay_s=1900.0, depth=50,
+                params=self.params, worker_ceil=10,
+                pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
+            )
+        self.assertFalse(mgr._get_lever1_active(self.r, "detail"))
+        self.assertTrue(any("ALERT manager [detail]" in m for m in logs.output))
+
+    def test_detail_ignores_leftover_lever1_flag(self):
+        self.r._store["manager:lever1:detail:active"] = "1"
         mgr._check_layer2(
             self.r, "detail",
-            n_workers=10, delay_s=1900.0, depth=50,
+            n_workers=3, delay_s=0.0, depth=0,
             params=self.params, worker_ceil=10,
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
-        self.assertTrue(mgr._get_lever1_active(self.r, "detail"))
+        self.assertEqual(mgr._lever1_stable_cycles.get("detail", 0), 0)
 
     def test_borrows_kept_on_lever1_lift(self):
         self.r._store["manager:lever1:scan:active"] = "1"

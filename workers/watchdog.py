@@ -62,6 +62,7 @@ Every WATCHDOG_INTERVAL_S (5 min):
   pending_work.md Phase 3 — Reliability Layer
 """
 
+import hashlib
 import html as _html_lib
 import json
 import math
@@ -80,6 +81,7 @@ from typing import Optional
 
 from workers.redis_client import get_redis, ping
 from workers.queue_stamp import payload_wait_s
+from workers.detail_drainer import HELD_KEY
 from config import (
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
@@ -133,6 +135,7 @@ _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
 _UNIT_MANAGER         = "recruiter-manager"
 _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
+_UNIT_DETAIL_DRAINER  = "recruiter-detail-drainer"
 
 
 # ─────────────────────────────────────────
@@ -153,6 +156,7 @@ HEARTBEAT_DEAD_AFTER = {
     "scan_worker":     45,
     "detail_worker":   45,
     "fullscan_worker":    1900,   # scans can legitimately take 30 min
+    "detail_drainer":       60,   # wakes every s/n seconds (a few s); heartbeat TTL 30s
     "h1b_llm_worker":       60,   # interval=30s → TTL=90s; 60s < TTL so STALE branch is reachable
     "email_processor":      60,   # interval=30s → same reasoning as h1b_llm_worker
 }
@@ -277,6 +281,12 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "description": f"Restarted {_UNIT_MANAGER} via systemd (service was inactive/failed)",
                 "foreground":  True,
             },
+            f"systemd_{_UNIT_DETAIL_DRAINER}": {
+                "cmd_args":    _systemd_restart_cmd(_UNIT_DETAIL_DRAINER),
+                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
+                "description": f"Restarted {_UNIT_DETAIL_DRAINER} via systemd (service was inactive/failed or heartbeat stale)",
+                "foreground":  True,
+            },
             f"systemd_{_UNIT_H1B_LLM_WORKER}": {
                 "cmd_args":    _systemd_restart_cmd(_UNIT_H1B_LLM_WORKER),
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
@@ -369,6 +379,11 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.manager"],
                 "log_file":    f"{_LOG_DIR}/manager.log",
                 "description": "Restarted manager process (subprocess fallback)",
+            },
+            f"systemd_{_UNIT_DETAIL_DRAINER}": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.detail_drainer"],
+                "log_file":    f"{_LOG_DIR}/detail_drainer.log",
+                "description": "Restarted detail_drainer process (subprocess fallback)",
             },
             f"systemd_{_UNIT_H1B_LLM_WORKER}": {
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.h1b_llm_worker"],
@@ -857,6 +872,46 @@ def check_h1b_llm_worker_heartbeat(r) -> list:
     return issues
 
 
+def check_detail_drainer_heartbeat(r) -> list:
+    """
+    Detail drainer liveness via worker:alive:detail_drainer:*.
+
+    A dead or hung drainer silently stops ALL detail admission (held rows are
+    never released), so a missing or stale heartbeat is an ERROR; the heal is a
+    systemd restart.  Runs independently of the scheduler checks.
+    """
+    now = time.time()
+    dead_after = HEARTBEAT_DEAD_AFTER["detail_drainer"]
+    fix = f"sudo {_SYSTEMCTL} restart {_UNIT_DETAIL_DRAINER}"
+    atype = f"systemd_{_UNIT_DETAIL_DRAINER}"
+    try:
+        newest = 0.0
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:detail_drainer:*", count=50)
+            for key in keys:
+                try:
+                    newest = max(newest, float(json.loads(r.get(key))["ts"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if cursor == 0:
+                break
+        if not newest:
+            return [Issue(Issue.ERROR, "worker:detail_drainer",
+                          "detail_drainer heartbeat missing — held detail jobs are not "
+                          "being released", fix, alert_type=atype)]
+        age_s = now - newest
+        if age_s > dead_after:
+            return [Issue(Issue.ERROR, "worker:detail_drainer",
+                          f"detail_drainer heartbeat {age_s:.0f}s old (STALE — process "
+                          f"may be hung)", fix, alert_type=atype)]
+        return [Issue(Issue.OK, "worker:detail_drainer",
+                      f"heartbeat {age_s:.0f}s ago")]
+    except Exception as exc:
+        return [Issue(Issue.WARNING, "worker:detail_drainer",
+                      f"heartbeat check failed: {exc}")]
+
+
 # ─────────────────────────────────────────
 # QUEUE HEALTH — HELPERS
 # ─────────────────────────────────────────
@@ -901,6 +956,36 @@ def _detail_queue_delay_s(r, queue_key: str) -> float | None:
         if not raw:
             return None
         return payload_wait_s(raw, time.time())
+    except Exception:
+        return None
+
+
+def _detail_queue_head(r, queue_key: str) -> Optional[str]:
+    """
+    Identity of the oldest item in a detail LIST queue (digest of its payload), or
+    None when the queue is empty/unreadable.  Workers pop the tail, so the same
+    head two cycles apart means nothing was served; a changed head means the
+    queue is moving, however long it is.
+    """
+    try:
+        raw = r.lindex(queue_key, -1)
+        if not raw:
+            return None
+        return hashlib.md5(raw if isinstance(raw, bytes) else raw.encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _held_state(r, now: float) -> Optional[dict]:
+    """Drainer-published held figures {count, oldest_age_s, oldest_id}, or None if absent/stale."""
+    try:
+        raw = r.get(HELD_KEY)
+        if not raw:
+            return None
+        held = json.loads(raw)
+        if now - float(held["ts"]) > WATCHDOG_SNAPSHOT_TTL:
+            return None
+        return held
     except Exception:
         return None
 
@@ -1336,8 +1421,12 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     detail_fs_depth  = r.llen(REDIS_DETAIL_FULLSCAN)
     detail_adp_delay = _detail_queue_delay_s(r, REDIS_DETAIL_ADAPTIVE)
     detail_fs_delay  = _detail_queue_delay_s(r, REDIS_DETAIL_FULLSCAN)
+    detail_adp_head  = _detail_queue_head(r, REDIS_DETAIL_ADAPTIVE)
+    detail_fs_head   = _detail_queue_head(r, REDIS_DETAIL_FULLSCAN)
+    held             = _held_state(r, now)
+    held_head        = held["oldest_id"] if held and held.get("count") else None
 
-    scan_proc        = _worker_processed(r, "scan_worker")
+    scan_proc       = _worker_processed(r, "scan_worker")
     fs_proc          = _worker_processed(r, "fullscan_worker")
     detail_proc      = _worker_processed(r, "detail_worker")
 
@@ -1367,6 +1456,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 "fs_head_s":        fs_head_s,
                 "detail_adp_depth": detail_adp_depth,
                 "detail_fs_depth":  detail_fs_depth,
+                "detail_adp_head":  detail_adp_head,
+                "detail_fs_head":   detail_fs_head,
+                "held_head":        held_head,
                 "scan_proc":        scan_proc,
                 "fs_proc":          fs_proc,
                 "detail_proc":      detail_proc,
@@ -1429,7 +1521,10 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     prev_fs_head_s   = snap.get("fs_head_s")
     prev_detail_adp  = snap.get("detail_adp_depth", 0)
     prev_detail_fs   = snap.get("detail_fs_depth", 0)
-    prev_scan_proc   = snap.get("scan_proc")
+    prev_detail_adp_head = snap.get("detail_adp_head")
+    prev_detail_fs_head  = snap.get("detail_fs_head")
+    prev_held_head       = snap.get("held_head")
+    prev_scan_proc  = snap.get("scan_proc")
     prev_fs_proc     = snap.get("fs_proc")
     prev_detail_proc = snap.get("detail_proc")
 
@@ -1533,17 +1628,26 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     )
 
     delay_warn_s = _backpressure_threshold(r, "detail")
-    for label, atype, depth, prev_depth, delay_s in [
+    for label, atype, depth, prev_depth, delay_s, head, prev_head in [
         ("queue:detail:adaptive", "queue_detail_adaptive",
-         detail_adp_depth, prev_detail_adp, detail_adp_delay),
+         detail_adp_depth, prev_detail_adp, detail_adp_delay,
+         detail_adp_head, prev_detail_adp_head),
         ("queue:detail:fullscan", "queue_detail_fullscan",
-         detail_fs_depth,  prev_detail_fs,  detail_fs_delay),
+         detail_fs_depth,  prev_detail_fs,  detail_fs_delay,
+         detail_fs_head, prev_detail_fs_head),
     ]:
         delta    = depth - prev_depth
-        # Use only this queue's own depth delta to determine if it is draining.
+        # Use only this queue's own state to determine if it is being served.
         # The pool-wide detail_proc_delta is not queue-specific: workers processing
         # adaptive jobs would make a growing fullscan queue falsely appear as draining.
-        draining = delta < 0
+        # Head tracking: a changed head means the oldest job was served since the
+        # last cycle, so a long or growing queue is overloaded, not stalled (report
+        # only, no restart).  Without a previous head (old snapshot) fall back to
+        # the depth delta.
+        if prev_head is not None and head is not None:
+            draining = head != prev_head
+        else:
+            draining = delta < 0
 
         if depth == 0:
             issues.append(Issue(Issue.OK, label, f"depth=0 — idle{proc_note}"))
@@ -1578,6 +1682,19 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 issues.append(Issue(Issue.OK, label,
                     f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
                     f"small backlog, {direction}{proc_note}"))
+
+    # Held rows (saved, not yet admitted by the drainer).  The oldest held id
+    # changing means the drainer is releasing; the same id two cycles running with
+    # fresh figures means it is not.  Report only: the drainer heartbeat check
+    # owns the restart.  Absent/stale figures are reported by that check.
+    if held_head is not None and prev_held_head is not None:
+        if held_head == prev_held_head:
+            issues.append(Issue(Issue.WARNING, "detail held",
+                f"{held['count']:,} held, oldest {held['oldest_age_s']:.0f}s — "
+                f"oldest held job unchanged since last cycle (drainer not releasing)"))
+        else:
+            issues.append(Issue(Issue.OK, "detail held",
+                f"{held['count']:,} held, oldest {held['oldest_age_s']:.0f}s — releasing"))
 
     # ── 9. PEL checks + DLQ depth ────────────────────────────────────────────
     _check_dlq_health(r, issues)
@@ -1624,7 +1741,8 @@ def check_coverage(r) -> list:
             stuck  = conn.execute("""
                 SELECT COUNT(*) AS c FROM job_postings
                 WHERE status = 'pending_detail'
-                  AND created_at < NOW() - INTERVAL '1 hour'
+                  AND pushed_at IS NOT NULL
+                  AND pushed_at < NOW() - INTERVAL '1 hour'
             """).fetchone()["c"]
         finally:
             conn.close()
@@ -1732,6 +1850,7 @@ def check_systemd_services() -> list:
         (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_MANAGER,       True),    # standalone daemon; healable via reset-failed + restart
+        (_UNIT_DETAIL_DRAINER, True),   # sole writer of held detail jobs to the queue; healable
         (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker (Gemini API — no llama-server dependency)
     ]:
         try:
@@ -1795,6 +1914,7 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     issues.extend(check_systemd_services())
     issues.extend(check_worker_heartbeats(r))
     issues.extend(check_h1b_llm_worker_heartbeat(r))
+    issues.extend(check_detail_drainer_heartbeat(r))
     issues.extend(check_queue_health(r, persist_snapshot=persist_snapshot))
     issues.extend(check_bloom_health(r))
     issues.extend(check_coverage(r))

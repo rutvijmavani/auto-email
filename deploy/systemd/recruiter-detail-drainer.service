@@ -1,0 +1,51 @@
+[Unit]
+Description=Recruiter Detail Drainer (token-bucket admission of held detail jobs)
+Documentation=https://github.com/rutvijmavani/auto-email
+After=network-online.target
+Wants=network-online.target
+
+# Reads the bucket parameters the manager publishes to Redis and releases held
+# pending_detail rows from Postgres.
+Wants=redis.service
+After=redis.service
+Wants=postgresql.service
+After=postgresql.service
+
+# Start before the watchdog so it does not false-alarm on boot.
+Before=recruiter-watchdog.service
+
+# ── Escalation — repeated rapid failures ─────────────────────────────────────
+StartLimitBurst=5
+StartLimitIntervalSec=300s
+OnFailure=recruiter-pipeline-alert@%p.service
+
+[Service]
+Type=simple
+User=opc
+Group=opc
+WorkingDirectory=/home/opc/mail
+EnvironmentFile=/home/opc/mail/.env
+
+ExecStart=/home/opc/mail/venv/bin/python -m workers.detail_drainer
+
+# ── Restart policy ────────────────────────────────────────────────────────────
+# Stateless (bucket tokens live in Redis, held rows in Postgres); a release that
+# was interrupted after pushed_at was set is re-pushed by rebuild_detail_queue.
+Restart=always
+RestartSec=5s
+
+# ── Sandboxing ───────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=tmpfs
+BindPaths=/home/opc/mail
+ReadWritePaths=/home/opc/mail
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=recruiter-detail-drainer
+
+[Install]
+WantedBy=multi-user.target

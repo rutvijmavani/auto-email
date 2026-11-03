@@ -252,7 +252,7 @@ class TestHysteresis(unittest.TestCase):
         """scale_up fires on the 2nd consecutive cycle meeting conditions, not the 1st."""
         _reset_cycle_state()
         pool_busy_ms = int(0.90 * 3 * 60 * 1000)  # 90% util
-        decisions = self._cycle_n(3, pool_busy_ms, depth=25, delay_s=35, n_workers=3)
+        decisions = self._cycle_n(3, pool_busy_ms, depth=60, delay_s=35, n_workers=3)
         self.assertNotEqual(decisions[0], "scale_up")  # first cycle: pending
         self.assertIn("scale_up", decisions[1:])       # fires by cycle 2 or 3
 
@@ -274,8 +274,8 @@ class TestHysteresis(unittest.TestCase):
         pool_busy_ms = int(0.90 * 3 * 60 * 1000)
         r = _make_redis()
         # Cycle 1: high delay → streak=1
-        # depth=25 → workers_target=5, avoids demand-urgent (5 < ceil×0.75=7.5)
-        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 25, 35, self.PARAMS, 10, peak_nd=5)
+        # depth=60 → workers_target=5, avoids demand-urgent (5 < ceil×0.75=7.5)
+        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 60, 35, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(mgr._scale_up_cycles["scan"], 1)
         # Cycle 2: delay drops → hold → resets streak
         mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 0, 5, self.PARAMS, 10, peak_nd=5)
@@ -301,8 +301,8 @@ class TestHysteresis(unittest.TestCase):
         pool_busy_ms_high = int(0.90 * 3 * 60 * 1000)
         pool_busy_ms_low  = int(0.05 * 5 * 60 * 1000)
         r = _make_redis()
-        # Build up-streak; depth=25 → workers_target=5, avoids demand-urgent (5 < ceil×0.75)
-        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms_high, 25, 35, self.PARAMS, 10, peak_nd=5)
+        # Build up-streak; depth=60 → workers_target=5, avoids demand-urgent (5 < ceil×0.75)
+        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms_high, 60, 35, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(mgr._scale_up_cycles["scan"], 1)
         # Switch to down-eligible conditions → up counter must reset
         mgr._run_pool_cycle(r, "scan", 5, pool_busy_ms_low, 0, 5, self.PARAMS, 10, peak_nd=5)
@@ -368,8 +368,8 @@ class TestUrgentMode(unittest.TestCase):
         # Fire urgent (delay spike)
         mgr._run_pool_cycle(r, "scan", 3, 0, 50, 46.0, self.PARAMS, 10, peak_nd=5)
         # Delay eases but still understaffed (3 workers, target=5) → urgent_hold
-        # depth=25 → workers_target=5, delay=35 → both urgent triggers off → urgent_hold
-        d, _ = mgr._run_pool_cycle(r, "scan", 3, 0, 25, 35.0, self.PARAMS, 10, peak_nd=5)
+        # depth=60 → workers_target=5, delay=35 → both urgent triggers off → urgent_hold
+        d, _ = mgr._run_pool_cycle(r, "scan", 3, 0, 60, 35.0, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(d, "urgent_hold")
 
     def test_urgent_resets_streak_counters(self):

@@ -720,7 +720,8 @@ def run_health_check() -> int:
             stuck = conn.execute("""
                 SELECT COUNT(*) AS c FROM job_postings
                 WHERE status = 'pending_detail'
-                  AND created_at < NOW() - INTERVAL '1 hour'
+                  AND pushed_at IS NOT NULL
+                  AND pushed_at < NOW() - INTERVAL '1 hour'
             """).fetchone()["c"]
         finally:
             conn.close()

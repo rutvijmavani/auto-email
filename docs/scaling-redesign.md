@@ -15,8 +15,8 @@ The current system uses five absolute depth thresholds spread across two files w
 | `DETAIL_QUEUE_WARN` | 100 | `watchdog.py` (hardcoded) | Warn level |
 | `DETAIL_QUEUE_ALERT` | 500 | `watchdog.py` (hardcoded) | CRITICAL trigger → restart scheduler |
 | `DETAIL_QUEUE_HIGH_WATERMARK` | 1000 | `config.py` → `scheduler.py` | Layer 3 add-worker trigger |
-| `DETAIL_QUEUE_MAX_FULLSCAN` | 2000 | `config.py` → `fullscan.py` | Fullscan backpressure (actually pauses) |
-| `DETAIL_QUEUE_MAX_ADAPTIVE` | 5000 | `config.py` → `scan_worker.py` | Adaptive backpressure (LOGS ONLY — does not pause) |
+| `DETAIL_QUEUE_MAX_FULLSCAN` | 2000 | REMOVED 2026-11-02 (TH step 9) | Was fullscan backpressure; replaced by held-job drainer |
+| `DETAIL_QUEUE_MAX_ADAPTIVE` | 5000 | REMOVED 2026-11-02 (TH step 9) | Was adaptive log-only backpressure; replaced by held-job drainer |
 
 **Why this fails:**
 
@@ -168,20 +168,17 @@ pool_capacity_ms  = n_workers * cycle_s * 1000
 pool_utilization  = pool_busy_ms / pool_capacity_ms       # 0.0 – 1.0
 
 # ── Drain rate ─────────────────────────────────────────────────────────────
-time_left         = DELAY_WARN_S - actual_delay_s          # seconds left before WARN
-drain_rate        = queue_depth / max(time_left, 1)        # jobs/s to clear queue in time
+# Fixed horizon W = DELAY_WARN_S (changed 2026-10-29, bug FB): the old time_left =
+# WARN - delay made the target explode as delay neared WARN and fed that raw value
+# into the daily peak.  Lateness is the urgent branch's job (delay >= WARN x 0.75),
+# so there is no delay/WARN multiplier either (it counted the same backlog twice).
+drain_rate        = queue_depth / DELAY_WARN_S + arrival_rate   # jobs/s to clear queue within W
 
 workers_target    = math.ceil(drain_rate * est_fetch_s)
-# NOTE: amplification below is vestigial since urgent fires at WARN×0.75.
-# When delay > WARN, time_left=1 already drives drain_rate to queue_depth and
-# workers_target to a huge number that clamps to ceil regardless of the multiplier.
-# Kept for safety in edge cases where time_left somehow stays > 1 past WARN.
-if actual_delay_s > DELAY_WARN_S:                          # already past WARN → amplify
-    workers_target = math.ceil(workers_target * (actual_delay_s / DELAY_WARN_S))
 workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
 
 # >>> SCAN AND FULLSCAN (changed 2026-10-29): the block above is the DETAIL formula only.
-# Scan and fullscan replace lines 171-174 with work-seconds from per-company data:
+# Scan and fullscan replace the drain-rate lines above with work-seconds from per-company data:
 #   needed  = ceil( backlog + steady )
 #   backlog = sum over late companies c of min( d_c / H , 1 )     # H = pool delay_warn_s (fixed, not time_left)
 #   steady  = ( sum over ALL companies c of d_c / (d_c + T_c) ) / MANAGER_SCALE_UP_UTIL
@@ -1406,7 +1403,7 @@ The only genuinely useful demand-reduction lever. Halting inflow gives existing 
 
 **Slow dispatch and interval multipliers are NOT used.** They only affect future scheduling — companies already sitting overdue in the ZSET are completely unaffected. They defer the problem, not fix it.
 
-*Detail:*
+*Detail:* **SUPERSEDED 2026-11-02 (TH steps 8-9, see `docs/detail-pool-ceiling-th-design.md`).** Detail has no Lever 1 or reintro. Producers are save-only (`pushed_at IS NULL` = held); `workers/detail_drainer.py` releases held rows at the ceiling rate via a token bucket. When the capacity chain is exhausted for detail the manager logs `ALERT manager [detail]: capacity chain exhausted`. Scan and fullscan keep Lever 1. The block below is the old design, kept for history.
 ```
 Both scan_worker AND fullscan_worker pause before pushing to detail queues:
   scan_worker  → pauses push to queue:detail:adaptive
@@ -1702,7 +1699,7 @@ Source order is fullscan, then scan, then detail. Lifting Lever 1 does not retur
 
 **Stage B inputs (as implemented).**
 
-- Target workers = `ceil((depth / time_left + λ) × s)`, scaled by delay / warn when over warn. λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over `SERVICE_TIME_WINDOW_CYCLES` (5) cycles (`_get_pool_service_time`); `fetch_p75` is only the fallback while `s` is unknown.
+- Target workers = `ceil((depth / time_left + λ) × s)`, scaled by delay / warn when over warn. λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over the last `SERVICE_TIME_WINDOW_CYCLES` (5) valid cycles (`_get_pool_service_time`; a cycle with no finished job is skipped and its busy seconds carry into the next valid one; window and carry live in Redis `manager:svc_window:<pool>`); `fetch_p75` is only the fallback while `s` is unknown.
 - The needed worker count is recorded **before** the ceiling clamp (`_needed_workers`), capped at what the DB budget can host, and that is what feeds the running daily peak — a surge is recorded at its real size, not at the ceiling.
 - The `manager:snapshot:{pool}:D/R` keys are gone: Lever 1 no longer writes a snapshot and the learning loop no longer reads one; the needed count is computed live.
 - Lever 1 fires only when the chain is exhausted **and** λ × s > n (or λ / s unknown). If λ × s ≤ n the backlog is draining and an INFO line says so. The lift stays delay-based, because under Lever 1 the arrival counters measure post-halt inflow (≈ 0), so a "λ × s < n" lift would release it immediately.
