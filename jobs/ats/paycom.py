@@ -34,7 +34,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE, TOTAL_ATS, attach, count_distinct, failed,
+    FetchReport, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE, TOTAL_ATS, attach, count_distinct, failed,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,9 +63,12 @@ def detect(company):
 # FETCH JOBS (listing)
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all active job listings for a Paycom portal.
+
+    stop_check (adaptive scan only): called with each page's jobs ({"job_id"} only is enough);
+    True ends paging with STOP_EARLY_EXIT.
 
     slug: JSON string {"host": "...", "key": "..."} or plain portal-key string
           (plain string supported for backwards compatibility).
@@ -99,6 +102,10 @@ def fetch_jobs(slug, company):
         previews.extend(new)
         if len(batch) < _TAKE:
             break                        # a short page is the server's last
+        if stop_check is not None and stop_check(
+                [{"job_id": str(p.get("jobId", ""))} for p in new]):
+            stop = STOP_EARLY_EXIT
+            break
         skip += _TAKE
 
     stubs = [_preview_to_stub(p, host, key, company) for p in previews]

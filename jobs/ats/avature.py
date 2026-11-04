@@ -40,7 +40,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from jobs.ats.base import fetch_html, fetch_json, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    STOP_EMPTY_PAGE, STOP_NO_CONFIG, FetchReport, attach, check_sitemap_body, count_distinct, failed,
+    STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, FetchReport, attach, check_sitemap_body, count_distinct, failed,
     new_sitemap_stats, sitemap_report,
 )
 
@@ -172,9 +172,10 @@ def detect(company):
 # FETCH JOBS (listing via sitemap)
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Avature via sitemap.xml.
+    stop_check is used only by the SearchJobs paging fallback (see _fetch_via_search).
 
     Strategy:
       Parse sitemap.xml → extract all /JobDetail/{title}/{id} URLs
@@ -227,7 +228,7 @@ def fetch_jobs(slug_info, company):
     if not job_urls:
         # Sitemap missing OR has no /JobDetail/ URLs (Siemens: platform-pages-only)
         # Fall back to SearchJobs pagination endpoint
-        return _fetch_via_search(slug_info, company)
+        return _fetch_via_search(slug_info, company, stop_check=stop_check)
 
     stubs = _urls_to_stubs(job_urls, slug_info, company)
     return attach(stubs, sitemap_report(stats, stubs, unusable=len(job_urls) - len(stubs)))
@@ -311,9 +312,11 @@ def _probe_search_jobs(base, path):
     return _anchors_to_urls(soup, url)
 
 
-def _fetch_via_search(slug_info, company):
+def _fetch_via_search(slug_info, company, stop_check=None):
     """
     Paginate SearchJobs endpoint to collect all job URLs.
+    stop_check (adaptive scan only): called with each page's {"job_id"} rows; True ends paging
+    with STOP_EARLY_EXIT. (The sitemap path is a single response and ignores it.)
     Fallback when sitemap is missing or contains only platform pages (Siemens pattern).
 
     URL: {base}/{path}/SearchJobs/?jobOffset=N&jobRecordsPerPage=12
@@ -333,6 +336,7 @@ def _fetch_via_search(slug_info, company):
     all_urls = []
     seen_ids = set()
     page     = 0
+    stop     = STOP_EMPTY_PAGE
 
     while True:
         offset = page * _SEARCH_PAGE_SIZE
@@ -345,7 +349,7 @@ def _fetch_via_search(slug_info, company):
 
         soup          = BeautifulSoup(resp.text, "html.parser")
         page_urls     = _anchors_to_urls(soup, url)
-        new_this_page = 0
+        page_ids      = []
 
         for job_url in page_urls:
             job_id = _extract_job_id(job_url)
@@ -353,10 +357,14 @@ def _fetch_via_search(slug_info, company):
                 continue
             seen_ids.add(job_id)
             all_urls.append(job_url)
-            new_this_page += 1
+            page_ids.append({"job_id": job_id})
 
-        if new_this_page == 0:
+        if not page_ids:
             break  # natural end of results — pagination complete
+
+        if stop_check is not None and stop_check(page_ids):
+            stop = STOP_EARLY_EXIT
+            break
 
         page += 1
         time.sleep(0.5)
@@ -365,7 +373,7 @@ def _fetch_via_search(slug_info, company):
     # recorded empty_page and complete stays unknown. A mid-pagination failure raised above.
     stubs = _urls_to_stubs(all_urls, slug_info, company)
     return attach(stubs, FetchReport(
-        stop_reason      = STOP_EMPTY_PAGE,
+        stop_reason      = stop,
         pages            = page + 1,
         fetched_distinct = count_distinct(stubs),
         unusable         = len(all_urls) - len(stubs),

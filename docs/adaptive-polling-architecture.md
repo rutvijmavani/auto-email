@@ -190,7 +190,7 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 │                    LISTING SCAN WORKERS                          │
 │  For each company when its scheduled time arrives:              │
 │    1. Fetch job listing (IDs + titles + dates only)             │
-│    2. Smart early exit: NOT BUILT (whole board for now)         │
+│    2. Smart early exit: BUILT (strict 2 clean pages, see Sec 11)  │
 │    3. Diff new IDs against job_postings (DB dedup)              │
 │    4. Push only NEW job IDs to queue:detail:adaptive            │
 │    5. Update this company's poll statistics                     │
@@ -1130,7 +1130,7 @@ Size: derived — capacity = number of jobs fetched (min 1), 0.1% error rate, sc
 
 The Bloom filter serves two purposes:
 1. **Full scan** — a hit means the job is already handled: no date/title work, no DB insert, no queue
-2. **Adaptive scan** — the stop condition for early exit only (Section 11; **not built yet**). Adaptive
+2. **Adaptive scan** — the stop condition for early exit only (Section 11; **built 2026-11-04** on every paged feeder). Adaptive
    never uses it to decide new vs known: that is `adaptive_seen` plus the DB.
 
 Full scan flow with Bloom filter:
@@ -1747,7 +1747,7 @@ The Bloom filter (`bloom:fullscan:{company}`) has two distinct uses at different
 
 **During full scan:** For each job ID fetched, if the ID is in the old bloom (the previous cycle's board) or in `adaptive_seen`, the job is handled and skipped. Only absent IDs go on to the date gate, title/location filter and `save_pending_detail`. This removes ~99.9% of per-job work during full scan.
 
-**During adaptive scan (early exit) — NOT BUILT:** the intent is that if 80%+ of job IDs on two consecutive pages are in the Bloom filter, adaptive stops paginating; see Section 11. Today adaptive always fetches the whole board (`early_exit=False`). When built, the bloom is only the stop condition: adaptive still decides new vs known with `adaptive_seen` plus the DB, never from the bloom.
+**During adaptive scan (early exit) — BUILT (2026-11-04):** adaptive stops paginating after `PAGINATOR_CONFIRM_PAGES` (2) consecutive pages in which EVERY job id is already seen (old fullscan bloom or `adaptive_seen`); any unseen job resets the streak; no old bloom means no early exit; the board's last page stays `STOP_ALL_PAGES`. The bloom is only the stop condition: adaptive still decides new vs known with `adaptive_seen` plus the DB, never from the bloom.
 
 ### Memory comparison
 
@@ -1934,7 +1934,7 @@ Built fresh on every full scan cycle. Contains ALL job IDs fetched this scan (no
 
 Two uses:
 - Full scan: treat jobs already in the old bloom as handled (~99.9% of jobs per cycle)
-- Adaptive scan: page-level early exit stop condition (NOT BUILT)
+- Adaptive scan: page-level early exit stop condition (BUILT)
 
 Fallback if RedisBloom unavailable: exact Redis SETs `bloom:fallback:{company}` / `bloom:fallback:new:{company}`.
 
@@ -3937,7 +3937,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **adaptive_seen:** Per-company Redis SET (`adaptive_seen:{company}`) tracking all job IDs touched by adaptive scan within the current day. 24h TTL. DEL'd at full scan start. Prevents redundant DB lookups when the same job ID appears across multiple adaptive scans within a single day. Never rebuilt on Redis restart — the next adaptive scan repopulates it naturally.
 
-**bloom:fullscan:** Per-company RedisBloom filter (`bloom:fullscan:{company}`) representing the complete state of the job board as of the last full scan. 7-day TTL. Built fresh each full scan cycle from ALL fetched job IDs and promoted by one RENAME. Used by full scan as the handled-job gate; adaptive page-level early exit is planned but NOT BUILT. Not rebuilt on Redis restart — next full scan runs as a cold start.
+**bloom:fullscan:** Per-company RedisBloom filter (`bloom:fullscan:{company}`) representing the complete state of the job board as of the last full scan. 7-day TTL. Built fresh each full scan cycle from ALL fetched job IDs and promoted by one RENAME. Used by full scan as the handled-job gate; adaptive page-level early exit reads the previous (old) bloom through `EarlyExitGate`. Not rebuilt on Redis restart — next full scan runs as a cold start.
 
 **Sliding window:** 10-minute Redis window tracking per-platform 429 + 404 errors for dynamic concurrency adjustment.
 

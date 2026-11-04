@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from config import JIBE_MAX_PAGES
 from jobs.ats.base import fetch_json
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
 )
 from logger import get_logger
@@ -40,9 +40,12 @@ HEADERS = {
 }
 
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all jobs for a Jibe-powered career page.
+
+    stop_check (adaptive scan only): called with each page's normalized jobs; True ends paging
+    with STOP_EARLY_EXIT. Jibe order can be shuffled, which only means the strict gate reads more.
 
     Args:
         slug:    careers domain (e.g. "careers.rivian.com")
@@ -78,6 +81,7 @@ def fetch_jobs(slug, company):
             break  # end of results
 
         new_ids = 0
+        page_jobs = []
         for item in jobs_page:
             job = item.get("data", {})
             if not job:
@@ -92,7 +96,8 @@ def fetch_jobs(slug, company):
 
             normalized = _normalize(job, company, slug)
             if normalized:
-                all_jobs.append(normalized)
+                page_jobs.append(normalized)
+        all_jobs.extend(page_jobs)
 
         logger.debug("Jibe page %d: %d jobs (%d new) for %r (total so far: %d)",
                      page, len(jobs_page), new_ids, company, len(all_jobs))
@@ -109,6 +114,9 @@ def fetch_jobs(slug, company):
         if len(jobs_page) < PAGE_SIZE:
             stop = STOP_EMPTY_PAGE   # a short page is the server's last
             break
+        if stop_check is not None and stop_check(page_jobs):
+            stop = STOP_EARLY_EXIT
+            break
 
         time.sleep(0.3)
     else:
@@ -116,7 +124,7 @@ def fetch_jobs(slug, company):
         logger.warning("Jibe fetch: hit JIBE_MAX_PAGES=%d for %r — result truncated at %d jobs",
                        JIBE_MAX_PAGES, company, len(all_jobs))
 
-    if isinstance(total, int) and total > len(seen_ids):
+    if stop != STOP_EARLY_EXIT and isinstance(total, int) and total > len(seen_ids):
         logger.warning("Jibe fetch: %r reports %d jobs but only %d distinct fetched",
                        company, total, len(seen_ids))
     logger.info("Jibe fetch complete: %d jobs for %r", len(all_jobs), company)

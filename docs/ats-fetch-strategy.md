@@ -333,7 +333,7 @@ Smart early exit requires the listing to be sorted newest-first. Only use the ov
 | Lever | ✓ Default | ✓ Yes |
 | Ashby | ✓ Default | ✓ Yes |
 | SmartRecruiters | ✓ Default | ✓ Yes |
-| Eightfold | ✓ Default (`sort=date`) | ✓ Yes |
+| Eightfold | ✓ Server default newest-first (no `sort_by`; `sort_by=distance` shuffles) | ✓ Yes |
 | Oracle HCM | ✓ (`sortBy=POSTING_DATES_DESC` in URL) | ✓ Yes |
 | Workday | ✗ Unreliable | ✗ No |
 | iCIMS | ✗ No guaranteed order | ✗ No |

@@ -19,7 +19,7 @@ def _ef_run(fetch_page, **cfg):
          patch.object(eightfold, "_resolve_api_path_and_domain", return_value=("/api/pcsx/search", "x.com")), \
          patch.object(eightfold, "_fetch_page", side_effect=fetch_page), \
          patch.object(eightfold, "EIGHTFOLD_MAX_PAGES", cfg.get("cap", 5000)):
-        return eightfold.fetch_jobs({"slug": "x"}, "Acme")
+        return eightfold.fetch_jobs({"slug": "x"}, "Acme", stop_check=cfg.get("stop_check"))
 
 
 def _ef_pages(total, per_page=10):
@@ -206,3 +206,59 @@ def test_taleo_repeated_page_stops_without_duplicates():
     rows = [_trow(i) for i in range(25)]
     jobs = _taleo_run(lambda url, json=None, timeout=None: _taleo_resp(rows, 100))
     assert len(jobs) == 25
+
+
+# ─────────────────────────────────────────
+# Adaptive early exit — Eightfold, Workday
+# ─────────────────────────────────────────
+
+def test_eightfold_stop_check_ends_paging_early():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    gate = EarlyExitGate({str(i) for i in range(11, 101)}.__contains__)   # only page 1 unseen
+    jobs = _ef_run(_ef_pages(100), stop_check=gate)
+    rep = report_of(jobs)
+    assert len(jobs) == 30 and rep.stop_reason == STOP_EARLY_EXIT and rep.complete is None
+
+
+def test_eightfold_last_page_stays_all_pages():
+    from jobs.ats.fetch_report import STOP_ALL_PAGES, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _ef_run(_ef_pages(20), stop_check=EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 20 and report_of(jobs).stop_reason == STOP_ALL_PAGES
+
+
+def _wd_post(i):
+    return {"title": f"Eng {i}", "externalPath": f"/job/X/Eng_R-{i}", "bulletFields": [f"R-{i}"],
+            "locationsText": "X"}
+
+
+def _wd_post_fn(total, page=20):
+    def fake(url, body=None, headers=None, platform=None, **kw):
+        off = body["offset"]
+        return {"total": total, "facets": [],
+                "jobPostings": [_wd_post(i) for i in range(off, min(off + page, total))]}
+    return fake
+
+
+def test_workday_stop_check_ends_paging_early():
+    from jobs.ats import workday
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    gate = EarlyExitGate({f"R-{i}" for i in range(20, 200)}.__contains__)
+    with patch.object(workday, "WORKDAY_PAGE_SIZE", 20), \
+         patch.object(workday, "fetch_json_post", side_effect=_wd_post_fn(200)):
+        jobs = workday.fetch_jobs({"slug": "x", "wd": "wd1", "path": "careers"}, "Acme", stop_check=gate)
+    rep = report_of(jobs)
+    assert len(jobs) == 60 and rep.stop_reason == STOP_EARLY_EXIT and rep.complete is None
+
+
+def test_workday_last_page_stays_all_pages():
+    from jobs.ats import workday
+    from jobs.ats.fetch_report import STOP_ALL_PAGES, report_of
+    from workers.paginator import EarlyExitGate
+    with patch.object(workday, "WORKDAY_PAGE_SIZE", 20), \
+         patch.object(workday, "fetch_json_post", side_effect=_wd_post_fn(40)):
+        jobs = workday.fetch_jobs({"slug": "x", "wd": "wd1", "path": "careers"}, "Acme",
+                                  stop_check=EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 40 and report_of(jobs).stop_reason == STOP_ALL_PAGES

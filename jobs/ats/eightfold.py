@@ -6,7 +6,7 @@
 # API endpoint (confirmed from DevTools — GET, not POST):
 #   GET https://{slug}.eightfold.ai/api/pcsx/search
 #       ?domain={domain}&query=&start={offset}&num={page_size}
-#       &sort_by=distance&filter_include_remote=1&hl=en-US
+#       &filter_include_remote=1&hl=en-US
 #
 # NOTE: NO server-side location filter is sent.
 #   Real browser curls show no location= param — tenants vary on which
@@ -74,7 +74,7 @@ logger = get_logger(__name__)
 
 # Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
 from jobs.ats.fetch_report import (  # noqa: E402
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
     STOP_REPEAT_PAGE, STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
 )
 
@@ -117,9 +117,12 @@ HEADERS = {
 # FETCH JOBS
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs from Eightfold.ai search API.
+
+    stop_check (adaptive scan only): called with each page's normalized jobs; True ends paging
+    with STOP_EARLY_EXIT. Needs newest-first order, so no sort_by is sent (see _fetch_page).
 
     Args:
         slug_info: JSON string or dict with:
@@ -215,6 +218,7 @@ def fetch_jobs(slug_info, company):
         total = page_total or total
 
         new = 0
+        page_jobs = []
         for pos in positions:
             pos_id = pos.get("id")
             if pos_id is not None:
@@ -224,7 +228,8 @@ def fetch_jobs(slug_info, company):
             new += 1
             job = _normalize(pos, company, slug, base_url)
             if job:
-                all_jobs.append(job)
+                page_jobs.append(job)
+        all_jobs.extend(page_jobs)
 
         start += len(positions)
 
@@ -239,10 +244,16 @@ def fetch_jobs(slug_info, company):
 
         if total and start >= total:
             break
+
+        if stop_check is not None and stop_check(page_jobs):
+            stop_reason = STOP_EARLY_EXIT
+            break
     else:
         stop_reason = STOP_PAGE_CAP
 
-    if len(all_jobs) < total or stop_reason != STOP_ALL_PAGES:
+    if stop_reason == STOP_EARLY_EXIT:
+        logger.info("eightfold: %s early exit at %d of %s jobs", slug, len(all_jobs), total)
+    elif len(all_jobs) < total or stop_reason != STOP_ALL_PAGES:
         logger.warning(
             "eightfold: %s fetched %d distinct of %d reported (stop=%s)",
             slug, len(all_jobs), total, stop_reason,
@@ -521,7 +532,8 @@ def _fetch_page(session, slug, domain, base_url, start, csrf_token,
         "query":                 "",
         "start":                 start,
         "num":                   PAGE_SIZE,  # server ignores this, uses its own default (~10)
-        "sort_by":               "distance",
+        # NO sort_by: sort_by=distance shuffles the board; the server default is newest-first,
+        # which the adaptive early-exit gate relies on (verified live on Starbucks, Lam, Qualcomm).
         "filter_include_remote": "1",
         "hl":                    "en-US",
     }

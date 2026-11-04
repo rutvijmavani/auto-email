@@ -297,7 +297,9 @@ def fetch_jobs(slug_info, company, stop_check=None):
     else:
         stop_reason = STOP_PAGE_CAP
 
-    if total is not None and len(all_jobs) < total:
+    if stop_reason == STOP_EARLY_EXIT:
+        logger.info("oracle_hcm: %s early exit at %d of %s jobs", slug, len(all_jobs), total)
+    elif total is not None and len(all_jobs) < total:
         logger.warning("oracle_hcm: %s fetched %d distinct of %d reported (stop=%s)",
                        slug, len(all_jobs), total, stop_reason)
     elif stop_reason != STOP_ALL_PAGES:
