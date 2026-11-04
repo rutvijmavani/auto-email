@@ -191,8 +191,8 @@ class _BloomPair:
     OLD key (bloom:fullscan:{company}):
         State from the last scan (replaced by one RENAME at the end).  Read-only
         during the current scan — a hit means the job is already handled (no date/
-        title work, no DB insert).  Adaptive scan will use it only as its stop
-        condition (early exit, not yet built).
+        title work, no DB insert).  Adaptive scan also uses it (OR adaptive_seen)
+        as the seen-check of its early-exit gate (workers/paginator.EarlyExitGate).
 
     NEW key (bloom:fullscan:new:{company}):
         Being built fresh during the current scan.  ALL currently active job
@@ -249,8 +249,12 @@ class _BloomPair:
                 self._use_bf = False
         return bool(self.r.sismember(self._old_fb, job_id))
 
+    def old_present(self) -> bool:
+        """True when an OLD bloom exists at all (a completed fullscan left one); BF.EXISTS on a missing key just says 0."""
+        return bool(self.r.exists(self._old_bf)) or bool(self.r.exists(self._old_fb))
+
     def old_exists_fn(self):
-        """Return a callable suitable for paginator.should_continue_paginating."""
+        """Return the old-bloom membership check, usable as a seen-check for the early-exit gate."""
         return self.old_exists
 
     # ── NEW bloom reads + writes ──────────────────────────────────────────────

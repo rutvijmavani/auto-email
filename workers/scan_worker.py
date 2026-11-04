@@ -100,6 +100,7 @@ from config import (
     WORKER_BACKOFF_GIVEUP_S,
     REDIS_ADAPTIVE_SEEN_PREFIX,
     ADAPTIVE_SEEN_TTL,
+    ADAPTIVE_EARLY_EXIT_ENABLED,
     # Stream-based delivery (two-layer scheduler redesign)
     REDIS_STREAM_ADAPTIVE,
     STREAM_CONSUMER_GROUP,
@@ -112,11 +113,11 @@ from workers.queue_stamp import count_arrival
 from workers import progress
 from workers.scheduler import set_heartbeat, clear_heartbeat, set_progress
 from workers.http_client import set_request_context, CeilingExceeded
-from workers.paginator import estimate_scan_depth
+from workers.paginator import EarlyExitGate, estimate_scan_depth, make_seen_check
 from jobs.ats_detector import get_ats_module
-from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
+from jobs.ats.registry import accepts_stop_check, get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
-from jobs.ats.fetch_report import STOP_REQUEST_FAILED, report_of
+from jobs.ats.fetch_report import STOP_EARLY_EXIT, STOP_REQUEST_FAILED, report_of
 from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
 from db.db import init_db
 from db.job_monitor import (
@@ -337,8 +338,26 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         set_request_context(_scan_ctx)
         _slug_info_before = copy.deepcopy(slug_info) if isinstance(slug_info, dict) else None
         _fetch_complete = True
+
+        # Early-exit gate: a page whose every job is already handled (old fullscan bloom OR this
+        # cycle's adaptive_seen) counts toward a stop; any unseen job resets the count. No old bloom
+        # (never fullscanned, or expired) means nothing to compare against, so no early exit.
+        adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
+        _gate = None
+        if (ADAPTIVE_EARLY_EXIT_ENABLED and accepts_stop_check(ats_module)
+                and company_row.get("first_scanned_at") is not None):
+            from workers.fullscan import _BloomPair
+            _bloom = _BloomPair(r, company)
+            if _bloom.old_present():
+                _gate = EarlyExitGate(make_seen_check(
+                    _bloom.old_exists,
+                    lambda jid: bool(r.sismember(adaptive_seen_key, jid)),
+                ))
         try:
-            raw_jobs = ats_module.fetch_jobs(slug_info, company)
+            if _gate is not None:
+                raw_jobs = ats_module.fetch_jobs(slug_info, company, stop_check=_gate)
+            else:
+                raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except CeilingExceeded:
             # Platform at concurrency ceiling — reschedule via poll:adaptive
             # with a 30s delay. Leave stream message in PEL (no XACK) so
@@ -474,7 +493,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             return result
 
         # ── 6. Incremental diff ───────────────────────────────────────────────
-        adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
+        early_exited = _report.stop_reason == STOP_EARLY_EXIT
 
         # In-cycle dedup — catches identical job_ids on multiple pages
         # when fetch_jobs() returns paginated data that has some overlap.
@@ -552,21 +571,22 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         # until the next full scan (which will DEL it explicitly).
         r.expire(adaptive_seen_key, ADAPTIVE_SEEN_TTL)
 
-        # Log paginator efficiency (Phase 7 prep — full-page analysis)
+        # Log paginator efficiency
         depth_stats = estimate_scan_depth(
             total_fetched=len(valid_jobs),
             new_found=new_count,
-            early_exit=False,   # Phase 7 will set this based on actual exit
+            early_exit=early_exited,
         )
         logger.info(
             "scan_worker [%s] done | company=%r platform=%s "
             "fetched=%d new=%d adaptive_skipped=%d date_skipped=%d "
-            "filter_skipped=%d waste=%.0f%%",
+            "filter_skipped=%d waste=%.0f%% early_exit=%s pages=%d",
             request_id, company, platform,
             depth_stats["total_fetched"],
             depth_stats["new_found"],
             adaptive_skipped, date_skipped, filter_skipped,
             depth_stats["waste_ratio"] * 100,
+            early_exited, _report.pages,
         )
 
         # ── 7. Update poll stats ──────────────────────────────────────────────

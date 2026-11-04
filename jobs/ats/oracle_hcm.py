@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 # Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
 from jobs.ats.fetch_report import (  # noqa: E402
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP,
     STOP_REPEAT_PAGE, STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
 )
 
@@ -198,11 +198,14 @@ def _discover_site_id(slug, region, ocs=False):
     return ""
 
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Oracle HCM.
     slug_info = {"slug": "jpmc", "site": "CX_1001"}
     Returns list of normalized job dicts.
+
+    stop_check (adaptive scan only): called with each page's normalized jobs; True ends paging
+    with STOP_EARLY_EXIT. The last page stays STOP_ALL_PAGES. Fullscan passes none.
     """
     if isinstance(slug_info, str):
         try:
@@ -229,6 +232,7 @@ def fetch_jobs(slug_info, company):
         logger.info("Oracle HCM: auto-discovered site_id=%r for slug=%r", site_id, slug)
 
     all_jobs    = []
+    out         = []            # normalized jobs, built page by page
     seen_ids    = set()
     offset      = 0
     limit       = 200
@@ -261,6 +265,7 @@ def fetch_jobs(slug_info, company):
             break
 
         new = 0
+        page_raw = []
         for j in reqs:
             key = j.get("Id") or j.get("ExternalJobId") or j.get("RequisitionId")
             if key is not None:
@@ -268,11 +273,15 @@ def fetch_jobs(slug_info, company):
                     continue
                 seen_ids.add(key)
             all_jobs.append(j)
+            page_raw.append(j)
             new += 1
         if new == 0:
             stop_reason = STOP_REPEAT_PAGE
             break
 
+        page_jobs = [_normalize(j, company, slug_info, slug, site_id)
+                     for j in page_raw if j.get("Title")]
+        out.extend(page_jobs)
         offset += len(reqs)
 
         # Done once the reported total is reached; with no total, a short
@@ -281,6 +290,9 @@ def fetch_jobs(slug_info, company):
             if offset >= total:
                 break
         elif len(reqs) < limit:
+            break
+        if stop_check is not None and stop_check(page_jobs):
+            stop_reason = STOP_EARLY_EXIT
             break
     else:
         stop_reason = STOP_PAGE_CAP
@@ -292,8 +304,6 @@ def fetch_jobs(slug_info, company):
         logger.warning("oracle_hcm: %s stopped early at %d jobs (stop=%s, reported=%s)",
                        slug, len(all_jobs), stop_reason, total)
 
-    out = [_normalize(j, company, slug_info, slug, site_id)
-           for j in all_jobs if j.get("Title")]
     return attach(out, FetchReport(
         stop_reason      = stop_reason,
         pages            = pages,

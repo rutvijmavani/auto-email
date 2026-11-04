@@ -128,6 +128,28 @@ def test_oracle_repeated_page_stops_without_duplicates():
     assert len(jobs) == 200
 
 
+def test_oracle_stop_check_ends_paging_early():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    seen = {str(i) for i in range(200, 1000)}          # only page 1 holds unseen jobs
+    gate = EarlyExitGate(seen.__contains__)
+    with patch.object(oracle_hcm, "fetch_json", side_effect=_oracle_pages(1000)):
+        jobs = oracle_hcm.fetch_jobs({"slug": "jpmc", "site": "CX_1001"}, "JPMC", stop_check=gate)
+    rep = report_of(jobs)
+    assert len(jobs) == 600                              # p1 new, p2 clean, p3 clean -> stop
+    assert rep.stop_reason == STOP_EARLY_EXIT and rep.complete is None
+
+
+def test_oracle_last_page_stays_all_pages_even_if_gate_would_stop():
+    from jobs.ats.fetch_report import STOP_ALL_PAGES, report_of
+    from workers.paginator import EarlyExitGate
+    gate = EarlyExitGate(lambda _i: True)
+    with patch.object(oracle_hcm, "fetch_json", side_effect=_oracle_pages(300)):
+        jobs = oracle_hcm.fetch_jobs({"slug": "jpmc", "site": "CX_1001"}, "JPMC", stop_check=gate)
+    rep = report_of(jobs)
+    assert rep.stop_reason == STOP_ALL_PAGES and rep.complete is True and len(jobs) == 300
+
+
 def test_oracle_page_cap_warns(caplog):
     with patch.object(oracle_hcm, "ORACLE_HCM_MAX_PAGES", 2), caplog.at_level(logging.WARNING):
         jobs = _oracle_run(_oracle_pages(1000))

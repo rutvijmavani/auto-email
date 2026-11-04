@@ -344,7 +344,20 @@ def is_supported(platform: str) -> bool:
 # Slug / detail-fetch helpers (used by adaptive scan_worker + detail_worker)
 # ─────────────────────────────────────────────────────────────────────────────
 
+import inspect as _inspect
 import json as _json
+
+
+def accepts_stop_check(ats_module) -> bool:
+    """
+    True when the feeder's fetch_jobs takes the optional `stop_check` page callback (adaptive early
+    exit). Feeders are converted one at a time; scan_worker passes the callback only to those that
+    declare it, so an unconverted feeder keeps reading the whole board.
+    """
+    try:
+        return "stop_check" in _inspect.signature(ats_module.fetch_jobs).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 # Keys each json-slug platform's fetch_jobs cannot run without. Anything else has a default or is

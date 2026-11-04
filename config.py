@@ -695,8 +695,9 @@ SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
 SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 
 # ── Smart early exit (Section 11) ─────────────────────────────────────────────
-PAGINATOR_OVERLAP_THRESHOLD    = 0.80       # 80% of page already seen → overlap
-PAGINATOR_CONFIRM_PAGES        = 2          # consecutive overlap pages to stop
+PAGINATOR_CONFIRM_PAGES        = 2          # consecutive fully-seen pages (every job seen) to stop
+# Master switch for the adaptive early exit; "0" makes every adaptive scan read the whole board.
+ADAPTIVE_EARLY_EXIT_ENABLED    = os.getenv("ADAPTIVE_EARLY_EXIT_ENABLED", "1") != "0"
 
 # ── Dynamic concurrency (Section 19) ──────────────────────────────────────────
 CONCURRENCY_ERROR_RATE_REDUCE   = 0.10      # > 10% errors → reduce concurrency

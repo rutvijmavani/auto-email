@@ -3,7 +3,8 @@ from unittest.mock import patch
 
 from jobs.ats import ashby, greenhouse, lever, smartrecruiters
 from jobs.ats.fetch_report import (
-    STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, report_of,
+    STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED,
+    STOP_SINGLE_RESPONSE, report_of,
 )
 
 
@@ -100,3 +101,22 @@ def test_smartrecruiters_ignored_offset_is_repeat_page():
     same = {"content": [{"id": str(i), "name": f"T{i}"} for i in range(100)], "totalFound": 500}
     rep = report_of(_run(smartrecruiters, lambda *a, **k: same))
     assert rep.stop_reason == STOP_REPEAT_PAGE and rep.complete is False
+
+
+def test_smartrecruiters_stop_check_ends_paging_early():
+    from workers.paginator import EarlyExitGate
+    seen = {str(i) for i in range(100, 673)}          # only the first page (ids 0-99) holds unseen jobs
+    gate = EarlyExitGate(seen.__contains__)
+    with patch.object(smartrecruiters, "fetch_json", side_effect=_sr(673)):
+        jobs = smartrecruiters.fetch_jobs("acme", "Acme", stop_check=gate)
+    rep = report_of(jobs)
+    assert rep.stop_reason == STOP_EARLY_EXIT and rep.complete is None
+    assert rep.pages == 3 and len(jobs) == 300          # p1 new, p2 clean, p3 clean -> stop
+
+
+def test_smartrecruiters_last_page_is_all_pages_even_if_gate_would_stop():
+    from workers.paginator import EarlyExitGate
+    gate = EarlyExitGate(lambda _i: True)
+    with patch.object(smartrecruiters, "fetch_json", side_effect=_sr(150)):
+        rep = report_of(smartrecruiters.fetch_jobs("acme", "Acme", stop_check=gate))
+    assert rep.stop_reason == STOP_ALL_PAGES and rep.complete is True

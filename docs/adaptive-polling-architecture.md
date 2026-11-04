@@ -1561,11 +1561,20 @@ Graceful decay over ~5 polls. Never abrupt.
 
 ## 11. Smart Early Exit — Pagination Without Limits
 
-> **STATUS: NOT BUILT.** Adaptive scans currently fetch the whole board (`early_exit=False` in
-> `workers/scan_worker.py`); `workers/paginator.py` holds the overlap algorithm but nothing calls it per
-> page. Planned build: one platform at a time, a per-page callback in each ATS `fetch_jobs`, Workday per
-> facet slice. The bloom is only the stop condition; new vs known comes from `adaptive_seen` plus the DB.
-> Full scan never early-exits. The unused `PAGINATOR_UNSORTED_CUTOFF_DAYS` time cutoff was removed.
+> **STATUS: CORE BUILT 2026-11-04, FEEDERS BEING CONVERTED ONE AT A TIME.** The rule is ONE strict rule
+> for every platform (no sorted/unsorted flag): a page counts only when EVERY job on it is already seen
+> (old fullscan bloom OR `adaptive_seen`); any unseen job resets the counter to 0; the fetch stops after
+> `PAGINATOR_CONFIRM_PAGES` (2) consecutive fully-seen pages. The 80%-of-page rule below is superseded:
+> live runs found 100% of new jobs on every newest-first board (SmartRecruiters, Oracle, Workday, Taleo,
+> Jibe, Eightfold) while 80% missed 10 of 11 on a shuffled Jibe board. Shuffled boards just read (nearly)
+> every page, which is safe; fullscan is the safety net. Built: `workers/paginator.EarlyExitGate`,
+> `STOP_EARLY_EXIT` in `fetch_report.py`, `registry.accepts_stop_check`, gate construction in
+> `scan_worker` (no old bloom or a feeder without `stop_check` = no early exit; kill switch
+> `ADAPTIVE_EARLY_EXIT_ENABLED`). A feeder opts in by taking `stop_check=None` and calling it with each
+> page's normalized jobs; Workday gets a fresh gate per facet slice. Full scan never passes a gate.
+> The bloom is only the stop condition; new vs known comes from `adaptive_seen` plus the DB.
+> Eightfold sends `sort_by=distance` (shuffled); dropping it gives newest-first and must be done with its
+> feeder conversion.
 
 ### The problem with static page limits
 
