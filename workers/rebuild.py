@@ -12,7 +12,7 @@ Rebuild order (from doc Section 18):
 
 NOT rebuilt on startup (by design):
     adaptive_seen:{company} — 24h TTL; next adaptive scan repopulates naturally
-    bloom:fullscan:{company} — 36h TTL; next full scan runs as cold start (correct)
+    bloom:fullscan:{company} — 7-day TTL (FULLSCAN_BLOOM_TTL_S); if lost, next full scan runs as cold start (correct)
 
 Usage:
     from workers.rebuild import rebuild_redis

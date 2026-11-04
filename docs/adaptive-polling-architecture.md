@@ -190,7 +190,7 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 │                    LISTING SCAN WORKERS                          │
 │  For each company when its scheduled time arrives:              │
 │    1. Fetch job listing (IDs + titles + dates only)             │
-│    2. Smart early exit (stop when mostly-seen jobs appear)      │
+│    2. Smart early exit: NOT BUILT (whole board for now)         │
 │    3. Diff new IDs against job_postings (DB dedup)              │
 │    4. Push only NEW job IDs to queue:detail:adaptive            │
 │    5. Update this company's poll statistics                     │
@@ -230,11 +230,12 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 ┌─────────────────────────────────────────────────────────────────┐
 │                    FULL SCAN WORKERS                             │
 │  Exhaustively scans ALL pages for each company:                 │
-│    1. Check per-company Bloom filter (skip already-seen jobs)   │
-│    2. SORTED platforms: 2-page early exit at >80% overlap       │
-│    3. NON-SORTED platforms: scan all pages, no cutoff           │
-│    4. Push new job IDs to queue:detail:fullscan                 │
-│    5. Build new Bloom filter for next cycle (36h TTL)           │
+│    1. Old Bloom / adaptive_seen hit = handled, skip the job     │
+│    2. Else date gate (reliable listing dates), title/location,  │
+│       then save pending_detail (drainer queues it)             │
+│    3. Always the whole board: no early exit                     │
+│    4. Every valid ID goes into the NEW Bloom                    │
+│    5. One RENAME promotes NEW to OLD (7-day TTL)                │
 │    6. Write checkpoint on pause signal                          │
 │    7. XACK stream:fullscan                                      │
 └─────────────────────────────────────────────────────────────────┘
@@ -1098,83 +1099,72 @@ result is already saved regardless, and the warning is logged.
 
 ### Full scan behavior by ATS platform type
 
-#### SORTED platforms (Greenhouse, Lever, Ashby, Eightfold)
+#### All platforms: no early exit in full scan
 
-Jobs returned newest-first. Full scan uses the 2-consecutive-page early exit:
+**Implemented (D4, 2026-11).** Full scan never exits early, sorted or not. No ATS order is guaranteed, and
+full scan is the safety net for adaptive's heuristic early exit, so it fetches the whole board
+(`fetch_jobs` returns it in one call). The board is then processed in chunks of `FULLSCAN_CHUNK_SIZE`
+jobs; the chunks exist only so pause and shutdown signals are honoured between them (checkpoint written
+on pause).
 
-```python
-OVERLAP_THRESHOLD = 0.80   # 80% of page already seen
-CONFIRM_PAGES     = 2      # 2 consecutive high-overlap pages to stop
-```
+Per job, in order:
 
-Even though this is full scan, the early exit is still valid here — if 80%+ of two consecutive pages are already seen, all new jobs have been found.
+1. OLD Bloom or `adaptive_seen` has the ID: handled. Add to the NEW Bloom, nothing else.
+2. Date gate, only for platforms whose listing date is the real posting date
+   (`jobs.ats.registry.LISTING_DATE_RELIABLE`; a missing or unparseable date passes).
+3. Title and location filter.
+4. `save_pending_detail` (held row; the detail drainer releases it to the queue at the bucket rate).
 
-#### NON-SORTED platforms (Workday, iCIMS, custom ATS)
-
-Jobs not in reliable order. **No early exit. No time-based cutoff.** Full scan goes all pages unconditionally:
-
-```python
-def full_scan_unsorted(company):
-    page = 0
-    while True:
-        jobs = fetch_listing_page(company, page)
-        if not jobs:
-            break   # genuine end of results only
-        
-        process_page(jobs, company)   # Bloom filter + DB upsert
-        page += 1
-        
-        # Check for pause signal between pages
-        if redis.pubsub_check("pipeline:pause"):
-            write_checkpoint(company, page)
-            requeue_with_score(company, time.time() - 1)
-            return
-```
-
-This is the "bulletproof" guarantee — non-sorted platforms cannot use smart early exit, so full scan must go the distance.
+Every valid ID goes into the NEW Bloom whatever its outcome, except payload-build failures (retried next
+scan). A DB error raises and aborts the scan.
 
 ### Bloom filter per company
 
 Each company has its own Bloom filter in Redis representing the **complete state of the job board as of the last full scan cycle**:
 
 ```text
-Key:  bloom:fullscan:{company}
-TTL:  36 hours (24h cycle + 12h buffer for timing drift)
-Size: ~0.5MB per company at 0.1% error rate
+Key:  bloom:fullscan:{company}            (OLD)   bloom:fullscan:new:{company}  (NEW, being built)
+TTL:  7 days (FULLSCAN_BLOOM_TTL_S; NEW gets +1h so it survives a slow scan)
+Size: derived — capacity = number of jobs fetched (min 1), 0.1% error rate, scalable, no hard cap
 ```
 
 The Bloom filter serves two purposes:
-1. **Full scan** — skip DB checks for already-known jobs (performance speedup)
-2. **Adaptive scan** — page-level early exit signal (see Section 11)
+1. **Full scan** — a hit means the job is already handled: no date/title work, no DB insert, no queue
+2. **Adaptive scan** — the stop condition for early exit only (Section 11; **not built yet**). Adaptive
+   never uses it to decide new vs known: that is `adaptive_seen` plus the DB.
 
 Full scan flow with Bloom filter:
 
 ```text
-1. Check if OLD bloom:fullscan:{company} exists
-   NO  → cold start, no reference — process everything, build NEW_BLOOM from scratch
-   YES → use OLD bloom as "already seen" reference for DB check optimisation
+1. Fetch the whole board. Create NEW (BF.RESERVE, capacity = fetched count). Fresh scan wipes NEW first;
+   a resumed scan keeps the partly built NEW.
 
-2. Initialise NEW_BLOOM = empty (built fresh this cycle)
-   DEL adaptive_seen:{company}     ← wipe today's adaptive scan history
+2. For each valid job ID:
+     in OLD bloom or adaptive_seen?  YES → ADD to NEW, skip
+     date gate (reliable platforms)  fail → ADD to NEW, skip
+     title/location filter           fail → ADD to NEW, skip
+     build payload                   ValueError → NOT added to NEW (retried next scan)
+     save_pending_detail             ADD to NEW (inserted or already in DB)
+   (ALL fetched jobs go into NEW regardless of outcome)
 
-3. For each page:
-   For each job ID on the page:
-     Already in NEW_BLOOM?   YES → pagination overlap → skip entirely
-     In OLD bloom?           YES → known job, skip DB check (speedup)
-                                   ADD to NEW_BLOOM
-                             NO  → DB check → not in DB? queue for detail fetch
-                                   ADD to NEW_BLOOM
-   (ALL currently fetched jobs go into NEW_BLOOM, regardless of old/new status)
-
-4. Full scan completes:
-   SET bloom:fullscan:{company} = NEW_BLOOM
-   EXPIRE bloom:fullscan:{company} 36h
+3. Full scan finishes (also after an incomplete fetch):
+   RENAME bloom:fullscan:new:{company} → bloom:fullscan:{company}   ← atomic overwrite of OLD
+   EXPIRE bloom:fullscan:{company} 7 days
+   DEL adaptive_seen:{company}      ← the fullscan has now seen everything adaptive handled
 ```
+
+OLD is untouched for the whole scan and replaced only by the final RENAME, so there is never a moment
+without a gate. If NEW does not exist at the end (empty board) OLD is deleted. An incomplete fetch
+(`FetchReport.complete is False`) is still promoted: a job missing from the bloom is simply re-evaluated
+next scan.
+
+**Sizing:** capacity comes from the board just fetched, not from the previous scan or a fixed number.
+RedisBloom filters from `BF.RESERVE` are scalable, so no headroom is needed.
 
 **Why ALL jobs go into NEW_BLOOM (not just new ones):**
 The naive approach (only add jobs not in old bloom to NEW_BLOOM) causes oscillation: cycle 2's bloom only contains jobs that were new in cycle 1, so cycle 3 re-processes all old jobs as if they were new. Building NEW_BLOOM from every currently active job means closed or filled positions fall out naturally — they are no longer fetched, so they never enter NEW_BLOOM, and are absent from the next cycle's reference.
 
-**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly skipped by the old bloom. Since adaptive polling runs throughout the day, the skipped job was almost certainly already detected by Tier 1. Worst case: one full-scan cycle delay on 1 in 1000 new jobs — acceptable.
+**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly treated as handled by the old bloom. The next rebuild no longer contains the false positive's collision (the new bloom is built from this scan's own IDs), so the job is processed then. Adaptive scans decide new vs known from the DB, so they can still catch it meanwhile. Accepted.
 
 **Fallback if RedisBloom unavailable:** Use Redis SET at key `bloom:fallback:{company}`. Less memory efficient (~100MB vs ~4.5MB at scale) but functionally identical.
 
@@ -1571,6 +1561,12 @@ Graceful decay over ~5 polls. Never abrupt.
 
 ## 11. Smart Early Exit — Pagination Without Limits
 
+> **STATUS: NOT BUILT.** Adaptive scans currently fetch the whole board (`early_exit=False` in
+> `workers/scan_worker.py`); `workers/paginator.py` holds the overlap algorithm but nothing calls it per
+> page. Planned build: one platform at a time, a per-page callback in each ATS `fetch_jobs`, Workday per
+> facet slice. The bloom is only the stop condition; new vs known comes from `adaptive_seen` plus the DB.
+> Full scan never early-exits. The unused `PAGINATOR_UNSORTED_CUTOFF_DAYS` time cutoff was removed.
+
 ### The problem with static page limits
 
 For large companies like Starbucks or Amazon (20,000+ job listings), we cannot fetch all 200+ pages every adaptive poll. But we also cannot arbitrarily cap at, say, "50 pages" — what if all the new jobs are on pages 51–60?
@@ -1689,6 +1685,9 @@ Simply checking "is this ID already in seen_ids?" handles new jobs, but it doesn
 
 When we see a job we've already processed, we check:
 
+> **NOT BUILT.** Nothing in the code re-fetches a known job on an updated timestamp; `refresh_window_hr`
+> in `company_config` is likewise unused. Known jobs are skipped. The design below is kept for reference.
+
 ```python
 if job.updated_at > seen_ids[job_id].last_updated + REFRESH_WINDOW:
     enqueue_detail_fetch(job)   # re-fetch the detail page
@@ -1717,19 +1716,19 @@ Layer 1: In-cycle Python set (per scan run)
   → cycle_seen = set(); if job_id in cycle_seen: skip
 
 Layer 2a: Bloom filter — full scan cross-cycle dedup
-  → bloom:fullscan:{company}, 36h TTL, 0.1% false positive rate
-  → Full scan checks: if job_id IN old bloom → skip DB check (speedup)
-  → Bloom filter is rebuilt from scratch each cycle (ALL active jobs added)
+  → bloom:fullscan:{company}, 7-day TTL, 0.1% false positive rate
+  → Full scan checks: if job_id IN old bloom → handled, skip (no date/title/DB/queue work)
+  → Bloom filter is rebuilt from scratch each cycle (ALL fetched jobs added), promoted by one RENAME
   → Closed/filled jobs fall out naturally — not fetched → not in NEW_BLOOM
 
-Layer 2b: adaptive_seen:{company} SET — same-day adaptive dedup
-  → Covers job IDs already processed by an earlier adaptive scan today
-  → If job_id IN adaptive_seen → skip entirely (no DB check)
-  → 24h TTL, DEL'd at full scan start, written only by adaptive scan
+Layer 2b: adaptive_seen:{company} SET — adaptive dedup between full scans
+  → Covers every job ID an adaptive scan handled (new, known, date- or title-rejected)
+  → If job_id IN adaptive_seen → skip entirely (no DB check); full scan honours it too
+  → DEL'd when a full scan FINISHES (not at its start), written only by adaptive scan
 
 Layer 3: Database unique constraint
-  → UNIQUE(company, job_id) on job_postings
-  → Upsert pattern — any duplicate that reaches this layer is a safe no-op
+  → job_url is unique on job_postings (there is no UNIQUE(company, job_id))
+  → Insert-or-ignore pattern — any duplicate that reaches this layer is a safe no-op
   → Final correctness guarantee — cannot be bypassed
 ```
 
@@ -1737,11 +1736,9 @@ Layer 3: Database unique constraint
 
 The Bloom filter (`bloom:fullscan:{company}`) has two distinct uses at different points in the cycle:
 
-**During full scan (speedup):** For each job ID fetched, if the ID is already in the old bloom (the previous cycle's complete board state), skip the DB check. Only job IDs absent from the old bloom trigger a DB lookup. This eliminates ~99.9% of DB round-trips during full scan.
+**During full scan:** For each job ID fetched, if the ID is in the old bloom (the previous cycle's board) or in `adaptive_seen`, the job is handled and skipped. Only absent IDs go on to the date gate, title/location filter and `save_pending_detail`. This removes ~99.9% of per-job work during full scan.
 
-**During adaptive scan (early exit):** If 80%+ of job IDs on two consecutive pages are found in the Bloom filter, stop paginating. The board is mostly unchanged since the last full scan. See Section 11 for the full algorithm.
-
-The Bloom filter is **never used to decide whether a job needs detail fetching** — that decision always comes from the DB (layer 3). The Bloom filter only decides: skip DB check (full scan speedup) or stop paginating (adaptive early exit).
+**During adaptive scan (early exit) — NOT BUILT:** the intent is that if 80%+ of job IDs on two consecutive pages are in the Bloom filter, adaptive stops paginating; see Section 11. Today adaptive always fetches the whole board (`early_exit=False`). When built, the bloom is only the stop condition: adaptive still decides new vs known with `adaptive_seen` plus the DB, never from the bloom.
 
 ### Memory comparison
 
@@ -1916,20 +1913,21 @@ Backpressure: listing scan checks queue depth before pushing. If depth > MAX_QUE
 ```text
 Key: "bloom:fullscan:{company}"
 Type: RedisBloom (BF)
-TTL: 36 hours (24h cycle + 12h timing buffer)
-Error rate: 0.1%
+TTL: 7 days (FULLSCAN_BLOOM_TTL_S)
+Error rate: 0.1%, capacity = jobs fetched this scan (no cap, no headroom)
 
-BF.EXISTS bloom:fullscan:{company} {job_id}   — check (full scan speedup + adaptive early exit)
-BF.ADD    bloom:fullscan:{company} {job_id}   — written by full scan only
+BF.EXISTS bloom:fullscan:{company} {job_id}   — check (full scan gate; adaptive early exit when built)
+BF.ADD    bloom:fullscan:new:{company} {job_id} — written by full scan only, into the NEW key
+RENAME    bloom:fullscan:new:{company} → bloom:fullscan:{company}   — once, at scan end
 ```
 
-Built fresh on every full scan cycle. Contains ALL job IDs currently active on the board (not just new ones). Closed/filled jobs fall out naturally — not fetched → not added to new filter.
+Built fresh on every full scan cycle. Contains ALL job IDs fetched this scan (not just new ones). Closed/filled jobs fall out naturally — not fetched → not added to new filter.
 
 Two uses:
-- Full scan: skip DB check for jobs already in old bloom (~99.9% of jobs per cycle)
-- Adaptive scan: page-level early exit when 80%+ of two consecutive pages are in the bloom
+- Full scan: treat jobs already in the old bloom as handled (~99.9% of jobs per cycle)
+- Adaptive scan: page-level early exit stop condition (NOT BUILT)
 
-Fallback if RedisBloom unavailable: Redis SET at key `bloom:fallback:{company}`.
+Fallback if RedisBloom unavailable: exact Redis SETs `bloom:fallback:{company}` / `bloom:fallback:new:{company}`.
 
 #### 5. Adaptive Seen Cache (Sets, one per company)
 
@@ -2089,7 +2087,7 @@ CREATE TABLE company_config (
 
     -- Fetch behavior overrides
     sorted_by_recency   BOOLEAN,
-    refresh_window_hr   INTEGER,
+    refresh_window_hr   INTEGER,   -- NOT BUILT: nothing reads it
 
     -- Interval overrides
     min_interval        INTEGER,
@@ -2385,7 +2383,8 @@ Full scan for company Workday_Corp:
        Return — wait for resume
 
 4. Full scan completes:
-   BF.RESERVE / SET bloom:fullscan:Workday_Corp = NEW_BLOOM, EXPIRE 36h
+   RENAME bloom:fullscan:new:Workday_Corp → bloom:fullscan:Workday_Corp, EXPIRE 7d
+   DEL adaptive_seen:Workday_Corp
    UPDATE company_poll_stats SET
      full_scan_interrupted=FALSE,
      last_full_scan_at=NOW(),
@@ -3712,10 +3711,11 @@ NEW (last_poll_at IS NULL AND last_full_scan_at IS NULL)
     • Do NOT add to poll:adaptive yet.
 
   Why full scan before adaptive?
-  Full scan marks all existing jobs as pre_existing — prevents the
-  digest from flooding with hundreds of jobs that were already posted
-  before monitoring started. Adaptive would queue all of them for
-  detail fetch if it ran first.
+  The first scan of a company IS the full scan path (no separate
+  first-scan handler, no pre_existing writes). Its date gate and
+  title/location filter keep the old board from flooding the detail
+  queue. An adaptive request for a company that has never been full
+  scanned (first_scanned_at NULL) is routed to poll:fullscan instead.
 
     ↓  (first full scan completes → on_fullscan_complete() fires)
 
@@ -3884,7 +3884,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Bloom filter:** A probabilistic data structure that efficiently checks "have I seen this before?" with a small false positive rate (0.1%). Used per-company for full scan dedup. Never produces false negatives.
 
-**Cold start:** The first time a company is polled. All existing jobs marked `pre_existing` to prevent digest flooding.
+**Cold start:** The first time a company is polled. Handled by the full scan path (date gate + title/location filter); no `pre_existing` marking.
 
 **consecutive_empty:** Counter incremented when a poll finds 0 new jobs. Feeds into the 5-queue to drive the interval toward MAX.
 
@@ -3928,7 +3928,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **adaptive_seen:** Per-company Redis SET (`adaptive_seen:{company}`) tracking all job IDs touched by adaptive scan within the current day. 24h TTL. DEL'd at full scan start. Prevents redundant DB lookups when the same job ID appears across multiple adaptive scans within a single day. Never rebuilt on Redis restart — the next adaptive scan repopulates it naturally.
 
-**bloom:fullscan:** Per-company RedisBloom filter (`bloom:fullscan:{company}`) representing the complete state of the job board as of the last full scan. 36h TTL. Built fresh each full scan cycle from ALL currently active job IDs. Used by full scan to skip DB checks and by adaptive scan for page-level early exit. Not rebuilt on Redis restart — next full scan runs as a cold start.
+**bloom:fullscan:** Per-company RedisBloom filter (`bloom:fullscan:{company}`) representing the complete state of the job board as of the last full scan. 7-day TTL. Built fresh each full scan cycle from ALL fetched job IDs and promoted by one RENAME. Used by full scan as the handled-job gate; adaptive page-level early exit is planned but NOT BUILT. Not rebuilt on Redis restart — next full scan runs as a cold start.
 
 **Sliding window:** 10-minute Redis window tracking per-platform 429 + 404 errors for dynamic concurrency adjustment.
 
@@ -3978,7 +3978,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **stream:fullscan:** Redis Stream used as the crash-safe delivery queue for full scan work. Single shared stream for all DC keys; `dc_key` is a field in each message, not part of the key. Companies are XADD'd (with `MAXLEN ~ 500`) by the full scan dispatcher when their `poll:fullscan` score becomes due. Workers consume via XREADGROUP with a 500ms block timeout. PEL + XAUTOCLAIM recover work from crashed workers — idle timeout = `p95_full_scan_ms × 3` (uses full scan duration from api_health, not listing scan duration). Consumer names are `worker-{hostname}-{pid}`. Consumer group created with `id=$`; `BUSYGROUP` ignored. Dead-letter after 5 redeliveries. Replaces the previous BLPOP/LIST approach.
 
-**NEW → WARMING → STABLE:** The three lifecycle phases for a newly added company. NEW: full scan first (pre_existing mark), no adaptive yet. WARMING: 3 adaptive polls at fixed 2h interval using `initial_slot_offset_s` (stored in DB). STABLE: adaptive engine takes control, slot switches to `slot_offset(company_id)`, recurring Rules 3/5 govern full scans. Phase tracked by `warming_polls_remaining` column — NULL = STABLE, 1–3 = WARMING.
+**NEW → WARMING → STABLE:** The three lifecycle phases for a newly added company. NEW: full scan first (the first-scan path), no adaptive yet. WARMING: 3 adaptive polls at fixed 2h interval using `initial_slot_offset_s` (stored in DB). STABLE: adaptive engine takes control, slot switches to `slot_offset(company_id)`, recurring Rules 3/5 govern full scans. Phase tracked by `warming_polls_remaining` column — NULL = STABLE, 1–3 = WARMING.
 
 **slot_offset(identifier):** `int(hashlib.md5(str(identifier).encode()).hexdigest(), 16) % 86400`. Returns a deterministic, well-distributed number of seconds in [0, 86400). Must use MD5 (or equivalent proper hash) — Python's built-in `hash()` is an identity function for small integers and produces no distribution.
 

@@ -28,17 +28,22 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     OLD bloom  bloom:fullscan:{company}      — authoritative (last completed scan)
     NEW bloom  bloom:fullscan:new:{company}  — being built this cycle
     Fallback   bloom:fallback:{company}      — Redis SET if RedisBloom unavailable
-    TTL = 36h (FULLSCAN_BLOOM_TTL)
+    TTL = FULLSCAN_BLOOM_TTL (default 7 days; a multiple of the fullscan interval)
 
-    OLD bloom: read-only during the scan.  Used to skip DB checks for jobs
-    already known from the last cycle (speedup), and read by adaptive scan
-    workers for early-exit overlap detection (Section 11).
+    OLD bloom: read-only during the scan.  It is the "already handled" GATE: a hit means
+    the job is skipped entirely (no date/title work, no DB insert, no queue).  It is also
+    the adaptive scan's stop test (only the stop test; adaptive's new/known decision is the DB).
 
-    NEW bloom: ALL currently fetched job IDs are added, regardless of whether
-    they were in the OLD bloom or are genuinely new.  Closed/filled jobs fall
-    out naturally — they are no longer fetched so they never enter NEW bloom.
+    NEW bloom: EVERY valid fetched job ID is added whatever its outcome (queued, date-stale,
+    title/location-rejected, already handled), except payload-build failures which must retry.
+    Closed/filled jobs fall out naturally — they are no longer fetched.  Sized from the fetched
+    board (capacity = fetched count); scalable, no hard cap, no headroom.
 
-    On completion: NEW bloom is promoted to OLD (DEL old, RENAME new → old).
+    Per-job order: OLD bloom / adaptive_seen -> date (reliable listing dates only) ->
+    title+location -> save_pending_detail.  adaptive_seen is deleted when the fullscan FINISHES.
+
+    On completion: one RENAME promotes NEW over OLD (also after an incomplete fetch: a job
+                   missing from the bloom is just re-evaluated next scan).
     On resume:     both keys are preserved; NEW bloom provides intra-scan dedup
                    so jobs queued before the pause are not re-queued.
 
@@ -63,16 +68,11 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     restores the Bloom filter state, and continues processing — jobs already
     in the Bloom filter are skipped, ensuring no duplicate queue pushes.
 
-─── Sorted vs. non-sorted platforms ─────────────────────────────────────────
+─── No early exit ───────────────────────────────────────────────────────────
 
-    SORTED (Greenhouse, Lever, Ashby, SmartRecruiters, Eightfold, Oracle HCM):
-        Results are newest-first. Use should_continue_paginating() with 80%/2-page
-        early exit — even in full scan mode, we stop when we hit the "old zone".
-
-    NON-SORTED (Workday, iCIMS, Taleo, ADP, etc.):
-        No ordering guarantee. All pages are fetched unconditionally.
-        Note: Phase 7 will add true page-by-page streaming; until then
-        fetch_jobs() returns all pages at once and we process in chunks.
+    A fullscan always fetches and gates the whole board (it is the safety net for adaptive's
+    heuristic early exit).  fetch_jobs() returns all pages at once; the board is processed in
+    FULLSCAN_CHUNK_SIZE chunks only so pause / shutdown can be honoured between them.
 
 ─── Usage ────────────────────────────────────────────────────────────────────
 
@@ -124,7 +124,6 @@ from config import (
     FULLSCAN_BLOOM_TTL,
     FULLSCAN_BLOOM_ERROR_RATE,
     REDIS_ADAPTIVE_SEEN_PREFIX,
-    ADAPTIVE_SEEN_TTL,
     # Stream-based delivery (two-layer scheduler redesign)
     REDIS_STREAM_FULLSCAN,
     STREAM_CONSUMER_GROUP,
@@ -142,14 +141,14 @@ from workers.scheduler import (
     set_heartbeat, clear_heartbeat, set_progress, clear_reaped,
     _pick_schedule_time, _next_digest_deadline, _atomic_schedule,
 )
-from workers.paginator import should_continue_paginating, estimate_scan_depth
+from workers.paginator import estimate_scan_depth
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.ats.fetch_report import STOP_EMPTY_PAGE, STOP_REQUEST_FAILED, FetchReport, report_of
 from db.scan_health import SOURCE_FULLSCAN, annotate_latest, record_scan
 from workers.http_client import CeilingExceeded
-from jobs.job_filter import filter_jobs, filter_jobs_title_only
+from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
 from db.db import init_db, get_conn
 from db.job_monitor import (
     get_company_row,
@@ -170,12 +169,9 @@ _EMA_ALPHA = 0.3
 # Matches db/schema.py DEFAULT 1800.0 — overwritten after first real scan.
 _AVG_DURATION_SEED = 1800.0
 
-# How many jobs to process per "page chunk" before checking for pause.
-# Phase 7 will replace this with actual per-page HTTP fetching.
+# How many jobs to process between pause / shutdown checks (the board is fetched in one call, so this
+# is the only point at which a maintenance pause can be honoured).
 FULLSCAN_CHUNK_SIZE = 50
-
-# Estimated capacity for BF.RESERVE (jobs per company full scan)
-FULLSCAN_BLOOM_CAPACITY = 10_000
 
 # Seconds to wait between pause-polling loops
 FULLSCAN_PAUSE_POLL_SECS = 10
@@ -193,9 +189,10 @@ class _BloomPair:
     Two-key Bloom filter pair for per-company full scan (Section 9 / 13).
 
     OLD key (bloom:fullscan:{company}):
-        Authoritative state from the last *completed* scan.  Read-only during
-        the current scan — used to skip DB checks for already-known jobs
-        (speedup) and read by adaptive scan for early exit (Section 11).
+        State from the last scan (replaced by one RENAME at the end).  Read-only
+        during the current scan — a hit means the job is already handled (no date/
+        title work, no DB insert).  Adaptive scan will use it only as its stop
+        condition (early exit, not yet built).
 
     NEW key (bloom:fullscan:new:{company}):
         Being built fresh during the current scan.  ALL currently active job
@@ -215,7 +212,7 @@ class _BloomPair:
     """
 
     # NEW bloom needs a slightly longer TTL than OLD so it survives slow scans.
-    _NEW_TTL = FULLSCAN_BLOOM_TTL + 3600   # 37h
+    _NEW_TTL = FULLSCAN_BLOOM_TTL + 3600   # OLD TTL + 1h
 
     def __init__(self, r, company: str):
         self.r        = r
@@ -285,19 +282,29 @@ class _BloomPair:
         """
         Prepare for a FRESH full scan (not a resume).
 
-        Keeps OLD key as-is (DB-skip reference for this scan cycle).
-        Wipes NEW key and pre-creates it for the current scan.
+        Keeps OLD key as-is (the "already handled" gate for this scan cycle).
+        Wipes NEW key; reserve() creates it once the board size is known.
         """
         self.r.delete(self._new_bf)
         self.r.delete(self._new_fb)
+
+    def reserve(self, fetched_count: int) -> None:
+        """
+        Create the NEW bloom sized from this scan's fetched board (no hard cap).
+
+        capacity = number of jobs fetched (BF.RESERVE needs at least 1). RedisBloom filters created by
+        BF.RESERVE are scalable, so no headroom is needed. Skipped when the NEW key already exists (resume).
+        """
+        capacity = max(1, fetched_count)
         if self._probe():
             try:
-                self.r.execute_command(
-                    "BF.RESERVE",
-                    self._new_bf,
-                    str(FULLSCAN_BLOOM_ERROR_RATE),
-                    str(FULLSCAN_BLOOM_CAPACITY),
-                )
+                if not self.r.exists(self._new_bf):
+                    self.r.execute_command(
+                        "BF.RESERVE",
+                        self._new_bf,
+                        str(FULLSCAN_BLOOM_ERROR_RATE),
+                        str(capacity),
+                    )
             except Exception:
                 pass  # BF.RESERVE failed — BF.ADD will auto-create
         self.r.expire(self._new_bf, self._NEW_TTL)
@@ -321,25 +328,20 @@ class _BloomPair:
 
     def finalize(self) -> None:
         """
-        Promote NEW bloom → OLD on scan completion.
+        Promote NEW bloom → OLD after a COMPLETE fetch.
 
-        DEL old keys, RENAME new keys to old keys, set authoritative TTL.
-        The promoted OLD bloom now represents the complete current board state
-        and will be read by adaptive scans for early exit until the next
-        full scan cycle rebuilds it.
+        One RENAME per key: Redis RENAME replaces the destination atomically, so there is no moment
+        with no OLD bloom (the old DEL-then-RENAME left a crash window). If the NEW key does not
+        exist (empty board, or the other implementation was in use) the matching OLD key is dropped.
+        The promoted OLD bloom is the fullscan's gate next cycle and the adaptive scan's stop test.
         """
-        self.r.delete(self._old_bf)
-        self.r.delete(self._old_fb)
-        try:
-            self.r.rename(self._new_bf, self._old_bf)
-            self.r.expire(self._old_bf, FULLSCAN_BLOOM_TTL)
-        except Exception:
-            pass  # new_bf may not exist if scan found 0 jobs
-        try:
-            self.r.rename(self._new_fb, self._old_fb)
-            self.r.expire(self._old_fb, FULLSCAN_BLOOM_TTL)
-        except Exception:
-            pass
+        for new_key, old_key in ((self._new_bf, self._old_bf), (self._new_fb, self._old_fb)):
+            try:
+                self.r.rename(new_key, old_key)
+                self.r.expire(old_key, FULLSCAN_BLOOM_TTL)
+            except redis.exceptions.ResponseError:
+                # no such key: nothing was built under this implementation
+                self.r.delete(old_key)
 
 
 # ─────────────────────────────────────────
@@ -1010,11 +1012,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
         is_resume    = fs_state.get("full_scan_interrupted", False)
         interval_s   = fs_state.get("full_scan_interval_s", SCHEDULER_FULL_SCAN_INTERVAL_S)
-        sorted_plat  = config.get("sorted_by_recency", False)
 
         logger.info(
-            "fullscan [%s] starting | platform=%s sorted=%s resume=%s",
-            company, platform, sorted_plat, is_resume,
+            "fullscan [%s] starting | platform=%s resume=%s",
+            company, platform, is_resume,
         )
 
         # ── 6. Bloom filter + adaptive_seen setup ────────────────────────────────
@@ -1031,13 +1032,13 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 company, fs_state.get("interrupted_at_page"),
             )
         else:
-            # Fresh scan: keep OLD bloom as DB-skip reference, wipe NEW bloom,
-            # and clear today's adaptive_seen cache.
+            # Fresh scan: keep OLD bloom as the "already handled" gate, wipe NEW bloom.
+            # adaptive_seen is NOT cleared here: step 1 of the per-job gate reads it, so the
+            # fullscan does not redo what adaptive already handled. It is deleted when this
+            # fullscan finishes (see the completion branch).
             bloom.prepare_fresh()
-            r.delete(adaptive_seen_key)
             logger.info(
-                "fullscan [%s]: fresh scan — NEW bloom cleared, "
-                "adaptive_seen cleared",
+                "fullscan [%s]: fresh scan — NEW bloom cleared (adaptive_seen kept)",
                 company,
             )
 
@@ -1128,6 +1129,9 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
         result["fetched"] = len(valid_jobs)
 
+        # Size the NEW bloom from what was actually fetched (no-op on resume: key already exists).
+        bloom.reserve(len(valid_jobs))
+
         # Completeness verdict of this fetch (jobs/ats/fetch_report.py): recorded, and an incomplete
         # fetch is treated like Avature's partial one so nothing downstream reads it as the full board.
         _report = report_of(raw_jobs)
@@ -1159,16 +1163,19 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         # ── 9. Intra-scan dedup (Python set — one scan run fits in memory) ───────
         cycle_seen: set = set()
 
-        # ── 10. Page-chunk processing loop ───────────────────────────────────
+        # ── 10. Per-job gate over the WHOLE fetched board ────────────────────
+        # Per job: (1) OLD bloom / adaptive_seen -> already handled; (2) date; (3) title/location;
+        # (4) save_pending_detail. Every valid ID ends up in the NEW bloom, whatever the outcome,
+        # except payload-build failures (retried next scan) -- a DB error raises and aborts the scan.
         new_count     = 0
         page_num      = 0
         paused        = False
-        early_exit    = False
-        overlap_pages = 0
+        early_exit    = False   # fullscan never exits early: it must see the whole board
+        matched_ids   = {j.get("job_id") for j in title_matched}
+        gate_hit = date_skipped = filter_skipped = 0
 
-        # Chunk the flat job list to simulate page-level pause checks.
-        # Phase 7 will replace this outer loop with actual paginated HTTP fetches.
-        for chunk_start in range(0, max(len(title_matched), 1), FULLSCAN_CHUNK_SIZE):
+        # The board is already in memory; chunks exist only so pause/shutdown can be honoured.
+        for chunk_start in range(0, max(len(valid_jobs), 1), FULLSCAN_CHUNK_SIZE):
             if shutdown_event and shutdown_event.is_set():
                 logger.info("fullscan [%s]: shutdown during chunk processing", company)
                 try:
@@ -1181,7 +1188,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
                 result["outcome"] = "shutdown"
                 return result
-            chunk = title_matched[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]
+            chunk = valid_jobs[chunk_start:chunk_start + FULLSCAN_CHUNK_SIZE]
             if not chunk:
                 break
 
@@ -1193,23 +1200,6 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 )
                 paused = True
                 break
-
-            # ── Smart early exit for SORTED platforms ─────────────────────────
-            # Uses OLD bloom (last completed scan's board state) — contains ALL
-            # jobs that were active then, so the 80% threshold is meaningful.
-            if sorted_plat:
-                should_go_on, overlap_pages = should_continue_paginating(
-                    chunk, bloom.old_exists_fn(), overlap_pages,
-                    sorted_by_recency=True,
-                )
-                if not should_go_on:
-                    early_exit = True
-                    logger.debug(
-                        "fullscan [%s]: early exit at page=%d "
-                        "(80%%/2-page bloom threshold)",
-                        company, page_num,
-                    )
-                    break
 
             # ── Process jobs in this chunk ────────────────────────────────────
             for job in chunk:
@@ -1226,16 +1216,28 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                 if bloom.new_exists(job_id):
                     continue
 
-                # Layer 3: OLD bloom — known from last completed scan.
-                # Still call save_pending_detail (DB ON CONFLICT is the source
-                # of truth); bloom.old_exists is an optimisation hint only.
-                # False positives (0.1%) would silently drop genuinely new jobs
-                # if we skipped the DB here.
-                if bloom.old_exists(job_id):
-                    bloom.new_add(job_id)   # ALL active jobs go into NEW bloom
-                    # Fall through to DB check (no continue) — source of truth.
+                # Step 1: already handled -- OLD bloom (last completed scan) or adaptive_seen
+                # (adaptive handled it since). A hit means no date/title work, no DB insert, no
+                # queue; it just carries into the NEW bloom. A bloom false positive (0.1%) drops
+                # a genuinely new job until the next fullscan: accepted by design.
+                if bloom.old_exists(job_id) or r.sismember(adaptive_seen_key, job_id):
+                    bloom.new_add(job_id)
+                    gate_hit += 1
+                    continue
 
-                # Layer 4: DB check — source of truth for new/known decision.
+                # Step 2: date, where the listing carries a trustworthy one.
+                if not passes_listing_date(job, platform):
+                    bloom.new_add(job_id)
+                    date_skipped += 1
+                    continue
+
+                # Step 3: title / location filter result (computed once for the board above).
+                if job_id not in matched_ids:
+                    bloom.new_add(job_id)
+                    filter_skipped += 1
+                    continue
+
+                # Step 4: save for the detail worker.
                 try:
                     detail_payload = _build_detail_payload(
                         display_name, platform, job, slug_info,
@@ -1248,6 +1250,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                         company, platform, job.get("job_id"),
                         exc_info=True,
                     )
+                    continue   # NOT added to the bloom: it is retried next scan
                 else:
                     if save_pending_detail(
                         display_name, platform, job, found_by="tier2_fullscan",
@@ -1258,8 +1261,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                         count_arrival(r, REDIS_DETAIL_FULLSCAN)
                         new_count += 1
 
-                # ALL fetched jobs go into NEW bloom regardless of outcome —
-                # this ensures closed/filled jobs fall out naturally next cycle.
+                # Inserted or already in the DB: handled either way.
                 bloom.new_add(job_id)
 
             set_progress(company, f"fullscan_page_{page_num}")
@@ -1268,28 +1270,11 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         result["pages"]    = page_num
         result["new_jobs"] = new_count
 
-        # ── 10b. Bloom backfill for title-filtered-out jobs ───────────────────
-        # When the title filter eliminates ALL fetched jobs (e.g. a company with
-        # 500 positions but none matching our target roles), the chunk loop above
-        # runs 0 iterations and bloom.new_add() is never called.  finalize()
-        # then has an empty NEW bloom to rename → no bloom key is written.
-        #
-        # The bloom must cover ALL valid job IDs (not just title-matched ones)
-        # so that the next full scan's early-exit overlap check is meaningful
-        # and the adaptive scan can correctly skip already-known job IDs.
-        #
-        # We add any valid_job IDs that weren't already added via the main loop
-        # (bloom.new_exists() guards against double-adding resumes).
-        if valid_jobs and not title_matched:
-            for _job in valid_jobs:
-                _jid = _job.get("job_id")
-                if _jid:
-                    bloom.new_add(_jid)
-            logger.debug(
-                "fullscan [%s]: bloom backfill — added %d title-filtered "
-                "job IDs to NEW bloom (title_matched=0)",
-                company, len(valid_jobs),
-            )
+        logger.info(
+            "fullscan [%s]: gate | board=%d already_handled=%d date_skipped=%d "
+            "filter_skipped=%d queued=%d",
+            company, len(valid_jobs), gate_hit, date_skipped, filter_skipped, new_count,
+        )
 
         # ── 11. Depth/waste stats ─────────────────────────────────────────────
         depth_stats = estimate_scan_depth(
@@ -1353,10 +1338,14 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
             # Scan completed — a later transient failure gets a fresh retry budget.
             _clear_partial_retries(r, company)
 
-            # Promote NEW bloom → OLD (DEL old, RENAME new → old, set TTL).
-            # The promoted OLD bloom now reflects the complete current board
-            # state and will be read by adaptive scans for early exit.
+            # Promote NEW bloom → OLD with one RENAME (the gate for the next fullscan and the
+            # adaptive stop test). Always, even after an incomplete fetch: a job missing from the
+            # bloom is simply re-evaluated next scan.
             bloom.finalize()
+            # The fullscan has now seen everything adaptive handled meanwhile.
+            # (An ID adaptive adds after this scan's last read but before this delete is lost,
+            # so a rejected job may be queued once more: accepted.)
+            r.delete(adaptive_seen_key)
 
             # Reschedule using gap-detection algorithm (Phase 2 — thundering herd prevention).
             #

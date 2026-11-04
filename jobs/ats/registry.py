@@ -311,6 +311,25 @@ def get_config(platform: str) -> dict:
     return ATS_REGISTRY.get(platform, {})
 
 
+# Platforms whose LISTING response carries a posting date that is the original posting date
+# (verified in each module / against live feeds 2026-11-03). Only these may be date-filtered at
+# scan time. Everything else is treated as undated at the listing and decided by the detail worker:
+#   - detail-only dates: icims, avature, jobvite, phenom, talentbrew, paradox, paycom
+#   - adp: posted_at is always None at listing level
+#   - taleo: the date column is tenant-configured with no header (some tenants have none at all,
+#     others could show a closing/updated date) -- cannot be trusted
+#   - sitemap / custom / generic career pages: lastmod or a configurable field, not a posting date
+LISTING_DATE_RELIABLE = frozenset({
+    "greenhouse", "lever", "ashby", "smartrecruiters", "oracle_hcm", "jibe",
+    "successfactors", "workday", "google", "eightfold",
+})
+
+
+def has_reliable_listing_date(platform: str) -> bool:
+    """True when the platform's listing `posted_at` is the original posting date (see above)."""
+    return platform in LISTING_DATE_RELIABLE
+
+
 def all_platforms() -> list:
     """Return list of all supported platform names."""
     return list(ATS_REGISTRY.keys())

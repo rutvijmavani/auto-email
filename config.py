@@ -697,7 +697,6 @@ SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 # ── Smart early exit (Section 11) ─────────────────────────────────────────────
 PAGINATOR_OVERLAP_THRESHOLD    = 0.80       # 80% of page already seen → overlap
 PAGINATOR_CONFIRM_PAGES        = 2          # consecutive overlap pages to stop
-PAGINATOR_UNSORTED_CUTOFF_DAYS = 3          # time-based cutoff for non-sorted ATS
 
 # ── Dynamic concurrency (Section 19) ──────────────────────────────────────────
 CONCURRENCY_ERROR_RATE_REDUCE   = 0.10      # > 10% errors → reduce concurrency
@@ -904,8 +903,12 @@ WORKER_SCALING_LOCK_TTL            = 1800    # 30 min = WORKER_SLOW_CHECK_INTERV
 REDIS_INFLIGHT_PREFIX              = "inflight:scans"  # key: {prefix}:{dc_key}
 
 # ── Full scan (Section 9) ─────────────────────────────────────────────────────
-FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
+# The bloom is the fullscan's "already handled" gate (a hit = no DB insert), so it must outlive several
+# fullscan intervals: if it expires, every previously rejected job is DB-checked and re-inserted once.
+FULLSCAN_BLOOM_TTL             = int(os.getenv("FULLSCAN_BLOOM_TTL_S", str(7 * 24 * 3600)))   # default 7 days
 FULLSCAN_BLOOM_ERROR_RATE      = 0.001      # 0.1% false positive rate
+# Initial BF.RESERVE size = jobs fetched this scan * (1 + headroom), never below the floor. The filter is
+# scalable, so a board that grows past it still works; this only sets where it starts. No hard cap.
 # Hourly retries after a fetch that ended request_failed. Past the limit the scan completes normally with its
 # incomplete verdict recorded, so a board that always fails mid-way is not retried forever.
 REDIS_FULLSCAN_PARTIAL_PREFIX  = "fullscan:partial_retries"   # key: {prefix}:{company}

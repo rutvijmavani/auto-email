@@ -162,12 +162,12 @@ class TestBloomPairFallbackMode(unittest.TestCase):
         self.assertIn("bloom:fullscan:new:TestCo", delete_calls)
         self.assertIn("bloom:fallback:new:TestCo", delete_calls)
 
-    def test_finalize_deletes_old_keys(self):
-        """finalize() DELs old bf and old fb keys."""
+    def test_finalize_does_not_delete_old_before_rename(self):
+        """finalize() promotes with RENAME only (atomic overwrite): no DEL of the old keys."""
         self.bp.finalize()
         delete_calls = [c[0][0] for c in self.r.delete.call_args_list]
-        self.assertIn("bloom:fullscan:TestCo", delete_calls)
-        self.assertIn("bloom:fallback:TestCo", delete_calls)
+        self.assertNotIn("bloom:fullscan:TestCo", delete_calls)
+        self.assertNotIn("bloom:fallback:TestCo", delete_calls)
 
     def test_finalize_renames_new_to_old(self):
         """finalize() RENAMEs new keys to old keys."""
@@ -604,11 +604,6 @@ class TestFullscanConstants(unittest.TestCase):
         from workers.fullscan import FULLSCAN_CHUNK_SIZE
         self.assertEqual(FULLSCAN_CHUNK_SIZE, 50)
 
-    def test_bloom_capacity_is_10000(self):
-        """FULLSCAN_BLOOM_CAPACITY = 10_000."""
-        from workers.fullscan import FULLSCAN_BLOOM_CAPACITY
-        self.assertEqual(FULLSCAN_BLOOM_CAPACITY, 10_000)
-
     def test_adaptive_first_delay_is_900(self):
         """FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900 (15 minutes)."""
         from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
@@ -619,10 +614,19 @@ class TestFullscanConstants(unittest.TestCase):
         from workers.fullscan import FULLSCAN_PAUSE_POLL_SECS
         self.assertGreater(FULLSCAN_PAUSE_POLL_SECS, 0)
 
-    def test_bloom_capacity_positive(self):
-        """FULLSCAN_BLOOM_CAPACITY > 0."""
-        from workers.fullscan import FULLSCAN_BLOOM_CAPACITY
-        self.assertGreater(FULLSCAN_BLOOM_CAPACITY, 0)
+    def test_bloom_capacity_derived_from_fetched_board(self):
+        """reserve() sizes BF.RESERVE as the fetched count (min 1); there is no fixed cap or headroom."""
+        from workers.fullscan import _BloomPair
+        r = _make_redis_bf_available()
+        r.exists = MagicMock(return_value=0)
+        bp = _BloomPair(r, "BigCo")
+        bp.reserve(33_000)
+        reserve_calls = [c[0] for c in r.execute_command.call_args_list if c[0][0] == "BF.RESERVE"]
+        self.assertEqual(int(reserve_calls[-1][3]), 33_000)
+        bp2 = _BloomPair(r, "TinyCo")
+        bp2.reserve(0)
+        reserve_calls = [c[0] for c in r.execute_command.call_args_list if c[0][0] == "BF.RESERVE"]
+        self.assertEqual(int(reserve_calls[-1][3]), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -62,7 +62,6 @@ Usage (current, post-fetch scan):
 from config import (
     PAGINATOR_OVERLAP_THRESHOLD,   # 0.80
     PAGINATOR_CONFIRM_PAGES,       # 2
-    PAGINATOR_UNSORTED_CUTOFF_DAYS,
 )
 
 

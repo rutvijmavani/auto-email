@@ -21,7 +21,7 @@ to hydrate and filter.
    c. For each job ID: check adaptive_seen:{company} SET → skip if seen today
    d. DB lookup for unseen IDs → queue new ones for detail fetch
    e. Add all processed IDs to adaptive_seen:{company} SET
-   f. First scan: save pre_existing rows, mark first_scanned_at
+   f. First scan (first_scanned_at NULL): route to poll:fullscan, no scan here
    g. Call on_adaptive_complete() inline (reschedule + WARMING check)
    h. XACK stream message (remove from PEL)
 3. detail_worker: BRPOP queue:detail:adaptive → fetch detail → filter → save 'new'
@@ -50,16 +50,12 @@ to hydrate and filter.
         "completed_at": "2026-04-27T07:00:01+00:00"
     }
 
-─── First-scan bootstrap ────────────────────────────────────────────────────
+─── First scan = fullscan ───────────────────────────────────────────────────
 
-    When a company's first_scanned_at IS NULL, all jobs returned by the
-    listing are "new" from the API's perspective but should be treated as
-    pre_existing (they existed before we started monitoring). The worker:
-
-      1. SADDs every returned job_id to adaptive_seen:{company} SET
-      2. Saves a minimal pre_existing row to DB (source of truth)
-      3. Marks first_scanned_at so subsequent scans do the incremental diff
-      4. Returns new_jobs=0 (correct — no new jobs on first scan)
+    When a company's first_scanned_at IS NULL the worker does not scan: it
+    ZADDs the company to poll:fullscan (NX) and returns new_jobs=0 with
+    routed_to_fullscan=True. The fullscan path (old bloom empty, date gate,
+    title/location filter) handles the first board and sets first_scanned_at.
 
 ─── Usage ───────────────────────────────────────────────────────────────────
 
@@ -97,7 +93,7 @@ from config import (
     WORKER_BLOCK_SECS,
     REDIS_DETAIL_ADAPTIVE,
     REDIS_POLL_ADAPTIVE,
-    JOB_MONITOR_DAYS_FRESH,
+    REDIS_POLL_FULLSCAN,
     REDIS_BACKOFF_PREFIX,
     WORKER_BACKOFF_BASE_S,
     WORKER_BACKOFF_CAP_S,
@@ -121,15 +117,13 @@ from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
 from jobs.ats.avature import IncompleteSearchError
 from jobs.ats.fetch_report import STOP_REQUEST_FAILED, report_of
-from jobs.job_filter import filter_jobs, filter_jobs_title_only
+from jobs.job_filter import filter_jobs, filter_jobs_title_only, passes_listing_date
 from db.db import init_db
 from db.job_monitor import (
     get_company_row,
     is_company_row_active,
     upsert_poll_stats,
     save_pending_detail,
-    save_pre_existing_listing,
-    mark_first_scan_complete,
 )
 
 logger = get_logger(__name__)
@@ -458,38 +452,24 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         # Not recorded to scan_health: the completeness verdict comes from fullscan only, and adaptive
         # scans run constantly — their rows would feed nothing.
 
-        # ── 5. First-scan bootstrap ───────────────────────────────────────────
-        is_first_scan = company_row.get("first_scanned_at") is None
-
-        if is_first_scan:
+        # ── 5. Never-fullscanned company → fullscan ───────────────────────────
+        # A first scan IS a fullscan (old bloom empty, so every listing job goes
+        # through date + title gates and is queued). Adaptive does no bootstrap
+        # of its own: hand the company to the fullscan queue and stop.
+        if company_row.get("first_scanned_at") is None:
+            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time()}, nx=True)
             logger.info(
-                "scan_worker [%s]: FIRST SCAN for %r — %d jobs "
-                "(fresh ones will be queued, stale marked pre_existing)",
+                "scan_worker [%s]: %r never fullscanned — routed to fullscan "
+                "(adaptive fetched %d jobs, none processed)",
                 request_id, company, len(valid_jobs),
             )
-            fresh_count = _handle_first_scan(
-                r, company, platform, valid_jobs,
-                slug_info=slug_info,
-                config=config,
-                request_id=request_id,
-                display_name=display_name,
-            )
-            if _fetch_complete:
-                mark_first_scan_complete(company)
-            duration_ms = int((time.monotonic() - start_mono) * 1000)
             result.update({
-                "success":     True,
-                "new_jobs":    fresh_count,
-                "duration_ms": duration_ms,
-                "first_scan":  True,
+                "success":      True,
+                "new_jobs":     0,
+                "duration_ms":  int((time.monotonic() - start_mono) * 1000),
+                "routed_to_fullscan": True,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             })
-            logger.info(
-                "scan_worker [%s]: FIRST SCAN done | company=%r "
-                "fetched=%d fresh_queued=%d pre_existing=%d",
-                request_id, company,
-                len(valid_jobs), fresh_count, len(valid_jobs) - fresh_count,
-            )
             clear_heartbeat(company)
             return result
 
@@ -508,28 +488,42 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         else:
             title_matched = filter_jobs(valid_jobs)
 
+        matched_ids      = {j.get("job_id") for j in title_matched}
         new_count        = 0
         adaptive_skipped = 0
+        date_skipped     = 0
+        filter_skipped   = 0
 
-        for job in title_matched:
+        for job in valid_jobs:
             job_id = job.get("job_id")
-            if not job_id:
-                continue
 
             # Layer 1: in-cycle dedup (pagination overlap within this fetch)
             if job_id in cycle_seen:
                 continue
             cycle_seen.add(job_id)
 
-            # Layer 2: adaptive_seen cache — already processed in an earlier
-            # adaptive scan today (DB lookup already done, outcome recorded).
-            # Skip entirely — no DB round-trip needed.
+            # Layer 2: adaptive_seen — handled by an earlier adaptive scan
+            # since the last fullscan. Skip, no DB round-trip.
             if r.sismember(adaptive_seen_key, job_id):
                 adaptive_skipped += 1
                 continue
 
-            # Layer 3: DB check — validate payload first to avoid orphaned DB
+            # Layer 3: date gate (platforms whose listing date is the posting
+            # date only), then title/location filter. Rejected jobs are marked
+            # handled so they are not re-evaluated every scan.
+            if not passes_listing_date(job, platform):
+                r.sadd(adaptive_seen_key, job_id)
+                date_skipped += 1
+                continue
+            if job_id not in matched_ids:
+                r.sadd(adaptive_seen_key, job_id)
+                filter_skipped += 1
+                continue
+
+            # Layer 4: DB check — validate payload first to avoid orphaned DB
             # records (a job inserted but never queued can never be re-queued).
+            # A DB error raises out of save_pending_detail and aborts the scan;
+            # a payload failure leaves the ID unmarked so it retries.
             try:
                 detail_payload = _build_detail_payload(
                     display_name, platform, job, slug_info,
@@ -551,8 +545,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                     # queue at the bucket rate (pushed_at NULL = held).
                     count_arrival(r, REDIS_DETAIL_ADAPTIVE)
                     new_count += 1
-                    # The row is safe in the DB, so mark seen now.
-                    r.sadd(adaptive_seen_key, job_id)
+                # New or already known (DB decided): handled either way.
+                r.sadd(adaptive_seen_key, job_id)
 
         # Refresh adaptive_seen TTL after each adaptive scan so it stays alive
         # until the next full scan (which will DEL it explicitly).
@@ -566,11 +560,12 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         )
         logger.info(
             "scan_worker [%s] done | company=%r platform=%s "
-            "fetched=%d new=%d adaptive_skipped=%d waste=%.0f%%",
+            "fetched=%d new=%d adaptive_skipped=%d date_skipped=%d "
+            "filter_skipped=%d waste=%.0f%%",
             request_id, company, platform,
             depth_stats["total_fetched"],
             depth_stats["new_found"],
-            adaptive_skipped,
+            adaptive_skipped, date_skipped, filter_skipped,
             depth_stats["waste_ratio"] * 100,
         )
 
@@ -596,140 +591,6 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
 
     clear_heartbeat(company)
     return result
-
-
-# ─────────────────────────────────────────
-# FIRST-SCAN HELPER
-# ─────────────────────────────────────────
-
-def _is_fresh_at_listing(job: dict) -> bool:
-    """
-    Return True if a job's posted_at is within JOB_MONITOR_DAYS_FRESH days.
-
-    Used during first-scan bootstrap to decide whether a job should be
-    queued for detail fetch (fresh) or treated as pre-existing (stale).
-
-    Conservative: if posted_at is missing or unparseable → False (pre-existing).
-    """
-    from datetime import datetime, timezone, timedelta
-    posted = job.get("posted_at")
-    if not posted:
-        return False
-
-    try:
-        if isinstance(posted, datetime):
-            dt = posted
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            # ISO string — handle both offset-aware and naive
-            s = str(posted).strip()
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=JOB_MONITOR_DAYS_FRESH)
-    return dt >= cutoff
-
-
-def _handle_first_scan(
-    r,
-    company: str,
-    platform: str,
-    jobs: list,
-    slug_info=None,
-    config: dict = None,
-    request_id: str = "",
-    display_name: str = "",
-) -> int:
-    """
-    Bootstrap a company's first scan with fresh/stale split.
-
-    Fresh jobs (posted_at within JOB_MONITOR_DAYS_FRESH days):
-        - Apply listing-level title filter
-        - Pass  → INSERT pending_detail + LPUSH queue:detail:adaptive
-        - Fail filter → treat as pre-existing (save_pre_existing + adaptive_seen)
-
-    Stale jobs (posted_at older than freshness window, or date missing):
-        - INSERT as pre_existing to DB (source of truth)
-        - SADD to adaptive_seen:{company} so subsequent adaptive scans today
-          skip the DB lookup for these already-processed IDs
-
-    Returns:
-        Count of fresh jobs pushed to the detail queue.
-    """
-    adaptive_seen_key = f"{REDIS_ADAPTIVE_SEEN_PREFIX}:{company}"
-    config            = config or {}
-    listing_filter    = config.get("listing_filter", "full")
-
-    fresh_queued    = 0
-    preexisting_ids: list = []
-
-    for job in jobs:
-        job_id  = job.get("job_id")
-        job_url = job.get("job_url")
-        if not job_id or not job_url:
-            continue
-
-        if _is_fresh_at_listing(job):
-            # ── Fresh job: apply title filter, then queue for detail ──────────
-            if listing_filter == "title_only":
-                title_passed = filter_jobs_title_only([job])
-            else:
-                title_passed = filter_jobs([job])
-
-            if title_passed:
-                try:
-                    detail_payload = _build_detail_payload(
-                        display_name, platform, job, slug_info,
-                        request_id=request_id,
-                        found_by="first_scan_fresh",
-                    )
-                except ValueError:
-                    logger.error(
-                        "scan_worker: _build_detail_payload raised — job skipped "
-                        "to avoid orphaned DB record. "
-                        "company=%r platform=%s job_id=%s",
-                        company, platform, job.get("job_id"),
-                        exc_info=True,
-                    )
-                else:
-                    if save_pending_detail(
-                        display_name, platform, job, found_by="first_scan_fresh",
-                        detail_payload=detail_payload,
-                    ):
-                        count_arrival(r, REDIS_DETAIL_ADAPTIVE)
-                        fresh_queued += 1
-                # Always mark in adaptive_seen — repeat adaptive scans today
-                # must not re-check this job regardless of whether it was a
-                # new DB insert (inserted=True) or a duplicate (inserted=False).
-                preexisting_ids.append(job_id)
-            else:
-                # Filtered by title → treat as pre-existing
-                preexisting_ids.append(job_id)
-                save_pre_existing_listing(display_name, platform, job)
-        else:
-            # ── Stale job: mark pre-existing immediately ──────────────────────
-            preexisting_ids.append(job_id)
-            save_pre_existing_listing(display_name, platform, job)
-
-    # Bulk SADD all processed IDs to adaptive_seen (saves DB lookups today)
-    if preexisting_ids:
-        pipe = r.pipeline()
-        for i in range(0, len(preexisting_ids), 500):
-            pipe.sadd(adaptive_seen_key, *preexisting_ids[i:i + 500])
-        pipe.execute()
-        r.expire(adaptive_seen_key, ADAPTIVE_SEEN_TTL)
-
-    logger.debug(
-        "_handle_first_scan [%s]: company=%r fresh_queued=%d pre_existing=%d",
-        request_id, company, fresh_queued, len(preexisting_ids),
-    )
-    return fresh_queued
 
 
 # ─────────────────────────────────────────
