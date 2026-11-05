@@ -2170,20 +2170,27 @@ def _start_state(r, ptype: str, pool: list) -> dict:
     oldest_pending_start_s = age of the longest-waiting one; start_warn_s = the learned
     slowest start-up x PROGRESS_GAP_FACTOR (0 until one start has been observed).
     """
-    now = time.time()
-    pending = 0
-    oldest = 0.0
-    for proc, _event in list(pool):
-        info = _worker_spawn_times.get(proc.pid)
-        if info is not None and proc.pid not in _worker_started:
-            pending += 1
-            oldest = max(oldest, now - info[1])
     try:
         hw = float(r.hget(REDIS_START_LATENCY_HASH, ptype) or 0)
     except Exception:
         hw = 0.0
+    now = time.time()
+    pending = 0
+    starting = 0
+    oldest = 0.0
+    for proc, _event in list(pool):
+        info = _worker_spawn_times.get(proc.pid)
+        if info is not None and proc.pid not in _worker_started:
+            age = now - info[1]
+            pending += 1
+            oldest = max(oldest, age)
+            # still inside its start-up allowance: expected to join, so it counts
+            # as a worker (before any start was observed the kill deadline applies)
+            if hw <= 0 or age <= hw * PROGRESS_GAP_FACTOR:
+                starting += 1
     return {
         "started":                len(pool) - pending,
+        "starting":               starting,
         "pending_start":          pending,
         "oldest_pending_start_s": round(oldest, 1),
         "start_warn_s":           round(hw * PROGRESS_GAP_FACTOR, 1),
@@ -2328,8 +2335,11 @@ def _write_scheduler_health() -> None:
         payload = {"ts": time.time(), "pool": {}}
         for _t in _pools:
             payload["pool"][_t] = {
-                # alive = started (heartbeating) and not stalled
-                "alive":              max(0, _ss[_t]["started"] - _st[_t]),
+                # alive = heartbeating and not stalled, plus workers still starting
+                # inside their learned allowance; a start that overruns it (probably
+                # hung) drops out.  The manager sizes the pool from this number.
+                "alive":              max(0, _ss[_t]["started"] + _ss[_t]["starting"]
+                                          - _st[_t]),
                 "consecutive_deaths": _consecutive_deaths[_t],
                 "total_replacements": _total_replacements[_t],
                 **_ss[_t],
@@ -3075,18 +3085,18 @@ def _manager_cmds_loop() -> None:
             parts = cmd.split(":")
 
             # ── {pool}:target:{n} ─────────────────────────────────────────────
-            if len(parts) == 3 and parts[1] == "target":
-                pool, _, n_str = parts
+            if parts[1:2] == ["target"] and len(parts) in (3, 5):
+                pool, _, n_str = parts[:3]
+                seen = None
                 try:
                     target = int(n_str)
+                    if len(parts) == 5:
+                        if parts[3] != "seen":
+                            raise ValueError(cmd)
+                        seen = int(parts[4])
                 except ValueError:
                     logger.warning("manager_cmds: bad target command %r", cmd)
                     continue
-
-                # The manager owns the ceilings (it already clamps the target to
-                # the pool's ceiling plus borrowed seats); the scheduler only
-                # applies the number it is given.
-                target = max(WORKER_FLOOR, target)
 
                 if pool in ("scan", "detail", "fullscan"):
                     if pool == "fullscan":
@@ -3094,6 +3104,18 @@ def _manager_cmds_loop() -> None:
                     else:
                         n_scan, n_detail = _get_pool_snapshot()
                         current = n_scan if pool == "scan" else n_detail
+
+                    # "{pool}:target:{n}:seen:{s}": the manager wants n after seeing
+                    # s workers, i.e. a change of n - s.  Apply that change to the
+                    # real pool, so a count that differs from the manager's (workers
+                    # still starting, a stale read) cannot turn "one fewer" into two.
+                    if seen is not None:
+                        target = current + (target - seen)
+
+                    # The manager owns the ceilings (it already clamps the target
+                    # to the pool's ceiling plus borrowed seats); the scheduler
+                    # only applies the number it is given.
+                    target = max(WORKER_FLOOR, target)
 
                     if target > current:
                         for _ in range(target - current):

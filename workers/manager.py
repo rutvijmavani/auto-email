@@ -1377,7 +1377,7 @@ def _run_pool_cycle(
             pool, delay_s, delay_warn_s, depth,
             pool_utilization * 100, workers_target, n_workers, worker_ceil,
         )
-        _send_cmd(r, f"{pool}:target:{workers_target}")
+        _send_cmd(r, f"{pool}:target:{workers_target}:seen:{n_workers}")
         _incr_pending_spawns(r, pool, max(0, workers_target - n_workers))
 
     elif _urgent_active[pool]:
@@ -1409,7 +1409,7 @@ def _run_pool_cycle(
                 pool, delay_s, delay_warn_s, depth,
                 pool_utilization * 100, workers_target, effective_target, n_workers,
             )
-            _send_cmd(r, f"{pool}:target:{n_workers + 1}")
+            _send_cmd(r, f"{pool}:target:{n_workers + 1}:seen:{n_workers}")
             _incr_pending_spawns(r, pool, 1)
         else:
             decision = "scale_up_pending"
@@ -1431,7 +1431,7 @@ def _run_pool_cycle(
                 pool, delay_s, delay_warn_s, depth,
                 pool_utilization * 100, workers_target, effective_target, n_workers,
             )
-            _send_cmd(r, f"{pool}:target:{max(WORKER_FLOOR, n_workers - 1)}")
+            _send_cmd(r, f"{pool}:target:{max(WORKER_FLOOR, n_workers - 1)}:seen:{n_workers}")
         else:
             decision = "scale_down_pending"
 
