@@ -93,6 +93,7 @@ from db.db import init_db
 from db.job_monitor import (
     complete_pending_detail,
     delete_pending_detail,
+    pending_detail_exists,
     ContentHashConflict,
 )
 
@@ -124,6 +125,7 @@ def _timed_db(fn):
 
 complete_pending_detail = _timed_db(complete_pending_detail)
 delete_pending_detail   = _timed_db(delete_pending_detail)
+pending_detail_exists   = _timed_db(pending_detail_exists)
 
 # ── At-least-once delivery via LMOVE processing lists ────────────────────────
 # BRPOP is destructive: if the worker dies after pop but before the DB write,
@@ -528,6 +530,29 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
 
     if not company or not job_id:
         logger.warning("detail_worker: missing company or job_id in payload — skipping")
+        return result
+
+    # ── 0. Stale copy check (NC) ──────────────────────────────────────────────
+    # Every DB write below is guarded by status='pending_detail', so a queue item
+    # whose row is gone or already promoted (a stacked copy) can change nothing.
+    # Skip it without an ATS fetch; acknowledged like any finished item
+    # (retryable stays False).  A DB error here must never drop a real job:
+    # fall through and process normally.
+    try:
+        _still_pending = pending_detail_exists(company, job_id)
+    except Exception as _chk_err:
+        _still_pending = True
+        logger.warning(
+            "detail_worker: pending check failed for company=%r job_id=%s: %s "
+            "- processing anyway", company, job_id, _chk_err,
+        )
+    if not _still_pending:
+        logger.info(
+            "detail_worker: no pending_detail row for company=%r job_id=%s - "
+            "stale copy, skipped without fetch", company, job_id,
+        )
+        result["outcome"]     = "noop"
+        result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
         return result
 
     try:

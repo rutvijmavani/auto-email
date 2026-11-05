@@ -818,7 +818,7 @@ def save_pending_detail(company: str, platform: str, job: dict,
     The detail_worker will later UPDATE this to 'new' after fetching full
     detail and applying filters.
 
-    Returns True if inserted (new row), False if job_url already exists.
+    Returns True if inserted (new row), False if job_url OR (company, job_id) already exists.
     """
     conn = get_conn()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -827,13 +827,21 @@ def save_pending_detail(company: str, platform: str, job: dict,
         posted_at = posted_at.isoformat()
 
     try:
+        # Dedup on job_id as well as job_url: a URL can drift while the id stays (Workday puts the
+        # city in the path), and job_url alone would insert the same job a second time. The
+        # fullscan already treats job_id as unique within a company (cycle_seen / bloom).
         cursor = conn.execute("""
             INSERT INTO job_postings
               (company, title, job_url, job_id, ats_platform,
                location, posted_at, description, skill_score,
                status, found_by, first_seen, detail_payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    'pending_detail', %s, %s, %s)
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   'pending_detail', %s, %s, %s
+            WHERE COALESCE(%s::text, '') = ''
+               OR NOT EXISTS (
+                SELECT 1 FROM job_postings
+                WHERE company = %s AND ats_platform = %s AND job_id = %s
+            )
             ON CONFLICT (job_url) DO NOTHING
         """, (
             company,
@@ -848,6 +856,10 @@ def save_pending_detail(company: str, platform: str, job: dict,
             found_by,
             today,
             json.dumps(detail_payload) if detail_payload else None,
+            job.get("job_id"),
+            company,
+            platform,
+            job.get("job_id"),
         ))
         conn.commit()
         return cursor.rowcount > 0
@@ -952,6 +964,26 @@ def complete_pending_detail(company: str, job_id: str, job: dict,
                 pass
             raise ContentHashConflict(job.get("content_hash")) from exc
         raise
+    finally:
+        conn.close()
+
+
+def pending_detail_exists(company: str, job_id: str) -> bool:
+    """
+    True if a row with status='pending_detail' exists for (company, job_id).
+
+    The detail worker calls this before the ATS fetch: complete_pending_detail and
+    delete_pending_detail only touch pending_detail rows, so a queue item whose row
+    is gone or already promoted/deleted (a stacked copy) can do nothing useful.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT 1 FROM job_postings
+            WHERE company = %s AND job_id = %s AND status = 'pending_detail'
+            LIMIT 1
+        """, (company, job_id)).fetchone()
+        return row is not None
     finally:
         conn.close()
 

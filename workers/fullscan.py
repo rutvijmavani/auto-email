@@ -1222,8 +1222,10 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
                 # Step 1: already handled -- OLD bloom (last completed scan) or adaptive_seen
                 # (adaptive handled it since). A hit means no date/title work, no DB insert, no
-                # queue; it just carries into the NEW bloom. A bloom false positive (0.1%) drops
-                # a genuinely new job until the next fullscan: accepted by design.
+                # queue; it just carries into the NEW bloom. A bloom false positive (~0.1% of
+                # genuinely NEW ids) is carried forward too, so fullscan never inserts that job
+                # while it stays on the board; only an adaptive scan (adaptive_seen + DB decide
+                # per job) can still pick it up. Accepted by design.
                 if bloom.old_exists(job_id) or r.sismember(adaptive_seen_key, job_id):
                     bloom.new_add(job_id)
                     gate_hit += 1
