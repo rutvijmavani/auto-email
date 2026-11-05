@@ -103,6 +103,8 @@ from config import (
     REDIS_INFLIGHT_MSG_PREFIX,
     REDIS_WORKER_CUR_PREFIX,
     REDIS_START_LATENCY_HASH,
+    REDIS_WORKER_HEALTH_STREAM, WORKER_HEALTH_SNAPSHOT_INTERVAL_S,
+    WORKER_HEALTH_STREAM_MAXLEN,
     PROGRESS_GAP_FACTOR,
     PROGRESS_COLD_GAP_S,
     # WARMING lifecycle
@@ -2271,6 +2273,33 @@ def _unstarted_pids(r, snapshot: list) -> set:
     return unstarted
 
 
+_last_health_snapshot_ts = 0.0
+
+
+def _snapshot_worker_health(r, payload: dict) -> None:
+    """
+    Append the current pool state to the trimmed stream worker:health_history, at most
+    once per WORKER_HEALTH_SNAPSHOT_INTERVAL_S, so a hang that clears itself leaves a
+    record (counters are cumulative: the report reads deltas between rows).
+    scripts/worker_health_report.py prints it.
+    """
+    global _last_health_snapshot_ts
+    now = time.time()
+    if now - _last_health_snapshot_ts < WORKER_HEALTH_SNAPSHOT_INTERVAL_S:
+        return
+    try:
+        lat = r.hgetall(REDIS_START_LATENCY_HASH) or {}
+        lat = {(k.decode() if isinstance(k, bytes) else k):
+               float(v.decode() if isinstance(v, bytes) else v) for k, v in lat.items()}
+        r.xadd(REDIS_WORKER_HEALTH_STREAM,
+               {"data": json.dumps({"ts": now, "pool": payload["pool"],
+                                    "start_latency_s": lat})},
+               maxlen=WORKER_HEALTH_STREAM_MAXLEN, approximate=True)
+        _last_health_snapshot_ts = now
+    except Exception as exc:
+        logger.warning("scheduler: worker health snapshot failed: %s", exc)
+
+
 def _write_scheduler_health() -> None:
     """
     Publish current pool state and consecutive-death counters to Redis as
@@ -2310,6 +2339,7 @@ def _write_scheduler_health() -> None:
             json.dumps(payload),
             ex=_SCHEDULER_HEALTH_TTL,
         )
+        _snapshot_worker_health(_r, payload)
     except Exception as exc:
         logger.warning("scheduler: failed to write scheduler:health: %s", exc)
 

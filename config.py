@@ -961,6 +961,9 @@ REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg 
 # A pool worker that is alive but has published no heartbeat within
 # (slowest start-up seen for its type) x PROGRESS_GAP_FACTOR never finished starting
 # and is killed and replaced.  No deadline until one start-up has been observed.
+REDIS_WORKER_HEALTH_STREAM = "worker:health_history"   # STREAM of periodic pool snapshots
+WORKER_HEALTH_SNAPSHOT_INTERVAL_S = int(os.getenv("WORKER_HEALTH_SNAPSHOT_INTERVAL_S", "3600"))
+WORKER_HEALTH_STREAM_MAXLEN = int(os.getenv("WORKER_HEALTH_STREAM_MAXLEN", "2000"))
 REDIS_START_LATENCY_HASH = "worker:start_latency"   # HASH worker type -> slowest spawn->heartbeat (s)
 
 # ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
