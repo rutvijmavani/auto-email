@@ -958,6 +958,10 @@ PROGRESS_GAP_FACTOR     = float(os.getenv("PROGRESS_GAP_FACTOR", "3"))
 PROGRESS_COLD_GAP_S     = int(os.getenv("PROGRESS_COLD_GAP_S", "600"))
 REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
 REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
+# A pool worker that is alive but has published no heartbeat within
+# (slowest start-up seen for its type) x PROGRESS_GAP_FACTOR never finished starting
+# and is killed and replaced.  No deadline until one start-up has been observed.
+REDIS_START_LATENCY_HASH = "worker:start_latency"   # HASH worker type -> slowest spawn->heartbeat (s)
 
 # ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
 # NEW companies do their first full scan, then WARMING: 3 adaptive polls at a

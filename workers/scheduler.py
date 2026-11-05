@@ -102,6 +102,9 @@ from config import (
     REDIS_REAPED_PREFIX,
     REDIS_INFLIGHT_MSG_PREFIX,
     REDIS_WORKER_CUR_PREFIX,
+    REDIS_START_LATENCY_HASH,
+    PROGRESS_GAP_FACTOR,
+    PROGRESS_COLD_GAP_S,
     # WARMING lifecycle
     WARMING_POLLS_COUNT,
     WARMING_INTERVAL_S,
@@ -170,6 +173,7 @@ _hysteresis: dict = {
 _consecutive_deaths:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _total_replacements:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _worker_spawn_times:      dict = {}   # pid → (ptype, spawn_epoch)
+_worker_started:          set  = set()  # pids seen with a heartbeat (finished starting)
 _death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
 # Timestamp (epoch) when the current consecutive-death streak began.
 # A replacement must have been spawned AFTER this time and lived >=
@@ -1880,15 +1884,53 @@ def _get_pool_snapshot() -> tuple:
 
 # ── Process target functions ──────────────────────────────────────────────────
 
+_mp_ctx = None
+
+
+def _worker_mp_context():
+    """
+    Process-creation context for pool workers (bug FK).
+
+    A plain fork from a scheduler thread copies every lock another thread holds at
+    that instant (module import locks, the DB pool lock) with no thread left in the
+    child to release it, so the worker hangs before it starts.  The "forkserver"
+    start method forks workers from a separate single-threaded server process, so no
+    scheduler lock can be inherited.  The server preloads the worker modules once, so
+    a new worker starts as fast as a fork.  Platforms without forkserver (Windows)
+    keep their default method.  The first call must come from the main thread before
+    the scheduler threads start (run_scheduler's initial spawn does).
+    """
+    global _mp_ctx
+    if _mp_ctx is None:
+        if "forkserver" in multiprocessing.get_all_start_methods():
+            ctx = multiprocessing.get_context("forkserver")
+            ctx.set_forkserver_preload([
+                "workers.scheduler", "workers.scan_worker",
+                "workers.detail_worker", "workers.fullscan",
+            ])
+        else:
+            ctx = multiprocessing.get_context()
+        _mp_ctx = ctx
+    return _mp_ctx
+
+
+def _init_worker_logging() -> None:
+    """Send this worker's log lines to scheduler.log, as the forked workers did."""
+    from logger import init_logging
+    init_logging("scheduler")
+
+
 def _reset_inherited_db_pool() -> None:
     """
     Discard any PostgreSQL connection pool inherited from the parent process.
 
-    multiprocessing.Process forks the parent, so the child inherits the
-    parent's _pool which holds open TCP sockets to PostgreSQL.  Both parent
-    and child would then share the same file descriptors, causing libpq to
-    emit "error with status PGRES_TUPLES_OK and no message from the libpq"
-    when the child tries to use or re-initialise the connection.
+    Under a plain fork the child inherits the parent's _pool, which holds open
+    TCP sockets to PostgreSQL.  Both parent and child would then share the same
+    file descriptors, causing libpq to emit "error with status PGRES_TUPLES_OK and
+    no message from the libpq" when the child tries to use or re-initialise the
+    connection.  Workers are now started through the fork server (see
+    _worker_mp_context), so nothing is inherited; this stays as a guard for the
+    platforms that fall back to fork.
 
     Calling this at the top of every worker-process target function ensures
     the child creates its own fresh pool on first get_conn() call.
@@ -1911,6 +1953,7 @@ def _scan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     when shutdown_event is set — the run_worker() loop's
     `except KeyboardInterrupt: break` then exits cleanly.
     """
+    _init_worker_logging()
     _reset_inherited_db_pool()
 
     def _watcher() -> None:
@@ -1935,6 +1978,7 @@ def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
 
     Mirrors _scan_worker_process but runs detail_worker.run_worker().
     """
+    _init_worker_logging()
     _reset_inherited_db_pool()
 
     def _watcher() -> None:
@@ -1962,6 +2006,7 @@ def _fullscan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     shutdown_event fires — fullscan.run_worker()'s KeyboardInterrupt handler
     exits the XREADGROUP loop cleanly.
     """
+    _init_worker_logging()
     _reset_inherited_db_pool()
 
     def _watcher() -> None:
@@ -1992,14 +2037,15 @@ def _spawn_worker(worker_type: str) -> tuple:
         (multiprocessing.Process, multiprocessing.Event) — process handle and
         its shutdown event.  Store this tuple in the pool list.
     """
-    shutdown_event = multiprocessing.Event()
+    ctx = _worker_mp_context()
+    shutdown_event = ctx.Event()
     target_map = {
         "scan":     _scan_worker_process,
         "detail":   _detail_worker_process,
         "fullscan": _fullscan_worker_process,
     }
     target = target_map.get(worker_type, _scan_worker_process)
-    proc = multiprocessing.Process(
+    proc = ctx.Process(
         target = target,
         args   = (shutdown_event,),
         name   = f"{worker_type}_worker_{int(time.time())}",
@@ -2031,6 +2077,52 @@ def _stalled_pids(r, worker_type: str, pool: list) -> set:
         except Exception:
             continue
     return stalled
+
+
+def _unstarted_pids(r, snapshot: list) -> set:
+    """
+    PIDs of alive pool workers that never finished starting (bug FK safety net).
+
+    A worker has started once it publishes worker:alive:{type}_worker:{host}:{pid}
+    (its heartbeat is written right after "started").  Each observed spawn->heartbeat
+    time updates the slowest start-up seen per type (REDIS_START_LATENCY_HASH).  A
+    worker with no heartbeat after max(slowest start x PROGRESS_GAP_FACTOR,
+    PROGRESS_COLD_GAP_S) is unstarted: the same learned allowance and floor the stall
+    check uses, so a start that is merely slow under load is never killed.
+    snapshot: [(ptype, pool_list), ...].  Redis errors skip the check.
+    """
+    import socket as _socket
+    host = _socket.gethostname()
+    now = time.time()
+    unstarted: set = set()
+    live: set = set()
+    for ptype, pool in snapshot:
+        try:
+            hw = float(r.hget(REDIS_START_LATENCY_HASH, ptype) or 0)
+        except Exception:
+            hw = 0.0
+        deadline = max(hw * PROGRESS_GAP_FACTOR, float(PROGRESS_COLD_GAP_S))
+        for proc, _event in pool:
+            pid = proc.pid
+            live.add(pid)
+            info = _worker_spawn_times.get(pid)
+            if pid in _worker_started or info is None:
+                continue
+            try:
+                if not proc.is_alive():
+                    continue
+                age = now - info[1]
+                if r.exists(f"worker:alive:{ptype}_worker:{host}:{pid}"):
+                    _worker_started.add(pid)
+                    if age > hw:
+                        r.hset(REDIS_START_LATENCY_HASH, ptype, round(age, 1))
+                        hw = age
+                elif age > deadline:
+                    unstarted.add(pid)
+            except Exception:
+                continue
+    _worker_started.intersection_update(live)
+    return unstarted
 
 
 def _write_scheduler_health() -> None:
@@ -2115,6 +2207,12 @@ def _replace_dead_workers() -> None:
                      ("fullscan", list(_fullscan_pool))]
         for _pt, _pl in _snap:
             stalled |= _stalled_pids(_sr, _pt, _pl)
+        unstarted = _unstarted_pids(_sr, _snap)
+        if unstarted:
+            logger.warning(
+                "scheduler: pids %s never finished starting (no heartbeat past the "
+                "start-up allowance) — killing", sorted(unstarted))
+            stalled |= unstarted
     except Exception as exc:
         logger.warning("scheduler: stalled-worker check failed: %s", exc)
 
