@@ -759,6 +759,28 @@ def check_worker_heartbeats(r) -> list:
                 f"total_replacements={total}  pool_age={pool_age:.0f}s"
             ).strip()
 
+            pending   = info.get("pending_start", 0)
+            oldest    = info.get("oldest_pending_start_s", 0)
+            warn_s    = info.get("start_warn_s", 0)
+            unst_kill = info.get("unstarted_kills", 0)
+            if unst_kill:
+                detail_str += f"  unstarted_kills={unst_kill}"
+            if pending and warn_s and oldest > warn_s:
+                # Spawned but no heartbeat well past the slowest start-up seen: a
+                # hung start, flagged before the scheduler's own kill deadline.
+                issues.append(Issue(
+                    Issue.WARNING,
+                    label,
+                    f"{detail_str}  {pending} worker(s) spawned but not started for "
+                    f"{oldest:.0f}s (learned start-up allowance {warn_s:.0f}s) "
+                    "— possible hung start; see scheduler.log HUNG START",
+                    FIX_CMD,
+                    alert_type=f"worker_{label_suffix}",
+                ))
+                hung_start = True
+            else:
+                hung_start = False
+
             if consec >= ERR_DEATHS:
                 issues.append(Issue(
                     Issue.ERROR,
@@ -777,7 +799,7 @@ def check_worker_heartbeats(r) -> list:
                     FIX_CMD,
                     alert_type=f"worker_{label_suffix}",
                 ))
-            else:
+            elif not hung_start:
                 note = (
                     f"  ({consec} recent death(s) — scheduler replacing)"
                     if consec > 0 else ""

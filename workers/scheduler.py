@@ -172,6 +172,7 @@ _hysteresis: dict = {
 #                          (it survived — next death resets the streak).
 _consecutive_deaths:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _total_replacements:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
+_unstarted_kills:         dict = {"scan": 0, "detail": 0, "fullscan": 0}  # killed: never started
 _worker_spawn_times:      dict = {}   # pid → (ptype, spawn_epoch)
 _worker_started:          set  = set()  # pids seen with a heartbeat (finished starting)
 _death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
@@ -1953,6 +1954,7 @@ def _scan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     when shutdown_event is set — the run_worker() loop's
     `except KeyboardInterrupt: break` then exits cleanly.
     """
+    _install_stack_dump()
     _init_worker_logging()
     _reset_inherited_db_pool()
 
@@ -1978,6 +1980,7 @@ def _detail_worker_process(shutdown_event: multiprocessing.Event) -> None:
 
     Mirrors _scan_worker_process but runs detail_worker.run_worker().
     """
+    _install_stack_dump()
     _init_worker_logging()
     _reset_inherited_db_pool()
 
@@ -2006,6 +2009,7 @@ def _fullscan_worker_process(shutdown_event: multiprocessing.Event) -> None:
     shutdown_event fires — fullscan.run_worker()'s KeyboardInterrupt handler
     exits the XREADGROUP loop cleanly.
     """
+    _install_stack_dump()
     _init_worker_logging()
     _reset_inherited_db_pool()
 
@@ -2079,6 +2083,148 @@ def _stalled_pids(r, worker_type: str, pool: list) -> set:
     return stalled
 
 
+_stack_dump_file = None   # kept open so faulthandler can write to it from a signal
+
+
+def _install_stack_dump() -> None:
+    """
+    Worker side of the hung-start evidence: on SIGUSR1 write every thread's stack to
+    logs/worker_stack_<pid>.log (faulthandler runs at C level, so it works even when
+    the interpreter is deadlocked on a lock inherited at start).  POSIX only.
+    """
+    global _stack_dump_file
+    try:
+        import faulthandler
+        import signal
+        from logger import LOG_DIR
+        if not hasattr(signal, "SIGUSR1"):
+            return
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _stack_dump_file = open(LOG_DIR / f"worker_stack_{os.getpid()}.log", "a")
+        faulthandler.register(signal.SIGUSR1, file=_stack_dump_file, all_threads=True)
+    except Exception:
+        pass
+
+
+def _stack_file(pid: int):
+    from logger import LOG_DIR
+    return LOG_DIR / f"worker_stack_{pid}.log"
+
+
+def _remove_stack_file(pid: int) -> None:
+    """Delete the (empty) stack-dump file of a worker that exited normally."""
+    try:
+        _stack_file(pid).unlink()
+    except Exception:
+        pass
+
+
+def _dump_worker_stack(ptype: str, pid: int) -> None:
+    """
+    Record where a worker that never started is stuck, before it is killed.
+
+    Asks the worker for a faulthandler dump (SIGUSR1; present in workers of this
+    version) and also tries py-spy (works on workers of any version).  Both are
+    best effort and logged at ERROR so the evidence reaches the log.
+    """
+    import shutil
+    import signal
+    import subprocess
+    import sys
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            os.kill(pid, signal.SIGUSR1)
+            time.sleep(1.0)
+        except Exception as exc:
+            logger.error("scheduler: stack signal to %s_worker pid=%d failed: %s",
+                         ptype, pid, exc)
+    try:
+        text = _stack_file(pid).read_text(errors="replace").strip()
+    except Exception:
+        text = ""
+    if text:
+        logger.error("scheduler: %s_worker pid=%d stack (faulthandler):\n%s",
+                     ptype, pid, text[-6000:])
+    spy = shutil.which("py-spy") or os.path.join(os.path.dirname(sys.executable), "py-spy")
+    if os.path.exists(spy):
+        try:
+            out = subprocess.run([spy, "dump", "--pid", str(pid)],
+                                 capture_output=True, text=True, timeout=15)
+            logger.error("scheduler: %s_worker pid=%d stack (py-spy):\n%s",
+                         ptype, pid, (out.stdout or out.stderr).strip()[-6000:])
+        except Exception as exc:
+            logger.error("scheduler: py-spy dump of %s_worker pid=%d failed: %s",
+                         ptype, pid, exc)
+    elif not text:
+        logger.error("scheduler: no stack evidence for %s_worker pid=%d "
+                     "(no faulthandler output, py-spy not installed)", ptype, pid)
+
+
+def _start_state(r, ptype: str, pool: list) -> dict:
+    """
+    Spawn-vs-started picture of one pool for scheduler:health.
+
+    started = workers that have published a heartbeat; pending = spawned but not yet;
+    oldest_pending_start_s = age of the longest-waiting one; start_warn_s = the learned
+    slowest start-up x PROGRESS_GAP_FACTOR (0 until one start has been observed).
+    """
+    now = time.time()
+    pending = 0
+    oldest = 0.0
+    for proc, _event in list(pool):
+        info = _worker_spawn_times.get(proc.pid)
+        if info is not None and proc.pid not in _worker_started:
+            pending += 1
+            oldest = max(oldest, now - info[1])
+    try:
+        hw = float(r.hget(REDIS_START_LATENCY_HASH, ptype) or 0)
+    except Exception:
+        hw = 0.0
+    return {
+        "started":                len(pool) - pending,
+        "pending_start":          pending,
+        "oldest_pending_start_s": round(oldest, 1),
+        "start_warn_s":           round(hw * PROGRESS_GAP_FACTOR, 1),
+        "unstarted_kills":        _unstarted_kills[ptype],
+    }
+
+
+def _audit_orphan_workers(spawned: set) -> None:
+    """
+    At scheduler start, report worker processes this scheduler did not spawn.
+
+    A heartbeat key worker:alive:{type}_worker:{host}:{pid} whose process is still
+    running (POSIX only) and is not one of ours is a leftover from an earlier
+    scheduler or a manual run, logged at ERROR.
+    """
+    if os.name != "posix":
+        return
+    import socket as _socket
+    host = _socket.gethostname()
+    try:
+        r = get_redis()
+        for wtype in ("scan_worker", "detail_worker", "fullscan_worker"):
+            for key in r.scan_iter(match=f"worker:alive:{wtype}:{host}:*", count=100):
+                k = key.decode() if isinstance(key, bytes) else key
+                try:
+                    pid = int(k.rsplit(":", 1)[1])
+                except ValueError:
+                    continue
+                if pid in spawned or pid == os.getpid():
+                    continue
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except Exception:
+                    pass
+                logger.error("scheduler: %s pid=%d is running but was not started by "
+                             "this scheduler (orphan from an earlier run or a manual "
+                             "start)", wtype, pid)
+    except Exception as exc:
+        logger.warning("scheduler: orphan-worker audit failed: %s", exc)
+
+
 def _unstarted_pids(r, snapshot: list) -> set:
     """
     PIDs of alive pool workers that never finished starting (bug FK safety net).
@@ -2147,31 +2293,18 @@ def _write_scheduler_health() -> None:
     try:
         _fp = globals().get("_fullscan_pool_ref", [])
         _r = get_redis()
-        _st = {
-            "scan":     len(_stalled_pids(_r, "scan", _scan_pool)),
-            "detail":   len(_stalled_pids(_r, "detail", _detail_pool)),
-            "fullscan": len(_stalled_pids(_r, "fullscan", _fp)),
-        }
-        payload = {
-            "ts": time.time(),
-            "pool": {
-                "scan": {
-                    "alive":              len(_scan_pool) - _st["scan"],
-                    "consecutive_deaths": _consecutive_deaths["scan"],
-                    "total_replacements": _total_replacements["scan"],
-                },
-                "detail": {
-                    "alive":              len(_detail_pool) - _st["detail"],
-                    "consecutive_deaths": _consecutive_deaths["detail"],
-                    "total_replacements": _total_replacements["detail"],
-                },
-                "fullscan": {
-                    "alive":              len(_fp) - _st["fullscan"],
-                    "consecutive_deaths": _consecutive_deaths["fullscan"],
-                    "total_replacements": _total_replacements["fullscan"],
-                },
-            },
-        }
+        _pools = {"scan": _scan_pool, "detail": _detail_pool, "fullscan": _fp}
+        _st = {t: len(_stalled_pids(_r, t, p)) for t, p in _pools.items()}
+        _ss = {t: _start_state(_r, t, p) for t, p in _pools.items()}
+        payload = {"ts": time.time(), "pool": {}}
+        for _t in _pools:
+            payload["pool"][_t] = {
+                # alive = started (heartbeating) and not stalled
+                "alive":              max(0, _ss[_t]["started"] - _st[_t]),
+                "consecutive_deaths": _consecutive_deaths[_t],
+                "total_replacements": _total_replacements[_t],
+                **_ss[_t],
+            }
         get_redis().set(
             _SCHEDULER_HEALTH_KEY,
             json.dumps(payload),
@@ -2200,6 +2333,7 @@ def _replace_dead_workers() -> None:
     # A worker past its progress deadline is hung even though its process lives;
     # it is killed and replaced like a crashed one.  Redis is read before the lock.
     stalled: set = set()
+    unstarted: set = set()
     try:
         _sr = get_redis()
         with _pool_lock:
@@ -2209,9 +2343,14 @@ def _replace_dead_workers() -> None:
             stalled |= _stalled_pids(_sr, _pt, _pl)
         unstarted = _unstarted_pids(_sr, _snap)
         if unstarted:
-            logger.warning(
-                "scheduler: pids %s never finished starting (no heartbeat past the "
-                "start-up allowance) — killing", sorted(unstarted))
+            logger.error(
+                "scheduler: HUNG START — pids %s never finished starting (no "
+                "heartbeat past the start-up allowance) — dumping stacks, killing",
+                sorted(unstarted))
+            for _pt, _pl in _snap:
+                for _p, _e in _pl:
+                    if _p.pid in unstarted:
+                        _dump_worker_stack(_pt, _p.pid)
             stalled |= unstarted
     except Exception as exc:
         logger.warning("scheduler: stalled-worker check failed: %s", exc)
@@ -2249,7 +2388,15 @@ def _replace_dead_workers() -> None:
                     spawn_info = _worker_spawn_times.pop(proc.pid, None)
                     if spawn_info:
                         worker_age = time.time() - spawn_info[1]
-                        if worker_age >= _WORKER_STABLE_AFTER_S:
+                        if proc.pid in unstarted:
+                            # A hung start is a failed start however long it
+                            # waited: always escalate so the watchdog alerts.
+                            _unstarted_kills[ptype] += 1
+                            if _consecutive_deaths[ptype] == 0:
+                                _death_streak_started_at[ptype] = time.time()
+                            _consecutive_deaths[ptype] += 1
+                        elif worker_age >= _WORKER_STABLE_AFTER_S:
+                            _remove_stack_file(proc.pid)
                             _consecutive_deaths[ptype]      = 0    # stable run — reset
                             _death_streak_started_at[ptype] = 0.0  # streak cleared
                         else:
@@ -2279,6 +2426,8 @@ def _replace_dead_workers() -> None:
             if (
                 (_now_ts - _spawn_ts) >= _WORKER_STABLE_AFTER_S
                 and _consecutive_deaths[_wtype] > 0
+                # A worker that has not finished starting is not stable, however old.
+                and _pid in _worker_started
                 # Only reset if this worker was spawned AFTER the death streak
                 # began.  An old pre-streak worker being alive does not mean
                 # the streak workers are now healthy.
@@ -3174,6 +3323,8 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
 
     global _scan_pool, _detail_pool
     _fullscan_pool: list = []
+
+    _audit_orphan_workers(set())   # before our own spawns: anything running is foreign
 
     with _pool_lock:
         for _ in range(scan_count):
