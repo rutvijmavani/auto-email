@@ -941,6 +941,8 @@ def main():
         init_logging("monitor")
     elif "--sync-forms" in args or "--sync-prospective" in args:
         init_logging("sync")
+    elif "--rebuild" in args:
+        init_logging("rebuild")
     elif "--detect-ats" in args:
         init_logging("detect")
     elif "--find-only" in args:
@@ -956,7 +958,7 @@ def main():
 
     # Only --monitor-jobs / --monitor-status actively query Redis worker state;
     # --detect-ats is DB + web scraping only, no Redis reads.
-    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status", "--scheduler"}
+    _REDIS_CMDS = {"--monitor-jobs", "--monitor-status", "--scheduler", "--rebuild"}
     _needs_redis = any(a in _REDIS_CMDS for a in args)
 
     # Gmail credentials are required for all subcommands that send email.
@@ -1105,6 +1107,12 @@ def main():
             print('[ERROR] Usage: --set-custom-ats "Company" --curl "curl ..."')
             return
         run_set_custom_ats(company, curl_string, detail_curl=detail_curl)
+        return
+
+    if "--rebuild" in args:
+        # Rebuild Redis from PostgreSQL and exit (watchdog heal for an empty poll queue).
+        from workers.rebuild import rebuild_redis
+        rebuild_redis()
         return
 
     if "--scheduler" in args:
