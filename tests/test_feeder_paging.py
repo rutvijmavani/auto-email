@@ -262,3 +262,89 @@ def test_workday_last_page_stays_all_pages():
         jobs = workday.fetch_jobs({"slug": "x", "wd": "wd1", "path": "careers"}, "Acme",
                                   stop_check=EarlyExitGate(lambda _i: True))
     assert len(jobs) == 40 and report_of(jobs).stop_reason == STOP_ALL_PAGES
+
+
+# ─────────────────────────────────────────
+# Adaptive early exit — Taleo, iCIMS, Paycom
+# ─────────────────────────────────────────
+
+def _taleo_gate_run(post, gate):
+    session = MagicMock()
+    session.post.side_effect = post
+    with patch.object(taleo, "_make_session", return_value=session):
+        return taleo.fetch_jobs({"company": "utsw", "portal_id": "1", "section": "ex"}, "UTSW", stop_check=gate)
+
+
+def _taleo_post(total):
+    def post(url, json=None, timeout=None):
+        p = json["pageNo"]
+        return _taleo_resp([_trow(i) for i in range((p - 1) * 25, min(p * 25, total))], total)
+    return post
+
+
+def test_taleo_stop_check_ends_paging_early():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _taleo_gate_run(_taleo_post(200), EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 50 and report_of(jobs).stop_reason == STOP_EARLY_EXIT
+
+
+def test_taleo_last_page_stays_all_pages():
+    from jobs.ats.fetch_report import STOP_ALL_PAGES, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _taleo_gate_run(_taleo_post(50), EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 50 and report_of(jobs).stop_reason == STOP_ALL_PAGES
+
+
+def _icims_run(n_pages, gate):
+    from jobs.ats import icims
+
+    def listing(url, base_url, company, seen_ids, info=None):
+        page = int(url.split("pr=")[1].split("&")[0])
+        if page >= n_pages:
+            return []
+        info.setdefault("pages_total", n_pages)
+        return [{"job_id": f"{page}-{i}", "title": "t", "job_url": f"u{page}-{i}"} for i in range(5)]
+    with patch.object(icims, "_resolve_base_url", return_value="https://x.icims.com"), \
+         patch.object(icims, "_fetch_listing_page", side_effect=listing), \
+         patch.object(icims, "PAGE_DELAY", 0):
+        return icims.fetch_jobs("x", "X", stop_check=gate)
+
+
+def test_icims_stop_check_ends_paging_early():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _icims_run(10, EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 10 and report_of(jobs).stop_reason == STOP_EARLY_EXIT
+
+
+def test_icims_last_page_never_gated():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _icims_run(2, EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 10 and report_of(jobs).stop_reason != STOP_EARLY_EXIT
+
+
+def _paycom_run(total, gate, take=3):
+    from jobs.ats import paycom
+
+    def search(session, jwt, api_base, host, key, skip, info=None):
+        info["total"] = total
+        return [{"jobId": i, "jobTitle": "t", "locations": ""} for i in range(skip, min(skip + take, total))]
+    with patch.object(paycom, "_get_session", return_value=(MagicMock(), "jwt", "https://api")), \
+         patch.object(paycom, "_search_page", side_effect=search), \
+         patch.object(paycom, "_TAKE", take):
+        return paycom.fetch_jobs({"host": "h", "key": "k"}, "X", stop_check=gate)
+
+
+def test_paycom_stop_check_ends_paging_early():
+    from jobs.ats.fetch_report import STOP_EARLY_EXIT, report_of
+    from workers.paginator import EarlyExitGate
+    jobs = _paycom_run(30, EarlyExitGate(lambda _i: True))
+    assert len(jobs) == 6 and report_of(jobs).stop_reason == STOP_EARLY_EXIT
+
+
+def test_paycom_unseen_job_resets_streak():
+    from workers.paginator import EarlyExitGate
+    jobs = _paycom_run(12, EarlyExitGate(lambda i: i != "4"))   # job 4 (page 2) is unseen -> streak resets
+    assert len(jobs) == 12
