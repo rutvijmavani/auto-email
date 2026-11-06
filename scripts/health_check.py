@@ -592,15 +592,11 @@ def run_health_check() -> int:
         _wdg_queue_issues = check_queue_health(r, persist_snapshot=False)
         for _issue in _wdg_queue_issues:
             _lbl = _issue.category.replace("queue:", "").replace("stream:", "")
-            _level = _issue.level
-            # GATEORD: the gate runs ~70s after a restart while the scheduler's
-            # startup rebuild may still be running, so a detail-queue age/stall
-            # signal alone must not fail the deploy; the watchdog decides on
-            # its own later cycles (gated restart).
-            if _level in ("ERROR", "CRITICAL") and _issue.category.startswith("queue:detail"):
-                _level = "WARNING"
-            _row(_level, _lbl, _issue.message)
-            if _level in ("ERROR", "CRITICAL"):
+            # GATEORD: check_queue_health itself reports a detail-queue delay as a
+            # WARNING ("scheduler still starting") until both scheduler loops
+            # report ready, and as the normal ERROR afterwards.
+            _row(_issue.level, _lbl, _issue.message)
+            if _issue.level in ("ERROR", "CRITICAL"):
                 errors += 1
             elif _issue.level == "WARNING":
                 warnings += 1

@@ -1341,7 +1341,8 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
 _hb_run: dict = {}
 
 
-def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30) -> None:
+def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30,
+                               ready: bool = True) -> None:
     """Write per-loop liveness key so a hung loop is detected independently.
 
     Key: worker:alive:scheduler:{loop}  (e.g. :adaptive or :fullscan)
@@ -1365,6 +1366,9 @@ def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30) -> 
             "ts":         now,
             "up_since":   up_since,
             "dispatched": dispatched,
+            # GATEORD: False only for the startup heartbeat (init_db/rebuild still
+            # running); the loop's own writes are ready=True.
+            "ready":      ready,
         }), ex=ttl)
     except Exception as _hb_err:
         logger.debug("scheduler: %s_loop heartbeat write failed: %s", loop, _hb_err)
@@ -3342,8 +3346,8 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
     # Same pattern as manager.py (_MANAGER_HB_TTL=180).  The loop's 1s-tick
     # writes take over once adaptive_loop / fullscan_loop start.
     _r_startup = get_redis()
-    _write_scheduler_heartbeat(_r_startup, "adaptive", 0, ttl=_SCHEDULER_STARTUP_HB_TTL)
-    _write_scheduler_heartbeat(_r_startup, "fullscan", 0, ttl=_SCHEDULER_STARTUP_HB_TTL)
+    _write_scheduler_heartbeat(_r_startup, "adaptive", 0, ttl=_SCHEDULER_STARTUP_HB_TTL, ready=False)
+    _write_scheduler_heartbeat(_r_startup, "fullscan", 0, ttl=_SCHEDULER_STARTUP_HB_TTL, ready=False)
     logger.info("scheduler: startup heartbeats written (ttl=%ds)", _SCHEDULER_STARTUP_HB_TTL)
 
     init_db()

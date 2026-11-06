@@ -1049,6 +1049,25 @@ def _backpressure_threshold(r, pool: str) -> float:
     return _DETAIL_DELAY_WARN_FALLBACK
 
 
+def _scheduler_ready(r) -> bool:
+    """
+    True when both scheduler loop heartbeats exist and report ready (startup
+    init_db()/rebuild_redis() finished).  A heartbeat without the field (older
+    scheduler) counts as ready.  A missing heartbeat is not ready — the dead
+    scheduler has its own alert.
+    """
+    try:
+        for loop in ("adaptive", "fullscan"):
+            raw = r.get(f"worker:alive:scheduler:{loop}")
+            if not raw:
+                return False
+            if not json.loads(raw).get("ready", True):
+                return False
+        return True
+    except Exception:
+        return True   # unknown: do not mask a real stall
+
+
 def _backpressure_threshold_published(r, pool: str) -> bool:
     """True when the manager has published a usable delay_warn_s for the pool."""
     try:
@@ -1752,6 +1771,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     # RS/WR gate: a restart needs the manager's own D.  When the manager has not
     # published it (fallback in use) the figure is a guess, so only warn.
     d_published = _backpressure_threshold_published(r, "detail")
+    # GATEORD: queue age right after a scheduler restart reflects the downtime and
+    # the startup rebuild, not a stall — no ERROR until both loops report ready.
+    sched_ready = _scheduler_ready(r)
     for label, atype, depth, prev_depth, delay_s, head, prev_head in [
         ("queue:detail:adaptive", "queue_detail_adaptive",
          detail_adp_depth, prev_detail_adp, detail_adp_delay,
@@ -1797,7 +1819,12 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 # processed count unchanged, and work waiting (depth > 0).  Otherwise
                 # warn only.
                 no_service = detail_proc_delta == 0
-                if d_published and no_service:
+                if not sched_ready:
+                    issues.append(Issue(Issue.WARNING, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s) but "
+                        f"scheduler still starting (startup rebuild), decided next check{proc_note}"))
+                elif d_published and no_service:
                     issues.append(Issue(Issue.ERROR, label,
                         f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
                         f"{direction}, delay exceeds manager threshold ({delay_warn_s:.0f}s), "
