@@ -38,10 +38,20 @@ Every WATCHDOG_INTERVAL_S (5 min):
 
 ─── Escalation ───────────────────────────────────────────────────────────────
 
-  After HEAL_MAX_ATTEMPTS (3) failed restarts within HEAL_ATTEMPT_WINDOW (30 min),
-  the watchdog sends an escalation email and stops retrying.  The escalation
-  flag expires after 24h, at which point the watchdog will try again if the
-  issue persists.
+  D2 policy — the watchdog is a gated BACKSTOP, not a second actor:
+    * Detail queue: scheduler restart only when ALL hold — oldest job age > the
+      manager's published D (manager:backpressure:threshold:detail), queue head
+      unchanged, processed count unchanged, depth > 0.  Otherwise WARNING only.
+      A baseline (no-snapshot) cycle never restarts.
+    * Stream PEL (WB): a stalled owner (worker:cur deadline passed) is a WARNING;
+      ERROR + scheduler restart only if the same entry persists two checks.
+    * Heal budget is per ACTION TARGET (scheduler), shared by every alert type:
+      HEAL_MAX_ATTEMPTS (3) per HEAL_ATTEMPT_WINDOW (30 min), HEAL_COOLDOWN_S
+      (600s) between restarts; once spent, restarts of that target are blocked
+      for WATCHDOG_HEAL_BLOCK_S (7200s).  Alert emails are never silenced.
+      Counters are not reset on "resolved" — they expire by their own windows.
+    * Logs/emails name the cause: "queue:adaptive -> scheduler".
+    * A fullscan:lock:* only suppresses stall checks while its owner is alive.
 
 ─── Running ──────────────────────────────────────────────────────────────────
 
@@ -92,6 +102,8 @@ from config import (
     REDIS_DETAIL_DLQ,
     REDIS_EMAIL_DLQ,
     STREAM_CONSUMER_GROUP,
+    WATCHDOG_HEAL_COOLDOWN_S,
+    WATCHDOG_HEAL_BLOCK_S,
     EMAIL,
     APP_PASSWORD,
 )
@@ -146,8 +158,8 @@ WATCHDOG_INTERVAL_S   = 300     # 5 min between checks
 ALERT_COOLDOWN_S      = 3600    # 1 h — don't repeat same alert type within this
 HEAL_MAX_ATTEMPTS     = 3       # max auto-restarts before escalation
 HEAL_ATTEMPT_WINDOW   = 1800    # 30 min — attempt counter TTL
-HEAL_COOLDOWN_S       = 150     # min gap between two heal attempts (avoids rapid loop)
-ESCALATION_COOLDOWN   = 86400   # 24 h — re-escalation window
+HEAL_COOLDOWN_S       = WATCHDOG_HEAL_COOLDOWN_S   # min gap between two restarts of one target
+ESCALATION_COOLDOWN   = WATCHDOG_HEAL_BLOCK_S      # restarts of a target stay off this long after the budget is spent
 RESOLVE_COOLDOWN_S    = 7200    # 2 h — min gap between "RESOLVED" emails
 
 # Worker heartbeat absence threshold (seconds) before watchdog considers worker dead
@@ -251,6 +263,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
             "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
             "description": f"Restarted {_UNIT_SCHEDULER} via systemd (respawns all workers)",
             "foreground":  True,
+            "target":      "scheduler",
         }
         actions: dict = {
             "worker_scan_worker":     worker_via_systemd,
@@ -261,6 +274,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_SCHEDULER} via systemd",
                 "foreground":  True,
+                "target":      "scheduler",
             },
             # systemd_service_* alert types from check_systemd_services()
             f"systemd_{_UNIT_SCHEDULER}": {
@@ -268,6 +282,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_SCHEDULER} via systemd (service was inactive/failed)",
                 "foreground":  True,
+                "target":      "scheduler",
             },
             f"systemd_{_UNIT_EMAIL_PROC}": {
                 "cmd_args":    _systemd_restart_cmd(_UNIT_EMAIL_PROC),
@@ -345,6 +360,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler process (subprocess)",
+                "target":      "scheduler",
             },
             "queue_poll_adaptive_empty": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--rebuild"],
@@ -357,6 +373,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:adaptive stalled)",
+                "target":      "scheduler",
             },
             "queue_poll_fullscan_empty": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--rebuild"],
@@ -369,6 +386,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:fullscan stalled)",
+                "target":      "scheduler",
             },
             f"systemd_{_UNIT_EMAIL_PROC}": {
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.email_processor"],
@@ -411,10 +429,11 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
 # REDIS STATE KEYS
 # ─────────────────────────────────────────
 # watchdog:alert:{type}           — cooldown flag after alert sent (1h TTL)
-# watchdog:heal_count:{type}      — consecutive heal attempts (30min TTL)
-# watchdog:heal_last:{type}       — timestamp of last heal attempt
+# watchdog:heal_count:{target}    — heal attempts per ACTION TARGET (30min TTL)
+# watchdog:heal_last:{target}     — timestamp of last heal attempt
 # watchdog:heal_pid:{type}        — PID of spawned process (if applicable)
-# watchdog:escalated:{type}       — escalation already sent (24h TTL)
+# watchdog:escalated:{target}     — restarts blocked (WATCHDOG_HEAL_BLOCK_S TTL)
+# watchdog:pel_stalled:{stream}   — stalled PEL entries seen last check (WB)
 # watchdog:resolved:{type}        — "resolved" email already sent (2h TTL)
 # watchdog:active_issues          — JSON list of alert_types from last cycle
 
@@ -1030,6 +1049,15 @@ def _backpressure_threshold(r, pool: str) -> float:
     return _DETAIL_DELAY_WARN_FALLBACK
 
 
+def _backpressure_threshold_published(r, pool: str) -> bool:
+    """True when the manager has published a usable delay_warn_s for the pool."""
+    try:
+        val = r.get(f"manager:backpressure:threshold:{pool}")
+        return bool(val) and 0 < float(val) < float("inf")
+    except Exception:
+        return False
+
+
 def _zset_head(r, key: str):
     """(company_str, score_float) for the lowest-scored ZSET entry, or (None, None)."""
     try:
@@ -1043,13 +1071,25 @@ def _zset_head(r, key: str):
 
 
 def _fullscan_lock_active(r) -> bool:
-    """True if any fullscan:lock:* key is present — a scan is running right now."""
+    """
+    True if a fullscan:lock:* lease is held by a LIVE owner — a scan is running now.
+
+    The lock is a TTL-less lease (value = "host:pid" of the owner), so a crashed
+    fullscan leaves it behind.  FL-WD: a lock whose owner has no worker heartbeat
+    is stale and must not blind the stall checks.
+    """
     try:
         cursor = 0
         while True:
             cursor, keys = r.scan(cursor, match="fullscan:lock:*", count=10)
-            if keys:
-                return True
+            for key in keys:
+                owner = r.get(key)
+                if isinstance(owner, (bytes, bytearray)):
+                    owner = owner.decode()
+                if not owner:
+                    continue
+                if r.exists(f"worker:alive:fullscan_worker:{owner}"):
+                    return True
             if cursor == 0:
                 break
         return False
@@ -1260,7 +1300,10 @@ def _check_dlq_health(r, issues: list) -> None:
                 f"depth={depth} (≤{_DLQ_ALERT_THRESHOLD} OK)"))
 
 
-def _check_pel_health(r, issues: list) -> None:
+_PEL_STALLED_KEY_TTL_S = 3 * 300   # remembers stalled entries across ~3 watchdog cycles
+
+
+def _check_pel_health(r, issues: list, persist: bool = True) -> None:
     """
     PEL liveness checks for stream:adaptive and stream:fullscan.
 
@@ -1303,6 +1346,7 @@ def _check_pel_health(r, issues: list) -> None:
             worst_ms      = 0
             worst_orphan  = None
             alive_entries = []
+            stalled_now   = {}     # msg_id -> consumer (alive heartbeat, deadline passed)
             first_entry   = None
             _min_id       = "-"
             while True:
@@ -1321,6 +1365,19 @@ def _check_pel_health(r, issues: list) -> None:
                     e_ms    = entry.get("time_since_delivered", 0)
                     if e_alive:
                         alive_entries.append((e_consumer, e_pid, e_ms))
+                        # WB: owner heartbeat is alive — is it also making progress?
+                        # worker:cur:{consumer} deadline passed = wedged owner.
+                        try:
+                            from workers import progress as _progress
+                            _mid = entry.get("message_id", b"")
+                            if isinstance(_mid, bytes):
+                                _mid = _mid.decode()
+                            _cur = _progress.read_cur(r, e_consumer)
+                            if (_cur and str(_cur.get("msg_id")) == str(_mid)
+                                    and _progress.is_stalled(r, e_consumer)):
+                                stalled_now[str(_mid)] = e_consumer
+                        except Exception:
+                            pass
                     else:
                         if e_ms > worst_ms:
                             worst_ms     = e_ms
@@ -1342,9 +1399,47 @@ def _check_pel_health(r, issues: list) -> None:
                 if oldest_ms >= 60000 else f"{oldest_ms // 1000:.0f}s"
             )
 
+            # WB: a stalled owner is the scheduler's job to reap (it kills and
+            # replaces stalled workers).  Warn first; ERROR + scheduler restart
+            # only if the SAME stalled entry survives two consecutive checks,
+            # i.e. the scheduler failed to reap it.
+            _pel_key = f"watchdog:pel_stalled:{stream_key}"
+            persistent = {}
+            try:
+                prev_ids = {(x.decode() if isinstance(x, bytes) else x)
+                            for x in r.smembers(_pel_key)}
+                persistent = {m: c for m, c in stalled_now.items() if m in prev_ids}
+                if persist:
+                    pipe = r.pipeline()
+                    pipe.delete(_pel_key)
+                    if stalled_now:
+                        pipe.sadd(_pel_key, *stalled_now.keys())
+                        pipe.expire(_pel_key, _PEL_STALLED_KEY_TTL_S)
+                    pipe.execute()
+            except Exception:
+                pass
+            if persistent:
+                _m, _c = next(iter(persistent.items()))
+                issues.append(Issue(Issue.ERROR, label,
+                    f"{total} pending  stalled owner {_c} holds {_m} for 2 consecutive "
+                    f"checks ({len(persistent)} entr{'y' if len(persistent) == 1 else 'ies'}) "
+                    "— scheduler failed to reap it; restart scheduler",
+                    "python pipeline.py --scheduler",
+                    alert_type=atype,
+                ))
+                continue
+            if stalled_now:
+                _m, _c = next(iter(stalled_now.items()))
+                issues.append(Issue(Issue.WARNING, label,
+                    f"{total} pending  stalled owner {_c} (msg {_m}, progress deadline "
+                    "passed) — scheduler should kill/replace it; restart only if it "
+                    "persists next check"))
+
             if worst_orphan is None:
                 # All PEL entries have alive consumers.
                 _rep_consumer, _rep_pid, _ = alive_entries[0] if alive_entries else ("?", None, 0)
+                if stalled_now:
+                    continue
                 issues.append(Issue(Issue.OK, label,
                     f"{total} pending  oldest={age_str}  "
                     f"consumer={_rep_consumer} alive (pid={_rep_pid}) — in progress"))
@@ -1520,9 +1615,13 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             if depth == 0 or delay_s is None:
                 issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
             elif delay_s > delay_warn_s:
-                issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} delay={delay_s:.0f}s > threshold {delay_warn_s:.0f}s (baseline)",
-                    "python -m workers.detail_worker"))
+                # BASELINE-NODRAIN: with no previous snapshot there is no way to tell
+                # whether the queue is moving, so age alone never raises an ERROR
+                # (and so never a restart).  The next cycle decides.
+                issues.append(Issue(Issue.WARNING, label,
+                    f"depth={depth:,} delay={delay_s:.0f}s > threshold {delay_warn_s:.0f}s "
+                    "(baseline — no previous snapshot, cannot tell if draining; "
+                    "decided next cycle)"))
             elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
                     f"depth={depth:,} delay={delay_s:.0f}s (baseline, approaching threshold {delay_warn_s:.0f}s)"))
@@ -1530,7 +1629,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 issues.append(Issue(Issue.OK, label,
                     f"depth={depth} delay={delay_s:.0f}s (baseline)"))
         _check_dlq_health(r, issues)
-        _check_pel_health(r, issues)
+        _check_pel_health(r, issues, persist=persist_snapshot)
         return issues
 
     # ── 5. Extract previous snapshot values ───────────────────────────────────
@@ -1650,6 +1749,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     )
 
     delay_warn_s = _backpressure_threshold(r, "detail")
+    # RS/WR gate: a restart needs the manager's own D.  When the manager has not
+    # published it (fallback in use) the figure is a guess, so only warn.
+    d_published = _backpressure_threshold_published(r, "detail")
     for label, atype, depth, prev_depth, delay_s, head, prev_head in [
         ("queue:detail:adaptive", "queue_detail_adaptive",
          detail_adp_depth, prev_detail_adp, detail_adp_delay,
@@ -1690,12 +1792,26 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
         else:
             direction = "growing" if delta > 0 else "stalled"
             if delay_s > delay_warn_s:
-                issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
-                    f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s){proc_note}",
-                    "python -m workers.detail_worker",
-                    alert_type=atype,
-                ))
+                # Restart only when EVERY condition holds: delay above the manager's
+                # D (published), queue head unchanged (not draining), detail workers'
+                # processed count unchanged, and work waiting (depth > 0).  Otherwise
+                # warn only.
+                no_service = detail_proc_delta == 0
+                if d_published and no_service:
+                    issues.append(Issue(Issue.ERROR, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds manager threshold ({delay_warn_s:.0f}s), "
+                        f"head unchanged, no jobs processed{proc_note}",
+                        "python -m workers.detail_worker",
+                        alert_type=atype,
+                    ))
+                else:
+                    why = ("manager threshold not published" if not d_published
+                           else "processed count moved or unknown")
+                    issues.append(Issue(Issue.WARNING, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s) but "
+                        f"restart gate not met ({why}){proc_note}"))
             elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
                     f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
@@ -1720,7 +1836,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
 
     # ── 9. PEL checks + DLQ depth ────────────────────────────────────────────
     _check_dlq_health(r, issues)
-    _check_pel_health(r, issues)
+    _check_pel_health(r, issues, persist=persist_snapshot)
     return issues
 
 
@@ -2232,25 +2348,42 @@ def _kill_ghost_workers(r) -> None:
 # SELF-HEALING
 # ─────────────────────────────────────────
 
+def _heal_target(alert_type: str) -> str:
+    """
+    What a heal acts on.  Heal state (attempt count, last attempt, lock, escalation
+    block) is kept per TARGET, not per alert type, so every alert that restarts the
+    scheduler shares one budget.  Targets default to the alert type itself.
+    """
+    action = _get_heal_action(alert_type)
+    return (action or {}).get("target") or alert_type
+
+
+def _heal_label(issue: "Issue") -> str:
+    """'queue:detail:adaptive -> scheduler' — which alert caused which action."""
+    return f"{issue.category} -> {_heal_target(issue.alert_type)}"
+
+
 def _heal_attempt_count(alert_type: str, r) -> int:
-    return int(r.get(_rkey("heal_count", alert_type)) or 0)
+    return int(r.get(_rkey("heal_count", _heal_target(alert_type))) or 0)
 
 
 def _can_heal(alert_type: str, r) -> bool:
     """
     True if we should attempt a self-heal for this alert type.
 
+    Everything below is keyed by the heal TARGET (see _heal_target).
     Blocked if:
       - No heal action is defined for this alert type
-      - Already escalated (and escalation hasn't expired)
+      - Restarts of the target are blocked (budget spent, block not yet expired)
       - Heal was attempted too recently (< HEAL_COOLDOWN_S ago)
       - Attempt count >= HEAL_MAX_ATTEMPTS
     """
     if _get_heal_action(alert_type) is None:
         return False
-    if r.exists(_rkey("escalated", alert_type)):
+    target = _heal_target(alert_type)
+    if r.exists(_rkey("escalated", target)):
         return False
-    last_ts_raw = r.get(_rkey("heal_last", alert_type))
+    last_ts_raw = r.get(_rkey("heal_last", target))
     if last_ts_raw:
         last_ts = float(last_ts_raw)
         if time.time() - last_ts < HEAL_COOLDOWN_S:
@@ -2280,15 +2413,16 @@ def _attempt_heal(issue: Issue, r) -> bool:
     is_fg    = action.get("foreground", False)
 
     mode = "systemd" if _systemd_available() else "subprocess"
+    target = _heal_target(issue.alert_type)
     logger.info(
-        "watchdog: attempting self-heal for %r [%s] — %s",
-        issue.alert_type, mode, action["description"],
+        "watchdog: attempting self-heal %s (%r) [%s] — %s",
+        _heal_label(issue), issue.alert_type, mode, action["description"],
     )
 
     # ── Atomic exclusive lock — prevent concurrent watchdog instances from
-    # both healing the same issue simultaneously (service + cron overlap).
+    # both healing the same target simultaneously (service + cron overlap).
     # NX ensures only the first caller proceeds; EX auto-expires if we crash.
-    _heal_lock_key = _rkey("heal_lock", issue.alert_type)
+    _heal_lock_key = _rkey("heal_lock", target)
     _heal_lock_val = f"{os.getpid()}:{time.time()}"
     try:
         _lock_acquired = r.set(_heal_lock_key, _heal_lock_val,
@@ -2306,12 +2440,12 @@ def _attempt_heal(issue: Issue, r) -> bool:
     # Record the attempt BEFORE running the subprocess so a timeout or spawn
     # error still counts toward the cooldown / max-attempt limits.  Without
     # this, a consistently timing-out command would retry indefinitely.
-    count_key = _rkey("heal_count", issue.alert_type)
+    count_key = _rkey("heal_count", target)
     try:
         r.incr(count_key)
         r.expire(count_key, HEAL_ATTEMPT_WINDOW)
-        r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
-              ex=HEAL_ATTEMPT_WINDOW)
+        r.set(_rkey("heal_last", target), str(time.time()),
+              ex=max(HEAL_ATTEMPT_WINDOW, HEAL_COOLDOWN_S))
     except Exception as _re:
         logger.warning("watchdog: could not record heal attempt in Redis: %s", _re)
 
@@ -2414,7 +2548,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             # Downgraded to WARNING — still present, not yet resolved
             continue
         # Check if this was actually a heal success (heal_last key still in window)
-        was_being_healed = r.exists(_rkey("heal_last", alert_type))
+        was_being_healed = r.exists(_rkey("heal_last", _heal_target(alert_type)))
         if was_being_healed:
             subject = f"✅ Auto-healed: {alert_type.replace('_', ' ').title()}"
             body    = f"""
@@ -2442,10 +2576,10 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
                     dedup_key=_rkey("resolved", alert_type),
                     dedup_ttl=RESOLVE_COOLDOWN_S, r=r)
 
-        # Clean up heal state for this alert type
-        r.delete(_rkey("heal_count", alert_type))
-        r.delete(_rkey("heal_last", alert_type))
-        r.delete(_rkey("escalated", alert_type))
+        # RL: heal state (attempt count, last attempt, block) is deliberately NOT
+        # cleared here.  An issue that dips below ERROR for one cycle and comes
+        # back must not get a fresh restart budget; the counters expire by their
+        # own window (HEAL_ATTEMPT_WINDOW / HEAL_COOLDOWN_S / ESCALATION_COOLDOWN).
 
     # ── NEW / PERSISTING ISSUES ───────────────────────────────────────────────
     multi_issue_body_needed = []
@@ -2460,7 +2594,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         i.alert_type == "worker_scheduler" and i.is_alertable()
         for i in issues
     )
-    scheduler_being_healed_already = r.exists(_rkey("heal_last", "worker_scheduler"))
+    scheduler_being_healed_already = r.exists(_rkey("heal_last", "scheduler"))
     # Skip individual worker heals only on the FIRST cycle of scheduler failure.
     # If scheduler was already restarted (heal_last exists) but workers are still
     # missing, heal them directly (scheduler spawn may have failed or taken its pool down).
@@ -2475,18 +2609,19 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             continue
 
         atype       = issue.alert_type
+        target      = _heal_target(atype)
         is_new      = atype not in last_active
-        was_healing = r.exists(_rkey("heal_last", atype))
+        was_healing = r.exists(_rkey("heal_last", target))
         attempts    = _heal_attempt_count(atype, r)
-        escalated   = r.exists(_rkey("escalated", atype))
-
-        if escalated:
-            # Already escalated — do nothing until escalation TTL expires
-            continue
+        # Restarts of this target are blocked after the budget is spent.  The block
+        # only stops RESTARTS: the alert email below still goes out on its own
+        # cooldown (ALERT_COOLDOWN_S).
+        escalated   = r.exists(_rkey("escalated", target))
 
         # ── Escalation check (persisting issue, exhausted attempts) ───────────
-        if not is_new and was_healing and attempts >= HEAL_MAX_ATTEMPTS:
-            subj = f"🆘 ESCALATION — {issue.category} still broken after {HEAL_MAX_ATTEMPTS} auto-restarts"
+        if (not escalated and not is_new and was_healing
+                and attempts >= HEAL_MAX_ATTEMPTS):
+            subj = f"🆘 ESCALATION — {issue.category} still broken after {HEAL_MAX_ATTEMPTS} auto-restarts ({target})"
             body = f"""
             <p style="color:#ef4444;font-weight:700;font-size:16px;">
               🆘 Manual intervention required
@@ -2498,11 +2633,12 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             <p style="color:#374151;"><strong>Issue:</strong> {_html_lib.escape(issue.message)}</p>
             {"<p style='font-family:monospace;background:#fef2f2;padding:10px;border-radius:6px;color:#991b1b;'><strong>Manual fix:</strong><br>" + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
             <p style="color:#64748b;font-size:12px;">
-              Auto-heal will retry after {ESCALATION_COOLDOWN // 3600}h.
+              Auto-restart of <strong>{target}</strong> is blocked for
+              {ESCALATION_COOLDOWN / 3600:.1f}h; alert emails continue.
               Worker restart logs: <code>{_LOG_DIR}/{atype.replace('worker_','')}.log</code>
             </p>"""
             sent = _send_email(subj, body,
-                               dedup_key=_rkey("escalated", atype),
+                               dedup_key=_rkey("escalated", target),
                                dedup_ttl=ESCALATION_COOLDOWN, r=r)
             if sent:
                 logger.warning(
@@ -2541,7 +2677,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             if heal_ok:
                 attempt_n = _heal_attempt_count(atype, r)
                 heal_action = _get_heal_action(atype)
-                subj = f"⚠ Pipeline Issue — Auto-heal Attempted: {issue.category}"
+                subj = f"⚠ Pipeline Issue — Auto-heal Attempted: {_heal_label(issue)}"
                 body = f"""
                 <p style="color:#f59e0b;font-weight:700;font-size:15px;">
                   ⚠ Issue detected — attempting automatic recovery
@@ -2582,8 +2718,9 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         <p style="color:#374151;">{_html_lib.escape(issue.message)}</p>
         {"<p style='font-family:monospace;background:#f1f5f9;padding:8px;border-radius:4px;color:#475569;font-size:13px;'><strong>Fix:</strong> " + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
         <p style="color:#64748b;font-size:12px;">
-          Auto-heal is not configured for this issue type.
-          Manual intervention required.
+          {"Auto-heal is not configured for this issue type." if _get_heal_action(atype) is None
+           else f"Auto-restart of {target} is paused (cooldown, attempt budget used, or blocked after escalation)."}
+          Manual intervention may be required.
         </p>"""
         _send_email(subj, body,
                     dedup_key=_rkey("alert", atype),

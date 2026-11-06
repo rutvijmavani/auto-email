@@ -673,6 +673,8 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
                 return json.dumps(snap).encode() if snap else None
             if key_s.startswith("manager:backpressure:threshold:"):
                 return str(backpressure_threshold_s).encode()
+            if key_s.startswith("fullscan:lock:"):
+                return b"host:2"          # lease owner
             # per-PID heartbeat keys returned by _scan above
             if "worker:alive:scan_worker:" in key_s:
                 return json.dumps({"pid": 1, "ts": now - 5, "processed": scan_proc}).encode()

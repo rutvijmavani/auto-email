@@ -956,6 +956,14 @@ REDIS_INFLIGHT_MSG_PREFIX = "inflight:msg"      # key: {prefix}:{op}:{company} â
 # for an HTTP read with no timeout).  Past alive_until the owner counts as stalled.
 PROGRESS_GAP_FACTOR     = float(os.getenv("PROGRESS_GAP_FACTOR", "3"))
 PROGRESS_COLD_GAP_S     = int(os.getenv("PROGRESS_COLD_GAP_S", "600"))
+# Watchdog self-heal pacing (D2).  Restarts are counted per ACTION TARGET (every alert
+# that restarts the scheduler shares one budget).  Cooldown = minimum gap between two
+# restarts of the same target: two watchdog cycles (10 min) so a restart has its
+# start-up allowance plus one full check to show an effect.  Block = how long restarts
+# of a target stay off after the attempt budget is spent (alert emails continue on
+# their own cooldown).
+WATCHDOG_HEAL_COOLDOWN_S = int(os.getenv("WATCHDOG_HEAL_COOLDOWN_S", "600"))
+WATCHDOG_HEAL_BLOCK_S    = int(os.getenv("WATCHDOG_HEAL_BLOCK_S", "7200"))
 REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
 REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
 # A pool worker that is alive but has published no heartbeat within

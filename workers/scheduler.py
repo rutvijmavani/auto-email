@@ -1814,6 +1814,11 @@ def _check_auto_resume() -> None:
     db_maintenance = r.exists(REDIS_DB_MAINTENANCE)
 
     if not cron_alive and not db_maintenance:
+        if not _pause_event.is_set():
+            # AR: a resume was already received (the chain's normal final step
+            # races the heartbeat expiry) — nothing to auto-resume.
+            logger.info("scheduler: cron chain heartbeat expired after a normal resume — no action")
+            return
         logger.warning(
             "scheduler: cron chain heartbeat expired and no db:maintenance flag — "
             "auto-resuming workers (cron chain may have crashed)"
