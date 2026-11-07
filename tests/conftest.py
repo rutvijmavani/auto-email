@@ -3,6 +3,13 @@
 import os
 import gc
 
+try:
+    from tests._db_guard import enforce_test_database, assert_live_connection_is_test
+except ImportError:  # run as a top-level module (python tests/test_x.py)
+    from _db_guard import enforce_test_database, assert_live_connection_is_test
+
+enforce_test_database()
+
 
 # ---------------------------------------------------------------------------
 # Tables to truncate between tests (dependents first; CASCADE handles the rest).
@@ -67,6 +74,8 @@ def cleanup_db(db_path=None):
       hasn't been created in this environment).
     - Never raises — cleanup failures must not mask real test failures.
     """
+    # Hard stop (NOT swallowed): never truncate a non-test database.
+    assert_live_connection_is_test()
     try:
         from db.connection import get_conn
         conn = get_conn()
