@@ -1080,7 +1080,7 @@ class TestBootstrapMode(unittest.TestCase):
 
     def test_bootstrap_ceil_values_match_production_fleet(self):
         """Bootstrap ceilings should match current production defaults."""
-        self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     10)
+        self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     7)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],   10)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["fullscan"],  5)
 

@@ -66,6 +66,24 @@ RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
 RETENTION_SCAN_HEALTH_DAYS     = int(os.getenv("RETENTION_SCAN_HEALTH_DAYS", "90"))  # scan_health — one row per scan, history checks need weeks
 DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
+RETENTION_WORKER_SCALING_EVENTS_DAYS = int(os.getenv("RETENTION_WORKER_SCALING_EVENTS_DAYS", "90"))  # worker_scaling_events — crash/outage/canary/ceiling events
+RETENTION_ADAPTIVE_POLL_METRICS_DAYS = int(os.getenv("RETENTION_ADAPTIVE_POLL_METRICS_DAYS", "90"))  # adaptive_poll_metrics — covers the 14-day score window + 7-day backfill
+# Platforms whose job_postings.posted_at carries a real time of day (not a date or
+# a relative "N days ago"), so created_at - posted_at can fill the 1h/4h/24h
+# detection buckets. Verified in jobs/ats/<platform>.py 2026-11-07; confirm on the
+# VM with the posted_at/timed query in docs/adaptive-metrics-snapshot-design.md.
+ADAPTIVE_TIMED_POSTED_AT_PLATFORMS = tuple(
+    p.strip() for p in os.getenv(
+        "ADAPTIVE_TIMED_POSTED_AT_PLATFORMS",
+        "eightfold,lever,greenhouse,ashby,smartrecruiters,jibe",
+    ).split(",") if p.strip()
+)
+# Snapshot backfills at most this many missed days per run.
+ADAPTIVE_SNAPSHOT_BACKFILL_DAYS = int(os.getenv("ADAPTIVE_SNAPSHOT_BACKFILL_DAYS", "7"))
+# A job counts as a likely early-exit miss when a fullscan inserted it and it was
+# posted more than this many hours before the insert (same default as
+# scripts/early_exit_miss_rate.py).
+ADAPTIVE_MISS_LAG_HOURS = int(os.getenv("ADAPTIVE_MISS_LAG_HOURS", "36"))
 RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
 RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
 RETENTION_EXTERNAL_API_HEALTH  = 60     # external_api_health — matches RETENTION_API_HEALTH (same shape/cadence)
@@ -344,6 +362,18 @@ MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% fetched jobs match filter
 RATE_LIMIT_CRITICAL_THRESHOLD = 10   # % 429s in one run → immediate email
 RATE_LIMIT_WARNING_THRESHOLD  = 2    # % 429s → warning in daily digest
 SLOW_RESPONSE_THRESHOLD_MS    = 3000 # avg ms → warning in daily digest
+
+# Sustained-429 trend trigger (manager health check).  Daily 429 rate is read from
+# api_health per calendar day; a weekly average hides single-day spikes (Workday
+# 2-3% on 2026-10-20..23 averaged to 0.8% for the week).  A WARNING alert fires
+# when at least RATE_LIMIT_TREND_DAYS_HIT of the last RATE_LIMIT_TREND_WINDOW_DAYS
+# days each had a 429 rate >= RATE_LIMIT_TREND_PCT with >= RATE_LIMIT_TREND_MIN_REQ
+# requests.  Meaning: this platform is being rate limited often enough that the
+# per-platform concurrency limit design (docs/scaling-redesign.md Q10/Q13) is due.
+RATE_LIMIT_TREND_PCT         = float(os.environ.get("RATE_LIMIT_TREND_PCT", "1.0"))
+RATE_LIMIT_TREND_WINDOW_DAYS = int(os.environ.get("RATE_LIMIT_TREND_WINDOW_DAYS", "5"))
+RATE_LIMIT_TREND_DAYS_HIT    = int(os.environ.get("RATE_LIMIT_TREND_DAYS_HIT", "3"))
+RATE_LIMIT_TREND_MIN_REQ     = int(os.environ.get("RATE_LIMIT_TREND_MIN_REQ", "1000"))
 SERPER_CRITICAL_THRESHOLD     = 0    # credits remaining → immediate email
 SERPER_WARNING_THRESHOLD      = 50   # credits remaining → warning in digest
 

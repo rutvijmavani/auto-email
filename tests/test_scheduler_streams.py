@@ -439,11 +439,12 @@ class TestWarmingLifecycleOnAdaptiveComplete(unittest.TestCase):
             return "NOT_WRITTEN"
         # Params order (from the UPDATE SQL):
         # (recent_poll_counts, adaptive_score, interval, next_poll_at,
-        #  new_jobs, consec_errors, success, not_success,
-        #  new_warming,  ← index 8
+        #  consec_errors, success, not_success,
+        #  new_warming,  ← index 7
         #  company)
+        # (new_jobs was removed: consecutive_empty is owned by upsert_poll_stats)
         params = params_list[0]
-        return params[8] if params and len(params) > 8 else "NOT_WRITTEN"
+        return params[7] if params and len(params) > 7 else "NOT_WRITTEN"
 
     def _get_interval_written(self, params_list):
         """Extract the interval value written (index 2 in UPDATE params)."""

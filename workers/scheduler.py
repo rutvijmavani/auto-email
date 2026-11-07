@@ -811,8 +811,6 @@ def on_adaptive_complete(company: str, new_jobs: int,
                 current_interval_s      = %s,
                 last_poll_at            = CURRENT_TIMESTAMP,
                 next_poll_at            = %s,
-                consecutive_empty       = CASE WHEN %s > 0 THEN 0
-                                          ELSE consecutive_empty + 1 END,
                 consecutive_errors      = %s,
                 last_success_at         = CASE WHEN %s THEN CURRENT_TIMESTAMP
                                           ELSE last_success_at END,
@@ -826,8 +824,7 @@ def on_adaptive_complete(company: str, new_jobs: int,
             result["adaptive_score"],
             interval,
             next_poll_at,
-            new_jobs,             # for consecutive_empty CASE
-            consec_errors,
+            consec_errors,        # consecutive_empty is owned by upsert_poll_stats only
             success,              # for last_success_at CASE
             not success,          # for last_error_at CASE
             new_warming,          # NULL = STABLE, int = still WARMING

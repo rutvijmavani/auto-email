@@ -373,6 +373,7 @@ class TestAttemptBorrow(unittest.TestCase):
 
     def test_borrows_all_lendable_from_scan(self):
         # fullscan deadlocked; scan has 2 lendable (8 workers, target=6)
+        self.r._store["manager:worker_ceil:scan"] = "10"
         borrowed = mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(),
@@ -444,6 +445,7 @@ class TestAttemptBorrow(unittest.TestCase):
 
     def test_borrow_accumulates_on_successive_calls(self):
         # First call borrows 2 lendable
+        self.r._store["manager:worker_ceil:scan"] = "10"
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(),
@@ -457,13 +459,6 @@ class TestAttemptBorrow(unittest.TestCase):
         mgr._record_borrow(self.r, "scan", "fullscan", 1)
         total = int(self.r._store["manager:borrow:scan:fullscan"])
         self.assertEqual(total, 3)
-
-    def test_return_all_borrows_clears_keys(self):
-        self.r._store["manager:borrow:scan:fullscan"] = "2"
-        self.r._store["manager:borrow:detail:fullscan"] = "1"
-        mgr._return_all_borrows(self.r, "fullscan")
-        self.assertNotIn("manager:borrow:scan:fullscan", self.r._store)
-        self.assertNotIn("manager:borrow:detail:fullscan", self.r._store)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

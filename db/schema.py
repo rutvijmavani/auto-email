@@ -36,6 +36,8 @@ from config import (
     RETENTION_API_HEALTH,
     RETENTION_PIPELINE_ALERTS,
     RETENTION_SCAN_HEALTH_DAYS,
+    RETENTION_ADAPTIVE_POLL_METRICS_DAYS,
+    RETENTION_WORKER_SCALING_EVENTS_DAYS,
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
     RETENTION_ENRICHMENT_METRICS_DAYS,
@@ -208,9 +210,15 @@ def _cleanup_scan_health(c):
     c.execute("DELETE FROM scan_health WHERE scanned_at < %s", (cutoff,))
 
 
+def _cleanup_adaptive_poll_metrics(c):
+    """adaptive_poll_metrics — one row per company per day, kept RETENTION_ADAPTIVE_POLL_METRICS_DAYS."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_ADAPTIVE_POLL_METRICS_DAYS)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM adaptive_poll_metrics WHERE date < %s", (cutoff,))
+
+
 def _cleanup_worker_scaling_events(c):
-    """Delete worker_scaling_events older than 90 days (Phase 10)."""
-    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+    """Delete worker_scaling_events older than RETENTION_WORKER_SCALING_EVENTS_DAYS (Phase 10)."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_WORKER_SCALING_EVENTS_DAYS)).isoformat()
     c.execute(
         "DELETE FROM worker_scaling_events WHERE occurred_at < %s", (cutoff,)
     )
@@ -921,7 +929,7 @@ def init_db():
     # scaling decision (Phase 10 — Section 16).
     # Effectiveness is derived by querying adjacent events within a time
     # window — no row is ever updated.
-    # Retention: managed by _cleanup_worker_scaling_events (90 days).
+    # Retention: managed by _cleanup_worker_scaling_events (RETENTION_WORKER_SCALING_EVENTS_DAYS).
     c.execute("""
         CREATE TABLE IF NOT EXISTS worker_scaling_events (
             id                    BIGSERIAL PRIMARY KEY,
@@ -1273,9 +1281,26 @@ def init_db():
         # Seed 120s = conservative 2-min estimate; converges after a few real scans.
         ("last_scan_duration_s", "INTEGER"),
         ("avg_scan_duration_s",  "DOUBLE PRECISION DEFAULT 120.0"),
+        # Running counters for the nightly adaptive_poll_metrics snapshot
+        # (db/adaptive_metrics.py). empty_polls = completed scans with
+        # new_jobs = 0; early_exit_polls = completed scans that stopped early.
+        ("empty_polls",       "BIGINT DEFAULT 0"),
+        ("early_exit_polls",  "BIGINT DEFAULT 0"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
+        )
+
+    # adaptive_poll_metrics: cumulative counters at snapshot time (daily value =
+    # now minus the previous row's *_cum) and the day's adaptive_score.
+    for col, defn in [
+        ("polls_cum",        "BIGINT"),
+        ("empty_polls_cum",  "BIGINT"),
+        ("early_exit_cum",   "BIGINT"),
+        ("adaptive_score",   "REAL"),
+    ]:
+        c.execute(
+            f"ALTER TABLE adaptive_poll_metrics ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
 
     # monitor_stats: new per-run metrics (in_flight, fallback_scanned, enrichment_queued)
@@ -2225,6 +2250,7 @@ def init_db():
     _cleanup_api_health(c)
     _cleanup_external_api_health(c)
     _cleanup_scan_health(c)
+    _cleanup_adaptive_poll_metrics(c)
     _cleanup_worker_scaling_events(c)
     _cleanup_pipeline_alerts(c)
     _cleanup_mark_resolved_diagnostics(c)

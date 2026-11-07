@@ -213,8 +213,7 @@ if needs_urgent_spawn:
         worker_ceil = new_ceil                  # correct stale ceiling immediately
     # Step 2: spawn exactly what the formula says (not always the ceiling)
     spawn_to(min(workers_target, worker_ceil))
-    # Step 3: throttle dispatch to 75% of new capacity while workers come online
-    set_dispatch_throttle(pool, 0.75)
+    # Step 3: no dispatch throttle (decided: not built)
     scale_up_cycles = 0                         # prevent stale count from triggering add_one
     urgent_active[pool] = True
 
@@ -261,7 +260,7 @@ utilization       < 50%                 > 80%                 —
 delay             < WARN × 0.25         > WARN × 0.5          >= WARN × 0.75
 target            ≤ current − 1         > current             >= ceil×0.75 AND > peak_Nd
 spawn             remove 1              add 1                 min(workers_target, ceil)
-dispatch          normal                normal                throttle to 75% capacity
+dispatch          normal                normal                normal (no throttle)
 cycles            5                     2                     1 (immediate)
 release           —                     —                     recalc confirms count
                                                               (1 cycle after spawn)
@@ -2349,6 +2348,14 @@ Two independent phases — no cross-dependency:
 
 - **Phase 1 (now):** Accenture fix (`detail_payload` + `_REBUILD_SKIP_PLATFORMS`) + `avg_scan_duration_s` migration — both blocked on a single `init_db()` run. Deploy together.
 - **Phase 2 (after implementation):** Full manager. No Phase 1 dependency; can go out on any deploy after manager is built and tested.
+
+> **STATUS (2026-11-06): the whole `ats_get` / per-platform concurrency chain described in
+> this section, Q9-Q13 and the Q13 probing design is PARKED, not live.** `ats_get()` has no
+> production caller and the scrapers do not call it (they use `jobs/ats/base.py`
+> `fetch_json*`/`fetch_html`, plus eight modules calling `requests` directly). The statement
+> below that the scraper library calls `ats_get()` was never true. Evidence, the build
+> trigger (`_check_rate_limit_trend`) and the open design points are in
+> `docs/adaptive-polling-architecture.md` section 19.
 
 **7. `CeilingExceeded` in `ats_get()` (resolved — 2026-07-21)**
 

@@ -2634,6 +2634,33 @@ cycle_start = eastern.localize(
 
 ## 19. Per-ATS Dynamic Concurrency
 
+> **STATUS (2026-11-06): PARKED, NOT LIVE.** `ats_get()` in `workers/http_client.py`
+> and everything built on it (distributed semaphore, `adjust_concurrency`, learned
+> ceiling `worker:ceil:learned`, `CeilingExceeded` handling, manager error-spike
+> check, scheduler ceiling decay) has **no production caller**. The scrapers do not
+> call `ats_get()`: they fetch through `jobs/ats/base.py` (`fetch_json`,
+> `fetch_json_post`, `fetch_html`), and eight modules call `requests` directly
+> (custom_career, eightfold, generic_career, icims, jobvite, oracle_hcm, paycom,
+> taleo). Real concurrency per platform has only ever been bounded by the worker
+> pool sizes plus the 60 s sleep after a 429.
+>
+> **Evidence for parking** (`api_health`, all days to 2026-11-05): Workday is 97% of
+> traffic (6.09 M requests) at a 0.26% 429 rate, and every other platform has zero
+> 429s on low volume. 429s clustered on 2026-10-20..23 (2-3% daily, cause open) and
+> fell to <=0.3% afterwards with higher volume.
+>
+> **Build trigger** (implemented): the manager health check
+> (`workers/manager.py::_check_rate_limit_trend`) raises a WARNING alert when a
+> platform has a daily 429 rate >= `RATE_LIMIT_TREND_PCT` (1%) on at least
+> `RATE_LIMIT_TREND_DAYS_HIT` (3) of the last `RATE_LIMIT_TREND_WINDOW_DAYS` (5) days.
+> When it fires, build this design starting from the platform that fired, seeding the
+> limit from the concurrency actually run (not the config table), and wire the
+> scrapers (`fetch_json*`, then the direct-`requests` modules) to the semaphore.
+> Open design points at that time: the SCAN-NOCAP coverage of scan/fullscan, the
+> QSTARVE interaction with the platform-blind detail drainer
+> (`workers/detail_drainer.py`: skip held rows of blocked platforms), and the
+> Lua acquire-with-TTL (current `ats_get` uses plain INCR/DECR, so a crash leaks a slot).
+
 ### The problem
 
 Hardcoded worker counts per ATS platform caused 32 `requests_error` spikes on Workday. The system was hammering Workday's servers with more concurrent requests than they could handle, producing 404s and connection errors that were indistinguishable from genuine API failures.
@@ -3041,7 +3068,7 @@ For scan_worker and detail_worker, Workday calls pass `dc_key` from `ats_slug["w
 
 ### Scope
 
-Both `scan_worker` (listing fetches) and `detail_worker` (detail fetches) go through `ats_get()`. All ATS modules replace direct `requests.get()` calls with `ats_get()`. This ensures the limit is enforced regardless of which worker type is making the request.
+*Design intent (NOT the current code — see the STATUS note at the top of this section):* both `scan_worker` (listing fetches) and `detail_worker` (detail fetches) would go through `ats_get()`, and all ATS modules would replace direct `requests.get()` calls with `ats_get()`, so the limit is enforced regardless of which worker type is making the request. Today no module does this.
 
 ---
 

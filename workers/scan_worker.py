@@ -591,7 +591,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
 
         # ── 7. Update poll stats ──────────────────────────────────────────────
         duration_ms = int((time.monotonic() - start_mono) * 1000)
-        upsert_poll_stats(company, platform, new_count, duration_ms)
+        upsert_poll_stats(company, platform, new_count, duration_ms,
+                          early_exited=early_exited)
 
         result.update({
             "success":      True,

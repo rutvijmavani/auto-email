@@ -578,7 +578,10 @@ for job in jobs:
 
 ### Per-company overrides
 
-The `company_config` table can override any of these settings for a specific company. For example:
+> **NOT IMPLEMENTED (checked 2026-11-07):** the `company_config` table is created in `db/schema.py` but no
+> code reads it, so rows have no effect today. The examples below describe the intended design only.
+
+The `company_config` table is intended to override any of these settings for a specific company. For example:
 
 ```sql
 -- Force Workday for a specific tenant that sorts by recency (atypical)
@@ -590,4 +593,4 @@ INSERT INTO company_config (company, max_interval)
 VALUES ('Dream Company Inc', 900);
 ```
 
-Override lookup order: `company_config` → `ATS_TIER1_CONFIG` → defaults.
+Intended override lookup order (not wired): `company_config` → `ATS_TIER1_CONFIG` → defaults.

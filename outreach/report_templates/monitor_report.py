@@ -936,7 +936,8 @@ def _build_adaptive_health_section() -> str:
             'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
             'Detection Age Distribution &nbsp;'
             '<span style="font-weight:400;font-size:10px;">'
-            '(how quickly adaptive polling finds new jobs)</span></p>'
+            '(posting time to insert time, so includes detail-queue delay; '
+            'only platforms that publish a posting time of day)</span></p>'
         )
 
         def _age_row(label, count, pct, color):
@@ -971,7 +972,8 @@ def _build_adaptive_health_section() -> str:
             + _age_row("> 24 hours", age.get("after_24hr",  0),
                        age.get("after_24hr_pct"),  "#ef4444")
             + f'<tr><td colspan="2" style="font-size:10px;color:#94a3b8;'
-              f'padding-top:4px;">Total: {total_jobs:,} new jobs across all platforms</td></tr>'
+              f'padding-top:4px;">{age.get("dated_jobs", 0):,} of {total_jobs:,} '
+              f'new jobs have a posting time</td></tr>'
             + '</table>'
         )
 
@@ -1020,7 +1022,7 @@ def _build_adaptive_health_section() -> str:
             'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
             'Score Stability (14-day) &nbsp;'
             '<span style="font-weight:400;font-size:10px;">'
-            '(stddev of daily poll score — high variance = score still converging)</span></p>'
+            '(average per-company stddev of daily score — high = score still converging)</span></p>'
         )
         sections.append(
             '<table width="100%" cellpadding="0" cellspacing="0" '
@@ -1070,7 +1072,7 @@ def _build_adaptive_health_section() -> str:
         sections.append(
             '<p style="font-size:11px;font-weight:600;color:#64748b;'
             'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
-            'Worker Scaling Events</p>'
+            'Worker Crashes, Outages &amp; Ceiling Changes</p>'
         )
 
         def _ev_cell(label, count, color="#1e293b"):
@@ -1083,15 +1085,15 @@ def _build_adaptive_health_section() -> str:
             )
 
         outage_color  = "#ef4444" if ev["outage_start"] > 0 else "#22c55e"
-        remove_color  = "#f59e0b" if ev["worker_remove"] > 0 else "#1e293b"
-
+        # Only crash replacements ("worker_add" from the liveness check), outages,
+        # canary probes and ceiling changes are recorded. Routine scale up/down is
+        # NOT recorded and nothing writes "worker_remove", so no tile for it.
         sections.append(
             '<table width="100%" cellpadding="0" cellspacing="0" '
             'style="border-collapse:collapse;background:#f8fafc;'
             'border-radius:8px;border:1px solid #e2e8f0;">'
             '<tr>'
-            + _ev_cell("Workers Added",   ev["worker_add"],      "#22c55e")
-            + _ev_cell("Workers Removed", ev["worker_remove"],   remove_color)
+            + _ev_cell("Crash Replacements", ev["worker_add"],   "#f59e0b" if ev["worker_add"] > 0 else "#1e293b")
             + _ev_cell("Outages Started", ev["outage_start"],    outage_color)
             + _ev_cell("Outages Ended",   ev["outage_end"],      "#22c55e")
             + _ev_cell("Canary Probes",   ev["canary_probe"],    "#3b82f6")
@@ -1101,7 +1103,8 @@ def _build_adaptive_health_section() -> str:
     else:
         sections.append(
             '<p style="font-size:12px;color:#22c55e;margin-top:12px;">'
-            '✓ No worker scaling events this week — system stable.</p>'
+            '✓ No worker crashes, outages or ceiling changes recorded this week '
+            '(routine scale up/down is not recorded).</p>'
         )
 
     # ── Early-exit validation ─────────────────────────────────────────────────
@@ -1119,7 +1122,8 @@ def _build_adaptive_health_section() -> str:
                 'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
                 'Early-Exit Validation &nbsp;'
                 '<span style="font-weight:400;font-size:10px;">'
-                '(jobs skipped by paginator early exit — should be near zero)</span></p>'
+                '(upper bound: full-scan inserts of jobs posted over 36h earlier, '
+                'listing-date platforms only — should be near zero)</span></p>'
             )
             sections.append(
                 '<table width="100%" cellpadding="0" cellspacing="0" '

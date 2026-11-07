@@ -67,7 +67,7 @@ def _make_metrics_db():
             found_within_24hr INTEGER DEFAULT 0,
             found_after_24hr  INTEGER DEFAULT 0,
             early_exit_missed INTEGER DEFAULT 0,
-            poll_score        REAL
+            adaptive_score    REAL
         )
     """)
     conn.commit()
@@ -1515,7 +1515,7 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
     def test_worker_scaling_events_tile_present(self):
         """'Worker Scaling Events' section present when events exist."""
         html = self._build(_full_data())
-        self.assertIn("Worker Scaling Events", html)
+        self.assertIn("Worker Crashes, Outages &amp; Ceiling Changes", html)
 
     def test_worker_scaling_shows_counts(self):
         """All tile counts appear in HTML."""
@@ -1533,7 +1533,7 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
             "canary_probe": 0, "ceiling_learned": 0,
         }
         html = self._build(data)
-        self.assertIn("No worker scaling events", html)
+        self.assertIn("No worker crashes, outages or ceiling changes", html)
 
     def test_outage_tile_red_when_outages_started(self):
         """Outage tile red when outage_start > 0."""

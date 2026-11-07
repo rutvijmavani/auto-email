@@ -1008,7 +1008,8 @@ def delete_pending_detail(company: str, job_id: str) -> None:
 
 
 def upsert_poll_stats(company: str, platform: str,
-                      new_jobs: int, duration_ms: int) -> None:
+                      new_jobs: int, duration_ms: int,
+                      early_exited: bool = False) -> None:
     """
     Create or update the company_poll_stats row after a scan completes.
 
@@ -1029,10 +1030,17 @@ def upsert_poll_stats(company: str, platform: str,
     avg_scan_duration_s via EMA (alpha=0.3, seed=120s).  The manager reads
     avg_scan_duration_s as avg_fetch_s for the universal scaling formula.
     next_poll_at and adaptive_score are left for the scheduler to set.
+
+    This is the ONLY writer of consecutive_empty (completed scans only; a failed
+    scan never reaches here). It also maintains the running counters the nightly
+    adaptive_poll_metrics snapshot differences: empty_polls (new_jobs == 0) and
+    early_exit_polls (early_exited).
     """
     from workers.slot import slot_offset as _slot_offset
     offset_s  = _slot_offset(company)
     duration_s = max(0, duration_ms // 1000)
+    empty_inc  = 1 if new_jobs <= 0 else 0
+    early_inc  = 1 if early_exited else 0
 
     conn = get_conn()
     try:
@@ -1041,8 +1049,10 @@ def upsert_poll_stats(company: str, platform: str,
                 (company, ats_platform, last_poll_at,
                  total_polls, total_new_jobs,
                  consecutive_empty, initial_slot_offset_s,
-                 last_scan_duration_s, avg_scan_duration_s, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, ?, 120.0, CURRENT_TIMESTAMP)
+                 last_scan_duration_s, avg_scan_duration_s, updated_at,
+                 empty_polls, early_exit_polls)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, ?, 120.0, CURRENT_TIMESTAMP,
+                    ?, ?)
             ON CONFLICT(company) DO UPDATE SET
                 ats_platform          = EXCLUDED.ats_platform,
                 last_poll_at          = CURRENT_TIMESTAMP,
@@ -1055,6 +1065,10 @@ def upsert_poll_stats(company: str, platform: str,
                     ELSE company_poll_stats.consecutive_empty + 1
                 END,
                 updated_at            = CURRENT_TIMESTAMP,
+                empty_polls           = COALESCE(company_poll_stats.empty_polls, 0)
+                                        + EXCLUDED.empty_polls,
+                early_exit_polls      = COALESCE(company_poll_stats.early_exit_polls, 0)
+                                        + EXCLUDED.early_exit_polls,
                 initial_slot_offset_s = COALESCE(
                     company_poll_stats.initial_slot_offset_s,
                     EXCLUDED.initial_slot_offset_s
@@ -1065,7 +1079,8 @@ def upsert_poll_stats(company: str, platform: str,
                                             company_poll_stats.avg_scan_duration_s,
                                             120.0
                                         )
-        """, (company, platform, new_jobs, offset_s, duration_s))
+        """, (company, platform, new_jobs, offset_s, duration_s,
+              empty_inc, early_inc))
         # NOTE: initial_slot_offset_s uses COALESCE so the original
         # registration slot is preserved once set, but legacy NULL rows
         # (created before the column existed) are backfilled on next scan.

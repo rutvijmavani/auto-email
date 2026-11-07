@@ -55,6 +55,10 @@ from config import (
     DETAIL_QUEUE_HIGH_WATERMARK,
     DETAIL_QUEUE_ALERT_CYCLES,
     REDIS_MEMORY_ALERT_PCT,
+    RATE_LIMIT_TREND_PCT,
+    RATE_LIMIT_TREND_WINDOW_DAYS,
+    RATE_LIMIT_TREND_DAYS_HIT,
+    RATE_LIMIT_TREND_MIN_REQ,
     SCAN_DELAY_WARN_MIN_S,
     FULLSCAN_DELAY_WARN_MIN_S,
     SERVICE_TIME_WINDOW_CYCLES,
@@ -110,8 +114,9 @@ MANAGER_CYCLE_S: int = 60
 # ── Bootstrap ceilings (used until 28 days of daily_peak data accumulates) ────
 # detail raised to 10: burst arrivals (single scan can drop 300+ jobs) require
 # more headroom to drain fast enough to stay below the 300s delay_warn threshold.
+# scan lowered 10 -> 7 so the three ceilings sum to WORKER_SEAT_BUDGET (22) (BUDG).
 BOOTSTRAP_CEIL: dict = {
-    "scan":     10,
+    "scan":     7,
     "detail":   10,
     "fullscan": 5,
 }
@@ -626,6 +631,55 @@ def _check_health_alerts(r, now: float) -> None:
             _detail_alert_streak = 0
     except Exception as exc:
         logger.error("manager: detail queue alert check failed: %s", exc)
+
+    try:
+        _check_rate_limit_trend()
+    except Exception as exc:
+        logger.error("manager: rate limit trend check failed: %s", exc)
+
+
+def _check_rate_limit_trend() -> None:
+    """
+    Sustained-429 trigger: WARNING alert for each platform that had a 429 rate of at
+    least RATE_LIMIT_TREND_PCT (on >= RATE_LIMIT_TREND_MIN_REQ requests) on at least
+    RATE_LIMIT_TREND_DAYS_HIT of the last RATE_LIMIT_TREND_WINDOW_DAYS days.  Daily
+    granularity on purpose: the weekly report averages a 2-3% spike day away.  The
+    alert is the signal that the per-platform concurrency limit (docs/scaling-redesign.md
+    Q10/Q13, parked) is due.  create_alert dedups repeats per platform.
+    """
+    from db.api_health import get_daily_429_rates
+    from db.pipeline_alerts import create_alert, ALERT_RATE_LIMIT, WARNING
+
+    hits: dict = {}
+    for row in get_daily_429_rates(RATE_LIMIT_TREND_WINDOW_DAYS):
+        made = int(row["requests"] or 0)
+        if made < RATE_LIMIT_TREND_MIN_REQ:
+            continue
+        pct = 100.0 * int(row["e429"] or 0) / made
+        if pct >= RATE_LIMIT_TREND_PCT:
+            hits.setdefault(row["platform"], []).append(round(pct, 1))
+
+    for platform, pcts in hits.items():
+        if len(pcts) < RATE_LIMIT_TREND_DAYS_HIT:
+            continue
+        alert_id = create_alert(
+            alert_type = ALERT_RATE_LIMIT,
+            severity   = WARNING,
+            platform   = platform,
+            value      = max(pcts),
+            threshold  = RATE_LIMIT_TREND_PCT,
+            message    = (
+                f"{platform}: 429 rate >= {RATE_LIMIT_TREND_PCT}% on {len(pcts)} of the "
+                f"last {RATE_LIMIT_TREND_WINDOW_DAYS} days ({pcts}) — sustained rate "
+                f"limiting; per-platform concurrency limit is due "
+                f"(docs/scaling-redesign.md Q10/Q13)"
+            ),
+        )
+        if alert_id:
+            logger.warning(
+                "manager: SUSTAINED 429 alert platform=%s days=%s (alert_id=%s)",
+                platform, pcts, alert_id,
+            )
 
 
 def _scan_pool_work(r, pool: str, metrics: dict, params: dict) -> "dict | None":
@@ -1182,6 +1236,26 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             _plan_detail_nightly(r, params_now)
         except Exception as exc:
             logger.error("manager: nightly detail ceiling failed: %s", exc, exc_info=True)
+
+
+def _start_adaptive_snapshot(day_str: str) -> None:
+    """
+    Nightly adaptive_poll_metrics snapshot (db/adaptive_metrics.py), run in a
+    daemon thread so its job_postings scan can never stall the manager loop.
+    Independent of the ceiling recompute: any failure is logged inside run_nightly
+    (or here) and nothing else is affected. Retention of the table is the
+    init_db cleanup pass (RETENTION_ADAPTIVE_POLL_METRICS_DAYS), not this step.
+    """
+    def _run():
+        try:
+            from datetime import date as _date
+            from db.adaptive_metrics import run_nightly
+            run_nightly(_date.fromisoformat(day_str))
+        except Exception as exc:
+            logger.error("manager: adaptive metrics snapshot failed: %s", exc, exc_info=True)
+
+    import threading
+    threading.Thread(target=_run, name="adaptive-snapshot", daemon=True).start()
 
 
 def _emergency_recalc(r, pool: str, pools: list[str]) -> bool:
@@ -1809,31 +1883,6 @@ def _reclaim_lent_seats(r, pool: str, pool_sizes: dict) -> bool:
     if pool_sizes.get(t, 0) > new_ceil:
         _send_cmd(r, f"{t}:target:{new_ceil}")
     return True
-
-
-def _return_all_borrows(r, pool: str) -> None:
-    """
-    Return all borrowed workers for a pool (both as source and target).
-    Called when a pool fully recovers and Layer 2 state is cleared.
-    """
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match=f"manager:borrow:{pool}:*", count=20)
-        for key in keys:
-            k = key.decode() if isinstance(key, bytes) else key
-            logger.info("manager: returning borrow state %s", k)
-            r.delete(k)
-        if cursor == 0:
-            break
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match=f"manager:borrow:*:{pool}", count=20)
-        for key in keys:
-            k = key.decode() if isinstance(key, bytes) else key
-            logger.info("manager: returning borrow state %s", k)
-            r.delete(k)
-        if cursor == 0:
-            break
 
 
 _BORROW_SOURCE_ORDER: tuple = ("fullscan", "scan", "detail")   # seats are taken in this order
@@ -2752,6 +2801,7 @@ def run_manager() -> None:
                     logger.info("manager: triggering nightly Layer 1 recompute")
                     _midnight_recompute(r, pools)
                     r.set("manager:last_recompute_date", _recompute_date())
+                    _start_adaptive_snapshot(_recompute_date())
 
                     # Refresh bootstrap flag after recompute
                     any_bootstrap = any(

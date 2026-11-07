@@ -381,7 +381,8 @@ class TestDeadlock8_Phase2Borrow(unittest.TestCase):
     def test_phase2_takes_one_from_unused_capacity(self):
         # scan lent 2 to detail; n=7, target=5 → Phase-1 lendable to fullscan = 7-5-2 = 0
         # Phase-2 available = 7 - 0(borrow:scan:fullscan) - 5 = 2 → take 1
-        r = _make_redis({"manager:borrow:scan:detail": "2"})
+        r = _make_redis({"manager:borrow:scan:detail": "2",
+                         "manager:worker_ceil:scan": "10"})
         pool_sizes      = {"scan": 7, "detail": 5, "fullscan": 5}
         workers_targets = {"scan": 5, "detail": 5, "fullscan": 5}
         result = _attempt_borrow(r, "fullscan", pool_sizes, workers_targets)
