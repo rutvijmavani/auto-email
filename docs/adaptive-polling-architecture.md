@@ -816,10 +816,15 @@ def run_full_scan(company):
     last_poll   = company.last_poll_at
 
     if last_poll is None or last_poll.timestamp() < cycle_start:
-        # Adaptive hasn't run today — trigger it immediately
-        redis.zadd("poll:adaptive", {company.name: time.time()})
-        # Requeue full scan for 15 min from now
-        redis.zadd("poll:fullscan", {company.name: time.time() + 900})
+        # Adaptive hasn't run today. Trigger it now ONLY if the company is not
+        # already scheduled in poll:adaptive (a backoff / reap delay / interval
+        # is kept, never pulled forward).
+        scheduled = redis.zscore("poll:adaptive", company.name)
+        if scheduled is None:
+            redis.zadd("poll:adaptive", {company.name: time.time()})
+        adaptive_at = max(scheduled or 0, time.time())
+        # Requeue full scan 15 min after the adaptive poll
+        redis.zadd("poll:fullscan", {company.name: adaptive_at + 900})
         return   # come back after adaptive runs
 
     proceed_with_full_scan(company)

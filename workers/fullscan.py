@@ -51,8 +51,10 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
 
     If company_poll_stats.last_poll_at < cycle:start (Redis):
         The company hasn't had its adaptive poll this cycle yet.
-        → ZADD poll:adaptive with score=now (trigger immediately)
-        → ZADD poll:fullscan with score=now+900 (retry in 15 minutes)
+        → ZADD poll:adaptive with score=now ONLY if the company is not already
+          scheduled there; a scheduled company (interval, backoff, reap delay)
+          keeps its schedule (R4W)
+        → ZADD poll:fullscan with score=adaptive time + 900 (retry 15 minutes after it)
         → Skip this full scan run
 
 ─── Pause / resume ───────────────────────────────────────────────────────────
@@ -423,15 +425,28 @@ def _defer_adaptive_first(company: str, r) -> None:
     """
     Rule 4: adaptive poll hasn't happened this cycle yet.
 
-    Trigger adaptive immediately, re-queue fullscan in 15 minutes.
+    The fullscan only needs the adaptive poll to run BEFORE it retries, not
+    immediately.  A company already scheduled in poll:adaptive (normal interval,
+    a backoff, or a reap delay) keeps that schedule: pulling it to "now" would
+    poll an ATS we deliberately backed off from.  The fullscan then retries
+    FULLSCAN_ADAPTIVE_FIRST_DELAY_S after that adaptive time.  Only a company
+    absent from poll:adaptive is triggered now.
     """
     now = time.time()
-    r.zadd(REDIS_POLL_ADAPTIVE, {company: now})           # trigger now
-    r.zadd(REDIS_POLL_FULLSCAN, {company: now + FULLSCAN_ADAPTIVE_FIRST_DELAY_S})
+    scheduled = r.zscore(REDIS_POLL_ADAPTIVE, company)
+    if scheduled is None:
+        r.zadd(REDIS_POLL_ADAPTIVE, {company: now})       # not scheduled: trigger now
+        adaptive_at = now
+    else:
+        adaptive_at = max(float(scheduled), now)          # keep its schedule
+    r.zadd(REDIS_POLL_FULLSCAN, {company: adaptive_at + FULLSCAN_ADAPTIVE_FIRST_DELAY_S})
     logger.info(
-        "fullscan [%s]: Rule 4 — adaptive-first; "
+        "fullscan [%s]: Rule 4 — adaptive-first (%s); "
         "re-scheduling fullscan in %ds",
-        company, FULLSCAN_ADAPTIVE_FIRST_DELAY_S,
+        company,
+        "triggered now" if scheduled is None
+        else "adaptive already scheduled in %ds" % int(adaptive_at - now),
+        int(adaptive_at + FULLSCAN_ADAPTIVE_FIRST_DELAY_S - now),
     )
 
 

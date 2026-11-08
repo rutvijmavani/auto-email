@@ -363,6 +363,7 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         """_defer_adaptive_first ZADDs company to poll:adaptive with score=now."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
+        r.zscore.return_value = None
         before = time.time()
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
@@ -384,6 +385,7 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         from config import REDIS_POLL_FULLSCAN
         from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
         r = MagicMock()
+        r.zscore.return_value = None
         before = time.time()
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
@@ -403,11 +405,37 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         self.assertEqual(FULLSCAN_ADAPTIVE_FIRST_DELAY_S, 900)
 
     def test_both_zadd_calls_made(self):
-        """_defer_adaptive_first calls zadd exactly twice."""
+        """Company not in poll:adaptive: zadd to adaptive (now) and fullscan."""
         r = MagicMock()
+        r.zscore.return_value = None
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
         self.assertEqual(r.zadd.call_count, 2)
+
+    def test_scheduled_adaptive_is_not_pulled_forward(self):
+        """Backed-off company keeps its poll:adaptive schedule; fullscan waits after it."""
+        from config import REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN
+        from workers.fullscan import _defer_adaptive_first, FULLSCAN_ADAPTIVE_FIRST_DELAY_S
+        r = MagicMock()
+        later = time.time() + 3600
+        r.zscore.return_value = later
+        _defer_adaptive_first("TestCo", r)
+        keys = [c[0][0] for c in r.zadd.call_args_list]
+        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
+        fs = [c for c in r.zadd.call_args_list if c[0][0] == REDIS_POLL_FULLSCAN]
+        self.assertEqual(len(fs), 1)
+        self.assertAlmostEqual(list(fs[0][0][1].values())[0],
+                               later + FULLSCAN_ADAPTIVE_FIRST_DELAY_S, delta=1)
+
+    def test_overdue_adaptive_entry_not_rewritten(self):
+        """An already-due poll:adaptive entry is left alone; fullscan retries now+delay."""
+        from config import REDIS_POLL_ADAPTIVE
+        from workers.fullscan import _defer_adaptive_first
+        r = MagicMock()
+        r.zscore.return_value = time.time() - 100
+        _defer_adaptive_first("TestCo", r)
+        keys = [c[0][0] for c in r.zadd.call_args_list]
+        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
