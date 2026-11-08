@@ -101,6 +101,85 @@ _STACK_SEEN: dict[str, float] = {}
 _STACK_LOCK = threading.Lock()
 
 
+class SharedTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """
+    Midnight rotation that is safe when many processes log to ONE file (RO / F-ROTRACE).
+
+    The scheduler and its ~12 pool workers each open their own handler on scheduler.log.
+    With the stock handler every process renames the file at midnight, so a late process
+    renames (or, on POSIX, overwrites the backup with) the file another process just
+    created, and processes that never roll keep writing into the renamed backup, so one
+    day ends up split across two files.  This handler fixes both:
+      * rollover renames only a file last written BEFORE the boundary just crossed, never
+        overwrites an existing backup, and runs under an flock (Linux) so two processes
+        cannot both rename;
+      * before each emit it reopens the stream if the path no longer points at the file
+        it holds (another process rotated), like WatchedFileHandler.
+    """
+
+    def _lock_path(self) -> str:
+        return self.baseFilename + ".rotate.lock"
+
+    def shouldRollover(self, record) -> bool:
+        self._reopen_if_moved()
+        return super().shouldRollover(record)
+
+    def _reopen_if_moved(self) -> None:
+        if self.stream is None or os.name == "nt":
+            return
+        try:
+            path_stat = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            path_stat = None
+        except OSError:
+            return
+        try:
+            cur = os.fstat(self.stream.fileno())
+        except (OSError, ValueError):
+            return
+        if path_stat is None or (path_stat.st_dev, path_stat.st_ino) != (cur.st_dev, cur.st_ino):
+            self.stream.close()
+            self.stream = self._open()
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        lock_fh = None
+        try:
+            try:
+                import fcntl
+                lock_fh = open(self._lock_path(), "a")
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                lock_fh = None          # Windows / unwritable dir: best effort, no lock
+            boundary = self.rolloverAt
+            dfn = self.rotation_filename(
+                self.baseFilename + "." + time.strftime(self.suffix, time.localtime(boundary - self.interval)))
+            try:
+                # Rename only the previous period's file; a base file written at/after the
+                # boundary was already created by another process's rollover.
+                if (os.path.exists(self.baseFilename)
+                        and os.path.getmtime(self.baseFilename) < boundary
+                        and not os.path.exists(dfn)):
+                    self.rotate(self.baseFilename, dfn)
+            except OSError:
+                pass
+        finally:
+            if lock_fh is not None:
+                try:
+                    lock_fh.close()     # closing releases the flock
+                except OSError:
+                    pass
+        if not self.delay:
+            self.stream = self._open()
+        now = int(time.time())
+        nxt = self.computeRollover(now)
+        while nxt <= now:
+            nxt += self.interval
+        self.rolloverAt = nxt
+
+
 def _auto_stack() -> str:
     """Return the current call stack with logging-internal frames trimmed off the bottom."""
     frames = traceback.extract_stack()
@@ -389,7 +468,7 @@ def init_logging(command: str = "pipeline") -> None:
         _instance = os.environ.get("WORKER_INSTANCE", "")
         _suffix = f"_{_instance}" if _instance else ""
         command_file = LOG_DIR / f"{command}{_suffix}.log"
-        file_handler = logging.handlers.TimedRotatingFileHandler(
+        file_handler = SharedTimedRotatingFileHandler(
             command_file,
             when="midnight",
             backupCount=0,       # _cleanup_old_logs() handles deletion
