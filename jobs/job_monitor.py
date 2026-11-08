@@ -67,6 +67,7 @@ from config import (
     MONITOR_MATCH_RATE_HIGH_ALERT,
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
+    MONITOR_PLATFORM_CONCURRENCY_DEFAULT,
     REDIS_POLL_FULLSCAN,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
@@ -109,12 +110,13 @@ def _record_cycle_start(counts_snapshot=None) -> None:
 _IN_FLIGHT_WAIT_S   = 5 * 60   # max wait: 5 minutes
 _IN_FLIGHT_POLL_S   = 15        # check Redis every 15 seconds
 
-_DEFAULT_CONCURRENCY = 10
 _PLATFORM_SEMAPHORES = {
     platform: threading.Semaphore(limit)
     for platform, limit in MONITOR_PLATFORM_CONCURRENCY.items()
 }
-_DEFAULT_SEMAPHORE = threading.Semaphore(_DEFAULT_CONCURRENCY)
+# One default for unlisted platforms, shared with detail_worker and http_client
+# (SEM-DEFAULT): config.MONITOR_PLATFORM_CONCURRENCY_DEFAULT.
+_DEFAULT_SEMAPHORE = threading.Semaphore(MONITOR_PLATFORM_CONCURRENCY_DEFAULT)
 
 
 def _get_semaphore(platform):

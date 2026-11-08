@@ -794,7 +794,10 @@ def _build_detail_payload(
         "sitemap":         ["_feed_type"],
     }
     for key in PLATFORM_DETAIL_KEYS.get(platform, []):
-        if job.get(key) is not None:
+        # Truthiness, same as scan_worker._build_detail_payload (BDP): an empty
+        # string is "absent" for the fetch_job_detail guards (`not all([...])`),
+        # so both tiers must drop it the same way.
+        if job.get(key):
             payload[key] = job[key]
 
     if job.get("_country_code"):
@@ -1608,7 +1611,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
     elif skip_lock:
         print("[fullscan] --skip-lock mode (dev only)")
     else:
-        print("[fullscan] Press Ctrl+C to stop\n")
+        if sys.stdout.isatty():  # CTRLC: no interactive hint under systemd
+            print("[fullscan] Press Ctrl+C to stop\n")
 
     # ── Background heartbeat ─────────────────────────────────────────────────
     # Full scans can legitimately take 20-30 minutes for large Workday tenants.

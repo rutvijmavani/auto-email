@@ -191,10 +191,24 @@ jobs:
             #    them cleanly so they never become "stuck dead-consumer" entries after restart.
             # 2. Clear inflight:scans ZSETs — accumulated entries from prior restarts cause
             #    the ceiling check to block all dispatch (dispatched=0 stall) in the new scheduler.
-            _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
-            if [ -n "$_pending_ids" ]; then
-              redis-cli XACK stream:adaptive scan-workers $_pending_ids > /dev/null || true
-              echo "  Pre-restart: ACKed PEL entries ($_pending_ids)"
+            # DXP: redis-cli (non-tty) prints 4 lines per XPENDING entry — id, consumer,
+            # idle ms, delivery count — so only every 4th line (NR%4==1) is an id.
+            # Loop in batches of 100 until the PEL is empty; stop on an XACK error so a
+            # failing XACK can never loop forever.
+            _acked_ids=""
+            while :; do
+              _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk 'NR%4==1' | tr '\n' ' ')
+              if [ -z "${_pending_ids// /}" ]; then
+                break
+              fi
+              if ! redis-cli XACK stream:adaptive scan-workers $_pending_ids > /dev/null; then
+                echo "  Pre-restart: XACK failed for ($_pending_ids) — continuing"
+                break
+              fi
+              _acked_ids="$_acked_ids $_pending_ids"
+            done
+            if [ -n "${_acked_ids// /}" ]; then
+              echo "  Pre-restart: ACKed PEL entries ($_acked_ids)"
             fi
             redis-cli --scan --pattern 'inflight:scans:*' 2>/dev/null | xargs -r redis-cli DEL > /dev/null || true
             echo "  Pre-restart: cleared inflight:scans ZSETs"

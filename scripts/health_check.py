@@ -930,6 +930,15 @@ def run_health_check() -> int:
           f"{_c(f'{warnings} warnings', _YELLOW if warnings else _GREY)}")
     print(f"{_c(DSEP, _BOLD)}\n")
 
+    # GATELOG: the verdict also goes to the log file (stdout alone is lost once
+    # the deploy gate's output scrolls away).  Plain text, no ANSI colour codes.
+    _plain = ("ALL OK" if errors == 0 and warnings == 0 else
+              "DEGRADED" if errors == 0 else "UNHEALTHY")
+    logger.log(
+        logging.ERROR if errors else (logging.WARNING if warnings else logging.INFO),
+        "health_check: VERDICT %s errors=%d warnings=%d", _plain, errors, warnings,
+    )
+
     try:
         r.close()
     except Exception:
@@ -939,4 +948,6 @@ def run_health_check() -> int:
 
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("health_check")
     sys.exit(run_health_check())

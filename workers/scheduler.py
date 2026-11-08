@@ -34,7 +34,9 @@ import os
 from logger import get_logger
 import random
 import threading
+import sys
 import time
+import uuid
 from datetime import datetime
 from typing import Optional
 
@@ -98,6 +100,7 @@ from config import (
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
     STREAM_CONSUMER_GROUP,
+    STREAM_CONSUMER_PRUNE_IDLE_S,
     MAX_STREAM_REDELIVERIES,
     REDIS_REAPED_PREFIX,
     REDIS_INFLIGHT_MSG_PREFIX,
@@ -177,6 +180,10 @@ _total_replacements:      dict = {"scan": 0, "detail": 0, "fullscan": 0}
 _unstarted_kills:         dict = {"scan": 0, "detail": 0, "fullscan": 0}  # killed: never started
 _worker_spawn_times:      dict = {}   # pid → (ptype, spawn_epoch)
 _worker_started:          set  = set()  # pids seen with a heartbeat (finished starting)
+# ZJ: workers removed by _remove_one_worker that are still finishing their job.
+# Each entry is (ptype, proc, removed_at_epoch); _reap_retiring_workers joins
+# finished ones (no zombie) and kills any still alive past the shutdown grace.
+_retiring_workers:        list = []
 _death_streak_started_at: dict = {"scan": 0.0, "detail": 0.0, "fullscan": 0.0}
 # Timestamp (epoch) when the current consecutive-death streak began.
 # A replacement must have been spawned AFTER this time and lived >=
@@ -469,6 +476,33 @@ def sweep_inflight(r, op_type: str, stream_key: str, group: str) -> None:
             r.zrem(REDIS_INFLIGHT_FULLSCAN, company)
             r.delete(f"fullscan:lock:{company}")
         logger.warning("sweep_inflight: released leaked %s slot %s for %r", op_type, zkey, company)
+
+    prune_idle_consumers(r, stream_key, group)
+
+
+def prune_idle_consumers(r, stream_key: str, group: str) -> int:
+    """
+    CL: delete consumers of the group that hold no pending messages and have been
+    idle STREAM_CONSUMER_PRUNE_IDLE_S.  Each worker restart creates a new
+    consumer name, so without this the consumer list only grows.  A consumer
+    with pending messages is never touched (claim_stale_work owns those).
+    Returns the number deleted; a failure never blocks the dispatch loop.
+    """
+    removed = 0
+    try:
+        for c in r.xinfo_consumers(stream_key, group):
+            if int(c.get("pending", 0)) != 0:
+                continue
+            if int(c.get("idle", 0)) < STREAM_CONSUMER_PRUNE_IDLE_S * 1000:
+                continue
+            r.xgroup_delconsumer(stream_key, group, _s(c.get("name", "")))
+            removed += 1
+        if removed:
+            logger.info("prune_idle_consumers: deleted %d idle consumer(s) from %r/%r",
+                        removed, stream_key, group)
+    except Exception as exc:
+        logger.debug("prune_idle_consumers: %r/%r failed: %s", stream_key, group, exc)
+    return removed
 
 
 # ─────────────────────────────────────────
@@ -857,14 +891,20 @@ def on_adaptive_complete(company: str, new_jobs: int,
     })
 
     # Reschedule adaptive (Rule 3 part 1: never orphaned)
-    _reschedule_adaptive(company, interval)
+    _scheduled_ts = _reschedule_adaptive(company, interval)
     clear_heartbeat(company)
 
+    # JITLOG: log the slot actually written (gap-picked / jittered), not now+interval.
+    # None means an existing future score was kept (BO).
+    if isinstance(_scheduled_ts, (int, float)):
+        _next_poll_str = datetime.fromtimestamp(_scheduled_ts).strftime("%H:%M")
+    else:
+        _next_poll_str = "kept-existing"
     logger.info(
         "on_adaptive_complete: company=%r new_jobs=%d interval=%ds "
         "next_poll=%s success=%s",
         company, new_jobs, interval,
-        next_poll_at.strftime("%H:%M"), success,
+        _next_poll_str, success,
     )
 
     # ── Phase 11: error streak alert ─────────────────────────────────────────
@@ -1250,9 +1290,13 @@ def _atomic_schedule(
                 )
 
 
-def _reschedule_adaptive(company: str, interval_s: int) -> None:
+def _reschedule_adaptive(company: str, interval_s: int) -> Optional[float]:
     """
     Add company back to poll:adaptive ZSET with its new interval.
+
+    Returns the score actually written (jitter / gap-picking applied), or None
+    when the company already holds a future score and that score was kept (BO:
+    a later backoff score set elsewhere is not overwritten).
 
     Uses _atomic_schedule() which wraps _pick_schedule_time() + ZADD under a
     short Redis lock so concurrent scan_worker processes do not all read the
@@ -1263,9 +1307,10 @@ def _reschedule_adaptive(company: str, interval_s: int) -> None:
     """
     r   = get_redis()
     now = time.time()
-    _atomic_schedule(
+    return _atomic_schedule(
         r, REDIS_POLL_ADAPTIVE, company,
         now + interval_s, interval_s, 0.20,
+        skip_if_future=True,
     )
 
 
@@ -1543,7 +1588,7 @@ def adaptive_loop() -> None:
                             "dc_key":      dc_key,
                             "context":     dispatch_context,
                             "enqueued_at": datetime.utcnow().isoformat(),
-                            "request_id":  f"adp-{int(now)}",
+                            "request_id":  f"adp-{int(now)}-{uuid.uuid4().hex[:8]}",
                         },
                     )
                 except Exception as _xadd_err:
@@ -1699,7 +1744,7 @@ def fullscan_loop() -> None:
                             "dc_key":      dc_key,
                             "context":     "normal",
                             "enqueued_at": datetime.utcnow().isoformat(),
-                            "request_id":  f"full-{int(now)}",
+                            "request_id":  f"full-{int(now)}-{uuid.uuid4().hex[:8]}",
                         },
                     )
                 except Exception as _xadd_exc:
@@ -2661,6 +2706,7 @@ def _remove_one_worker(worker_type: str, floor_: int) -> bool:
         _idx = _pick_removal_index([p.pid for p, _e in pool], _sp, _busy)
         proc, event = pool.pop(_idx)
         _worker_spawn_times.pop(proc.pid, None)   # prevent stale entry accumulation
+        _retiring_workers.append((worker_type, proc, time.time()))
 
     event.set()
     logger.info(
@@ -2733,6 +2779,49 @@ def _deprioritise_platform(r, platform: str) -> int:
 
 # ── Monitoring threads ────────────────────────────────────────────────────────
 
+def _reap_retiring_workers() -> None:
+    """
+    ZJ: reap workers removed from a pool by _remove_one_worker.
+
+    A removed worker leaves the pool list at once, so the liveness check no
+    longer sees it.  Without this it stays a zombie after it exits, and a worker
+    that never exits on its shutdown event runs on forever.  Finished procs are
+    joined; ones still alive WORKER_SHUTDOWN_TIMEOUT_S after removal are killed.
+    """
+    now = time.time()
+    with _pool_lock:
+        entries = list(_retiring_workers)
+    done = []
+    for entry in entries:
+        ptype, proc, removed_at = entry
+        try:
+            if not proc.is_alive():
+                proc.join(timeout=0)
+                done.append(entry)
+            elif now - removed_at >= WORKER_SHUTDOWN_TIMEOUT_S:
+                logger.warning(
+                    "scheduler: retiring %s_worker pid=%d still alive %ds after "
+                    "removal — killing", ptype, proc.pid, int(now - removed_at))
+                try:
+                    get_redis().delete(
+                        f"{REDIS_WORKER_CUR_PREFIX}:{_worker_consumer(ptype, proc.pid)}")
+                except Exception:
+                    pass
+                proc.kill()
+                proc.join(timeout=2)
+                done.append(entry)
+        except Exception as exc:
+            logger.warning("scheduler: reaping retiring %s_worker failed: %s", ptype, exc)
+            done.append(entry)   # do not retry a proc that errors on every check
+    if done:
+        with _pool_lock:
+            for entry in done:
+                try:
+                    _retiring_workers.remove(entry)
+                except ValueError:
+                    pass
+
+
 def _liveness_check_loop() -> None:
     """
     Layer 1: liveness monitor — checks worker processes every ~5 seconds.
@@ -2745,6 +2834,7 @@ def _liveness_check_loop() -> None:
         try:
             time.sleep(5)
             _replace_dead_workers()
+            _reap_retiring_workers()
         except KeyboardInterrupt:
             logger.info("liveness_check_loop: stopping")
             break
@@ -3123,20 +3213,37 @@ def _manager_cmds_loop() -> None:
                     # only applies the number it is given.
                     target = max(WORKER_FLOOR, target)
 
+                    _refused = 0
                     if target > current:
                         for _ in range(target - current):
-                            _add_one_worker(pool, target)
+                            if not _add_one_worker(pool, target):
+                                _refused += 1
                     elif target < current:
                         for _ in range(current - target):
-                            _remove_one_worker(pool, WORKER_FLOOR)
+                            if not _remove_one_worker(pool, WORKER_FLOOR):
+                                _refused += 1
 
                     n_scan_a, n_detail_a = _get_pool_snapshot()
-                    logger.info(
-                        "manager_cmds: %s:target:%d applied "
-                        "(was %d → scan=%d detail=%d fullscan=%d)",
-                        pool, target, current,
-                        n_scan_a, n_detail_a, _get_fullscan_pool_size(),
-                    )
+                    # CLAMPLOG: "applied" only when the pool really changed.
+                    if target == current:
+                        logger.debug(
+                            "manager_cmds: %s:target:%d no change (pool already %d)",
+                            pool, target, current,
+                        )
+                    elif _refused:
+                        logger.warning(
+                            "manager_cmds: %s:target:%d partly refused "
+                            "(%d of %d steps refused; was %d → scan=%d detail=%d fullscan=%d)",
+                            pool, target, _refused, abs(target - current), current,
+                            n_scan_a, n_detail_a, _get_fullscan_pool_size(),
+                        )
+                    else:
+                        logger.info(
+                            "manager_cmds: %s:target:%d applied "
+                            "(was %d → scan=%d detail=%d fullscan=%d)",
+                            pool, target, current,
+                            n_scan_a, n_detail_a, _get_fullscan_pool_size(),
+                        )
                 else:
                     logger.warning("manager_cmds: unknown pool %r in cmd %r", pool, cmd)
 
@@ -3438,9 +3545,10 @@ def run_scheduler(skip_rebuild: bool = False) -> None:
 
     logger.info("scheduler: all loops started — %d threads + %d processes",
                 len(threads), scan_count + detail_count + fullscan_count)
-    print(f"[scheduler] Running — "
-          f"{scan_count} scan + {detail_count} detail + {fullscan_count} fullscan workers "
-          f"— Ctrl+C to stop")
+    if sys.stdout.isatty():  # CTRLC: no interactive hint under systemd
+        print(f"[scheduler] Running — "
+              f"{scan_count} scan + {detail_count} detail + {fullscan_count} fullscan workers "
+              f"— Ctrl+C to stop")
 
     from logger import cleanup_logs_if_due
     try:

@@ -964,6 +964,10 @@ REDIS_STREAM_ADAPTIVE   = "stream:adaptive"     # adaptive scan delivery stream
 REDIS_STREAM_FULLSCAN   = "stream:fullscan"     # full scan delivery stream
 STREAM_CONSUMER_GROUP   = "scan-workers"        # shared consumer group for all workers
 STREAM_BLOCK_MS         = 500                   # XREADGROUP BLOCK timeout (ms)
+# CL: a consumer with no pending messages that has been idle this long belongs
+# to a worker that is gone (every restart/respawn creates a new consumer name);
+# the scheduler deletes it so the group's consumer list does not grow forever.
+STREAM_CONSUMER_PRUNE_IDLE_S = int(os.getenv("STREAM_CONSUMER_PRUNE_IDLE_S", "3600"))
                                                 # Short (0.5s) so workers check
                                                 # pause_event within ~1s of signal.
                                                 # No MAXLEN: a count cap deletes entries

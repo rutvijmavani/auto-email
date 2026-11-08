@@ -1116,6 +1116,19 @@ def _fullscan_lock_active(r) -> bool:
         return False
 
 
+def _counter_delta(cur, prev):
+    """
+    Change of a cumulative processed counter between two checks, or None when it
+    cannot be known: either value missing, or the counter went DOWN (a worker
+    restart reset it).  A negative delta is not "work done", so it is reported as
+    unknown, never as "+-3399 jobs" (NEGD).  None is not 0, so a reset can never
+    read as "no jobs processed" in the restart gate.
+    """
+    if cur is None or prev is None or cur < prev:
+        return None
+    return cur - prev
+
+
 def _trend(delta: int) -> str:
     """↓ shrinking (good), → stable, ↑ growing (bad)."""
     return "↓" if delta < 0 else ("↑" if delta > 0 else "→")
@@ -1687,7 +1700,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             prev_adp_head_c, prev_adp_head_s,
             scan_proc,   prev_scan_proc,
         )
-        proc_delta = (scan_proc - prev_scan_proc) if (scan_proc is not None and prev_scan_proc is not None) else None
+        proc_delta = _counter_delta(scan_proc, prev_scan_proc)
         summary = (
             f"{adp_total} total  {adp_overdue} overdue {_trend(adp_delta)}({adp_delta:+d})  "
             f"head={adp_head_c or '?'}  "
@@ -1738,7 +1751,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             prev_fs_head_c, prev_fs_head_s,
             fs_proc,    prev_fs_proc,
         )
-        proc_delta = (fs_proc - prev_fs_proc) if (fs_proc is not None and prev_fs_proc is not None) else None
+        proc_delta = _counter_delta(fs_proc, prev_fs_proc)
         summary = (
             f"{fs_total} total  {fs_overdue} overdue {_trend(fs_delta)}({fs_delta:+d})  "
             f"head={fs_head_c or '?'}  "
@@ -1757,11 +1770,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             issues.append(Issue(Issue.OK, "queue:poll:fullscan", summary))
 
     # ── 8. Detail queues ──────────────────────────────────────────────────────
-    detail_proc_delta = (
-        (detail_proc - prev_detail_proc)
-        if detail_proc is not None and prev_detail_proc is not None
-        else None
-    )
+    detail_proc_delta = _counter_delta(detail_proc, prev_detail_proc)
     proc_note = (
         f"  detail_worker +{detail_proc_delta} jobs"
         if detail_proc_delta is not None else ""

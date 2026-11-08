@@ -463,18 +463,21 @@ def _push_to_dlq(job: dict) -> None:
 # HTTP call per job, so semaphores throttle cross-worker pressure on
 # the same ATS domain. Import lazily to avoid circular imports.
 _PLATFORM_SEMAPHORES: dict = {}
-_DEFAULT_CONCURRENCY = 5
 
 
 def _get_semaphore(platform: str):
     """Return (or lazily create) the per-platform Semaphore."""
     if not _PLATFORM_SEMAPHORES:
         import threading
-        from config import MONITOR_PLATFORM_CONCURRENCY
+        from config import (
+            MONITOR_PLATFORM_CONCURRENCY,
+            MONITOR_PLATFORM_CONCURRENCY_DEFAULT,
+        )
         for plat, limit in MONITOR_PLATFORM_CONCURRENCY.items():
             _PLATFORM_SEMAPHORES[plat] = threading.Semaphore(limit)
+        # One default for unlisted platforms, from config (SEM-DEFAULT).
         _PLATFORM_SEMAPHORES["_default"] = threading.Semaphore(
-            _DEFAULT_CONCURRENCY
+            MONITOR_PLATFORM_CONCURRENCY_DEFAULT
         )
     return _PLATFORM_SEMAPHORES.get(platform,
                                     _PLATFORM_SEMAPHORES["_default"])
@@ -1120,7 +1123,8 @@ def run_worker(once: bool = False, shutdown_event=None,
     if once:
         print("[detail_worker] --once mode: processing one job then exiting")
     else:
-        print("[detail_worker] Press Ctrl+C to stop\n")
+        if sys.stdout.isatty():  # CTRLC: no interactive hint under systemd
+            print("[detail_worker] Press Ctrl+C to stop\n")
 
     # ── Background heartbeat ─────────────────────────────────────────────────
     # Daemon thread writes worker:alive:detail_worker every 10s.
@@ -1188,6 +1192,7 @@ def run_worker(once: bool = False, shutdown_event=None,
             # Moves item atomically: source_queue → inflight list.
             # The item is acknowledged (LREM'd) only after a successful DB write.
             # On crash, _recover_stuck_jobs() restores it on next startup.
+            _held = None   # (inflight_key, source_queue, raw) once an item is popped
             item = _pop_with_inflight(r, timeout=WORKER_BLOCK_SECS)
 
             if item is None:
@@ -1203,6 +1208,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             source_queue, raw = item
             inflight_key = _INFLIGHT_KEY[source_queue]
+            _held = (inflight_key, source_queue, raw)
 
             # ── Shutdown checkpoint: item is already in inflight list ─────────
             # Atomically move our specific job back to the front of the source
@@ -1434,6 +1440,23 @@ def run_worker(once: bool = False, shutdown_event=None,
             logger.error(
                 "detail_worker: unexpected loop error: %s", exc, exc_info=True,
             )
+            # OI: an item popped before the error would sit in this worker's
+            # inflight list for the worker's whole life (peers skip live PIDs).
+            # _ATOMIC_REQUEUE_LUA only pushes back if the item is still in the
+            # inflight list, so this is a no-op when it was already acknowledged.
+            if _held is not None:
+                try:
+                    _o_removed = r.eval(_ATOMIC_REQUEUE_LUA, 2, *_held)
+                    if _o_removed:
+                        logger.warning(
+                            "detail_worker: loop error with an item in flight - "
+                            "returned it to %s", _held[1],
+                        )
+                except Exception as _oi_err:
+                    logger.error(
+                        "detail_worker: could not return in-flight item after "
+                        "loop error (peer recovery needed): %s", _oi_err,
+                    )
             if once:
                 break
             time.sleep(1)

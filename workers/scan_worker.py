@@ -803,7 +803,8 @@ def run_worker(once: bool = False, shutdown_event=None,
     if once:
         print("[scan_worker] --once mode: processing one job then exiting")
     else:
-        print("[scan_worker] Press Ctrl+C to stop\n")
+        if sys.stdout.isatty():  # CTRLC: no interactive hint under systemd
+            print("[scan_worker] Press Ctrl+C to stop\n")
 
     # ── Background heartbeat ─────────────────────────────────────────────────
     # Daemon thread writes worker:alive:scan_worker every 10s, independent of
