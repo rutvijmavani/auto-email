@@ -944,12 +944,12 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         )
 
         if not updated:
-            # Row may have been deleted (cleanup) or never inserted.
-            # Log as warning and continue — data is not lost because
-            # detail was fetched; we just can't update the status.
+            # Row was deleted (cleanup/other worker) or never inserted, so the
+            # status update matched nothing and the outcome below is "noop":
+            # the fetched detail is NOT stored by this path.
             logger.warning(
                 "detail_worker: no pending_detail row found for "
-                "company=%r job_id=%s — may have been cleaned up",
+                "company=%r job_id=%s — status not updated (outcome=noop)",
                 company, job_id,
             )
 
@@ -1146,6 +1146,7 @@ def run_worker(once: bool = False, shutdown_event=None,
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
         WORKER_ID, REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN, once,
     )
+    logger.info("detail_worker: ready worker=%s once=%s", WORKER_ID, once)   # GL
     print(f"[detail_worker] Ready — worker={WORKER_ID}")
     print(f"[detail_worker] Draining: {REDIS_DETAIL_ADAPTIVE!r} (priority) "
           f"then {REDIS_DETAIL_FULLSCAN!r}")
@@ -1457,6 +1458,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 
         except KeyboardInterrupt:
             logger.info("detail_worker: KeyboardInterrupt — shutting down")
+            logger.info("detail_worker: shutting down worker=%s", WORKER_ID)
             print("\n[detail_worker] Shutting down.")
             break
 

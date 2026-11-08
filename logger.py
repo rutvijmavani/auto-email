@@ -69,6 +69,9 @@ _MONTHLY_COMMANDS = frozenset({
 _LONG_RUNNING_COMMANDS = frozenset({
     "scheduler", "api", "email_processor",
     "domain_enrichment_worker", "discover_h1b_ats_worker", "head_check_worker",
+    # WL/F-WDLOG: always-on daemons that used to write <name>_<start date>.log forever.
+    "watchdog", "manager", "h1b_llm_worker", "llama_server_wrapper",
+    "mobile_relay_drain_worker", "detail_drainer", "tunnel_manager",
 })
 
 # Subset of _LONG_RUNNING_COMMANDS that get extended retention (LOG_RETENTION_WORKER_DAYS).
@@ -119,6 +122,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict = {
             "time":   self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "tz":     time.strftime("%z", time.localtime(record.created)),   # LOGTZ: "time" is local, say which zone
+            "pid":    record.process,                                          # NOPID
             "ms":     record.msecs,
             "level":  record.levelname,
             "logger": record.name,
@@ -141,7 +146,8 @@ class JsonFormatter(logging.Formatter):
                     _inject = True
             if _inject:
                 payload["stack"] = _auto_stack()
-        return json.dumps(payload)
+        # EA: ensure_ascii=False keeps "—" etc. greppable; files are opened as utf-8.
+        return json.dumps(payload, ensure_ascii=False)
 
 
 # ─────────────────────────────────────────
@@ -163,6 +169,9 @@ class JsonFormatter(logging.Formatter):
 # Plain:    something.log (no date)
 #             Long-running process logs: scheduler.log, fullscan.log, pipeline.log
 #             Deleted once mtime ages past the daily retention window.
+# LOGDEL: names removed by the latest _cleanup_old_logs() run, logged by the caller.
+_CLEANUP_NAMES: list = []
+
 _MONTHLY_LOG_RE   = re.compile(r'^(.+)_\d{4}-\d{2}\.log$')
 _DAILY_LOG_RE     = re.compile(r'^(.+)_\d{4}-\d{2}-\d{2}\.log$')
 _ROTATION_LOG_RE  = re.compile(r'^.+\.log\.\d{4}-\d{2}-\d{2}$')
@@ -231,6 +240,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
     worker_cutoff  = now - timedelta(days=LOG_RETENTION_WORKER_DAYS)
 
     deleted, errors = 0, 0
+    _CLEANUP_NAMES.clear()
     for entry in LOG_DIR.iterdir():
         if not entry.is_file():
             continue
@@ -244,6 +254,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < monthly_cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             m = _DAILY_LOG_RE.match(name)
@@ -257,6 +268,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             if _ROTATION_LOG_RE.match(name):
@@ -270,6 +282,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             if name.endswith(".log"):
@@ -282,6 +295,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
 
         except OSError:
             errors += 1
@@ -426,8 +440,8 @@ def init_logging(command: str = "pipeline") -> None:
     )
     if _deleted or _errors:
         _log.info(
-            "Log cleanup ran at startup — deleted=%d errors=%d",
-            _deleted, _errors,
+            "Log cleanup ran at startup — deleted=%d errors=%d files=%s",
+            _deleted, _errors, ",".join(_CLEANUP_NAMES[:50]),
         )
 
 
@@ -452,8 +466,8 @@ def cleanup_logs_if_due() -> None:
         _last_log_cleanup = now  # only advance after success so failures retry
         if deleted or errors:
             _log.info(
-                "logger: periodic log cleanup — deleted=%d errors=%d",
-                deleted, errors,
+                "logger: periodic log cleanup — deleted=%d errors=%d files=%s",
+                deleted, errors, ",".join(_CLEANUP_NAMES[:50]),
             )
     except Exception as _exc:
         _log.warning("logger: periodic log cleanup failed — will retry next interval: %s", _exc)

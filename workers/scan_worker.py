@@ -512,6 +512,7 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
         adaptive_skipped = 0
         date_skipped     = 0
         filter_skipped   = 0
+        db_known         = 0
 
         for job in valid_jobs:
             job_id = job.get("job_id")
@@ -564,6 +565,8 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                     # queue at the bucket rate (pushed_at NULL = held).
                     count_arrival(r, REDIS_DETAIL_ADAPTIVE)
                     new_count += 1
+                else:
+                    db_known += 1   # ADPSKIP: row already in the DB, so not queued
                 # New or already known (DB decided): handled either way.
                 r.sadd(adaptive_seen_key, job_id)
 
@@ -578,13 +581,13 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             early_exit=early_exited,
         )
         logger.info(
-            "scan_worker [%s] done | company=%r platform=%s "
+            "scan_worker [%s] done | company=%r(%s) platform=%s "
             "fetched=%d new=%d adaptive_skipped=%d date_skipped=%d "
-            "filter_skipped=%d waste=%.0f%% early_exit=%s pages=%d",
-            request_id, company, platform,
+            "filter_skipped=%d db_known=%d waste=%.0f%% early_exit=%s pages=%d",
+            request_id, company, display_name, platform,   # CAKEY: name next to the ca:{id} key
             depth_stats["total_fetched"],
             depth_stats["new_found"],
-            adaptive_skipped, date_skipped, filter_skipped,
+            adaptive_skipped, date_skipped, filter_skipped, db_known,
             depth_stats["waste_ratio"] * 100,
             early_exited, _report.pages,
         )
@@ -797,6 +800,8 @@ def run_worker(once: bool = False, shutdown_event=None,
         "scan_worker started | worker_id=%s consumer=%s stream=%s once=%s",
         WORKER_ID, _CONSUMER_NAME, REDIS_STREAM_ADAPTIVE, once,
     )
+    logger.info("scan_worker: ready worker=%s stream=%s group=%s once=%s",   # GL: lifecycle in the log too
+                WORKER_ID, REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, once)
     print(f"[scan_worker] Ready — worker={WORKER_ID}")
     print(f"[scan_worker] Consuming from {REDIS_STREAM_ADAPTIVE!r} "
           f"group={STREAM_CONSUMER_GROUP!r}")
@@ -952,6 +957,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 
         except KeyboardInterrupt:
             logger.info("scan_worker: KeyboardInterrupt — shutting down")
+            logger.info("scan_worker: shutting down worker=%s", WORKER_ID)
             print("\n[scan_worker] Shutting down.")
             break
 

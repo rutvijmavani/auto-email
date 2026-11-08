@@ -1194,7 +1194,7 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
         paused        = False
         early_exit    = False   # fullscan never exits early: it must see the whole board
         matched_ids   = {j.get("job_id") for j in title_matched}
-        gate_hit = date_skipped = filter_skipped = 0
+        gate_hit = date_skipped = filter_skipped = db_known = 0
 
         # The board is already in memory; chunks exist only so pause/shutdown can be honoured.
         for chunk_start in range(0, max(len(valid_jobs), 1), FULLSCAN_CHUNK_SIZE):
@@ -1284,6 +1284,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
                         # the queue at the bucket rate (pushed_at NULL = held).
                         count_arrival(r, REDIS_DETAIL_FULLSCAN)
                         new_count += 1
+                    else:
+                        db_known += 1   # FSHELD/ADPSKIP: row already in the DB, not queued
 
                 # Inserted or already in the DB: handled either way.
                 bloom.new_add(job_id)
@@ -1296,8 +1298,8 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
         logger.info(
             "fullscan [%s]: gate | board=%d already_handled=%d date_skipped=%d "
-            "filter_skipped=%d queued=%d",
-            company, len(valid_jobs), gate_hit, date_skipped, filter_skipped, new_count,
+            "filter_skipped=%d db_known=%d queued=%d",
+            company, len(valid_jobs), gate_hit, date_skipped, filter_skipped, db_known, new_count,
         )
 
         # ── 11. Depth/waste stats ─────────────────────────────────────────────
@@ -1603,6 +1605,8 @@ def run_worker(once: bool = False, skip_lock: bool = False,
         "once=%s skip_lock=%s",
         WORKER_ID, _CONSUMER_NAME, REDIS_STREAM_FULLSCAN, once, skip_lock,
     )
+    logger.info("fullscan: ready worker=%s stream=%s group=%s once=%s",   # GL
+                WORKER_ID, REDIS_STREAM_FULLSCAN, STREAM_CONSUMER_GROUP, once)
     print(f"[fullscan] Ready — worker={WORKER_ID}")
     print(f"[fullscan] Consuming from {REDIS_STREAM_FULLSCAN!r} "
           f"group={STREAM_CONSUMER_GROUP!r}")
@@ -1733,6 +1737,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
 
         except KeyboardInterrupt:
             logger.info("fullscan: KeyboardInterrupt — shutting down")
+            logger.info("fullscan: shutting down worker=%s", WORKER_ID)
             print("\n[fullscan] Shutting down.")
             break
 

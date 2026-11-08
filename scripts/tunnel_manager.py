@@ -44,11 +44,16 @@ FRONTEND_PORT   = os.environ.get('STREAMLIT_PORT', '8501')
 GIST_FILENAME = 'api-config.json'
 URL_RE = re.compile(r'https://[a-z0-9-]+\.trycloudflare\.com')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-    stream=sys.stdout,
-)
+# TUN/CFTUN: log to logs/tunnel_manager.log (visible to log_monitor) via the shared
+# logger, and keep the journal copy that basicConfig(stream=stdout) used to give.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from logger import init_logging  # noqa: E402
+init_logging('tunnel_manager')
+if not (sys.stdout is not None and sys.stdout.isatty()):
+    _journal = logging.StreamHandler(sys.stdout)
+    _journal.setLevel(logging.INFO)
+    _journal.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    logging.getLogger().addHandler(_journal)
 log = logging.getLogger(__name__)
 
 # Shared Gist state — both threads write here, protected by a lock

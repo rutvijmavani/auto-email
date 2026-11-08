@@ -2656,6 +2656,14 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         # cooldown (ALERT_COOLDOWN_S).
         escalated   = r.exists(_rkey("escalated", target))
 
+        # WDREASON/LGAP/WP: record WHY this alert fired (the check's own message) in the log,
+        # not only in email/stdout, before any heal / escalation / plain-alert decision.
+        logger.warning(
+            "watchdog: alert %s level=%s new=%s heal_attempts=%d/%d escalated=%s — %s",
+            issue.category, issue.level, is_new, attempts, HEAL_MAX_ATTEMPTS,
+            bool(escalated), (issue.message or "")[:400],
+        )
+
         # ── Escalation check (persisting issue, exhausted attempts) ───────────
         if (not escalated and not is_new and was_healing
                 and attempts >= HEAL_MAX_ATTEMPTS):
@@ -2883,6 +2891,16 @@ def run_watchdog(once: bool = False,
     # WATCHDOG_INTERVAL_S seconds during a sustained Redis outage.
     _last_redis_down_email_ts: float = 0.0
 
+    # WP: systemd stops the service with SIGTERM, which would kill the process with no
+    # shutdown line.  Turn it into the same path as Ctrl-C so the loop exits cleanly.
+    try:
+        import signal as _sig
+        def _on_sigterm(_signum, _frame):
+            raise KeyboardInterrupt()
+        _sig.signal(_sig.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        pass   # not the main thread / unsupported platform
+
     while True:
         try:
             if self_heal and _systemd_available():
@@ -2891,7 +2909,7 @@ def run_watchdog(once: bool = False,
 
             errors   = sum(1 for i in issues if i.level in ("ERROR", "CRITICAL"))
             warnings = sum(1 for i in issues if i.level == "WARNING")
-            ts       = datetime.now().strftime("%H:%M:%S")
+            ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # WDDATE
 
             if errors or warnings:
                 print(f"[watchdog {ts}] ⚠  errors={errors} warnings={warnings}")
@@ -2910,6 +2928,7 @@ def run_watchdog(once: bool = False,
 
         except KeyboardInterrupt:
             print("\n[watchdog] Stopping.")
+            logger.info("watchdog: stop requested (SIGTERM/Ctrl-C)")
             break
         except Exception as exc:
             logger.error("watchdog: loop error: %s", exc, exc_info=True)

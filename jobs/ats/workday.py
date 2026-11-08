@@ -292,8 +292,11 @@ def _collect(url, applied, used, first, company, rep=None, slice_count=None, gat
             merged.setdefault(_job_key(p), p)
     early = bool(rep and rep.get("early"))
     if slice_count and not early and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
-        logger.warning("workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
-                       "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
+        # WW: a nested split routinely misses jobs lacking the new facet (e.g. a city); that is
+        # expected, and the board-level result is still flagged capped below. WARNING only at top level.
+        (logger.info if used else logger.warning)(
+            "workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
+            "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
         if rep is not None:
             rep["capped"] = True
     expected = sum(v.get("count", 0) for v in values)
@@ -302,8 +305,9 @@ def _collect(url, applied, used, first, company, rep=None, slice_count=None, gat
     if early:
         logger.info("workday fetch: %r split by %s early exit, %d distinct jobs read", company, name, len(merged))
     elif len(merged) < expected:
-        logger.warning("workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
-                       company, name, len(merged), expected, applied)
+        (logger.info if used else logger.warning)(   # WW: nested shortfall is covered by the slice check above
+            "workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
+            company, name, len(merged), expected, applied)
     else:
         logger.info("workday fetch: %r split by %s into %d slices, %d distinct jobs",
                     company, name, len(values), len(merged))

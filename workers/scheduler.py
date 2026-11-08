@@ -37,7 +37,7 @@ import threading
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from workers.redis_client import get_redis, get_pubsub_redis
@@ -365,7 +365,8 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
     try:
         pending = r.xpending_range(stream_key, group, min="-", max="+", count=100)
     except Exception as exc:
-        logger.debug("claim_stale_work: xpending error on %r: %s", stream_key, exc)
+        # LGAP: an unreadable PEL means no reaping this tick; that must be visible.
+        logger.warning("claim_stale_work: xpending error on %r: %s", stream_key, exc)
         return
 
     now = time.time()
@@ -1590,7 +1591,7 @@ def adaptive_loop() -> None:
                             "scan_type":   "adaptive",
                             "dc_key":      dc_key,
                             "context":     dispatch_context,
-                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "enqueued_at": datetime.now(timezone.utc).isoformat(),   # LOGTZ: tz-aware like the other producers
                             "request_id":  f"adp-{int(now)}-{uuid.uuid4().hex[:8]}",
                         },
                     )
@@ -1746,7 +1747,7 @@ def fullscan_loop() -> None:
                             "scan_type":   "fullscan",
                             "dc_key":      dc_key,
                             "context":     "normal",
-                            "enqueued_at": datetime.utcnow().isoformat(),
+                            "enqueued_at": datetime.now(timezone.utc).isoformat(),   # LOGTZ: tz-aware like the other producers
                             "request_id":  f"full-{int(now)}-{uuid.uuid4().hex[:8]}",
                         },
                     )
