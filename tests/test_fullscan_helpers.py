@@ -62,7 +62,7 @@ Coverage map
 
   TestFullscanConstants
     · FULLSCAN_CHUNK_SIZE = 50
-    · FULLSCAN_BLOOM_CAPACITY = 10_000
+    · (bloom capacity = fetched job count, not a constant)
     · FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900
 """
 

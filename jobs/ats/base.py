@@ -172,8 +172,14 @@ def fetch_json_post(url, body=None, retries=2,
                     _record(platform, 429, elapsed_ms, backoff_s=backoff_s)
                     _check_rate_limit_alert(platform)
                 if attempt < retries:
+                    # FJP: POST failures were silent; mirror fetch_json.
+                    logger.warning(
+                        "Rate limited on %s (POST) — waiting %ds",
+                        platform or url, backoff_s
+                    )
                     time.sleep(backoff_s)
                     continue
+                logger.debug("fetch_json_post: 429 on %s, retries exhausted", url)
                 return None
 
             if platform and track:
@@ -186,10 +192,12 @@ def fetch_json_post(url, body=None, retries=2,
                 if attempt < retries:
                     time.sleep(backoff_s)
                     continue
+                logger.debug("fetch_json_post: HTTP %d on %s, retries exhausted", status_code, url)
                 return None
 
             if status_code != 200:
                 # Non-retryable 4xx error
+                logger.debug("fetch_json_post: HTTP %d on %s", status_code, url)
                 return None
 
             return resp.json()
@@ -201,13 +209,16 @@ def fetch_json_post(url, body=None, retries=2,
             if attempt < retries:
                 time.sleep(2 ** attempt)
                 continue
+            logger.debug("fetch_json_post: timeout on %s, retries exhausted", url)
             return None
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.ConnectionError as e:
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_conn_err")
+            logger.debug("fetch_json_post: connection error on %s: %s", url, e)
             return None
-        except Exception:
+        except Exception as e:
+            logger.debug("fetch_json_post: %s on %s: %s", type(e).__name__, url, e)
             return None
 
     return None
