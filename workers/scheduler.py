@@ -843,6 +843,9 @@ def on_adaptive_complete(company: str, new_jobs: int,
                 recent_poll_counts      = %s,
                 adaptive_score          = %s,
                 current_interval_s      = %s,
+                -- LPF (by design): last_poll_at is the last ATTEMPT, stamped on failure
+                -- too.  Rule 4 (fullscan) relies on this: a failing adaptive scan must
+                -- not defer the fullscan forever.  Success time is last_success_at.
                 last_poll_at            = CURRENT_TIMESTAMP,
                 next_poll_at            = %s,
                 consecutive_errors      = %s,

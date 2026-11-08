@@ -1131,7 +1131,7 @@ def init_db():
             ats_platform          TEXT,
             current_interval_s    INTEGER DEFAULT 86400,
             next_poll_at          TIMESTAMP,
-            last_poll_at          TIMESTAMP,
+            last_poll_at          TIMESTAMP,  -- last adaptive ATTEMPT (set on failure too, by design: LPF); success = last_success_at
             adaptive_score        REAL DEFAULT 0.0,
             consecutive_empty     INTEGER DEFAULT 0,
             total_polls           BIGINT DEFAULT 0,
