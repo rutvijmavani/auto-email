@@ -197,9 +197,10 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, 
         if not data:
             if rep is not None:
                 rep["failed"] = True
-            if offset or total:
-                logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
-                               "— partial result", offset, total, company, applied)
+            # S0: log page 1 too — a failed first page is "0 fetched", not an empty board.
+            logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
+                           "— %s", offset, total, company, applied,
+                           "partial result" if (offset or total) else "no data")
             break
         jobs = data.get("jobPostings", [])
         if total is None:
@@ -521,6 +522,9 @@ def _normalize(job, company, domain, path, slug_info=None):
                 from datetime import timedelta
                 posted_at = datetime.utcnow() - timedelta(days=1)
             elif "30+" in posted:
+                # W30: "Posted 30+ Days Ago" is only a lower bound.  The listing gives no
+                # real date, so 30 days is the floor (oldest value the freshness filter can
+                # act on), not the true age; ordering among such jobs is unknown.
                 from datetime import timedelta
                 posted_at = datetime.utcnow() - timedelta(days=30)
             elif "day" in posted_lower:

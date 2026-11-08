@@ -104,6 +104,8 @@ from config import (
     STREAM_CONSUMER_GROUP,
     WATCHDOG_HEAL_COOLDOWN_S,
     WATCHDOG_HEAL_BLOCK_S,
+    WATCHDOG_HEAL_MAX_ATTEMPTS,
+    WATCHDOG_HEAL_ATTEMPT_WINDOW_S,
     EMAIL,
     APP_PASSWORD,
 )
@@ -156,8 +158,8 @@ _UNIT_DETAIL_DRAINER  = "recruiter-detail-drainer"
 
 WATCHDOG_INTERVAL_S   = 300     # 5 min between checks
 ALERT_COOLDOWN_S      = 3600    # 1 h — don't repeat same alert type within this
-HEAL_MAX_ATTEMPTS     = 3       # max auto-restarts before escalation
-HEAL_ATTEMPT_WINDOW   = 1800    # 30 min — attempt counter TTL
+HEAL_MAX_ATTEMPTS     = WATCHDOG_HEAL_MAX_ATTEMPTS        # max auto-restarts before escalation
+HEAL_ATTEMPT_WINDOW   = WATCHDOG_HEAL_ATTEMPT_WINDOW_S    # attempt counter TTL
 HEAL_COOLDOWN_S       = WATCHDOG_HEAL_COOLDOWN_S   # min gap between two restarts of one target
 ESCALATION_COOLDOWN   = WATCHDOG_HEAL_BLOCK_S      # restarts of a target stay off this long after the budget is spent
 RESOLVE_COOLDOWN_S    = 7200    # 2 h — min gap between "RESOLVED" emails

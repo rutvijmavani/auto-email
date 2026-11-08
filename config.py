@@ -213,8 +213,8 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 # MAX_WORKERS just controls how many companies are in-flight at once.
 # 20 is fine here because the per-platform semaphores prevent any single
 # ATS from being hammered even when all 20 slots are busy.
-MONITOR_MAX_WORKERS = 20
- 
+MONITOR_MAX_WORKERS = int(os.getenv("MONITOR_MAX_WORKERS", "20"))
+
 # Max concurrent requests per ATS platform.
 # Platforms sharing one API domain (Greenhouse, SmartRecruiters)
 # are throttled more aggressively than per-subdomain platforms (Workday).
@@ -998,6 +998,12 @@ PROGRESS_COLD_GAP_S     = int(os.getenv("PROGRESS_COLD_GAP_S", "600"))
 # their own cooldown).
 WATCHDOG_HEAL_COOLDOWN_S = int(os.getenv("WATCHDOG_HEAL_COOLDOWN_S", "600"))
 WATCHDOG_HEAL_BLOCK_S    = int(os.getenv("WATCHDOG_HEAL_BLOCK_S", "7200"))
+# Restart budget per target and the TTL of its attempt counter.
+WATCHDOG_HEAL_MAX_ATTEMPTS = int(os.getenv("WATCHDOG_HEAL_MAX_ATTEMPTS", "3"))
+WATCHDOG_HEAL_ATTEMPT_WINDOW_S = int(os.getenv("WATCHDOG_HEAL_ATTEMPT_WINDOW_S", "1800"))
+# Jobs processed between pause / shutdown checks in a fullscan (the board is
+# fetched in one call, so this is the only point where a maintenance pause is honoured).
+FULLSCAN_CHUNK_SIZE = int(os.getenv("FULLSCAN_CHUNK_SIZE", "50"))
 REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
 REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
 # A pool worker that is alive but has published no heartbeat within

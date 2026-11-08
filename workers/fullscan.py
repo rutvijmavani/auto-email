@@ -125,6 +125,7 @@ from config import (
     SCHEDULER_HEARTBEAT_TTL,
     FULLSCAN_BLOOM_TTL,
     FULLSCAN_BLOOM_ERROR_RATE,
+    FULLSCAN_CHUNK_SIZE,
     REDIS_ADAPTIVE_SEEN_PREFIX,
     # Stream-based delivery (two-layer scheduler redesign)
     REDIS_STREAM_FULLSCAN,
@@ -171,9 +172,8 @@ _EMA_ALPHA = 0.3
 # Matches db/schema.py DEFAULT 1800.0 — overwritten after first real scan.
 _AVG_DURATION_SEED = 1800.0
 
-# How many jobs to process between pause / shutdown checks (the board is fetched in one call, so this
-# is the only point at which a maintenance pause can be honoured).
-FULLSCAN_CHUNK_SIZE = 50
+# FULLSCAN_CHUNK_SIZE (jobs processed between pause / shutdown checks) lives in
+# config.py (env FULLSCAN_CHUNK_SIZE, default 50).
 
 # Seconds to wait between pause-polling loops
 FULLSCAN_PAUSE_POLL_SECS = 10
