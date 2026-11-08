@@ -350,19 +350,25 @@ def fetch_job_detail(job):
 
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
-        logger.debug(
+        logger.warning(
             "workday.fetch_job_detail: API returned None/empty for %r | %s | url=%s",
             job.get("company"), job.get("job_id"), url,
         )
+        # DF: request failed (non-JSON 200, throttle, etc.) — tell detail_worker
+        # this is a retryable empty, not "nothing to enrich".
+        job = dict(job)
+        job["_detail_failed"] = True
         return job
 
     info = data.get("jobPostingInfo", {})
     if not info:
-        logger.debug(
+        logger.warning(
             "workday.fetch_job_detail: jobPostingInfo absent/empty for %r | %s "
             "| top-level keys=%s",
             job.get("company"), job.get("job_id"), list(data.keys()),
         )
+        job = dict(job)
+        job["_detail_failed"] = True
         return job
 
     job = dict(job)

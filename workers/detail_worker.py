@@ -732,6 +732,35 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     result["fetch_ms"] = int((time.monotonic() - _fetch_t0) * 1000)
                     set_request_context("normal")   # always reset
 
+            # ── DF: retry a failed (empty) fetch before filtering on thin data ─
+            # Platforms set job["_detail_failed"] when the request itself failed
+            # (Workday: non-JSON/empty response).  Retry through the normal
+            # bounded retry path while budget remains; on the last attempt fall
+            # through to today's behaviour (filter on listing data) so a
+            # permanently empty job is never lost by retrying alone.
+            if job.pop("_detail_failed", False):
+                _df_key = (
+                    f"{_RETRY_KEY_PREFIX}{company}|{job_id}" if company
+                    else f"{_RETRY_KEY_PREFIX}{job_id}"
+                )
+                try:
+                    _df_used = int(r.get(_df_key) or 0)
+                except Exception:
+                    _df_used = _MAX_DETAIL_RETRIES   # unknown budget: do not retry
+                if _df_used < _MAX_DETAIL_RETRIES:
+                    logger.info(
+                        "detail_worker: empty fetch, retrying platform=%s "
+                        "company=%r job_id=%s (attempt %d/%d)",
+                        platform, company, job_id, _df_used + 1,
+                        _MAX_DETAIL_RETRIES,
+                    )
+                    result["duration_ms"] = int(
+                        (time.monotonic() - start_mono) * 1000
+                    )
+                    result["outcome"] = "error"
+                    result["retryable"] = True
+                    return result
+
             # ── Post-fetch enrichment audit ───────────────────────────────────
             # If none of the key fields changed, fetch_job_detail silently
             # returned the original job without making an HTTP request (guard
