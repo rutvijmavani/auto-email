@@ -15,8 +15,8 @@ The current system uses five absolute depth thresholds spread across two files w
 | `DETAIL_QUEUE_WARN` | 100 | `watchdog.py` (hardcoded) | Warn level |
 | `DETAIL_QUEUE_ALERT` | 500 | `watchdog.py` (hardcoded) | CRITICAL trigger → restart scheduler |
 | `DETAIL_QUEUE_HIGH_WATERMARK` | 1000 | `config.py` → `scheduler.py` | Layer 3 add-worker trigger |
-| `DETAIL_QUEUE_MAX_FULLSCAN` | 2000 | `config.py` → `fullscan.py` | Fullscan backpressure (actually pauses) |
-| `DETAIL_QUEUE_MAX_ADAPTIVE` | 5000 | `config.py` → `scan_worker.py` | Adaptive backpressure (LOGS ONLY — does not pause) |
+| `DETAIL_QUEUE_MAX_FULLSCAN` | 2000 | REMOVED 2026-11-02 (TH step 9) | Was fullscan backpressure; replaced by held-job drainer |
+| `DETAIL_QUEUE_MAX_ADAPTIVE` | 5000 | REMOVED 2026-11-02 (TH step 9) | Was adaptive log-only backpressure; replaced by held-job drainer |
 
 **Why this fails:**
 
@@ -142,7 +142,7 @@ flags. A proper fix (P90 of company delays instead of max) is left for a future 
 - Fullscan: **7200s (2h)** — fullscan interval is 24h. Being 2h late = 8% of interval. 300s was 0.3% and meaningless.
 
 **Key capacity insight (2026-07-20):**
-With real est_fetch_s values (P75), 2 scan workers can serve ~3 scans/min vs 0.32 scans/min needed (155 companies ÷ 8h avg interval). The current 10 scan workers are the startup default from `calculate_worker_counts()` — the manager's scale-down logic will right-size to 2–3 workers once deployed.
+With real est_fetch_s values (P75), 2 scan workers can serve ~3 scans/min vs 0.32 scans/min needed (155 companies ÷ 8h avg interval). The 10 scan workers in this example were the old startup default from `calculate_worker_counts()` (deleted 2026-10-29; pools now start at `WORKER_FLOOR`).
 
 ### 4.2 — What every worker publishes each cycle
 
@@ -168,17 +168,29 @@ pool_capacity_ms  = n_workers * cycle_s * 1000
 pool_utilization  = pool_busy_ms / pool_capacity_ms       # 0.0 – 1.0
 
 # ── Drain rate ─────────────────────────────────────────────────────────────
-time_left         = DELAY_WARN_S - actual_delay_s          # seconds left before WARN
-drain_rate        = queue_depth / max(time_left, 1)        # jobs/s to clear queue in time
+# Fixed horizon W = DELAY_WARN_S (changed 2026-10-29, bug FB): the old time_left =
+# WARN - delay made the target explode as delay neared WARN and fed that raw value
+# into the daily peak.  Lateness is the urgent branch's job (delay >= WARN x 0.75),
+# so there is no delay/WARN multiplier either (it counted the same backlog twice).
+drain_rate        = queue_depth / DELAY_WARN_S + arrival_rate   # jobs/s to clear queue within W
 
 workers_target    = math.ceil(drain_rate * est_fetch_s)
-# NOTE: amplification below is vestigial since urgent fires at WARN×0.75.
-# When delay > WARN, time_left=1 already drives drain_rate to queue_depth and
-# workers_target to a huge number that clamps to ceil regardless of the multiplier.
-# Kept for safety in edge cases where time_left somehow stays > 1 past WARN.
-if actual_delay_s > DELAY_WARN_S:                          # already past WARN → amplify
-    workers_target = math.ceil(workers_target * (actual_delay_s / DELAY_WARN_S))
 workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
+
+# >>> SCAN AND FULLSCAN (changed 2026-10-29): the block above is the DETAIL formula only.
+# Scan and fullscan replace the drain-rate lines above with work-seconds from per-company data:
+#   needed  = ceil( backlog + steady )
+#   backlog = sum over late companies c of min( d_c / H , 1 )     # H = pool delay_warn_s (fixed, not time_left)
+#   steady  = ( sum over ALL companies c of d_c / (d_c + T_c) ) / MANAGER_SCALE_UP_UTIL
+# d_c = DB EMA (avg_scan_duration_s / avg_fullscan_duration_s); T_c = current_interval_s (scan) or
+# full_scan_interval_s (fullscan); next run = completion + interval, so steady load is d/(d+T).
+# A late company with no entry uses fetch_p75; unknown is never 0. The delay multiplier, clamp,
+# urgent / scale-up / scale-down gates, _needed_workers pre-clamp record and Layer 1/2 are unchanged.
+# Data: workers/company_load.py (Redis hash per pool, updated by Lua after each scan, rebuilt nightly in
+# _midnight_recompute with RENAME + ~25 h TTL, rebuilt from the DB when missing). Late names come from
+# manager._get_scan_pool_metrics (overdue ZSET members + undelivered stream entries, no cap).
+# If the late list or table is unreadable the pool keeps its last work-based need (_last_work_need).
+# Full text: docs/scan-fullscan-sizing-plan.md.
 
 # ── Urgent (1 cycle) — fires on either condition, only when understaffed ───
 # Demand trigger requires BOTH: approaching ceiling AND exceeding historical norm.
@@ -201,8 +213,7 @@ if needs_urgent_spawn:
         worker_ceil = new_ceil                  # correct stale ceiling immediately
     # Step 2: spawn exactly what the formula says (not always the ceiling)
     spawn_to(min(workers_target, worker_ceil))
-    # Step 3: throttle dispatch to 75% of new capacity while workers come online
-    set_dispatch_throttle(pool, 0.75)
+    # Step 3: no dispatch throttle (decided: not built)
     scale_up_cycles = 0                         # prevent stale count from triggering add_one
     urgent_active[pool] = True
 
@@ -249,7 +260,7 @@ utilization       < 50%                 > 80%                 —
 delay             < WARN × 0.25         > WARN × 0.5          >= WARN × 0.75
 target            ≤ current − 1         > current             >= ceil×0.75 AND > peak_Nd
 spawn             remove 1              add 1                 min(workers_target, ceil)
-dispatch          normal                normal                throttle to 75% capacity
+dispatch          normal                normal                normal (no throttle)
 cycles            5                     2                     1 (immediate)
 release           —                     —                     recalc confirms count
                                                               (1 cycle after spawn)
@@ -852,7 +863,7 @@ Manager owns detail worker restarts. Scan and fullscan restarts stay in watchdog
 ### What moves to the manager
 
 Current responsibilities that belong to the manager:
-- Layer 3 slow throughput check (currently in `scheduler.py _slow_throughput_check_loop`) — **eliminated as a 30-min loop; replaced by manager's 30–60s cycle**
+- Layer 3 slow throughput check (was `scheduler.py _slow_throughput_check_loop`) — **DELETED 2026-10-29 (it was never started); replaced by manager's 30–60s cycle. Its Redis-memory (CRITICAL at `REDIS_MEMORY_ALERT_PCT`) and detail:adaptive queue-depth (WARNING after `DETAIL_QUEUE_ALERT_CYCLES` checks above `DETAIL_QUEUE_HIGH_WATERMARK`) alerts now run in `manager._check_health_alerts`, throttled by `WORKER_SLOW_CHECK_INTERVAL_S`. `_remaining_work_minimum` (dynamic floor, only caller was that loop) deleted too.**
 - Detail queue CRITICAL/WARN detection (currently in `watchdog.py`)
 - Worker add/remove decisions for both scan and detail pools
 
@@ -1254,6 +1265,8 @@ Layer 1 sets these ceilings at midnight and hands them to Layer 0 as `worker_cei
 
 #### When ceiling blocks the ideal target — structural borrowing
 
+> **Superseded units (2026-10-29):** the examples in this Phase 4 section and in the Layer 2 examples below use the old numbers (`DB_POOL_MAXCONN=25`, 3 reserved, `PROBE=60`). The implementation counts worker seats (`WORKER_SEAT_BUDGET`, no reserved subtraction) and takes the ceiling live from Postgres — see "Capacity overflow".
+
 Ceilings are soft per-pool fractions of `DB_POOL_MAXCONN`, not hard walls. If one pool's ceiling is not fully used, those slots are available to any other pool that needs more than its own ceiling allows. Phase 4 runs once daily as part of Layer 1 recompute, immediately after Step 5, to set the final `worker_ceil` values:
 
 ```
@@ -1389,7 +1402,7 @@ The only genuinely useful demand-reduction lever. Halting inflow gives existing 
 
 **Slow dispatch and interval multipliers are NOT used.** They only affect future scheduling — companies already sitting overdue in the ZSET are completely unaffected. They defer the problem, not fix it.
 
-*Detail:*
+*Detail:* **SUPERSEDED 2026-11-02 (TH steps 8-9, see `docs/detail-pool-ceiling-th-design.md`).** Detail has no Lever 1 or reintro. Producers are save-only (`pushed_at IS NULL` = held); `workers/detail_drainer.py` releases held rows at the ceiling rate via a token bucket. When the capacity chain is exhausted for detail the manager logs `ALERT manager [detail]: capacity chain exhausted`. Scan and fullscan keep Lever 1. The block below is the old design, kept for history.
 ```
 Both scan_worker AND fullscan_worker pause before pushing to detail queues:
   scan_worker  → pauses push to queue:detail:adaptive
@@ -1602,35 +1615,40 @@ not the suppressed inflow after backpressure.
 
 #### Capacity overflow: when required workers exceed total available
 
-Scenario: `true_required_workers(pool) + targets(other pools) > workers derivable from DB_POOL_MAXCONN`.
+Scenario: `true_required_workers(pool) + targets(other pools) > worker seats the manager holds`.
 
-**Manager has two limits, not one:**
+**The budget is counted in worker seats; the hard limit is Postgres connections.** A worker process opens `DB_POOL_MINCONN` (2) connections as soon as it touches the DB, so one seat costs ~2 connections, and manager, watchdog, h1b_llm and streamlit hold 2 each outside the workers. The manager reads all of this live each cycle (`workers/db_capacity.py`, no remembered numbers):
 
 ```
-DB_POOL_MAXCONN        = 25     ← current operating limit (what workers use now)
-DB_POOL_MAXCONN_PROBE  = 60     ← server's confirmed safe ceiling (set by operator once)
+cap        = max_connections − superuser_reserved_connections − DB_CAPACITY_MARGIN   (SHOW, live)
+non_worker = connections held by processes that are not live workers
+per_worker = most connections any live worker process holds right now
+seat cap   = (cap − non_worker) // per_worker
 
-Manager can autonomously raise DB_POOL_MAXCONN up to PROBE ceiling.
-Above PROBE → alert only, operator action required.
+WORKER_SEAT_BUDGET (22) = seats the manager starts with
+DB_POOL_RAISE_STEP (5)  = raise step, in CONNECTIONS → max(1, 5 // per_worker) seats (2 today)
+DB_POOL_PROCESS_MAXCONN = per-process pool cap (db/connection.py), unrelated to the budget
 ```
 
-Raising `DB_POOL_MAXCONN` is not free — it opens more connections to Postgres. Raising blindly past the server's `max_connections` kills the database for everything (API, workers, all of it). `DB_POOL_MAXCONN_PROBE` is the operator-confirmed ceiling beyond which no autonomous action is taken.
+Each process labels its connections `application_name = "pid<PID>"` (db/connection.py), so `pg_stat_activity` attributes every connection to its process; live worker PIDs come from the `worker:alive:*` heartbeats. If Postgres cannot be queried, the manager stops raising and logs an error rather than guess.
+
+Measured 2026-10-19..21 (48 h sampler, `~/diag/conn_census.log`): peak 39 of 100 connections, 34 from the app; ss attribution on 2026-10-29: every pool-holding process held exactly 2.
 
 **Overflow resolution steps:**
 
 ```
-Step 1: Is DB_POOL_MAXCONN < DB_POOL_MAXCONN_PROBE?
-        YES → raise DB_POOL_MAXCONN in increments of 5
+Step 1: Are worker seats < the live Postgres seat cap?
+        YES → raise the seats by the raise step (DB_POOL_RAISE_STEP connections)
               recompute ceilings, re-check if requirement is now met
-              repeat until met or PROBE ceiling reached
+              repeat until met or the seat cap is reached
         NO  → requirement cannot be met autonomously
               → alert: "need X workers total, server ceiling is Y"
               → operator decides: upgrade server, add read replica, or accept shortage
 
-Step 2: If at PROBE ceiling and still short (not all pools can be satisfied):
+Step 2: If at the seat cap and still short (not all pools can be satisfied):
         Allocate in priority order — higher-priority pool gets its full requirement first:
 
-        available = DB_POOL_MAXCONN_PROBE − 3    (reserve 3 for watchdog/scheduler/API)
+        available = seat cap                      (non-worker connections are already subtracted in it)
 
         detail_allocation  = min(true_required(detail),  detail_ceil_at_probe)
         scan_allocation    = min(true_required(scan),    min(scan_ceil_at_probe,   available − detail_allocation))
@@ -1663,6 +1681,32 @@ buffer)                         each move       if the deadlock resolved. Stop t
                                                 many workers from scan to fix fullscan
                                                 could deadlock scan next cycle.
 ```
+
+**As implemented (workers/manager.py `_attempt_borrow`).** Borrowing moves *ceiling seats* (`manager:borrow:{src}:{tgt}`, no TTL), not targets; the manager is the sole ceiling owner and the scheduler applies `_get_worker_ceil` without its own clamp. Per cycle, once a pool sits at its ceiling with delay above warn and rising (3 of 4 cycles), the first step that yields capacity wins:
+
+```
+1. Layer 0 grows to the pool's ceiling
+2. Emergency recalc of the pool's own ceiling (today's peak included)
+3. Raise the worker budget by DB_POOL_RAISE_STEP toward the live Postgres seat cap
+4. Reclaim the pool's own lent seats (_reclaim_lent_seats)
+5. Lendable workers (above target)                       ALL AT ONCE
+6. Buffer seats  (ceiling − peak_Nd)                     ALL AT ONCE
+7. Peak-headroom seats (peak_Nd − target)                ONE PER CYCLE, check each cycle
+8. Lever 1 — last resort, only when 2-7 yield nothing
+```
+
+Source order is fullscan, then scan, then detail. Lifting Lever 1 does not return seats; `_maybe_return_borrows` returns a borrow when both pools involved stay below warn × 0.25 for 3 consecutive cycles. The nightly recompute runs at `MANAGER_RECOMPUTE_HOUR` (23:00 America/New_York), guarded by the Redis key `manager:last_recompute_date`.
+
+**Stage B inputs (as implemented).**
+
+- Target workers (detail, and the fallback for a pool with no work estimate yet) = `ceil((depth / W + λ) × s)` with a fixed horizon `W = delay_warn_s`; there is no delay / warn multiplier (lateness is the urgent branch's job, and a multiplier would count the same backlog twice). Scan and fullscan are sized from per-company work instead: `ceil(backlog + steady)` (`_scan_pool_work`, see `docs/scan-fullscan-sizing-plan.md`). λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over the last `SERVICE_TIME_WINDOW_CYCLES` (5) valid cycles (`_get_pool_service_time`; a cycle with no finished job is skipped and its busy seconds carry into the next valid one; window and carry live in Redis `manager:svc_window:<pool>`); `fetch_p75` is only the fallback while `s` is unknown.
+- The needed worker count is recorded **before** the ceiling clamp (`_needed_workers`), capped at what the DB budget can host, and that is what feeds the running daily peak — a surge is recorded at its real size, not at the ceiling.
+- The `manager:snapshot:{pool}:D/R` keys are gone: Lever 1 no longer writes a snapshot and the learning loop no longer reads one; the needed count is computed live.
+- Lever 1 fires only when the chain is exhausted **and** λ × s > n (or λ / s unknown). If λ × s ≤ n the backlog is draining and an INFO line says so. The lift stays delay-based, because under Lever 1 the arrival counters measure post-halt inflow (≈ 0), so a "λ × s < n" lift would release it immediately.
+- One INFO line per pool per cycle: n, needed, target, ceiling, depth, delay, λ, s, decision.
+- Detail jobs log `fetch_ms` (time inside `fetch_job_detail`) and `db_ms` (sum of the job's DB calls) next to the total, so the heartbeat service time can be split into network and database.
+- Handoff: when a borrow is due back (both pools calm for 3 cycles) but a third pool's delay is above its warn, `_maybe_return_borrows` re-points the seats to that pool (`manager:borrow:{src}:{heir}`) instead of returning them; they return once the heir is calm too. Seats are conserved, so the lender and the budget are unaffected.
+- `DB_POOL_PROCESS_MAXCONN` / `DB_POOL_MINCONN` (config.py, env-overridable) build every process's pool in `db/connection.py`; the hardcoded 25 / 2 are gone. The manager's budget is separate: `WORKER_SEAT_BUDGET` in seats, ceiling read live from Postgres (see Capacity overflow).
 
 **Detail's buffer is protected by default.** Never take from detail's unused capacity for scan or fullscan unless detail's inflow is already halted (backpressure active). Detail inflow halted = detail queue won't grow while you borrow from it.
 
@@ -2293,11 +2337,11 @@ Self-adjusting: as actual_delay rises, time_left shrinks → backpressure_depth 
 
 See Section 5 for the updated manager stall-confirmation block.
 
-**5. `calculate_worker_counts()` at startup (resolved — 2026-07-21)**
+**5. Startup worker count (resolved — 2026-10-29, reverses the 2026-07-21 decision)**
 
-Keep `calculate_worker_counts()` as the startup seed; manager takes over from cycle 1 onward.
+`calculate_worker_counts()` is deleted. The scheduler starts every pool at `WORKER_FLOOR` and the manager owns all later sizing (the scheduler only executes spawns).
 
-Rationale: cold-starting at `WORKER_FLOOR=2` under an existing backlog causes a 2+ minute gap before the manager scales up to the correct level. The existing function uses 30-day `api_health` history and produces a good initial estimate at zero extra complexity. Manager cycle 1 immediately re-evaluates and adjusts from there.
+Rationale: the manager is the only owner of worker counts. The 2026-07-21 concern (a gap at the floor under an existing backlog) is covered by the urgent step, which spawns straight to the target in one cycle when delay >= 0.75*warn or the demand trigger holds. A mildly behind pool takes the slower scale-up (+1 per 2 cycles); not measured on the VM.
 
 **6. Deploy order (resolved — 2026-07-21)**
 
@@ -2305,6 +2349,14 @@ Two independent phases — no cross-dependency:
 
 - **Phase 1 (now):** Accenture fix (`detail_payload` + `_REBUILD_SKIP_PLATFORMS`) + `avg_scan_duration_s` migration — both blocked on a single `init_db()` run. Deploy together.
 - **Phase 2 (after implementation):** Full manager. No Phase 1 dependency; can go out on any deploy after manager is built and tested.
+
+> **STATUS (2026-11-06): the whole `ats_get` / per-platform concurrency chain described in
+> this section, Q9-Q13 and the Q13 probing design is PARKED, not live.** `ats_get()` has no
+> production caller and the scrapers do not call it (they use `jobs/ats/base.py`
+> `fetch_json*`/`fetch_html`, plus eight modules calling `requests` directly). The statement
+> below that the scraper library calls `ats_get()` was never true. Evidence, the build
+> trigger (`_check_rate_limit_trend`) and the open design points are in
+> `docs/adaptive-polling-architecture.md` section 19.
 
 **7. `CeilingExceeded` in `ats_get()` (resolved — 2026-07-21)**
 
@@ -2741,8 +2793,8 @@ When `workers/manager.py` is introduced, these are the ONLY changes needed in `s
 | `CONCURRENCY_ERROR_RATE_REDUCE` | http_client.py + scheduler.py | Split: http_client keeps it; scheduler's use moves to manager |
 | `WORKER_SCALING_LOCK_TTL` | scheduler.py | Delete — lock concept replaced by manager state |
 | `WORKER_OUTAGE_TTL_S` | scheduler.py | Move to manager.py (manager declares outage) |
-| `DB_POOL_MAXCONN` | connection.py + scheduler.py | Stays in connection.py; manager reads it via import |
-| `DB_POOL_MAXCONN_PROBE` | *(not yet in config)* | Add to config.py — operator-set ceiling for autonomous raise |
+| `DB_POOL_PROCESS_MAXCONN` | connection.py | Per-process pool cap only |
+| `WORKER_SEAT_BUDGET` | manager.py | Worker seats at start; raised toward the live Postgres seat cap |
 | `WORKER_FAST_CHECK_INTERVAL_S` | scheduler.py | Delete |
 | `RECOVERY_STABILITY_RATIO` | *(not yet in config)* | Add to config.py: `0.25` |
 | All constants for delay/backpressure | *(not yet in config)* | Add to config.py as part of manager implementation |
@@ -2836,7 +2888,7 @@ Remove the gate and the old function together after manager has been running for
    the race conditions in §16.7 items 1 and 2.
 
 6. **Delete old loops from scheduler.py** — `_fast_error_check_loop`, `_slow_throughput_check_loop`,
-   `calculate_worker_counts`. Gate the last one with the Redis exists check first.
+   `calculate_worker_counts` (done 2026-10-29: pools start at `WORKER_FLOOR`, no gate).
 
 7. **Add Layer 1 (midnight recompute + Phase 4)** — once Layer 0 has accumulated 7 days of
    `daily_peak:running` data.

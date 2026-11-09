@@ -325,15 +325,22 @@ Oracle wraps jobs in `items[0].requisitionList`. The `hasMore` field is always `
 
 ## 4. Smart Early Exit — Which Platforms Support It
 
-Smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+> **SUPERSEDED.** The overlap-ratio algorithm and the per-platform "applicable" column below are the
+> original design and are no longer what runs. The adaptive scan now uses the `EarlyExitGate`
+> (`workers/paginator.py`, see Section 11 of `docs/adaptive-polling-architecture.md`) on every paging
+> feeder, including Workday, Taleo and iCIMS: a page counts as seen only when ALL its job IDs are in the
+> old bloom or `adaptive_seen`, and the fetch stops after two consecutive fully-seen pages
+> (`PAGINATOR_CONFIRM_PAGES`). The "Sorted newest-first?" column is kept as background only.
 
-| Platform | Sorted newest-first? | Smart exit applicable? |
+Original design: smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+
+| Platform | Sorted newest-first? | Original design: smart exit applicable? (now: gate runs on all paging feeders) |
 |----------|---------------------|----------------------|
 | Greenhouse | ✓ Default | ✓ Yes |
 | Lever | ✓ Default | ✓ Yes |
 | Ashby | ✓ Default | ✓ Yes |
 | SmartRecruiters | ✓ Default | ✓ Yes |
-| Eightfold | ✓ Default (`sort=date`) | ✓ Yes |
+| Eightfold | ✓ Server default newest-first (no `sort_by`; `sort_by=distance` shuffles) | ✓ Yes |
 | Oracle HCM | ✓ (`sortBy=POSTING_DATES_DESC` in URL) | ✓ Yes |
 | Workday | ✗ Unreliable | ✗ No |
 | iCIMS | ✗ No guaranteed order | ✗ No |
@@ -578,7 +585,10 @@ for job in jobs:
 
 ### Per-company overrides
 
-The `company_config` table can override any of these settings for a specific company. For example:
+> **NOT IMPLEMENTED (checked 2026-11-07):** the `company_config` table is created in `db/schema.py` but no
+> code reads it, so rows have no effect today. The examples below describe the intended design only.
+
+The `company_config` table is intended to override any of these settings for a specific company. For example:
 
 ```sql
 -- Force Workday for a specific tenant that sorts by recency (atypical)
@@ -590,4 +600,4 @@ INSERT INTO company_config (company, max_interval)
 VALUES ('Dream Company Inc', 900);
 ```
 
-Override lookup order: `company_config` → `ATS_TIER1_CONFIG` → defaults.
+Intended override lookup order (not wired): `company_config` → `ATS_TIER1_CONFIG` → defaults.
