@@ -195,9 +195,13 @@ jobs:
             # idle ms, delivery count — so only every 4th line (NR%4==1) is an id.
             # Loop in batches of 100 until the PEL is empty; stop on an XACK error so a
             # failing XACK can never loop forever.
+            # Only well-formed stream ids (ms-seq) are passed to XACK, and the loop is
+            # capped so an unexpected output format cannot spin forever.
             _acked_ids=""
-            while :; do
-              _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk 'NR%4==1' | tr '\n' ' ')
+            _xack_rounds=0
+            while [ "$_xack_rounds" -lt 1000 ]; do
+              _xack_rounds=$((_xack_rounds + 1))
+              _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk 'NR%4==1' | grep -E '^[0-9]+-[0-9]+$' | tr '\n' ' ')
               if [ -z "${_pending_ids// /}" ]; then
                 break
               fi

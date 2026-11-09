@@ -1206,7 +1206,7 @@ def _full_data(**overrides):
              "error_rate_pct": 5.0, "avg_response_ms": 320, "days_with_data": 7},
         ],
         "detection_age": {
-            "total_new_jobs": 200,
+            "total_new_jobs": 200, "dated_jobs": 200,
             "within_1hr": 100, "within_4hr": 60,
             "within_24hr": 30, "after_24hr": 10,
             "within_1hr_pct": 50.0, "within_4hr_pct": 30.0,
@@ -1374,6 +1374,18 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
         data = _full_data()
         data["detection_age"] = {
             "total_new_jobs": 0, "within_1hr": 0, "within_4hr": 0,
+            "within_24hr": 0, "after_24hr": 0,
+            "within_1hr_pct": None, "within_4hr_pct": None,
+            "within_24hr_pct": None, "after_24hr_pct": None,
+        }
+        html = self._build(data)
+        self.assertNotIn("Detection Age", html)
+
+    def test_detection_age_not_shown_when_no_dated_jobs(self):
+        """Section hidden when jobs exist but none has a posting time."""
+        data = _full_data()
+        data["detection_age"] = {
+            "total_new_jobs": 40, "dated_jobs": 0, "within_1hr": 0, "within_4hr": 0,
             "within_24hr": 0, "after_24hr": 0,
             "within_1hr_pct": None, "within_4hr_pct": None,
             "within_24hr_pct": None, "after_24hr_pct": None,

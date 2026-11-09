@@ -930,7 +930,7 @@ def _build_adaptive_health_section() -> str:
 
     # ── Detection age distribution ────────────────────────────────────────────
     age = data.get("detection_age", {})
-    if age.get("total_new_jobs", 0) > 0:
+    if age.get("dated_jobs", 0) > 0:   # total can be > 0 with no dated jobs: nothing to show
         sections.append(
             '<p style="font-size:11px;font-weight:600;color:#64748b;'
             'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'

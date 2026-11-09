@@ -151,7 +151,8 @@ def _send_low_credit_email(remaining):
     <p>Use <code>--monitor-status</code> to check current credit usage.</p>
     """
 
-    send_email(subject, body)
+    if not send_email(subject, body):
+        raise RuntimeError("low-credit email was not sent")
     print(f"[ALERT] Serper low credit email sent ({remaining} remaining)")
 
 

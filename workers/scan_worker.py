@@ -106,6 +106,7 @@ from config import (
     STREAM_CONSUMER_GROUP,
     STREAM_BLOCK_MS,
     REDIS_INFLIGHT_PREFIX,
+    REDIS_INFLIGHT_MSG_PREFIX,
 )
 from workers.redis_client import get_redis, ping
 from workers.heartbeat import BusyMeter, Heartbeat
@@ -392,15 +393,14 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
                 raw_jobs = ats_module.fetch_jobs(slug_info, company)
         except CeilingExceeded:
             # Platform at concurrency ceiling — reschedule via poll:adaptive
-            # with a 30s delay. Leave stream message in PEL (no XACK) so
-            # XAUTOCLAIM reclaims it if this worker dies before the ZADD.
-            # result["requeued"] = True triggers the "leave in PEL" path in
-            # the main loop (line 944 check).
+            # with a 30s delay. The message stays in the PEL until the ZADD has
+            # run; result["requeued"] = True then makes the main loop release the
+            # inflight slot and XACK the delivery.
             r.zadd("poll:adaptive", {company: time.time() + 30})
             result["requeued"] = True
             logger.debug(
                 "scan_worker [%s]: CeilingExceeded for %r — "
-                "rescheduled poll:adaptive +30s, leaving in PEL",
+                "rescheduled poll:adaptive +30s",
                 request_id, company,
             )
             return result
@@ -906,8 +906,9 @@ def run_worker(once: bool = False, shutdown_event=None,
             # Guards:
             #   • Empty/missing company → malformed message; skip OAC + XACK
             #     so it stays in PEL for XAUTOCLAIM (prevents DB corruption).
-            #   • shutdown_mid_scan / requeued → work was re-queued elsewhere;
-            #     leave in PEL so the requeued entry is the canonical one.
+            #   • shutdown_mid_scan → leave in PEL for the reaper.
+            #   • requeued (CeilingExceeded) → already back in poll:adaptive;
+            #     release the slot and XACK.
             # Normal path: call OAC then XACK. If OAC raises, leave in PEL
             # (OAC is idempotent — XAUTOCLAIM retry is safe).
             if not company:
@@ -930,7 +931,21 @@ def run_worker(once: bool = False, shutdown_event=None,
                         "leaving in PEL",
                         company, dis_exc, exc_info=True,
                     )
-            elif result.get("error") == "shutdown_mid_scan" or result.get("requeued"):
+            elif result.get("requeued") and result.get("error") != "shutdown_mid_scan":
+                # CeilingExceeded: the company is already back in poll:adaptive (+30s).
+                # Close this delivery: free the inflight slot and stored id, then XACK,
+                # so the reaper does not later reap it and apply a failure backoff.
+                try:
+                    r.zrem(f"{REDIS_INFLIGHT_PREFIX}:{dc_key}", company)
+                    r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")
+                    r.xack(REDIS_STREAM_ADAPTIVE, STREAM_CONSUMER_GROUP, msg_id)
+                except Exception as req_exc:
+                    logger.error(
+                        "scan_worker: could not close delivery for requeued %r: %s — "
+                        "leaving in PEL",
+                        company, req_exc, exc_info=True,
+                    )
+            elif result.get("error") == "shutdown_mid_scan":
                 logger.info(
                     "scan_worker: %r result=%s — skipping OAC, leaving in PEL",
                     company, result.get("error") or "requeued",

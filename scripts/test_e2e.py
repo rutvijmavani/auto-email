@@ -779,34 +779,26 @@ def stage_watchdog():
     # The watchdog now covers:
     #   1. Stream PEL observability via XPENDING (informational; no recovery)
 
-    from workers.watchdog import check_pel_stats
+    from workers.watchdog import _check_pel_health, Issue
     from workers.redis_client import get_redis
-    from config import REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN
 
     r = get_redis()
 
-    # ── Stream PEL stats ───────────────────────────────────────────────────
-    info("Running check_pel_stats()...")
-    pel = check_pel_stats()
+    # ── Stream PEL health (read-only: persist=False writes no alert state) ──
+    info("Running _check_pel_health()...")
+    issues = []
+    _check_pel_health(r, issues, persist=False)
 
-    for stream_key in (REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN):
-        stats = pel.get(stream_key)
-        if stats is None:
-            warn(f"PEL stats missing for {stream_key} (stream may not exist yet)")
-            continue
-        total   = stats.get("total_pending", 0)
-        age_s   = (stats["oldest_age_ms"] // 1000) if stats.get("oldest_age_ms") else 0
-        ok(
-            f"PEL {stream_key}: pending={total} "
-            f"oldest_age={age_s}s "
-            f"consumers={stats.get('consumers', [])}"
-        )
-        if total > 0:
-            warn(
-                f"{stream_key} has {total} pending messages — "
-                "this is normal during active scans; "
-                "claim_stale_work() reclaims them after p95*3 ms idle."
-            )
+    if not issues:
+        warn("PEL health check returned no results")
+    for issue in issues:
+        text = f"{issue.category}: {issue.message}"
+        if issue.level == Issue.OK:
+            ok(text)
+        else:
+            # Pending entries are normal during active scans; the watchdog only
+            # flags owners that are dead or stalled.
+            warn(f"[{issue.level}] {text}")
 
 
 # ===========================================================

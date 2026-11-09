@@ -212,8 +212,9 @@ def fetch_jobs(slug, company, stop_check=None):
             total = page_total
 
         raw_rows += len(reqs)
+        page_rows = _parse_reqs(reqs, slug, company)   # every usable row, incl. repeats
         page_jobs = []
-        for job in _parse_reqs(reqs, slug, company):
+        for job in page_rows:
             if job["job_id"] not in seen_ids:
                 seen_ids.add(job["job_id"])
                 page_jobs.append(job)
@@ -226,7 +227,7 @@ def fetch_jobs(slug, company, stop_check=None):
         if total is not None and offset >= total:
             stop = STOP_ALL_PAGES
             break
-        if stop_check is not None and stop_check(page_jobs):
+        if stop_check is not None and stop_check(page_rows):
             stop = STOP_EARLY_EXIT
             break
 

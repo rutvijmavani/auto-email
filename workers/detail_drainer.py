@@ -268,7 +268,10 @@ def run_drainer() -> None:
             logger.error("drainer: wake failed: %s", exc, exc_info=True)
             wake_s = DRAIN_MIN_WAKE_S
         _heartbeat(r, cycles, wake_s)
-        time.sleep(wake_s)
+        # A long wake (slow pool) must not leave the heartbeat older than the
+        # watchdog's stale threshold: sleep in slices of at most a third of the TTL.
+        # Tokens refill by elapsed time, so extra wakes release nothing early.
+        time.sleep(min(wake_s, DRAIN_HEARTBEAT_TTL_S / 3))
 
 
 if __name__ == "__main__":
