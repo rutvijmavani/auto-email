@@ -12,7 +12,7 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     [this worker]
         → ZPOPMIN poll:fullscan  (score-ascending = most overdue first)
         → Rule 4 pre-check: if last_poll_at < cycle_start → adaptive first
-        → SET fullscan:lock:{company} NX EX 3600     ← exclusive lock
+        → SET fullscan:lock:{company} NX (no TTL)    ← exclusive lease, deleted by the scheduler reaper/sweep_inflight when the owner is gone
         → Resume from checkpoint if full_scan_interrupted=TRUE
         → Page-by-page: Bloom filter → save pending_detail → detail queue
         → On pause: checkpoint + re-queue immediately (score=now-1)

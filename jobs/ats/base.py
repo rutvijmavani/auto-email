@@ -215,7 +215,11 @@ def fetch_json_post(url, body=None, retries=2,
             if platform and track:
                 _record(platform, 0, int(time.time() * 1000) - start_ms,
                         error_type="requests_conn_err")
-            logger.debug("fetch_json_post: connection error on %s: %s", url, e)
+            if attempt < retries:
+                # Same transient-failure handling as the Timeout branch (and fetch_json).
+                time.sleep(2 ** attempt)
+                continue
+            logger.debug("fetch_json_post: connection error on %s, retries exhausted: %s", url, e)
             return None
         except Exception as e:
             logger.debug("fetch_json_post: %s on %s: %s", type(e).__name__, url, e)

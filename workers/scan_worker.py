@@ -309,6 +309,28 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             )
             return result
 
+        # ── 2b. Never-fullscanned company → fullscan ──────────────────────────
+        # A first scan IS a fullscan (old bloom empty, so every listing job goes
+        # through date + title gates and is queued). Adaptive does no bootstrap
+        # of its own: hand the company to the fullscan queue and stop — before
+        # spending a listing fetch whose result would be thrown away.
+        if company_row.get("first_scanned_at") is None:
+            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time()}, nx=True)
+            logger.info(
+                "scan_worker [%s]: %r never fullscanned — routed to fullscan "
+                "(no adaptive fetch)",
+                request_id, company,
+            )
+            result.update({
+                "success":      True,
+                "new_jobs":     0,
+                "duration_ms":  int((time.monotonic() - start_mono) * 1000),
+                "routed_to_fullscan": True,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            })
+            clear_heartbeat(company)
+            return result
+
         # ── 3. Heartbeat ──────────────────────────────────────────────────────
         set_heartbeat(company)
         set_progress(company, "fetching_listing")
@@ -470,27 +492,6 @@ def _run_listing_scan(payload: dict, shutdown_event=None) -> dict:
             _fetch_complete = False
         # Not recorded to scan_health: the completeness verdict comes from fullscan only, and adaptive
         # scans run constantly — their rows would feed nothing.
-
-        # ── 5. Never-fullscanned company → fullscan ───────────────────────────
-        # A first scan IS a fullscan (old bloom empty, so every listing job goes
-        # through date + title gates and is queued). Adaptive does no bootstrap
-        # of its own: hand the company to the fullscan queue and stop.
-        if company_row.get("first_scanned_at") is None:
-            r.zadd(REDIS_POLL_FULLSCAN, {company: time.time()}, nx=True)
-            logger.info(
-                "scan_worker [%s]: %r never fullscanned — routed to fullscan "
-                "(adaptive fetched %d jobs, none processed)",
-                request_id, company, len(valid_jobs),
-            )
-            result.update({
-                "success":      True,
-                "new_jobs":     0,
-                "duration_ms":  int((time.monotonic() - start_mono) * 1000),
-                "routed_to_fullscan": True,
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-            })
-            clear_heartbeat(company)
-            return result
 
         # ── 6. Incremental diff ───────────────────────────────────────────────
         early_exited = _report.stop_reason == STOP_EARLY_EXIT

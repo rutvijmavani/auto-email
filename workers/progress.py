@@ -172,12 +172,14 @@ def _timeout_bound(timeout) -> Optional[float]:
     """Seconds an HTTP call may stay silent, from its own timeout; None = unbounded."""
     if timeout is None:
         return None
+    # The call's own timeout plus the usual allowance, so the report outlives the call by the
+    # same margin a sleep gets (_sleep adds it too) instead of expiring exactly at the timeout.
     if isinstance(timeout, (tuple, list)):
         if any(t is None for t in timeout):
             return None
-        return float(sum(timeout))
+        return float(sum(timeout)) + _allowance()
     try:
-        return float(timeout) * 2      # connect + read, each bounded by the same value
+        return float(timeout) * 2 + _allowance()   # connect + read, each bounded by the same value
     except (TypeError, ValueError):
         return None
 

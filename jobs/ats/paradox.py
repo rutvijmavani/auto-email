@@ -178,11 +178,13 @@ def fetch_jobs(slug_info, company, stop_check=None):
         pages += 1
 
         page_jobs = []
+        gate_jobs = []                     # every usable row of the page, repeats included — what the gate judges
         for row in rows:
             stub = _to_stub(row, host, company)
             if stub is None:
                 unusable += 1
                 continue
+            gate_jobs.append(stub)
             if stub["job_id"] in seen:
                 continue
             seen.add(stub["job_id"])
@@ -194,7 +196,7 @@ def fetch_jobs(slug_info, company, stop_check=None):
         if total is not None and len(seen) + unusable >= total:
             stop = STOP_ALL_PAGES
             break
-        if stop_check is not None and stop_check(page_jobs):
+        if stop_check is not None and stop_check(gate_jobs):
             stop = STOP_EARLY_EXIT
             break
 

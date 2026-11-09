@@ -93,7 +93,8 @@ def fetch_jobs(slug, company, stop_check=None):
         if total is None or offset >= total:
             stop = STOP_ALL_PAGES if total is not None else STOP_SINGLE_RESPONSE
             break
-        if stop_check is not None and stop_check(page_jobs):
+        if stop_check is not None and stop_check(
+                [_normalize(j, company, slug) for j in jobs if j.get("name")]):
             stop = STOP_EARLY_EXIT
             break
 

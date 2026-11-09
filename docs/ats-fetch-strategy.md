@@ -325,9 +325,16 @@ Oracle wraps jobs in `items[0].requisitionList`. The `hasMore` field is always `
 
 ## 4. Smart Early Exit — Which Platforms Support It
 
-Smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+> **SUPERSEDED.** The overlap-ratio algorithm and the per-platform "applicable" column below are the
+> original design and are no longer what runs. The adaptive scan now uses the `EarlyExitGate`
+> (`workers/paginator.py`, see Section 11 of `docs/adaptive-polling-architecture.md`) on every paging
+> feeder, including Workday, Taleo and iCIMS: a page counts as seen only when ALL its job IDs are in the
+> old bloom or `adaptive_seen`, and the fetch stops after two consecutive fully-seen pages
+> (`PAGINATOR_CONFIRM_PAGES`). The "Sorted newest-first?" column is kept as background only.
 
-| Platform | Sorted newest-first? | Smart exit applicable? |
+Original design: smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+
+| Platform | Sorted newest-first? | Original design: smart exit applicable? (now: gate runs on all paging feeders) |
 |----------|---------------------|----------------------|
 | Greenhouse | ✓ Default | ✓ Yes |
 | Lever | ✓ Default | ✓ Yes |

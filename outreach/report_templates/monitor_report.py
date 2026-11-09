@@ -780,8 +780,8 @@ def _build_adaptive_health_section() -> str:
         • API error rates             — normal-context only (backoff/canary excluded)
         • Detection age distribution  — portfolio-wide ≤1h / ≤4h / ≤24h / >24h share
         • Wasted poll rate            — polls returning no new jobs per platform
-        • Score stability             — stddev of daily poll score (14-day window)
-        • Worker scaling events       — add/remove/outage/canary summary
+        • Score stability             — average per-company stddev of daily score (14-day window)
+        • Worker scaling events       — add/outage/canary summary (worker_remove is not recorded)
 
     Returns an HTML string.  Empty string on any failure or missing data so
     a DB issue never prevents the digest email from sending.

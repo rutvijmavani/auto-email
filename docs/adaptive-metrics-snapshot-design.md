@@ -1,6 +1,6 @@
-# Adaptive health report: one data source (DESIGN, 2026-11-07, NOT BUILT)
+# Adaptive health report: one data source (DESIGN, 2026-11-07, BUILT)
 
-Status: proposed, awaiting approval. Nothing in this file is implemented.
+Status: BUILT 2026-11-07 (see Section 9); not yet deployed and not VM-verified.
 
 ## 0. Why this exists
 

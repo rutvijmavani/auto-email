@@ -407,7 +407,10 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
             company, stream_key, consumer, state, reaps, delay, target_zset,
         )
 
-    _reap_seen.clear()
+    # Sightings are kept per stream: the adaptive and fullscan loops share this dict, so
+    # replacing all of it would wipe the other stream's first sightings between its calls.
+    for key in [k for k in _reap_seen if k[0] == stream_key]:
+        del _reap_seen[key]
     _reap_seen.update(seen_now)
 
 

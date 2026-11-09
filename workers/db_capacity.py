@@ -61,8 +61,7 @@ def probe(r) -> "dict | None":
             reserved = int(list(cur.fetchone().values())[0])
             cur.execute(
                 "SELECT application_name, COUNT(*) AS n FROM pg_stat_activity "
-                "WHERE datname = current_database() AND usename = current_user "
-                "AND backend_type = 'client backend' GROUP BY application_name"
+                "WHERE backend_type = 'client backend' GROUP BY application_name"
             )
             rows = cur.fetchall()
     except Exception as exc:

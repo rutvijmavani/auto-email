@@ -175,6 +175,7 @@ def release_held(r, conn, limit: int) -> int:
     conn.commit()
 
     pushed = 0
+    unpushed = [row["id"] for row in rows if row["id"] in claimed]   # still to push, in order
     for row in rows:
         if row["id"] not in claimed:
             continue            # completed or released by someone else meanwhile
@@ -182,9 +183,23 @@ def release_held(r, conn, limit: int) -> int:
         if push is None:
             logger.info("drainer: %s %s released but not pushed (no rebuildable payload)",
                         row["company"], row["job_id"])
+            unpushed.remove(row["id"])
             continue
         queue, payload = push
-        r.lpush(queue, payload)
+        try:
+            r.lpush(queue, payload)
+        except Exception:
+            # The claim was committed before the push: give this row and every later claimed
+            # row back to the held pool so a Redis failure does not lose them.
+            try:
+                conn.execute("UPDATE job_postings SET pushed_at = NULL WHERE id = ANY(?)",
+                             (unpushed,))
+                conn.commit()
+            except Exception as reset_exc:
+                logger.error("drainer: could not re-hold %d rows after a failed push: %s",
+                             len(unpushed), reset_exc)
+            raise
+        unpushed.remove(row["id"])
         pushed += 1
         logger.info("drainer: released %s %s -> %s", row["company"], row["job_id"], queue)
     return pushed

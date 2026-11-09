@@ -681,7 +681,7 @@ class TestCheckLayer2Integration(unittest.TestCase):
         self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
 
     def test_lever1_fires_once_idempotent(self):
-        # Two cycles both above WARN — Lever 1 should fire once, snapshot not overwritten
+        # Two cycles both above WARN — Lever 1 should fire once, fired_at not overwritten
         self._exhaust_chain()
         self._rising_history()
         mgr._check_layer2(
@@ -690,15 +690,17 @@ class TestCheckLayer2Integration(unittest.TestCase):
             params=self.params, worker_ceil=10,
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
-        first_D = self.r._store.get("manager:snapshot:scan:D")
+        first_fired = self.r._store.get("manager:lever1:scan:fired_at")
+        self.assertIsNotNone(first_fired)
         mgr._check_layer2(
             self.r, "scan",
             n_workers=10, delay_s=2000.0, depth=999,
             params=self.params, worker_ceil=10,
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
-        # Snapshot not overwritten
-        self.assertEqual(self.r._store.get("manager:snapshot:scan:D"), first_D)
+        # fired_at not overwritten, Lever 1 still active
+        self.assertEqual(self.r._store.get("manager:lever1:scan:fired_at"), first_fired)
+        self.assertTrue(mgr._get_lever1_active(self.r, "scan"))
 
     def test_lever1_lifts_after_stable_cycles(self):
         # Fire Lever 1 manually

@@ -697,6 +697,8 @@ def run_health_check() -> int:
 
         # Companies mid-scan are not missed — exclude them from the stale count
         # so the health check matches the contract used by the monitor layer.
+        # Every entry is a live scan: the scheduler reaper / sweep_inflight remove the
+        # slot of a dead owner, so no staleness filter is needed here.
         inflight_names: set = set()
         try:
             _raw_inflight = r.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)

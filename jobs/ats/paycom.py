@@ -103,7 +103,7 @@ def fetch_jobs(slug, company, stop_check=None):
         if len(batch) < _TAKE:
             break                        # a short page is the server's last
         if stop_check is not None and stop_check(
-                [{"job_id": str(p.get("jobId", ""))} for p in new]):
+                [{"job_id": str(p.get("jobId", ""))} for p in batch]):
             stop = STOP_EARLY_EXIT
             break
         skip += _TAKE
