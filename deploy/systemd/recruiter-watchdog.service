@@ -29,8 +29,6 @@ User=opc
 Group=opc
 WorkingDirectory=/home/opc/mail
 EnvironmentFile=/home/opc/mail/.env
-# WP: flush print() output to the journal immediately (stdout is block-buffered otherwise).
-Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/home/opc/mail/venv/bin/python -m workers.watchdog
 

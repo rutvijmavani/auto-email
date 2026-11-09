@@ -369,7 +369,7 @@ def _build_health_section(summary):
             (f'<span style="color:{COLORS["warning"]};">'
              f'{r["error_pct"]}%</span>'
              if r["error_pct"] > 0 else "0%"),
-            f'{int(round(float(r["avg_response_ms"] or 0))):,}ms',
+            f'{r["avg_response_ms"]}ms',
             _status(
                 r["rate_429_pct"],
                 r["error_pct"],

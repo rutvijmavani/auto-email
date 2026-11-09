@@ -122,7 +122,7 @@ def _check_low_credit_alert(credits):
 
 def _send_low_credit_email(remaining):
     """Send low credit alert email."""
-    from outreach.report_templates.base import send_report_email as send_email
+    from outreach.report_templates.base import send_email
 
     subject = f"[Alert] Serper API — only {remaining} credits remaining"
 

@@ -132,12 +132,11 @@ def test_family_over_cap_is_split_by_nested_city():
 def test_jobs_without_a_city_flag_the_slice_incomplete():
     # 300 of 2600 jobs have no city: the city split cannot see them → incomplete, not silently OK.
     board = _nested_location_board(2600, ["Bengaluru", "Pune", "Mumbai"], no_city=range(300))
-    # WW: the nested-slice shortfall is expected, so it logs at INFO; the board result stays flagged.
-    with patch.object(workday.logger, "info") as info:
+    with patch.object(workday.logger, "warning") as warn:
         with patch.object(workday, "fetch_json_post", side_effect=board):
             jobs = workday.fetch_jobs(SLUG, "Acme")
     assert len(jobs) < 2601
-    assert any("carry no" in c.args[0] for c in info.call_args_list)
+    assert any("carry no" in c.args[0] for c in warn.call_args_list)
     assert jobs.report.stop_reason == workday.STOP_PAGE_CAP and jobs.report.complete is False
 
 

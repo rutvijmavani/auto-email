@@ -91,12 +91,6 @@ The requeue approach makes this worse, not better — it is O(500 requeues) to r
 
 ## 3. The Fix — `blocked_platforms` SET + Per-Platform ZSET Queues
 
-> **STATUS (2026-11-09): PARKED, NOT LIVE (D7).** The `concurrency:limit` feedback loop,
-> `blocked_platforms`, per-platform queues and dynamic `CONCURRENCY_CEIL` probing described in
-> this document have no production caller (see the STATUS notes in
-> `adaptive-polling-architecture.md` §19 and `scaling-redesign.md`). Read it as design for the
-> parked chain, not as current behaviour.
-
 ### Two new Redis keys
 
 ```
