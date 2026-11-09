@@ -209,10 +209,11 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 # ─────────────────────────────────────────
  
 # Number of companies processed in parallel (thread pool size).
-# Real throttling is done by MONITOR_PLATFORM_CONCURRENCY semaphores below —
 # MAX_WORKERS just controls how many companies are in-flight at once.
-# 20 is fine here because the per-platform semaphores prevent any single
-# ATS from being hammered even when all 20 slots are busy.
+# MONITOR_PLATFORM_CONCURRENCY below limits concurrent requests per platform, but its
+# semaphores are per PROCESS (threading.Semaphore), not shared across the scheduler's
+# worker processes, and scans are not gated by them; the real cross-process limit is
+# the worker count.  A shared per-platform limiter is the parked D7 chain (DOC-SEM).
 MONITOR_MAX_WORKERS = int(os.getenv("MONITOR_MAX_WORKERS", "20"))
 
 # Max concurrent requests per ATS platform.

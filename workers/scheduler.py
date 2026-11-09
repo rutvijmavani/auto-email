@@ -3308,6 +3308,12 @@ def _ceiling_decay_loop() -> None:
     error event (`worker:ceil:last_error:{dc_key}`), increment the ceiling by 1.
     This probes upward toward the true safe maximum after a clean period.
 
+    DOC-LEARN / DECAY-DEAD: currently a no-op.  Nothing in the repo ever writes
+    `worker:ceil:last_error:{dc_key}`, and the `ceil:learned` high-water mark is only
+    written by http_client's concurrency adjuster (itself part of the parked D7 per-platform
+    concurrency chain).  The loop runs but never finds a key to relax.  Kept (not deleted)
+    until the D7 decision; see the parked-D7 note in project memory.
+
     Writes are guarded: if worker:ceil:last_error is missing or too recent, the key
     is left alone.  Only moves UP (decay means relaxing the ceiling, not lowering it).
     """
