@@ -217,7 +217,7 @@ def query_detection_age_distribution(days: int = 7) -> dict:
     """
     Compute portfolio-wide detection age distribution over the last `days` days.
 
-    Buckets (cumulative share of all new jobs):
+    Buckets (cumulative share of dated new jobs):
         found_within_1hr   — adaptive saw the job within 1 h of it going live
         found_within_4hr   — within 4 h
         found_within_24hr  — within 24 h
@@ -226,15 +226,17 @@ def query_detection_age_distribution(days: int = 7) -> dict:
     Returns:
         Dict with keys:
             total_new_jobs      — int, combined across all platforms
+            dated_jobs          — int, within_24hr + after_24hr: the jobs from platforms with a
+                                  real posting time, i.e. the denominator of every pct
             within_1hr          — int
             within_4hr          — int
             within_24hr         — int
             after_24hr          — int
-            within_1hr_pct      — float 0–100, or None if no data
-            within_4hr_pct      — float 0–100, or None if no data
-            within_24hr_pct     — float 0–100, or None if no data
-            after_24hr_pct      — float 0–100, or None if no data
-        All counts default to 0; pct values are None when total_new_jobs == 0.
+            within_1hr_pct      — float 0–100 (share of dated_jobs), or None if dated_jobs == 0
+            within_4hr_pct      — float 0–100 (share of dated_jobs), or None if dated_jobs == 0
+            within_24hr_pct     — float 0–100 (share of dated_jobs), or None if dated_jobs == 0
+            after_24hr_pct      — float 0–100 (share of dated_jobs), or None if dated_jobs == 0
+        All counts default to 0; total_new_jobs can be > 0 while dated_jobs is 0.
     """
     since = (date.today() - timedelta(days=days)).isoformat()
     conn  = get_conn()
@@ -349,9 +351,9 @@ def query_wasted_poll_rate(days: int = 7) -> list:
 
 def query_score_oscillation(days: int = 14) -> list:
     """
-    Compute score oscillation (stddev of daily poll score) per platform
-    over the last `days` days (default 14 — two full weeks gives a meaningful
-    spread).
+    Compute score oscillation (stddev of each company's daily poll score,
+    summarised per platform) over the last `days` days (default 14 — two full
+    weeks gives a meaningful spread).  Only companies with >= 3 days of data count.
 
     High oscillation means the adaptive score is fluctuating wildly rather
     than converging.  This suggests either:
@@ -363,14 +365,16 @@ def query_score_oscillation(days: int = 14) -> list:
 
     Returns:
         List of dicts sorted by score_stddev DESC, each with:
-            platform        — ATS name
-            days_with_data  — rows used (≤ days)
-            avg_score       — mean daily poll score
-            min_score       — minimum daily score seen
-            max_score       — maximum daily score seen
-            score_stddev    — population stddev of daily score  (0 = perfectly stable)
-            score_range     — max_score − min_score (simple spread)
-        Empty list if fewer than 3 days of data for every platform.
+            platform           — ATS name
+            companies          — companies with >= 3 days of data on this platform
+            days_with_data     — the most days of data any one company has (≤ days)
+            avg_score          — mean of the companies' average daily scores
+            min_score          — lowest daily score any company had
+            max_score          — highest daily score any company had
+            score_stddev       — AVERAGE of the per-company population stddevs (0 = stable)
+            max_company_stddev — the largest per-company population stddev (worst company)
+            score_range        — MAXIMUM per-company range (max − min of one company's scores)
+        Empty list if no company has at least 3 days of data.
     """
     since = (date.today() - timedelta(days=days)).isoformat()
     conn  = get_conn()

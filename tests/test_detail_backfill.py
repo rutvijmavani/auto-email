@@ -19,6 +19,12 @@ def _p(url):
     return json.dumps({"job_url": url}).encode()
 
 
+def _dlq(url):
+    """A DLQ entry as detail_worker._push_to_dlq writes it."""
+    return json.dumps({"_dlq_added_at": "2026-01-01T00:00:00+00:00",
+                       "payload": {"job_url": url}}).encode()
+
+
 def _redis(lists=None, zsets=None):
     lists, zsets = lists or {}, zsets or {}
     r = MagicMock()
@@ -38,13 +44,13 @@ class TestCollect(unittest.TestCase):
                 REDIS_DETAIL_ADAPTIVE: [_p("a"), _p("b")],
                 f"{REDIS_DETAIL_ADAPTIVE}:inflight:host:1": [_p("c")],
                 REDIS_DETAIL_FULLSCAN: [_p("d")],
-                REDIS_DETAIL_DLQ: [_p("e"), b"not json"],
+                REDIS_DETAIL_DLQ: [_dlq("e"), _p("g"), b"not json", b'{"payload": 5}'],
             },
             zsets={f"{REDIS_DETAIL_FULLSCAN}:retry_delay": [_p("f")]},
         )
         found = bf.collect_queued_urls(r)
         union = set().union(*found.values())
-        self.assertEqual(union, {"a", "b", "c", "d", "e", "f"})
+        self.assertEqual(union, {"a", "b", "c", "d", "e", "f", "g"})
 
 
 class TestStamp(unittest.TestCase):

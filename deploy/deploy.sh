@@ -234,6 +234,15 @@ for _wrapper in /usr/local/bin/install-pipeline-units /usr/local/bin/sync-pipeli
         _rollback_to_previous; exit 1
     fi
 done
+# The sudoers rules are generated per staged unit by install-systemd.sh, so a host
+# provisioned before recruiter-detail-drainer existed has no rule for it yet and the
+# restart below would fail (or prompt).  Detect that now and say what to run.
+_SYSTEMCTL_BIN="$(command -v systemctl)"
+if ! sudo -n -l "$_SYSTEMCTL_BIN" restart recruiter-detail-drainer >/dev/null 2>&1; then
+    echo "[ERROR] no sudoers rule to restart recruiter-detail-drainer."
+    echo "        Run 'sudo bash deploy/install-systemd.sh' once to add it, then redeploy."
+    _rollback_to_previous; exit 1
+fi
 sudo /usr/local/bin/sync-pipeline-staging || {
     echo "  [ERROR] Staging sync failed — rolling back"
     _rollback_to_previous; exit 1

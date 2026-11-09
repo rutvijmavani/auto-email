@@ -1687,11 +1687,12 @@ buffer)                         each move       if the deadlock resolved. Stop t
 ```
 1. Layer 0 grows to the pool's ceiling
 2. Emergency recalc of the pool's own ceiling (today's peak included)
-3. Lendable workers (above target)                       ALL AT ONCE
-4. Buffer seats  (ceiling − peak_Nd)                     ALL AT ONCE
-5. Peak-headroom seats (peak_Nd − target)                ONE PER CYCLE, check each cycle
-6. Raise the worker budget by DB_POOL_RAISE_STEP toward the live Postgres seat cap
-7. Lever 1 — last resort, only when 2-6 yield nothing
+3. Raise the worker budget by DB_POOL_RAISE_STEP toward the live Postgres seat cap
+4. Reclaim the pool's own lent seats (_reclaim_lent_seats)
+5. Lendable workers (above target)                       ALL AT ONCE
+6. Buffer seats  (ceiling − peak_Nd)                     ALL AT ONCE
+7. Peak-headroom seats (peak_Nd − target)                ONE PER CYCLE, check each cycle
+8. Lever 1 — last resort, only when 2-7 yield nothing
 ```
 
 Source order is fullscan, then scan, then detail. Lifting Lever 1 does not return seats; `_maybe_return_borrows` returns a borrow when both pools involved stay below warn × 0.25 for 3 consecutive cycles. The nightly recompute runs at `MANAGER_RECOMPUTE_HOUR` (23:00 America/New_York), guarded by the Redis key `manager:last_recompute_date`.

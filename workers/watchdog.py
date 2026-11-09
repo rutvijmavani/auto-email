@@ -1028,6 +1028,9 @@ def _held_state(r, now: float) -> Optional[dict]:
         held = json.loads(raw)
         if now - float(held["ts"]) > WATCHDOG_SNAPSHOT_TTL:
             return None
+        # A partial/older payload must not reach the callers, which index these keys.
+        if not all(k in held for k in ("count", "oldest_age_s", "oldest_id")):
+            return None
         return held
     except Exception:
         return None

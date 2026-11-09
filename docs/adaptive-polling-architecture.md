@@ -1169,7 +1169,7 @@ RedisBloom filters from `BF.RESERVE` are scalable, so no headroom is needed.
 **Why ALL jobs go into NEW_BLOOM (not just new ones):**
 The naive approach (only add jobs not in old bloom to NEW_BLOOM) causes oscillation: cycle 2's bloom only contains jobs that were new in cycle 1, so cycle 3 re-processes all old jobs as if they were new. Building NEW_BLOOM from every currently active job means closed or filled positions fall out naturally — they are no longer fetched, so they never enter NEW_BLOOM, and are absent from the next cycle's reference.
 
-**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly treated as handled by the old bloom. The next rebuild no longer contains the false positive's collision (the new bloom is built from this scan's own IDs), so the job is processed then. Adaptive scans decide new vs known from the DB, so they can still catch it meanwhile. Accepted.
+**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly treated as handled by the old bloom. The fullscan adds that ID to the NEW bloom before it skips the DB check, so on every later fullscan the job is still in the bloom and still treated as handled — a rebuild does not recover it. Only an adaptive scan can detect it, because adaptive decides new vs known from the DB. Accepted.
 
 **Fallback if RedisBloom unavailable:** Use Redis SET at key `bloom:fallback:{company}`. Less memory efficient (~100MB vs ~4.5MB at scale) but functionally identical.
 
@@ -1769,8 +1769,8 @@ The Bloom filter (`bloom:fullscan:{company}`) has two distinct uses at different
 
 This is acceptable because:
 1. Adaptive polling runs throughout the day — the job was very likely already detected by Tier 1
-2. The next full scan cycle rebuilds the bloom from scratch — the false positive is absent from the new bloom and the job is processed correctly
-3. Maximum delay: one full-scan cycle (≤24 hours) on 1 in 1000 new jobs
+2. A later full scan does not recover it: the ID is added to the NEW bloom before the DB check is skipped, so it stays treated as handled — only an adaptive scan (which decides new vs known from the DB) can detect it
+3. The exposure is 1 in 1000 new jobs, bounded by how soon an adaptive scan sees the job
 
 ### Adaptive-first guarantee
 

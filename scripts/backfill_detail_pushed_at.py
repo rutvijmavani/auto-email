@@ -52,7 +52,12 @@ def _decode(value):
 def _url_of(raw):
     """job_url from one queued payload, or None when it cannot be read."""
     try:
-        return json.loads(_decode(raw)).get("job_url")
+        data = json.loads(_decode(raw))
+        # DLQ entries are envelopes {"_dlq_added_at", "payload": {...}} (detail_worker._push_to_dlq);
+        # queue / inflight / retry entries are bare payloads.
+        if "payload" in data and "job_url" not in data:
+            data = data["payload"]
+        return data.get("job_url")
     except (TypeError, ValueError, AttributeError):
         return None
 

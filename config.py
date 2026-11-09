@@ -961,20 +961,18 @@ ADAPTIVE_SEEN_TTL              = 24 * 3600  # 24h fixed TTL
 # If a worker dies mid-scan the stream message stays in the PEL and is
 # reclaimed by XAUTOCLAIM after idle_ms = p95_scan_ms * 3, preventing lost work.
 # No separate heartbeat / watchdog needed for scan workers.
+# No MAXLEN on these streams: a count cap deletes entries no worker has taken
+# (company already ZREM'd → lost).  The scheduler trims delivered entries only
+# (stream_backlog).
 REDIS_STREAM_ADAPTIVE   = "stream:adaptive"     # adaptive scan delivery stream
 REDIS_STREAM_FULLSCAN   = "stream:fullscan"     # full scan delivery stream
 STREAM_CONSUMER_GROUP   = "scan-workers"        # shared consumer group for all workers
+# Short (0.5s) so workers check pause_event within ~1s of signal.
 STREAM_BLOCK_MS         = 500                   # XREADGROUP BLOCK timeout (ms)
 # CL: a consumer with no pending messages that has been idle this long belongs
 # to a worker that is gone (every restart/respawn creates a new consumer name);
 # the scheduler deletes it so the group's consumer list does not grow forever.
 STREAM_CONSUMER_PRUNE_IDLE_S = int(os.getenv("STREAM_CONSUMER_PRUNE_IDLE_S", "3600"))
-                                                # Short (0.5s) so workers check
-                                                # pause_event within ~1s of signal.
-                                                # No MAXLEN: a count cap deletes entries
-                                                # no worker has taken (company already
-                                                # ZREM'd → lost).  The scheduler trims
-                                                # delivered entries only (stream_backlog).
 MAX_STREAM_REDELIVERIES = 5                     # reaps of one company (reaped:{op}:{company},
                                                 # reset on a successful scan) after which
                                                 # the reap logs a repeat-offender warning;
@@ -1007,12 +1005,12 @@ WATCHDOG_HEAL_ATTEMPT_WINDOW_S = int(os.getenv("WATCHDOG_HEAL_ATTEMPT_WINDOW_S",
 FULLSCAN_CHUNK_SIZE = int(os.getenv("FULLSCAN_CHUNK_SIZE", "50"))
 REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
 REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
-# A pool worker that is alive but has published no heartbeat within
-# (slowest start-up seen for its type) x PROGRESS_GAP_FACTOR never finished starting
-# and is killed and replaced.  No deadline until one start-up has been observed.
 REDIS_WORKER_HEALTH_STREAM = "worker:health_history"   # STREAM of periodic pool snapshots
 WORKER_HEALTH_SNAPSHOT_INTERVAL_S = int(os.getenv("WORKER_HEALTH_SNAPSHOT_INTERVAL_S", "3600"))
 WORKER_HEALTH_STREAM_MAXLEN = int(os.getenv("WORKER_HEALTH_STREAM_MAXLEN", "2000"))
+# A pool worker that is alive but has published no heartbeat within
+# (slowest start-up seen for its type) x PROGRESS_GAP_FACTOR never finished starting
+# and is killed and replaced.  No deadline until one start-up has been observed.
 REDIS_START_LATENCY_HASH = "worker:start_latency"   # HASH worker type -> slowest spawn->heartbeat (s)
 
 # ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────

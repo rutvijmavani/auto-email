@@ -349,11 +349,15 @@ def _fetch_via_search(slug_info, company, stop_check=None):
 
         soup          = BeautifulSoup(resp.text, "html.parser")
         page_urls     = _anchors_to_urls(soup, url)
-        page_ids      = []
+        page_ids      = []     # ids not seen before — drives the natural-end check
+        page_all_ids  = []     # every valid id on the page — what the early-exit gate judges
 
         for job_url in page_urls:
             job_id = _extract_job_id(job_url)
-            if not job_id or job_id in seen_ids:
+            if not job_id:
+                continue
+            page_all_ids.append({"job_id": job_id})
+            if job_id in seen_ids:
                 continue
             seen_ids.add(job_id)
             all_urls.append(job_url)
@@ -362,7 +366,7 @@ def _fetch_via_search(slug_info, company, stop_check=None):
         if not page_ids:
             break  # natural end of results — pagination complete
 
-        if stop_check is not None and stop_check(page_ids):
+        if stop_check is not None and stop_check(page_all_ids):
             stop = STOP_EARLY_EXIT
             break
 

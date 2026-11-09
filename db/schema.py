@@ -1208,6 +1208,31 @@ def init_db():
         ON job_postings (company, job_id)
     """)
 
+    # One row per (company, ats_platform, job_id): save_pending_detail's NOT EXISTS check alone
+    # lets two concurrent inserts both pass.  The index is created only when no duplicates
+    # exist, so a database that already has some keeps starting; those must be resolved by hand
+    # (the query below lists them) and the next init_db then adds the index.
+    _dups = c.execute("""
+        SELECT COUNT(*) AS n FROM (
+            SELECT 1 FROM job_postings
+            WHERE job_id IS NOT NULL AND job_id <> ''
+            GROUP BY company, ats_platform, job_id
+            HAVING COUNT(*) > 1
+        ) d
+    """).fetchone()
+    _dup_n = _dups["n"] if _dups else 0
+    if _dup_n:
+        print(f"[WARN] job_postings has {_dup_n} duplicate (company, ats_platform, job_id) "
+              f"groups — unique index idx_job_postings_company_platform_jobid NOT created; "
+              f"resolve with: SELECT company, ats_platform, job_id, COUNT(*) FROM job_postings "
+              f"WHERE job_id <> '' GROUP BY 1,2,3 HAVING COUNT(*) > 1")
+    else:
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_job_postings_company_platform_jobid
+            ON job_postings (company, ats_platform, job_id)
+            WHERE job_id IS NOT NULL AND job_id <> ''
+        """)
+
     # Held backlog, in release order (created_at, id): the drainer's SELECT and the
     # held count both use exactly this predicate.
     c.execute("""

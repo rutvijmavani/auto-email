@@ -818,7 +818,9 @@ def save_pending_detail(company: str, platform: str, job: dict,
     The detail_worker will later UPDATE this to 'new' after fetching full
     detail and applying filters.
 
-    Returns True if inserted (new row), False if job_url OR (company, job_id) already exists.
+    Returns True if inserted (new row), False if job_url OR (company, ats_platform, job_id)
+    already exists (the NOT EXISTS check, and the partial unique index idx_job_postings_
+    company_platform_jobid for a concurrent insert that slips past it).
     """
     conn = get_conn()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -842,7 +844,7 @@ def save_pending_detail(company: str, platform: str, job: dict,
                 SELECT 1 FROM job_postings
                 WHERE company = %s AND ats_platform = %s AND job_id = %s
             )
-            ON CONFLICT (job_url) DO NOTHING
+            ON CONFLICT DO NOTHING
         """, (
             company,
             job.get("title", ""),
@@ -891,7 +893,7 @@ def save_pre_existing_listing(company: str, platform: str, job: dict) -> bool:
                location, posted_at, status, found_by, first_seen)
             VALUES (%s, %s, %s, %s, %s, %s, %s,
                     'pre_existing', 'tier1_adaptive', %s)
-            ON CONFLICT (job_url) DO NOTHING
+            ON CONFLICT DO NOTHING
         """, (
             company,
             job.get("title", ""),

@@ -161,8 +161,19 @@ from db.job_monitor import (
 
 logger = get_logger(__name__)
 
+# Identity of THIS worker process.  The module is preloaded by the scheduler's forkserver, so
+# a PID taken at import time is the fork-server's; run_worker() calls _init_identity() to
+# re-derive both from the real worker PID before the lock, heartbeat or consumer are used
+# (the heartbeat key worker:alive:fullscan_worker:{host}:{pid} and the lock owner must match).
 WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
 _CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
+
+
+def _init_identity() -> None:
+    """Set WORKER_ID / _CONSUMER_NAME from the current (worker) process PID."""
+    global WORKER_ID, _CONSUMER_NAME
+    WORKER_ID      = f"{socket.gethostname()}:{os.getpid()}"
+    _CONSUMER_NAME = f"worker-{socket.gethostname()}-{os.getpid()}"
 
 # Shared EMA alpha for fullscan duration: used in _complete_fullscan_db,
 # _run_fullscan, and the deadline guard in _pick_schedule_time.
@@ -1573,6 +1584,7 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                         cleanly after the current XREADGROUP poll completes.
                         Unacked messages remain in the PEL for XAUTOCLAIM recovery.
     """
+    _init_identity()
     from workers.sentry_init import init_sentry
     init_sentry()
 

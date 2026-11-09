@@ -136,9 +136,9 @@ def fetch_jobs(slug_info, company, stop_check=None):
     for j in all_jobs:
         if not j.get("title"):
             continue
-        norm = _normalize(j, company, domain, path, slug_info)
-        if norm is not None:
-            results.append(norm)
+        item = _normalize(j, company, domain, path, slug_info)
+        if item is not None:
+            results.append(item)
 
     if rep["failed"]:
         stop = STOP_REQUEST_FAILED
