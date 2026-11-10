@@ -327,14 +327,17 @@ Oracle wraps jobs in `items[0].requisitionList`. The `hasMore` field is always `
 
 > **SUPERSEDED.** The overlap-ratio algorithm and the per-platform "applicable" column below are the
 > original design and are no longer what runs. The adaptive scan now uses the `EarlyExitGate`
-> (`workers/paginator.py`, see Section 11 of `docs/adaptive-polling-architecture.md`) on every paging
-> feeder, including Workday, Taleo and iCIMS: a page counts as seen only when ALL its job IDs are in the
+> (`workers/paginator.py`, see Section 11 of `docs/adaptive-polling-architecture.md`) on paging
+> feeders whose `fetch_jobs` accepts `stop_check` (e.g. Workday, Taleo, iCIMS; Greenhouse and other
+> single-call feeders do not pass it). The gate is built only when `ADAPTIVE_EARLY_EXIT_ENABLED` is on,
+> the company has completed its first scan, and an old fullscan Bloom filter exists; otherwise the scan
+> may read the whole board. A page counts as seen only when ALL its job IDs are in the
 > old bloom or `adaptive_seen`, and the fetch stops after two consecutive fully-seen pages
 > (`PAGINATOR_CONFIRM_PAGES`). The "Sorted newest-first?" column is kept as background only.
 
 Original design: smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
 
-| Platform | Sorted newest-first? | Original design: smart exit applicable? (now: gate runs on all paging feeders) |
+| Platform | Sorted newest-first? | Original design: smart exit applicable? (now: gate runs on feeders that accept `stop_check`, when enabled) |
 |----------|---------------------|----------------------|
 | Greenhouse | ✓ Default | ✓ Yes |
 | Lever | ✓ Default | ✓ Yes |
@@ -556,7 +559,8 @@ ATS_TIER1_CONFIG = {
 
 ### How the config is used
 
-During each Tier 1 poll:
+During each Tier 1 poll (illustrative; the `updated_at` refresh branch below is NOT implemented, a
+seen job is always skipped):
 
 ```python
 config = ATS_TIER1_CONFIG[company.ats_platform]
@@ -572,7 +576,7 @@ for job in jobs:
             job_updated_at = job[config["updated_at_field"]]
             last_known_updated = seen_ids[company][job.job_id].last_updated
             if (job_updated_at - last_known_updated).hours > config["refresh_window_hr"]:
-                enqueue_detail_refresh(job)  # re-fetch — job meaningfully changed
+                enqueue_detail_refresh(job)  # NOT IMPLEMENTED: design only; the worker skips known jobs and never refreshes changed ones
         continue  # skip, already processed
 
     # Genuinely new job

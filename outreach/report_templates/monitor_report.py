@@ -1122,8 +1122,9 @@ def _build_adaptive_health_section() -> str:
                 'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
                 'Early-Exit Validation &nbsp;'
                 '<span style="font-weight:400;font-size:10px;">'
-                '(upper bound: full-scan inserts of jobs posted over 36h earlier, '
-                'listing-date platforms only — should be near zero)</span></p>'
+                '(indicator, not a bound: full-scan inserts of jobs posted over 36h earlier, '
+                'listing-date platforms only; misses recovered sooner are not counted '
+                '— should be near zero)</span></p>'
             )
             sections.append(
                 '<table width="100%" cellpadding="0" cellspacing="0" '

@@ -11,7 +11,8 @@ scan and fullscan pools compute `needed`, and the steps to build it.
 ## 1. Problem
 
 `_run_pool_cycle` (workers/manager.py:1036-1045) sizes every pool with
-`needed = ceil((depth / time_left + arrival_rate) x s)` and `time_left = max(warn - delay, 1)`.
+`needed = ceil((depth / time_left + arrival_rate) x s)` and `time_left = max(warn - delay, 1)`
+(historical: this describes the formula before this change; the shrinking `time_left` is gone).
 For scan and fullscan:
 
 * `depth` is a COUNT of late companies and `s` is one number (fetch_p75, about 35 s) for every
@@ -45,8 +46,10 @@ Detail keeps its formula.  Scan and fullscan use work-seconds from per-company d
 * target_util = the utilization at which the scale-up gate fires (today the literal 0.80 at
   manager.py:1087); steady is sized so the steady load runs at that utilization.
 * A late company with no table entry (new, NULL average) uses fetch_p75: unknown is never zero.
-* The delay multiplier (`delay / warn` after breach), the urgent gate, scale-up/scale-down gates,
-  floor/ceiling clamp, `_needed_workers` pre-clamp record, Layer 1 and Layer 2 are UNCHANGED.
+* The urgent gate, scale-up/scale-down gates, floor/ceiling clamp, `_needed_workers` pre-clamp
+  record, Layer 1 and Layer 2 are UNCHANGED. (The `delay / warn` multiplier no longer exists in the
+  code: lateness is the urgent branch's job, and a multiplier would count the same backlog twice,
+  `workers/manager.py` `_run_pool_cycle`.)
   Recorded peak stays `max(n, min(needed, seat_cap))`; outage spikes stay in the peak (user decision).
 * No cap on the late-company list: all overdue ZSET members and all undelivered stream entries are
   read.  Cost is proportional to the late count (unmeasured; log it).
@@ -67,6 +70,9 @@ Per pool (`scan`, `fullscan`), in Redis (the manager and the writers are differe
 * If the table or total is missing (TTL, Redis restart, first start), the manager REBUILDS it from
   the DB immediately with the same function.  p75 is only for a single company with no row/NULL.
   If the DB read itself fails the manager keeps its last good values, logs an error, never uses 0.
+  On the FIRST cycle there is no last good value to keep: a pool that has never had a work-based
+  need falls back to the depth-based formula (`depth / delay_warn_s + arrival_rate`) until the
+  table can be read (`_last_work_need` in `_run_pool_cycle`).
 
 ## 4. Blast radius (graphify query + grep, 2026-10-29)
 
@@ -97,7 +103,7 @@ completion event reaches `on_adaptive_complete`); `workers/rebuild.py` (ZSET reb
    (derived from the recompute period), and target_util (default = the scale-up gate value, ONE
    config value shared by gate and sizing).
 2. workers/company_load.py: Lua update script; `rebuild(r, pool)` from `company_poll_stats`
-   (active companies only), atomic RENAME + TTL; `steady(r, pool)` rebuilding on a missing table;
+   (every row of the table, not only active companies), atomic RENAME + TTL; `steady(r, pool)` rebuilding on a missing table;
    `loads(r, pool, names)` via HMGET with p75 for missing names.
 3. Writers: scheduler `on_adaptive_complete` hook; fullscan completion hook.  Failure path of a
    scan changes neither d nor T, so no write.  WARMING override interval is the T written.

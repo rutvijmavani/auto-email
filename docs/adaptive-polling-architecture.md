@@ -203,9 +203,9 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 │                DETAIL FETCH WORKERS (Two-Tier)                   │
 │  queue:detail:adaptive  ← high priority (from listing scan)     │
 │  queue:detail:fullscan  ← low priority  (from full scan)        │
-│  Workers drain adaptive queue first, then fullscan queue        │
+│  Workers take whichever queue's oldest item waited longer       │
 │  Each worker:                                                   │
-│    1. BRPOP from priority queues                                │
+│    1. Compare both queue tails, LMOVE the older (to inflight)   │
 │    2. Fetch full job detail (location, date, description)       │
 │    3. Save to PostgreSQL (status: pending_detail → new)         │
 │    4. Mark as seen in DB                                        │
@@ -261,7 +261,7 @@ Two co-scheduled worker pools (see Section 9 for full design):
   detail_workers: calculated at 7 AM from expected new jobs + avg detail duration
   Both pools managed by scheduler as multiprocessing.Process children
   Liveness check every tick (5s) — dead workers replaced immediately
-  Error spike check every 60s — manager.py _check_error_spikes() drives worker reduction
+  Error spike check every 60s — manager.py _check_error_spikes() runs each cycle, but reads flags only ats_get() writes (parked, no caller; see §19)
   Slow throughput check every 60s — manager.py queue-delay-driven scaling
   DB pool split proportionally between the two pools (combined ≤ DB_POOL_MAXCONN - 3)
 ```
@@ -834,7 +834,7 @@ def run_full_scan(company):
 |---|---|
 | Dormant company, last polled 11 PM | Rule 1 → 12h cap guarantees adaptive by 11 AM at latest |
 | Many companies with clustered adaptive intervals | Section 24 hash distribution → never cluster in the first place |
-| New company, never polled | Rule 4 → triggers adaptive before allowing full scan |
+| New company, never polled | Current code: a company with `first_scanned_at` NULL bypasses adaptive; the adaptive request is routed to `poll:fullscan` and the first full scan handles the whole board (`scan_worker.py`). Rule 4 below is the original design. |
 | Adaptive keeps erroring | Rule 4 → keeps retrying before allowing full scan |
 | Active company, 4h interval | Rule 3 → full scan triggered once per day naturally |
 | System restart mid-day | Rule 4 → pre-check catches any companies not yet polled |
@@ -937,71 +937,35 @@ def fullscan_worker(dc_key: str, group: str, consumer: str):
         run_full_scan(fields["company"])
         redis.xack(stream_key, group, msg_id)
         # Stale PEL entries (crashed workers) are recovered by claim_stale_work()
-        # via XAUTOCLAIM — idle threshold = max(p95_full_scan_ms × 3, 300 000 ms)
+        # in the scheduler (owner-state reaper, no idle-time threshold; see below)
 ```
 
 **Crash recovery and dead-letter handling:**
 
 ```python
-MAX_STREAM_REDELIVERIES = 5   # after this many claims, give up and backoff
-
-def claim_stale_work(stream_key: str, group: str, consumer: str,
-                     p95_ms: int, run_fn, op_type: str):
+def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> None:
     """
-    Re-claim messages idle longer than 3× p95 scan time.
-    Dead-letters after MAX_STREAM_REDELIVERIES to prevent infinite loops
-    on persistently broken companies.
+    Owner-state reaper (workers/scheduler.py), called from the scheduler
+    dispatch loops every tick.  No idle-time window and no XAUTOCLAIM.
     """
-    idle_ms = max(p95_ms * 3, 300_000)   # at least 5 min; scales with actual scan times
-    stale = redis.xautoclaim(stream_key, group, consumer, min_idle_time=idle_ms)
-
-    for msg_id, fields in stale[1]:
-        # Redis 7+ returns (None, None) for PEL entries whose backing stream
-        # message was trimmed/deleted by MAXLEN. Skip rather than XACK with None
-        # (which would raise a Redis error). These are logged separately as deleted_ids.
-        if msg_id is None:
-            continue
-        company = fields["company"]
-
-        # Check how many times this message has been delivered already
-        pending = redis.xpending_range(stream_key, group, msg_id, msg_id, count=1)
-        delivery_count = pending[0]["times_delivered"] if pending else 0
-
-        if delivery_count >= MAX_STREAM_REDELIVERIES:
-            # Dead-letter: move out of stream into poll:* with exponential backoff
-            delay = _get_backoff_delay(redis, company, op_type=op_type)
-            if op_type == "fullscan":
-                redis.zadd("poll:fullscan", {company: time.time() + delay})
-            else:
-                redis.zadd("poll:adaptive", {company: time.time() + delay})
-            redis.xack(stream_key, group, msg_id)
-            logger.warning(
-                "stream dead-letter: %s after %d redeliveries → backoff +%ds",
-                company, delivery_count, delay,
-            )
-            continue
-
-        run_fn(company)
-        redis.xack(stream_key, group, msg_id)
-
-
-# Called from full scan worker main loop when XREADGROUP returns empty:
-p95_ms = get_p95_full_scan_ms(redis, dc_key)   # from api_health — full scan duration only
-claim_stale_work(
-    "stream:fullscan", "fullscan-workers", consumer,
-    p95_ms=p95_ms, run_fn=run_full_scan, op_type="fullscan",
-)
-
-# Called from listing scan worker main loop when XREADGROUP returns empty:
-p95_ms = get_p95_listing_scan_ms(redis, dc_key)   # listing scan duration only
-claim_stale_work(
-    f"stream:adaptive:{dc_key}", "scan-workers", consumer,
-    p95_ms=p95_ms, run_fn=run_listing_scan, op_type="scan",
-)
+    for entry in r.xpending_range(stream_key, group, min="-", max="+", count=100):
+        state = owner_state(entry)           # heartbeat key + worker:cur report
+        if state == RUNNING:
+            continue                         # a slow scan is never reaped
+        if not seen_in_same_state_last_call(entry, state):
+            continue                         # two consecutive sightings required
+        if state == STALLED:
+            kill_stalled_worker(entry.consumer)
+        r.xack(stream_key, group, entry.message_id)
+        reaps = r.incr(f"reaped:{op_type}:{company}")
+        delay = backoff_delay_for(reaps - 1)  # grows from the first reap
+        # GT: an existing, later schedule wins
+        r.zadd(poll_zset_for(op_type), {company: now + delay}, gt=True)
+        release_inflight(r, op_type, company)   # slot, stored stream id, fullscan lease
 ```
 
-**Why p95 × 3 and not a hardcoded timeout:**
-A hardcoded 20 min reclaims messages from legitimately slow workers processing large companies (Starbucks full scans can take 30–45 min). Using `p95_full_scan_ms × 3` means the timeout automatically accommodates whatever scan durations the ATS + company size combination actually produces, and self-adjusts as the portfolio grows.
+**Why an owner-state reaper and not an idle-time threshold:**
+A fixed or p95-derived idle window either reclaims messages from legitimately slow workers (Starbucks full scans can take 30–45 min) or leaves a crashed worker's message pending for the whole window. Reading the owner's own state removes the guess: a worker whose heartbeat and `worker:cur` report say it is RUNNING is left alone however long the scan takes; any other state (dead, stalled, not working on the message) is rescheduled after two consecutive sightings. `reaped:{op}:{company}` (cleared by `clear_reaped` on a successful scan) drives the growing backoff and the WARNING log at `MAX_STREAM_REDELIVERIES`.
 
 **Overdue companies at startup (restart / crash):**
 Companies with `next_full_scan_at` in the past are added directly to the stream (bypassing the ZSET) so workers begin processing immediately at ceiling capacity. FIFO order means the most-overdue companies (added first) are processed first.
@@ -1169,7 +1133,7 @@ RedisBloom filters from `BF.RESERVE` are scalable, so no headroom is needed.
 **Why ALL jobs go into NEW_BLOOM (not just new ones):**
 The naive approach (only add jobs not in old bloom to NEW_BLOOM) causes oscillation: cycle 2's bloom only contains jobs that were new in cycle 1, so cycle 3 re-processes all old jobs as if they were new. Building NEW_BLOOM from every currently active job means closed or filled positions fall out naturally — they are no longer fetched, so they never enter NEW_BLOOM, and are absent from the next cycle's reference.
 
-**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly treated as handled by the old bloom. The fullscan adds that ID to the NEW bloom before it skips the DB check, so on every later fullscan the job is still in the bloom and still treated as handled — a rebuild does not recover it. Only an adaptive scan can detect it, because adaptive decides new vs known from the DB. Accepted.
+**False positives (0.1% error rate):** 1 in 1000 new jobs incorrectly treated as handled by the old bloom. The fullscan adds that ID to the NEW bloom before it skips the DB check, so on every later fullscan the job is still in the bloom and still treated as handled — a rebuild does not recover it. Only an adaptive scan can detect it, because adaptive decides new vs known from the DB, and only if it reads the page that holds the job: the early-exit gate also counts a Bloom hit as "seen", so a false positive can carry a missed ID forward into the NEW bloom and keep it hidden. Accepted.
 
 **Fallback if RedisBloom unavailable:** Use Redis SET at key `bloom:fallback:{company}`. Less memory efficient (~100MB vs ~4.5MB at scale) but functionally identical.
 
@@ -1383,10 +1347,8 @@ The fullscan dispatcher uses a Lua script so the check + ZADD is atomic — no t
 
 ```lua
 -- KEYS[1] = inflight:scans:{dc_key}      KEYS[2] = inflight:fullscans:{dc_key}
--- ARGV[1] = ceiling   ARGV[2] = adaptive stale cutoff   ARGV[3] = fullscan stale cutoff
--- ARGV[4] = company   ARGV[5] = now
-redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[2])   -- prune stale adaptive entries
-redis.call('ZREMRANGEBYSCORE', KEYS[2], 0, ARGV[3])   -- prune stale fullscan entries
+-- ARGV[1] = ceiling   ARGV[4] = company   ARGV[5] = now
+-- No age-based pruning: leaked slots are freed by sweep_inflight (see above).
 local total = redis.call('ZCARD', KEYS[1]) + redis.call('ZCARD', KEYS[2])
 if total >= tonumber(ARGV[1]) then
     return 0   -- throttled
@@ -1399,13 +1361,13 @@ If `_claimed == 0`: company re-queued to `poll:fullscan` at `+30s` and skipped. 
 
 **Why not use the Stream PEL for inflight tracking (historical evaluation):**
 
-The Stream PEL was evaluated and rejected in favour of the ZSET approach. ZSET with stale-window pruning (`ZREMRANGEBYSCORE`) is the authoritative inflight count; `_get_stream_pending_count()` queries `XPENDING` for monitoring only, not for ceiling checks.
+The Stream PEL was evaluated and rejected in favour of the ZSET approach. The ZSET (slots released on completion, by `claim_stale_work`, or by `sweep_inflight`; no age-based pruning) is the authoritative inflight count; `_get_stream_pending_count()` queries `XPENDING` for monitoring only, not for ceiling checks.
 
-| Property | Stream PEL | ZSET with stale window (current approach) |
+| Property | Stream PEL | ZSET with owner-state release (current approach) |
 |---|---|---|
 | Fullscan + adaptive combined count | Two separate streams → can't combine easily | Two ZSETs → simple ZCARD sum |
-| Atomic check + claim | Requires Lua anyway; PEL written by XADD not by the check | Lua can ZREMRANGEBYSCORE + ZCARD + ZADD atomically |
-| Stale window per type | PEL uses XAUTOCLAIM timeout (same for all messages) | Independent per-type stale windows |
+| Atomic check + claim | Requires Lua anyway; PEL written by XADD not by the check | Lua can ZCARD + ZADD atomically |
+| Release of crashed work | PEL entry stays until reaped | Slot freed by `claim_stale_work` / `sweep_inflight`, independent per type |
 
 A Workday DC12 ceiling has **zero effect** on Greenhouse or Lever dispatching. Each DC key has its own set of inflight ZSETs — fully independent.
 
@@ -1566,7 +1528,10 @@ Graceful decay over ~5 polls. Never abrupt.
 
 ## 11. Smart Early Exit — Pagination Without Limits
 
-> **STATUS: CORE BUILT 2026-11-04, FEEDERS BEING CONVERTED ONE AT A TIME.** The rule is ONE strict rule
+> **STATUS: BUILT 2026-11-04 on every paging feeder that takes `stop_check`** (see `registry.accepts_stop_check`;
+> single-dump feeders have no pages to skip). The gate is a HEURISTIC, not a proof: a job that appears later
+> in the listing than two fully-seen pages can be skipped by an adaptive scan, and a Bloom false positive can
+> mark an unseen ID as seen. Both are recovered by the full scan (the safety net), not by adaptive. The rule is ONE strict rule
 > for every platform (no sorted/unsorted flag): a page counts only when EVERY job on it is already seen
 > (old fullscan bloom OR `adaptive_seen`); any unseen job resets the counter to 0; the fetch stops after
 > `PAGINATOR_CONFIRM_PAGES` (2) consecutive fully-seen pages. The 80%-of-page rule below is superseded:
@@ -1607,9 +1572,11 @@ The right answer is: **stop when you've clearly passed the zone of new jobs.**
 
 For platforms with reliable newest-first ordering, we can detect the "old job frontier" and stop paginating as soon as we pass it.
 
-### The algorithm (SORTED platforms only)
+### The algorithm (HISTORICAL 80% design, superseded by the status note above)
 
-The early exit check compares page job IDs against `bloom:fullscan:{company}` — the Bloom filter built during the last full scan. This represents the complete state of the board at that point. If most jobs on a page are already in the Bloom filter, we are past the zone of new postings.
+An adaptive scan builds the gate only when the company has `first_scanned_at` set and an old Bloom exists; a company that has never been full-scanned is routed to a full scan instead and never early-exits. The sort-order table above is background only: any feeder that opts in with `stop_check` uses the gate regardless of sort order (shuffled boards just read nearly every page).
+
+The original early exit check compared page job IDs against `bloom:fullscan:{company}` — the Bloom filter built during the last full scan. This represents the complete state of the board at that point. If most jobs on a page are already in the Bloom filter, we are past the zone of new postings.
 
 ```python
 def smart_paginate(company, ats):
@@ -1641,11 +1608,11 @@ The old `seen:{company}` SET only contained jobs that passed keyword/location fi
 
 **Between full scan cycles:** New jobs found by adaptive scan are not written to the Bloom filter — it only reflects the state at the last full scan. This means the overlap ratio slightly understates how much is already known, and early exit may trigger one page later than strictly necessary. This is acceptable and conservative — it is better to fetch one extra page than to stop too early.
 
-### NON-SORTED platforms — no early exit in adaptive polling
+### NON-SORTED platforms — historical design (superseded)
 
-For Workday, iCIMS, and custom ATS with no reliable ordering:
+This describes the original design for Workday, iCIMS, and custom ATS with no reliable ordering. Today the strict two-page gate applies to any feeder that opts in, sorted or not.
 
-- **Adaptive polling**: scan pages until a time-based cutoff (e.g., skip jobs with `postedOn` older than 72 hours). Bloom filter early exit is NOT used — jobs can appear in any order so overlap on one page does not indicate we have passed the new-job frontier.
+- **Adaptive polling (original design)**: scan pages until a time-based cutoff (e.g., skip jobs with `postedOn` older than 72 hours). Bloom filter early exit was NOT used — jobs can appear in any order so overlap on one page does not indicate we have passed the new-job frontier.
 - **Full scan**: scan ALL pages unconditionally — no cutoff, no early exit.
 
 This is why full scan exists. Adaptive polling's time-based cutoff on non-sorted platforms means it might miss a new job posted at an unusual position in the listing. Full scan eliminates that risk entirely.
@@ -1681,13 +1648,13 @@ For each job ID on a fetched page, adaptive polling checks two layers in order:
 ```
 
 **Why `adaptive_seen` instead of a Redis `seen:{company}` SET:**
-The old design maintained a `seen:{company}` SET rebuilt from `job_postings` on every Redis restart. This was large (~100MB at scale), required a full table scan to rebuild, and grew unbounded. `adaptive_seen:{company}` is scoped to the current day only (24h TTL, DEL'd at full scan start), keeping it small and self-cleaning. The DB remains the authoritative source; `adaptive_seen` is purely a same-day lookup cache to avoid redundant DB round-trips.
+The old design maintained a `seen:{company}` SET rebuilt from `job_postings` on every Redis restart. This was large (~100MB at scale), required a full table scan to rebuild, and grew unbounded. `adaptive_seen:{company}` is scoped to the current day only (24h TTL, DEL'd at full scan completion after the Bloom promotion), keeping it small and self-cleaning. The DB remains the authoritative source; `adaptive_seen` is purely a same-day lookup cache to avoid redundant DB round-trips.
 
 **`adaptive_seen` lifecycle:**
 - Written by adaptive scan — ALL fetched job IDs added regardless of filter or DB outcome
 - TTL: 24 hours (fixed)
-- DEL'd explicitly at the start of each full scan
-- Never written by full scan
+- DEL'd explicitly when a full scan completes successfully, right after `bloom.finalize()` (the full scan has then seen everything adaptive handled meanwhile). An ID adaptive adds after the full scan's last read but before this delete is lost, so a rejected job may be queued once more: accepted (`fullscan.py` completion branch).
+- Not written by full scan; it only reads the key while running
 
 **Source of truth:** `job_postings` table (`job_id` + `company` columns). PostgreSQL is always consulted for any job ID not already in `adaptive_seen`. No separate seen-IDs table is needed.
 
@@ -1916,8 +1883,10 @@ Type: List
 
 LPUSH queue:detail:adaptive {job_json}    — push from adaptive listing scan
 LPUSH queue:detail:fullscan {job_json}    — push from full scan
-BRPOP queue:detail:adaptive 0.1           — workers serve the older tail first (see Two-tier detail queue note)
-BRPOP queue:detail:fullscan 5             — then fullscan queue
+LINDEX queue:detail:adaptive -1           — peek the tail (oldest) of each queue, compare queued_at
+LINDEX queue:detail:fullscan -1
+LMOVE  <older queue> inflight RIGHT LEFT  — non-blocking pop of the older tail; the other queue is the fallback
+BLMOVE queue:detail:fullscan ... (<= 1 s) — only when both are empty (workers/detail_worker.py _pop_with_inflight)
 ```
 
 Backpressure: listing scan checks queue depth before pushing. If depth > MAX_QUEUE_DEPTH (5,000 for adaptive, 2,000 for fullscan), listing scan pauses until workers catch up.
@@ -1952,7 +1921,7 @@ TTL: 24 hours (fixed)
 
 SISMEMBER adaptive_seen:{company} {job_id}   — check if processed today (O(1))
 SADD      adaptive_seen:{company} {job_id}   — mark as processed (written by adaptive scan only)
-DEL       adaptive_seen:{company}            — cleared at start of each full scan
+DEL       adaptive_seen:{company}            — cleared when a full scan completes (after Bloom promotion)
 ```
 
 Same-day lookup cache for adaptive scans. Prevents redundant DB round-trips when the same job ID appears across multiple adaptive scans within a single day. Job IDs are added regardless of whether the job passed filters or was already in the DB — the only question answered is "did we touch this job ID today?"
@@ -2353,7 +2322,7 @@ Adaptive poll for company Stripe:
 5. XACK stream:adaptive:greenhouse scan-workers X  ← only after step 4 complete
 
 Meanwhile, detail workers:
-   BRPOP queue:detail:adaptive → job
+   LMOVE (older queue tail) → job
    Fetch full detail
    UPDATE job_postings SET status='new', found_by='tier1_adaptive', ...
 ```
@@ -2648,6 +2617,11 @@ cycle_start = eastern.localize(
 > (custom_career, eightfold, generic_career, icims, jobvite, oracle_hcm, paycom,
 > taleo). Real concurrency per platform has only ever been bounded by the worker
 > pool sizes plus the 60 s sleep after a 429.
+>
+> `manager._check_error_spikes()` does run every manager cycle (manager.py, called
+> from the main loop), but it only reads the error counters that `ats_get()` writes.
+> With no caller of `ats_get()`, those counters are never produced, so the spike
+> check finds nothing and drives no worker reduction today.
 >
 > **Evidence for parking** (`api_health`, all days to 2026-11-05): Workday is 97% of
 > traffic (6.09 M requests) at a 0.26% 429 rate, and every other platform has zero
@@ -3967,7 +3941,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Score-ascending order:** Full scan scheduling where dormant companies (low score) are processed first. Ensures active companies (already covered by adaptive) are last if workers run out of time.
 
-**adaptive_seen:** Per-company Redis SET (`adaptive_seen:{company}`) tracking all job IDs touched by adaptive scan within the current day. 24h TTL. DEL'd at full scan start. Prevents redundant DB lookups when the same job ID appears across multiple adaptive scans within a single day. Never rebuilt on Redis restart — the next adaptive scan repopulates it naturally.
+**adaptive_seen:** Per-company Redis SET (`adaptive_seen:{company}`) tracking all job IDs touched by adaptive scan within the current day. 24h TTL. DEL'd at full scan completion (after Bloom promotion). Prevents redundant DB lookups when the same job ID appears across multiple adaptive scans within a single day. Never rebuilt on Redis restart — the next adaptive scan repopulates it naturally.
 
 **bloom:fullscan:** Per-company RedisBloom filter (`bloom:fullscan:{company}`) representing the complete state of the job board as of the last full scan. 7-day TTL. Built fresh each full scan cycle from ALL fetched job IDs and promoted by one RENAME. Used by full scan as the handled-job gate; adaptive page-level early exit reads the previous (old) bloom through `EarlyExitGate`. Not rebuilt on Redis restart — next full scan runs as a cold start.
 
@@ -3995,7 +3969,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **Learned ceiling:** The empirically discovered maximum safe in-flight scan count for a platform/DC key. Stored in Redis as `worker:ceil:learned:{dc_key}`. Set when error-triggered worker reduction fires; decays +1 per 24h of clean operation. Never pre-configured — only discovered through observed behaviour.
 
-**In-flight ZSET (`inflight:scans:{dc_key}`):** Active sorted set tracking adaptive scan slots per DC key. Scored by dispatch timestamp; stale entries pruned by `ZREMRANGEBYSCORE` with `INFLIGHT_STALE_WINDOW_S`. Used together with `inflight:fullscans:{dc_key}` in the adaptive dispatch Lua script to enforce the per-DC ceiling atomically. Stream PEL (`XPENDING`) is monitoring-only — not used for ceiling enforcement.
+**In-flight ZSET (`inflight:scans:{dc_key}`):** Active sorted set tracking adaptive scan slots per DC key. Scored by dispatch timestamp; slots are never pruned by age: they are released on completion, by `claim_stale_work`, or by `sweep_inflight`. Used together with `inflight:fullscans:{dc_key}` in the adaptive dispatch Lua script to enforce the per-DC ceiling atomically. Stream PEL (`XPENDING`) is monitoring-only — not used for ceiling enforcement.
 
 **ATS outage mode:** State entered when 3 consecutive worker reductions fail to improve a platform's error rate. All dispatches for that platform are paused for 60 minutes (`worker:outage:{platform}` TTL key). Workers continue serving all other healthy platforms. A canary probe fires at 30 minutes for early recovery detection.
 
@@ -4029,13 +4003,13 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **on_fullscan_complete():** Callback fired when a company's first-ever full scan finishes. Transitions the company from NEW → WARMING: sets `warming_polls_remaining = 3`, schedules first adaptive poll at `now + initial_slot_offset_s` (always in the future — no midnight anchoring), ZADDs to `poll:adaptive`. Not called for subsequent full scans (only for the one that sets `last_full_scan_at` for the first time).
 
-**Dead-letter (stream):** When `XAUTOCLAIM` re-delivers a stream message more than `MAX_STREAM_REDELIVERIES` (5) times, the message is considered un-processable in-stream. The company is moved to `poll:adaptive` (or `poll:fullscan`) with exponential backoff, and the stream message is `XACK`'d. Prevents broken companies from looping in the PEL indefinitely.
+**Dead-letter (stream):** When `claim_stale_work` has reaped a company `MAX_STREAM_REDELIVERIES` (5) or more times (`reaped:{op}:{company}`), it logs at WARNING and the backoff is already long. Each reap moves the company to `poll:adaptive` (or `poll:fullscan`) with exponential backoff, and the stream message is `XACK`'d. Prevents broken companies from looping in the PEL indefinitely.
 
 **p95_full_scan_ms vs p95_listing_scan_ms:** Two distinct p95 latency values from `api_health`, keyed by `(dc_key, scan_type)`. Used separately: listing scan p95 governs adaptive stream idle timeout and dispatcher ceiling check; full scan p95 governs fullscan stream idle timeout and Rule 5 time gate. Using the wrong value (listing scan p95 for full scan timeouts) would reclaim legitimate 30-min scans after 10 minutes.
 
 **Rule 5 (pre-7 AM full scan trigger):** An addition to `on_adaptive_complete()` that triggers a full scan tonight when the next adaptive poll crosses to tomorrow morning AND the full scan for the current cycle has not yet run AND sufficient time remains before 7 AM. Prevents a full scan cycle from being silently skipped for companies with long adaptive intervals.
 
-**Inflight expiry timestamp:** The score stored in `inflight:scans:{dc_key}` — the Unix timestamp when the adaptive slot was claimed (dispatch time). Used by `ZREMRANGEBYSCORE` to prune stale entries that were never cleaned up (e.g. worker crash before ZREM). Also stored in `inflight:fullscans:{dc_key}` for fullscan slots with a separate longer stale window (`INFLIGHT_FULLSCAN_STALE_S`).
+**Inflight expiry timestamp:** The score stored in `inflight:scans:{dc_key}` — the Unix timestamp when the adaptive slot was claimed (dispatch time). Informational only: it is no longer used for age-based pruning. A leaked slot (e.g. worker crash before ZREM) is freed by `claim_stale_work` / `sweep_inflight`. The same score is stored in `inflight:fullscans:{dc_key}` for fullscan slots.
 
 **total_ms_ok (deferred):** A proposed `api_health` column tracking cumulative response time for successful (HTTP 200) requests only, separate from `total_ms` which includes all requests including timeouts. Deferred pending real data — the distortion from timeout inflation may be acceptable given that timed-out workers are genuinely occupied for that duration. To be revisited once production data confirms whether the difference is material for baseline accuracy.
 ---

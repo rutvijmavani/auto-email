@@ -161,6 +161,10 @@ redis.set(f"worker:{type}:busy_ms:{pid}", busy_ms, ex=cycle_s * 2)
 # P75 absorbs slow-platform outliers without being dominated by high-volume fast
 # platforms (Workday). We need an estimate with a margin, not sub-second precision.
 est_fetch_s = scaling_params[pool]["fetch_p75"]
+# The detail formula below uses the MEASURED service time s (manager._get_pool_service_time,
+# rolling window of busy seconds per finished job); est_fetch_s (P75) is only the fallback
+# while s is unknown (first call, no job finished yet, no heartbeat).
+est_fetch_s = service_s if service_s else est_fetch_s
 
 # ── Utilisation ────────────────────────────────────────────────────────────
 pool_busy_ms      = sum(redis.get(f"worker:{wtype}:busy_ms:{pid}") for pid in pool)
@@ -190,6 +194,9 @@ workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
 # _midnight_recompute with RENAME + ~25 h TTL, rebuilt from the DB when missing). Late names come from
 # manager._get_scan_pool_metrics (overdue ZSET members + undelivered stream entries, no cap).
 # If the late list or table is unreadable the pool keeps its last work-based need (_last_work_need).
+# On the FIRST cycle (or after a manager restart) there is no last work-based need: if the DB read
+# fails then, the pool falls back to the depth formula (depth / delay_warn_s + arrival_rate) times the
+# service time until the table can be read; it never uses 0.
 # Full text: docs/scan-fullscan-sizing-plan.md.
 
 # ── Urgent (1 cycle) — fires on either condition, only when understaffed ───
@@ -1625,7 +1632,11 @@ non_worker = connections held by processes that are not live workers
 per_worker = most connections any live worker process holds right now
 seat cap   = (cap − non_worker) // per_worker
 
-WORKER_SEAT_BUDGET (22) = seats the manager starts with
+WORKER_SEAT_BUDGET (22) = seats the manager starts with. It is also a FLOOR: the
+                          seat total in force never goes under it (manager.py `_drop_db_total`,
+                          `_current_seat_total`), so if the live Postgres seat cap falls below
+                          22 the planner's pool ceilings can still sum to more than the cap
+                          allows, and the pools may hold more workers than the DB can serve.
 DB_POOL_RAISE_STEP (5)  = raise step, in CONNECTIONS → max(1, 5 // per_worker) seats (2 today)
 DB_POOL_PROCESS_MAXCONN = per-process pool cap (db/connection.py), unrelated to the budget
 ```

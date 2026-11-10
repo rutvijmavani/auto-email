@@ -97,26 +97,33 @@ field (`scan_worker.py:578`).
 
 **2. Today (evidence).** `early_exit_miss_rate.py` gives "fullscan inserted it, posted more than 36h
 earlier" (`likely_miss`) plus undated. Not all of those are early-exit misses (long poll interval,
-failed scan, filter error), so the true number is at most this count. It also cannot see jobs that
-appeared and disappeared between two fullscans.
+failed scan, filter error), and misses recovered by a fullscan within 36h are not counted, so it is
+an indicator, not a bound in either direction. It also cannot see jobs that appeared and disappeared
+between two fullscans.
 
 **3. Proposed.**
 - `early_exit_triggered`: add `company_poll_stats.early_exit_polls BIGINT DEFAULT 0`, incremented in
   `upsert_poll_stats` when the scan's stop reason is early-exit (pass it from `scan_worker.py:594`,
   where `early_exited` is already known, `scan_worker.py:496`). Snapshot delta as in Decision A.
-- `early_exit_missed`: fill with the script's `likely_miss` rule, per company per day. Label the
-  block "up to N jobs (upper bound; not all caused by early exit)".
+- `early_exit_missed`: fill with the script's `likely_miss` rule, per company per day. This is a
+  scoped indicator, not a bound on all misses: it counts only fullscan inserts of jobs posted more
+  than 36h earlier on `LISTING_DATE_RELIABLE` platforms. Misses that a fullscan recovers within 36h,
+  jobs without a posting date, and platforms outside that list are not counted, and not every counted
+  job was caused by early exit (long poll interval, failed scan, filter error). The report label says
+  so.
 
 ## 5. Snapshot job
 
-- One function `db/adaptive_metrics.py::snapshot_day(day)`, idempotent (`INSERT ... ON CONFLICT
-  (date, company) DO UPDATE`), one row per company per day. Target: ~one statement per company, not
-  per poll.
-- Where it runs: OPEN (cron entry vs. a manager nightly task; the manager already has a 23:00 ET
-  nightly step). Decide in implementation step 4. It must run after midnight for the finished day
-  and backfill any missed days up to 7.
+- Entry point as built: `db/adaptive_metrics.py::run_nightly(today)` (originally planned as a single
+  `snapshot_day(day)`; it is split into `snapshot_counters` and `snapshot_jobs`). Idempotent
+  (`INSERT ... ON CONFLICT (date, company) DO UPDATE`), one row per company per day.
+- Where it runs: the manager's nightly recompute at 23:00 local time (not after midnight). It
+  records the CURRENT cumulative counters against today's date, refreshes the job metrics for today
+  (partial: the run is at 23:00) and yesterday (now complete), and backfills job metrics only for days
+  inside `ADAPTIVE_SNAPSHOT_BACKFILL_DAYS` that have NO rows at all. A day that is only partially
+  populated is not recovered; there is no after-midnight run.
 - Backfill of history is not possible for polls and scores (never stored). Tier counts and
-  detection age CAN be backfilled from `job_postings` for the last 14 days.
+  detection age CAN be backfilled from `job_postings` for days with no rows.
 
 ## 6. Blast radius
 
@@ -142,13 +149,15 @@ passing one flag.
 3. Schema: add the columns (company_poll_stats: `empty_polls`, `early_exit_polls`;
    adaptive_poll_metrics: `polls_cum`, `empty_polls_cum`, `early_exit_cum`, `adaptive_score`).
 4. `upsert_poll_stats`: increment the two new counters; thread `early_exited` from `scan_worker`.
-5. Write `db/adaptive_metrics.py::snapshot_day` and decide where it runs.
+5. Write `db/adaptive_metrics.py` (`run_nightly`, built from `snapshot_counters` + `snapshot_jobs`);
+   it runs in the manager's 23:00 recompute.
 6. Fix the `adaptive_health` queries (column name, per-company stddev, label changes).
 7. Update `tests/test_adaptive_health.py` fixtures; add tests for the snapshot delta (first night = 0,
    counter reset/negative delta clamps to 0) and for the new upsert counters.
 8. Update the Monday section header text and the codebase map; correct
    `docs/ats-fetch-strategy.md` (company_config claim) in the same pass.
-9. VM: deploy, run `snapshot_day` once by hand, check rows, read the next Monday digest.
+9. VM: deploy, run `db.adaptive_metrics.run_nightly(date.today())` once by hand (the manager passes
+   its local date), check rows, read the next Monday digest.
 
 ## 8. Retention (decided 2026-11-07: config-driven, default 90 days)
 
@@ -164,8 +173,11 @@ daily 07:00 `pipeline.py --monitor-jobs` cron (`setup_cron.sh:293-308`), so clea
 the manager. Proof it works: `api_health` oldest row sits exactly at its 60-day cutoff on the VM.
 The manager step does NOT run cleanup. 90 covers the 14-day
 score window, the 7-day Monday report and the 7-day backfill with margin. The snapshot's `*_cum`
-baseline is read from the latest row, so retention must never delete a company's latest row
-(cutoff is far beyond the 7-day backfill, so safe).
+baseline is read from the latest row. `_cleanup_adaptive_poll_metrics` deletes by date only and does
+NOT protect a company's latest row: if snapshots stop for longer than the retention window, the
+company's baseline is deleted and the next night writes cumulative values with a delta of 0 (a
+one-night gap in that company's counts, no spike). With 90 days of retention against a nightly job
+this needs a three-month outage; it is accepted rather than guarded.
 
 ## 9. Open points
 

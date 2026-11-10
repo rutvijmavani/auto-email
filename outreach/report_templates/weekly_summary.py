@@ -277,6 +277,7 @@ def _get_detect_stats():
 # ─────────────────────────────────────────
 
 def _build_find_section(stats):
+    """Return the HTML block for the weekly find stats."""
     found    = stats.get("total_found", 0)
     companies = stats.get("companies_found", 0)
     return f"""
@@ -293,6 +294,7 @@ def _build_find_section(stats):
 
 
 def _build_verify_section(stats):
+    """Return the HTML block for the weekly verification stats."""
     verified = stats.get("verified", 0)
     inactive = stats.get("inactive", 0)
     return f"""
@@ -312,6 +314,7 @@ def _build_verify_section(stats):
 
 
 def _build_outreach_section(stats):
+    """Return the HTML block for the weekly outreach stats."""
     sent          = stats.get("sent", 0)
     replies       = stats.get("replies", 0)
     bounced       = stats.get("bounced", 0)
@@ -340,6 +343,7 @@ def _build_outreach_section(stats):
 
 
 def _build_health_section(summary):
+    """Return the HTML block for the 7-day API health summary."""
     rows = summary.get("rows", [])
     if not rows:
         return f"""
@@ -402,6 +406,7 @@ def _build_health_section(summary):
 
 
 def _build_enrich_section(stats):
+    """Return the HTML block for the enrichment progress stats."""
     total    = stats.get("total", 0)
     enriched = stats.get("enriched", 0)
     pending  = stats.get("pending", 0)
@@ -443,6 +448,7 @@ def _build_enrich_section(stats):
 
 
 def _build_detect_section(stats):
+    """Return the HTML block for the detection queue stats."""
     p1 = stats.get("priority1_new", 0) or 0
     p2 = stats.get("priority2_quiet", 0) or 0
     p3 = stats.get("priority3_unknown", 0) or 0

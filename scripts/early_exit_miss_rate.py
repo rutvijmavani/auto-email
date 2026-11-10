@@ -14,8 +14,9 @@ A raw tier2 share overstates misses, so three things are separated:
   * likely_miss - tier2 rows posted more than --lag-hours before the insert (adaptive had at least one
                   scan window to see it) PLUS tier2 rows with no posted_at (unknown, shown apart).
 
-No per-scan history is stored (company_ats.last_checked_at is overwritten), so this is an upper bound
-on early-exit misses, not an exact count.  Compare windows before and after the early-exit deploy.
+No per-scan history is stored (company_ats.last_checked_at is overwritten), so this is an indicator,
+not an exact count or a bound: misses a fullscan recovers within --lag-hours are not counted, and
+not every counted row is an early-exit miss.  Compare windows before and after the early-exit deploy.
 
 Usage:
     python scripts/early_exit_miss_rate.py [--days 14] [--lag-hours 36] [--cold-hours 24] [--top 15]
