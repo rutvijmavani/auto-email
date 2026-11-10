@@ -1212,15 +1212,21 @@ def init_db():
     # lets two concurrent inserts both pass.  The index is created only when no duplicates
     # exist, so a database that already has some keeps starting; those must be resolved by hand
     # (the query below lists them) and the next init_db then adds the index.
-    _dups = c.execute("""
-        SELECT COUNT(*) AS n FROM (
-            SELECT 1 FROM job_postings
-            WHERE job_id IS NOT NULL AND job_id <> '' AND ats_platform IS NOT NULL
-            GROUP BY company, ats_platform, job_id
-            HAVING COUNT(*) > 1
-        ) d
-    """).fetchone()
-    _dup_n = _dups["n"] if _dups else 0
+    # Skip the full-table GROUP BY once the index exists (it already guarantees no dups).
+    _idx_exists = c.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_job_postings_company_platform_jobid'"
+    ).fetchone()
+    _dup_n = 0
+    if not _idx_exists:
+        _dups = c.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT 1 FROM job_postings
+                WHERE job_id IS NOT NULL AND job_id <> '' AND ats_platform IS NOT NULL
+                GROUP BY company, ats_platform, job_id
+                HAVING COUNT(*) > 1
+            ) d
+        """).fetchone()
+        _dup_n = _dups["n"] if _dups else 0
     if _dup_n:
         print(f"[WARN] job_postings has {_dup_n} duplicate (company, ats_platform, job_id) "
               f"groups — unique index idx_job_postings_company_platform_jobid NOT created; "

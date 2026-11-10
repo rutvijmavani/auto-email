@@ -1384,7 +1384,7 @@ def _maybe_reschedule_full_scan(company: str, row) -> None:
     )
 
 
-# loop -> (up_since, last_write_ts, last_ttl) of the current heartbeat run
+# loop -> (up_since, last_write_ts, last_ttl, last_ready) of the current heartbeat run
 _hb_run: dict = {}
 
 
@@ -1405,8 +1405,11 @@ def _write_scheduler_heartbeat(r, loop: str, dispatched: int, ttl: int = 30,
     """
     now = time.time()
     prev = _hb_run.get(loop)
-    up_since = prev[0] if prev and now - prev[1] <= prev[2] else now
-    _hb_run[loop] = (up_since, now, ttl)
+    # A not-ready write (startup, dispatch not yet running) never extends a run, and the
+    # first ready write after it starts a new one: startup time is not dispatch uptime.
+    continues = bool(prev and ready and prev[3] and now - prev[1] <= prev[2])
+    up_since = prev[0] if continues else now
+    _hb_run[loop] = (up_since, now, ttl, ready)
     try:
         r.set(f"worker:alive:scheduler:{loop}", json.dumps({
             "pid":        os.getpid(),

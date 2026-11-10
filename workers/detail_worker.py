@@ -1267,10 +1267,12 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             try:
                 payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                if not isinstance(payload, dict):
+                    raise ValueError(f"payload is {type(payload).__name__}, not an object")
+            except ValueError as exc:      # JSONDecodeError is a ValueError
                 # Malformed payload — can never succeed, remove from inflight
                 logger.error(
-                    "detail_worker: bad JSON in %s: %s | raw=%r",
+                    "detail_worker: bad payload in %s: %s | raw=%r",
                     source_queue, exc, raw[:200],
                 )
                 try:
