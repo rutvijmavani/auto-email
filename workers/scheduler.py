@@ -2240,9 +2240,9 @@ def _start_state(r, ptype: str, pool: list) -> dict:
             age = now - info[1]
             pending += 1
             oldest = max(oldest, age)
-            # still inside its start-up allowance: expected to join, so it counts
-            # as a worker (before any start was observed the kill deadline applies)
-            if hw <= 0 or age <= hw * PROGRESS_GAP_FACTOR:
+            # still inside its start-up allowance: expected to join, so it counts as a
+            # worker; the allowance is the same one _unstarted_pids kills at
+            if age <= max(hw * PROGRESS_GAP_FACTOR, float(PROGRESS_COLD_GAP_S)):
                 starting += 1
     return {
         "started":                len(pool) - pending,

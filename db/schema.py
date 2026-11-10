@@ -1215,7 +1215,7 @@ def init_db():
     _dups = c.execute("""
         SELECT COUNT(*) AS n FROM (
             SELECT 1 FROM job_postings
-            WHERE job_id IS NOT NULL AND job_id <> ''
+            WHERE job_id IS NOT NULL AND job_id <> '' AND ats_platform IS NOT NULL
             GROUP BY company, ats_platform, job_id
             HAVING COUNT(*) > 1
         ) d

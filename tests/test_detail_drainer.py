@@ -50,6 +50,7 @@ class FakeConn:
 
     def __init__(self, held, events):
         self.held, self.events = list(held), events
+        self.claimed = []
 
     def execute(self, sql, params=None):
         if "COUNT(*)" in sql:
@@ -57,8 +58,14 @@ class FakeConn:
                          "oldest_id": self.held[0]["id"] if self.held else None}])
         if sql.lstrip().startswith("SELECT id"):
             return Cur(self.held[:params[0]])
-        self.events.append(("update", tuple(params[0])))
         ids = set(params[0])
+        if "pushed_at = NULL" in sql:         # re-hold after a failed push
+            self.events.append(("rehold", tuple(params[0])))
+            self.held = sorted(self.held + [c for c in self.claimed if c["id"] in ids],
+                               key=lambda h: h["id"])
+            return Cur([])
+        self.events.append(("update", tuple(params[0])))
+        self.claimed += [h for h in self.held if h["id"] in ids]
         out = [{"id": h["id"]} for h in self.held if h["id"] in ids]
         self.held = [h for h in self.held if h["id"] not in ids]
         return Cur(out)
@@ -155,6 +162,23 @@ class TestDrainOnce(unittest.TestCase):
         self.assertEqual(out["released"], 1)
         self.assertAlmostEqual(out["tokens"], 4.0)
         self.assertEqual(conn.held, [])
+
+    def test_push_failure_reholds_unpushed_rows_and_keeps_tokens(self):
+        r, conn, events = _setup([_row(1), _row(2), _row(3)], tokens=5.0)
+        real_lpush, calls = r.lpush, []
+
+        def flaky(k, v):
+            calls.append(k)
+            if len(calls) == 2:
+                raise ConnectionError("redis down")
+            real_lpush(k, v)
+
+        r.lpush = flaky
+        with self.assertRaises(ConnectionError):
+            self._run(r, conn)
+        self.assertEqual([h["id"] for h in conn.held], [2, 3])   # row 1 was pushed
+        self.assertIn(("rehold", (2, 3)), events)
+        self.assertEqual(json.loads(r.kv[dd.TOKENS_KEY])["tokens"], 5.0)
 
     def test_held_figures_published(self):
         r, conn, _ = _setup([_row(1), _row(2)], tokens=0.0)

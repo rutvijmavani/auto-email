@@ -1142,9 +1142,12 @@ def _plan_detail_nightly(r, params: dict) -> "dict | None":
 
     s = _stored_service_time(r, "detail")
     s_src = "window"
-    if s is None:
+    if s is None or s <= 0:
         s = params.get("detail", _FALLBACK_PARAMS["detail"])["fetch_p75"]
         s_src = "fetch_p75"
+    if s <= 0:      # a zero stored p75 must not reach the sizing (division by s)
+        s = _FALLBACK_PARAMS["detail"]["fetch_p75"]
+        s_src = "fallback"
 
     first = _plan_ceilings(r, ["scan", "fullscan"])      # scan and fullscan first
     others = sum(v["ceil"] for v in first["pools"].values())
