@@ -35,7 +35,11 @@ cannot be derived from what is stored. `company_poll_stats` keeps only running t
 - Add `company_poll_stats.empty_polls BIGINT DEFAULT 0`, incremented in `upsert_poll_stats` in the
   same statement that increments `total_polls`, when `new_jobs = 0`. `upsert_poll_stats` is step 7 of
   a completed scan, so a failed scan does not count as wasted. (Verify the failure path never reaches
-  it, implementation step 2.)
+  it, implementation step 2.) Exception, PROVEN in code: an Avature SearchJobs pagination failure
+  that still returns partial stubs (`scan_worker.py:407-416`, `_fetch_complete = False`) continues to
+  `upsert_poll_stats` with `success=True`, so an incomplete fetch whose partial results hold no new
+  jobs DOES increment `empty_polls`. Such a poll is counted as wasted although the board was not fully
+  read; accepted (rare, and the partial scan is a real poll), not gated.
 - `adaptive_poll_metrics.wasted_polls` for day D = `empty_polls` now minus `empty_polls` at the
   previous snapshot. `total_polls` the same way.
 - The snapshot needs the previous cumulative value per company. Add `polls_cum BIGINT` and
@@ -74,8 +78,11 @@ never filled. The source data does exist: `job_postings.found_by` (`tier1_adapti
 **2. Today (evidence).** `scripts/early_exit_miss_rate.py` already derives miss rate from these
 columns on demand, with cold start (24h after a company's first row) excluded. Nothing runs it on a
 schedule. Two limits: (a) `posted_at` is a real timestamp only on some platforms (the script says so
-at its docstring); (b) `created_at` is the time the DETAIL stage inserted the row, so it includes
-detail-queue delay, not only scan detection time. OPEN: which of the 23 feeders in `jobs/ats/`
+at its docstring); (b) `created_at` is set when the SCAN inserts the `pending_detail` row
+(`save_pending_detail` does not list it, so the column default applies; `complete_pending_detail` at
+`db/job_monitor.py:913` does not update it). So `created_at - posted_at` is posting-to-scan-insert
+time and does NOT include detail-queue delay. If that delay is ever wanted, a detail-completion
+timestamp must be recorded first. OPEN: which of the 23 feeders in `jobs/ats/`
 fill `posted_at` with a real time (113 mentions across 23 files, not yet read per platform).
 
 **3. Proposed.**
@@ -85,7 +92,7 @@ fill `posted_at` with a real time (113 mentions across 23 files, not yet read pe
 - Detection age buckets use `created_at - posted_at` and count only platforms on an allow-list of
   real-timestamp feeders (config list, built in implementation step 1 from the feeder code and a VM
   query). Other platforms contribute to counts but not to age buckets; the report shows "n/a" for
-  them. The block is labelled "includes detail-queue delay".
+  them. The block is labelled "posting time to scan-insert time" (it does not include detail-queue delay).
 - Evidence query for step 1 (run on the VM):
   `SELECT ats_platform, COUNT(*) n, COUNT(posted_at) dated, COUNT(*) FILTER (WHERE posted_at::time <> '00:00') timed FROM job_postings WHERE created_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY n DESC;`
 
@@ -107,7 +114,8 @@ between two fullscans.
   where `early_exited` is already known, `scan_worker.py:496`). Snapshot delta as in Decision A.
 - `early_exit_missed`: fill with the script's `likely_miss` rule, per company per day. This is a
   scoped indicator, not a bound on all misses: it counts only fullscan inserts of jobs posted more
-  than 36h earlier on `LISTING_DATE_RELIABLE` platforms. Misses that a fullscan recovers within 36h,
+  than `ADAPTIVE_MISS_LAG_HOURS` earlier (config, default 36; the report label shows the configured
+  value) on `LISTING_DATE_RELIABLE` platforms. Misses that a fullscan recovers within that lag,
   jobs without a posting date, and platforms outside that list are not counted, and not every counted
   job was caused by early exit (long poll interval, failed scan, filter error). The report label says
   so.
@@ -119,7 +127,10 @@ between two fullscans.
   (`INSERT ... ON CONFLICT (date, company) DO UPDATE`), one row per company per day.
 - Where it runs: the manager's nightly recompute at 23:00 local time (not after midnight). It
   records the CURRENT cumulative counters against today's date, refreshes the job metrics for today
-  (partial: the run is at 23:00) and yesterday (now complete), and backfills job metrics only for days
+  (partial: the run is at 23:00) and yesterday (re-read at its end, NOT guaranteed final: a
+  `pending_detail` row can later change status or posting date, and deleting a company's last
+  qualifying row leaves that company's earlier stored count unchanged because the snapshot only
+  upserts rows it finds; changed or deleted rows are not reconciled), and backfills job metrics only for days
   inside `ADAPTIVE_SNAPSHOT_BACKFILL_DAYS` that have NO rows at all. A day that is only partially
   populated is not recovered; there is no after-midnight run.
 - Backfill of history is not possible for polls and scores (never stored). Tier counts and
@@ -156,8 +167,9 @@ passing one flag.
    counter reset/negative delta clamps to 0) and for the new upsert counters.
 8. Update the Monday section header text and the codebase map; correct
    `docs/ats-fetch-strategy.md` (company_config claim) in the same pass.
-9. VM: deploy, run `db.adaptive_metrics.run_nightly(date.today())` once by hand (the manager passes
-   its local date), check rows, read the next Monday digest.
+9. VM: deploy, run `db.adaptive_metrics.run_nightly(<date in MANAGER_RECOMPUTE_TZ>)` once by hand: derive the date
+   the way the manager's `_recompute_date()` does (`datetime.now(ZoneInfo(MANAGER_RECOMPUTE_TZ)).date()`),
+   not the host-local `date.today()`, check rows, read the next Monday digest.
 
 ## 8. Retention (decided 2026-11-07: config-driven, default 90 days)
 

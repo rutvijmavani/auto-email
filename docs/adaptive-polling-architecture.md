@@ -3551,7 +3551,7 @@ for l in sys.stdin:
 - `poll:adaptive` ZSET → `stream:adaptive:{dc_key}` — adaptive dispatcher, scan workers via XREADGROUP
 - `poll:fullscan` ZSET → `stream:fullscan` — full scan dispatcher, full scan workers via XREADGROUP
 - `inflight:scans:{dc_key}` ZSET active — used with `inflight:fullscans:{dc_key}` for per-DC ceiling enforcement in the adaptive dispatch Lua script; Stream PEL (`XPENDING`) is monitoring-only
-- Watchdog process retired — `XAUTOCLAIM` handles crash recovery (10 min for adaptive, 20 min for full scan)
+- Crash recovery is the scheduler's owner-state reaper (`claim_stale_work`, `workers/scheduler.py`): it reaps entries whose owning worker is no longer RUNNING after two sightings and applies a backoff delay. The original `XAUTOCLAIM` idle-timeout design (10 min adaptive, 20 min full scan) described elsewhere in this document is superseded.
 - `ZPOPMIN` replaced by `ZRANGEBYSCORE` → `XADD` → `ZREM` pattern (crash between XADD and ZREM is idempotent)
 
 Hash-based slot assignment (Section 24): `now + slot_offset(batch_position)` for NEW → WARMING bootstrap; `now + adaptive_interval` for STABLE recurring polls — using `hashlib.md5`, not Python's `hash()`. No midnight anchoring — `now + offset` is always in the future regardless of time-of-day and distributes load evenly throughout the day. WARMING state persisted in `warming_polls_remaining` + `initial_slot_offset_s` columns (survives restarts). `on_fullscan_complete()` defined — bootstraps NEW → WARMING. `on_adaptive_complete()` Rule 5 (pre-7 AM full scan trigger) uses `p95_full_scan_s`, not listing scan p95. Dawn patrol removed.

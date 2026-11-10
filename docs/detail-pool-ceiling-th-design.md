@@ -328,6 +328,8 @@ Rule: steps 1-6 are additive (nothing changes behaviour until step 9). Step 9 is
 
 column and table, then backfill, then drainer running, then producers save-only. If producers switch before the drainer runs, jobs are held with nobody releasing them. If the drainer starts before the backfill, jobs already queued are queued again (harmless but wasteful).
 
+The drainer also needs the manager to be publishing `manager:detail_bucket` (`_publish_detail_bucket`, written after each pool loop, TTL 3 cycles). With no params key it releases nothing (`workers/detail_drainer.py` module docstring), so the new manager code must be live and have completed one cycle before producers go save-only, or held rows wait until it does. The step-9 backfill and the manager deploy ship together; the backfill still runs before the drainer starts.
+
 ### 10.6 Gaps found in this review (to settle before or during the build)
 
 - H1. RESOLVED 2026-11-02 (user): the backlog term B for detail stays the Redis queue only; `held_count` is NOT added. Reason: the bucket releases at the ceiling rate whatever the live worker count, so the queue refills and the target rises and spawns workers (only a cycle or two of lag, inside D); widening the bucket while held jobs wait and the queue is small is desired; held count is already used by the lender gate, the shortfall trigger and the alert. Keeping the two signals (held backlog, queue delay) separate was the intent.

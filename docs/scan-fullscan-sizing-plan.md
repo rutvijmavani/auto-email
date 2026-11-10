@@ -111,7 +111,7 @@ completion event reaches `on_adaptive_complete`); `workers/rebuild.py` (ZSET reb
    and every undelivered stream entry (no cap), and an unreadable read is reported as UNKNOWN, not
    as a zero (today `_get_queue_metrics` falls back to depth 0 / delay 0 at line 534).
 5. `_run_pool_cycle`: for scan and fullscan compute `needed` from backlog + steady; detail path
-   untouched; keep delay multiplier, `_needed_workers`, clamp.
+   untouched; keep `_needed_workers` and the clamp (there is no delay multiplier).
 6. Nightly: `_midnight_recompute` rebuilds both tables before the ceiling plan.
 7. Delete `_remaining_work_minimum` and `_slow_throughput_check_loop` after confirming the Redis
    memory alert it contains (scheduler.py 2994-) lives elsewhere (scheduler.py:2898 says it was
@@ -128,7 +128,10 @@ completion event reaches `on_adaptive_complete`); `workers/rebuild.py` (ZSET reb
 * The table is a second copy of DB values; drift is bounded by the nightly rebuild and
   rebuild-on-missing.
 * The late-name read costs O(late); measure with a log field before assuming it is small.
-* The formula clears a backlog in about H, it does not promise a deadline per company;
-  the delay multiplier and urgent gate remain the escalation.
+* H is a sizing horizon (the pool `delay_warn_s`), not a promised clearance time. The formula
+  sizes the pool so total backlog work is spread over H; it does not guarantee a deadline per
+  company. A single long scan (for example 7,000 s) cannot finish inside a short horizon (for
+  example 1,683 s) even with a dedicated worker; the per-company term is capped at 1 worker
+  (`min(d/H, 1)`) for that reason. The urgent / scale-up gates remain the escalation.
 * Open (separate): 90 of 92 companies with under 10 s average duration may be empty or failed
   boards (silent-failure angle).

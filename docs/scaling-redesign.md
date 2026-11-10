@@ -188,7 +188,7 @@ workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
 #   steady  = ( sum over ALL companies c of d_c / (d_c + T_c) ) / MANAGER_SCALE_UP_UTIL
 # d_c = DB EMA (avg_scan_duration_s / avg_fullscan_duration_s); T_c = current_interval_s (scan) or
 # full_scan_interval_s (fullscan); next run = completion + interval, so steady load is d/(d+T).
-# A late company with no entry uses fetch_p75; unknown is never 0. The delay multiplier, clamp,
+# A late company with no entry uses fetch_p75; unknown is never 0. The clamp,
 # urgent / scale-up / scale-down gates, _needed_workers pre-clamp record and Layer 1/2 are unchanged.
 # Data: workers/company_load.py (Redis hash per pool, updated by Lua after each scan, rebuilt nightly in
 # _midnight_recompute with RENAME + ~25 h TTL, rebuilt from the DB when missing). Late names come from
@@ -447,6 +447,12 @@ Outcome: system drains to healthy state without ever breaching DELAY_WARN_S.
 ---
 
 #### Scan Workers
+
+> **Superseded for scan and fullscan sizing (2026-10-29):** the worked examples below for Scan and
+> Fullscan Workers use the old `time_left` / `drain_rate` formula and a 75% dispatch throttle. Neither
+> is in the code: scan and fullscan `needed` now comes from `backlog + steady` (see the formula
+> above) with a fixed horizon H, and no dispatch throttle is built. Only the Detail Workers examples
+> above still match the code. The scan/fullscan numbers are kept as history, not as current behaviour.
 
 ```
 est_fetch_s ≈ 40s (P75 of avg_scan_duration_s distribution)  |  DELAY_WARN_S = 1800s  |  ceil = 10  |  floor = 2  |  cycle = 60s
