@@ -6,7 +6,7 @@ Exercises what is actually implemented in workers/manager.py (not design-doc con
   A. _get_worker_ceil — Redis hit, Redis parse error, bootstrap fallback, floor clamp
   B. _midnight_recompute — bootstrap mode writes BOOTSTRAP_CEIL; post-28d formula caps
      at MONITOR_MAX_WORKERS; volatility buffer applied; pool error is isolated
-  C. Combined budget invariant — BOOTSTRAP_CEIL sum ≤ DB_POOL_MAXCONN - 3
+  C. Combined budget invariant — BOOTSTRAP_CEIL sum ≤ WORKER_SEAT_BUDGET
   D. _midnight_recompute formula cap — computed ceil never exceeds MONITOR_MAX_WORKERS
 """
 
@@ -25,13 +25,13 @@ from workers.manager import (
     _midnight_recompute,
 )
 from config import (
-    DB_POOL_MAXCONN,
+    WORKER_SEAT_BUDGET,
     MONITOR_MAX_WORKERS,
     WORKER_FLOOR,
 )
 
-# Budget: 3 connections reserved for scheduler/manager
-_DB_BUDGET = DB_POOL_MAXCONN - 3
+# Budget: worker seats the manager starts with
+_DB_BUDGET = WORKER_SEAT_BUDGET
 _POOLS = ["scan", "detail", "fullscan"]
 
 
@@ -217,12 +217,12 @@ class TestMidnightRecomputeFormula(unittest.TestCase):
 class TestCombinedBudgetInvariant(unittest.TestCase):
     """
     BOOTSTRAP_CEIL values and formula-mode ceilings must stay within the
-    DB_POOL_MAXCONN budget (DB_POOL_MAXCONN - 3 = 22 for production).
+    WORKER_SEAT_BUDGET (22 for production).
     """
 
     def test_bootstrap_ceil_sum_within_budget(self):
         """
-        The documented budget constraint is scan_ceil + detail_ceil ≤ DB_POOL_MAXCONN - 3.
+        The documented budget constraint is scan_ceil + detail_ceil ≤ WORKER_SEAT_BUDGET.
         Fullscan is excluded from this check (it does not hold long-lived DB connections
         the way scan/detail workers do).
         """
@@ -234,14 +234,14 @@ class TestCombinedBudgetInvariant(unittest.TestCase):
 
     def test_monitor_max_workers_fits_within_db_budget(self):
         """
-        MONITOR_MAX_WORKERS ≤ DB_POOL_MAXCONN - 3: a single pool at its maximum
+        MONITOR_MAX_WORKERS ≤ WORKER_SEAT_BUDGET: a single pool at its maximum
         cannot exhaust the DB connection budget on its own.
         The sum of all pools CAN exceed the budget — that is intentional, since pools
         cannot all simultaneously reach their individual maxima.
         """
         self.assertLessEqual(
-            MONITOR_MAX_WORKERS, DB_POOL_MAXCONN - 3,
-            f"MONITOR_MAX_WORKERS={MONITOR_MAX_WORKERS} exceeds per-pool DB budget={DB_POOL_MAXCONN - 3}",
+            MONITOR_MAX_WORKERS, WORKER_SEAT_BUDGET,
+            f"MONITOR_MAX_WORKERS={MONITOR_MAX_WORKERS} exceeds per-pool DB budget={WORKER_SEAT_BUDGET}",
         )
 
     def test_each_bootstrap_pool_below_individual_monitor_max(self):

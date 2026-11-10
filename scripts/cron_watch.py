@@ -188,7 +188,7 @@ def due_slots(expr: str, tz_name: str, since: float, until: float) -> list[float
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(tz_name)
     else:
-        tz = datetime.now().astimezone().tzinfo
+        tz = None    # naive local time: .timestamp() applies the DST offset in force on each date
     it = croniter(expr, datetime.fromtimestamp(since, tz))
     slots: list[float] = []
     while True:

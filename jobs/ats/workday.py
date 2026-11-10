@@ -7,7 +7,7 @@ from datetime import datetime
 from config import FETCH_TOLERANCE_PCT, WORKDAY_FACET_SPLIT_AT, WORKDAY_PAGE_SIZE, WORKDAY_RESULT_CAP, WORKDAY_SPLIT_FACETS
 from jobs.ats.base import fetch_json, fetch_json_post, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_PAGE_CAP, STOP_REQUEST_FAILED, TOTAL_ATS, TOTAL_FACET_SUM,
     attach, count_distinct,
 )
 from jobs.utils import clean_html
@@ -109,10 +109,10 @@ def _get_path_variants(slug, company):
     return variants
 
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for company from Workday.
-    Handles pagination.
+    Handles pagination. stop_check: adaptive-scan EarlyExitGate (fresh gate per facet slice).
     Returns list of normalized job dicts.
     slug_info = {"slug": "att", "wd": "wd1", "path": "ATTGeneral"}
     """
@@ -125,21 +125,27 @@ def fetch_jobs(slug_info, company):
     # fetched as one query per facet value (jobFamilyGroup, then timeType/workerSubType if a slice is
     # still too large) and the slices are merged by job path.
     rep      = {"pages": 0, "failed": False, "capped": False, "expected": None}
-    first    = _fetch_pages(url, {}, company, defer_large=True, rep=rep)
-    all_jobs = _collect(url, {}, (), first, company, rep, first[1] or None)
+    norm = None
+    if stop_check is not None:
+        def norm(j):
+            return _normalize(j, company, domain, path, slug_info) if j.get("title") else None
+    first    = _fetch_pages(url, {}, company, defer_large=True, rep=rep, gate=stop_check, norm=norm)
+    all_jobs = _collect(url, {}, (), first, company, rep, first[1] or None, gate=stop_check, norm=norm)
 
     results = []
     for j in all_jobs:
         if not j.get("title"):
             continue
-        norm = _normalize(j, company, domain, path, slug_info)
-        if norm is not None:
-            results.append(norm)
+        item = _normalize(j, company, domain, path, slug_info)
+        if item is not None:
+            results.append(item)
 
     if rep["failed"]:
         stop = STOP_REQUEST_FAILED
     elif rep["capped"]:
         stop = STOP_PAGE_CAP
+    elif rep.get("early"):
+        stop = STOP_EARLY_EXIT
     else:
         stop = STOP_ALL_PAGES
     split = rep["expected"] is not None
@@ -161,7 +167,7 @@ def _job_key(posting):
             or f"{posting.get('title', '')}|{posting.get('locationsText', '')}")
 
 
-def _fetch_pages(url, applied, company, defer_large=False, rep=None):
+def _fetch_pages(url, applied, company, defer_large=False, rep=None, gate=None, norm=None):
     """
     Page one query (optionally filtered by appliedFacets) until its reported total is reached.
 
@@ -175,6 +181,9 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None):
 
     rep: optional dict collecting the completeness facts ("pages" count, "failed" on a failed or
     short-ended page) for the FetchReport built in fetch_jobs.
+
+    gate / norm: adaptive-scan EarlyExitGate and the raw->normalized job function; the gate sees each
+    non-final page's normalized jobs and True ends this query ("early" is set on rep).
     """
     postings, offset, total, facets = [], 0, None, []
     while True:
@@ -188,9 +197,10 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None):
         if not data:
             if rep is not None:
                 rep["failed"] = True
-            if offset or total:
-                logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
-                               "— partial result", offset, total, company, applied)
+            # S0: log page 1 too — a failed first page is "0 fetched", not an empty board.
+            logger.warning("workday fetch: request failed at offset=%d (total=%s) for %r applied=%s "
+                           "— %s", offset, total, company, applied,
+                           "partial result" if (offset or total) else "no data")
             break
         jobs = data.get("jobPostings", [])
         if total is None:
@@ -208,6 +218,12 @@ def _fetch_pages(url, applied, company, defer_large=False, rep=None):
         if offset >= total:
             break
         if defer_large and total >= WORKDAY_FACET_SPLIT_AT:
+            break
+        # Adaptive scan: a page of only already-seen jobs counts toward the gate's streak. Never on the
+        # last page (handled above) or on a deferred large query, so the board end stays STOP_ALL_PAGES.
+        if gate is not None and norm is not None and gate([j for j in map(norm, jobs) if j]):
+            if rep is not None:
+                rep["early"] = True
             break
     return postings, total or 0, facets
 
@@ -241,7 +257,7 @@ def _pick_split_facet(facets, used):
     return None, []
 
 
-def _collect(url, applied, used, first, company, rep=None, slice_count=None):
+def _collect(url, applied, used, first, company, rep=None, slice_count=None, gate=None, norm=None):
     """
     Return every posting reachable for `applied`: the plain paged result when it is under the split
     threshold, otherwise the union (deduped by _job_key) of one query per facet value, recursing with
@@ -267,21 +283,31 @@ def _collect(url, applied, used, first, company, rep=None, slice_count=None):
     merged = {}
     for value in values:
         slice_applied = {**applied, name: [value["id"]]}
+        # Each facet slice is its own list with its own order: it gets a fresh gate (streak 0).
+        slice_gate = gate.fresh() if gate is not None and hasattr(gate, "fresh") else gate
         for p in _collect(url, slice_applied, used + (name,),
-                          _fetch_pages(url, slice_applied, company, defer_large=True, rep=rep),
-                          company, rep, value.get("count")):
+                          _fetch_pages(url, slice_applied, company, defer_large=True, rep=rep,
+                                       gate=slice_gate, norm=norm),
+                          company, rep, value.get("count"), gate=slice_gate, norm=norm):
             merged.setdefault(_job_key(p), p)
-    if slice_count and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
-        logger.warning("workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
-                       "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
+    early = bool(rep and rep.get("early"))
+    if slice_count and not early and len(merged) < slice_count * (1 - FETCH_TOLERANCE_PCT / 100):
+        # WW: a nested split routinely misses jobs lacking the new facet (e.g. a city); that is
+        # expected, and the board-level result is still flagged capped below. WARNING only at top level.
+        (logger.info if used else logger.warning)(
+            "workday fetch: %r slice %s reports %d jobs but split by %s fetched %d distinct "
+            "— some jobs carry no %s value", company, applied, slice_count, name, len(merged), name)
         if rep is not None:
             rep["capped"] = True
     expected = sum(v.get("count", 0) for v in values)
     if rep is not None and not used:
         rep["expected"] = expected
-    if len(merged) < expected:
-        logger.warning("workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
-                       company, name, len(merged), expected, applied)
+    if early:
+        logger.info("workday fetch: %r split by %s early exit, %d distinct jobs read", company, name, len(merged))
+    elif len(merged) < expected:
+        (logger.info if used else logger.warning)(   # WW: nested shortfall is covered by the slice check above
+            "workday fetch: %r split by %s fetched %d distinct of %d expected (applied=%s)",
+            company, name, len(merged), expected, applied)
     else:
         logger.info("workday fetch: %r split by %s into %d slices, %d distinct jobs",
                     company, name, len(values), len(merged))
@@ -329,19 +355,25 @@ def fetch_job_detail(job):
 
     data = fetch_json(url, platform="workday", headers=WORKDAY_HEADERS)
     if not data:
-        logger.debug(
+        logger.warning(
             "workday.fetch_job_detail: API returned None/empty for %r | %s | url=%s",
             job.get("company"), job.get("job_id"), url,
         )
+        # DF: request failed (non-JSON 200, throttle, etc.) — tell detail_worker
+        # this is a retryable empty, not "nothing to enrich".
+        job = dict(job)
+        job["_detail_failed"] = True
         return job
 
     info = data.get("jobPostingInfo", {})
     if not info:
-        logger.debug(
+        logger.warning(
             "workday.fetch_job_detail: jobPostingInfo absent/empty for %r | %s "
             "| top-level keys=%s",
             job.get("company"), job.get("job_id"), list(data.keys()),
         )
+        job = dict(job)
+        job["_detail_failed"] = True
         return job
 
     job = dict(job)
@@ -494,6 +526,9 @@ def _normalize(job, company, domain, path, slug_info=None):
                 from datetime import timedelta
                 posted_at = datetime.utcnow() - timedelta(days=1)
             elif "30+" in posted:
+                # W30: "Posted 30+ Days Ago" is only a lower bound.  The listing gives no
+                # real date, so 30 days is the floor (oldest value the freshness filter can
+                # act on), not the true age; ordering among such jobs is unknown.
                 from datetime import timedelta
                 posted_at = datetime.utcnow() - timedelta(days=30)
             elif "day" in posted_lower:

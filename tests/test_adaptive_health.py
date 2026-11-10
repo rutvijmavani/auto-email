@@ -67,7 +67,7 @@ def _make_metrics_db():
             found_within_24hr INTEGER DEFAULT 0,
             found_after_24hr  INTEGER DEFAULT 0,
             early_exit_missed INTEGER DEFAULT 0,
-            poll_score        REAL
+            adaptive_score    REAL
         )
     """)
     conn.commit()
@@ -1206,7 +1206,7 @@ def _full_data(**overrides):
              "error_rate_pct": 5.0, "avg_response_ms": 320, "days_with_data": 7},
         ],
         "detection_age": {
-            "total_new_jobs": 200,
+            "total_new_jobs": 200, "dated_jobs": 200,
             "within_1hr": 100, "within_4hr": 60,
             "within_24hr": 30, "after_24hr": 10,
             "within_1hr_pct": 50.0, "within_4hr_pct": 30.0,
@@ -1381,6 +1381,18 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
         html = self._build(data)
         self.assertNotIn("Detection Age", html)
 
+    def test_detection_age_not_shown_when_no_dated_jobs(self):
+        """Section hidden when jobs exist but none has a posting time."""
+        data = _full_data()
+        data["detection_age"] = {
+            "total_new_jobs": 40, "dated_jobs": 0, "within_1hr": 0, "within_4hr": 0,
+            "within_24hr": 0, "after_24hr": 0,
+            "within_1hr_pct": None, "within_4hr_pct": None,
+            "within_24hr_pct": None, "after_24hr_pct": None,
+        }
+        html = self._build(data)
+        self.assertNotIn("Detection Age", html)
+
     # ── Wasted poll rate table ────────────────────────────────────────────────
 
     def test_wasted_poll_heading_present(self):
@@ -1515,7 +1527,7 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
     def test_worker_scaling_events_tile_present(self):
         """'Worker Scaling Events' section present when events exist."""
         html = self._build(_full_data())
-        self.assertIn("Worker Scaling Events", html)
+        self.assertIn("Worker Crashes, Outages &amp; Ceiling Changes", html)
 
     def test_worker_scaling_shows_counts(self):
         """All tile counts appear in HTML."""
@@ -1533,7 +1545,7 @@ class TestAdaptiveHealthSectionHTML(unittest.TestCase):
             "canary_probe": 0, "ceiling_learned": 0,
         }
         html = self._build(data)
-        self.assertIn("No worker scaling events", html)
+        self.assertIn("No worker crashes, outages or ceiling changes", html)
 
     def test_outage_tile_red_when_outages_started(self):
         """Outage tile red when outage_start > 0."""

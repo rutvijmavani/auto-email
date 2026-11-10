@@ -777,44 +777,28 @@ def stage_watchdog():
     # in the two-layer scheduler redesign (Section 5).  PEL + claim_stale_work()
     # (XAUTOCLAIM) in scheduler.py owns crash-recovery for scan workers.
     # The watchdog now covers:
-    #   1. Hung-worker detection via heartbeat:{company} + progress:{company}
-    #   2. Stream PEL observability via XPENDING (informational; no recovery)
+    #   1. Stream PEL observability via XPENDING (informational; no recovery)
 
-    from workers.watchdog import check_hung_workers, check_pel_stats
+    from workers.watchdog import _check_pel_health, Issue
     from workers.redis_client import get_redis
-    from config import REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN
 
     r = get_redis()
 
-    # ── 1. Hung-worker detection ──────────────────────────────────────────────
-    info("Running check_hung_workers()...")
-    hung = check_hung_workers()
-    ok(f"check_hung_workers returned {len(hung)} hung workers (expected 0 in clean state)")
-    if hung:
-        warn(f"Hung workers detected: {hung}")
+    # ── Stream PEL health (read-only: persist=False writes no alert state) ──
+    info("Running _check_pel_health()...")
+    issues = []
+    _check_pel_health(r, issues, persist=False)
 
-    # ── 2. Stream PEL stats ───────────────────────────────────────────────────
-    info("Running check_pel_stats()...")
-    pel = check_pel_stats()
-
-    for stream_key in (REDIS_STREAM_ADAPTIVE, REDIS_STREAM_FULLSCAN):
-        stats = pel.get(stream_key)
-        if stats is None:
-            warn(f"PEL stats missing for {stream_key} (stream may not exist yet)")
-            continue
-        total   = stats.get("total_pending", 0)
-        age_s   = (stats["oldest_age_ms"] // 1000) if stats.get("oldest_age_ms") else 0
-        ok(
-            f"PEL {stream_key}: pending={total} "
-            f"oldest_age={age_s}s "
-            f"consumers={stats.get('consumers', [])}"
-        )
-        if total > 0:
-            warn(
-                f"{stream_key} has {total} pending messages — "
-                "this is normal during active scans; "
-                "claim_stale_work() reclaims them after p95*3 ms idle."
-            )
+    if not issues:
+        warn("PEL health check returned no results")
+    for issue in issues:
+        text = f"{issue.category}: {issue.message}"
+        if issue.level == Issue.OK:
+            ok(text)
+        else:
+            # Pending entries are normal during active scans; the watchdog only
+            # flags owners that are dead or stalled.
+            warn(f"[{issue.level}] {text}")
 
 
 # ===========================================================

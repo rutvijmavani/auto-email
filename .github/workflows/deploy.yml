@@ -78,6 +78,14 @@ jobs:
               fi
             done
 
+            # Pre-flight: the deploy restarts the detail drainer with sudo; confirm it is
+            # permitted without a password (sudo -l only checks, it does not restart).
+            if ! sudo -n -l systemctl restart recruiter-detail-drainer >/dev/null 2>&1; then
+              echo "[ERROR] this user cannot run 'sudo systemctl restart recruiter-detail-drainer' non-interactively."
+              echo "        Re-run 'sudo bash deploy/install-systemd.sh' on the VM to refresh the sudoers rules."
+              exit 1
+            fi
+
             echo "[1/8] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
@@ -108,7 +116,7 @@ jobs:
                 echo "[WARN] Skipping pip install and unit sync — code state unknown"
               fi
               # llama-server and h1b-llm-worker excluded — see [7/8] comment above
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
                 sudo systemctl restart "$svc" || echo "[WARN] could not restart $svc during rollback"
               done
             }
@@ -121,7 +129,7 @@ jobs:
               _rollback_to_sha "$PREVIOUS_SHA"
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true
@@ -191,10 +199,28 @@ jobs:
             #    them cleanly so they never become "stuck dead-consumer" entries after restart.
             # 2. Clear inflight:scans ZSETs — accumulated entries from prior restarts cause
             #    the ceiling check to block all dispatch (dispatched=0 stall) in the new scheduler.
-            _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
-            if [ -n "$_pending_ids" ]; then
-              redis-cli XACK stream:adaptive scan-workers $_pending_ids > /dev/null || true
-              echo "  Pre-restart: ACKed PEL entries ($_pending_ids)"
+            # DXP: redis-cli (non-tty) prints 4 lines per XPENDING entry — id, consumer,
+            # idle ms, delivery count — so only every 4th line (NR%4==1) is an id.
+            # Loop in batches of 100 until the PEL is empty; stop on an XACK error so a
+            # failing XACK can never loop forever.
+            # Only well-formed stream ids (ms-seq) are passed to XACK, and the loop is
+            # capped so an unexpected output format cannot spin forever.
+            _acked_ids=""
+            _xack_rounds=0
+            while [ "$_xack_rounds" -lt 1000 ]; do
+              _xack_rounds=$((_xack_rounds + 1))
+              _pending_ids=$(redis-cli XPENDING stream:adaptive scan-workers - + 100 2>/dev/null | awk 'NR%4==1' | grep -E '^[0-9]+-[0-9]+$' | tr '\n' ' ')
+              if [ -z "${_pending_ids// /}" ]; then
+                break
+              fi
+              if ! redis-cli XACK stream:adaptive scan-workers $_pending_ids > /dev/null; then
+                echo "  Pre-restart: XACK failed for ($_pending_ids) — continuing"
+                break
+              fi
+              _acked_ids="$_acked_ids $_pending_ids"
+            done
+            if [ -n "${_acked_ids// /}" ]; then
+              echo "  Pre-restart: ACKed PEL entries ($_acked_ids)"
             fi
             redis-cli --scan --pattern 'inflight:scans:*' 2>/dev/null | xargs -r redis-cli DEL > /dev/null || true
             echo "  Pre-restart: cleared inflight:scans ZSETs"
@@ -203,9 +229,10 @@ jobs:
             #    The new manager's startup re-evaluation will re-fire Lever 1 within 60s
             #    if conditions still warrant it.
             redis-cli DEL manager:lever1:scan:active manager:lever1:scan:fired_at \
-                          manager:lever1:fullscan:active manager:lever1:fullscan:fired_at > /dev/null || true
+                          manager:lever1:fullscan:active manager:lever1:fullscan:fired_at \
+                          manager:lever1:detail:active manager:lever1:detail:fired_at > /dev/null || true
             echo "  Pre-restart: cleared stale Lever 1 keys"
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
               if ! systemctl cat "$svc" &>/dev/null; then
                 echo "[ERROR] $svc unit not found after systemd sync — check deploy/systemd/"
                 false  # trigger ERR trap → _early_rollback runs
@@ -214,7 +241,7 @@ jobs:
             done
             echo "[8/8] Verifying services are active..."
             sleep 3   # brief settle: systemctl restart returns once the process starts, not fully active
-            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+            for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
               if ! systemctl is-active --quiet "$svc"; then
                 echo "[ERROR] $svc failed to start after restart:"
                 journalctl -u "$svc" -n 30 --no-pager || true
@@ -254,7 +281,7 @@ jobs:
 
               echo "[ROLLBACK] Verifying rollback services are active..."
               sleep 3
-              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+              for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
                 if ! systemctl is-active --quiet "$svc"; then
                   echo "[ERROR] $svc failed to start after rollback:"
                   journalctl -u "$svc" -n 30 --no-pager || true

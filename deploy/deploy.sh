@@ -88,6 +88,8 @@ _rollback_to_previous() {
         || echo "  [WARN] could not restart pipeline-api"
     sudo systemctl restart recruiter-manager \
         || echo "  [WARN] could not restart recruiter-manager"
+    sudo systemctl restart recruiter-detail-drainer \
+        || echo "  [WARN] could not restart recruiter-detail-drainer"
     sudo systemctl restart email-processor \
         || echo "  [WARN] could not restart email-processor"
     sudo systemctl restart streamlit-frontend \
@@ -99,7 +101,7 @@ _rollback_to_previous() {
     # Post-rollback verification
     sleep 3
     local _all_active=true
-    for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+    for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
         if systemctl is-active --quiet "$svc"; then
             echo "  [OK] $svc is active after rollback"
         else
@@ -232,6 +234,15 @@ for _wrapper in /usr/local/bin/install-pipeline-units /usr/local/bin/sync-pipeli
         _rollback_to_previous; exit 1
     fi
 done
+# The sudoers rules are generated per staged unit by install-systemd.sh, so a host
+# provisioned before recruiter-detail-drainer existed has no rule for it yet and the
+# restart below would fail (or prompt).  Detect that now and say what to run.
+_SYSTEMCTL_BIN="$(command -v systemctl)"
+if ! sudo -n -l "$_SYSTEMCTL_BIN" restart recruiter-detail-drainer >/dev/null 2>&1; then
+    echo "[ERROR] no sudoers rule to restart recruiter-detail-drainer."
+    echo "        Run 'sudo bash deploy/install-systemd.sh' once to add it, then redeploy."
+    _rollback_to_previous; exit 1
+fi
 sudo /usr/local/bin/sync-pipeline-staging || {
     echo "  [ERROR] Staging sync failed — rolling back"
     _rollback_to_previous; exit 1
@@ -275,6 +286,11 @@ sudo systemctl restart recruiter-manager || {
     _rollback_to_previous; exit 1
 }
 
+sudo systemctl restart recruiter-detail-drainer || {
+    echo "  [ERROR] recruiter-detail-drainer failed to restart — rolling back"
+    _rollback_to_previous; exit 1
+}
+
 sudo systemctl restart email-processor || {
     echo "  [ERROR] email-processor failed to restart — rolling back"
     _rollback_to_previous; exit 1
@@ -303,7 +319,7 @@ sleep 5
 echo ""
 echo "► Service status:"
 _svc_fail=0
-for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager email-processor streamlit-frontend; do
+for svc in recruiter-scheduler recruiter-watchdog pipeline-api recruiter-manager recruiter-detail-drainer email-processor streamlit-frontend; do
     status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     pid=$(systemctl show -p MainPID --value "$svc" 2>/dev/null || echo "?")
     if [[ "$status" == "active" ]]; then

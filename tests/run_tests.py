@@ -85,6 +85,8 @@ def main():
         "test_scheduler_streams", "test_slot",
         # Redis client
         "test_redis_client",
+        # Test-DB safety guard + adaptive metrics snapshot
+        "test_db_guard", "test_adaptive_metrics",
     ]
     _integration_names = ["test_integration"]
     _scraper_names     = ["test_job_scraper"]

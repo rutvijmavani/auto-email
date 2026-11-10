@@ -57,7 +57,7 @@ HEADERS       = {"User-Agent": "Mozilla/5.0"}
 
 # stop reasons of the paging loop (shared with fetch_report) — only EMPTY_PAGE proves the end of the board
 from jobs.ats.fetch_report import (  # noqa: E402
-    FetchReport, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    FetchReport, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, attach, count_distinct, failed,
 )
 
@@ -105,9 +105,11 @@ def detect(company):
 # FETCH JOBS (listing)
 # ─────────────────────────────────────────
 
-def fetch_board(slug, company):
+def fetch_board(slug, company, stop_check=None):
     """
     Fetch the whole Jobvite board and record HOW the paging loop ended.
+    stop_check (adaptive scan only): called with each page's new jobs; True ends paging with
+    STOP_EARLY_EXIT.
 
     Strategy:
       1. /jobs landing page — kept as a union source (jobs it shows that
@@ -127,13 +129,13 @@ def fetch_board(slug, company):
     seen_ids = set()
 
     def _add(anchors):
-        new = 0
+        new = []
         for anchor in anchors:
             job = _anchor_to_job(anchor, slug, company)
             if job and job["job_id"] not in seen_ids:
                 seen_ids.add(job["job_id"])
                 all_jobs.append(job)
-                new += 1
+                new.append(job)
         return new
 
     # ── Step 1: landing page ──
@@ -155,9 +157,13 @@ def fetch_board(slug, company):
             report["stop_reason"] = STOP_EMPTY_PAGE
             break
         report["pages"] += 1
-        if _add(anchors) == 0:
+        page_jobs = _add(anchors)
+        if not page_jobs:
             # non-empty page with nothing new = the site ignored p (loop would never end)
             report["stop_reason"] = STOP_REPEAT_PAGE
+            break
+        if stop_check is not None and stop_check(page_jobs):
+            report["stop_reason"] = STOP_EARLY_EXIT
             break
 
     # ── Step 3: union with landing page ──
@@ -174,16 +180,17 @@ def fetch_board(slug, company):
     return all_jobs, report
 
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all jobs for company from Jobvite (list of normalized job dicts).
     posted_at is always None — Jobvite hides posting dates.
     location and description filled by fetch_job_detail().
+    stop_check (adaptive scan only): see fetch_board.
     """
     if not slug:
         return failed(STOP_NO_CONFIG, "empty slug")
-    jobs, report = fetch_board(slug, company)
-    if report["stop_reason"] != STOP_EMPTY_PAGE:
+    jobs, report = fetch_board(slug, company, stop_check=stop_check)
+    if report["stop_reason"] not in (STOP_EMPTY_PAGE, STOP_EARLY_EXIT):
         logger.warning(
             "[jobvite] %s: paging ended by %s after %d page(s) — %d job(s) may be incomplete",
             slug, report["stop_reason"], report["pages"], len(jobs),

@@ -62,7 +62,7 @@ Coverage map
 
   TestFullscanConstants
     · FULLSCAN_CHUNK_SIZE = 50
-    · FULLSCAN_BLOOM_CAPACITY = 10_000
+    · (bloom capacity = fetched job count, not a constant)
     · FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900
 """
 
@@ -162,12 +162,12 @@ class TestBloomPairFallbackMode(unittest.TestCase):
         self.assertIn("bloom:fullscan:new:TestCo", delete_calls)
         self.assertIn("bloom:fallback:new:TestCo", delete_calls)
 
-    def test_finalize_deletes_old_keys(self):
-        """finalize() DELs old bf and old fb keys."""
+    def test_finalize_does_not_delete_old_before_rename(self):
+        """finalize() promotes with RENAME only (atomic overwrite): no DEL of the old keys."""
         self.bp.finalize()
         delete_calls = [c[0][0] for c in self.r.delete.call_args_list]
-        self.assertIn("bloom:fullscan:TestCo", delete_calls)
-        self.assertIn("bloom:fallback:TestCo", delete_calls)
+        self.assertNotIn("bloom:fullscan:TestCo", delete_calls)
+        self.assertNotIn("bloom:fallback:TestCo", delete_calls)
 
     def test_finalize_renames_new_to_old(self):
         """finalize() RENAMEs new keys to old keys."""
@@ -307,9 +307,8 @@ class TestAcquireReleaseLock(unittest.TestCase):
         result = _acquire_lock("TestCo", r)
         self.assertFalse(result)
 
-    def test_acquire_uses_nx_and_ex_flags(self):
-        """_acquire_lock uses nx=True and ex=TTL."""
-        from config import SCHEDULER_FULL_SCAN_LOCK_TTL
+    def test_acquire_uses_nx_without_ttl(self):
+        """_acquire_lock is a lease: nx=True and no expiry."""
         r = MagicMock()
         r.set.return_value = True
         from workers.fullscan import _acquire_lock
@@ -317,7 +316,7 @@ class TestAcquireReleaseLock(unittest.TestCase):
         r.set.assert_called_once()
         kwargs = r.set.call_args[1]
         self.assertTrue(kwargs.get("nx"))
-        self.assertEqual(kwargs.get("ex"), SCHEDULER_FULL_SCAN_LOCK_TTL)
+        self.assertNotIn("ex", kwargs)
 
     def test_acquire_lock_key_format(self):
         """Lock key is fullscan:lock:{company}."""
@@ -364,6 +363,7 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         """_defer_adaptive_first ZADDs company to poll:adaptive with score=now."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
+        r.zscore.return_value = None
         before = time.time()
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
@@ -385,6 +385,7 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         from config import REDIS_POLL_FULLSCAN
         from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
         r = MagicMock()
+        r.zscore.return_value = None
         before = time.time()
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
@@ -404,11 +405,37 @@ class TestDeferAdaptiveFirst(unittest.TestCase):
         self.assertEqual(FULLSCAN_ADAPTIVE_FIRST_DELAY_S, 900)
 
     def test_both_zadd_calls_made(self):
-        """_defer_adaptive_first calls zadd exactly twice."""
+        """Company not in poll:adaptive: zadd to adaptive (now) and fullscan."""
         r = MagicMock()
+        r.zscore.return_value = None
         from workers.fullscan import _defer_adaptive_first
         _defer_adaptive_first("TestCo", r)
         self.assertEqual(r.zadd.call_count, 2)
+
+    def test_scheduled_adaptive_is_not_pulled_forward(self):
+        """Backed-off company keeps its poll:adaptive schedule; fullscan waits after it."""
+        from config import REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN
+        from workers.fullscan import _defer_adaptive_first, FULLSCAN_ADAPTIVE_FIRST_DELAY_S
+        r = MagicMock()
+        later = time.time() + 3600
+        r.zscore.return_value = later
+        _defer_adaptive_first("TestCo", r)
+        keys = [c[0][0] for c in r.zadd.call_args_list]
+        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
+        fs = [c for c in r.zadd.call_args_list if c[0][0] == REDIS_POLL_FULLSCAN]
+        self.assertEqual(len(fs), 1)
+        self.assertAlmostEqual(list(fs[0][0][1].values())[0],
+                               later + FULLSCAN_ADAPTIVE_FIRST_DELAY_S, delta=1)
+
+    def test_overdue_adaptive_entry_not_rewritten(self):
+        """An already-due poll:adaptive entry is left alone; fullscan retries now+delay."""
+        from config import REDIS_POLL_ADAPTIVE
+        from workers.fullscan import _defer_adaptive_first
+        r = MagicMock()
+        r.zscore.return_value = time.time() - 100
+        _defer_adaptive_first("TestCo", r)
+        keys = [c[0][0] for c in r.zadd.call_args_list]
+        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,11 +632,6 @@ class TestFullscanConstants(unittest.TestCase):
         from workers.fullscan import FULLSCAN_CHUNK_SIZE
         self.assertEqual(FULLSCAN_CHUNK_SIZE, 50)
 
-    def test_bloom_capacity_is_10000(self):
-        """FULLSCAN_BLOOM_CAPACITY = 10_000."""
-        from workers.fullscan import FULLSCAN_BLOOM_CAPACITY
-        self.assertEqual(FULLSCAN_BLOOM_CAPACITY, 10_000)
-
     def test_adaptive_first_delay_is_900(self):
         """FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900 (15 minutes)."""
         from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
@@ -620,10 +642,19 @@ class TestFullscanConstants(unittest.TestCase):
         from workers.fullscan import FULLSCAN_PAUSE_POLL_SECS
         self.assertGreater(FULLSCAN_PAUSE_POLL_SECS, 0)
 
-    def test_bloom_capacity_positive(self):
-        """FULLSCAN_BLOOM_CAPACITY > 0."""
-        from workers.fullscan import FULLSCAN_BLOOM_CAPACITY
-        self.assertGreater(FULLSCAN_BLOOM_CAPACITY, 0)
+    def test_bloom_capacity_derived_from_fetched_board(self):
+        """reserve() sizes BF.RESERVE as the fetched count (min 1); there is no fixed cap or headroom."""
+        from workers.fullscan import _BloomPair
+        r = _make_redis_bf_available()
+        r.exists = MagicMock(return_value=0)
+        bp = _BloomPair(r, "BigCo")
+        bp.reserve(33_000)
+        reserve_calls = [c[0] for c in r.execute_command.call_args_list if c[0][0] == "BF.RESERVE"]
+        self.assertEqual(int(reserve_calls[-1][3]), 33_000)
+        bp2 = _BloomPair(r, "TinyCo")
+        bp2.reserve(0)
+        reserve_calls = [c[0] for c in r.execute_command.call_args_list if c[0][0] == "BF.RESERVE"]
+        self.assertEqual(int(reserve_calls[-1][3]), 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

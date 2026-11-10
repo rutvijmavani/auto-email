@@ -248,6 +248,9 @@ echo "[STEP 6] VACUUM + ANALYZE at $(date '+%H:%M:%S')" >> "$LOG_FILE" && \
 python -c "
 from db.connection import get_conn
 conn = get_conn()
+# VACUUM cannot run inside a transaction block; get_conn() is autocommit=False
+# so psycopg2 would open one implicitly. Switch this connection to autocommit.
+conn._conn.autocommit = True
 conn.execute('VACUUM')
 conn.execute('ANALYZE')
 conn.close()

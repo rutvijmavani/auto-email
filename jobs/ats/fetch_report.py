@@ -33,6 +33,7 @@ STOP_REPEAT_PAGE     = "repeat_page"      # a page added nothing new — the sit
 STOP_REQUEST_FAILED  = "request_failed"   # an HTTP/parse failure cut the loop short
 STOP_PAGE_CAP        = "page_cap"         # safety cap hit before the end
 STOP_NO_CONFIG       = "no_config"        # slug unusable or target not discoverable — nothing was fetched
+STOP_EARLY_EXIT      = "early_exit"       # adaptive stop_check ended paging on purpose (rest of the board already seen)
 STOP_UNKNOWN         = "unknown"          # feeder attaches no report
 
 CLEAN_STOPS  = frozenset({STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_SINGLE_RESPONSE})

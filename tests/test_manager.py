@@ -55,6 +55,7 @@ import workers.manager as mgr
 
 def _reset_cycle_state():
     """Reset all hysteresis counters and urgent flags to zero/False."""
+    mgr._last_work_need.clear()   # scan pools keep the last need when work is unknown
     for pool in ("scan", "detail", "fullscan"):
         mgr._scale_up_cycles[pool]   = 0
         mgr._scale_down_cycles[pool] = 0
@@ -251,7 +252,7 @@ class TestHysteresis(unittest.TestCase):
         """scale_up fires on the 2nd consecutive cycle meeting conditions, not the 1st."""
         _reset_cycle_state()
         pool_busy_ms = int(0.90 * 3 * 60 * 1000)  # 90% util
-        decisions = self._cycle_n(3, pool_busy_ms, depth=25, delay_s=35, n_workers=3)
+        decisions = self._cycle_n(3, pool_busy_ms, depth=60, delay_s=35, n_workers=3)
         self.assertNotEqual(decisions[0], "scale_up")  # first cycle: pending
         self.assertIn("scale_up", decisions[1:])       # fires by cycle 2 or 3
 
@@ -273,8 +274,8 @@ class TestHysteresis(unittest.TestCase):
         pool_busy_ms = int(0.90 * 3 * 60 * 1000)
         r = _make_redis()
         # Cycle 1: high delay → streak=1
-        # depth=25 → workers_target=5, avoids demand-urgent (5 < ceil×0.75=7.5)
-        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 25, 35, self.PARAMS, 10, peak_nd=5)
+        # depth=60 → workers_target=5, avoids demand-urgent (5 < ceil×0.75=7.5)
+        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 60, 35, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(mgr._scale_up_cycles["scan"], 1)
         # Cycle 2: delay drops → hold → resets streak
         mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms, 0, 5, self.PARAMS, 10, peak_nd=5)
@@ -300,8 +301,8 @@ class TestHysteresis(unittest.TestCase):
         pool_busy_ms_high = int(0.90 * 3 * 60 * 1000)
         pool_busy_ms_low  = int(0.05 * 5 * 60 * 1000)
         r = _make_redis()
-        # Build up-streak; depth=25 → workers_target=5, avoids demand-urgent (5 < ceil×0.75)
-        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms_high, 25, 35, self.PARAMS, 10, peak_nd=5)
+        # Build up-streak; depth=60 → workers_target=5, avoids demand-urgent (5 < ceil×0.75)
+        mgr._run_pool_cycle(r, "scan", 3, pool_busy_ms_high, 60, 35, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(mgr._scale_up_cycles["scan"], 1)
         # Switch to down-eligible conditions → up counter must reset
         mgr._run_pool_cycle(r, "scan", 5, pool_busy_ms_low, 0, 5, self.PARAMS, 10, peak_nd=5)
@@ -367,8 +368,8 @@ class TestUrgentMode(unittest.TestCase):
         # Fire urgent (delay spike)
         mgr._run_pool_cycle(r, "scan", 3, 0, 50, 46.0, self.PARAMS, 10, peak_nd=5)
         # Delay eases but still understaffed (3 workers, target=5) → urgent_hold
-        # depth=25 → workers_target=5, delay=35 → both urgent triggers off → urgent_hold
-        d, _ = mgr._run_pool_cycle(r, "scan", 3, 0, 25, 35.0, self.PARAMS, 10, peak_nd=5)
+        # depth=60 → workers_target=5, delay=35 → both urgent triggers off → urgent_hold
+        d, _ = mgr._run_pool_cycle(r, "scan", 3, 0, 60, 35.0, self.PARAMS, 10, peak_nd=5)
         self.assertEqual(d, "urgent_hold")
 
     def test_urgent_resets_streak_counters(self):
@@ -696,30 +697,73 @@ class TestQueueMetrics(unittest.TestCase):
 
 class TestBusyMs(unittest.TestCase):
 
-    def test_scan_sums_all_pid_keys(self):
-        """Scans worker:scan:busy_ms:* and sums all values."""
-        r = MagicMock()
-        keys = [b"worker:scan:busy_ms:1001", b"worker:scan:busy_ms:1002"]
-        r.scan.return_value = (0, keys)
-        r.get.side_effect = lambda k: b"15000" if b"1001" in k else b"20000"
-        total = mgr._get_pool_busy_ms(r, "scan")
-        self.assertEqual(total, 35000)
+    def setUp(self):
+        mgr._prev_busy_snap.clear()
 
-    def test_no_keys_returns_zero(self):
-        """No workers publishing busy_ms → returns 0."""
+    @staticmethod
+    def _redis(beats):
+        """beats: {key: heartbeat dict or None}; r.get returns JSON bytes."""
+        import json as _json
         r = MagicMock()
-        r.scan.return_value = (0, [])
-        total = mgr._get_pool_busy_ms(r, "scan")
+        r.scan_iter.return_value = list(beats)
+        r.get.side_effect = lambda k: (
+            _json.dumps(beats[k]).encode() if beats.get(k) is not None else None
+        )
+        return r
+
+    def test_first_sight_contributes_nothing(self):
+        """A worker seen for the first time has no previous snapshot → 0."""
+        r = self._redis({"worker:alive:scan_worker:h:1": {"ts": 1000.0, "busy_ms": 5000, "busy_since": None}})
+        self.assertEqual(mgr._get_pool_busy_ms(r, "scan"), 0)
+
+    def test_delta_between_snapshots_own_ts(self):
+        """3 s of work between snapshots 10 s apart → 30% of one cycle."""
+        key = "worker:alive:scan_worker:h:1"
+        mgr._get_pool_busy_ms(self._redis({key: {"ts": 1000.0, "busy_ms": 500000, "busy_since": None}}), "scan")
+        total = mgr._get_pool_busy_ms(self._redis({key: {"ts": 1010.0, "busy_ms": 503000, "busy_since": None}}), "scan")
+        self.assertEqual(total, int(0.3 * mgr.MANAGER_CYCLE_S * 1000))
+
+    def test_job_in_progress_counts_since_start(self):
+        """busy_since adds (ts - busy_since) so a long job counts mid-run."""
+        key = "worker:alive:scan_worker:h:1"
+        mgr._get_pool_busy_ms(self._redis({key: {"ts": 1000.0, "busy_ms": 100000, "busy_since": 900.0}}), "scan")
+        total = mgr._get_pool_busy_ms(self._redis({key: {"ts": 1010.0, "busy_ms": 100000, "busy_since": 900.0}}), "scan")
+        self.assertEqual(total, mgr.MANAGER_CYCLE_S * 1000)
+
+    def test_pool_sums_workers(self):
+        """Two workers at 50% and 100% sum to 1.5 cycles of busy time."""
+        a, b = "worker:alive:scan_worker:h:1", "worker:alive:scan_worker:h:2"
+        mgr._get_pool_busy_ms(self._redis({
+            a: {"ts": 1000.0, "busy_ms": 0, "busy_since": None},
+            b: {"ts": 1000.0, "busy_ms": 0, "busy_since": 990.0}}), "scan")
+        total = mgr._get_pool_busy_ms(self._redis({
+            a: {"ts": 1010.0, "busy_ms": 5000, "busy_since": None},
+            b: {"ts": 1010.0, "busy_ms": 0, "busy_since": 990.0}}), "scan")
+        self.assertEqual(total, int(1.5 * mgr.MANAGER_CYCLE_S * 1000))
+
+    def test_dead_worker_dropped(self):
+        """A worker whose heartbeat key is gone stops contributing and its snapshot is pruned."""
+        key = "worker:alive:scan_worker:h:1"
+        mgr._get_pool_busy_ms(self._redis({key: {"ts": 1000.0, "busy_ms": 0, "busy_since": 990.0}}), "scan")
+        total = mgr._get_pool_busy_ms(self._redis({}), "scan")
         self.assertEqual(total, 0)
+        self.assertEqual(mgr._prev_busy_snap, {})
 
-    def test_partial_missing_values_skipped(self):
-        """Keys with missing values are skipped, others summed."""
-        r = MagicMock()
-        keys = [b"worker:scan:busy_ms:1001", b"worker:scan:busy_ms:1002"]
-        r.scan.return_value = (0, keys)
-        r.get.side_effect = lambda k: b"10000" if b"1001" in k else None
-        total = mgr._get_pool_busy_ms(r, "scan")
-        self.assertEqual(total, 10000)
+    def test_same_beat_reuses_last_fraction(self):
+        """No new beat between two calls → previous fraction reused, not dropped."""
+        key = "worker:alive:scan_worker:h:1"
+        beat0 = {"ts": 1000.0, "busy_ms": 0, "busy_since": None}
+        beat1 = {"ts": 1010.0, "busy_ms": 5000, "busy_since": None}
+        mgr._get_pool_busy_ms(self._redis({key: beat0}), "scan")
+        first = mgr._get_pool_busy_ms(self._redis({key: beat1}), "scan")
+        again = mgr._get_pool_busy_ms(self._redis({key: beat1}), "scan")
+        self.assertEqual(first, again)
+
+    def test_old_format_heartbeat_ignored(self):
+        """Heartbeat without busy fields (worker not yet upgraded) is skipped."""
+        key = "worker:alive:scan_worker:h:1"
+        r = self._redis({key: {"pid": 1, "ts": 1000.0, "processed": 3}})
+        self.assertEqual(mgr._get_pool_busy_ms(r, "scan"), 0)
 
     def test_utilization_formula(self):
         """pool_utilization = pool_busy_ms / (n_workers × cycle_s × 1000)."""
@@ -737,19 +781,6 @@ class TestBusyMs(unittest.TestCase):
         capacity_ms  = max(n_workers * mgr.MANAGER_CYCLE_S * 1000, 1)
         util = min(pool_busy_ms / capacity_ms, 1.0)
         self.assertEqual(util, 1.0)
-
-    def test_multi_page_scan_busy_ms(self):
-        """Busy_ms accumulated across multiple Redis SCAN pages."""
-        r = MagicMock()
-        page1_keys = [b"worker:scan:busy_ms:1001"]
-        page2_keys = [b"worker:scan:busy_ms:1002"]
-        r.scan.side_effect = [
-            (42, page1_keys),   # cursor != 0 → more pages
-            (0,  page2_keys),   # cursor == 0 → done
-        ]
-        r.get.side_effect = lambda k: b"5000"
-        total = mgr._get_pool_busy_ms(r, "scan")
-        self.assertEqual(total, 10000)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -790,8 +821,8 @@ class TestManagerCmdsDispatch(unittest.TestCase):
             if len(parts) == 3 and parts[1] == "target":
                 pool, _, n_str = parts
                 target = int(n_str)
-                from config import WORKER_FLOOR, DB_POOL_MAXCONN
-                db_budget = DB_POOL_MAXCONN - 3
+                from config import WORKER_FLOOR, WORKER_SEAT_BUDGET
+                db_budget = WORKER_SEAT_BUDGET
                 ceil_map = {
                     "scan":     max(WORKER_FLOOR, db_budget // 2),
                     "detail":   max(WORKER_FLOOR, db_budget // 3),
@@ -1049,7 +1080,7 @@ class TestBootstrapMode(unittest.TestCase):
 
     def test_bootstrap_ceil_values_match_production_fleet(self):
         """Bootstrap ceilings should match current production defaults."""
-        self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     10)
+        self.assertEqual(mgr.BOOTSTRAP_CEIL["scan"],     7)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["detail"],   10)
         self.assertEqual(mgr.BOOTSTRAP_CEIL["fullscan"],  5)
 

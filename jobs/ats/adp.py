@@ -33,7 +33,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import slugify, validate_company_match, alpha3_to_alpha2
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, TOTAL_ATS, attach, count_distinct, failed,
 )
 from logger import get_logger
@@ -149,9 +149,12 @@ def detect(company):
 # FETCH JOBS (listing)
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all jobs for company from ADP WorkforceNow.
+
+    stop_check (adaptive scan only): called with each page's jobs; True ends paging with
+    STOP_EARLY_EXIT. The gate uses job ids only (ADP's listing carries no date).
 
     Step 1: fetch company config (orgoid + myJobsToken) — public, no auth.
     Step 2: paginate job-requisitions API using myJobsToken as header.
@@ -209,18 +212,23 @@ def fetch_jobs(slug, company):
             total = page_total
 
         raw_rows += len(reqs)
-        before = len(all_jobs)
-        for job in _parse_reqs(reqs, slug, company):
+        page_rows = _parse_reqs(reqs, slug, company)   # every usable row, incl. repeats
+        page_jobs = []
+        for job in page_rows:
             if job["job_id"] not in seen_ids:
                 seen_ids.add(job["job_id"])
-                all_jobs.append(job)
-        if len(all_jobs) == before:
+                page_jobs.append(job)
+        all_jobs.extend(page_jobs)
+        if not page_jobs:
             stop = STOP_REPEAT_PAGE   # a page of nothing new: $skip ignored, or every row unusable
             break
 
         offset += len(reqs)
         if total is not None and offset >= total:
             stop = STOP_ALL_PAGES
+            break
+        if stop_check is not None and stop_check(page_rows):
+            stop = STOP_EARLY_EXIT
             break
 
     return attach(all_jobs, FetchReport(

@@ -65,3 +65,7 @@ results/build_ats_list_test.txt
 # Wrangler (Cloudflare Workers CLI)
 # ─────────────────────────────────────────
 .wrangler/cache/
+# Graphify build output and per-machine Claude/graphify setup
+graphify-out/
+.claude/
+CLAUDE.md

@@ -66,6 +66,24 @@ RETENTION_API_HEALTH           = 60
 RETENTION_PIPELINE_ALERTS      = 30
 RETENTION_SCAN_HEALTH_DAYS     = int(os.getenv("RETENTION_SCAN_HEALTH_DAYS", "90"))  # scan_health — one row per scan, history checks need weeks
 DIAGNOSTICS_AUTO_RESOLVED_DAYS = 60
+RETENTION_WORKER_SCALING_EVENTS_DAYS = int(os.getenv("RETENTION_WORKER_SCALING_EVENTS_DAYS", "90"))  # worker_scaling_events — crash/outage/canary/ceiling events
+RETENTION_ADAPTIVE_POLL_METRICS_DAYS = int(os.getenv("RETENTION_ADAPTIVE_POLL_METRICS_DAYS", "90"))  # adaptive_poll_metrics — covers the 14-day score window + 7-day backfill
+# Platforms whose job_postings.posted_at carries a real time of day (not a date or
+# a relative "N days ago"), so created_at - posted_at can fill the 1h/4h/24h
+# detection buckets. Verified in jobs/ats/<platform>.py 2026-11-07; confirm on the
+# VM with the posted_at/timed query in docs/adaptive-metrics-snapshot-design.md.
+ADAPTIVE_TIMED_POSTED_AT_PLATFORMS = tuple(
+    p.strip() for p in os.getenv(
+        "ADAPTIVE_TIMED_POSTED_AT_PLATFORMS",
+        "eightfold,lever,greenhouse,ashby,smartrecruiters,jibe",
+    ).split(",") if p.strip()
+)
+# Snapshot backfills at most this many missed days per run.
+ADAPTIVE_SNAPSHOT_BACKFILL_DAYS = int(os.getenv("ADAPTIVE_SNAPSHOT_BACKFILL_DAYS", "7"))
+# A job counts as a likely early-exit miss when a fullscan inserted it and it was
+# posted more than this many hours before the insert (same default as
+# scripts/early_exit_miss_rate.py).
+ADAPTIVE_MISS_LAG_HOURS = int(os.getenv("ADAPTIVE_MISS_LAG_HOURS", "36"))
 RETENTION_CUSTOM_ATS_DIAGNOSTIC= 30
 RETENTION_ENRICHMENT_METRICS_DAYS = 90  # h1b_enrichment_metrics — keep longer than monitor_stats
 RETENTION_EXTERNAL_API_HEALTH  = 60     # external_api_health — matches RETENTION_API_HEALTH (same shape/cadence)
@@ -191,12 +209,13 @@ GEMINI_VERIFY_RETRY_DAYS      = 5    # days to retry Gemini verification
 # ─────────────────────────────────────────
  
 # Number of companies processed in parallel (thread pool size).
-# Real throttling is done by MONITOR_PLATFORM_CONCURRENCY semaphores below —
 # MAX_WORKERS just controls how many companies are in-flight at once.
-# 20 is fine here because the per-platform semaphores prevent any single
-# ATS from being hammered even when all 20 slots are busy.
-MONITOR_MAX_WORKERS = 20
- 
+# MONITOR_PLATFORM_CONCURRENCY below limits concurrent requests per platform, but its
+# semaphores are per PROCESS (threading.Semaphore), not shared across the scheduler's
+# worker processes, and scans are not gated by them; the real cross-process limit is
+# the worker count.  A shared per-platform limiter is the parked D7 chain (DOC-SEM).
+MONITOR_MAX_WORKERS = int(os.getenv("MONITOR_MAX_WORKERS", "20"))
+
 # Max concurrent requests per ATS platform.
 # Platforms sharing one API domain (Greenhouse, SmartRecruiters)
 # are throttled more aggressively than per-subdomain platforms (Workday).
@@ -344,6 +363,18 @@ MONITOR_MATCH_RATE_HIGH_ALERT = 0.60  # alert if > 60% fetched jobs match filter
 RATE_LIMIT_CRITICAL_THRESHOLD = 10   # % 429s in one run → immediate email
 RATE_LIMIT_WARNING_THRESHOLD  = 2    # % 429s → warning in daily digest
 SLOW_RESPONSE_THRESHOLD_MS    = 3000 # avg ms → warning in daily digest
+
+# Sustained-429 trend trigger (manager health check).  Daily 429 rate is read from
+# api_health per calendar day; a weekly average hides single-day spikes (Workday
+# 2-3% on 2026-10-20..23 averaged to 0.8% for the week).  A WARNING alert fires
+# when at least RATE_LIMIT_TREND_DAYS_HIT of the last RATE_LIMIT_TREND_WINDOW_DAYS
+# days each had a 429 rate >= RATE_LIMIT_TREND_PCT with >= RATE_LIMIT_TREND_MIN_REQ
+# requests.  Meaning: this platform is being rate limited often enough that the
+# per-platform concurrency limit design (docs/scaling-redesign.md Q10/Q13) is due.
+RATE_LIMIT_TREND_PCT         = float(os.environ.get("RATE_LIMIT_TREND_PCT", "1.0"))
+RATE_LIMIT_TREND_WINDOW_DAYS = int(os.environ.get("RATE_LIMIT_TREND_WINDOW_DAYS", "5"))
+RATE_LIMIT_TREND_DAYS_HIT    = int(os.environ.get("RATE_LIMIT_TREND_DAYS_HIT", "3"))
+RATE_LIMIT_TREND_MIN_REQ     = int(os.environ.get("RATE_LIMIT_TREND_MIN_REQ", "1000"))
 SERPER_CRITICAL_THRESHOLD     = 0    # credits remaining → immediate email
 SERPER_WARNING_THRESHOLD      = 50   # credits remaining → warning in digest
 
@@ -604,8 +635,6 @@ REDIS_INFLIGHT_FULLSCAN = "inflight:fullscan"      # ZSET — companies currentl
                                                    # written at scan start, removed on completion/error
                                                    # read by _get_worker_missed_companies() to exclude
                                                    # in-progress scans from fallback re-fetch
-INFLIGHT_FULLSCAN_STALE_S = 7200                   # 2 h — entries older than this are considered
-                                                   # abandoned (used by health_check and job_monitor)
 REDIS_INFLIGHT_FULLSCAN_DC_PREFIX  = "inflight:fullscans"           # ZSET per-DC fullscan concurrency
                                                                     # key: {prefix}:{dc_key}, member: company
 WORKER_CURRENT_JOB_FULLSCAN_PREFIX = "worker:current_job:fullscan" # STRING per-worker pid
@@ -694,17 +723,12 @@ COMPANY_REGISTRATION_MARKER_TTL_S     = int(os.getenv("COMPANY_REGISTRATION_MARK
 SCHEDULER_FULL_SCAN_BUFFER_S   = 300        # 5-min buffer after adaptive → full scan
 SCHEDULER_FULL_SCAN_INTERVAL_S = 86400      # default full scan every 24h
 SCHEDULER_HEARTBEAT_TTL        = 300        # worker heartbeat TTL (seconds)
-SCHEDULER_FULL_SCAN_LOCK_TTL   = 3600       # full scan exclusive lock TTL
 SCHEDULER_TICK_SECS            = 1.0        # scheduler loop tick interval
 
-# ── Detail queue backpressure (Section 15) ────────────────────────────────────
-DETAIL_QUEUE_MAX_ADAPTIVE      = 5000       # pause listing scan if adaptive queue > this
-DETAIL_QUEUE_MAX_FULLSCAN      = 2000       # pause full scan if fullscan queue > this
-
 # ── Smart early exit (Section 11) ─────────────────────────────────────────────
-PAGINATOR_OVERLAP_THRESHOLD    = 0.80       # 80% of page already seen → overlap
-PAGINATOR_CONFIRM_PAGES        = 2          # consecutive overlap pages to stop
-PAGINATOR_UNSORTED_CUTOFF_DAYS = 3          # time-based cutoff for non-sorted ATS
+PAGINATOR_CONFIRM_PAGES        = 2          # consecutive fully-seen pages (every job seen) to stop
+# Master switch for the adaptive early exit; "0" makes every adaptive scan read the whole board.
+ADAPTIVE_EARLY_EXIT_ENABLED    = os.getenv("ADAPTIVE_EARLY_EXIT_ENABLED", "1") != "0"
 
 # ── Dynamic concurrency (Section 19) ──────────────────────────────────────────
 CONCURRENCY_ERROR_RATE_REDUCE   = 0.10      # > 10% errors → reduce concurrency
@@ -771,20 +795,16 @@ CONCURRENCY_SPIKE_FACTOR_THRESHOLD = 5.0   # spike_factor > this → concurrency
 
 # ── Dynamic worker pools (Section 9) ──────────────────────────────────────────
 # Scheduler manages scan + detail worker processes via multiprocessing.Process.
-# Both pool sizes are calculated at 7 AM from historical api_health averages.
+# Every pool starts at WORKER_FLOOR; workers/manager.py owns all later sizing.
 # MONITOR_MAX_WORKERS is the cold-start fallback ceiling only (day 1, no history).
 WORKER_SHUTDOWN_TIMEOUT_S         = 30     # seconds before forced SIGKILL on shutdown
 WORKER_FAST_CHECK_INTERVAL_S      = 300    # 5 min — error-triggered worker reduction
 WORKER_SLOW_CHECK_INTERVAL_S      = 1800   # 30 min — throughput-driven scaling
-WORKER_POOL_SCAN_FRACTION         = 0.6    # 60% of post-fullscan remaining DB pool for scan workers
-WORKER_POOL_DETAIL_FRACTION       = 0.4    # 40% of post-fullscan remaining DB pool for detail workers
-WORKER_POOL_FULLSCAN_FRACTION     = 0.25   # 25% of DB pool removed first; remainder split 60/40 between scan+detail
 WORKER_FLOOR                      = 2      # minimum workers per pool (redundancy)
 WORKER_DEPRIORITISE_SECS          = 300    # seconds to push erroring platform's
                                            # companies forward in poll:adaptive
 DETAIL_QUEUE_HIGH_WATERMARK       = 1000   # cascade trigger — detail queue above this
                                            # → stop adding scan workers, drain first
-                                           # (hard emergency brake is DETAIL_QUEUE_MAX_ADAPTIVE=5000)
 
 # ── Phase 11 — Monitoring and alerting thresholds ────────────────────────────
 
@@ -812,10 +832,75 @@ DETAIL_QUEUE_ALERT_CYCLES         = 3
 # new entries, silently dropping jobs.  0 = Redis has no maxmemory limit set.
 REDIS_MEMORY_ALERT_PCT            = 80
 
-# DB connection pool size (must match maxconn in db/connection.py).
-# Used by scheduler.py to compute the combined worker ceiling:
-#   scan_ceil + detail_ceil ≤ DB_POOL_MAXCONN - 3 (3 reserved for scheduler)
-DB_POOL_MAXCONN                   = 25
+# Per-process DB connection pool (db/connection.py): every process opens
+# DB_POOL_MINCONN connections at once and may grow to DB_POOL_PROCESS_MAXCONN.
+# This is a per-process limit only; it is not the manager's worker budget.
+DB_POOL_PROCESS_MAXCONN           = int(os.getenv("DB_POOL_PROCESS_MAXCONN", "25"))
+DB_POOL_MINCONN                   = int(os.getenv("DB_POOL_MINCONN", "2"))
+
+# Worker seats the manager starts with, counted in workers (not connections).
+# The manager raises it when pools are short, never past what Postgres can host.
+WORKER_SEAT_BUDGET                = int(os.getenv("WORKER_SEAT_BUDGET", "22"))
+
+# Capacity overflow (docs/scaling-redesign.md Layer 2): the raise step is counted
+# in connections; the manager turns it into seats with the live connections per
+# worker.  The ceiling is read from Postgres each cycle (workers/db_capacity.py):
+# max_connections - superuser_reserved_connections - DB_CAPACITY_MARGIN, minus the
+# connections held by non-worker processes.
+DB_POOL_RAISE_STEP                = int(os.getenv("DB_POOL_RAISE_STEP", "5"))
+DB_CAPACITY_MARGIN                = int(os.getenv("DB_CAPACITY_MARGIN", "10"))
+
+# Layer 0 target: real per-job service time s = busy time / jobs finished,
+# summed over this many manager cycles (one cycle is too noisy).
+SERVICE_TIME_WINDOW_CYCLES        = int(os.getenv("SERVICE_TIME_WINDOW_CYCLES", "5"))
+
+# Layer 1 nightly recompute: runs once per local day from this hour on, and the
+# daily_peak record is labelled with that local date.
+MANAGER_RECOMPUTE_HOUR            = int(os.getenv("MANAGER_RECOMPUTE_HOUR", "23"))
+MANAGER_RECOMPUTE_TZ              = os.getenv("MANAGER_RECOMPUTE_TZ", "America/New_York")
+
+# Per-pool soft ceiling = (budget - reserved) // divisor (Phase 2 of the ceiling
+# plan); spare slots then fill shortages in priority order (Phase 4).
+POOL_CEIL_DIVISOR                 = {"scan": 2, "detail": 3, "fullscan": 5}
+# Safety buffer assumed for a pool still in bootstrap (no 28-day history yet).
+BOOTSTRAP_BUFFER                  = 2
+
+# Layer 0 utilization gates: scale-up fires above SCALE_UP_UTIL, scale-down below
+# SCALE_DOWN_UTIL.  Scan/fullscan size their steady load so it runs at SCALE_UP_UTIL
+# (one value for gate and sizing, no slack-free 100% target).
+MANAGER_SCALE_UP_UTIL             = float(os.getenv("MANAGER_SCALE_UP_UTIL", "0.80"))
+MANAGER_SCALE_DOWN_UTIL           = float(os.getenv("MANAGER_SCALE_DOWN_UTIL", "0.50"))
+
+# Lowest delay_warn_s the manager derives for the scan / fullscan pools
+# (scan: 10% of P10 current_interval_s, fullscan: 10% of AVG full_scan_interval_s).
+SCAN_DELAY_WARN_MIN_S             = int(os.getenv("SCAN_DELAY_WARN_MIN_S", "300"))
+FULLSCAN_DELAY_WARN_MIN_S         = int(os.getenv("FULLSCAN_DELAY_WARN_MIN_S", "600"))
+
+# Detail pool ceiling and admission (docs/detail-pool-ceiling-th-design.md).
+# Window T over which arrivals are summed (bucket size); the design delay D
+# follows from it.  Utilisation u reuses MANAGER_SCALE_UP_UTIL.
+DETAIL_BUCKET_WINDOW_MIN          = int(os.getenv("DETAIL_BUCKET_WINDOW_MIN", "30"))
+# Per-minute arrivals history the nightly ceiling is computed from; used once at
+# least DETAIL_ARRIVALS_MIN_HOURS of rows exist, bootstrap defaults before that.
+DETAIL_ARRIVALS_HISTORY_DAYS      = int(os.getenv("DETAIL_ARRIVALS_HISTORY_DAYS", "28"))
+DETAIL_ARRIVALS_MIN_HOURS         = int(os.getenv("DETAIL_ARRIVALS_MIN_HOURS", "24"))
+# Coverage ladder: start at START_PCT and step down by 1 to the first level whose
+# ceiling fits the seats left for detail; below FLOOR_PCT the alert is critical.
+DETAIL_COVERAGE_START_PCT         = int(os.getenv("DETAIL_COVERAGE_START_PCT", "99"))
+DETAIL_COVERAGE_FLOOR_PCT         = int(os.getenv("DETAIL_COVERAGE_FLOOR_PCT", "75"))
+# Longest acceptable detail wait; the nightly run alerts when the design delay or
+# the simulated drain time of the biggest backlog exceeds it.
+DETAIL_MAX_WAIT_MIN               = int(os.getenv("DETAIL_MAX_WAIT_MIN", "120"))
+# Detail drainer wakes every k x tick with k = ceil(DRAIN_MIN_WAKE_S / tick), so
+# one wake releases a whole number of tokens.
+DRAIN_MIN_WAKE_S                  = float(os.getenv("DRAIN_MIN_WAKE_S", "1"))
+# Lifetime of the drainer's heartbeat key (at least 3 wakes); the watchdog alerts
+# when it is missing or stale.
+DRAIN_HEARTBEAT_TTL_S             = int(os.getenv("DRAIN_HEARTBEAT_TTL_S", "30"))
+
+# Per-company load table (workers/company_load.py): replaced by the nightly rebuild,
+# so it expires one hour after the recompute period if that rebuild stops running.
+COMPANY_LOAD_TTL_S                = int(os.getenv("COMPANY_LOAD_TTL_S", str(25 * 3600)))
 
 # ── Phase 10 — Adaptive protection + resilience hardening (Section 18) ────────
 #
@@ -845,14 +930,17 @@ WORKER_CONSEC_REDUCTIONS_TTL       = 3600    # TTL for consec_reductions counter
 WORKER_SCALING_LOCK_TTL            = 1800    # 30 min = WORKER_SLOW_CHECK_INTERVAL_S
 
 # Per-DC in-flight scan tracking (drift-proof ZSET).
-# Score = dispatch timestamp.  Entries older than INFLIGHT_STALE_WINDOW_S are
-# removed before ZCARD to prevent drift from crashed workers.
+# Score = dispatch timestamp.  Entries are released by completion, the reaper
+# (claim_stale_work) and sweep_inflight — never by age.
 REDIS_INFLIGHT_PREFIX              = "inflight:scans"  # key: {prefix}:{dc_key}
-INFLIGHT_STALE_WINDOW_S            = 600     # 10 min = 2× max scan timeout
 
 # ── Full scan (Section 9) ─────────────────────────────────────────────────────
-FULLSCAN_BLOOM_TTL             = 36 * 3600  # 36h bloom filter TTL
+# The bloom is the fullscan's "already handled" gate (a hit = no DB insert), so it must outlive several
+# fullscan intervals: if it expires, every previously rejected job is DB-checked and re-inserted once.
+FULLSCAN_BLOOM_TTL             = int(os.getenv("FULLSCAN_BLOOM_TTL_S", str(7 * 24 * 3600)))   # default 7 days
 FULLSCAN_BLOOM_ERROR_RATE      = 0.001      # 0.1% false positive rate
+# Initial BF.RESERVE size = jobs fetched this scan * (1 + headroom), never below the floor. The filter is
+# scalable, so a board that grows past it still works; this only sets where it starts. No hard cap.
 # Hourly retries after a fetch that ended request_failed. Past the limit the scan completes normally with its
 # incomplete verdict recorded, so a board that always fails mid-way is not retried forever.
 REDIS_FULLSCAN_PARTIAL_PREFIX  = "fullscan:partial_retries"   # key: {prefix}:{company}
@@ -873,17 +961,57 @@ ADAPTIVE_SEEN_TTL              = 24 * 3600  # 24h fixed TTL
 # If a worker dies mid-scan the stream message stays in the PEL and is
 # reclaimed by XAUTOCLAIM after idle_ms = p95_scan_ms * 3, preventing lost work.
 # No separate heartbeat / watchdog needed for scan workers.
+# No MAXLEN on these streams: a count cap deletes entries no worker has taken
+# (company already ZREM'd → lost).  The scheduler trims delivered entries only
+# (stream_backlog).
 REDIS_STREAM_ADAPTIVE   = "stream:adaptive"     # adaptive scan delivery stream
 REDIS_STREAM_FULLSCAN   = "stream:fullscan"     # full scan delivery stream
 STREAM_CONSUMER_GROUP   = "scan-workers"        # shared consumer group for all workers
+# Short (0.5s) so workers check pause_event within ~1s of signal.
 STREAM_BLOCK_MS         = 500                   # XREADGROUP BLOCK timeout (ms)
-                                                # Short (0.5s) so workers check
-                                                # pause_event within ~1s of signal.
-STREAM_MAXLEN_ADAPTIVE  = 1000                  # XADD MAXLEN ~ (trimmed approximately)
-STREAM_MAXLEN_FULLSCAN  = 500                   # lower — fullscans are slower
-MAX_STREAM_REDELIVERIES = 5                     # XAUTOCLAIM: after this many
-                                                # redeliveries → dead-letter to ZSET
-                                                # with exponential backoff
+# CL: a consumer with no pending messages that has been idle this long belongs
+# to a worker that is gone (every restart/respawn creates a new consumer name);
+# the scheduler deletes it so the group's consumer list does not grow forever.
+STREAM_CONSUMER_PRUNE_IDLE_S = int(os.getenv("STREAM_CONSUMER_PRUNE_IDLE_S", "3600"))
+MAX_STREAM_REDELIVERIES = 5                     # reaps of one company (reaped:{op}:{company},
+                                                # reset on a successful scan) after which
+                                                # the reap logs a repeat-offender warning;
+                                                # the backoff itself grows from reap 1
+REDIS_REAPED_PREFIX     = "reaped"              # key: {prefix}:{op}:{company} — reaps since last success
+REDIS_INFLIGHT_MSG_PREFIX = "inflight:msg"      # key: {prefix}:{op}:{company} — stream id of the
+                                                # dispatched message holding the inflight slot
+
+# Worker progress reports (workers/progress.py): while a worker holds a stream
+# message it publishes worker:cur:{consumer} = {msg_id, alive_until}.  The deadline
+# after each checkpoint is the longest silent gap ever seen between checkpoints for
+# that dc_key (high-water mark in the progress:gap hash) x PROGRESS_GAP_FACTOR,
+# never below PROGRESS_COLD_GAP_S (also the allowance before any gap is learned and
+# for an HTTP read with no timeout).  Past alive_until the owner counts as stalled.
+PROGRESS_GAP_FACTOR     = float(os.getenv("PROGRESS_GAP_FACTOR", "3"))
+PROGRESS_COLD_GAP_S     = int(os.getenv("PROGRESS_COLD_GAP_S", "600"))
+# Watchdog self-heal pacing (D2).  Restarts are counted per ACTION TARGET (every alert
+# that restarts the scheduler shares one budget).  Cooldown = minimum gap between two
+# restarts of the same target: two watchdog cycles (10 min) so a restart has its
+# start-up allowance plus one full check to show an effect.  Block = how long restarts
+# of a target stay off after the attempt budget is spent (alert emails continue on
+# their own cooldown).
+WATCHDOG_HEAL_COOLDOWN_S = int(os.getenv("WATCHDOG_HEAL_COOLDOWN_S", "600"))
+WATCHDOG_HEAL_BLOCK_S    = int(os.getenv("WATCHDOG_HEAL_BLOCK_S", "7200"))
+# Restart budget per target and the TTL of its attempt counter.
+WATCHDOG_HEAL_MAX_ATTEMPTS = int(os.getenv("WATCHDOG_HEAL_MAX_ATTEMPTS", "3"))
+WATCHDOG_HEAL_ATTEMPT_WINDOW_S = int(os.getenv("WATCHDOG_HEAL_ATTEMPT_WINDOW_S", "1800"))
+# Jobs processed between pause / shutdown checks in a fullscan (the board is
+# fetched in one call, so this is the only point where a maintenance pause is honoured).
+FULLSCAN_CHUNK_SIZE = int(os.getenv("FULLSCAN_CHUNK_SIZE", "50"))
+REDIS_PROGRESS_GAP_HASH = "progress:gap"        # HASH dc_key -> longest silent gap seen (s)
+REDIS_WORKER_CUR_PREFIX = "worker:cur"          # key per consumer: current msg + deadline
+REDIS_WORKER_HEALTH_STREAM = "worker:health_history"   # STREAM of periodic pool snapshots
+WORKER_HEALTH_SNAPSHOT_INTERVAL_S = int(os.getenv("WORKER_HEALTH_SNAPSHOT_INTERVAL_S", "3600"))
+WORKER_HEALTH_STREAM_MAXLEN = int(os.getenv("WORKER_HEALTH_STREAM_MAXLEN", "2000"))
+# A pool worker that is alive but has published no heartbeat within
+# (slowest start-up seen for its type) x PROGRESS_GAP_FACTOR never finished starting
+# and is killed and replaced.  No deadline until one start-up has been observed.
+REDIS_START_LATENCY_HASH = "worker:start_latency"   # HASH worker type -> slowest spawn->heartbeat (s)
 
 # ── WARMING lifecycle — new company onboarding (Section 25) ───────────────────
 # NEW companies do their first full scan, then WARMING: 3 adaptive polls at a

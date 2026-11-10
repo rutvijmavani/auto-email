@@ -69,6 +69,9 @@ _MONTHLY_COMMANDS = frozenset({
 _LONG_RUNNING_COMMANDS = frozenset({
     "scheduler", "api", "email_processor",
     "domain_enrichment_worker", "discover_h1b_ats_worker", "head_check_worker",
+    # WL/F-WDLOG: always-on daemons that used to write <name>_<start date>.log forever.
+    "watchdog", "manager", "h1b_llm_worker", "llama_server_wrapper",
+    "mobile_relay_drain_worker", "detail_drainer", "tunnel_manager",
 })
 
 # Subset of _LONG_RUNNING_COMMANDS that get extended retention (LOG_RETENTION_WORKER_DAYS).
@@ -98,6 +101,85 @@ _STACK_SEEN: dict[str, float] = {}
 _STACK_LOCK = threading.Lock()
 
 
+class SharedTimedRotatingFileHandler(logging.handlers.TimedRotatingFileHandler):
+    """
+    Midnight rotation that is safe when many processes log to ONE file (RO / F-ROTRACE).
+
+    The scheduler and its ~12 pool workers each open their own handler on scheduler.log.
+    With the stock handler every process renames the file at midnight, so a late process
+    renames (or, on POSIX, overwrites the backup with) the file another process just
+    created, and processes that never roll keep writing into the renamed backup, so one
+    day ends up split across two files.  This handler fixes both:
+      * rollover renames only a file last written BEFORE the boundary just crossed, never
+        overwrites an existing backup, and runs under an flock (Linux) so two processes
+        cannot both rename;
+      * before each emit it reopens the stream if the path no longer points at the file
+        it holds (another process rotated), like WatchedFileHandler.
+    """
+
+    def _lock_path(self) -> str:
+        return self.baseFilename + ".rotate.lock"
+
+    def shouldRollover(self, record) -> bool:
+        self._reopen_if_moved()
+        return super().shouldRollover(record)
+
+    def _reopen_if_moved(self) -> None:
+        if self.stream is None or os.name == "nt":
+            return
+        try:
+            path_stat = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            path_stat = None
+        except OSError:
+            return
+        try:
+            cur = os.fstat(self.stream.fileno())
+        except (OSError, ValueError):
+            return
+        if path_stat is None or (path_stat.st_dev, path_stat.st_ino) != (cur.st_dev, cur.st_ino):
+            self.stream.close()
+            self.stream = self._open()
+
+    def doRollover(self) -> None:
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        lock_fh = None
+        try:
+            try:
+                import fcntl
+                lock_fh = open(self._lock_path(), "a")
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                lock_fh = None          # Windows / unwritable dir: best effort, no lock
+            boundary = self.rolloverAt
+            dfn = self.rotation_filename(
+                self.baseFilename + "." + time.strftime(self.suffix, time.localtime(boundary - self.interval)))
+            try:
+                # Rename only the previous period's file; a base file written at/after the
+                # boundary was already created by another process's rollover.
+                if (os.path.exists(self.baseFilename)
+                        and os.path.getmtime(self.baseFilename) < boundary
+                        and not os.path.exists(dfn)):
+                    self.rotate(self.baseFilename, dfn)
+            except OSError:
+                pass
+        finally:
+            if lock_fh is not None:
+                try:
+                    lock_fh.close()     # closing releases the flock
+                except OSError:
+                    pass
+        if not self.delay:
+            self.stream = self._open()
+        now = int(time.time())
+        nxt = self.computeRollover(now)
+        while nxt <= now:
+            nxt += self.interval
+        self.rolloverAt = nxt
+
+
 def _auto_stack() -> str:
     """Return the current call stack with logging-internal frames trimmed off the bottom."""
     frames = traceback.extract_stack()
@@ -119,6 +201,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict = {
             "time":   self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "tz":     time.strftime("%z", time.localtime(record.created)),   # LOGTZ: "time" is local, say which zone
+            "pid":    record.process,                                          # NOPID
             "ms":     record.msecs,
             "level":  record.levelname,
             "logger": record.name,
@@ -141,7 +225,8 @@ class JsonFormatter(logging.Formatter):
                     _inject = True
             if _inject:
                 payload["stack"] = _auto_stack()
-        return json.dumps(payload)
+        # EA: ensure_ascii=False keeps "—" etc. greppable; files are opened as utf-8.
+        return json.dumps(payload, ensure_ascii=False)
 
 
 # ─────────────────────────────────────────
@@ -163,6 +248,9 @@ class JsonFormatter(logging.Formatter):
 # Plain:    something.log (no date)
 #             Long-running process logs: scheduler.log, fullscan.log, pipeline.log
 #             Deleted once mtime ages past the daily retention window.
+# LOGDEL: names removed by the latest _cleanup_old_logs() run, logged by the caller.
+_CLEANUP_NAMES: list = []
+
 _MONTHLY_LOG_RE   = re.compile(r'^(.+)_\d{4}-\d{2}\.log$')
 _DAILY_LOG_RE     = re.compile(r'^(.+)_\d{4}-\d{2}-\d{2}\.log$')
 _ROTATION_LOG_RE  = re.compile(r'^.+\.log\.\d{4}-\d{2}-\d{2}$')
@@ -231,6 +319,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
     worker_cutoff  = now - timedelta(days=LOG_RETENTION_WORKER_DAYS)
 
     deleted, errors = 0, 0
+    _CLEANUP_NAMES.clear()
     for entry in LOG_DIR.iterdir():
         if not entry.is_file():
             continue
@@ -244,6 +333,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < monthly_cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             m = _DAILY_LOG_RE.match(name)
@@ -257,6 +347,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             if _ROTATION_LOG_RE.match(name):
@@ -270,6 +361,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
                 continue
 
             if name.endswith(".log"):
@@ -282,6 +374,7 @@ def _cleanup_old_logs() -> tuple[int, int]:
                 if mtime < cutoff:
                     entry.unlink(missing_ok=True)
                     deleted += 1
+                    _CLEANUP_NAMES.append(name)
 
         except OSError:
             errors += 1
@@ -375,7 +468,7 @@ def init_logging(command: str = "pipeline") -> None:
         _instance = os.environ.get("WORKER_INSTANCE", "")
         _suffix = f"_{_instance}" if _instance else ""
         command_file = LOG_DIR / f"{command}{_suffix}.log"
-        file_handler = logging.handlers.TimedRotatingFileHandler(
+        file_handler = SharedTimedRotatingFileHandler(
             command_file,
             when="midnight",
             backupCount=0,       # _cleanup_old_logs() handles deletion
@@ -426,8 +519,8 @@ def init_logging(command: str = "pipeline") -> None:
     )
     if _deleted or _errors:
         _log.info(
-            "Log cleanup ran at startup — deleted=%d errors=%d",
-            _deleted, _errors,
+            "Log cleanup ran at startup — deleted=%d errors=%d files=%s",
+            _deleted, _errors, ",".join(_CLEANUP_NAMES[:50]),
         )
 
 
@@ -452,8 +545,8 @@ def cleanup_logs_if_due() -> None:
         _last_log_cleanup = now  # only advance after success so failures retry
         if deleted or errors:
             _log.info(
-                "logger: periodic log cleanup — deleted=%d errors=%d",
-                deleted, errors,
+                "logger: periodic log cleanup — deleted=%d errors=%d files=%s",
+                deleted, errors, ",".join(_CLEANUP_NAMES[:50]),
             )
     except Exception as _exc:
         _log.warning("logger: periodic log cleanup failed — will retry next interval: %s", _exc)

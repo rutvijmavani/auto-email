@@ -34,7 +34,7 @@ from bs4 import BeautifulSoup
 
 import config
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, TOTAL_ATS, attach, count_distinct, failed,
 )
 from logger import get_logger
@@ -122,9 +122,12 @@ def has_paradox_state(html) -> bool:
 # FETCH JOBS (listing)
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch every job of a Paradox careers site.
+
+    stop_check (adaptive scan only): called with each page's stubs; True ends paging with
+    STOP_EARLY_EXIT.
 
     slug_info: {"host": "careers.fedex.com"} (dict or JSON string).
     Returns job stubs; description / posted_at are filled by fetch_job_detail().
@@ -174,22 +177,27 @@ def fetch_jobs(slug_info, company):
             break
         pages += 1
 
-        new = 0
+        page_jobs = []
+        gate_jobs = []                     # every usable row of the page, repeats included — what the gate judges
         for row in rows:
             stub = _to_stub(row, host, company)
             if stub is None:
                 unusable += 1
                 continue
+            gate_jobs.append(stub)
             if stub["job_id"] in seen:
                 continue
             seen.add(stub["job_id"])
-            jobs.append(stub)
-            new += 1
-        if not new:
+            page_jobs.append(stub)
+        jobs.extend(page_jobs)
+        if not page_jobs:
             stop = STOP_REPEAT_PAGE        # the same rows again — paging param ignored (would loop forever)
             break
         if total is not None and len(seen) + unusable >= total:
             stop = STOP_ALL_PAGES
+            break
+        if stop_check is not None and stop_check(gate_jobs):
+            stop = STOP_EARLY_EXIT
             break
 
     # Rows with no title/id are excluded from what the board can be expected to yield.

@@ -7,7 +7,6 @@ PEL consumer-PID checking, and stall-signal logic.
 Phase 3 update
 ──────────────
 Several functions were refactored or replaced in Phase 3:
-  - check_hung_workers(r) now takes `r` as argument and returns Issue objects
   - check_pel_stats() was replaced by _check_pel_health() (private helper inside
     check_queue_health) with PID-based consumer liveness
   - check_queue_health() now uses velocity/delta tracking across cycles instead
@@ -137,74 +136,6 @@ def _make_redis(**overrides):
     return r
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TestCheckHungWorkers
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestCheckHungWorkers(unittest.TestCase):
-    """check_hung_workers(r) — heartbeat-alive but no progress key = hung."""
-
-    def _run(self, alive_heartbeats=None, progress_exists=None):
-        r = MagicMock()
-        hb_keys = [f"heartbeat:{c}".encode() for c in (alive_heartbeats or [])]
-        r.scan.side_effect = [(0, hb_keys)]
-
-        progress_map = progress_exists or {}
-        def _exists(key):
-            if key.startswith("progress:"):
-                return int(progress_map.get(key.split(":", 1)[1], False))
-            return 0
-        r.exists.side_effect = _exists
-
-        from workers.watchdog import check_hung_workers
-        return check_hung_workers(r)
-
-    def test_no_heartbeats_returns_empty(self):
-        """No heartbeat keys → empty list."""
-        self.assertEqual(self._run(alive_heartbeats=[]), [])
-
-    def test_alive_with_progress_not_hung(self):
-        """Heartbeat + progress key → not hung → empty list."""
-        result = self._run(
-            alive_heartbeats=["CompanyA"],
-            progress_exists={"CompanyA": True},
-        )
-        self.assertEqual(result, [])
-
-    def test_alive_without_progress_returns_warning_issue(self):
-        """Heartbeat alive, progress key gone → WARNING Issue returned."""
-        from workers.watchdog import Issue
-        result = self._run(
-            alive_heartbeats=["CompanyA"],
-            progress_exists={"CompanyA": False},
-        )
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].level, Issue.WARNING)
-
-    def test_issue_mentions_company_name(self):
-        """Warning message includes the hung company name."""
-        result = self._run(
-            alive_heartbeats=["MyCompany"],
-            progress_exists={"MyCompany": False},
-        )
-        self.assertTrue(
-            any("MyCompany" in str(i) for i in result),
-            "Expected 'MyCompany' in issue output",
-        )
-
-    def test_multiple_only_hung_ones_flagged(self):
-        """Only companies with missing progress appear in warning."""
-        from workers.watchdog import Issue
-        result = self._run(
-            alive_heartbeats=["Co1", "Co2", "Co3"],
-            progress_exists={"Co1": True, "Co2": False, "Co3": True},
-        )
-        self.assertEqual(len(result), 1)
-        self.assertIn("Co2", str(result[0]))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TestWatchdogConstants
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestWatchdogConstants(unittest.TestCase):
@@ -742,6 +673,10 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
                 return json.dumps(snap).encode() if snap else None
             if key_s.startswith("manager:backpressure:threshold:"):
                 return str(backpressure_threshold_s).encode()
+            if key_s.startswith("fullscan:lock:"):
+                return b"host:2"          # lease owner
+            if key_s.startswith("worker:alive:scheduler:"):
+                return json.dumps({"pid": 9, "ts": now - 1, "ready": True}).encode()
             # per-PID heartbeat keys returned by _scan above
             if "worker:alive:scan_worker:" in key_s:
                 return json.dumps({"pid": 1, "ts": now - 5, "processed": scan_proc}).encode()
@@ -912,6 +847,64 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0,
                               backpressure_threshold_s=300.0, detail_proc=200)
         self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def _head_snap(self, **extra):
+        snap = {
+            "adp_total": 10, "adp_overdue": 0, "adp_head_c": None, "adp_head_s": None,
+            "fs_total": 10, "fs_overdue": 0, "fs_head_c": None, "fs_head_s": None,
+            "detail_adp_depth": 200, "detail_fs_depth": 0,
+            "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+        }
+        snap.update(extra)
+        return snap
+
+    def test_detail_head_moved_is_overloaded_not_stalled(self):
+        """Depth unchanged but the head changed: served, so no ERROR (report only)."""
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_head="old")
+        with patch("workers.watchdog._detail_queue_head", return_value="new"):
+            issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.WARNING)
+
+    def test_detail_head_unchanged_is_stalled_error(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_head="same")
+        with patch("workers.watchdog._detail_queue_head", return_value="same"):
+            issues, _ = self._run(snap=snap, detail_adp=200, detail_adp_delay_s=400.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.ERROR)
+
+    def test_detail_head_previous_missing_falls_back_to_depth_delta(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(detail_adp_depth=80)       # depth fell 80 -> 60: draining
+        with patch("workers.watchdog._detail_queue_head", return_value="new"):
+            issues, _ = self._run(snap=snap, detail_adp=60, detail_adp_delay_s=60.0)
+        self.assertEqual(self._level(issues, "queue:detail:adaptive"), Issue.OK)
+
+    def _held(self, oldest_id, ts=None):
+        return {"count": 5, "oldest_age_s": 120.0, "oldest_id": oldest_id,
+                "ts": self._NOW if ts is None else ts}
+
+    def test_held_oldest_unchanged_warns(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(held_head=7)
+        with patch("workers.watchdog._held_state", return_value=self._held(7)):
+            issues, _ = self._run(snap=snap)
+        self.assertEqual(self._level(issues, "detail held"), Issue.WARNING)
+
+    def test_held_oldest_changed_is_ok(self):
+        from workers.watchdog import Issue
+        snap = self._head_snap(held_head=7)
+        with patch("workers.watchdog._held_state", return_value=self._held(9)):
+            issues, _ = self._run(snap=snap)
+        self.assertEqual(self._level(issues, "detail held"), Issue.OK)
+
+    def test_held_absent_or_no_previous_reports_nothing(self):
+        with patch("workers.watchdog._held_state", return_value=None):
+            issues, _ = self._run(snap=self._head_snap(held_head=7))
+        self.assertIsNone(self._level(issues, "detail held"))
+        with patch("workers.watchdog._held_state", return_value=self._held(7)):
+            issues, _ = self._run(snap=self._head_snap())
+        self.assertIsNone(self._level(issues, "detail held"))
 
     def test_detail_queue_non_default_threshold_delay_just_over_is_error(self):
         """Non-default threshold: delay just above threshold → ERROR."""

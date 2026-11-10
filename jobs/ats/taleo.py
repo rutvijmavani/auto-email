@@ -54,7 +54,7 @@ DATE_FORMATS = ["%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]
 
 # Why the page loop ended — STOP_* are shared with jobs/ats/fetch_report.py (re-exported here)
 from jobs.ats.fetch_report import (  # noqa: E402
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, TOTAL_ATS, attach, failed,
 )
 
@@ -74,7 +74,8 @@ def _make_session():
 # FETCH JOBS
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
+    """stop_check (adaptive scan only): called with each page's jobs; True ends paging early."""
     if not slug_info:
         return failed(STOP_NO_CONFIG, "empty slug_info")
     if isinstance(slug_info, str):
@@ -225,9 +226,14 @@ def fetch_jobs(slug_info, company):
             new += 1
         return new
 
-    add_page(parse_page(data, 1))
+    first_page = parse_page(data, 1)
+    add_page(first_page)
     logger.debug("taleo: %s page 1/%d — %d distinct so far",
                  taleo_company, total_pages, len(all_jobs))
+    # The last page is never an early exit (it stays STOP_ALL_PAGES).
+    if total_pages > 1 and stop_check is not None and stop_check(first_page):
+        stop_reason = STOP_EARLY_EXIT
+        total_pages = 1                      # skip the loop below
 
     # Fetch remaining pages 2..total_pages
     for page in range(2, total_pages + 1):
@@ -250,6 +256,10 @@ def fetch_jobs(slug_info, company):
                 stop_reason = STOP_REPEAT_PAGE
                 break
 
+            if page < total_pages and stop_check is not None and stop_check(page_jobs):
+                stop_reason = STOP_EARLY_EXIT
+                break
+
         except requests.HTTPError as e:
             logger.error("taleo: HTTP %s page %d for %s",
                          e.response.status_code, page, taleo_company)
@@ -261,7 +271,9 @@ def fetch_jobs(slug_info, company):
             stop_reason = STOP_REQUEST_FAILED
             break
 
-    if len(all_jobs) < total:
+    if stop_reason == STOP_EARLY_EXIT:
+        logger.info("taleo: %s early exit at %d of %d jobs", taleo_company, len(all_jobs), total)
+    elif len(all_jobs) < total:
         # Taleo's own list API can return fewer rows than totalCount no matter
         # the sort or facet filter (utsw: 506 of 649, probed 2026-10-14), so a
         # shortfall with a clean stop is the server's, not ours.

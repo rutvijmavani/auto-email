@@ -99,7 +99,7 @@ from jobs.utils import (
 )
 
 from jobs.ats.fetch_report import (
-    STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
+    STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REPEAT_PAGE,
     STOP_REQUEST_FAILED, STOP_SINGLE_RESPONSE, TOTAL_ATS, FetchReport, attach,
     count_distinct, failed,
 )
@@ -625,9 +625,11 @@ def _build_legacy_session(slug_info):
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs for a company using stored curl config.
+    stop_check (adaptive scan only): called with each page's normalized jobs; True ends paging
+    with STOP_EARLY_EXIT.
     Warms session before every call — cookies never expire.
     """
     if not slug_info:
@@ -760,11 +762,21 @@ def fetch_jobs(slug_info, company):
     pagination = slug_info.get("pagination", {})
     pag_type   = pagination.get("type", "none")
 
+    field_map = slug_info.get("field_map", {})
+
+    def page_gate(raw_page):
+        """Normalize one raw page and ask the early-exit gate about it."""
+        page_jobs = [j for j in (_normalize(r, company, field_map, base_url, slug_info=slug_info)
+                                 for r in raw_page) if j]
+        return stop_check(page_jobs)
+
     outcome = {"stop": STOP_SINGLE_RESPONSE, "pages": 0}
     if pag_type == "none":
         pass
     elif total and len(jobs_arr) >= total:
         outcome["stop"] = STOP_ALL_PAGES
+    elif stop_check is not None and page_gate(jobs_arr):
+        outcome["stop"] = STOP_EARLY_EXIT      # page 1 alone already satisfied the gate
     elif pag_type != "none":
         # total unknown → exhaustion mode (page until empty/repeat) rather than silently stopping at page 1
         first_cursor = None
@@ -773,7 +785,8 @@ def fetch_jobs(slug_info, company):
             first_cursor = (cursor_data or {}).get(pagination.get("cursor_field", "nextCursor")) \
                 if isinstance(cursor_data, dict) else None
         extra = _paginate(session, slug_info, jobs_arr, total or None, company,
-                          initial_page = initial_page, outcome = outcome, first_cursor = first_cursor)
+                          initial_page = initial_page, outcome = outcome, first_cursor = first_cursor,
+                          page_gate = page_gate if stop_check is not None else None)
         all_raw.extend(extra)
 
     logger.info("custom_career: %d raw jobs for %r", len(all_raw), company)
@@ -2489,8 +2502,11 @@ def _resolve_protobuf_long(v):
 # ─────────────────────────────────────────
 
 def _paginate(session, slug_info, first_page_jobs, total, company, initial_page = 0, outcome=None,
-              first_cursor=None):
+              first_cursor=None, page_gate=None):
     """
+    `page_gate` (adaptive scan only): called with each extra page's RAW jobs; True ends paging with
+    STOP_EARLY_EXIT (never on the board's last page).
+
     `first_cursor` is the cursor page 1's response carried (cursor pagination only): page 2 is requested
     with it instead of re-requesting page 1. A cursor board whose page 1 carries none is a one-page chain.
 
@@ -2608,6 +2624,11 @@ def _paginate(session, slug_info, first_page_jobs, total, company, initial_page 
             if not cursor:
                 outcome["stop"] = STOP_ALL_PAGES   # the cursor chain ended
                 break
+
+        reached_end = (not exhaustion_mode) and offset >= total   # that was the last page: stays a full read
+        if page_gate is not None and not reached_end and page_gate(jobs_arr):
+            outcome["stop"] = STOP_EARLY_EXIT
+            break
 
         time.sleep(PAGE_RETRY_DELAY)
 

@@ -72,23 +72,25 @@ def fetch_json(url, params=None, retries=2,
             status_code  = resp.status_code
             elapsed_ms   = int(time.time() * 1000) - start_ms
 
-            if platform and track:
-                _record(platform, status_code, elapsed_ms)
-
             if status_code == 429:
-                backoff_s = 60
+                # One record per 429, carrying the backoff actually slept (0 on
+                # the final attempt, which returns without sleeping).
+                backoff_s = 60 if attempt < retries else 0
+                if platform and track:
+                    _record(platform, 429, elapsed_ms, backoff_s=backoff_s)
+                    _check_rate_limit_alert(platform)
                 if attempt < retries:
                     logger.warning(
                         "Rate limited on %s — waiting %ds",
                         platform or url, backoff_s
                     )
-                    if platform and track:
-                        _record(platform, 429, elapsed_ms,
-                                backoff_s=backoff_s)
-                        _check_rate_limit_alert(platform)
                     time.sleep(backoff_s)
                     continue
                 return None
+
+            if platform and track:
+                _record(platform, status_code, elapsed_ms,
+                        error_type=_status_error_type(status_code))
 
             if status_code == 404:
                 return None
@@ -108,7 +110,8 @@ def fetch_json(url, params=None, retries=2,
         except requests.exceptions.Timeout:
             elapsed_ms = int(time.time() * 1000) - start_ms
             if platform and track:
-                _record(platform, 0, elapsed_ms)
+                _record(platform, 0, elapsed_ms,
+                        error_type="requests_timeout")
             if attempt < retries:
                 time.sleep(5)
                 continue
@@ -117,7 +120,8 @@ def fetch_json(url, params=None, retries=2,
         except requests.exceptions.ConnectionError:
             elapsed_ms = int(time.time() * 1000) - start_ms
             if platform and track:
-                _record(platform, 0, elapsed_ms)
+                _record(platform, 0, elapsed_ms,
+                        error_type="requests_conn_err")
             if attempt < retries:
                 time.sleep(5)
                 continue
@@ -159,15 +163,28 @@ def fetch_json_post(url, body=None, retries=2,
             status_code = resp.status_code
             elapsed_ms  = int(time.time() * 1000) - start_ms
 
-            if platform and track:
-                _record(platform, status_code, elapsed_ms)
-
             if status_code == 429:
-                backoff_s = 60
+                # Same single-record rule as fetch_json; Workday (the main
+                # caller) previously recorded no backoff and never ran the
+                # rate-limit alert check.
+                backoff_s = 60 if attempt < retries else 0
+                if platform and track:
+                    _record(platform, 429, elapsed_ms, backoff_s=backoff_s)
+                    _check_rate_limit_alert(platform)
                 if attempt < retries:
+                    # FJP: POST failures were silent; mirror fetch_json.
+                    logger.warning(
+                        "Rate limited on %s (POST) — waiting %ds",
+                        platform or url, backoff_s
+                    )
                     time.sleep(backoff_s)
                     continue
+                logger.debug("fetch_json_post: 429 on %s, retries exhausted", url)
                 return None
+
+            if platform and track:
+                _record(platform, status_code, elapsed_ms,
+                        error_type=_status_error_type(status_code))
 
             if 500 <= status_code < 600:
                 # Transient server error — retry with backoff
@@ -175,20 +192,37 @@ def fetch_json_post(url, body=None, retries=2,
                 if attempt < retries:
                     time.sleep(backoff_s)
                     continue
+                logger.debug("fetch_json_post: HTTP %d on %s, retries exhausted", status_code, url)
                 return None
 
             if status_code != 200:
                 # Non-retryable 4xx error
+                logger.debug("fetch_json_post: HTTP %d on %s", status_code, url)
                 return None
 
             return resp.json()
 
         except requests.exceptions.Timeout:
+            if platform and track:
+                _record(platform, 0, int(time.time() * 1000) - start_ms,
+                        error_type="requests_timeout")
             if attempt < retries:
                 time.sleep(2 ** attempt)
                 continue
+            logger.debug("fetch_json_post: timeout on %s, retries exhausted", url)
             return None
-        except Exception:
+        except requests.exceptions.ConnectionError as e:
+            if platform and track:
+                _record(platform, 0, int(time.time() * 1000) - start_ms,
+                        error_type="requests_conn_err")
+            if attempt < retries:
+                # Same transient-failure handling as the Timeout branch (and fetch_json).
+                time.sleep(2 ** attempt)
+                continue
+            logger.debug("fetch_json_post: connection error on %s, retries exhausted: %s", url, e)
+            return None
+        except Exception as e:
+            logger.debug("fetch_json_post: %s on %s: %s", type(e).__name__, url, e)
             return None
 
     return None
@@ -222,7 +256,8 @@ def fetch_html(url, params=None, platform=None, track=True, timeout=None):
         elapsed_ms  = int(time.time() * 1000) - start_ms
 
         if platform and track:
-            _record(platform, status_code, elapsed_ms)
+            _record(platform, status_code, elapsed_ms,
+                    error_type=_status_error_type(status_code))
 
         if status_code == 429:
             if platform:
@@ -237,7 +272,13 @@ def fetch_html(url, params=None, platform=None, track=True, timeout=None):
     except Exception as e:
         elapsed_ms = int(time.time() * 1000) - start_ms
         if platform and track:
-            _record(platform, 0, elapsed_ms)
+            if isinstance(e, requests.exceptions.Timeout):
+                etype = "requests_timeout"
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                etype = "requests_conn_err"
+            else:
+                etype = "requests_other_err"
+            _record(platform, 0, elapsed_ms, error_type=etype)
         logger.debug("fetch_html failed for %s: %s", url, e)
         return None
 
@@ -246,11 +287,25 @@ def fetch_html(url, params=None, platform=None, track=True, timeout=None):
 # INTERNAL HELPERS
 # ─────────────────────────────────────────
 
-def _record(platform, status_code, elapsed_ms, backoff_s=0):
+def _status_error_type(status_code):
+    """
+    api_health error sub-type for an HTTP status, or None when it is not an
+    error row (200, 429 and 404 have their own columns).  5xx -> requests_5xx,
+    any other status -> requests_other_err.
+    """
+    if status_code in (200, 404, 429):
+        return None
+    if 500 <= status_code < 600:
+        return "requests_5xx"
+    return "requests_other_err"
+
+
+def _record(platform, status_code, elapsed_ms, backoff_s=0, error_type=None):
     """Record request to api_health table. Best-effort."""
     try:
         from db.api_health import record_request
-        record_request(platform, status_code, elapsed_ms, backoff_s)
+        record_request(platform, status_code, elapsed_ms, backoff_s,
+                       error_type=error_type)
     except Exception:
         pass  # never block on tracking failure
 

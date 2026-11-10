@@ -38,10 +38,20 @@ Every WATCHDOG_INTERVAL_S (5 min):
 
 ─── Escalation ───────────────────────────────────────────────────────────────
 
-  After HEAL_MAX_ATTEMPTS (3) failed restarts within HEAL_ATTEMPT_WINDOW (30 min),
-  the watchdog sends an escalation email and stops retrying.  The escalation
-  flag expires after 24h, at which point the watchdog will try again if the
-  issue persists.
+  D2 policy — the watchdog is a gated BACKSTOP, not a second actor:
+    * Detail queue: scheduler restart only when ALL hold — oldest job age > the
+      manager's published D (manager:backpressure:threshold:detail), queue head
+      unchanged, processed count unchanged, depth > 0.  Otherwise WARNING only.
+      A baseline (no-snapshot) cycle never restarts.
+    * Stream PEL (WB): a stalled owner (worker:cur deadline passed) is a WARNING;
+      ERROR + scheduler restart only if the same entry persists two checks.
+    * Heal budget is per ACTION TARGET (scheduler), shared by every alert type:
+      HEAL_MAX_ATTEMPTS (3) per HEAL_ATTEMPT_WINDOW (30 min), HEAL_COOLDOWN_S
+      (600s) between restarts; once spent, restarts of that target are blocked
+      for WATCHDOG_HEAL_BLOCK_S (7200s).  Alert emails are never silenced.
+      Counters are not reset on "resolved" — they expire by their own windows.
+    * Logs/emails name the cause: "queue:adaptive -> scheduler".
+    * A fullscan:lock:* only suppresses stall checks while its owner is alive.
 
 ─── Running ──────────────────────────────────────────────────────────────────
 
@@ -62,6 +72,7 @@ Every WATCHDOG_INTERVAL_S (5 min):
   pending_work.md Phase 3 — Reliability Layer
 """
 
+import hashlib
 import html as _html_lib
 import json
 import math
@@ -79,6 +90,8 @@ from email.mime.text import MIMEText
 from typing import Optional
 
 from workers.redis_client import get_redis, ping
+from workers.queue_stamp import payload_wait_s
+from workers.detail_drainer import HELD_KEY
 from config import (
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
@@ -89,6 +102,11 @@ from config import (
     REDIS_DETAIL_DLQ,
     REDIS_EMAIL_DLQ,
     STREAM_CONSUMER_GROUP,
+    WATCHDOG_HEAL_COOLDOWN_S,
+    WATCHDOG_HEAL_BLOCK_S,
+    DRAIN_HEARTBEAT_TTL_S,
+    WATCHDOG_HEAL_MAX_ATTEMPTS,
+    WATCHDOG_HEAL_ATTEMPT_WINDOW_S,
     EMAIL,
     APP_PASSWORD,
 )
@@ -132,6 +150,7 @@ _UNIT_WATCHDOG   = "recruiter-watchdog"
 _UNIT_EMAIL_PROC = "email-processor"
 _UNIT_MANAGER         = "recruiter-manager"
 _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
+_UNIT_DETAIL_DRAINER  = "recruiter-detail-drainer"
 
 
 # ─────────────────────────────────────────
@@ -140,10 +159,10 @@ _UNIT_H1B_LLM_WORKER  = "h1b-llm-worker"
 
 WATCHDOG_INTERVAL_S   = 300     # 5 min between checks
 ALERT_COOLDOWN_S      = 3600    # 1 h — don't repeat same alert type within this
-HEAL_MAX_ATTEMPTS     = 3       # max auto-restarts before escalation
-HEAL_ATTEMPT_WINDOW   = 1800    # 30 min — attempt counter TTL
-HEAL_COOLDOWN_S       = 150     # min gap between two heal attempts (avoids rapid loop)
-ESCALATION_COOLDOWN   = 86400   # 24 h — re-escalation window
+HEAL_MAX_ATTEMPTS     = WATCHDOG_HEAL_MAX_ATTEMPTS        # max auto-restarts before escalation
+HEAL_ATTEMPT_WINDOW   = WATCHDOG_HEAL_ATTEMPT_WINDOW_S    # attempt counter TTL
+HEAL_COOLDOWN_S       = WATCHDOG_HEAL_COOLDOWN_S   # min gap between two restarts of one target
+ESCALATION_COOLDOWN   = WATCHDOG_HEAL_BLOCK_S      # restarts of a target stay off this long after the budget is spent
 RESOLVE_COOLDOWN_S    = 7200    # 2 h — min gap between "RESOLVED" emails
 
 # Worker heartbeat absence threshold (seconds) before watchdog considers worker dead
@@ -152,6 +171,9 @@ HEARTBEAT_DEAD_AFTER = {
     "scan_worker":     45,
     "detail_worker":   45,
     "fullscan_worker":    1900,   # scans can legitimately take 30 min
+    # The drainer caps its sleep at TTL/3, so a live one beats at least every TTL/3 s
+    # whatever DRAIN_MIN_WAKE_S is; 2 x TTL keeps this above any configured TTL.
+    "detail_drainer":       max(60, 2 * DRAIN_HEARTBEAT_TTL_S),
     "h1b_llm_worker":       60,   # interval=30s → TTL=90s; 60s < TTL so STALE branch is reachable
     "email_processor":      60,   # interval=30s → same reasoning as h1b_llm_worker
 }
@@ -246,6 +268,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
             "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
             "description": f"Restarted {_UNIT_SCHEDULER} via systemd (respawns all workers)",
             "foreground":  True,
+            "target":      "scheduler",
         }
         actions: dict = {
             "worker_scan_worker":     worker_via_systemd,
@@ -256,6 +279,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_SCHEDULER} via systemd",
                 "foreground":  True,
+                "target":      "scheduler",
             },
             # systemd_service_* alert types from check_systemd_services()
             f"systemd_{_UNIT_SCHEDULER}": {
@@ -263,6 +287,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_SCHEDULER} via systemd (service was inactive/failed)",
                 "foreground":  True,
+                "target":      "scheduler",
             },
             f"systemd_{_UNIT_EMAIL_PROC}": {
                 "cmd_args":    _systemd_restart_cmd(_UNIT_EMAIL_PROC),
@@ -274,6 +299,12 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    _systemd_restart_cmd(_UNIT_MANAGER),
                 "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
                 "description": f"Restarted {_UNIT_MANAGER} via systemd (service was inactive/failed)",
+                "foreground":  True,
+            },
+            f"systemd_{_UNIT_DETAIL_DRAINER}": {
+                "cmd_args":    _systemd_restart_cmd(_UNIT_DETAIL_DRAINER),
+                "log_file":    f"{_LOG_DIR}/systemctl_restart.log",
+                "description": f"Restarted {_UNIT_DETAIL_DRAINER} via systemd (service was inactive/failed or heartbeat stale)",
                 "foreground":  True,
             },
             f"systemd_{_UNIT_H1B_LLM_WORKER}": {
@@ -334,6 +365,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler process (subprocess)",
+                "target":      "scheduler",
             },
             "queue_poll_adaptive_empty": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--rebuild"],
@@ -346,6 +378,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:adaptive stalled)",
+                "target":      "scheduler",
             },
             "queue_poll_fullscan_empty": {
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--rebuild"],
@@ -358,6 +391,7 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "pipeline.py", "--scheduler"],
                 "log_file":    f"{_LOG_DIR}/scheduler.log",
                 "description": "Restarted scheduler (poll:fullscan stalled)",
+                "target":      "scheduler",
             },
             f"systemd_{_UNIT_EMAIL_PROC}": {
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.email_processor"],
@@ -368,6 +402,11 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.manager"],
                 "log_file":    f"{_LOG_DIR}/manager.log",
                 "description": "Restarted manager process (subprocess fallback)",
+            },
+            f"systemd_{_UNIT_DETAIL_DRAINER}": {
+                "cmd_args":    [_PYTHON_EXE, "-m", "workers.detail_drainer"],
+                "log_file":    f"{_LOG_DIR}/detail_drainer.log",
+                "description": "Restarted detail_drainer process (subprocess fallback)",
             },
             f"systemd_{_UNIT_H1B_LLM_WORKER}": {
                 "cmd_args":    [_PYTHON_EXE, "-m", "workers.h1b_llm_worker"],
@@ -395,10 +434,11 @@ def _get_heal_action(alert_type: str) -> Optional[dict]:
 # REDIS STATE KEYS
 # ─────────────────────────────────────────
 # watchdog:alert:{type}           — cooldown flag after alert sent (1h TTL)
-# watchdog:heal_count:{type}      — consecutive heal attempts (30min TTL)
-# watchdog:heal_last:{type}       — timestamp of last heal attempt
+# watchdog:heal_count:{target}    — heal attempts per ACTION TARGET (30min TTL)
+# watchdog:heal_last:{target}     — timestamp of last heal attempt
 # watchdog:heal_pid:{type}        — PID of spawned process (if applicable)
-# watchdog:escalated:{type}       — escalation already sent (24h TTL)
+# watchdog:escalated:{target}     — restarts blocked (WATCHDOG_HEAL_BLOCK_S TTL)
+# watchdog:pel_stalled:{stream}   — stalled PEL entries seen last check (WB)
 # watchdog:resolved:{type}        — "resolved" email already sent (2h TTL)
 # watchdog:active_issues          — JSON list of alert_types from last cycle
 
@@ -743,6 +783,28 @@ def check_worker_heartbeats(r) -> list:
                 f"total_replacements={total}  pool_age={pool_age:.0f}s"
             ).strip()
 
+            pending   = info.get("pending_start", 0)
+            oldest    = info.get("oldest_pending_start_s", 0)
+            warn_s    = info.get("start_warn_s", 0)
+            unst_kill = info.get("unstarted_kills", 0)
+            if unst_kill:
+                detail_str += f"  unstarted_kills={unst_kill}"
+            if pending and warn_s and oldest > warn_s:
+                # Spawned but no heartbeat well past the slowest start-up seen: a
+                # hung start, flagged before the scheduler's own kill deadline.
+                issues.append(Issue(
+                    Issue.WARNING,
+                    label,
+                    f"{detail_str}  {pending} worker(s) spawned but not started for "
+                    f"{oldest:.0f}s (learned start-up allowance {warn_s:.0f}s) "
+                    "— possible hung start; see scheduler.log HUNG START",
+                    FIX_CMD,
+                    alert_type=f"worker_{label_suffix}",
+                ))
+                hung_start = True
+            else:
+                hung_start = False
+
             if consec >= ERR_DEATHS:
                 issues.append(Issue(
                     Issue.ERROR,
@@ -761,7 +823,7 @@ def check_worker_heartbeats(r) -> list:
                     FIX_CMD,
                     alert_type=f"worker_{label_suffix}",
                 ))
-            else:
+            elif not hung_start:
                 note = (
                     f"  ({consec} recent death(s) — scheduler replacing)"
                     if consec > 0 else ""
@@ -856,6 +918,46 @@ def check_h1b_llm_worker_heartbeat(r) -> list:
     return issues
 
 
+def check_detail_drainer_heartbeat(r) -> list:
+    """
+    Detail drainer liveness via worker:alive:detail_drainer:*.
+
+    A dead or hung drainer silently stops ALL detail admission (held rows are
+    never released), so a missing or stale heartbeat is an ERROR; the heal is a
+    systemd restart.  Runs independently of the scheduler checks.
+    """
+    now = time.time()
+    dead_after = HEARTBEAT_DEAD_AFTER["detail_drainer"]
+    fix = f"sudo {_SYSTEMCTL} restart {_UNIT_DETAIL_DRAINER}"
+    atype = f"systemd_{_UNIT_DETAIL_DRAINER}"
+    try:
+        newest = 0.0
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:detail_drainer:*", count=50)
+            for key in keys:
+                try:
+                    newest = max(newest, float(json.loads(r.get(key))["ts"]))
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if cursor == 0:
+                break
+        if not newest:
+            return [Issue(Issue.ERROR, "worker:detail_drainer",
+                          "detail_drainer heartbeat missing — held detail jobs are not "
+                          "being released", fix, alert_type=atype)]
+        age_s = now - newest
+        if age_s > dead_after:
+            return [Issue(Issue.ERROR, "worker:detail_drainer",
+                          f"detail_drainer heartbeat {age_s:.0f}s old (STALE — process "
+                          f"may be hung)", fix, alert_type=atype)]
+        return [Issue(Issue.OK, "worker:detail_drainer",
+                      f"heartbeat {age_s:.0f}s ago")]
+    except Exception as exc:
+        return [Issue(Issue.WARNING, "worker:detail_drainer",
+                      f"heartbeat check failed: {exc}")]
+
+
 # ─────────────────────────────────────────
 # QUEUE HEALTH — HELPERS
 # ─────────────────────────────────────────
@@ -899,12 +1001,40 @@ def _detail_queue_delay_s(r, queue_key: str) -> float | None:
         raw = r.lindex(queue_key, -1)
         if not raw:
             return None
-        payload = json.loads(raw)
-        enqueued_at = payload.get("enqueued_at")
-        if not enqueued_at:
+        return payload_wait_s(raw, time.time())
+    except Exception:
+        return None
+
+
+def _detail_queue_head(r, queue_key: str) -> Optional[str]:
+    """
+    Identity of the oldest item in a detail LIST queue (digest of its payload), or
+    None when the queue is empty/unreadable.  Workers pop the tail, so the same
+    head two cycles apart means nothing was served; a changed head means the
+    queue is moving, however long it is.
+    """
+    try:
+        raw = r.lindex(queue_key, -1)
+        if not raw:
             return None
-        enqueued_ts = datetime.fromisoformat(enqueued_at).timestamp()
-        return max(time.time() - enqueued_ts, 0.0)
+        return hashlib.md5(raw if isinstance(raw, bytes) else raw.encode()).hexdigest()
+    except Exception:
+        return None
+
+
+def _held_state(r, now: float) -> Optional[dict]:
+    """Drainer-published held figures {count, oldest_age_s, oldest_id}, or None if absent/stale."""
+    try:
+        raw = r.get(HELD_KEY)
+        if not raw:
+            return None
+        held = json.loads(raw)
+        if now - float(held["ts"]) > WATCHDOG_SNAPSHOT_TTL:
+            return None
+        # A partial/older payload must not reach the callers, which index these keys.
+        if not all(k in held for k in ("count", "oldest_age_s", "oldest_id")):
+            return None
+        return held
     except Exception:
         return None
 
@@ -927,6 +1057,34 @@ def _backpressure_threshold(r, pool: str) -> float:
     return _DETAIL_DELAY_WARN_FALLBACK
 
 
+def _scheduler_ready(r) -> bool:
+    """
+    True when both scheduler loop heartbeats exist and report ready (startup
+    init_db()/rebuild_redis() finished).  A heartbeat without the field (older
+    scheduler) counts as ready.  A missing heartbeat is not ready — the dead
+    scheduler has its own alert.
+    """
+    try:
+        for loop in ("adaptive", "fullscan"):
+            raw = r.get(f"worker:alive:scheduler:{loop}")
+            if not raw:
+                return False
+            if not json.loads(raw).get("ready", True):
+                return False
+        return True
+    except Exception:
+        return True   # unknown: do not mask a real stall
+
+
+def _backpressure_threshold_published(r, pool: str) -> bool:
+    """True when the manager has published a usable delay_warn_s for the pool."""
+    try:
+        val = r.get(f"manager:backpressure:threshold:{pool}")
+        return bool(val) and 0 < float(val) < float("inf")
+    except Exception:
+        return False
+
+
 def _zset_head(r, key: str):
     """(company_str, score_float) for the lowest-scored ZSET entry, or (None, None)."""
     try:
@@ -940,18 +1098,43 @@ def _zset_head(r, key: str):
 
 
 def _fullscan_lock_active(r) -> bool:
-    """True if any fullscan:lock:* key is present — a scan is running right now."""
+    """
+    True if a fullscan:lock:* lease is held by a LIVE owner — a scan is running now.
+
+    The lock is a TTL-less lease (value = "host:pid" of the owner), so a crashed
+    fullscan leaves it behind.  FL-WD: a lock whose owner has no worker heartbeat
+    is stale and must not blind the stall checks.
+    """
     try:
         cursor = 0
         while True:
             cursor, keys = r.scan(cursor, match="fullscan:lock:*", count=10)
-            if keys:
-                return True
+            for key in keys:
+                owner = r.get(key)
+                if isinstance(owner, (bytes, bytearray)):
+                    owner = owner.decode()
+                if not owner:
+                    continue
+                if r.exists(f"worker:alive:fullscan_worker:{owner}"):
+                    return True
             if cursor == 0:
                 break
         return False
     except Exception:
         return False
+
+
+def _counter_delta(cur, prev):
+    """
+    Change of a cumulative processed counter between two checks, or None when it
+    cannot be known: either value missing, or the counter went DOWN (a worker
+    restart reset it).  A negative delta is not "work done", so it is reported as
+    unknown, never as "+-3399 jobs" (NEGD).  None is not 0, so a reset can never
+    read as "no jobs processed" in the restart gate.
+    """
+    if cur is None or prev is None or cur < prev:
+        return None
+    return cur - prev
 
 
 def _trend(delta: int) -> str:
@@ -1157,7 +1340,10 @@ def _check_dlq_health(r, issues: list) -> None:
                 f"depth={depth} (≤{_DLQ_ALERT_THRESHOLD} OK)"))
 
 
-def _check_pel_health(r, issues: list) -> None:
+_PEL_STALLED_KEY_TTL_S = 3 * 300   # remembers stalled entries across ~3 watchdog cycles
+
+
+def _check_pel_health(r, issues: list, persist: bool = True) -> None:
     """
     PEL liveness checks for stream:adaptive and stream:fullscan.
 
@@ -1200,6 +1386,7 @@ def _check_pel_health(r, issues: list) -> None:
             worst_ms      = 0
             worst_orphan  = None
             alive_entries = []
+            stalled_now   = {}     # msg_id -> consumer (alive heartbeat, deadline passed)
             first_entry   = None
             _min_id       = "-"
             while True:
@@ -1218,6 +1405,19 @@ def _check_pel_health(r, issues: list) -> None:
                     e_ms    = entry.get("time_since_delivered", 0)
                     if e_alive:
                         alive_entries.append((e_consumer, e_pid, e_ms))
+                        # WB: owner heartbeat is alive — is it also making progress?
+                        # worker:cur:{consumer} deadline passed = wedged owner.
+                        try:
+                            from workers import progress as _progress
+                            _mid = entry.get("message_id", b"")
+                            if isinstance(_mid, bytes):
+                                _mid = _mid.decode()
+                            _cur = _progress.read_cur(r, e_consumer)
+                            if (_cur and str(_cur.get("msg_id")) == str(_mid)
+                                    and _progress.is_stalled(r, e_consumer)):
+                                stalled_now[str(_mid)] = e_consumer
+                        except Exception:
+                            pass
                     else:
                         if e_ms > worst_ms:
                             worst_ms     = e_ms
@@ -1239,9 +1439,47 @@ def _check_pel_health(r, issues: list) -> None:
                 if oldest_ms >= 60000 else f"{oldest_ms // 1000:.0f}s"
             )
 
+            # WB: a stalled owner is the scheduler's job to reap (it kills and
+            # replaces stalled workers).  Warn first; ERROR + scheduler restart
+            # only if the SAME stalled entry survives two consecutive checks,
+            # i.e. the scheduler failed to reap it.
+            _pel_key = f"watchdog:pel_stalled:{stream_key}"
+            persistent = {}
+            try:
+                prev_ids = {(x.decode() if isinstance(x, bytes) else x)
+                            for x in r.smembers(_pel_key)}
+                persistent = {m: c for m, c in stalled_now.items() if m in prev_ids}
+                if persist:
+                    pipe = r.pipeline()
+                    pipe.delete(_pel_key)
+                    if stalled_now:
+                        pipe.sadd(_pel_key, *stalled_now.keys())
+                        pipe.expire(_pel_key, _PEL_STALLED_KEY_TTL_S)
+                    pipe.execute()
+            except Exception:
+                pass
+            if persistent:
+                _m, _c = next(iter(persistent.items()))
+                issues.append(Issue(Issue.ERROR, label,
+                    f"{total} pending  stalled owner {_c} holds {_m} for 2 consecutive "
+                    f"checks ({len(persistent)} entr{'y' if len(persistent) == 1 else 'ies'}) "
+                    "— scheduler failed to reap it; restart scheduler",
+                    "python pipeline.py --scheduler",
+                    alert_type=atype,
+                ))
+                continue
+            if stalled_now:
+                _m, _c = next(iter(stalled_now.items()))
+                issues.append(Issue(Issue.WARNING, label,
+                    f"{total} pending  stalled owner {_c} (msg {_m}, progress deadline "
+                    "passed) — scheduler should kill/replace it; restart only if it "
+                    "persists next check"))
+
             if worst_orphan is None:
                 # All PEL entries have alive consumers.
                 _rep_consumer, _rep_pid, _ = alive_entries[0] if alive_entries else ("?", None, 0)
+                if stalled_now:
+                    continue
                 issues.append(Issue(Issue.OK, label,
                     f"{total} pending  oldest={age_str}  "
                     f"consumer={_rep_consumer} alive (pid={_rep_pid}) — in progress"))
@@ -1340,8 +1578,12 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     detail_fs_depth  = r.llen(REDIS_DETAIL_FULLSCAN)
     detail_adp_delay = _detail_queue_delay_s(r, REDIS_DETAIL_ADAPTIVE)
     detail_fs_delay  = _detail_queue_delay_s(r, REDIS_DETAIL_FULLSCAN)
+    detail_adp_head  = _detail_queue_head(r, REDIS_DETAIL_ADAPTIVE)
+    detail_fs_head   = _detail_queue_head(r, REDIS_DETAIL_FULLSCAN)
+    held             = _held_state(r, now)
+    held_head        = held["oldest_id"] if held and held.get("count") else None
 
-    scan_proc        = _worker_processed(r, "scan_worker")
+    scan_proc       = _worker_processed(r, "scan_worker")
     fs_proc          = _worker_processed(r, "fullscan_worker")
     detail_proc      = _worker_processed(r, "detail_worker")
 
@@ -1371,6 +1613,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 "fs_head_s":        fs_head_s,
                 "detail_adp_depth": detail_adp_depth,
                 "detail_fs_depth":  detail_fs_depth,
+                "detail_adp_head":  detail_adp_head,
+                "detail_fs_head":   detail_fs_head,
+                "held_head":        held_head,
                 "scan_proc":        scan_proc,
                 "fs_proc":          fs_proc,
                 "detail_proc":      detail_proc,
@@ -1410,9 +1655,13 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             if depth == 0 or delay_s is None:
                 issues.append(Issue(Issue.OK, label, f"depth={depth} (baseline)"))
             elif delay_s > delay_warn_s:
-                issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} delay={delay_s:.0f}s > threshold {delay_warn_s:.0f}s (baseline)",
-                    "python -m workers.detail_worker"))
+                # BASELINE-NODRAIN: with no previous snapshot there is no way to tell
+                # whether the queue is moving, so age alone never raises an ERROR
+                # (and so never a restart).  The next cycle decides.
+                issues.append(Issue(Issue.WARNING, label,
+                    f"depth={depth:,} delay={delay_s:.0f}s > threshold {delay_warn_s:.0f}s "
+                    "(baseline — no previous snapshot, cannot tell if draining; "
+                    "decided next cycle)"))
             elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
                     f"depth={depth:,} delay={delay_s:.0f}s (baseline, approaching threshold {delay_warn_s:.0f}s)"))
@@ -1420,7 +1669,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 issues.append(Issue(Issue.OK, label,
                     f"depth={depth} delay={delay_s:.0f}s (baseline)"))
         _check_dlq_health(r, issues)
-        _check_pel_health(r, issues)
+        _check_pel_health(r, issues, persist=persist_snapshot)
         return issues
 
     # ── 5. Extract previous snapshot values ───────────────────────────────────
@@ -1433,7 +1682,10 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     prev_fs_head_s   = snap.get("fs_head_s")
     prev_detail_adp  = snap.get("detail_adp_depth", 0)
     prev_detail_fs   = snap.get("detail_fs_depth", 0)
-    prev_scan_proc   = snap.get("scan_proc")
+    prev_detail_adp_head = snap.get("detail_adp_head")
+    prev_detail_fs_head  = snap.get("detail_fs_head")
+    prev_held_head       = snap.get("held_head")
+    prev_scan_proc  = snap.get("scan_proc")
     prev_fs_proc     = snap.get("fs_proc")
     prev_detail_proc = snap.get("detail_proc")
 
@@ -1456,7 +1708,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             prev_adp_head_c, prev_adp_head_s,
             scan_proc,   prev_scan_proc,
         )
-        proc_delta = (scan_proc - prev_scan_proc) if (scan_proc is not None and prev_scan_proc is not None) else None
+        proc_delta = _counter_delta(scan_proc, prev_scan_proc)
         summary = (
             f"{adp_total} total  {adp_overdue} overdue {_trend(adp_delta)}({adp_delta:+d})  "
             f"head={adp_head_c or '?'}  "
@@ -1507,7 +1759,7 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             prev_fs_head_c, prev_fs_head_s,
             fs_proc,    prev_fs_proc,
         )
-        proc_delta = (fs_proc - prev_fs_proc) if (fs_proc is not None and prev_fs_proc is not None) else None
+        proc_delta = _counter_delta(fs_proc, prev_fs_proc)
         summary = (
             f"{fs_total} total  {fs_overdue} overdue {_trend(fs_delta)}({fs_delta:+d})  "
             f"head={fs_head_c or '?'}  "
@@ -1526,28 +1778,39 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             issues.append(Issue(Issue.OK, "queue:poll:fullscan", summary))
 
     # ── 8. Detail queues ──────────────────────────────────────────────────────
-    detail_proc_delta = (
-        (detail_proc - prev_detail_proc)
-        if detail_proc is not None and prev_detail_proc is not None
-        else None
-    )
+    detail_proc_delta = _counter_delta(detail_proc, prev_detail_proc)
     proc_note = (
         f"  detail_worker +{detail_proc_delta} jobs"
         if detail_proc_delta is not None else ""
     )
 
     delay_warn_s = _backpressure_threshold(r, "detail")
-    for label, atype, depth, prev_depth, delay_s in [
+    # RS/WR gate: a restart needs the manager's own D.  When the manager has not
+    # published it (fallback in use) the figure is a guess, so only warn.
+    d_published = _backpressure_threshold_published(r, "detail")
+    # GATEORD: queue age right after a scheduler restart reflects the downtime and
+    # the startup rebuild, not a stall — no ERROR until both loops report ready.
+    sched_ready = _scheduler_ready(r)
+    for label, atype, depth, prev_depth, delay_s, head, prev_head in [
         ("queue:detail:adaptive", "queue_detail_adaptive",
-         detail_adp_depth, prev_detail_adp, detail_adp_delay),
+         detail_adp_depth, prev_detail_adp, detail_adp_delay,
+         detail_adp_head, prev_detail_adp_head),
         ("queue:detail:fullscan", "queue_detail_fullscan",
-         detail_fs_depth,  prev_detail_fs,  detail_fs_delay),
+         detail_fs_depth,  prev_detail_fs,  detail_fs_delay,
+         detail_fs_head, prev_detail_fs_head),
     ]:
         delta    = depth - prev_depth
-        # Use only this queue's own depth delta to determine if it is draining.
+        # Use only this queue's own state to determine if it is being served.
         # The pool-wide detail_proc_delta is not queue-specific: workers processing
         # adaptive jobs would make a growing fullscan queue falsely appear as draining.
-        draining = delta < 0
+        # Head tracking: a changed head means the oldest job was served since the
+        # last cycle, so a long or growing queue is overloaded, not stalled (report
+        # only, no restart).  Without a previous head (old snapshot) fall back to
+        # the depth delta.
+        if prev_head is not None and head is not None:
+            draining = head != prev_head
+        else:
+            draining = delta < 0
 
         if depth == 0:
             issues.append(Issue(Issue.OK, label, f"depth=0 — idle{proc_note}"))
@@ -1568,12 +1831,31 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
         else:
             direction = "growing" if delta > 0 else "stalled"
             if delay_s > delay_warn_s:
-                issues.append(Issue(Issue.ERROR, label,
-                    f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
-                    f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s){proc_note}",
-                    "python -m workers.detail_worker",
-                    alert_type=atype,
-                ))
+                # Restart only when EVERY condition holds: delay above the manager's
+                # D (published), queue head unchanged (not draining), detail workers'
+                # processed count unchanged, and work waiting (depth > 0).  Otherwise
+                # warn only.
+                no_service = detail_proc_delta == 0
+                if not sched_ready:
+                    issues.append(Issue(Issue.WARNING, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s) but "
+                        f"scheduler still starting (startup rebuild), decided next check{proc_note}"))
+                elif d_published and no_service:
+                    issues.append(Issue(Issue.ERROR, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds manager threshold ({delay_warn_s:.0f}s), "
+                        f"head unchanged, no jobs processed{proc_note}",
+                        "python -m workers.detail_worker",
+                        alert_type=atype,
+                    ))
+                else:
+                    why = ("manager threshold not published" if not d_published
+                           else "processed count moved or unknown")
+                    issues.append(Issue(Issue.WARNING, label,
+                        f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
+                        f"{direction}, delay exceeds threshold ({delay_warn_s:.0f}s) but "
+                        f"restart gate not met ({why}){proc_note}"))
             elif delay_s > delay_warn_s * 0.75:
                 issues.append(Issue(Issue.WARNING, label,
                     f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
@@ -1583,9 +1865,22 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                     f"depth={depth:,} delay={delay_s:.0f}s {_trend(delta)}({delta:+d}) — "
                     f"small backlog, {direction}{proc_note}"))
 
+    # Held rows (saved, not yet admitted by the drainer).  The oldest held id
+    # changing means the drainer is releasing; the same id two cycles running with
+    # fresh figures means it is not.  Report only: the drainer heartbeat check
+    # owns the restart.  Absent/stale figures are reported by that check.
+    if held_head is not None and prev_held_head is not None:
+        if held_head == prev_held_head:
+            issues.append(Issue(Issue.WARNING, "detail held",
+                f"{held['count']:,} held, oldest {held['oldest_age_s']:.0f}s — "
+                f"oldest held job unchanged since last cycle (drainer not releasing)"))
+        else:
+            issues.append(Issue(Issue.OK, "detail held",
+                f"{held['count']:,} held, oldest {held['oldest_age_s']:.0f}s — releasing"))
+
     # ── 9. PEL checks + DLQ depth ────────────────────────────────────────────
     _check_dlq_health(r, issues)
-    _check_pel_health(r, issues)
+    _check_pel_health(r, issues, persist=persist_snapshot)
     return issues
 
 
@@ -1628,7 +1923,8 @@ def check_coverage(r) -> list:
             stuck  = conn.execute("""
                 SELECT COUNT(*) AS c FROM job_postings
                 WHERE status = 'pending_detail'
-                  AND created_at < NOW() - INTERVAL '1 hour'
+                  AND pushed_at IS NOT NULL
+                  AND pushed_at < NOW() - INTERVAL '1 hour'
             """).fetchone()["c"]
         finally:
             conn.close()
@@ -1706,25 +2002,6 @@ def check_redis_persistence(r) -> list:
     return []
 
 
-def check_hung_workers(r) -> list:
-    hung = []
-    cursor = 0
-    while True:
-        cursor, keys = r.scan(cursor, match="heartbeat:*", count=100)
-        for key in keys:
-            ks      = key.decode() if isinstance(key, bytes) else key
-            company = ks.split(":", 1)[1]
-            if not r.exists(f"progress:{company}"):
-                hung.append(company)
-        if cursor == 0:
-            break
-    if hung:
-        return [Issue(Issue.WARNING, "hung_workers",
-            f"{len(hung)} scan(s) may be hung: "
-            f"{', '.join(hung[:5])}{'...' if len(hung) > 5 else ''}")]
-    return []
-
-
 def check_systemd_services() -> list:
     """
     Directly query systemd for the state of both pipeline units.
@@ -1755,6 +2032,7 @@ def check_systemd_services() -> list:
         (_UNIT_WATCHDOG,   False),   # we're the watchdog — can't self-heal
         (_UNIT_EMAIL_PROC, True),    # standalone daemon; healable via reset-failed + restart
         (_UNIT_MANAGER,       True),    # standalone daemon; healable via reset-failed + restart
+        (_UNIT_DETAIL_DRAINER, True),   # sole writer of held detail jobs to the queue; healable
         (_UNIT_H1B_LLM_WORKER, True),  # async LLM worker (Gemini API — no llama-server dependency)
     ]:
         try:
@@ -1818,10 +2096,10 @@ def _run_all_checks(r, persist_snapshot: bool = True) -> list:
     issues.extend(check_systemd_services())
     issues.extend(check_worker_heartbeats(r))
     issues.extend(check_h1b_llm_worker_heartbeat(r))
+    issues.extend(check_detail_drainer_heartbeat(r))
     issues.extend(check_queue_health(r, persist_snapshot=persist_snapshot))
     issues.extend(check_bloom_health(r))
     issues.extend(check_coverage(r))
-    issues.extend(check_hung_workers(r))
     issues.extend(check_redis_persistence(r))
     _check_unmatched_emails(issues)
     return issues
@@ -2114,25 +2392,42 @@ def _kill_ghost_workers(r) -> None:
 # SELF-HEALING
 # ─────────────────────────────────────────
 
+def _heal_target(alert_type: str) -> str:
+    """
+    What a heal acts on.  Heal state (attempt count, last attempt, lock, escalation
+    block) is kept per TARGET, not per alert type, so every alert that restarts the
+    scheduler shares one budget.  Targets default to the alert type itself.
+    """
+    action = _get_heal_action(alert_type)
+    return (action or {}).get("target") or alert_type
+
+
+def _heal_label(issue: "Issue") -> str:
+    """'queue:detail:adaptive -> scheduler' — which alert caused which action."""
+    return f"{issue.category} -> {_heal_target(issue.alert_type)}"
+
+
 def _heal_attempt_count(alert_type: str, r) -> int:
-    return int(r.get(_rkey("heal_count", alert_type)) or 0)
+    return int(r.get(_rkey("heal_count", _heal_target(alert_type))) or 0)
 
 
 def _can_heal(alert_type: str, r) -> bool:
     """
     True if we should attempt a self-heal for this alert type.
 
+    Everything below is keyed by the heal TARGET (see _heal_target).
     Blocked if:
       - No heal action is defined for this alert type
-      - Already escalated (and escalation hasn't expired)
+      - Restarts of the target are blocked (budget spent, block not yet expired)
       - Heal was attempted too recently (< HEAL_COOLDOWN_S ago)
       - Attempt count >= HEAL_MAX_ATTEMPTS
     """
     if _get_heal_action(alert_type) is None:
         return False
-    if r.exists(_rkey("escalated", alert_type)):
+    target = _heal_target(alert_type)
+    if r.exists(_rkey("escalated", target)):
         return False
-    last_ts_raw = r.get(_rkey("heal_last", alert_type))
+    last_ts_raw = r.get(_rkey("heal_last", target))
     if last_ts_raw:
         last_ts = float(last_ts_raw)
         if time.time() - last_ts < HEAL_COOLDOWN_S:
@@ -2162,15 +2457,16 @@ def _attempt_heal(issue: Issue, r) -> bool:
     is_fg    = action.get("foreground", False)
 
     mode = "systemd" if _systemd_available() else "subprocess"
+    target = _heal_target(issue.alert_type)
     logger.info(
-        "watchdog: attempting self-heal for %r [%s] — %s",
-        issue.alert_type, mode, action["description"],
+        "watchdog: attempting self-heal %s (%r) [%s] — %s",
+        _heal_label(issue), issue.alert_type, mode, action["description"],
     )
 
     # ── Atomic exclusive lock — prevent concurrent watchdog instances from
-    # both healing the same issue simultaneously (service + cron overlap).
+    # both healing the same target simultaneously (service + cron overlap).
     # NX ensures only the first caller proceeds; EX auto-expires if we crash.
-    _heal_lock_key = _rkey("heal_lock", issue.alert_type)
+    _heal_lock_key = _rkey("heal_lock", target)
     _heal_lock_val = f"{os.getpid()}:{time.time()}"
     try:
         _lock_acquired = r.set(_heal_lock_key, _heal_lock_val,
@@ -2188,12 +2484,12 @@ def _attempt_heal(issue: Issue, r) -> bool:
     # Record the attempt BEFORE running the subprocess so a timeout or spawn
     # error still counts toward the cooldown / max-attempt limits.  Without
     # this, a consistently timing-out command would retry indefinitely.
-    count_key = _rkey("heal_count", issue.alert_type)
+    count_key = _rkey("heal_count", target)
     try:
         r.incr(count_key)
         r.expire(count_key, HEAL_ATTEMPT_WINDOW)
-        r.set(_rkey("heal_last", issue.alert_type), str(time.time()),
-              ex=HEAL_ATTEMPT_WINDOW)
+        r.set(_rkey("heal_last", target), str(time.time()),
+              ex=max(HEAL_ATTEMPT_WINDOW, HEAL_COOLDOWN_S))
     except Exception as _re:
         logger.warning("watchdog: could not record heal attempt in Redis: %s", _re)
 
@@ -2296,7 +2592,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             # Downgraded to WARNING — still present, not yet resolved
             continue
         # Check if this was actually a heal success (heal_last key still in window)
-        was_being_healed = r.exists(_rkey("heal_last", alert_type))
+        was_being_healed = r.exists(_rkey("heal_last", _heal_target(alert_type)))
         if was_being_healed:
             subject = f"✅ Auto-healed: {alert_type.replace('_', ' ').title()}"
             body    = f"""
@@ -2324,10 +2620,10 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
                     dedup_key=_rkey("resolved", alert_type),
                     dedup_ttl=RESOLVE_COOLDOWN_S, r=r)
 
-        # Clean up heal state for this alert type
-        r.delete(_rkey("heal_count", alert_type))
-        r.delete(_rkey("heal_last", alert_type))
-        r.delete(_rkey("escalated", alert_type))
+        # RL: heal state (attempt count, last attempt, block) is deliberately NOT
+        # cleared here.  An issue that dips below ERROR for one cycle and comes
+        # back must not get a fresh restart budget; the counters expire by their
+        # own window (HEAL_ATTEMPT_WINDOW / HEAL_COOLDOWN_S / ESCALATION_COOLDOWN).
 
     # ── NEW / PERSISTING ISSUES ───────────────────────────────────────────────
     multi_issue_body_needed = []
@@ -2342,7 +2638,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         i.alert_type == "worker_scheduler" and i.is_alertable()
         for i in issues
     )
-    scheduler_being_healed_already = r.exists(_rkey("heal_last", "worker_scheduler"))
+    scheduler_being_healed_already = r.exists(_rkey("heal_last", "scheduler"))
     # Skip individual worker heals only on the FIRST cycle of scheduler failure.
     # If scheduler was already restarted (heal_last exists) but workers are still
     # missing, heal them directly (scheduler spawn may have failed or taken its pool down).
@@ -2357,18 +2653,27 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             continue
 
         atype       = issue.alert_type
+        target      = _heal_target(atype)
         is_new      = atype not in last_active
-        was_healing = r.exists(_rkey("heal_last", atype))
+        was_healing = r.exists(_rkey("heal_last", target))
         attempts    = _heal_attempt_count(atype, r)
-        escalated   = r.exists(_rkey("escalated", atype))
+        # Restarts of this target are blocked after the budget is spent.  The block
+        # only stops RESTARTS: the alert email below still goes out on its own
+        # cooldown (ALERT_COOLDOWN_S).
+        escalated   = r.exists(_rkey("escalated", target))
 
-        if escalated:
-            # Already escalated — do nothing until escalation TTL expires
-            continue
+        # WDREASON/LGAP/WP: record WHY this alert fired (the check's own message) in the log,
+        # not only in email/stdout, before any heal / escalation / plain-alert decision.
+        logger.warning(
+            "watchdog: alert %s level=%s new=%s heal_attempts=%d/%d escalated=%s — %s",
+            issue.category, issue.level, is_new, attempts, HEAL_MAX_ATTEMPTS,
+            bool(escalated), (issue.message or "")[:400],
+        )
 
         # ── Escalation check (persisting issue, exhausted attempts) ───────────
-        if not is_new and was_healing and attempts >= HEAL_MAX_ATTEMPTS:
-            subj = f"🆘 ESCALATION — {issue.category} still broken after {HEAL_MAX_ATTEMPTS} auto-restarts"
+        if (not escalated and not is_new and was_healing
+                and attempts >= HEAL_MAX_ATTEMPTS):
+            subj = f"🆘 ESCALATION — {issue.category} still broken after {HEAL_MAX_ATTEMPTS} auto-restarts ({target})"
             body = f"""
             <p style="color:#ef4444;font-weight:700;font-size:16px;">
               🆘 Manual intervention required
@@ -2380,11 +2685,12 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             <p style="color:#374151;"><strong>Issue:</strong> {_html_lib.escape(issue.message)}</p>
             {"<p style='font-family:monospace;background:#fef2f2;padding:10px;border-radius:6px;color:#991b1b;'><strong>Manual fix:</strong><br>" + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
             <p style="color:#64748b;font-size:12px;">
-              Auto-heal will retry after {ESCALATION_COOLDOWN // 3600}h.
+              Auto-restart of <strong>{target}</strong> is blocked for
+              {ESCALATION_COOLDOWN / 3600:.1f}h; alert emails continue.
               Worker restart logs: <code>{_LOG_DIR}/{atype.replace('worker_','')}.log</code>
             </p>"""
             sent = _send_email(subj, body,
-                               dedup_key=_rkey("escalated", atype),
+                               dedup_key=_rkey("escalated", target),
                                dedup_ttl=ESCALATION_COOLDOWN, r=r)
             if sent:
                 logger.warning(
@@ -2423,7 +2729,7 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
             if heal_ok:
                 attempt_n = _heal_attempt_count(atype, r)
                 heal_action = _get_heal_action(atype)
-                subj = f"⚠ Pipeline Issue — Auto-heal Attempted: {issue.category}"
+                subj = f"⚠ Pipeline Issue — Auto-heal Attempted: {_heal_label(issue)}"
                 body = f"""
                 <p style="color:#f59e0b;font-weight:700;font-size:15px;">
                   ⚠ Issue detected — attempting automatic recovery
@@ -2464,8 +2770,9 @@ def _process_issues(issues: list, r, self_heal: bool = True) -> None:
         <p style="color:#374151;">{_html_lib.escape(issue.message)}</p>
         {"<p style='font-family:monospace;background:#f1f5f9;padding:8px;border-radius:4px;color:#475569;font-size:13px;'><strong>Fix:</strong> " + _html_lib.escape(issue.fix) + "</p>" if issue.fix else ""}
         <p style="color:#64748b;font-size:12px;">
-          Auto-heal is not configured for this issue type.
-          Manual intervention required.
+          {"Auto-heal is not configured for this issue type." if _get_heal_action(atype) is None
+           else f"Auto-restart of {target} is paused (cooldown, attempt budget used, or blocked after escalation)."}
+          Manual intervention may be required.
         </p>"""
         _send_email(subj, body,
                     dedup_key=_rkey("alert", atype),
@@ -2590,6 +2897,16 @@ def run_watchdog(once: bool = False,
     # WATCHDOG_INTERVAL_S seconds during a sustained Redis outage.
     _last_redis_down_email_ts: float = 0.0
 
+    # WP: systemd stops the service with SIGTERM, which would kill the process with no
+    # shutdown line.  Turn it into the same path as Ctrl-C so the loop exits cleanly.
+    try:
+        import signal as _sig
+        def _on_sigterm(_signum, _frame):
+            raise KeyboardInterrupt()
+        _sig.signal(_sig.SIGTERM, _on_sigterm)
+    except (ValueError, OSError, AttributeError):
+        pass   # not the main thread / unsupported platform
+
     while True:
         try:
             if self_heal and _systemd_available():
@@ -2598,7 +2915,7 @@ def run_watchdog(once: bool = False,
 
             errors   = sum(1 for i in issues if i.level in ("ERROR", "CRITICAL"))
             warnings = sum(1 for i in issues if i.level == "WARNING")
-            ts       = datetime.now().strftime("%H:%M:%S")
+            ts       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")   # WDDATE
 
             if errors or warnings:
                 print(f"[watchdog {ts}] ⚠  errors={errors} warnings={warnings}")
@@ -2617,6 +2934,7 @@ def run_watchdog(once: bool = False,
 
         except KeyboardInterrupt:
             print("\n[watchdog] Stopping.")
+            logger.info("watchdog: stop requested (SIGTERM/Ctrl-C)")
             break
         except Exception as exc:
             logger.error("watchdog: loop error: %s", exc, exc_info=True)
@@ -2635,7 +2953,12 @@ def run_watchdog(once: bool = False,
             if once:
                 import sys as _sys
                 _sys.exit(1)
-            time.sleep(WATCHDOG_INTERVAL_S)
+            try:
+                time.sleep(WATCHDOG_INTERVAL_S)
+            except KeyboardInterrupt:
+                print("\n[watchdog] Stopping.")
+                logger.info("watchdog: stop requested (SIGTERM/Ctrl-C)")
+                break
 
     logger.info("watchdog shutdown")
 

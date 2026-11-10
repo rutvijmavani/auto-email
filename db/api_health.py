@@ -398,6 +398,30 @@ def get_run_429_rate(platform):
         conn.close()
 
 
+def get_daily_429_rates(days):
+    """
+    Per-platform, per-day request and 429 totals for the last `days` calendar
+    days (today included), summed across contexts.  Returns a list of dicts
+    {platform, date, requests, e429}.  Used by the manager's sustained-429
+    trend alert; a weekly average (get_health_summary) hides single-day spikes.
+    """
+    since = (date.today() - timedelta(days=days - 1)).isoformat()
+    conn  = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT platform, date,
+                   SUM(requests_made) AS requests,
+                   SUM(requests_429)  AS e429
+            FROM api_health
+            WHERE date >= ?
+            GROUP BY platform, date
+            ORDER BY platform, date
+        """, (since,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_error_breakdown(platform, for_date=None):
     """
     Return per-error-type counts for a platform on a given date.
@@ -470,8 +494,8 @@ def query_30day_avg_response_ms(platform: str) -> float:
     """
     Compute the 30-day average response time (ms) for a platform.
 
-    Used by calculate_worker_counts() in scheduler.py to estimate per-request
-    duration when computing how many workers are needed at cycle start.
+    No caller since scheduler.calculate_worker_counts() was deleted
+    (2026-10-29); kept as a query helper.
 
     Returns 0.0 if no data exists (caller uses a hardcoded fallback constant).
     """

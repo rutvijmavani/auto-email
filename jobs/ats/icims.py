@@ -26,7 +26,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from jobs.ats.base import alpha2_to_country_name
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_NO_CONFIG, STOP_PAGE_CAP, STOP_REQUEST_FAILED,
     attach, count_distinct, failed,
 )
 
@@ -64,9 +64,12 @@ def _track(status_code, elapsed_ms, backoff_s=0):
         )
 
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all jobs for company from iCIMS.
+
+    stop_check (adaptive scan only): called with each page's jobs; True ends paging with
+    STOP_EARLY_EXIT (never on the board's last page).
 
     Args:
         slug:    company slug (e.g. "schwab")
@@ -119,6 +122,11 @@ def fetch_jobs(slug, company):
 
         pages += 1               # pages that returned jobs, comparable to the board's "of N"
         all_jobs.extend(jobs)
+        # Not on the board's last page ("Page 1 of N"): that one stays a complete read.
+        last_page = info.get("pages_total") is not None and page + 1 >= info["pages_total"]
+        if stop_check is not None and not last_page and stop_check(jobs):
+            stop = STOP_EARLY_EXIT
+            break
         time.sleep(PAGE_DELAY)
 
     # iCIMS states its page count, not its job count ("Search Results Page 1 of N", live-checked 2026-10-15).
@@ -126,7 +134,9 @@ def fetch_jobs(slug, company):
     # no header found a clean stop stays unknown.
     pages_total = info.get("pages_total")
     note = ""
-    if pages_total is not None and pages < pages_total:
+    if stop == STOP_EARLY_EXIT:
+        pass                     # stopped on purpose: the rest of the board is already seen
+    elif pages_total is not None and pages < pages_total:
         note = f"read {pages} of {pages_total} pages"
     elif stop == STOP_PAGE_CAP and pages_total is not None:
         stop = STOP_ALL_PAGES    # the board ends exactly at the cap: every reported page was read

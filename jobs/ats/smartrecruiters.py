@@ -6,7 +6,7 @@ from datetime import datetime
 
 from jobs.ats.base import fetch_json, slugify, validate_company_match
 from jobs.ats.fetch_report import (
-    FetchReport, STOP_ALL_PAGES, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED,
+    FetchReport, STOP_ALL_PAGES, STOP_EARLY_EXIT, STOP_EMPTY_PAGE, STOP_REPEAT_PAGE, STOP_REQUEST_FAILED,
     STOP_SINGLE_RESPONSE, TOTAL_ATS, attach, count_distinct,
 )
 from jobs.utils import clean_html
@@ -48,13 +48,17 @@ def detect(company):
     return None, None
 
 
-def fetch_jobs(slug, company):
+def fetch_jobs(slug, company, stop_check=None):
     """
     Fetch all jobs for company from SmartRecruiters.
     Handles pagination.
     Returns list of normalized job dicts.
+
+    stop_check (adaptive scan only): called with each page's normalized jobs; a True answer ends
+    paging with STOP_EARLY_EXIT (the rest of the board is already seen). Fullscan passes none.
     """
-    all_jobs = []
+    result = []
+    raw_count = 0
     seen = set()
     offset = 0
     limit = 100
@@ -81,19 +85,24 @@ def fetch_jobs(slug, company):
             stop = STOP_REPEAT_PAGE         # `offset` ignored — the same rows came back
             break
         seen.update(j.get("id") for j in new)
-        all_jobs.extend(new)
+        raw_count += len(new)
+        page_jobs = [_normalize(j, company, slug) for j in new if j.get("name")]
+        result.extend(page_jobs)
         total = data.get("totalFound")
         offset += limit
         if total is None or offset >= total:
             stop = STOP_ALL_PAGES if total is not None else STOP_SINGLE_RESPONSE
             break
+        if stop_check is not None and stop_check(
+                [_normalize(j, company, slug) for j in jobs if j.get("name")]):
+            stop = STOP_EARLY_EXIT
+            break
 
-    result = [_normalize(j, company, slug) for j in all_jobs if j.get("name")]
     return attach(result, FetchReport(
         stop_reason      = stop,
         pages            = pages,
         fetched_distinct = count_distinct(result),
-        unusable         = len(all_jobs) - len(result),
+        unusable         = raw_count - len(result),
         reported_total   = total if isinstance(total, int) else None,
         total_source     = TOTAL_ATS if isinstance(total, int) else None,
         repeated_pages   = 1 if stop == STOP_REPEAT_PAGE else 0,

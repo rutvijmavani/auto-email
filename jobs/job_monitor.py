@@ -67,7 +67,7 @@ from config import (
     MONITOR_MATCH_RATE_HIGH_ALERT,
     MONITOR_MAX_WORKERS,
     MONITOR_PLATFORM_CONCURRENCY,
-    INFLIGHT_FULLSCAN_STALE_S,
+    MONITOR_PLATFORM_CONCURRENCY_DEFAULT,
     REDIS_POLL_FULLSCAN,
     SCHEDULER_FULL_SCAN_BUFFER_S,
     SCHEDULER_FULL_SCAN_INTERVAL_S,
@@ -110,12 +110,13 @@ def _record_cycle_start(counts_snapshot=None) -> None:
 _IN_FLIGHT_WAIT_S   = 5 * 60   # max wait: 5 minutes
 _IN_FLIGHT_POLL_S   = 15        # check Redis every 15 seconds
 
-_DEFAULT_CONCURRENCY = 10
 _PLATFORM_SEMAPHORES = {
     platform: threading.Semaphore(limit)
     for platform, limit in MONITOR_PLATFORM_CONCURRENCY.items()
 }
-_DEFAULT_SEMAPHORE = threading.Semaphore(_DEFAULT_CONCURRENCY)
+# One default for unlisted platforms, shared with detail_worker and http_client
+# (SEM-DEFAULT): config.MONITOR_PLATFORM_CONCURRENCY_DEFAULT.
+_DEFAULT_SEMAPHORE = threading.Semaphore(MONITOR_PLATFORM_CONCURRENCY_DEFAULT)
 
 
 def _get_semaphore(platform):
@@ -186,18 +187,17 @@ def _get_worker_missed_companies(companies: list) -> tuple:
 
     # Take two Redis inflight snapshots — before and after the DB query — then
     # union them so companies that start a scan during the DB read window are
-    # not misclassified as missed.  Only entries within the last 2 h are
-    # considered (older entries come from killed workers without cleanup).
+    # not misclassified as missed.  The scheduler releases the slot of a dead
+    # worker, so every entry present is a live scan.
     inflight:    set   = set()
     _r_inflight        = None
-    stale_threshold    = time.time() - INFLIGHT_FULLSCAN_STALE_S
     try:
         from config import REDIS_INFLIGHT_FULLSCAN, REDIS_URL
         import redis as _redis_lib_jm
         _r_inflight = _redis_lib_jm.from_url(
             REDIS_URL, socket_timeout=5, socket_connect_timeout=3
         )
-        raw = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+        raw = _r_inflight.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)
         inflight = {(c.decode() if isinstance(c, bytes) else c) for c in (raw or [])}
         if inflight:
             logger.debug(
@@ -237,7 +237,7 @@ def _get_worker_missed_companies(companies: list) -> tuple:
         # Second inflight snapshot after DB query — union narrows the race window.
         if _r_inflight is not None:
             try:
-                raw2 = _r_inflight.zrangebyscore(REDIS_INFLIGHT_FULLSCAN, stale_threshold, "+inf")
+                raw2 = _r_inflight.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)
                 inflight |= {(c.decode() if isinstance(c, bytes) else c) for c in (raw2 or [])}
             except Exception:
                 pass
@@ -557,11 +557,8 @@ def run():
             )
 
             while _remaining_inflight and (time.time() - _wait_start) < _IN_FLIGHT_WAIT_S:
-                _stale_ts = time.time() - INFLIGHT_FULLSCAN_STALE_S
                 try:
-                    _active_raw = _r_wait.zrangebyscore(
-                        REDIS_INFLIGHT_FULLSCAN, _stale_ts, "+inf"
-                    )
+                    _active_raw = _r_wait.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)
                 except Exception as _redis_poll_err:
                     logger.warning(
                         "In-flight wait: Redis poll failed (%s) — retrying next cycle",

@@ -36,6 +36,8 @@ from config import (
     RETENTION_API_HEALTH,
     RETENTION_PIPELINE_ALERTS,
     RETENTION_SCAN_HEALTH_DAYS,
+    RETENTION_ADAPTIVE_POLL_METRICS_DAYS,
+    RETENTION_WORKER_SCALING_EVENTS_DAYS,
     RETENTION_CUSTOM_ATS_DIAGNOSTIC,
     DIAGNOSTICS_AUTO_RESOLVED_DAYS,
     RETENTION_ENRICHMENT_METRICS_DAYS,
@@ -208,9 +210,15 @@ def _cleanup_scan_health(c):
     c.execute("DELETE FROM scan_health WHERE scanned_at < %s", (cutoff,))
 
 
+def _cleanup_adaptive_poll_metrics(c):
+    """adaptive_poll_metrics — one row per company per day, kept RETENTION_ADAPTIVE_POLL_METRICS_DAYS."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_ADAPTIVE_POLL_METRICS_DAYS)).strftime("%Y-%m-%d")
+    c.execute("DELETE FROM adaptive_poll_metrics WHERE date < %s", (cutoff,))
+
+
 def _cleanup_worker_scaling_events(c):
-    """Delete worker_scaling_events older than 90 days (Phase 10)."""
-    cutoff = (datetime.now() - timedelta(days=90)).isoformat()
+    """Delete worker_scaling_events older than RETENTION_WORKER_SCALING_EVENTS_DAYS (Phase 10)."""
+    cutoff = (datetime.now() - timedelta(days=RETENTION_WORKER_SCALING_EVENTS_DAYS)).isoformat()
     c.execute(
         "DELETE FROM worker_scaling_events WHERE occurred_at < %s", (cutoff,)
     )
@@ -921,7 +929,7 @@ def init_db():
     # scaling decision (Phase 10 — Section 16).
     # Effectiveness is derived by querying adjacent events within a time
     # window — no row is ever updated.
-    # Retention: managed by _cleanup_worker_scaling_events (90 days).
+    # Retention: managed by _cleanup_worker_scaling_events (RETENTION_WORKER_SCALING_EVENTS_DAYS).
     c.execute("""
         CREATE TABLE IF NOT EXISTS worker_scaling_events (
             id                    BIGSERIAL PRIMARY KEY,
@@ -1123,7 +1131,7 @@ def init_db():
             ats_platform          TEXT,
             current_interval_s    INTEGER DEFAULT 86400,
             next_poll_at          TIMESTAMP,
-            last_poll_at          TIMESTAMP,
+            last_poll_at          TIMESTAMP,  -- last adaptive ATTEMPT (set on failure too, by design: LPF); success = last_success_at
             adaptive_score        REAL DEFAULT 0.0,
             consecutive_empty     INTEGER DEFAULT 0,
             total_polls           BIGINT DEFAULT 0,
@@ -1189,12 +1197,63 @@ def init_db():
         ("last_polled",     "TIMESTAMP"),
         ("_country_code",   "CHAR(2)"),
         ("detail_payload",  "JSONB"),
+        # NULL on a pending_detail row = held at the detail token bucket (not yet
+        # in a Redis detail queue); set by the drainer when it releases the row.
+        ("pushed_at",       "TIMESTAMP"),
     ]:
         c.execute(f"ALTER TABLE job_postings ADD COLUMN IF NOT EXISTS {col} {defn}")
 
     c.execute("""
         CREATE INDEX IF NOT EXISTS idx_job_postings_company_jobid
         ON job_postings (company, job_id)
+    """)
+
+    # One row per (company, ats_platform, job_id): save_pending_detail's NOT EXISTS check alone
+    # lets two concurrent inserts both pass.  The index is created only when no duplicates
+    # exist, so a database that already has some keeps starting; those must be resolved by hand
+    # (the query below lists them) and the next init_db then adds the index.
+    # Skip the full-table GROUP BY once the index exists (it already guarantees no dups).
+    _idx_exists = c.execute(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_job_postings_company_platform_jobid'"
+    ).fetchone()
+    _dup_n = 0
+    if not _idx_exists:
+        _dups = c.execute("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT 1 FROM job_postings
+                WHERE job_id IS NOT NULL AND job_id <> '' AND ats_platform IS NOT NULL
+                GROUP BY company, ats_platform, job_id
+                HAVING COUNT(*) > 1
+            ) d
+        """).fetchone()
+        _dup_n = _dups["n"] if _dups else 0
+    if _dup_n:
+        print(f"[WARN] job_postings has {_dup_n} duplicate (company, ats_platform, job_id) "
+              f"groups — unique index idx_job_postings_company_platform_jobid NOT created; "
+              f"resolve with: SELECT company, ats_platform, job_id, COUNT(*) FROM job_postings "
+              f"WHERE job_id <> '' GROUP BY 1,2,3 HAVING COUNT(*) > 1")
+    else:
+        c.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_job_postings_company_platform_jobid
+            ON job_postings (company, ats_platform, job_id)
+            WHERE job_id IS NOT NULL AND job_id <> ''
+        """)
+
+    # Held backlog, in release order (created_at, id): the drainer's SELECT and the
+    # held count both use exactly this predicate.
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_postings_held
+        ON job_postings (created_at, id)
+        WHERE status = 'pending_detail' AND pushed_at IS NULL
+    """)
+
+    # New jobs discovered per minute (scans + fullscans, counted at discovery);
+    # the nightly detail ceiling is computed from this table.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS detail_arrivals (
+            minute    TIMESTAMP PRIMARY KEY,
+            arrivals  INTEGER NOT NULL
+        )
     """)
 
     # prospective_companies: all ATS detection columns (safe to re-run)
@@ -1253,9 +1312,26 @@ def init_db():
         # Seed 120s = conservative 2-min estimate; converges after a few real scans.
         ("last_scan_duration_s", "INTEGER"),
         ("avg_scan_duration_s",  "DOUBLE PRECISION DEFAULT 120.0"),
+        # Running counters for the nightly adaptive_poll_metrics snapshot
+        # (db/adaptive_metrics.py). empty_polls = completed scans with
+        # new_jobs = 0; early_exit_polls = completed scans that stopped early.
+        ("empty_polls",       "BIGINT DEFAULT 0"),
+        ("early_exit_polls",  "BIGINT DEFAULT 0"),
     ]:
         c.execute(
             f"ALTER TABLE company_poll_stats ADD COLUMN IF NOT EXISTS {col} {defn}"
+        )
+
+    # adaptive_poll_metrics: cumulative counters at snapshot time (daily value =
+    # now minus the previous row's *_cum) and the day's adaptive_score.
+    for col, defn in [
+        ("polls_cum",        "BIGINT"),
+        ("empty_polls_cum",  "BIGINT"),
+        ("early_exit_cum",   "BIGINT"),
+        ("adaptive_score",   "REAL"),
+    ]:
+        c.execute(
+            f"ALTER TABLE adaptive_poll_metrics ADD COLUMN IF NOT EXISTS {col} {defn}"
         )
 
     # monitor_stats: new per-run metrics (in_flight, fallback_scanned, enrichment_queued)
@@ -2205,6 +2281,7 @@ def init_db():
     _cleanup_api_health(c)
     _cleanup_external_api_health(c)
     _cleanup_scan_health(c)
+    _cleanup_adaptive_poll_metrics(c)
     _cleanup_worker_scaling_events(c)
     _cleanup_pipeline_alerts(c)
     _cleanup_mark_resolved_diagnostics(c)

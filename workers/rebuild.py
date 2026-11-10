@@ -12,7 +12,7 @@ Rebuild order (from doc Section 18):
 
 NOT rebuilt on startup (by design):
     adaptive_seen:{company} — 24h TTL; next adaptive scan repopulates naturally
-    bloom:fullscan:{company} — 36h TTL; next full scan runs as cold start (correct)
+    bloom:fullscan:{company} — 7-day TTL (FULLSCAN_BLOOM_TTL_S); if lost, next full scan runs as cold start (correct)
 
 Usage:
     from workers.rebuild import rebuild_redis
@@ -22,15 +22,19 @@ Usage:
 import json
 import math
 import time
+from typing import Optional
 
 from logger import get_logger
 
 from workers.redis_client import get_redis
+from workers.queue_stamp import count_arrival
+from workers.detail_payload import build_detail_push
 from db.db import get_conn, init_db, get_monitorable_companies
 from config import (
+    REDIS_DETAIL_ADAPTIVE,
+    REDIS_DETAIL_FULLSCAN,
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
-    REDIS_DETAIL_ADAPTIVE,
     REDIS_CYCLE_START,
     WORKER_FLOOR,
     STARTUP_AVG_SCAN_TIME_S,
@@ -38,17 +42,6 @@ from config import (
 )
 
 logger = get_logger(__name__)
-
-# Platforms whose detail payloads require ephemeral keys extracted from the
-# listing-scan API response (_slug, _wd, _path, _base_url, etc.). job_postings
-# only stores job_url/job_id — rebuild cannot reconstruct those keys. Skip
-# these during rebuild; their pending_detail rows will be re-discovered on the
-# next adaptive/fullscan cycle.  Keep in sync with _REQUIRED_DETAIL_KEYS in
-# workers/detail_worker.py.
-_REBUILD_SKIP_PLATFORMS = frozenset({
-    "workday", "taleo", "smartrecruiters", "icims", "jobvite",
-})
-
 
 # ─────────────────────────────────────────
 # CYCLE BOUNDARY HELPER
@@ -123,6 +116,34 @@ def _spread_window_s(n: int, n_workers: int, avg_scan_s: float) -> float:
     if n <= 0 or n_workers <= 0:
         return 0.0
     return math.ceil(n / n_workers) * avg_scan_s
+
+
+def _drop_live_current(r, zset_key: str, entries: dict, cycle_start: float):
+    """
+    Remove from `entries` every company whose live score in `zset_key` is from the
+    current monitoring cycle (score >= cycle_start); those keep their live score.
+
+    Companies missing from the ZSET, and companies whose live score predates the
+    cycle (stale), stay in `entries` so they are written (and re-spread) as before.
+    After a Redis loss the ZSET is empty and nothing is dropped.  If the live
+    scores cannot be read, nothing is dropped (old behaviour).
+
+    Returns (entries_to_write, number_kept).
+    """
+    try:
+        live = r.zrange(zset_key, 0, -1, withscores=True)
+    except Exception as exc:
+        logger.warning("rebuild: could not read live %s (%s) — writing all DB times",
+                       zset_key, exc)
+        return entries, 0
+    keep = set()
+    for member, score in live:
+        if score >= cycle_start:
+            keep.add(member.decode() if isinstance(member, bytes) else member)
+    if not keep:
+        return entries, 0
+    to_write = {c: s for c, s in entries.items() if c not in keep}
+    return to_write, len(entries) - len(to_write)
 
 
 def rebuild_poll_queues() -> dict:
@@ -321,6 +342,19 @@ def rebuild_poll_queues() -> dict:
         )
 
     # ── Write to Redis ────────────────────────────────────────────────────────
+    # Live scores from the current cycle win over the DB times (RZ): dispatch
+    # removes a company while it scans and the outage back-off is Redis-only, so
+    # the DB time is older than the live schedule.  Missing and stale entries are
+    # written as categorised above.
+    adaptive_entries, kept_adp = _drop_live_current(
+        r, REDIS_POLL_ADAPTIVE, adaptive_entries, cycle_start)
+    fullscan_entries, kept_fs = _drop_live_current(
+        r, REDIS_POLL_FULLSCAN, fullscan_entries, cycle_start)
+    if kept_adp or kept_fs:
+        logger.info(
+            "rebuild: kept live current-cycle scores (poll:adaptive=%d poll:fullscan=%d)",
+            kept_adp, kept_fs,
+        )
     if adaptive_entries:
         r.zadd(REDIS_POLL_ADAPTIVE, adaptive_entries)
     if fullscan_entries:
@@ -349,59 +383,139 @@ def rebuild_poll_queues() -> dict:
 # 2. DETAIL QUEUE
 # ─────────────────────────────────────────
 
+_RETRY_DELAY_SUFFIX = ":retry_delay"   # same literal as detail_worker._RETRY_DELAY_KEY_SUFFIX
+
+
+def _payload_key(raw) -> Optional[tuple]:
+    """(company, job_id) of a queued detail payload, or None when unreadable/empty."""
+    try:
+        p = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(p, dict):
+        return None
+    company, job_id = p.get("company"), p.get("job_id")
+    if not company or job_id in (None, ""):
+        return None
+    return (str(company), str(job_id))
+
+
+def _live_detail_keys(r) -> set:
+    """
+    (company, job_id) of every detail job already in Redis: the two detail queues,
+    every worker's :inflight: list and the retry-delay ZSETs.
+
+    Read order is queue -> inflight -> delay, the order a job moves in when a worker
+    takes it, so a job moving between reads is seen at least once.  A job moving
+    the other way (inflight -> delay) or one the drainer pushes after this read can
+    still be missed: that costs one extra copy, never a lost job, and the detail
+    worker skips a copy whose row is no longer pending_detail.
+    """
+    queues = (REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN)
+    keys: set = set()
+
+    def _add(raws) -> None:
+        for raw in raws:
+            k = _payload_key(raw)
+            if k is not None:
+                keys.add(k)
+
+    for q in queues:
+        _add(r.lrange(q, 0, -1))
+    for q in queues:
+        for inflight_key in r.scan_iter(match=f"{q}:inflight:*", count=100):
+            _add(r.lrange(inflight_key, 0, -1))
+    for q in queues:
+        _add(r.zrange(f"{q}{_RETRY_DELAY_SUFFIX}", 0, -1))
+    return keys
+
+
 def rebuild_detail_queue() -> int:
     """
-    Rebuild queue:detail:adaptive from job_postings WHERE status='pending_detail'.
+    Rebuild queue:detail:adaptive / queue:detail:fullscan (by found_by) from
+    job_postings WHERE status='pending_detail'.
 
     These are jobs whose ID was found by a listing scan but whose detail
     page was not yet fetched before the last restart.
+
+    Only rows the drainer already released (pushed_at set) are pushed: that
+    re-queues a job whose Redis push was lost.  Held rows (pushed_at NULL) belong
+    to the drainer, which releases them at the bucket rate.
+
+    A row whose (company, job_id) is already queued, in flight or waiting out a
+    retry delay is skipped (RBDUP), so a rebuild with Redis alive does not stack a
+    second copy on the live queue.  After a Redis loss nothing is live and every
+    row is pushed, as before.
 
     Returns count of jobs re-queued.
     """
     r = get_redis()
 
+    try:
+        live = _live_detail_keys(r)
+    except Exception as exc:
+        # Cannot tell what is queued: push everything (a duplicate is harmless,
+        # a lost job is not).
+        logger.warning("rebuild: could not read live detail queues (%s) — "
+                       "no duplicate check this run", exc)
+        live = set()
+
     conn = get_conn()
     try:
         rows = conn.execute("""
-            SELECT company, job_url, job_id, ats_platform, detail_payload
+            SELECT company, job_url, job_id, ats_platform, detail_payload,
+                   found_by, first_seen
             FROM job_postings
             WHERE status = 'pending_detail'
+              AND pushed_at IS NOT NULL
             ORDER BY first_seen ASC
         """).fetchall()
     finally:
         conn.close()
 
+    # first_seen is a DATE, so same-day rows tie in SQL.  Break the tie by the
+    # build time stored in the payload (enqueued_at) so the oldest job is
+    # pushed first and served first.  Rows without a stored payload keep SQL order.
+    def _built_at(row) -> str:
+        stored = row["detail_payload"]
+        try:
+            if isinstance(stored, str):
+                stored = json.loads(stored)
+            return (stored or {}).get("enqueued_at") or ""
+        except Exception:
+            return ""
+
+    rows = sorted(rows, key=lambda row: (row["first_seen"], _built_at(row)))
+
     skipped = 0
+    already = 0
     count = 0
     for row in rows:
-        stored = row["detail_payload"]
-        if stored:
-            # Full payload persisted at scan time — push it verbatim so
-            # detail_worker gets every platform-specific key it needs.
-            payload = json.dumps(stored) if isinstance(stored, dict) else stored
-        elif row["ats_platform"] in _REBUILD_SKIP_PLATFORMS:
-            # Old row (pre detail_payload column) for a platform that needs
-            # ephemeral keys we can't reconstruct.  Skip; next scan re-queues
-            # with a complete payload.
+        row_key = ((str(row["company"]), str(row["job_id"]))
+                   if row["company"] and row["job_id"] not in (None, "") else None)
+        if row_key is not None and row_key in live:
+            already += 1
+            continue
+        # build_detail_push picks the queue from the row's found_by (fullscan
+        # finds go back to the fullscan queue) and returns None for old rows of
+        # platforms that need ephemeral keys we can't reconstruct; the next scan
+        # re-queues those with a complete payload.
+        push = build_detail_push(row)
+        if push is None:
             skipped += 1
             continue
-        else:
-            # Old row for a platform whose minimal payload is sufficient.
-            payload = json.dumps({
-                "company":      row["company"],
-                "job_url":      row["job_url"],
-                "job_id":       row["job_id"],
-                "ats_platform": row["ats_platform"],
-                "found_by":     "rebuild",
-            })
-        r.lpush(REDIS_DETAIL_ADAPTIVE, payload)
+        queue, payload = push
+        r.lpush(queue, payload)
+        count_arrival(r, queue, "rebuild")
+        if row_key is not None:
+            live.add(row_key)
         count += 1
 
-    if count or skipped:
+    if count or skipped or already:
         logger.info(
-            "rebuild: re-queued %d pending_detail jobs, skipped %d "
-            "(old rows for platforms requiring ephemeral keys)",
-            count, skipped,
+            "rebuild: re-queued %d pending_detail jobs, %d already queued/in flight, "
+            "skipped %d (old rows for platforms requiring ephemeral keys)",
+            count, already, skipped,
         )
 
     return count

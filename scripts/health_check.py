@@ -50,7 +50,6 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from config import INFLIGHT_FULLSCAN_STALE_S
 try:
     from workers.watchdog import (
         HEARTBEAT_DEAD_AFTER as _HEARTBEAT_DEAD_AFTER,
@@ -107,7 +106,6 @@ def _row(level: str, label: str, detail: str) -> None:
 # CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INFLIGHT_STALE_S = INFLIGHT_FULLSCAN_STALE_S   # imported from config; matches job_monitor.py
 
 
 def _ats_lanes() -> list:
@@ -594,6 +592,9 @@ def run_health_check() -> int:
         _wdg_queue_issues = check_queue_health(r, persist_snapshot=False)
         for _issue in _wdg_queue_issues:
             _lbl = _issue.category.replace("queue:", "").replace("stream:", "")
+            # GATEORD: check_queue_health itself reports a detail-queue delay as a
+            # WARNING ("scheduler still starting") until both scheduler loops
+            # report ready, and as the normal ERROR afterwards.
             _row(_issue.level, _lbl, _issue.message)
             if _issue.level in ("ERROR", "CRITICAL"):
                 errors += 1
@@ -696,12 +697,11 @@ def run_health_check() -> int:
 
         # Companies mid-scan are not missed — exclude them from the stale count
         # so the health check matches the contract used by the monitor layer.
+        # Every entry is a live scan: the scheduler reaper / sweep_inflight remove the
+        # slot of a dead owner, so no staleness filter is needed here.
         inflight_names: set = set()
         try:
-            _stale_cutoff = now - _INFLIGHT_STALE_S
-            _raw_inflight = r.zrangebyscore(
-                REDIS_INFLIGHT_FULLSCAN, _stale_cutoff, "+inf"
-            )
+            _raw_inflight = r.zrange(REDIS_INFLIGHT_FULLSCAN, 0, -1)
             inflight_names = {
                 (c.decode() if isinstance(c, bytes) else c)
                 for c in (_raw_inflight or [])
@@ -725,7 +725,8 @@ def run_health_check() -> int:
             stuck = conn.execute("""
                 SELECT COUNT(*) AS c FROM job_postings
                 WHERE status = 'pending_detail'
-                  AND created_at < NOW() - INTERVAL '1 hour'
+                  AND pushed_at IS NOT NULL
+                  AND pushed_at < NOW() - INTERVAL '1 hour'
             """).fetchone()["c"]
         finally:
             conn.close()
@@ -919,21 +920,6 @@ def run_health_check() -> int:
             except Exception:
                 pass
 
-    # ── HUNG WORKERS ─────────────────────────────────────────────────────────
-    _section("HUNG WORKERS  (heartbeat alive, no progress update)")
-    try:
-        from workers.watchdog import check_hung_workers
-        _hung_issues = check_hung_workers(r)
-        if _hung_issues:
-            for _hi in _hung_issues:
-                _row(_hi.level, "hung workers", _hi.message)
-                warnings += 1
-        else:
-            _row("OK", "hung workers", "none detected")
-    except Exception as _hung_err:
-        _row("DEGRADED", "hung workers", f"Redis scan error: {_hung_err}")
-        warnings += 1
-
     # ── SUMMARY ───────────────────────────────────────────────────────────────
     print(f"\n  {'─' * 60}")
     verdict = (
@@ -946,6 +932,15 @@ def run_health_check() -> int:
           f"{_c(f'{warnings} warnings', _YELLOW if warnings else _GREY)}")
     print(f"{_c(DSEP, _BOLD)}\n")
 
+    # GATELOG: the verdict also goes to the log file (stdout alone is lost once
+    # the deploy gate's output scrolls away).  Plain text, no ANSI colour codes.
+    _plain = ("ALL OK" if errors == 0 and warnings == 0 else
+              "DEGRADED" if errors == 0 else "UNHEALTHY")
+    logger.log(
+        logging.ERROR if errors else (logging.WARNING if warnings else logging.INFO),
+        "health_check: VERDICT %s errors=%d warnings=%d", _plain, errors, warnings,
+    )
+
     try:
         r.close()
     except Exception:
@@ -955,4 +950,6 @@ def run_health_check() -> int:
 
 
 if __name__ == "__main__":
+    from logger import init_logging
+    init_logging("health_check")
     sys.exit(run_health_check())

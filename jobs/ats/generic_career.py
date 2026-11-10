@@ -73,7 +73,7 @@ SKIP_URL_KEYWORDS = {
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────
 
-def fetch_jobs(slug_info, company):
+def fetch_jobs(slug_info, company, stop_check=None):
     """
     Fetch all jobs from any career site using network interception
     and dynamic structure analysis.
@@ -81,6 +81,8 @@ def fetch_jobs(slug_info, company):
     Args:
         slug_info: JSON string or dict with {"url": "https://..."}
         company:   company name
+        stop_check: adaptive-scan EarlyExitGate; called per page with normalized jobs,
+                    True ends paging (this feeder returns a plain list, so no FetchReport)
 
     Returns:
         List of normalized job dicts, or [] on failure.
@@ -147,13 +149,28 @@ def fetch_jobs(slug_info, company):
     all_raw = list(jobs_arr)
     total   = _detect_total(best["data"])
 
+    outcome = {}
+
+    def page_gate(raw_page):
+        """Normalize one raw page and ask the early-exit gate about it."""
+        page_jobs = [j for j in (_normalize(r, company, mapping, best["url"]) for r in raw_page) if j]
+        return stop_check(page_jobs)
+
     if total and len(jobs_arr) < total:
         logger.info("generic_career: paginating %r total=%d page_size=%d",
                     company, total, len(jobs_arr))
-        extra = _paginate(best, jobs_arr, total, len(jobs_arr), company)
-        all_raw.extend(extra)
+        if stop_check is not None and page_gate(jobs_arr):
+            outcome["early_exit"] = True       # page 1 fully seen: stop before paging
+        else:
+            extra = _paginate(best, jobs_arr, total, len(jobs_arr), company,
+                              page_gate=page_gate if stop_check is not None else None,
+                              outcome=outcome)
+            all_raw.extend(extra)
 
-    logger.info("generic_career: %d raw jobs for %r", len(all_raw), company)
+    if outcome.get("early_exit"):
+        logger.info("generic_career: %r early exit after %d raw jobs", company, len(all_raw))
+    else:
+        logger.info("generic_career: %d raw jobs for %r", len(all_raw), company)
 
     # Step 6 — Normalize using learned mapping
     results = []
@@ -732,8 +749,11 @@ def _detect_total(data):
     return search(data)
 
 
-def _paginate(best_resp, first_page_jobs, total, page_size, company):
+def _paginate(best_resp, first_page_jobs, total, page_size, company, page_gate=None, outcome=None):
     """
+    page_gate (adaptive scan only): called with each extra page's RAW jobs; True ends paging
+    (never on the last page). `outcome["early_exit"]` is set to True when it does.
+
     Replay captured API request with incremented pagination params.
     Detects offset-based or page-based pagination from URL or POST body.
     """
@@ -797,6 +817,10 @@ def _paginate(best_resp, first_page_jobs, total, page_size, company):
             if offset >= total or not jobs_arr:
                 break
             if len(first_page_jobs) + len(all_extra) >= MAX_JOBS:
+                break
+            if page_gate is not None and page_gate(jobs_arr):
+                if outcome is not None:
+                    outcome["early_exit"] = True
                 break
 
             time.sleep(0.5)

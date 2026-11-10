@@ -64,6 +64,7 @@ import os
 import redis.exceptions
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -78,7 +79,9 @@ from config import (
     REDIS_ADAPTIVE_SEEN_PREFIX,
 )
 from workers.redis_client import get_redis
-from workers.heartbeat import Heartbeat
+from workers.heartbeat import BusyMeter, Heartbeat
+from workers.queue_stamp import payload_wait_s
+from workers import progress
 from workers.http_client import set_request_context, CeilingExceeded
 from jobs.ats_detector import get_ats_module
 from jobs.ats.registry import get_config, parse_slug, should_fetch_detail
@@ -90,12 +93,39 @@ from db.db import init_db
 from db.job_monitor import (
     complete_pending_detail,
     delete_pending_detail,
+    pending_detail_exists,
     ContentHashConflict,
 )
 
 logger = get_logger(__name__)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+# ── Per-job time split: website fetch vs database ────────────────────────────
+# The heartbeat gives the manager one service time per job; these two numbers
+# say where that time goes (fetch_ms in _process_detail, db_ms summed here over
+# every DB call the job makes).  Reset at the start of each job.
+_timing = threading.local()
+
+
+def _timed_db(fn):
+    """Wrap a DB call so its elapsed time is added to this job's db_ms."""
+    def wrapper(*args, **kwargs):
+        t0 = time.monotonic()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _timing.db_ms = getattr(_timing, "db_ms", 0) + int(
+                (time.monotonic() - t0) * 1000
+            )
+    wrapper.__name__ = getattr(fn, "__name__", "timed_db")
+    wrapper.__doc__ = fn.__doc__
+    return wrapper
+
+
+complete_pending_detail = _timed_db(complete_pending_detail)
+delete_pending_detail   = _timed_db(delete_pending_detail)
+pending_detail_exists   = _timed_db(pending_detail_exists)
 
 # ── At-least-once delivery via LMOVE processing lists ────────────────────────
 # BRPOP is destructive: if the worker dies after pop but before the DB write,
@@ -258,12 +288,26 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
                 _hb_token = ":".join(_hb_parts[:2]) if len(_hb_parts) >= 3 else peer_token
                 hb_key = f"worker:alive:detail_worker:{_hb_token}"
                 if r.exists(hb_key):
-                    logger.debug(
-                        "detail_worker: peer token=%s heartbeat present — "
-                        "skipping inflight recovery for %s",
-                        peer_token, key,
-                    )
-                    continue
+                    # A live heartbeat thread does not prove the job loop is alive:
+                    # a worker past its progress deadline is hung, so kill it and
+                    # drain its inflight list below.
+                    _consumer = f"detail_worker:{_hb_token}"
+                    if progress.is_stalled(r, _consumer):
+                        _host, _, _pid = _hb_token.rpartition(":")
+                        logger.warning(
+                            "detail_worker: peer %s is past its progress deadline — "
+                            "terminating and recovering its inflight list", _hb_token)
+                        if _pid.isdigit():
+                            progress.terminate(r, _consumer, _host, int(_pid),
+                                               socket.gethostname())
+                        r.delete(hb_key)
+                    else:
+                        logger.debug(
+                            "detail_worker: peer token=%s heartbeat present — "
+                            "skipping inflight recovery for %s",
+                            peer_token, key,
+                        )
+                        continue
 
                 # Peer is dead — drain atomically so no concurrent drain worker
                 # can steal an item between peek and pop.
@@ -317,13 +361,18 @@ def _recover_stuck_jobs(r, own_token: str) -> None:
 
 def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     """
-    Priority-aware pop with at-least-once guarantee via inflight list.
+    Oldest-first pop with at-least-once guarantee via inflight list.
 
-    1. Try non-blocking LMOVE from adaptive first (high priority).
-    2. If adaptive is empty, block on BLMOVE from fullscan for up to 1 s,
-       then re-check adaptive.  This avoids a busy-poll loop while still
-       picking up adaptive items within ~1 s of enqueue.
-    3. If both empty, sleep briefly and retry until timeout.
+    1. Compare the tail (oldest) item of both queues by queued_at and try
+       non-blocking LMOVE from the queue whose tail waited longer, so neither
+       queue starves the other.  A tail with no readable stamp, or an empty
+       queue, falls back to adaptive first.  The read and the LMOVE are two
+       calls; a racing worker can take the tail in between, in which case the
+       LMOVE returns the next item (slightly younger) or nothing.
+    2. If the first choice is empty, try the other queue.
+    3. If both empty, block on BLMOVE from fullscan for up to 1 s, then
+       re-check.  This avoids a busy-poll loop while still picking up
+       adaptive items within ~1 s of enqueue.
 
     Returns (source_queue_key, raw_payload) or None on timeout.
 
@@ -334,12 +383,26 @@ def _pop_with_inflight(r, timeout: float) -> Optional[tuple]:
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
-        # ── Adaptive first (high priority, non-blocking) ──────────────────────
-        raw = r.lmove(REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE, "RIGHT", "LEFT")
-        if raw is not None:
-            return (REDIS_DETAIL_ADAPTIVE, raw)
+        # ── Older tail first (non-blocking), other queue as fallback ──────────
+        now = time.time()
+        adaptive_age = payload_wait_s(r.lindex(REDIS_DETAIL_ADAPTIVE, -1), now)
+        fullscan_age = payload_wait_s(r.lindex(REDIS_DETAIL_FULLSCAN, -1), now)
+        fullscan_older = (
+            adaptive_age is not None and fullscan_age is not None
+            and fullscan_age > adaptive_age
+        )
+        order = (
+            ((REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN),
+             (REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE)) if fullscan_older
+            else ((REDIS_DETAIL_ADAPTIVE, _INFLIGHT_ADAPTIVE),
+                  (REDIS_DETAIL_FULLSCAN, _INFLIGHT_FULLSCAN))
+        )
+        for source, inflight in order:
+            raw = r.lmove(source, inflight, "RIGHT", "LEFT")
+            if raw is not None:
+                return (source, raw)
 
-        # ── Fullscan fallback — block for up to 1 s ───────────────────────────
+        # ── Both empty — block on fullscan for up to 1 s ──────────────────────
         # Use BLMOVE so we yield the thread while waiting rather than busy-polling.
         # Cap the wait at 1 s so adaptive items are re-checked frequently.
         remaining = deadline - time.monotonic()
@@ -400,18 +463,21 @@ def _push_to_dlq(job: dict) -> None:
 # HTTP call per job, so semaphores throttle cross-worker pressure on
 # the same ATS domain. Import lazily to avoid circular imports.
 _PLATFORM_SEMAPHORES: dict = {}
-_DEFAULT_CONCURRENCY = 5
 
 
 def _get_semaphore(platform: str):
     """Return (or lazily create) the per-platform Semaphore."""
     if not _PLATFORM_SEMAPHORES:
         import threading
-        from config import MONITOR_PLATFORM_CONCURRENCY
+        from config import (
+            MONITOR_PLATFORM_CONCURRENCY,
+            MONITOR_PLATFORM_CONCURRENCY_DEFAULT,
+        )
         for plat, limit in MONITOR_PLATFORM_CONCURRENCY.items():
             _PLATFORM_SEMAPHORES[plat] = threading.Semaphore(limit)
+        # One default for unlisted platforms, from config (SEM-DEFAULT).
         _PLATFORM_SEMAPHORES["_default"] = threading.Semaphore(
-            _DEFAULT_CONCURRENCY
+            MONITOR_PLATFORM_CONCURRENCY_DEFAULT
         )
     return _PLATFORM_SEMAPHORES.get(platform,
                                     _PLATFORM_SEMAPHORES["_default"])
@@ -449,6 +515,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
     slug_info   = payload.get("slug_info")
 
     start_mono  = time.monotonic()
+    _timing.db_ms = 0
 
     result = {
         "company":     company,
@@ -456,6 +523,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         "platform":    platform,
         "outcome":     "error",
         "duration_ms": 0,
+        "fetch_ms":    0,   # time inside fetch_job_detail (network + parse)
         # retryable=True means leave the Redis item in inflight so
         # _recover_stuck_jobs restores it for retry on the next worker start.
         # Defaults False — most errors (filtered, fetch failure, bad payload)
@@ -465,6 +533,29 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
 
     if not company or not job_id:
         logger.warning("detail_worker: missing company or job_id in payload — skipping")
+        return result
+
+    # ── 0. Stale copy check (NC) ──────────────────────────────────────────────
+    # Every DB write below is guarded by status='pending_detail', so a queue item
+    # whose row is gone or already promoted (a stacked copy) can change nothing.
+    # Skip it without an ATS fetch; acknowledged like any finished item
+    # (retryable stays False).  A DB error here must never drop a real job:
+    # fall through and process normally.
+    try:
+        _still_pending = pending_detail_exists(company, job_id)
+    except Exception as _chk_err:
+        _still_pending = True
+        logger.warning(
+            "detail_worker: pending check failed for company=%r job_id=%s: %s "
+            "- processing anyway", company, job_id, _chk_err,
+        )
+    if not _still_pending:
+        logger.info(
+            "detail_worker: no pending_detail row for company=%r job_id=%s - "
+            "stale copy, skipped without fetch", company, job_id,
+        )
+        result["outcome"]     = "noop"
+        result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
         return result
 
     try:
@@ -612,6 +703,7 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
             set_request_context(_detail_ctx)
             sem = _get_semaphore(platform)
             with sem:
+                _fetch_t0 = time.monotonic()
                 try:
                     if platform == "custom":
                         job = ats_module.fetch_job_detail(job, slug_info)
@@ -637,7 +729,37 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
                     result["retryable"] = True
                     return result
                 finally:
+                    result["fetch_ms"] = int((time.monotonic() - _fetch_t0) * 1000)
                     set_request_context("normal")   # always reset
+
+            # ── DF: retry a failed (empty) fetch before filtering on thin data ─
+            # Platforms set job["_detail_failed"] when the request itself failed
+            # (Workday: non-JSON/empty response).  Retry through the normal
+            # bounded retry path while budget remains; on the last attempt fall
+            # through to today's behaviour (filter on listing data) so a
+            # permanently empty job is never lost by retrying alone.
+            if job.pop("_detail_failed", False):
+                _df_key = (
+                    f"{_RETRY_KEY_PREFIX}{company}|{job_id}" if company
+                    else f"{_RETRY_KEY_PREFIX}{job_id}"
+                )
+                try:
+                    _df_used = int(r.get(_df_key) or 0)
+                except Exception:
+                    _df_used = _MAX_DETAIL_RETRIES   # unknown budget: do not retry
+                if _df_used < _MAX_DETAIL_RETRIES:
+                    logger.info(
+                        "detail_worker: empty fetch, retrying platform=%s "
+                        "company=%r job_id=%s (attempt %d/%d)",
+                        platform, company, job_id, _df_used + 1,
+                        _MAX_DETAIL_RETRIES,
+                    )
+                    result["duration_ms"] = int(
+                        (time.monotonic() - start_mono) * 1000
+                    )
+                    result["outcome"] = "error"
+                    result["retryable"] = True
+                    return result
 
             # ── Post-fetch enrichment audit ───────────────────────────────────
             # If none of the key fields changed, fetch_job_detail silently
@@ -822,22 +944,23 @@ def _process_detail(payload: dict, source_queue: str) -> dict:
         )
 
         if not updated:
-            # Row may have been deleted (cleanup) or never inserted.
-            # Log as warning and continue — data is not lost because
-            # detail was fetched; we just can't update the status.
+            # Row was deleted (cleanup/other worker) or never inserted, so the
+            # status update matched nothing and the outcome below is "noop":
+            # the fetched detail is NOT stored by this path.
             logger.warning(
                 "detail_worker: no pending_detail row found for "
-                "company=%r job_id=%s — may have been cleaned up",
+                "company=%r job_id=%s — status not updated (outcome=noop)",
                 company, job_id,
             )
 
-        result["outcome"]     = "new"
+        result["outcome"]     = "new" if updated else "noop"
         result["duration_ms"] = int((time.monotonic() - start_mono) * 1000)
 
-        logger.info(
-            "detail_worker: NEW job | company=%r | %s | %s",
-            company, job.get("title"), job.get("location"),
-        )
+        if updated:
+            logger.info(
+                "detail_worker: NEW job | company=%r | %s | %s",
+                company, job.get("title"), job.get("location"),
+            )
 
     except ContentHashConflict:
         # A different job already stored this exact content — permanent duplicate.
@@ -1023,13 +1146,15 @@ def run_worker(once: bool = False, shutdown_event=None,
         "detail_worker started | worker_id=%s adaptive=%s fullscan=%s once=%s",
         WORKER_ID, REDIS_DETAIL_ADAPTIVE, REDIS_DETAIL_FULLSCAN, once,
     )
+    logger.info("detail_worker: ready worker=%s once=%s", WORKER_ID, once)   # GL
     print(f"[detail_worker] Ready — worker={WORKER_ID}")
     print(f"[detail_worker] Draining: {REDIS_DETAIL_ADAPTIVE!r} (priority) "
           f"then {REDIS_DETAIL_FULLSCAN!r}")
     if once:
         print("[detail_worker] --once mode: processing one job then exiting")
     else:
-        print("[detail_worker] Press Ctrl+C to stop\n")
+        if sys.stdout.isatty():  # CTRLC: no interactive hint under systemd
+            print("[detail_worker] Press Ctrl+C to stop\n")
 
     # ── Background heartbeat ─────────────────────────────────────────────────
     # Daemon thread writes worker:alive:detail_worker every 10s.
@@ -1037,7 +1162,14 @@ def run_worker(once: bool = False, shutdown_event=None,
     # pattern consistent and future-proof if heavier fetches are added.
     # daemon=True means the thread dies with the process — no ghost heartbeats.
     _hw = {"count": 0}
-    _hb = Heartbeat(r, "detail_worker", lambda: _hw["count"]).start()
+    _busy = BusyMeter()
+    _hb = Heartbeat(r, "detail_worker", lambda: _hw["count"], busy_meter=_busy).start()
+
+    # Progress reports: a job past its deadline marks this worker stalled, which
+    # lets peers (and the manager) kill it and recover its inflight list even
+    # though the heartbeat thread keeps beating.
+    progress.bind(r, f"detail_worker:{socket.gethostname()}:{own_pid}")
+    progress.install()
 
     # Periodic peer-recovery — also runs at startup (line above).
     # A peer can die at any time, not just before we start.  Check every
@@ -1046,13 +1178,8 @@ def run_worker(once: bool = False, shutdown_event=None,
     _PEER_RECOVERY_INTERVAL_S = 300   # 5 minutes
     _last_peer_recovery = time.monotonic()
 
-    # ── Busy-time tracking for manager.py utilization signal ─────────────────
-    # Accumulates actual job-processing ms in a rolling 60s window.
-    # Published to worker:detail:busy_ms:{pid} after each job so manager.py can
-    # compute pool_utilization = pool_busy_ms / (n_workers × 60s × 1000).
-    _BUSY_CYCLE_S    = 60
-    _busy_ms_acc     = 0
-    _busy_window_t   = time.monotonic()
+    # Busy time for the manager's utilization signal is carried in the
+    # heartbeat (_busy above): _busy.begin()/end() bracket each job.
 
     while True:
         try:
@@ -1095,6 +1222,7 @@ def run_worker(once: bool = False, shutdown_event=None,
             # Moves item atomically: source_queue → inflight list.
             # The item is acknowledged (LREM'd) only after a successful DB write.
             # On crash, _recover_stuck_jobs() restores it on next startup.
+            _held = None   # (inflight_key, source_queue, raw) once an item is popped
             item = _pop_with_inflight(r, timeout=WORKER_BLOCK_SECS)
 
             if item is None:
@@ -1110,6 +1238,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             source_queue, raw = item
             inflight_key = _INFLIGHT_KEY[source_queue]
+            _held = (inflight_key, source_queue, raw)
 
             # ── Shutdown checkpoint: item is already in inflight list ─────────
             # Atomically move our specific job back to the front of the source
@@ -1138,10 +1267,12 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             try:
                 payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                if not isinstance(payload, dict):
+                    raise ValueError(f"payload is {type(payload).__name__}, not an object")
+            except ValueError as exc:      # JSONDecodeError is a ValueError
                 # Malformed payload — can never succeed, remove from inflight
                 logger.error(
-                    "detail_worker: bad JSON in %s: %s | raw=%r",
+                    "detail_worker: bad payload in %s: %s | raw=%r",
                     source_queue, exc, raw[:200],
                 )
                 try:
@@ -1157,7 +1288,8 @@ def run_worker(once: bool = False, shutdown_event=None,
                     break
                 continue
 
-            _job_t0 = time.monotonic()
+            _busy.begin()
+            progress.begin(own_token, "detail")
             try:
                 result = _process_detail(payload, source_queue)
             except CeilingExceeded as _ce:
@@ -1180,18 +1312,9 @@ def run_worker(once: bool = False, shutdown_event=None,
                 if once:
                     break
                 continue
-            # ── Publish busy_ms for manager.py utilization ───────────────────
-            _elapsed_ms = int((time.monotonic() - _job_t0) * 1000)
-            _now_m = time.monotonic()
-            if _now_m - _busy_window_t >= _BUSY_CYCLE_S:
-                _busy_ms_acc   = 0
-                _busy_window_t = _now_m
-            _busy_ms_acc += _elapsed_ms
-            try:
-                r.set(f"worker:detail:busy_ms:{own_pid}", _busy_ms_acc,
-                      ex=_BUSY_CYCLE_S * 2)
-            except Exception:
-                pass
+            finally:
+                _busy.end()
+                progress.end()
 
             _hw["count"] += 1
 
@@ -1323,13 +1446,13 @@ def run_worker(once: bool = False, shutdown_event=None,
 
             tier    = "T1" if source_queue == REDIS_DETAIL_ADAPTIVE else "T2"
             outcome = result["outcome"]
-            icon    = {"new": "[NEW]", "filtered": "[skip]", "error": "[ERR]"}.get(
-                outcome, "[?]"
-            )
+            icon    = {"new": "[NEW]", "filtered": "[skip]", "duplicate": "[dup]",
+                       "noop": "[skip]", "error": "[ERR]"}.get(outcome, "[?]")
             logger.info(
-                "%s [%s] %s %s (%dms)",
+                "%s [%s] %s %s outcome=%s (%dms fetch=%dms db=%dms)",
                 icon, tier, result["company"],
-                result.get("job_id", "?"), result["duration_ms"],
+                result.get("job_id", "?"), outcome, result["duration_ms"],
+                result.get("fetch_ms", 0), getattr(_timing, "db_ms", 0),
             )
 
             if once:
@@ -1337,6 +1460,7 @@ def run_worker(once: bool = False, shutdown_event=None,
 
         except KeyboardInterrupt:
             logger.info("detail_worker: KeyboardInterrupt — shutting down")
+            logger.info("detail_worker: shutting down worker=%s", WORKER_ID)
             print("\n[detail_worker] Shutting down.")
             break
 
@@ -1349,6 +1473,23 @@ def run_worker(once: bool = False, shutdown_event=None,
             logger.error(
                 "detail_worker: unexpected loop error: %s", exc, exc_info=True,
             )
+            # OI: an item popped before the error would sit in this worker's
+            # inflight list for the worker's whole life (peers skip live PIDs).
+            # _ATOMIC_REQUEUE_LUA only pushes back if the item is still in the
+            # inflight list, so this is a no-op when it was already acknowledged.
+            if _held is not None:
+                try:
+                    _o_removed = r.eval(_ATOMIC_REQUEUE_LUA, 2, *_held)
+                    if _o_removed:
+                        logger.warning(
+                            "detail_worker: loop error with an item in flight - "
+                            "returned it to %s", _held[1],
+                        )
+                except Exception as _oi_err:
+                    logger.error(
+                        "detail_worker: could not return in-flight item after "
+                        "loop error (peer recovery needed): %s", _oi_err,
+                    )
             if once:
                 break
             time.sleep(1)

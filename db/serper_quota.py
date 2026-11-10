@@ -118,11 +118,25 @@ def _check_low_credit_alert(credits):
         _send_low_credit_email(remaining)
     except Exception as e:
         print(f"[WARNING] Failed to send Serper low credit alert: {e}")
+        # Clear the sent flag so a later increment retries the alert.
+        try:
+            conn = get_conn()
+            try:
+                conn.execute("""
+                    UPDATE serper_quota
+                    SET low_credit_alert_sent = 0
+                    WHERE id = 1
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as reset_exc:
+            print(f"[WARNING] Could not reset Serper low credit alert flag: {reset_exc}")
 
 
 def _send_low_credit_email(remaining):
     """Send low credit alert email."""
-    from outreach.report_templates.base import send_email
+    from outreach.report_templates.base import send_report_email as send_email
 
     subject = f"[Alert] Serper API — only {remaining} credits remaining"
 
@@ -151,7 +165,8 @@ def _send_low_credit_email(remaining):
     <p>Use <code>--monitor-status</code> to check current credit usage.</p>
     """
 
-    send_email(subject, body)
+    if not send_email(subject, body):
+        raise RuntimeError("low-credit email was not sent")
     print(f"[ALERT] Serper low credit email sent ({remaining} remaining)")
 
 

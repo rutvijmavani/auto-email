@@ -913,6 +913,7 @@ class TestOnAdaptiveCompleteAlertIntegration(unittest.TestCase):
             "consecutive_errors":     consec_errors,
             "last_success_at":        last_success_at,
             "warming_polls_remaining": None,
+            "avg_scan_duration_s":    40.0,
         }
 
     def _run(self, company="TestCo", new_jobs=0, success=True,

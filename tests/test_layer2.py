@@ -26,6 +26,12 @@ from unittest.mock import MagicMock, patch, call
 
 import workers.manager as mgr
 
+# Live Postgres probe stand-in: 2 connections per worker, 57 worker seats fit.
+_FAKE_CAPACITY = {
+    "max_connections": 100, "reserved": 3, "margin": 10, "cap": 87, "used": 30,
+    "worker_conns": 22, "non_worker": 8, "per_worker": 2, "seat_cap": 57,
+}
+
 
 def _make_redis(data: dict | None = None):
     """
@@ -234,27 +240,21 @@ class TestLever1Lifecycle(unittest.TestCase):
         mgr._fire_lever1(self.r, "scan", depth=50, prev_depth=30)
         self.assertTrue(mgr._get_lever1_active(self.r, "scan"))
 
-    def test_fire_lever1_snapshots_D_and_R(self):
+    def test_fire_lever1_keeps_no_snapshot(self):
         mgr._fire_lever1(self.r, "scan", depth=80, prev_depth=40)
-        D = self.r.get("manager:snapshot:scan:D")
-        R = self.r.get("manager:snapshot:scan:R")
-        self.assertEqual(float(D), 80.0)
-        # R = (80 - 40) / MANAGER_CYCLE_S
-        expected_R = 40 / mgr.MANAGER_CYCLE_S
-        self.assertAlmostEqual(float(R), expected_R, places=4)
+        self.assertIsNone(self.r.get("manager:snapshot:scan:D"))
+        self.assertIsNone(self.r.get("manager:snapshot:scan:R"))
 
     def test_fire_lever1_idempotent(self):
         mgr._fire_lever1(self.r, "scan", depth=50, prev_depth=30)
-        # Second fire should not overwrite the snapshot
+        fired_at = self.r.get("manager:lever1:scan:fired_at")
         mgr._fire_lever1(self.r, "scan", depth=999, prev_depth=999)
-        D = self.r.get("manager:snapshot:scan:D")
-        self.assertEqual(float(D), 50.0)  # still original
+        self.assertEqual(self.r.get("manager:lever1:scan:fired_at"), fired_at)
 
     def test_inflow_guard_skips_when_depth_drops(self):
-        # depth < prev_depth AND inflow_rate=0 → bail out entirely (no snapshot, no active key)
+        # depth < prev_depth AND inflow_rate=0 → bail out entirely (no active key)
         mgr._fire_lever1(self.r, "scan", depth=30, prev_depth=60)
         self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
-        self.assertIsNone(self.r.get("manager:snapshot:scan:R"))
 
     def test_lift_lever1_clears_active_flag(self):
         mgr._fire_lever1(self.r, "scan", depth=50, prev_depth=30)
@@ -280,42 +280,32 @@ class TestEffectiveTarget(unittest.TestCase):
         result = mgr._get_effective_target(self.r, "scan", workers_target=8)
         self.assertEqual(result, 8)
 
-    def test_borrowed_out_reduces_effective_target(self):
-        # scan lent 2 to fullscan
+    def test_borrow_does_not_change_target(self):
+        # Borrowing moves ceiling seats, not targets (avoids double counting).
         self.r._store["manager:borrow:scan:fullscan"] = "2"
-        result = mgr._get_effective_target(self.r, "scan", workers_target=8)
-        self.assertEqual(result, 6)  # 8 - 2
+        self.assertEqual(mgr._get_effective_target(self.r, "scan", workers_target=8), 8)
+        self.assertEqual(mgr._get_effective_target(self.r, "fullscan", workers_target=5), 5)
 
-    def test_borrowed_in_increases_effective_target(self):
-        # fullscan borrowed 2 from scan
+    def test_borrowed_out_reduces_ceiling(self):
+        self.r._store["manager:worker_ceil:scan"] = "8"
         self.r._store["manager:borrow:scan:fullscan"] = "2"
-        result = mgr._get_effective_target(self.r, "fullscan", workers_target=5)
-        self.assertEqual(result, 7)  # 5 + 2
+        self.assertEqual(mgr._get_worker_ceil(self.r, "scan"), 6)
 
-    def test_effective_target_floored_at_worker_floor(self):
-        # extreme borrow: scan lent 10, workers_target=2
+    def test_borrowed_in_increases_ceiling(self):
+        self.r._store["manager:worker_ceil:fullscan"] = "5"
+        self.r._store["manager:borrow:scan:fullscan"] = "2"
+        self.assertEqual(mgr._get_worker_ceil(self.r, "fullscan"), 7)
+
+    def test_ceiling_floored_at_worker_floor(self):
+        self.r._store["manager:worker_ceil:scan"] = "4"
         self.r._store["manager:borrow:scan:fullscan"] = "10"
-        result = mgr._get_effective_target(self.r, "scan", workers_target=2)
-        self.assertEqual(result, mgr.WORKER_FLOOR)
+        self.assertEqual(mgr._get_worker_ceil(self.r, "scan"), mgr.WORKER_FLOOR)
 
     def test_multiple_borrows_accumulated(self):
-        # scan lent 2 to fullscan and 1 to detail
+        self.r._store["manager:worker_ceil:scan"] = "8"
         self.r._store["manager:borrow:scan:fullscan"] = "2"
         self.r._store["manager:borrow:scan:detail"] = "1"
-        result = mgr._get_effective_target(self.r, "scan", workers_target=8)
-        self.assertEqual(result, 5)  # 8 - 2 - 1
-
-    def test_prevents_layer0_from_undoing_borrow(self):
-        """
-        Classic deadlock scenario 7: scan lent 2 to fullscan.
-        Layer 0 sees n_workers=6, workers_target=8 and would scale up.
-        effective_target=6 → no scale-up sends, borrow is preserved.
-        """
-        self.r._store["manager:borrow:scan:fullscan"] = "2"
-        effective = mgr._get_effective_target(self.r, "scan", workers_target=8)
-        n_workers = 6
-        # scale-up condition: effective_target > n_workers → 6 > 6 → False ✓
-        self.assertFalse(effective > n_workers)
+        self.assertEqual(mgr._get_worker_ceil(self.r, "scan"), 5)  # 8 - 2 - 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,7 +356,8 @@ class TestAttemptBorrow(unittest.TestCase):
 
     def setUp(self):
         self.r = _make_redis()
-        # Reset lever1 state so detail can never lend unless its Lever 1 is active
+        # Detail lends only after LEVER1_STABLE_REQUIRED calm cycles
+        mgr._detail_calm["cycles"] = 0
         for pool in ("scan", "detail", "fullscan"):
             mgr._lever1_stable_cycles[pool] = 0
 
@@ -382,6 +373,7 @@ class TestAttemptBorrow(unittest.TestCase):
 
     def test_borrows_all_lendable_from_scan(self):
         # fullscan deadlocked; scan has 2 lendable (8 workers, target=6)
+        self.r._store["manager:worker_ceil:scan"] = "10"
         borrowed = mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(),
@@ -391,9 +383,9 @@ class TestAttemptBorrow(unittest.TestCase):
         borrow_key = self.r._store.get("manager:borrow:scan:fullscan")
         self.assertEqual(int(borrow_key), 2)
 
-    def test_does_not_borrow_from_detail_unless_lever1_active(self):
+    def test_does_not_borrow_from_detail_unless_calm(self):
         # fullscan deadlocked; scan has 0 lendable; detail has 2 lendable
-        # but detail Lever 1 is NOT active → detail must not be borrowed from
+        # but detail has not been calm for LEVER1_STABLE_REQUIRED cycles
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(scan=5, detail=6),
@@ -402,9 +394,9 @@ class TestAttemptBorrow(unittest.TestCase):
         detail_borrow = self.r._store.get("manager:borrow:detail:fullscan")
         self.assertIsNone(detail_borrow)
 
-    def test_borrows_from_detail_when_lever1_active(self):
-        # detail Lever 1 active → detail can be borrowed from
-        self.r._store["manager:lever1:detail:active"] = "1"
+    def test_borrows_from_detail_when_calm(self):
+        # detail calm for LEVER1_STABLE_REQUIRED cycles → detail can be borrowed from
+        mgr._detail_calm["cycles"] = mgr.LEVER1_STABLE_REQUIRED
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(scan=5, detail=6),
@@ -413,20 +405,47 @@ class TestAttemptBorrow(unittest.TestCase):
         detail_borrow = self.r._store.get("manager:borrow:detail:fullscan")
         self.assertIsNotNone(detail_borrow)
 
-    def test_phase2_one_by_one_when_no_lendable(self):
-        # scan has no lendable (n=6, target=6) but has unused capacity (above floor)
-        # Phase 2: should borrow 1 and return True
+    def test_no_seats_when_ceiling_equals_peak_and_no_lendable(self):
+        # scan: 6 workers = target, ceiling 6 = peak_nd → no lendable, buffer or headroom
+        for p, c in (("scan", "6"), ("detail", "5")):
+            self.r._store[f"manager:worker_ceil:{p}"] = c
+            self.r._store[f"manager:pool:{p}:peak_nd"] = c
         borrowed = mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(scan=6, detail=5),
             workers_targets=self._targets(scan=6),
         )
-        # scan has 6 workers, target=6, floor=2 → available_above_floor = 6-0-6=0
-        # No unused capacity either → returns False
         self.assertFalse(borrowed)
+
+    def test_buffer_seats_taken_all_at_once(self):
+        # scan ceiling 10, peak 6, target 6, 6 workers → 4 buffer seats, all moved
+        self.r._store["manager:worker_ceil:scan"] = "10"
+        self.r._store["manager:pool:scan:peak_nd"] = "6"
+        self.r._store["manager:worker_ceil:detail"] = "5"
+        self.r._store["manager:pool:detail:peak_nd"] = "5"
+        self.assertTrue(mgr._attempt_borrow(
+            self.r, "fullscan",
+            pool_sizes=self._pool_sizes(scan=6, detail=5),
+            workers_targets=self._targets(scan=6),
+        ))
+        self.assertEqual(int(self.r._store["manager:borrow:scan:fullscan"]), 4)
+
+    def test_headroom_seat_taken_one_per_cycle(self):
+        # scan ceiling 8 = peak 8 (no buffer), target 6 → 2 headroom seats, 1 per call
+        self.r._store["manager:worker_ceil:scan"] = "8"
+        self.r._store["manager:pool:scan:peak_nd"] = "8"
+        self.r._store["manager:worker_ceil:detail"] = "5"
+        self.r._store["manager:pool:detail:peak_nd"] = "5"
+        mgr._attempt_borrow(
+            self.r, "fullscan",
+            pool_sizes=self._pool_sizes(scan=6, detail=5),
+            workers_targets=self._targets(scan=6),
+        )
+        self.assertEqual(int(self.r._store["manager:borrow:scan:fullscan"]), 1)
 
     def test_borrow_accumulates_on_successive_calls(self):
         # First call borrows 2 lendable
+        self.r._store["manager:worker_ceil:scan"] = "10"
         mgr._attempt_borrow(
             self.r, "fullscan",
             pool_sizes=self._pool_sizes(),
@@ -441,77 +460,138 @@ class TestAttemptBorrow(unittest.TestCase):
         total = int(self.r._store["manager:borrow:scan:fullscan"])
         self.assertEqual(total, 3)
 
-    def test_return_all_borrows_clears_keys(self):
-        self.r._store["manager:borrow:scan:fullscan"] = "2"
-        self.r._store["manager:borrow:detail:fullscan"] = "1"
-        mgr._return_all_borrows(self.r, "fullscan")
-        self.assertNotIn("manager:borrow:scan:fullscan", self.r._store)
-        self.assertNotIn("manager:borrow:detail:fullscan", self.r._store)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Section 6 — Learning loop: true_required formula + daily_peak update
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestLearningLoop(unittest.TestCase):
+class TestNeededWorkersAndServiceTime(unittest.TestCase):
+    """Stage B inputs: real service time s, lambda, and the uncapped needed peak."""
 
     def setUp(self):
         self.r = _make_redis()
-        self.params = {
-            "fetch_p75":    40.0,
-            "delay_warn_s": 1800.0,
-        }
+        mgr._prev_svc_snap.clear()
+        self.params = {"fetch_p75": 40.0, "delay_warn_s": 1800.0}
 
-    def test_compute_true_required_missing_snapshot(self):
-        # No snapshot stored → returns 0
-        result = mgr._compute_true_required(self.r, "scan", self.params)
-        self.assertEqual(result, 0)
+    def _beat(self, key, ts, busy_ms, processed, since=None):
+        self.r._store[key] = json.dumps(
+            {"ts": ts, "busy_ms": busy_ms, "processed": processed, "busy_since": since})
+        self.r.scan_iter = lambda match=None, count=None: [
+            k for k in self.r._store if k.startswith("worker:alive:detail_worker:")]
 
-    def test_compute_true_required_drain_only(self):
-        # D=200, R=0, F=40, W=1800
-        # true_required = ceil(200×40/1800 + 0×40) = ceil(4.44) = 5
-        self.r._store["manager:snapshot:scan:D"] = "200"
-        self.r._store["manager:snapshot:scan:R"] = "0"
-        result = mgr._compute_true_required(self.r, "scan", self.params)
-        self.assertEqual(result, 5)
+    def test_service_time_is_busy_delta_over_jobs_delta(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 10_000, 10)
+        self.assertIsNone(mgr._get_pool_service_time(self.r, "detail"))   # first sight
+        self._beat(k, 160.0, 40_000, 40)                                  # 30 s busy, 30 jobs
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 1.0)
 
-    def test_compute_true_required_drain_and_inflow(self):
-        # D=200, R=2, F=40, W=1800
-        # true_required = ceil(200×40/1800 + 2×40) = ceil(4.44 + 80) = 85
-        self.r._store["manager:snapshot:scan:D"] = "200"
-        self.r._store["manager:snapshot:scan:R"] = "2"
-        result = mgr._compute_true_required(self.r, "scan", self.params)
-        self.assertEqual(result, 85)
+    def test_service_time_counts_job_in_progress(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 0, 3, since=100.0)                           # 60 s in a job, 3 done
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 20.0)
 
-    def test_compute_true_required_floored_at_worker_floor(self):
-        # Very small D, no inflow → result would be 0 → clamped to WORKER_FLOOR
-        self.r._store["manager:snapshot:scan:D"] = "0"
-        self.r._store["manager:snapshot:scan:R"] = "0"
-        result = mgr._compute_true_required(self.r, "scan", self.params)
-        self.assertEqual(result, mgr.WORKER_FLOOR)
+    def test_service_time_none_when_no_job_finished(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 0, 0)
+        self.assertIsNone(mgr._get_pool_service_time(self.r, "detail"))
 
-    def test_write_true_required_updates_daily_peak(self):
-        mgr._write_true_required(self.r, "scan", 10)
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        stored = int(self.r._store[f"manager:pool:scan:daily_peak:{today}"])
-        self.assertEqual(stored, 10)
+    def test_zero_finished_cycle_is_skipped_and_busy_carried(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 10_000, 5)                                   # 10 s busy, 5 done
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        # 30 s busy and nothing finished: not a sample, s unchanged
+        self._beat(k, 190.0, 40_000, 5)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        # 5 jobs finish in 10 s busy: the carried 30 s is charged to this cycle
+        self._beat(k, 220.0, 50_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), (10 + 40) / 10)
 
-    def test_write_true_required_only_updates_if_higher(self):
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self.r._store[f"manager:pool:scan:daily_peak:{today}"] = "15"
-        mgr._write_true_required(self.r, "scan", 8)  # lower → no update
-        stored = int(self.r._store[f"manager:pool:scan:daily_peak:{today}"])
-        self.assertEqual(stored, 15)
+    def test_window_survives_manager_restart(self):
+        k = "worker:alive:detail_worker:h:1"
+        self._beat(k, 100.0, 0, 0)
+        mgr._get_pool_service_time(self.r, "detail")
+        self._beat(k, 160.0, 20_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
+        mgr._prev_svc_snap.clear()                                        # restart: odometers re-seen
+        self._beat(k, 220.0, 20_000, 10)
+        self.assertAlmostEqual(mgr._get_pool_service_time(self.r, "detail"), 2.0)
 
-    def test_write_true_required_updates_if_higher(self):
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        self.r._store[f"manager:pool:scan:daily_peak:{today}"] = "5"
-        mgr._write_true_required(self.r, "scan", 12)
-        stored = int(self.r._store[f"manager:pool:scan:daily_peak:{today}"])
-        self.assertEqual(stored, 12)
+    def test_service_time_window_keeps_last_cycles_only(self):
+        k = "worker:alive:detail_worker:h:1"
+        ts, busy, done = 100.0, 0, 0
+        self._beat(k, ts, busy, done)
+        mgr._get_pool_service_time(self.r, "detail")
+        # one slow cycle (10 s/job) followed by WINDOW fast cycles (1 s/job)
+        for per_job in [10] + [1] * mgr.SERVICE_TIME_WINDOW_CYCLES:
+            ts += 60; busy += per_job * 5 * 1000; done += 5
+            self._beat(k, ts, busy, done)
+            s = mgr._get_pool_service_time(self.r, "detail")
+        self.assertAlmostEqual(s, 1.0)
+
+    def _record(self, adaptive, fullscan):
+        from unittest.mock import MagicMock, patch
+        self.r._store["signal:arrivals:queue:detail:adaptive:organic"] = adaptive
+        self.r._store["signal:arrivals:queue:detail:fullscan:organic"] = fullscan
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        with patch("db.db.get_conn", return_value=conn), \
+             patch.object(mgr, "REDIS_DETAIL_ADAPTIVE", "queue:detail:adaptive"), \
+             patch.object(mgr, "REDIS_DETAIL_FULLSCAN", "queue:detail:fullscan"):
+            mgr._record_detail_arrivals(self.r)
+        return conn
+
+    def test_arrivals_first_sample_writes_nothing_then_delta_is_upserted(self):
+        conn = self._record(10, 5)
+        conn.cursor.return_value.execute.assert_not_called()
+        conn = self._record(14, 8)                       # +4 adaptive, +3 fullscan
+        args = conn.cursor.return_value.execute.call_args.args
+        self.assertEqual(args[1], (7,))
+        self.assertIn("ON CONFLICT (minute)", args[0])
+        conn.commit.assert_called_once()
+
+    def test_arrivals_counter_reset_skips_that_cycle_and_resumes(self):
+        self._record(10, 5)
+        conn = self._record(2, 1)                        # Redis restart: counter went back
+        conn.cursor.return_value.execute.assert_not_called()
+        conn = self._record(4, 1)                        # +2 from the new baseline
+        self.assertEqual(conn.cursor.return_value.execute.call_args.args[1], (2,))
+
+    def test_arrivals_write_failure_never_raises(self):
+        from unittest.mock import patch
+        self.r._store["manager:arrivals:last"] = 0
+        with patch("db.db.get_conn", side_effect=RuntimeError("db down")):
+            mgr._record_detail_arrivals(self.r)          # must not raise
+
+    def test_target_uses_arrival_rate_and_service_time(self):
+        # depth 0, lambda 2/s, s 3 s → ceil(2*3) = 6 workers needed
+        _, target = mgr._run_pool_cycle(
+            self.r, "detail", 2, 0, 0, 0.0, self.params, 10, 2,
+            service_s=3.0, arrival_rate=2.0)
+        self.assertEqual(target, 6)
+
+    def test_fetch_p75_is_fallback_when_service_time_unknown(self):
+        # depth 90, time_left 1800 → 0.05/s * fetch_p75 40 = 2 → floor 2
+        _, target = mgr._run_pool_cycle(
+            self.r, "scan", 2, 0, 90, 0.0, self.params, 10, 2)
+        self.assertEqual(target, max(mgr.WORKER_FLOOR, 2))
+
+    def test_needed_is_recorded_before_ceiling_clamp(self):
+        _, target = mgr._run_pool_cycle(
+            self.r, "detail", 2, 0, 0, 0.0, self.params, 4, 2,
+            service_s=3.0, arrival_rate=5.0)
+        self.assertEqual(target, 4)                       # clamped to the ceiling
+        self.assertEqual(mgr._needed_workers["detail"], 15)   # ceil(5*3): real demand
+
+    def test_daily_peak_running_takes_needed_not_clamped_count(self):
+        mgr._update_daily_peak_running(self.r, "detail", 15)
+        self.assertEqual(int(self.r._store["manager:pool:detail:daily_peak:running"]), 15)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -521,6 +601,9 @@ class TestLearningLoop(unittest.TestCase):
 class TestCheckLayer2Integration(unittest.TestCase):
 
     def setUp(self):
+        patcher = patch.object(mgr, "_db_capacity", return_value=_FAKE_CAPACITY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.r = _make_redis()
         self.params = {"fetch_p75": 40.0, "delay_warn_s": 1800.0}
         self.pool_sizes = {"scan": 10, "detail": 6, "fullscan": 5}
@@ -530,7 +613,31 @@ class TestCheckLayer2Integration(unittest.TestCase):
             mgr._reintro_stable_cycles[pool] = 0
             mgr._prev_depth[pool] = 0
 
-    def test_lever1_fires_when_delay_crosses_warn(self):
+    def _exhaust_chain(self):
+        """No buffer/headroom seats anywhere and the worker budget at PROBE."""
+        for p, t in self.workers_targets.items():
+            self.r._store[f"manager:worker_ceil:{p}"] = str(t)
+            self.r._store[f"manager:pool:{p}:peak_nd"] = str(t)
+        # scan runs 10 workers: its own ceiling already covers today's peak
+        self.r._store["manager:worker_ceil:scan"] = "10"
+        self.r._store["manager:pool:scan:peak_nd"] = "10"
+        self.r._store["manager:db_pool_maxconn"] = str(_FAKE_CAPACITY["seat_cap"])
+
+    def _exhaust_chain_for(self, pool):
+        """Like _exhaust_chain, with `pool` itself holding all 10 seats it uses."""
+        self._exhaust_chain()
+        self.r._store[f"manager:worker_ceil:{pool}"] = "10"
+        self.r._store[f"manager:pool:{pool}:peak_nd"] = "10"
+        # no lendable seats elsewhere: every other pool runs exactly its target
+        self.workers_targets = dict(self.workers_targets, scan=10)
+        self.pool_sizes = dict(self.workers_targets, **{pool: 10})
+
+    def _rising_history(self, pool="scan"):
+        self.r._store[f"manager:layer2:{pool}:delay_history"] = ["1850.0", "1860.0", "1870.0"]
+
+    def test_lever1_fires_when_chain_exhausted(self):
+        self._exhaust_chain()
+        self._rising_history()
         mgr._check_layer2(
             self.r, "scan",
             n_workers=10, delay_s=1900.0, depth=50,
@@ -538,6 +645,31 @@ class TestCheckLayer2Integration(unittest.TestCase):
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
         self.assertTrue(mgr._get_lever1_active(self.r, "scan"))
+
+    def test_lever1_not_fired_while_budget_can_be_raised(self):
+        self._exhaust_chain()
+        self.r._store["manager:db_pool_maxconn"] = str(_FAKE_CAPACITY["seat_cap"] - 10)
+        self._rising_history()
+        mgr._check_layer2(
+            self.r, "scan",
+            n_workers=10, delay_s=1900.0, depth=50,
+            params=self.params, worker_ceil=10,
+            pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
+        )
+        self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
+        self.assertEqual(int(self.r._store["manager:db_pool_maxconn"]),
+                         _FAKE_CAPACITY["seat_cap"] - 10
+                         + mgr.DB_POOL_RAISE_STEP // _FAKE_CAPACITY["per_worker"])
+
+    def test_lever1_not_fired_on_first_cycle_above_warn(self):
+        self._exhaust_chain()
+        mgr._check_layer2(
+            self.r, "scan",
+            n_workers=10, delay_s=1900.0, depth=50,
+            params=self.params, worker_ceil=10,
+            pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
+        )
+        self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
 
     def test_lever1_does_not_fire_below_warn(self):
         mgr._check_layer2(
@@ -549,22 +681,26 @@ class TestCheckLayer2Integration(unittest.TestCase):
         self.assertFalse(mgr._get_lever1_active(self.r, "scan"))
 
     def test_lever1_fires_once_idempotent(self):
-        # Two cycles both above WARN — Lever 1 should fire once, snapshot not overwritten
+        # Two cycles both above WARN — Lever 1 should fire once, fired_at not overwritten
+        self._exhaust_chain()
+        self._rising_history()
         mgr._check_layer2(
             self.r, "scan",
             n_workers=10, delay_s=1900.0, depth=60,
             params=self.params, worker_ceil=10,
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
-        first_D = self.r._store.get("manager:snapshot:scan:D")
+        first_fired = self.r._store.get("manager:lever1:scan:fired_at")
+        self.assertIsNotNone(first_fired)
         mgr._check_layer2(
             self.r, "scan",
             n_workers=10, delay_s=2000.0, depth=999,
             params=self.params, worker_ceil=10,
             pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
         )
-        # Snapshot not overwritten
-        self.assertEqual(self.r._store.get("manager:snapshot:scan:D"), first_D)
+        # fired_at not overwritten, Lever 1 still active
+        self.assertEqual(self.r._store.get("manager:lever1:scan:fired_at"), first_fired)
+        self.assertTrue(mgr._get_lever1_active(self.r, "scan"))
 
     def test_lever1_lifts_after_stable_cycles(self):
         # Fire Lever 1 manually
@@ -619,25 +755,48 @@ class TestCheckLayer2Integration(unittest.TestCase):
         self.assertTrue(mgr._get_lever1_active(self.r, "scan"))
         self.assertEqual(mgr._lever1_stable_cycles.get("scan", 0), 0)
 
-    def test_learning_loop_fires_on_lever1_lift(self):
-        self.r._store["manager:lever1:scan:active"] = "1"
-        self.r._store["manager:snapshot:scan:D"] = "100"
-        self.r._store["manager:snapshot:scan:R"] = "0.05"
-        # true_required = ceil(100×40/1800 + 0.05×40) = ceil(2.22+2) = 5
-        for _ in range(mgr.LEVER1_STABLE_REQUIRED):
+    def test_lever1_not_fired_when_arrivals_fit_in_workers(self):
+        # detail: lambda * s = 1.0/s * 2s = 2 <= n=10 → the backlog is draining
+        self._exhaust_chain_for("detail")
+        mgr._cycle_arrival_rate["detail"] = 1.0
+        mgr._cycle_service_s["detail"] = 2.0
+        self._rising_history("detail")
+        mgr._check_layer2(
+            self.r, "detail",
+            n_workers=10, delay_s=1900.0, depth=50,
+            params=self.params, worker_ceil=10,
+            pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
+        )
+        self.assertFalse(mgr._get_lever1_active(self.r, "detail"))
+
+    def test_detail_never_fires_lever1_and_alerts_when_chain_exhausted(self):
+        # lambda * s = 8/s * 2s = 16 > n=10: Lever 1 would fire for scan/fullscan,
+        # but detail has none (save-only producers) — it raises an ALERT instead.
+        self._exhaust_chain_for("detail")
+        mgr._cycle_arrival_rate["detail"] = 8.0
+        mgr._cycle_service_s["detail"] = 2.0
+        self._rising_history("detail")
+        with self.assertLogs("workers.manager", level="ERROR") as logs:
             mgr._check_layer2(
-                self.r, "scan",
-                n_workers=10, delay_s=100.0, depth=5,
+                self.r, "detail",
+                n_workers=10, delay_s=1900.0, depth=50,
                 params=self.params, worker_ceil=10,
                 pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
             )
-        from datetime import datetime, timezone
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        daily_peak = self.r._store.get(f"manager:pool:scan:daily_peak:{today}")
-        self.assertIsNotNone(daily_peak)
-        self.assertGreaterEqual(int(daily_peak), mgr.WORKER_FLOOR)
+        self.assertFalse(mgr._get_lever1_active(self.r, "detail"))
+        self.assertTrue(any("ALERT manager [detail]" in m for m in logs.output))
 
-    def test_borrows_cleared_on_lever1_lift(self):
+    def test_detail_ignores_leftover_lever1_flag(self):
+        self.r._store["manager:lever1:detail:active"] = "1"
+        mgr._check_layer2(
+            self.r, "detail",
+            n_workers=3, delay_s=0.0, depth=0,
+            params=self.params, worker_ceil=10,
+            pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
+        )
+        self.assertEqual(mgr._lever1_stable_cycles.get("detail", 0), 0)
+
+    def test_borrows_kept_on_lever1_lift(self):
         self.r._store["manager:lever1:scan:active"] = "1"
         self.r._store["manager:borrow:detail:scan"] = "2"
         self.r._store["manager:snapshot:scan:D"] = "50"
@@ -649,7 +808,8 @@ class TestCheckLayer2Integration(unittest.TestCase):
                 params=self.params, worker_ceil=10,
                 pool_sizes=self.pool_sizes, workers_targets=self.workers_targets,
             )
-        self.assertNotIn("manager:borrow:detail:scan", self.r._store)
+        # Seats are returned by _maybe_return_borrows, not by the Lever 1 lift.
+        self.assertEqual(self.r._store.get("manager:borrow:detail:scan"), "2")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

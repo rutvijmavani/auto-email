@@ -636,3 +636,19 @@ def is_fresh(job, ats_platform, days_fresh=None):
         return days_old <= days_fresh
     except (ValueError, TypeError, AttributeError):
         return True   # parse error → trust first_seen
+
+
+def passes_listing_date(job, ats_platform, days_fresh=None):
+    """
+    Scan-time date gate (fullscan + adaptive producers), run BEFORE the title/location filters.
+
+    Returns False only when the platform's listing date is trustworthy (registry
+    LISTING_DATE_RELIABLE), the job has one, and it is older than the freshness window.
+    Every other case returns True so the job continues to the title/location filter and the queue:
+    platforms without a reliable listing date, and jobs with a missing/unparseable date. The
+    detail worker still applies is_fresh() after its fetch, so nothing is decided on a guess here.
+    """
+    from jobs.ats.registry import has_reliable_listing_date
+    if not has_reliable_listing_date(ats_platform):
+        return True
+    return is_fresh(job, ats_platform, days_fresh)

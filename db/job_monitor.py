@@ -818,7 +818,9 @@ def save_pending_detail(company: str, platform: str, job: dict,
     The detail_worker will later UPDATE this to 'new' after fetching full
     detail and applying filters.
 
-    Returns True if inserted (new row), False if job_url already exists.
+    Returns True if inserted (new row), False if job_url OR (company, ats_platform, job_id)
+    already exists (the NOT EXISTS check, and the partial unique index idx_job_postings_
+    company_platform_jobid for a concurrent insert that slips past it).
     """
     conn = get_conn()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -827,14 +829,22 @@ def save_pending_detail(company: str, platform: str, job: dict,
         posted_at = posted_at.isoformat()
 
     try:
+        # Dedup on job_id as well as job_url: a URL can drift while the id stays (Workday puts the
+        # city in the path), and job_url alone would insert the same job a second time. The
+        # fullscan already treats job_id as unique within a company (cycle_seen / bloom).
         cursor = conn.execute("""
             INSERT INTO job_postings
               (company, title, job_url, job_id, ats_platform,
                location, posted_at, description, skill_score,
                status, found_by, first_seen, detail_payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    'pending_detail', %s, %s, %s)
-            ON CONFLICT (job_url) DO NOTHING
+            SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                   'pending_detail', %s, %s, %s
+            WHERE COALESCE(%s::text, '') = ''
+               OR NOT EXISTS (
+                SELECT 1 FROM job_postings
+                WHERE company = %s AND ats_platform = %s AND job_id = %s
+            )
+            ON CONFLICT DO NOTHING
         """, (
             company,
             job.get("title", ""),
@@ -848,6 +858,10 @@ def save_pending_detail(company: str, platform: str, job: dict,
             found_by,
             today,
             json.dumps(detail_payload) if detail_payload else None,
+            job.get("job_id"),
+            company,
+            platform,
+            job.get("job_id"),
         ))
         conn.commit()
         return cursor.rowcount > 0
@@ -879,7 +893,7 @@ def save_pre_existing_listing(company: str, platform: str, job: dict) -> bool:
                location, posted_at, status, found_by, first_seen)
             VALUES (%s, %s, %s, %s, %s, %s, %s,
                     'pre_existing', 'tier1_adaptive', %s)
-            ON CONFLICT (job_url) DO NOTHING
+            ON CONFLICT DO NOTHING
         """, (
             company,
             job.get("title", ""),
@@ -956,6 +970,26 @@ def complete_pending_detail(company: str, job_id: str, job: dict,
         conn.close()
 
 
+def pending_detail_exists(company: str, job_id: str) -> bool:
+    """
+    True if a row with status='pending_detail' exists for (company, job_id).
+
+    The detail worker calls this before the ATS fetch: complete_pending_detail and
+    delete_pending_detail only touch pending_detail rows, so a queue item whose row
+    is gone or already promoted/deleted (a stacked copy) can do nothing useful.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT 1 FROM job_postings
+            WHERE company = %s AND job_id = %s AND status = 'pending_detail'
+            LIMIT 1
+        """, (company, job_id)).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def delete_pending_detail(company: str, job_id: str) -> None:
     """
     Remove a pending_detail row that failed filters.
@@ -976,7 +1010,8 @@ def delete_pending_detail(company: str, job_id: str) -> None:
 
 
 def upsert_poll_stats(company: str, platform: str,
-                      new_jobs: int, duration_ms: int) -> None:
+                      new_jobs: int, duration_ms: int,
+                      early_exited: bool = False) -> None:
     """
     Create or update the company_poll_stats row after a scan completes.
 
@@ -997,10 +1032,17 @@ def upsert_poll_stats(company: str, platform: str,
     avg_scan_duration_s via EMA (alpha=0.3, seed=120s).  The manager reads
     avg_scan_duration_s as avg_fetch_s for the universal scaling formula.
     next_poll_at and adaptive_score are left for the scheduler to set.
+
+    This is the ONLY writer of consecutive_empty (completed scans only; a failed
+    scan never reaches here). It also maintains the running counters the nightly
+    adaptive_poll_metrics snapshot differences: empty_polls (new_jobs == 0) and
+    early_exit_polls (early_exited).
     """
     from workers.slot import slot_offset as _slot_offset
     offset_s  = _slot_offset(company)
     duration_s = max(0, duration_ms // 1000)
+    empty_inc  = 1 if new_jobs <= 0 else 0
+    early_inc  = 1 if early_exited else 0
 
     conn = get_conn()
     try:
@@ -1009,8 +1051,10 @@ def upsert_poll_stats(company: str, platform: str,
                 (company, ats_platform, last_poll_at,
                  total_polls, total_new_jobs,
                  consecutive_empty, initial_slot_offset_s,
-                 last_scan_duration_s, avg_scan_duration_s, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, ?, 120.0, CURRENT_TIMESTAMP)
+                 last_scan_duration_s, avg_scan_duration_s, updated_at,
+                 empty_polls, early_exit_polls)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 1, ?, 0, ?, ?, 120.0, CURRENT_TIMESTAMP,
+                    ?, ?)
             ON CONFLICT(company) DO UPDATE SET
                 ats_platform          = EXCLUDED.ats_platform,
                 last_poll_at          = CURRENT_TIMESTAMP,
@@ -1023,6 +1067,10 @@ def upsert_poll_stats(company: str, platform: str,
                     ELSE company_poll_stats.consecutive_empty + 1
                 END,
                 updated_at            = CURRENT_TIMESTAMP,
+                empty_polls           = COALESCE(company_poll_stats.empty_polls, 0)
+                                        + EXCLUDED.empty_polls,
+                early_exit_polls      = COALESCE(company_poll_stats.early_exit_polls, 0)
+                                        + EXCLUDED.early_exit_polls,
                 initial_slot_offset_s = COALESCE(
                     company_poll_stats.initial_slot_offset_s,
                     EXCLUDED.initial_slot_offset_s
@@ -1033,7 +1081,8 @@ def upsert_poll_stats(company: str, platform: str,
                                             company_poll_stats.avg_scan_duration_s,
                                             120.0
                                         )
-        """, (company, platform, new_jobs, offset_s, duration_s))
+        """, (company, platform, new_jobs, offset_s, duration_s,
+              empty_inc, early_inc))
         # NOTE: initial_slot_offset_s uses COALESCE so the original
         # registration slot is preserved once set, but legacy NULL rows
         # (created before the column existed) are backfilled on next scan.
