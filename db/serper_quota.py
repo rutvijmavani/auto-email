@@ -118,6 +118,20 @@ def _check_low_credit_alert(credits):
         _send_low_credit_email(remaining)
     except Exception as e:
         print(f"[WARNING] Failed to send Serper low credit alert: {e}")
+        # Clear the sent flag so a later increment retries the alert.
+        try:
+            conn = get_conn()
+            try:
+                conn.execute("""
+                    UPDATE serper_quota
+                    SET low_credit_alert_sent = 0
+                    WHERE id = 1
+                """)
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as reset_exc:
+            print(f"[WARNING] Could not reset Serper low credit alert flag: {reset_exc}")
 
 
 def _send_low_credit_email(remaining):

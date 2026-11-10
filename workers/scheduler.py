@@ -288,7 +288,7 @@ def _trim_stream(r, stream_key: str) -> None:
 _OWNER_RUNNING, _OWNER_STALLED, _OWNER_ABANDONED, _OWNER_DEAD = (
     "running", "stalled", "abandoned", "dead")
 
-_reap_seen: dict = {}     # (stream_key, msg_id) -> state seen on the previous call
+_reap_seen: dict = {}     # stream_key -> {msg_id: state seen on the previous call}
 
 _STREAM_WORKER_TYPE = {
     REDIS_STREAM_ADAPTIVE: "scan_worker",
@@ -370,6 +370,7 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
         return
 
     now = time.time()
+    seen_before = _reap_seen.get(stream_key, {})
     seen_now = {}
     for entry in pending:
         msg_id = _s(entry["message_id"])
@@ -377,9 +378,8 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
         state = _owner_state(r, stream_key, consumer, msg_id, now)
         if state == _OWNER_RUNNING:
             continue
-        key = (stream_key, msg_id)
-        seen_now[key] = state
-        if _reap_seen.get(key) != state:
+        seen_now[msg_id] = state
+        if seen_before.get(msg_id) != state:
             continue                       # first sighting in this state — confirm next call
 
         if state == _OWNER_STALLED:
@@ -407,11 +407,9 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
             company, stream_key, consumer, state, reaps, delay, target_zset,
         )
 
-    # Sightings are kept per stream: the adaptive and fullscan loops share this dict, so
-    # replacing all of it would wipe the other stream's first sightings between its calls.
-    for key in [k for k in _reap_seen if k[0] == stream_key]:
-        del _reap_seen[key]
-    _reap_seen.update(seen_now)
+    # Sightings are kept per stream (the adaptive and fullscan loops share this dict):
+    # replace only this stream's entry, in one assignment.
+    _reap_seen[stream_key] = seen_now
 
 
 def _release_inflight(r, op_type: str, company: str, dc_key: str) -> None:
