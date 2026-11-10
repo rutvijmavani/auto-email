@@ -104,6 +104,7 @@ from config import (
     STREAM_CONSUMER_GROUP,
     WATCHDOG_HEAL_COOLDOWN_S,
     WATCHDOG_HEAL_BLOCK_S,
+    DRAIN_HEARTBEAT_TTL_S,
     WATCHDOG_HEAL_MAX_ATTEMPTS,
     WATCHDOG_HEAL_ATTEMPT_WINDOW_S,
     EMAIL,
@@ -170,7 +171,9 @@ HEARTBEAT_DEAD_AFTER = {
     "scan_worker":     45,
     "detail_worker":   45,
     "fullscan_worker":    1900,   # scans can legitimately take 30 min
-    "detail_drainer":       60,   # wakes every s/n seconds (a few s); heartbeat TTL 30s
+    # The drainer caps its sleep at TTL/3, so a live one beats at least every TTL/3 s
+    # whatever DRAIN_MIN_WAKE_S is; 2 x TTL keeps this above any configured TTL.
+    "detail_drainer":       max(60, 2 * DRAIN_HEARTBEAT_TTL_S),
     "h1b_llm_worker":       60,   # interval=30s → TTL=90s; 60s < TTL so STALE branch is reachable
     "email_processor":      60,   # interval=30s → same reasoning as h1b_llm_worker
 }
@@ -2950,7 +2953,12 @@ def run_watchdog(once: bool = False,
             if once:
                 import sys as _sys
                 _sys.exit(1)
-            time.sleep(WATCHDOG_INTERVAL_S)
+            try:
+                time.sleep(WATCHDOG_INTERVAL_S)
+            except KeyboardInterrupt:
+                print("\n[watchdog] Stopping.")
+                logger.info("watchdog: stop requested (SIGTERM/Ctrl-C)")
+                break
 
     logger.info("watchdog shutdown")
 

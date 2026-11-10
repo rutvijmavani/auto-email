@@ -78,6 +78,14 @@ jobs:
               fi
             done
 
+            # Pre-flight: the deploy restarts the detail drainer with sudo; confirm it is
+            # permitted without a password (sudo -l only checks, it does not restart).
+            if ! sudo -n -l systemctl restart recruiter-detail-drainer >/dev/null 2>&1; then
+              echo "[ERROR] this user cannot run 'sudo systemctl restart recruiter-detail-drainer' non-interactively."
+              echo "        Re-run 'sudo bash deploy/install-systemd.sh' on the VM to refresh the sudoers rules."
+              exit 1
+            fi
+
             echo "[1/8] Upgrading pip..."
             source venv/bin/activate
             pip install --upgrade pip --quiet
