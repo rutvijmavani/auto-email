@@ -231,7 +231,7 @@ Detect this: if response body is <500 bytes AND contains an off-icims.com redire
 - Smart early exit applicable (sorted by recency ✓)
 
 **Why Eightfold matters:**
-Amazon and Starbucks both use Eightfold with 10,000–20,000+ active job listings. Without smart early exit, Tier 1 would need to fetch hundreds of pages on every poll. With smart early exit (80% overlap threshold, 2-page confirm), it typically exits after 2–5 pages once the company's active listings are known.
+Amazon and Starbucks both use Eightfold with 10,000–20,000+ active job listings. Without smart early exit, Tier 1 would need to fetch hundreds of pages on every poll. With the `EarlyExitGate` (Section 4 note), the fetch can stop once every identifiable job ID on a page has been seen (old Bloom filter or `adaptive_seen`), confirmed over `PAGINATOR_CONFIRM_PAGES` consecutive pages. How many pages that takes in practice has not been measured here.
 
 ---
 

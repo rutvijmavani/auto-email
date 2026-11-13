@@ -727,8 +727,11 @@ def _is_timestamped(line: str) -> bool:
         return False
 
 
-def _seen_key(line: str) -> str:
-    return _PFX_SEEN + hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:24]
+def _seen_key(line: str, context: list[str] | None = None) -> str:
+    """Key of one handled occurrence: the flagged line plus the traceback context that
+    _fingerprint also sees, so two identical lines with different tracebacks stay distinct."""
+    payload = "\n".join([line, *(context or [])])
+    return _PFX_SEEN + hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:24]
 
 
 def mark_seen(r, seen: list[str]) -> None:
@@ -765,7 +768,7 @@ def process_findings(
     for fname, hits in raw.items():
         for line, context in hits:
             if _is_timestamped(line):
-                skey = _seen_key(line)
+                skey = _seen_key(line, context)
                 try:
                     if r.exists(skey):
                         continue
