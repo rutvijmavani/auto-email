@@ -183,9 +183,11 @@ workers_target    = clamp(workers_target, WORKER_FLOOR, worker_ceil)
 
 # >>> SCAN AND FULLSCAN (changed 2026-10-29): the block above is the DETAIL formula only.
 # Scan and fullscan replace the drain-rate lines above with work-seconds from per-company data:
-#   needed  = ceil( backlog + steady )
-#   backlog = sum over late companies c of min( d_c / H , 1 )     # H = pool delay_warn_s (fixed, not time_left)
-#   steady  = ( sum over ALL companies c of d_c / (d_c + T_c) ) / MANAGER_SCALE_UP_UTIL
+#   needed  = ceil( backlog + running + steady_rest )             # 2026-11-12 (docs/scan-running-work-design.md)
+#   backlog = sum over late companies c (not running) of min( d_c / H , 1 )   # H = pool delay_warn_s (fixed, not time_left)
+#   running = sum over companies being scanned now of min( d_c / H , 1 )      # owner RUNNING per the reaper's test
+#   steady_rest = ( sum over ALL companies c of d_c / (d_c + T_c)  -  the same sum over the running companies,
+#                   clamped at 0 ) / MANAGER_SCALE_UP_UTIL
 # d_c = DB EMA (avg_scan_duration_s / avg_fullscan_duration_s); T_c = current_interval_s (scan) or
 # full_scan_interval_s (fullscan); next run = completion + interval, so steady load is d/(d+T).
 # A late company with no entry uses fetch_p75; unknown is never 0. The clamp,
@@ -450,7 +452,7 @@ Outcome: system drains to healthy state without ever breaching DELAY_WARN_S.
 
 > **Superseded for scan and fullscan sizing (2026-10-29):** the worked examples below for Scan and
 > Fullscan Workers use the old `time_left` / `drain_rate` formula and a 75% dispatch throttle. Neither
-> is in the code: scan and fullscan `needed` now comes from `backlog + steady` (see the formula
+> is in the code: scan and fullscan `needed` now comes from `backlog + running + steady_rest` (see the formula
 > above) with a fixed horizon H, and no dispatch throttle is built. Only the Detail Workers examples
 > above still match the code. The scan/fullscan numbers are kept as history, not as current behaviour.
 
@@ -1716,7 +1718,7 @@ Source order is fullscan, then scan, then detail. Lifting Lever 1 does not retur
 
 **Stage B inputs (as implemented).**
 
-- Target workers (detail, and the fallback for a pool with no work estimate yet) = `ceil((depth / W + λ) × s)` with a fixed horizon `W = delay_warn_s`; there is no delay / warn multiplier (lateness is the urgent branch's job, and a multiplier would count the same backlog twice). Scan and fullscan are sized from per-company work instead: `ceil(backlog + steady)` (`_scan_pool_work`, see `docs/scan-fullscan-sizing-plan.md`). λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over the last `SERVICE_TIME_WINDOW_CYCLES` (5) valid cycles (`_get_pool_service_time`; a cycle with no finished job is skipped and its busy seconds carry into the next valid one; window and carry live in Redis `manager:svc_window:<pool>`); `fetch_p75` is only the fallback while `s` is unknown.
+- Target workers (detail, and the fallback for a pool with no work estimate yet) = `ceil((depth / W + λ) × s)` with a fixed horizon `W = delay_warn_s`; there is no delay / warn multiplier (lateness is the urgent branch's job, and a multiplier would count the same backlog twice). Scan and fullscan are sized from per-company work instead: `ceil(backlog + running + steady_rest)` (`_scan_pool_work`, see `docs/scan-fullscan-sizing-plan.md`). λ is the organic arrival rate (`signal:arrivals:*:organic` counters, detail only; other pools use λ = 0). `s` is the real per-job service time: Σ Δbusy_ms / Σ Δprocessed from worker heartbeats over the last `SERVICE_TIME_WINDOW_CYCLES` (5) valid cycles (`_get_pool_service_time`; a cycle with no finished job is skipped and its busy seconds carry into the next valid one; window and carry live in Redis `manager:svc_window:<pool>`); `fetch_p75` is only the fallback while `s` is unknown.
 - The needed worker count is recorded **before** the ceiling clamp (`_needed_workers`), capped at what the DB budget can host, and that is what feeds the running daily peak — a surge is recorded at its real size, not at the ceiling.
 - The `manager:snapshot:{pool}:D/R` keys are gone: Lever 1 no longer writes a snapshot and the learning loop no longer reads one; the needed count is computed live.
 - Lever 1 fires only when the chain is exhausted **and** λ × s > n (or λ / s unknown). If λ × s ≤ n the backlog is draining and an INFO line says so. The lift stays delay-based, because under Lever 1 the arrival counters measure post-halt inflow (≈ 0), so a "λ × s < n" lift would release it immediately. Scan and fullscan are also force-lifted after `LEVER1_MAX_HOLD_S` (scan 300 s, fullscan 600 s, measured from `manager:lever1:{pool}:fired_at`) even when delay has not recovered, because the scan/fullscan delay grows while dispatch is halted; if the conditions still warrant it, Lever 1 re-fires within one cycle.

@@ -473,12 +473,20 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     conn = get_conn()
     try:
         row = conn.execute("""
-            SELECT id, initial_slot_offset_s
+            SELECT id, initial_slot_offset_s, warming_polls_remaining
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
     finally:
         conn.close()
+
+    # Already bootstrapped (warming counter set, or a pending adaptive entry):
+    # keep the existing schedule and counter. last_poll_at stays NULL until the
+    # first adaptive scan completes, so a later fullscan would otherwise reset them.
+    if (row and row["warming_polls_remaining"] is not None) \
+            or r.zscore(REDIS_POLL_ADAPTIVE, company) is not None:
+        logger.info("fullscan: WARMING bootstrap for %r skipped — adaptive schedule already pending", company)
+        return
 
     if row and row["initial_slot_offset_s"] is not None:
         offset_s = int(row["initial_slot_offset_s"])

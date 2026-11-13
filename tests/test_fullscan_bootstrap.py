@@ -158,8 +158,9 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         """When DB row has initial_slot_offset_s, that value is used as offset."""
         from config import WARMING_POLLS_COUNT
         r = MagicMock()
+        r.zscore.return_value = None
 
-        row = {"initial_slot_offset_s": 30000, "id": 10}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": 30000, "id": 10}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -179,9 +180,10 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
     def test_falls_back_to_slot_offset_id_when_offset_null(self):
         """When initial_slot_offset_s is NULL, slot_offset(row['id']) is used."""
         r = MagicMock()
+        r.zscore.return_value = None
 
         row_id = 99
-        row = {"initial_slot_offset_s": None, "id": row_id}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": None, "id": row_id}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -206,6 +208,7 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
     def test_falls_back_to_slot_offset_company_when_no_row(self):
         """When no DB row, slot_offset(company) is used."""
         r = MagicMock()
+        r.zscore.return_value = None
 
         company = "NewCo"
         conn1 = MagicMock()
@@ -233,11 +236,12 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         """r.zadd score = now + offset_s — always in the future, no midnight math."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
+        r.zscore.return_value = None
 
         now_ts   = 1_700_000_000.0
         offset_s = 3600          # 1 h
 
-        row = {"initial_slot_offset_s": offset_s, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": offset_s, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -259,11 +263,12 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         """A large offset (near 24 h) still lands in the future, never wraps back."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
+        r.zscore.return_value = None
 
         now_ts   = 1_700_000_000.0
         offset_s = 82800         # 23 h — near the top of the [0, 86400) range
 
-        row = {"initial_slot_offset_s": offset_s, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": offset_s, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -285,8 +290,9 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         """DB UPDATE sets warming_polls_remaining = WARMING_POLLS_COUNT (3)."""
         from config import WARMING_POLLS_COUNT
         r = MagicMock()
+        r.zscore.return_value = None
 
-        row = {"initial_slot_offset_s": 3600, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": 3600, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -309,8 +315,9 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
     def test_db_update_commits(self):
         """conn.commit() called after UPDATE."""
         r = MagicMock()
+        r.zscore.return_value = None
 
-        row = {"initial_slot_offset_s": 3600, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": 3600, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -327,8 +334,9 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
     def test_both_conn_close_called(self):
         """Both DB connections are closed (finally blocks)."""
         r = MagicMock()
+        r.zscore.return_value = None
 
-        row = {"initial_slot_offset_s": 3600, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": 3600, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -347,8 +355,9 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         """r.zadd is called with REDIS_POLL_ADAPTIVE as the key."""
         from config import REDIS_POLL_ADAPTIVE
         r = MagicMock()
+        r.zscore.return_value = None
 
-        row = {"initial_slot_offset_s": 3600, "id": 1}
+        row = {"warming_polls_remaining": None, "initial_slot_offset_s": 3600, "id": 1}
         conn1 = MagicMock()
         conn1.execute.return_value.fetchone.return_value = row
         conn2 = MagicMock()
@@ -413,6 +422,7 @@ class TestRunFullscanBootstrapIntegration(unittest.TestCase):
         """
         company = "TestCo"
         r = MagicMock()
+        r.zscore.return_value = None
 
         # Minimal mocks to let _run_fullscan reach the bootstrap call
         with patch("workers.fullscan._get_fullscan_state",
@@ -476,6 +486,7 @@ class TestRunFullscanBootstrapIntegration(unittest.TestCase):
 
         bootstrap = MagicMock(side_effect=Exception("DB timeout"))
         r = MagicMock()
+        r.zscore.return_value = None
 
         with patch("workers.fullscan._get_fullscan_state",
                    return_value=self._make_fs_state(None)), \
@@ -527,6 +538,7 @@ class TestFullscanEmptyDaysSignal(unittest.TestCase):
 
     def _run(self, raw_jobs, title_matched):
         r = MagicMock()
+        r.zscore.return_value = None
         r.exists.return_value = False   # no maintenance pause / lever flags
         with patch("workers.fullscan._get_fullscan_state", return_value={
                  "full_scan_interrupted": False, "interrupted_at_page": None,
