@@ -1133,7 +1133,7 @@ def _build_adaptive_health_section() -> str:
                 'style="border-collapse:collapse;font-size:12px;">'
                 f'<tr>'
                 f'<th style="{th_style}">Platform</th>'
-                f'<th style="{th_style}">Likely Early-Exit Misses (indicator)</th>'
+                f'<th style="{th_style}">Delayed Full-Scan Discoveries (indicator)</th>'
                 f'<th style="{th_style}">Total New Jobs</th>'
                 f'<th style="{th_style}">Missed Rate</th>'
                 f'<th style="{th_style}">Days</th>'

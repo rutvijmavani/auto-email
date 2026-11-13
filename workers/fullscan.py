@@ -473,7 +473,7 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     conn = get_conn()
     try:
         row = conn.execute("""
-            SELECT id, initial_slot_offset_s, warming_polls_remaining
+            SELECT id, initial_slot_offset_s, warming_polls_remaining, next_poll_at
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
@@ -483,8 +483,18 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     # Already bootstrapped (warming counter set, or a pending adaptive entry):
     # keep the existing schedule and counter. last_poll_at stays NULL until the
     # first adaptive scan completes, so a later fullscan would otherwise reset them.
-    if (row and row["warming_polls_remaining"] is not None) \
-            or r.zscore(REDIS_POLL_ADAPTIVE, company) is not None:
+    pending = r.zscore(REDIS_POLL_ADAPTIVE, company) is not None
+    if (row and row["warming_polls_remaining"] is not None) or pending:
+        # A previous bootstrap committed the DB counter but died before the ZADD:
+        # restore the persisted schedule, unless it is queued or an adaptive scan is in flight.
+        next_at = row["next_poll_at"] if row and row["warming_polls_remaining"] is not None else None
+        if (next_at is not None and not pending
+                and not r.exists(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")):
+            if next_at.tzinfo is None:
+                next_at = next_at.replace(tzinfo=timezone.utc)
+            r.zadd(REDIS_POLL_ADAPTIVE, {company: next_at.timestamp()}, nx=True)
+            logger.info("fullscan: WARMING bootstrap for %r — restored adaptive schedule from next_poll_at", company)
+            return
         logger.info("fullscan: WARMING bootstrap for %r skipped — adaptive schedule already pending", company)
         return
 

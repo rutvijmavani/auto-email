@@ -373,6 +373,36 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
         key_used = r.zadd.call_args[0][0]
         self.assertEqual(key_used, REDIS_POLL_ADAPTIVE)
 
+    def _interrupted_run(self, zscore, inflight):
+        """Counter committed (warming=3, next_poll_at set) but no ZADD happened."""
+        from datetime import datetime, timezone
+        r = MagicMock()
+        r.zscore.return_value = zscore
+        r.exists.return_value = inflight
+        due = datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc)
+        row = {"warming_polls_remaining": 3, "initial_slot_offset_s": 3600,
+               "id": 1, "next_poll_at": due}
+        conn1 = MagicMock()
+        conn1.execute.return_value.fetchone.return_value = row
+        conns = iter([conn1])
+        with patch("workers.fullscan.get_conn", side_effect=lambda: next(conns)):
+            from workers.fullscan import _bootstrap_warming_adaptive
+            _bootstrap_warming_adaptive("Stripe", r)
+        return r, due
+
+    def test_interrupted_bootstrap_restores_schedule_from_next_poll_at(self):
+        from config import REDIS_POLL_ADAPTIVE
+        r, due = self._interrupted_run(zscore=None, inflight=0)
+        r.zadd.assert_called_once_with(REDIS_POLL_ADAPTIVE, {"Stripe": due.timestamp()}, nx=True)
+
+    def test_interrupted_bootstrap_skips_when_already_scheduled(self):
+        r, _ = self._interrupted_run(zscore=123.0, inflight=0)
+        r.zadd.assert_not_called()
+
+    def test_interrupted_bootstrap_skips_when_adaptive_in_flight(self):
+        r, _ = self._interrupted_run(zscore=None, inflight=1)
+        r.zadd.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TestBootstrapWarmingAdaptiveSlot

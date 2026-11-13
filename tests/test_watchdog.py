@@ -774,6 +774,37 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             from workers.watchdog import check_queue_health
             return check_queue_health(r)
 
+    def _mid_scan_count(self, cur_by_consumer, keys=("worker:alive:scan_worker:host1:1",)):
+        """Real _scan_workers_mid_scan against a fake Redis (heartbeat keys + worker:cur values)."""
+        from workers.watchdog import _scan_workers_mid_scan
+        from config import REDIS_WORKER_CUR_PREFIX
+        store = {f"{REDIS_WORKER_CUR_PREFIX}:{c}": v for c, v in cur_by_consumer.items()}
+        r = MagicMock()
+        r.scan.return_value = (0, [k.encode() for k in keys])
+        r.get.side_effect = lambda k: store.get(k)
+        return _scan_workers_mid_scan(r)
+
+    def test_mid_scan_helper_fresh_report_counts(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() + 600})
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": cur}), 1)
+
+    def test_mid_scan_helper_expired_report_not_counted(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() - 5})
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": cur}), 0)
+
+    def test_mid_scan_helper_missing_report_not_counted(self):
+        self.assertEqual(self._mid_scan_count({}), 0)
+
+    def test_mid_scan_helper_malformed_report_not_counted(self):
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": "{not json"}), 0)
+
+    def test_mid_scan_helper_other_workers_report_not_counted(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() + 600})
+        self.assertEqual(self._mid_scan_count({"worker-host2-9": cur}), 0)
+
     def test_stall_with_worker_mid_scan_is_busy_not_error(self):
         from workers.watchdog import Issue
         issues = self._stalled_run(_scan_workers_mid_scan=lambda r: 3)

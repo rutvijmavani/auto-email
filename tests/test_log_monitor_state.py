@@ -15,7 +15,10 @@ import types
 import unittest
 from pathlib import Path
 
-sys.modules.setdefault("fcntl", types.ModuleType("fcntl"))
+try:
+    import fcntl  # noqa: F401  (real module on POSIX)
+except ImportError:
+    sys.modules["fcntl"] = types.ModuleType("fcntl")   # Windows: stub only when absent
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import scripts.log_monitor as lm
 

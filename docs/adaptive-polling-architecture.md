@@ -1718,7 +1718,7 @@ This is acceptable because:
 
 ### Adaptive-first guarantee
 
-Full scan only runs after at least one adaptive poll has completed for that company (see Section 7). This ensures that when a false positive occurs, adaptive polling has already had the opportunity to detect the same job.
+There is no adaptive-first prerequisite: a new company's first fullscan runs first and bootstraps its WARMING adaptive schedule at completion, and a fullscan never waits for an adaptive poll (see the New-company rule in Section 7). For an established company, adaptive polling runs throughout the day, so a job the bloom wrongly marks as seen has usually already been detected by an adaptive scan; a company's first fullscan has no such earlier adaptive coverage.
 
 ---
 
@@ -3555,7 +3555,7 @@ Stream correctness: `XADD MAXLEN ~ N` on every enqueue (bounded stream size). Co
 
 ### Phase 6 — Full Scan
 
-**What:** `pipeline/fullscan.py`. Score-ascending scheduling. Adaptive-first prerequisite check. Bloom filter per company (36h TTL, 0.1% error, RedisBloom + SET fallback). SORTED vs NON-SORTED behavior. Graceful termination (Pub/Sub + checkpoint). Dynamic worker scaling.
+**What:** `pipeline/fullscan.py`. Score-ascending scheduling. No adaptive-first prerequisite (removed). Bloom filter per company (36h TTL, 0.1% error, RedisBloom + SET fallback). SORTED vs NON-SORTED behavior. Graceful termination (Pub/Sub + checkpoint). Dynamic worker scaling.
 
 **Deliverable:** Exhaustive safety net running daily. miss_rate metric meaningful.
 
