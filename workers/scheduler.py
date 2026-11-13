@@ -399,6 +399,15 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
                            stream_key, msg_id, state)
             continue
 
+        # A newer dispatch of this company owns the slot: this entry is superseded.  It is acked
+        # above; it must not requeue, count a reap or release the newer dispatch's slot.  A missing
+        # stored id (slot already released) keeps the existing handling.
+        stored = r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
+        if stored and _s(stored) != msg_id:
+            logger.info("claim_stale_work: %r entry %s (%s) superseded by dispatch %s — acked only",
+                        company, msg_id, state, _s(stored))
+            continue
+
         target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
         delivered_ms = entry.get("time_since_delivered")
         restart_victim = (

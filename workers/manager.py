@@ -1313,24 +1313,54 @@ def _midnight_recompute(r, pools: list[str]) -> None:
             logger.error("manager: nightly detail ceiling failed: %s", exc, exc_info=True)
 
 
-def _start_adaptive_snapshot(day_str: str) -> None:
+_ADAPTIVE_SNAPSHOT_DONE_KEY = "manager:adaptive_snapshot_date"
+_adaptive_snapshot_running = False
+
+
+def _adaptive_snapshot_due(r) -> bool:
+    """True when today's recompute has run but today's snapshot has not completed
+    (it failed, or the manager restarted while it ran).  Retried every cycle until
+    the date rolls over; the snapshot is idempotent per (date, company)."""
+    today = _recompute_date()
+    return (_decode(r.get("manager:last_recompute_date")) == today
+            and _decode(r.get(_ADAPTIVE_SNAPSHOT_DONE_KEY)) != today)
+
+
+def _start_adaptive_snapshot(day_str: str, r=None) -> None:
     """
     Nightly adaptive_poll_metrics snapshot (db/adaptive_metrics.py), run in a
     daemon thread so its job_postings scan can never stall the manager loop.
     Independent of the ceiling recompute: any failure is logged inside run_nightly
     (or here) and nothing else is affected. Retention of the table is the
     init_db cleanup pass (RETENTION_ADAPTIVE_POLL_METRICS_DAYS), not this step.
+    When *r* is given, a fully successful run records the date in
+    manager:adaptive_snapshot_date so _adaptive_snapshot_due stops retrying; one
+    run at a time.
     """
+    global _adaptive_snapshot_running
+    if _adaptive_snapshot_running:
+        return
+    _adaptive_snapshot_running = True
+
     def _run():
+        global _adaptive_snapshot_running
         try:
             from datetime import date as _date
             from db.adaptive_metrics import run_nightly
-            run_nightly(_date.fromisoformat(day_str))
+            out = run_nightly(_date.fromisoformat(day_str))
+            if r is not None and isinstance(out, dict) and out.get("errors", 1) == 0:
+                r.set(_ADAPTIVE_SNAPSHOT_DONE_KEY, day_str)
         except Exception as exc:
             logger.error("manager: adaptive metrics snapshot failed: %s", exc, exc_info=True)
+        finally:
+            _adaptive_snapshot_running = False
 
     import threading
-    threading.Thread(target=_run, name="adaptive-snapshot", daemon=True).start()
+    try:
+        threading.Thread(target=_run, name="adaptive-snapshot", daemon=True).start()
+    except Exception:
+        _adaptive_snapshot_running = False
+        raise
 
 
 def _emergency_recalc(r, pool: str, pools: list[str]) -> bool:
@@ -2877,7 +2907,6 @@ def run_manager() -> None:
                     logger.info("manager: triggering nightly Layer 1 recompute")
                     _midnight_recompute(r, pools)
                     r.set("manager:last_recompute_date", _recompute_date())
-                    _start_adaptive_snapshot(_recompute_date())
 
                     # Refresh bootstrap flag after recompute
                     any_bootstrap = any(
@@ -2888,6 +2917,14 @@ def run_manager() -> None:
                         r.set("manager:bootstrap", "1")
                     else:
                         r.delete("manager:bootstrap")
+
+                # ── Adaptive metrics snapshot: starts after today's recompute and is
+                # retried each cycle until it completes (survives a manager restart) ──
+                try:
+                    if _adaptive_snapshot_due(r):
+                        _start_adaptive_snapshot(_recompute_date(), r)
+                except Exception as exc:
+                    logger.error("manager: adaptive snapshot scheduling failed: %s", exc)
 
             finally:
                 try:

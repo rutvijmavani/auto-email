@@ -205,8 +205,11 @@ this needs a three-month outage; it is accepted rather than guarded.
 - BUILT 2026-11-07 (uncommitted, not deployed, not VM-verified): config constants, schema columns
   (`company_poll_stats.empty_polls/early_exit_polls`, `adaptive_poll_metrics.*_cum/adaptive_score`),
   `upsert_poll_stats(..., early_exited)`, `db/adaptive_metrics.py` (`snapshot_counters`, `snapshot_jobs`,
-  `run_nightly`), manager hook `_start_adaptive_snapshot` (daemon thread after `manager:last_recompute_date`
-  is set, so a snapshot failure cannot touch the ceiling recompute), `db/adaptive_health.py` fixes
+  `run_nightly`), manager hook `_start_adaptive_snapshot` (daemon thread, one at a time; started by
+  `_adaptive_snapshot_due` once `manager:last_recompute_date` is today and `manager:adaptive_snapshot_date`
+  is not, so a snapshot failure cannot touch the ceiling recompute; a run with errors or a manager restart
+  mid-run is retried every cycle until the local date rolls over, after which that day's counter delta is
+  merged into the next snapshot's delta), `db/adaptive_health.py` fixes
   (`query_score_oscillation` per-company stddev of `adaptive_score`, was selecting non-existent
   `poll_score`; detection-age percentages over dated jobs), report labels, `tests/test_adaptive_metrics.py`.
 - KEY MISMATCH (from code, `scan_worker.py` ca:NN note): `upsert_poll_stats` uses the routing key
