@@ -93,5 +93,110 @@ class TestManagerSizing(unittest.TestCase):
         self.assertEqual(mgr._needed_workers["scan"], 7)
 
 
+class TestRunningTerm(unittest.TestCase):
+    """docs/scan-running-work-design.md: target = ceil(backlog + running + steady_rest)."""
+    H300 = 300.0
+    PARAMS = {"fetch_p75": 35.0, "delay_warn_s": H300}
+    # 11-10 operator Redis values: (d, T)
+    ACC, CA27, BOA = (3045.0, 10800.0), (3496.0, 21600.0), (8549.0, 43196.0)
+    TOTAL = 1.03 * mgr.MANAGER_SCALE_UP_UTIL      # logged steady 1.03
+
+    def work(self, running, late_d=(), total=None):
+        table = {"acc": self.ACC, "ca27": self.CA27, "boa": self.BOA}
+        rows = [(*table[n], True) if n in table else (0.2, 3600.0, True) for n in running]
+        r = MagicMock()
+        with patch.object(company_load, "steady_load",
+                          return_value=self.TOTAL if total is None else total), \
+             patch.object(company_load, "durations", return_value=list(late_d)), \
+             patch.object(company_load, "entries", return_value=rows):
+            return mgr._scan_pool_work(
+                r, "scan", {"late_names": ["l"] * len(late_d), "running_names": list(running)},
+                self.PARAMS)
+
+    def target(self, w):
+        return math.ceil(w["backlog"] + w["running"] + w["steady"])
+
+    def test_two_long_running_small_late_raises_target(self):
+        w = self.work(["ca27", "acc"], late_d=[0.2] * 2)
+        self.assertEqual(self.target(w), 3)
+        self.assertAlmostEqual(w["running"], 2.0)
+
+    def test_two_long_running_nothing_late(self):
+        self.assertEqual(self.target(self.work(["ca27", "acc"])), 3)
+
+    def test_only_one_long_running_target_stays_two(self):
+        self.assertEqual(self.target(self.work(["acc"])), 2)
+
+    def test_three_long_running(self):
+        self.assertEqual(self.target(self.work(["boa", "acc", "ca27"])), 4)
+
+    def test_small_running_scans_add_almost_nothing(self):
+        w = self.work(["s1", "s2"], late_d=[0.2] * 200)
+        self.assertEqual(self.target(w), 2)
+
+    def test_running_company_not_in_table_subtracts_nothing(self):
+        r = MagicMock()
+        with patch.object(company_load, "steady_load", return_value=1.0), \
+             patch.object(company_load, "durations", return_value=[]), \
+             patch.object(company_load, "entries", return_value=[(35.0, None, False)]):
+            w = mgr._scan_pool_work(r, "scan", {"late_names": [], "running_names": ["new"]},
+                                    self.PARAMS)
+        self.assertAlmostEqual(w["steady"], 1.0 / mgr.MANAGER_SCALE_UP_UTIL)
+        self.assertAlmostEqual(w["running"], 35.0 / self.H300)
+
+    def test_steady_rest_clamped_at_zero(self):
+        self.assertEqual(company_load.steady_excluding(0.1, [(3000.0, 1000.0, True)]), 0.0)
+
+    def test_unreadable_running_list_is_unknown(self):
+        self.assertIsNone(mgr._scan_pool_work(
+            MagicMock(), "scan", {"late_names": [], "running_names": None}, self.PARAMS))
+
+    def test_entries_unknown_company(self):
+        r = MagicMock()
+        r.hmget.return_value = ["40.0,3600.0", None, "garbage"]
+        self.assertEqual(company_load.entries(r, "scan", ["a", "b", "c"], 35.0),
+                         [(40.0, 3600.0, True), (35.0, None, False), (35.0, None, False)])
+
+
+class _FakeStreamRedis:
+    def __init__(self, pending, alive, cur, msgs):
+        self.pending, self.alive, self.cur, self.msgs = pending, alive, cur, msgs
+
+    def xpending(self, *a):
+        return {"pending": len(self.pending)}
+
+    def xpending_range(self, *a, **k):
+        return [{"message_id": m, "consumer": c} for m, c in self.pending]
+
+    def exists(self, key):
+        return key in self.alive
+
+    def get(self, key):
+        return self.cur.get(key)
+
+    def xrange(self, key, min=None, max=None, count=None):
+        return [(min, {"company": self.msgs[min]})]
+
+
+class TestGetRunningCompanies(unittest.TestCase):
+
+    def test_only_live_running_owner_counts(self):
+        import json
+        now = 1000.0
+        r = _FakeStreamRedis(
+            pending=[("1-0", "worker-h-11"), ("2-0", "worker-h-12"), ("3-0", "worker-h-13"),
+                     ("4-0", "other")],
+            alive={"worker:alive:scan_worker:h:11", "worker:alive:scan_worker:h:12"},
+            cur={"worker:cur:worker-h-11": json.dumps({"msg_id": "1-0", "alive_until": now + 5}),
+                 "worker:cur:worker-h-12": json.dumps({"msg_id": "2-0", "alive_until": now - 5})},
+            msgs={"1-0": "acc", "2-0": "ca27", "3-0": "x"})
+        self.assertEqual(
+            mgr._get_running_companies(r, mgr.REDIS_STREAM_ADAPTIVE, "g", now), ["acc"])
+
+    def test_empty_pel(self):
+        r = _FakeStreamRedis([], set(), {}, {})
+        self.assertEqual(mgr._get_running_companies(r, mgr.REDIS_STREAM_ADAPTIVE, "g", 1.0), [])
+
+
 if __name__ == "__main__":
     unittest.main()

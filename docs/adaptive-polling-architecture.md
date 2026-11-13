@@ -182,7 +182,7 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 ┌─────────────────────────────────────────────────────────────────┐
 │          stream:adaptive:{dc_key}  (Redis Stream per DC key)     │
 │  Crash-safe delivery: PEL tracks in-flight work                  │
-│  XAUTOCLAIM recovers from worker crashes (10 min idle timeout)  │
+│  owner-state reaper recovers worker crashes (was XAUTOCLAIM)    │
 └──────────────────────────┬──────────────────────────────────────┘
                            │  XREADGROUP
                            ▼
@@ -216,14 +216,14 @@ This adaptive behavior is entirely automatic — no one configures it by hand.
 │               FULL SCAN DISPATCHER (Tier 2 — scheduling layer)   │
 │  ZRANGEBYSCORE poll:fullscan -inf {now} → due companies          │
 │  XADD stream:fullscan  then  ZREM poll:fullscan        │
-│  Rule 4 pre-check: adaptive run today? (else defer 15 min)      │
+│  (no adaptive-first pre-check: a fullscan never waits for adaptive) │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │          stream:fullscan  (single shared Redis Stream)           │
 │  Crash-safe delivery: PEL tracks in-flight work                  │
-│  XAUTOCLAIM recovers from worker crashes (20 min idle timeout)  │
+│  owner-state reaper recovers worker crashes (was XAUTOCLAIM)    │
 └──────────────────────────┬──────────────────────────────────────┘
                            │  XREADGROUP
                            ▼
@@ -339,7 +339,7 @@ Listing scan workers (one shared pool, dc_key in message fields):
        c. Rule 3 / Rule 5: ZADD poll:fullscan if full scan due
   5. XACK stream:adaptive {msg_id}  ← only after step 4 completes
 
-  Crash recovery (run when step 2 returns empty — no new messages):
+  Crash recovery (ORIGINAL DESIGN, superseded by the scheduler's owner-state reaper `claim_stale_work`; run when step 2 returns empty — no new messages):
        p95_ms = get_p95_listing_scan_ms(redis, dc_key)   ← from api_health, 5-min cache
        idle_ms = max(p95_ms * 3, 60_000)                 ← at least 1 min
        XAUTOCLAIM stream:adaptive scan-workers {consumer}
@@ -350,10 +350,8 @@ Listing scan workers (one shared pool, dc_key in message fields):
 Full scan dispatcher (runs every 5 seconds):
   1. ZRANGEBYSCORE poll:fullscan -inf {now} LIMIT 0 50
   2. For each due company:
-       Rule 4 pre-check: did adaptive run today?
-         If not: ZADD poll:adaptive {company: now}
-                 ZADD poll:fullscan  {company: now + 900}
-                 continue  ← come back after adaptive runs
+       No adaptive-first pre-check: dispatch the fullscan as scheduled
+       (a new company gets its fullscan first, adaptive polling starts after it)
        dc_key = get_dc_key(company)
        Ceiling check (Lua — atomic): if worker:ceil:learned:{dc_key} exists:
          ZREMRANGEBYSCORE inflight:scans:{dc_key} 0 (now-10min)     ← prune stale adaptive entries
@@ -384,7 +382,7 @@ Full scan workers (one shared pool):
      Full scan self-reschedules via Path 1: _atomic_schedule(r, poll:fullscan, now+interval) with gap-detection.
      on_adaptive_complete() also triggers poll:fullscan entry via Rules 3 and 5
 
-  Crash recovery (run when step 2 returns empty):
+  Crash recovery (ORIGINAL DESIGN, superseded by the scheduler's owner-state reaper `claim_stale_work`; run when step 2 returns empty):
        p95_ms = get_p95_full_scan_ms(redis, dc_key)   ← separate from listing scan p95
        idle_ms = max(p95_ms * 3, 300_000)             ← at least 5 min
        XAUTOCLAIM stream:fullscan fullscan-workers {consumer}
@@ -422,7 +420,7 @@ This pattern is identical for both adaptive scan workers and full scan workers.
 `ZPOPMIN` is destructive — if the process crashes between the pop and the `XADD`, the company exists in neither the ZSET nor the Stream. With `ZRANGEBYSCORE` (read) → `XADD` → `ZREM` (delete only after successful write), a crash between `XADD` and `ZREM` leaves the company in both structures. On restart the dispatcher finds it in the ZSET again and tries another `XADD`. The duplicate in the stream is harmless: the scan worker runs twice in quick succession; the second scan finds all IDs already in `adaptive_seen:{company}` and exits immediately.
 
 **Why there is no watchdog process:**
-Watchdog existed to detect expired `heartbeat:{company}` keys and re-queue orphaned companies. With Streams, the PEL is the watchdog — messages not ACK'd within the idle timeout are automatically re-delivered by `XAUTOCLAIM`. No separate process, no TTL tuning, no race between ZPOPMIN and heartbeat:set.
+Watchdog existed to detect expired `heartbeat:{company}` keys and re-queue orphaned companies. With Streams, the PEL holds the in-flight messages; the scheduler's owner-state reaper (`claim_stale_work`) releases those whose owning worker is no longer RUNNING (the original `XAUTOCLAIM` idle-timeout design is superseded). No separate process, no TTL tuning, no race between ZPOPMIN and heartbeat:set.
 
 ### Why Redis instead of Python's heapq?
 
@@ -691,11 +689,9 @@ miss_rate = tier2_new_jobs / total_new_jobs
 
 This single field tells you whether the adaptive engine is doing its job.
 
-### The adaptive-first rule — four enforcement layers
+### New-company rule — first fullscan, then adaptive
 
-Full scan must always run **after at least one adaptive poll has completed today**. This ensures `found_by` attribution is accurate and miss_rate reflects genuine adaptive failures, not scheduling races.
-
-Four rules enforce this together:
+There is exactly one ordering rule for a new company: **its first fullscan runs first, and only then does adaptive polling start** (the first fullscan bootstraps the WARMING adaptive schedule at completion). A fullscan never waits for, defers to, or triggers an adaptive poll. The former adaptive-first "Rule 4" pre-check (defer the fullscan 15 min until an adaptive poll ran today) was removed; the rules below are the remaining scheduling rules.
 
 **Rule 1 — 12h MAX_INTERVAL floor (primary prevention)**
 No company polls less frequently than every 12 hours. Worst case: a dormant company last polled at 1 AM gets its adaptive poll at 1 PM — full scan follows at 1:05 PM. Covered before end of day.
@@ -710,9 +706,8 @@ rescheduled, and queues one if needed. Full scan can enter `poll:fullscan` via t
 - **Path 1** — `fullscan.py` post-completion rescheduling (normal cadence)
 - **Path 2** — `_maybe_reschedule_full_scan()` triggered by adaptive completion (this rule)
 - **Path 3** — `_queue_fullscans_for_missed()` in `job_monitor.py` (safety net for companies
-  whose fullscan was missed entirely — NULL or stale `next_full_scan_at`). This path bypasses
-  the adaptive-first rule (Rule 4) since the company has already been seen by the listing
-  fallback; it schedules a fullscan directly.
+  whose fullscan was missed entirely — NULL or stale `next_full_scan_at`). It schedules a
+  fullscan directly after a listing-scan fallback.
 
 ```python
 def on_adaptive_complete(company):
@@ -750,12 +745,10 @@ Three cases trigger (re)scheduling: `next_full_scan_at` is NULL (never scheduled
 `next_full_scan_at` is in the past (overdue / ZSET entry lost), or the scheduled time
 plus average scan duration would miss the 7 AM digest deadline.
 
-Because fullscan requires a prior adaptive completion (Path 2 only fires inside
-`on_adaptive_complete`), the adaptive-first rule is enforced by design for the normal
-scan cycle. **Exception — Path 3 safety net:** `_queue_fullscans_for_missed()` in
-`job_monitor.py` (Path 3) can schedule a fullscan after a listing-scan fallback even
-when no adaptive completion has occurred, to catch companies whose fullscan window
-would otherwise be missed entirely.
+Path 2 only fires inside `on_adaptive_complete`; Path 3 (`_queue_fullscans_for_missed()` in
+`job_monitor.py`) can schedule a fullscan after a listing-scan fallback even when no adaptive
+completion has occurred, to catch companies whose fullscan window would otherwise be missed
+entirely. Neither path gates the fullscan on an adaptive poll having run.
 
 **Rule 5 — Pre-7 AM full scan trigger (crossing-day boundary)**
 When `on_adaptive_complete()` reschedules the next adaptive poll to *tomorrow* (crossing the 7 AM boundary), the full scan for the current cycle may not have run yet. If sufficient time remains tonight, trigger the full scan now rather than leaving it undone until tomorrow's cycle.
@@ -807,37 +800,16 @@ def _maybe_trigger_pre7am_fullscan(company):
 | next_poll_at = tomorrow 8:30 AM, full scan already done today | Rule 5 skipped |
 | next_poll_at = tomorrow 8:30 AM, only 90 min until 7 AM (< p95_fullscan × 3 + 2h) | Rule 5 skipped — insufficient time |
 
-**Rule 4 — Full scan worker pre-check (safety net for restarts and edge cases)**
-As a fallback for system restarts, first-run companies, or repeated adaptive errors:
-
-```python
-def run_full_scan(company):
-    cycle_start = float(redis.get("cycle:start"))
-    last_poll   = company.last_poll_at
-
-    if last_poll is None or last_poll.timestamp() < cycle_start:
-        # Adaptive hasn't run today. Trigger it now ONLY if the company is not
-        # already scheduled in poll:adaptive (a backoff / reap delay / interval
-        # is kept, never pulled forward).
-        scheduled = redis.zscore("poll:adaptive", company.name)
-        if scheduled is None:
-            redis.zadd("poll:adaptive", {company.name: time.time()})
-        adaptive_at = max(scheduled or 0, time.time())
-        # Requeue full scan 15 min after the adaptive poll
-        redis.zadd("poll:fullscan", {company.name: adaptive_at + 900})
-        return   # come back after adaptive runs
-
-    proceed_with_full_scan(company)
-```
+**(Removed) Full scan worker adaptive-first pre-check.** The fullscan worker no longer checks whether an adaptive poll ran today; it runs the fullscan it was dispatched. See "New-company rule" above.
 
 | Scenario | Rule that handles it |
 |---|---|
 | Dormant company, last polled 11 PM | Rule 1 → 12h cap guarantees adaptive by 11 AM at latest |
 | Many companies with clustered adaptive intervals | Section 24 hash distribution → never cluster in the first place |
-| New company, never polled | Current code: a company with `first_scanned_at` NULL bypasses adaptive; the adaptive request is routed to `poll:fullscan` and the first full scan handles the whole board (`scan_worker.py`). Rule 4 below is the original design. |
-| Adaptive keeps erroring | Rule 4 → keeps retrying before allowing full scan |
+| New company, never polled | Current code: a company with `first_scanned_at` NULL bypasses adaptive; the adaptive request is routed to `poll:fullscan` and the first full scan handles the whole board (`scan_worker.py`), then adaptive polling starts. |
+| Adaptive keeps erroring | Fullscan still runs on its own schedule (no adaptive-first gate) |
 | Active company, 4h interval | Rule 3 → full scan triggered once per day naturally |
-| System restart mid-day | Rule 4 → pre-check catches any companies not yet polled |
+| System restart mid-day | Fullscan ZSET and adaptive ZSET survive in Redis; due fullscans simply dispatch |
 | next_poll_at crosses to tomorrow, full scan not done today | Rule 5 → triggers full scan tonight if time allows |
 
 ---
@@ -870,7 +842,7 @@ def get_max_interval(score, thresholds):
 **Why this works:**
 
 The 12h floor for dormant companies serves two purposes simultaneously:
-1. Keeps the adaptive-first rule achievable — any company polled up to 1 AM will get its next adaptive poll by 1 PM, leaving the full afternoon for the full scan
+1. Bounds the adaptive gap — any company polled up to 1 AM will get its next adaptive poll by 1 PM, leaving the full afternoon for the full scan
 2. Catches reactivations within half a day instead of a full day
 
 For active companies, the 6h MAX_INTERVAL prevents EMA smoothing from drifting the interval too high during a temporarily slow week while still allowing the 3h natural band for peak activity.
@@ -1005,9 +977,9 @@ scheduled that will finish before the 7 AM digest (checked via `next_full_scan_a
 when scheduling is genuinely missing or stale, and uses `_atomic_schedule` (gap-filling)
 rather than a raw `zadd` to prevent clustering with other companies.
 
-This makes the adaptive-first rule structural: full scan **cannot** enter `poll:fullscan`
-without an adaptive poll having just completed — **except** via Path 3
-(`_queue_fullscans_for_missed()` in `job_monitor.py`), which schedules a fullscan directly
+For an existing company, Path 2 schedules the fullscan from adaptive completion; a new
+company's first fullscan is queued at registration (before any adaptive poll), and Path 3
+(`_queue_fullscans_for_missed()` in `job_monitor.py`) schedules a fullscan directly
 after a listing-scan fallback when `next_full_scan_at` is NULL or stale. The
 `SCHEDULER_FULL_SCAN_BUFFER_S` offset (default 5 min) gives detail workers a head start
 on any new jobs adaptive just found before the full scan begins.
@@ -1116,7 +1088,8 @@ Full scan flow with Bloom filter:
      save_pending_detail             ADD to NEW (inserted or already in DB)
    (ALL fetched jobs go into NEW regardless of outcome)
 
-3. Full scan finishes (also after an incomplete fetch):
+3. Full scan finishes (also after a structurally incomplete fetch, or a transient request failure whose
+   retry budget `FULLSCAN_PARTIAL_MAX_RETRIES` is spent; NOT during a transient failure inside the budget):
    RENAME bloom:fullscan:new:{company} → bloom:fullscan:{company}   ← atomic overwrite of OLD
    EXPIRE bloom:fullscan:{company} 7 days
    DEL adaptive_seen:{company}      ← the fullscan has now seen everything adaptive handled
@@ -1124,8 +1097,12 @@ Full scan flow with Bloom filter:
 
 OLD is untouched for the whole scan and replaced only by the final RENAME, so there is never a moment
 without a gate. If NEW does not exist at the end (empty board) OLD is deleted. An incomplete fetch
-(`FetchReport.complete is False`) is still promoted: a job missing from the bloom is simply re-evaluated
-next scan.
+(`FetchReport.complete is False`) is still promoted when the incompleteness is structural (page cap,
+repeat page, shortfall) or when a transient request failure has used up `FULLSCAN_PARTIAL_MAX_RETRIES`:
+a job missing from the bloom is simply re-evaluated next scan. A transient request failure
+(`STOP_REQUEST_FAILED`) still inside that retry budget is different (`fullscan.py` `_partial_retry_allowed`):
+the scan is treated as partial, the NEW bloom is not promoted, `adaptive_seen` is not deleted, and the
+company is rescheduled in about 1 hour.
 
 **Sizing:** capacity comes from the board just fetched, not from the previous scan or a fixed number.
 RedisBloom filters from `BF.RESERVE` are scalable, so no headroom is needed.
@@ -1286,18 +1263,18 @@ Each worker process receives a `multiprocessing.Event` at spawn. On full schedul
 
 **Error-triggered worker removal (mid-cycle)**
 
-When manager sends a `{pool}:target:{n}` command and the scheduler terminates a worker, that worker may be mid-scan when the shutdown event fires. With the Stream delivery model, the company's message remains in the PEL — it will be re-delivered by `XAUTOCLAIM` to another worker after the idle timeout. No explicit re-queuing logic is needed for the "removed cleanly before scan starts" case.
+When manager sends a `{pool}:target:{n}` command and the scheduler terminates a worker, that worker may be mid-scan when the shutdown event fires. With the Stream delivery model, the company's message remains in the PEL — the scheduler's owner-state reaper (`claim_stale_work`) releases it for another worker once the owner is no longer RUNNING. No explicit re-queuing logic is needed for the "removed cleanly before scan starts" case.
 
-However, for the worker that is **already mid-scan** when shutdown fires: the worker should re-queue with exponential backoff (not rely on `XAUTOCLAIM`) so the delay is proportional to the ATS error state rather than a fixed idle timeout.
+However, for the worker that is **already mid-scan** when shutdown fires: the worker should re-queue with exponential backoff (not rely on the reaper) so the delay is proportional to the ATS error state rather than the reaper's sighting and backoff delay.
 
-The worker checks the shutdown event at each **page boundary** inside `_run_listing_scan()`. If set: partial results are discarded, the company is explicitly re-queued in `poll:adaptive` with backoff, and the message is `XACK`'d (so `XAUTOCLAIM` does not re-deliver the message after recovery — the ZADD to `poll:adaptive` already handles rescheduling):
+The worker checks the shutdown event at each **page boundary** inside `_run_listing_scan()`. If set: partial results are discarded, the company is explicitly re-queued in `poll:adaptive` with backoff, and the message is `XACK`'d (so the reaper does not release the message again after recovery — the ZADD to `poll:adaptive` already handles rescheduling):
 
 ```python
 # Inside _run_listing_scan(), at each page boundary:
 if shutdown_event.is_set():
     delay = _get_backoff_delay(r, company, op_type="scan")
     r.zadd(REDIS_POLL_ADAPTIVE, {company: time.time() + delay})
-    r.xack(stream_key, group, msg_id)   # ACK so XAUTOCLAIM doesn't double-deliver
+    r.xack(stream_key, group, msg_id)   # ACK so the reaper doesn't re-release it
     logger.info("scan_worker: shutdown re-queue %r with +%ds backoff", company, delay)
     return
 ```
@@ -1648,11 +1625,11 @@ For each job ID on a fetched page, adaptive polling checks two layers in order:
 ```
 
 **Why `adaptive_seen` instead of a Redis `seen:{company}` SET:**
-The old design maintained a `seen:{company}` SET rebuilt from `job_postings` on every Redis restart. This was large (~100MB at scale), required a full table scan to rebuild, and grew unbounded. `adaptive_seen:{company}` is scoped to the current day only (24h TTL, DEL'd at full scan completion after the Bloom promotion), keeping it small and self-cleaning. The DB remains the authoritative source; `adaptive_seen` is purely a same-day lookup cache to avoid redundant DB round-trips.
+The old design maintained a `seen:{company}` SET rebuilt from `job_postings` on every Redis restart. This was large (~100MB at scale), required a full table scan to rebuild, and grew unbounded. `adaptive_seen:{company}` is a same-day cache (24h TTL, refreshed after every adaptive scan, DEL'd at full scan completion after the Bloom promotion), keeping it small and self-cleaning. Because the TTL is refreshed, the set can live longer than one day when full scans are delayed. The DB remains the authoritative source; `adaptive_seen` is purely a same-day lookup cache to avoid redundant DB round-trips.
 
 **`adaptive_seen` lifecycle:**
 - Written by adaptive scan — ALL fetched job IDs added regardless of filter or DB outcome
-- TTL: 24 hours (fixed)
+- TTL: 24 hours, re-armed by `scan_worker` after every adaptive scan (`r.expire(adaptive_seen_key, ADAPTIVE_SEEN_TTL)`), so it expires 24h after the LAST adaptive scan, not 24h after creation
 - DEL'd explicitly when a full scan completes successfully, right after `bloom.finalize()` (the full scan has then seen everything adaptive handled meanwhile). An ID adaptive adds after the full scan's last read but before this delete is lost, so a rejected job may be queued once more: accepted (`fullscan.py` completion branch).
 - Not written by full scan; it only reads the key while running
 
@@ -1822,7 +1799,7 @@ XREADGROUP GROUP scan-workers {consumer} COUNT 1 BLOCK 500                 — 5
   STREAMS stream:adaptive >
 XACK stream:adaptive:{dc_key} scan-workers {msg_id}                        — after on_adaptive_complete
 XAUTOCLAIM stream:adaptive scan-workers {consumer}
-  MIN-IDLE-TIME {p95_listing_scan_ms * 3}                                  — self-calibrating, not hardcoded
+  MIN-IDLE-TIME {p95_listing_scan_ms * 3}                                  — ORIGINAL DESIGN, superseded by the owner-state reaper
 XPENDING stream:adaptive:{dc_key} scan-workers                             — inflight count (ceiling check)
 ```
 
@@ -1848,7 +1825,7 @@ XREADGROUP GROUP fullscan-workers {consumer} COUNT 1 BLOCK 500      — 500ms bl
   STREAMS stream:fullscan >
 XACK stream:fullscan fullscan-workers {msg_id}
 XAUTOCLAIM stream:fullscan fullscan-workers {consumer}
-  MIN-IDLE-TIME {p95_full_scan_ms * 3}                              — self-calibrating; separate from listing scan p95
+  MIN-IDLE-TIME {p95_full_scan_ms * 3}                              — ORIGINAL DESIGN, superseded by the owner-state reaper
 
 Key: "inflight:fullscans:{dc_key}"   e.g. inflight:fullscans:workday_wd1
 Type: Sorted Set (ZSET)
@@ -1948,7 +1925,7 @@ Used for dynamic concurrency adjustment (see Section 19)
 
 #### 8. Worker Heartbeats (retired for scan workers)
 
-Scan worker heartbeat keys (`heartbeat:{company}`) are retired. Crash recovery for adaptive and full scan workers is handled by the Stream PEL + `XAUTOCLAIM` — no separate heartbeat or watchdog process required.
+Scan worker heartbeat keys (`heartbeat:{company}`) are retired. Crash recovery for adaptive and full scan workers is handled by the scheduler's owner-state reaper (`claim_stale_work`, `workers/scheduler.py`): it reads the worker heartbeat (`worker:alive:*`) and progress (`worker:cur:*`) state, and reaps a Stream PEL entry only when its owning worker is no longer RUNNING, after two sightings and with a backoff delay. The original `XAUTOCLAIM` idle-timeout design is superseded (see the status note near the end of this document).
 
 Heartbeat keys are still used by **detail fetch workers** (which use BRPOP, not Streams) to detect stuck workers.
 
@@ -1973,7 +1950,7 @@ db:maintenance   — set when DB maintenance starts, cleared when complete (no a
 
 #### 11. Full Scan Exclusive Lock (retired)
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. `XAUTOCLAIM` re-delivers to a *different* worker on crash, not a duplicate second dispatch.
+`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented by the Stream delivery model: a company in the `stream:fullscan` PEL (delivered but not ACK'd) is not re-added by the dispatcher because `ZREM poll:fullscan` already removed it from the scheduling ledger. On a crash the owner-state reaper (not `XAUTOCLAIM`) releases the stale entry for a *different* worker, not a duplicate second dispatch.
 
 #### 12. Company Stats Cache (Hash)
 
@@ -2427,7 +2404,9 @@ Workers reconnect with exponential backoff. If Redis unreachable for > 2 minutes
 ### Worker failures
 
 **Crashed workers — Stream PEL recovery (replaces watchdog):**
-Scan worker crashes no longer require a watchdog process. The Stream PEL tracks every message delivered but not yet ACK'd. `XAUTOCLAIM` re-delivers unACK'd messages after the idle timeout to another available worker:
+> **SUPERSEDED (see the owner-state reaper note near the end of this document):** crash recovery is the scheduler's `claim_stale_work`, not `XAUTOCLAIM`. The rest of this subsection records the original design.
+
+Scan worker crashes no longer require a watchdog process. The Stream PEL tracks every message delivered but not yet ACK'd. In the original design `XAUTOCLAIM` re-delivered unACK'd messages after the idle timeout to another available worker:
 
 ```text
 stream:adaptive:{dc_key}  → XAUTOCLAIM after 10 min idle (adaptive scans)
@@ -2447,7 +2426,7 @@ Two-layer detection:
    Updated after every meaningful step (each page processed, each DB write).
    If progress key expires while heartbeat is still alive → worker is frozen
    between requests → scheduler liveness check kills the process; Stream PEL
-   entry remains unACK'd and is recovered by `XAUTOCLAIM` after idle timeout.
+   entry remains unACK'd and is released by the owner-state reaper (`claim_stale_work`) once the owner is no longer RUNNING.
 
 This correctly distinguishes a SAP XML dump taking 3 minutes (many progress updates)
 from a worker frozen waiting on a dead DB connection (no progress updates).
@@ -2579,7 +2558,7 @@ See Section 19 for dynamic concurrency details.
 
 ### Full scan double-dispatch protection
 
-`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; `XAUTOCLAIM` re-delivers it to exactly one other worker — not as a second concurrent dispatch.
+`fullscan:lock:{company}` NX key is retired. Double-dispatch is prevented structurally by the two-layer delivery model: once the dispatcher `XADD`s a company to `stream:fullscan` and `ZREM`s it from `poll:fullscan`, it no longer exists in the scheduling ledger. A crashed worker leaves the message in the PEL; the owner-state reaper (`claim_stale_work`) releases it for exactly one other worker — not as a second concurrent dispatch.
 
 ### Digest email safety
 
@@ -3911,7 +3890,7 @@ python scripts/reschedule_on_deploy.py --fullscan-only
 
 **found_by:** Field on `job_postings` tracking whether a job was caught by `tier1_adaptive` or `tier2_full_scan`. Foundation of the miss_rate health metric.
 
-**Heartbeat:** A short-TTL Redis key refreshed by a running worker. Still used by detail fetch workers (BRPOP-based) to detect stuck workers. Retired for adaptive and full scan workers — Stream PEL + `XAUTOCLAIM` handles their crash recovery without a separate heartbeat or watchdog.
+**Heartbeat:** A short-TTL Redis key refreshed by a running worker. Still used by detail fetch workers (BRPOP-based) to detect stuck workers. Retired as a per-company key for adaptive and full scan workers: their crash recovery is the scheduler's owner-state reaper, driven by the per-worker `worker:alive:*` heartbeat and `worker:cur:*` progress keys.
 
 **Incremental filtering:** Only processing jobs that are genuinely new since the last poll. Core efficiency mechanism.
 

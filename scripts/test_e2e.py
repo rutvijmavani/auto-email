@@ -722,11 +722,6 @@ def stage_fullscan():
         fail(f"fullscan returned outcome=error: {result}")
     if result["outcome"] == "skipped":
         fail(f"fullscan skipped {INCR_COMPANY} -- check DB company row")
-    if result["outcome"] == "deferred":
-        warn("Fullscan deferred (Rule 4: adaptive hasn't run this cycle)")
-        ok("Deferred is a valid outcome (Rule 4 working)")
-        return
-
     ok(f"outcome={result['outcome']}")
     ok(f"fetched={result['fetched']}  new_jobs={result['new_jobs']}  pages={result['pages']}")
 

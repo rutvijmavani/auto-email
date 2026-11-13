@@ -18,7 +18,9 @@ The core behavior: **when a worker hits the platform ceiling, put the job back i
 | Adaptive scan | XREADGROUP stream | XACK + ZADD `poll:adaptive` score=now+30s | `XREADGROUP` next message |
 | Fullscan | Checkpoint-based | `_write_checkpoint()` + requeue | Next company dispatch |
 
-Single code change unlocks all three: `ats_get()` line 552-558 must raise `CeilingExceeded` instead of proceeding after retry exhaustion. Each worker already has infrastructure to handle the catch — just needs the catch added.
+> **Historical:** `ats_get()` has no production caller (adaptive-polling-architecture §19), so the `ats_get()` change below does not apply as written; retarget it to the live request path (the shared ceiling check used by the current fetch helpers) before building.
+
+Single code change unlocks all three (original proposal): `ats_get()` line 552-558 must raise `CeilingExceeded` instead of proceeding after retry exhaustion. Each worker already has infrastructure to handle the catch — just needs the catch added.
 
 **Ship this first. Small blast radius. Solves the confirmed bug.**
 

@@ -91,8 +91,9 @@ fill `posted_at` with a real time (113 mentions across 23 files, not yet read pe
   `tier1_new_jobs`, `tier2_new_jobs`, `total_new_jobs = tier1 + tier2`.
 - Detection age buckets use `created_at - posted_at` and count only platforms on an allow-list of
   real-timestamp feeders (config list, built in implementation step 1 from the feeder code and a VM
-  query). Other platforms contribute to counts but not to age buckets; the report shows "n/a" for
-  them. The block is labelled "posting time to scan-insert time" (it does not include detail-queue delay).
+  query). Other platforms contribute to counts but not to age buckets. Age is aggregated across the
+  allow-listed platforms (the report shows no per-platform "n/a"), and the section is omitted when
+  there are no dated jobs. The block is labelled "posting time to scan-insert time" (it does not include detail-queue delay).
 - Evidence query for step 1 (run on the VM):
   `SELECT ats_platform, COUNT(*) n, COUNT(posted_at) dated, COUNT(*) FILTER (WHERE posted_at::time <> '00:00') timed FROM job_postings WHERE created_at > NOW() - INTERVAL '14 days' GROUP BY 1 ORDER BY n DESC;`
 

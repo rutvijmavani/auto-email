@@ -794,7 +794,6 @@ def _build_adaptive_health_section() -> str:
             MISS_RATE_WARN, MISS_RATE_CRIT,
             ERROR_RATE_WARN, ERROR_RATE_CRIT,
         )
-        from config import ADAPTIVE_MISS_LAG_HOURS
         data = build_weekly_health_data(days=7)
     except Exception:
         return ""
@@ -1123,7 +1122,8 @@ def _build_adaptive_health_section() -> str:
                 'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
                 'Early-Exit Validation &nbsp;'
                 '<span style="font-weight:400;font-size:10px;">'
-                f'(indicator, not a bound: full-scan inserts of jobs posted over {ADAPTIVE_MISS_LAG_HOURS}h earlier, '
+                '(indicator, not a bound: full-scan inserts of jobs posted well before the scan '
+                '(lag threshold as configured when each snapshot was taken), '
                 'listing-date platforms only; misses recovered sooner are not counted. '
                 'Other causes (long poll interval, failed scan, filter error) can also '
                 'qualify, so these are not confirmed early-exit misses)</span></p>'

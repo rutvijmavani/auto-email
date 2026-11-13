@@ -74,6 +74,7 @@ from config import (
     REDIS_DETAIL_FULLSCAN,
     REDIS_STREAM_ADAPTIVE,
     REDIS_STREAM_FULLSCAN,
+    REDIS_WORKER_CUR_PREFIX,
     STREAM_CONSUMER_GROUP,
     WORKER_OUTAGE_TTL_S,
     WORKER_CONSEC_REDUCTIONS_THRESHOLD,
@@ -502,6 +503,54 @@ def _dispatcher_uptime_s(r, loop: str, now: float, default: float) -> float:
         return default
 
 
+_STREAM_WORKER_TYPE = {
+    REDIS_STREAM_ADAPTIVE: "scan_worker",
+    REDIS_STREAM_FULLSCAN: "fullscan_worker",
+}
+
+
+def _s(v) -> str:
+    return v.decode() if isinstance(v, bytes) else str(v)
+
+
+def _get_running_companies(r, stream_key: str, group: str, now: float) -> list:
+    """
+    Companies being scanned right now: pending stream entries whose owner is alive
+    (heartbeat key) and whose worker:cur report names that message with its
+    deadline not passed.  Same RUNNING test as scheduler._owner_state; a stalled,
+    abandoned or dead owner is not running (the reaper handles those).  Raises on a
+    Redis error so the caller treats the list as unknown, never as empty.
+    """
+    worker_type = _STREAM_WORKER_TYPE.get(stream_key, "scan_worker")
+    summary = r.xpending(stream_key, group)
+    count = int(summary.get("pending", 0)) if isinstance(summary, dict) else 0
+    if count <= 0:
+        return []
+    names = []
+    for entry in r.xpending_range(stream_key, group, min="-", max="+", count=count):
+        consumer, msg_id = _s(entry["consumer"]), _s(entry["message_id"])
+        if not consumer.startswith("worker-"):
+            continue
+        host, _, pid = consumer[len("worker-"):].rpartition("-")
+        if not host or not pid.isdigit():
+            continue
+        if not r.exists(f"worker:alive:{worker_type}:{host}:{pid}"):
+            continue
+        raw = r.get(f"{REDIS_WORKER_CUR_PREFIX}:{consumer}")
+        try:
+            cur = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            cur = None
+        if not cur or cur.get("msg_id") != msg_id or now > float(cur.get("alive_until", 0)):
+            continue
+        msgs = r.xrange(stream_key, min=msg_id, max=msg_id, count=1)
+        fields = msgs[0][1] if msgs else {}
+        company = _s(fields.get("company") or fields.get(b"company") or "")
+        if company:
+            names.append(company)
+    return names
+
+
 def _get_scan_pool_metrics(r, zset_key: str, stream_key: str, now: float,
                            loop: str) -> dict:
     """
@@ -540,6 +589,19 @@ def _get_scan_pool_metrics(r, zset_key: str, stream_key: str, now: float,
     except Exception as exc:
         logger.warning("manager: late company names unreadable for %s: %s", zset_key, exc)
 
+    # Companies being scanned right now (their worker is pinned).  They are not late:
+    # a company in both lists (redelivered) counts once, as running.  None =
+    # unreadable (unknown, not empty).
+    running_names = None
+    try:
+        running_names = sorted(set(_get_running_companies(r, stream_key,
+                                                          STREAM_CONSUMER_GROUP, now)))
+        if late_names is not None:
+            running_set = set(running_names)
+            late_names = [n for n in late_names if n not in running_set]
+    except Exception as exc:
+        logger.warning("manager: running company names unreadable for %s: %s", stream_key, exc)
+
     return {
         "depth":          overdue + (waiting or 0),
         "delay_s":        max(zset_delay, stream_age or 0.0),
@@ -548,6 +610,7 @@ def _get_scan_pool_metrics(r, zset_key: str, stream_key: str, now: float,
         "stream_waiting": waiting,
         "stream_age_s":   stream_age,
         "late_names":     late_names,
+        "running_names":  running_names,
     }
 
 
@@ -686,15 +749,21 @@ def _scan_pool_work(r, pool: str, metrics: dict, params: dict) -> "dict | None":
     """
     Workers a scan-type pool needs, from per-company work (company_load.py):
 
-      backlog = sum over late companies of min(d / H, 1)     H = delay_warn_s
-      steady  = (sum over all companies of d / (d + T)) / MANAGER_SCALE_UP_UTIL
+      backlog = sum over late companies of min(d / H, 1)        H = delay_warn_s
+      running = sum over companies being scanned now of min(d / H, 1)
+      steady  = (sum over companies NOT running of d / (d + T)) / MANAGER_SCALE_UP_UTIL
 
-    d is a company's averaged duration (fetch_p75 when it has no entry), T its
-    interval.  Returns None when the late list or the table cannot be read; the
+    A running company is counted once, as running (its worker is pinned for the
+    whole scan).  d is a company's averaged duration (fetch_p75 when it has no
+    entry), T its interval.  Returns None when the late list, the running list or
+    the table cannot be read; the
     caller then keeps the last need, never a zero.
     """
     names = metrics.get("late_names")
     if names is None:
+        return None
+    running_names = metrics.get("running_names", [])    # absent key = none running
+    if running_names is None:
         return None
     fetch_p75    = params.get("fetch_p75",    _FALLBACK_PARAMS[pool]["fetch_p75"])
     delay_warn_s = params.get("delay_warn_s", _FALLBACK_PARAMS[pool]["delay_warn_s"])
@@ -703,12 +772,15 @@ def _scan_pool_work(r, pool: str, metrics: dict, params: dict) -> "dict | None":
         if steady_load is None:
             return None
         durations = company_load.durations(r, pool, names, fetch_p75)
+        running_rows = company_load.entries(r, pool, running_names, fetch_p75)
     except Exception as exc:
         logger.error("manager [%s]: company load unreadable: %s", pool, exc)
         return None
+    steady_rest = company_load.steady_excluding(steady_load, running_rows)
     return {
         "backlog": company_load.backlog_term(durations, delay_warn_s),
-        "steady":  steady_load / MANAGER_SCALE_UP_UTIL,
+        "running": company_load.backlog_term([d for d, _, _ in running_rows], delay_warn_s),
+        "steady":  steady_rest / MANAGER_SCALE_UP_UTIL,
         "late":    len(names),
     }
 
@@ -1417,7 +1489,7 @@ def _run_pool_cycle(
     # When that is unknown this cycle the last computed need stays; only a pool
     # that never had one falls through to the formula above.
     if work is not None:
-        workers_target = math.ceil(work["backlog"] + work["steady"])
+        workers_target = math.ceil(work["backlog"] + work.get("running", 0.0) + work["steady"])
         _last_work_need[pool] = workers_target
     elif pool in _last_work_need:
         workers_target = _last_work_need[pool]
@@ -2668,6 +2740,7 @@ def run_manager() -> None:
                         "" if pool not in _SCAN_TYPE_POOLS else (
                             " work=unknown" if work is None else
                             f" late={work['late']} backlog={work['backlog']:.2f} "
+                            f"running={work.get('running', 0.0):.2f} "
                             f"steady={work['steady']:.2f} read={_work_ms:.0f}ms"
                         ),
                         decision,

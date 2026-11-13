@@ -29,6 +29,9 @@ For scan and fullscan:
 Detail keeps its formula.  Scan and fullscan use work-seconds from per-company data.
 
     needed = ceil( backlog + steady )
+    # 2026-11-12 extension (docs/scan-running-work-design.md): + running term, and
+    # steady excludes the companies being scanned:
+    #   needed = ceil( backlog_late + running + steady_rest )
 
     backlog = sum over late companies c of  min( d_c / H , 1 )
     steady  = ( sum over ALL companies c of  d_c / (d_c + T_c) ) / target_util
@@ -71,7 +74,7 @@ Per pool (`scan`, `fullscan`), in Redis (the manager and the writers are differe
   the DB immediately with the same function.  p75 is only for a single company with no row/NULL.
   If the DB read itself fails the manager keeps its last good values, logs an error, never uses 0.
   On the FIRST cycle there is no last good value to keep: a pool that has never had a work-based
-  need falls back to the depth-based formula (`depth / delay_warn_s + arrival_rate`) until the
+  need falls back to the depth-based formula (`ceil((depth / delay_warn_s + arrival_rate) * s_used)`, with `s_used` the measured service time, or `fetch_p75` when unknown) until the
   table can be read (`_last_work_need` in `_run_pool_cycle`).
 
 ## 4. Blast radius (graphify query + grep, 2026-10-29)

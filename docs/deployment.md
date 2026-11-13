@@ -1340,8 +1340,14 @@ A Workday full scan legitimately takes 20–30 minutes. During that time the pro
 ```text
 poll:adaptive EMPTY  → ERROR   → auto-heal: python pipeline.py --rebuild
 poll:adaptive STALL  → ERROR   → auto-heal: restart recruiter-scheduler
+                         (only when all 3 stall signals fire AND no veto applies;
+                          vetoes: a scan_worker is mid-scan with a fresh progress
+                          report -> WARNING "BUSY"; the dispatcher's `dispatched`
+                          count rose since last cycle; Lever 1 / db:maintenance halt)
 poll:fullscan EMPTY  → WARNING (normal briefly after rebuild, ignored if transient)
 poll:fullscan STALL  → ERROR   → auto-heal: restart recruiter-scheduler
+                         (same vetoes except mid-scan, which is the fullscan:lock check:
+                          Lever 1 / db:maintenance halt, or `dispatched` count rose)
 detail queue depth >500, not draining → ERROR  (no auto-heal)
 detail queue depth >100, not draining → WARNING (no auto-heal)
 ```
@@ -1664,7 +1670,8 @@ systemctl is-active recruiter-scheduler recruiter-watchdog
 /home/opc/mail/venv/bin/python /home/opc/mail/scripts/log_monitor.py
 # Should print "[log_monitor] clean — no issues found" if logs are quiet
 
-# Check that the state file was created (byte offsets per log file):
+# Check that the state file was created (version 2: one entry per (path, inode)
+# with offset + scanned_at; an old offsets/inodes file is migrated on first run):
 cat /home/opc/mail/data/log_monitor_state.json | python3 -m json.tool | head -20
 
 # ── 8. Full health check ──────────────────────────────────────────────────────

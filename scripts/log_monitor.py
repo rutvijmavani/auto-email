@@ -27,6 +27,15 @@ Redis key schema
   log_monitor:resolved      Redis list of JSON records for resolved errors
                             since the last digest.  Cleared after digest.
   log_monitor:digest_ts     Float str — Unix timestamp of last digest sent.
+  log_monitor:seen:{h}      "1"                 TTL = 3 days
+                            Safety net: hash of a handled, timestamped flagged line.
+                            A line re-read after lost/wrong file state is skipped.
+
+File state (data/log_monitor_state.json, version 2): one entry per real file, keyed
+by (path, inode) with {offset, scanned_at}.  A rotated backup is matched to the file it
+was renamed from by name family + inode + offset<=size + newest scanned_at; entries whose
+(path, inode) is gone from disk are pruned after matching.  The old two-dict format
+(offsets + inodes) is migrated on first load.
 
 Why Redis instead of a local file?
   Byte offsets (what we've already read) live in a local JSON file so the
@@ -82,6 +91,8 @@ _PFX_ACT      = "log_monitor:act:"
 _PFX_TS       = "log_monitor:ts:"
 _KEY_RESOLVED = "log_monitor:resolved"
 _KEY_DIGEST   = "log_monitor:digest_ts"
+_PFX_SEEN     = "log_monitor:seen:"   # safety net: one key per handled timestamped line
+SEEN_TTL_S    = 3 * 24 * 3600         # covers the 48 h scan window plus margin
 
 # ── Levels that trigger an alert when detected via field-split ────────────────
 # WARNING is included; benign WARNINGs are filtered by SUPPRESS_PATTERNS below.
@@ -292,30 +303,102 @@ def _fingerprint(line: str, context: list[str]) -> str:
 # State helpers (byte offsets — kept in a local file, not Redis)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_offsets() -> dict[str, int]:
-    if STATE_FILE.exists():
+# The notebook is keyed by (path, inode): one entry per real file.  An exact match
+# means "the same file as last cycle".  A rotated backup has no entry under its new
+# name, so it is matched to its predecessor by inode + name family (_find_predecessor).
+# Entry value: {"offset": bytes already read, "scanned_at": unix time of last scan}.
+Entries = dict[tuple[str, int], dict[str, float]]
+
+_STATE_VERSION = 2
+# "manager.log.2026-11-10" -> prefix "manager.log", date "2026-11-10"
+_BACKUP_RE = re.compile(r'^(?P<prefix>.+\.log)\.(?P<date>\d{4}-\d{2}-\d{2})$')
+
+
+def _migrate_v1_state(data: dict) -> Entries:
+    """Pair the old two-dict format (offsets + inodes, both keyed by path) into entries.
+
+    scanned_at is 0.0 (unknown) so migrated entries rank oldest when two candidates
+    compete.  A path with no recorded inode gets inode 0, which never matches a real
+    file, so it is simply pruned on the first cycle."""
+    offsets = data.get("offsets", {}) or {}
+    inodes  = data.get("inodes", {}) or {}
+    entries: Entries = {}
+    for path, off in offsets.items():
         try:
-            return json.loads(STATE_FILE.read_text()).get("offsets", {})
-        except Exception as exc:
-            print(f"[log_monitor] _load_offsets: failed to read state ({exc}) — starting from 0")
-    return {}
+            entries[(path, int(inodes.get(path, 0)))] = {"offset": int(off), "scanned_at": 0.0}
+        except (TypeError, ValueError):
+            continue
+    return entries
 
 
-def _load_inodes() -> dict[str, int]:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text()).get("inodes", {})
-        except Exception as exc:
-            print(f"[log_monitor] _load_inodes: failed to read state ({exc}) — no inode tracking")
-    return {}
+def _load_state() -> Entries:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        if "entries" not in data:
+            return _migrate_v1_state(data)       # first run after upgrade
+        entries: Entries = {}
+        for e in data["entries"]:
+            entries[(e["path"], int(e["inode"]))] = {
+                "offset":     int(e["offset"]),
+                "scanned_at": float(e.get("scanned_at", 0.0)),
+            }
+        return entries
+    except Exception as exc:
+        print(f"[log_monitor] _load_state: failed to read state ({exc}) — starting from 0")
+        return {}
 
 
-def _save_offsets(offsets: dict[str, int],
-                  inodes: dict[str, int] | None = None) -> None:
+def _save_state(entries: Entries) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     _tmp = STATE_FILE.with_suffix(".tmp")
-    _tmp.write_text(json.dumps({"offsets": offsets, "inodes": inodes or {}}, indent=2))
+    payload = {
+        "version": _STATE_VERSION,
+        "entries": [
+            {"path": p, "inode": ino, "offset": int(v["offset"]), "scanned_at": v["scanned_at"]}
+            for (p, ino), v in sorted(entries.items())
+        ],
+    }
+    _tmp.write_text(json.dumps(payload, indent=2))
     _tmp.replace(STATE_FILE)   # atomic rename — no partial-write corruption
+
+
+def _find_predecessor(
+    entries: Entries, backup_path: Path, inode: int, size: int,
+    taken: set[tuple[str, int]],
+) -> tuple[str, int] | None:
+    """Return the notebook key of the file this rotated backup used to be, or None.
+
+    A backup (manager.log.2026-11-10) keeps the inode of the file it was renamed from
+    (manager.log), so the predecessor is the entry that passes ALL of:
+      1. name family — path name is "<prefix>" or "<prefix>.<date>" (same prefix as the
+         backup), so an unrelated dead file that once had the same inode never qualifies;
+      2. same inode;
+      3. saved offset <= backup size — an offset past the end cannot belong to this file;
+      4. among what is left, the newest scanned_at wins (then the live "<prefix>" name,
+         then the larger offset).
+    None means the caller starts the backup at 0."""
+    m = _BACKUP_RE.match(backup_path.name)
+    if not m or not inode:
+        return None
+    prefix = m.group("prefix")
+    best_key, best_rank = None, None
+    for key, e in entries.items():
+        path, ino = key
+        if ino != inode or key in taken:
+            continue
+        name = os.path.basename(path)
+        if name != prefix:
+            nm = _BACKUP_RE.match(name)
+            if not nm or nm.group("prefix") != prefix:
+                continue
+        if e["offset"] > size:
+            continue
+        rank = (e["scanned_at"], name == prefix, e["offset"])
+        if best_rank is None or rank > best_rank:
+            best_key, best_rank = key, rank
+    return best_key
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -453,16 +536,24 @@ def scan_file(
 
 
 def collect_raw_findings(
-    offsets: dict[str, int],
-    inodes: dict[str, int] | None = None,
-) -> tuple[dict[str, int], dict[str, int], dict[str, list[tuple[str, list[str]]]]]:
+    entries: Entries,
+    now: float | None = None,
+) -> tuple[Entries, dict[str, list[tuple[str, list[str]]]], int]:
     """
     Scan all relevant log files.
-    Returns (updated_offsets, updated_inodes, per-filename raw findings).
-    Inode tracking detects log rotation where the replacement file grows larger
-    than the old offset (the existing size<offset check handles file shrinkage).
+    Returns (updated_entries, per-filename raw findings, bytes scanned).
+
+    Every file is looked up by (path, inode):
+      * exact match            → same file as last cycle, continue from its offset;
+      * no match, live file    → a new or replaced file, start at 0;
+      * no match, dated backup → it was renamed from a live file at rotation; take the
+        position of its predecessor (_find_predecessor), else start at 0.
+    Matching reads the OLD notebook; the new notebook is built from what was scanned
+    plus old entries whose (path, inode) still exists on disk, so everything pointing
+    at a file that is gone (or was replaced by a new inode) is pruned AFTER matching.
     """
-    cutoff = time.time() - MAX_LOG_AGE_HOURS * 3600
+    now    = time.time() if now is None else now
+    cutoff = now - MAX_LOG_AGE_HOURS * 3600
 
     priority = [
         LOGS_DIR / "scheduler.log",
@@ -491,55 +582,55 @@ def collect_raw_findings(
         if _mtime_safe(p) >= cutoff
     ]
 
-    new_offsets = dict(offsets)
-    new_inodes: dict[str, int] = dict(inodes or {})
+    new_entries: Entries = {}
     raw: dict[str, list] = {}
-
-    # For rotated backups whose inode matches the prior active log inode,
-    # inherit that log's offset so we don't re-scan already-processed content.
-    if inodes is not None:
-        for backup_path in rotation_backups:
-            backup_key = str(backup_path)
-            if backup_key in new_offsets:
-                continue  # already tracked
-            try:
-                backup_inode = backup_path.stat().st_ino
-            except OSError:
-                continue
-            if not backup_inode:
-                continue
-            for prior_key, prior_inode in inodes.items():
-                if prior_inode == backup_inode and prior_key != backup_key:
-                    new_offsets[backup_key] = offsets.get(prior_key, 0)
-                    break
+    taken: set[tuple[str, int]] = set()   # predecessors already given to a backup
+    scanned_bytes = 0
+    seen_paths: set[Path] = set()
 
     for path in priority + recent_dated + rotation_backups:
-        if not path.exists():
+        if path in seen_paths:
             continue
-        key = str(path)
-        saved_offset = new_offsets.get(key, 0)
+        seen_paths.add(path)
+        try:
+            st = path.stat()
+        except OSError:
+            continue                       # vanished between glob and stat
+        inode = st.st_ino                  # 0 on some Windows filesystems
+        key   = (str(path), inode)
 
-        # Reset offset when the file was replaced (log rotation where the new
-        # file has grown past the old offset — the size<offset check in
-        # scan_file already covers truncation/shrinkage).
-        if inodes is not None:
-            try:
-                st = path.stat()
-                current_inode = st.st_ino
-                if current_inode != 0:  # st_ino is 0 on some Windows filesystems
-                    saved_inode = inodes.get(key)
-                    if saved_inode is not None and saved_inode != 0 and current_inode != saved_inode:
-                        saved_offset = 0  # file replaced — restart from beginning
-                new_inodes[key] = current_inode
-            except OSError:
-                pass
+        if key in entries:
+            saved_offset = entries[key]["offset"]
+        elif _BACKUP_RE.match(path.name):
+            pred = _find_predecessor(entries, path, inode, st.st_size, taken)
+            if pred is not None:
+                taken.add(pred)
+                saved_offset = entries[pred]["offset"]
+            else:
+                saved_offset = 0
+        else:
+            saved_offset = 0               # new file, or live file replaced (new inode)
 
         new_off, hits = scan_file(path, saved_offset)
-        new_offsets[key] = new_off
+        scanned_bytes += max(0, new_off - (saved_offset if saved_offset <= st.st_size else 0))
+        new_entries[key] = {"offset": new_off, "scanned_at": now}
         if hits:
             raw[path.name] = hits
 
-    return new_offsets, new_inodes, raw
+    # Prune AFTER matching: keep an old entry that was not scanned this cycle (for
+    # example a file older than MAX_LOG_AGE_HOURS) only while its exact (path, inode)
+    # is still on disk.  Entries whose file is gone or was replaced are dropped, so the
+    # notebook cannot grow forever or hand a stale position to a later file.
+    for (p, ino), v in entries.items():
+        if (p, ino) in new_entries:
+            continue
+        try:
+            if os.stat(p).st_ino == ino:
+                new_entries[(p, ino)] = v
+        except OSError:
+            pass
+
+    return new_entries, raw, scanned_bytes
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -604,21 +695,71 @@ def _compute_act_ttl(r, fp: str) -> int:
     return max(MIN_ACT_TTL_S, min(MAX_ACT_TTL_S, ttl))
 
 
+_TS_PREFIX_RE = re.compile(r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}')
+
+
+def _is_timestamped(line: str) -> bool:
+    """True when the line carries its own date+time, so its text is unique per occurrence.
+
+    JSON lines have "time" (with date) + pid + ms; pipe-delimited lines start with a
+    timestamp.  Bare traceback lines ("Traceback (most recent call last):") repeat
+    verbatim on every occurrence, so they must never go in the seen-lines set."""
+    if _TS_PREFIX_RE.match(line):
+        return True
+    try:
+        t = json.loads(line).get("time", "")
+        return isinstance(t, str) and bool(_TS_PREFIX_RE.match(t))
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return False
+
+
+def _seen_key(line: str) -> str:
+    return _PFX_SEEN + hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def mark_seen(r, seen: list[str]) -> None:
+    """Record flagged lines as handled.  Called only after the notebook is saved, so a
+    failed run that did not advance offsets leaves its lines unmarked and they are
+    still alerted when re-read.  A failure here is harmless (the set is a safety net)."""
+    for key in seen:
+        try:
+            r.set(key, "1", ex=SEEN_TTL_S)
+        except Exception as exc:
+            print(f"[log_monitor] seen-lines write failed: {exc}")
+            return
+
+
 def process_findings(
     r,
     raw: dict[str, list[tuple[str, list[str]]]],
     now: float,
+    seen_out: list[str] | None = None,
 ) -> dict[str, dict]:
     """
     Classify each raw finding as NEW or KNOWN using Redis.
 
     Returns {fp: record} for NEW errors only (the ones to alert on immediately).
     As a side-effect, refreshes the "active" TTL for all seen errors.
+
+    Seen-lines safety net: a timestamped line already in the seen set was handled in
+    an earlier cycle (it is being re-read because notebook state was lost or wrong), so
+    it is skipped entirely — no alert, no count, no heartbeat refresh.  Keys of lines
+    handled now are appended to *seen_out* for the caller to commit via mark_seen().
     """
     new_errors: dict[str, dict] = {}
 
     for fname, hits in raw.items():
         for line, context in hits:
+            if _is_timestamped(line):
+                skey = _seen_key(line)
+                try:
+                    if r.exists(skey):
+                        continue
+                except Exception as _se:
+                    print(f"[log_monitor] seen-lines check failed: {_se}")
+                else:
+                    if seen_out is not None:
+                        seen_out.append(skey)
             fp      = _fingerprint(line, context)
             err_key = _err_key(fp)
             act_key = _act_key(fp)
@@ -976,18 +1117,17 @@ def main() -> None:
         print(f"[log_monitor] cron_watch unavailable: {_cw_err}")
 
     # ── 1. Scan log files ────────────────────────────────────────────────────
-    offsets                      = _load_offsets()
-    inodes                       = _load_inodes()
-    new_offsets, new_inodes, raw = collect_raw_findings(offsets, inodes)
+    entries                     = _load_state()
+    new_entries, raw, total_new = collect_raw_findings(entries, now)
 
     total_hits = sum(len(v) for v in raw.values())
-    total_new  = sum(new_offsets.get(k, 0) - offsets.get(k, 0) for k in new_offsets)
-    print(f"[log_monitor] scanned {total_new:,} new bytes — {total_hits} flagged line(s)")
+    print(f"[log_monitor] scanned {total_new:,} new bytes — {total_hits} flagged line(s)"
+          f" — tracking {len(new_entries)} file(s)")
 
     if not raw:
         print("[log_monitor] clean — no issues found")
         # Nothing to alert on — safe to advance offsets now.
-        _save_offsets(new_offsets, new_inodes)
+        _save_state(new_entries)
         # Still run the resolution sweep and digest check even on a clean run.
         # Without the sweep, expired action keys accumulate and errors that
         # recur after a quiet period are not treated as NEW.
@@ -1015,8 +1155,9 @@ def main() -> None:
         print("[log_monitor] Redis unavailable — skipping dedup/alert this run")
         return
 
+    seen_keys: list[str] = []
     try:
-        new_errors = process_findings(r, raw, now)
+        new_errors = process_findings(r, raw, now, seen_keys)
     except Exception as exc:
         print(f"[log_monitor] Redis error during dedup: {exc}")
         return
@@ -1064,12 +1205,14 @@ def main() -> None:
                     print(f"[log_monitor] Redis write failed for {fp}: {_we}")
             print("[log_monitor] Email send failed — errors recorded for next digest")
         # Advance offsets only after dedup keys are written.
-        _save_offsets(new_offsets, new_inodes)
+        _save_state(new_entries)
     else:
         known = total_hits - len(new_errors)
         print(f"[log_monitor] {known} known/duplicate occurrence(s) — suppressed")
         # No new errors — safe to advance offsets immediately.
-        _save_offsets(new_offsets, new_inodes)
+        _save_state(new_entries)
+    # Commit the seen-lines safety net only after the notebook is saved.
+    mark_seen(r, seen_keys)
 
     # ── 5. Periodic digest ───────────────────────────────────────────────────
     try:

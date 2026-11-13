@@ -36,16 +36,6 @@ Coverage map
     · _release_lock does nothing when different worker holds the lock
     · Lock key is fullscan:lock:{company}
 
-  TestDeferAdaptiveFirst
-    · _defer_adaptive_first ZADDs company to poll:adaptive with score=now
-    · _defer_adaptive_first ZADDs company to poll:fullscan with future score
-    · Fullscan reschedule delay = FULLSCAN_ADAPTIVE_FIRST_DELAY_S (900s)
-
-  TestGetCycleStart
-    · Returns None when Redis key is not set
-    · Returns float when Redis key is set
-    · Handles string value correctly (converts to float)
-
   TestBuildDetailPayload
     · Base payload has required keys: company, ats_platform, job_id, job_url, etc.
     · found_by = 'tier2_fullscan'
@@ -63,7 +53,6 @@ Coverage map
   TestFullscanConstants
     · FULLSCAN_CHUNK_SIZE = 50
     · (bloom capacity = fetched job count, not a constant)
-    · FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900
 """
 
 import sys
@@ -354,123 +343,6 @@ class TestAcquireReleaseLock(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestDeferAdaptiveFirst
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestDeferAdaptiveFirst(unittest.TestCase):
-
-    def test_zadd_to_adaptive_with_score_now(self):
-        """_defer_adaptive_first ZADDs company to poll:adaptive with score=now."""
-        from config import REDIS_POLL_ADAPTIVE
-        r = MagicMock()
-        r.zscore.return_value = None
-        before = time.time()
-        from workers.fullscan import _defer_adaptive_first
-        _defer_adaptive_first("TestCo", r)
-        after = time.time()
-
-        # Find the zadd call for poll:adaptive
-        adaptive_calls = [
-            c for c in r.zadd.call_args_list
-            if c[0][0] == REDIS_POLL_ADAPTIVE
-        ]
-        self.assertEqual(len(adaptive_calls), 1)
-        # Score should be approximately now
-        score = list(adaptive_calls[0][0][1].values())[0]
-        self.assertGreaterEqual(score, before)
-        self.assertLessEqual(score, after + 1)
-
-    def test_zadd_to_fullscan_with_future_score(self):
-        """_defer_adaptive_first ZADDs company to poll:fullscan with score=now+delay."""
-        from config import REDIS_POLL_FULLSCAN
-        from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
-        r = MagicMock()
-        r.zscore.return_value = None
-        before = time.time()
-        from workers.fullscan import _defer_adaptive_first
-        _defer_adaptive_first("TestCo", r)
-
-        fullscan_calls = [
-            c for c in r.zadd.call_args_list
-            if c[0][0] == REDIS_POLL_FULLSCAN
-        ]
-        self.assertEqual(len(fullscan_calls), 1)
-        score = list(fullscan_calls[0][0][1].values())[0]
-        expected_min = before + FULLSCAN_ADAPTIVE_FIRST_DELAY_S
-        self.assertGreaterEqual(score, expected_min)
-
-    def test_fullscan_delay_is_900_seconds(self):
-        """FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900."""
-        from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
-        self.assertEqual(FULLSCAN_ADAPTIVE_FIRST_DELAY_S, 900)
-
-    def test_both_zadd_calls_made(self):
-        """Company not in poll:adaptive: zadd to adaptive (now) and fullscan."""
-        r = MagicMock()
-        r.zscore.return_value = None
-        from workers.fullscan import _defer_adaptive_first
-        _defer_adaptive_first("TestCo", r)
-        self.assertEqual(r.zadd.call_count, 2)
-
-    def test_scheduled_adaptive_is_not_pulled_forward(self):
-        """Backed-off company keeps its poll:adaptive schedule; fullscan waits after it."""
-        from config import REDIS_POLL_ADAPTIVE, REDIS_POLL_FULLSCAN
-        from workers.fullscan import _defer_adaptive_first, FULLSCAN_ADAPTIVE_FIRST_DELAY_S
-        r = MagicMock()
-        later = time.time() + 3600
-        r.zscore.return_value = later
-        _defer_adaptive_first("TestCo", r)
-        keys = [c[0][0] for c in r.zadd.call_args_list]
-        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
-        fs = [c for c in r.zadd.call_args_list if c[0][0] == REDIS_POLL_FULLSCAN]
-        self.assertEqual(len(fs), 1)
-        self.assertAlmostEqual(list(fs[0][0][1].values())[0],
-                               later + FULLSCAN_ADAPTIVE_FIRST_DELAY_S, delta=1)
-
-    def test_overdue_adaptive_entry_not_rewritten(self):
-        """An already-due poll:adaptive entry is left alone; fullscan retries now+delay."""
-        from config import REDIS_POLL_ADAPTIVE
-        from workers.fullscan import _defer_adaptive_first
-        r = MagicMock()
-        r.zscore.return_value = time.time() - 100
-        _defer_adaptive_first("TestCo", r)
-        keys = [c[0][0] for c in r.zadd.call_args_list]
-        self.assertNotIn(REDIS_POLL_ADAPTIVE, keys)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TestGetCycleStart
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TestGetCycleStart(unittest.TestCase):
-
-    def test_returns_none_when_key_not_set(self):
-        """r.get returns None → _get_cycle_start returns None."""
-        r = MagicMock()
-        r.get.return_value = None
-        from workers.fullscan import _get_cycle_start
-        result = _get_cycle_start(r)
-        self.assertIsNone(result)
-
-    def test_returns_float_when_key_set(self):
-        """r.get returns bytes string → converted to float."""
-        r = MagicMock()
-        r.get.return_value = b"1714900000.0"
-        from workers.fullscan import _get_cycle_start
-        result = _get_cycle_start(r)
-        self.assertAlmostEqual(result, 1714900000.0, places=1)
-
-    def test_uses_cycle_start_key(self):
-        """Uses REDIS_CYCLE_START config key."""
-        from config import REDIS_CYCLE_START
-        r = MagicMock()
-        r.get.return_value = None
-        from workers.fullscan import _get_cycle_start
-        _get_cycle_start(r)
-        r.get.assert_called_once_with(REDIS_CYCLE_START)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # TestBuildDetailPayload
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -631,11 +503,6 @@ class TestFullscanConstants(unittest.TestCase):
         """FULLSCAN_CHUNK_SIZE = 50."""
         from workers.fullscan import FULLSCAN_CHUNK_SIZE
         self.assertEqual(FULLSCAN_CHUNK_SIZE, 50)
-
-    def test_adaptive_first_delay_is_900(self):
-        """FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900 (15 minutes)."""
-        from workers.fullscan import FULLSCAN_ADAPTIVE_FIRST_DELAY_S
-        self.assertEqual(FULLSCAN_ADAPTIVE_FIRST_DELAY_S, 900)
 
     def test_pause_poll_secs_positive(self):
         """FULLSCAN_PAUSE_POLL_SECS is a positive integer."""
@@ -881,7 +748,6 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
              patch("workers.fullscan.parse_slug", return_value={}), \
              patch("workers.fullscan.get_config", return_value={}), \
              patch("workers.fullscan._complete_fullscan_db"), \
-             patch("workers.fullscan._get_cycle_start", return_value=None), \
              patch("workers.fullscan.set_heartbeat"), \
              patch("workers.fullscan.set_progress"), \
              patch("workers.fullscan.clear_heartbeat"), \
@@ -923,7 +789,6 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
              patch("workers.fullscan.parse_slug", return_value={}), \
              patch("workers.fullscan.get_config", return_value={}), \
              patch("workers.fullscan._complete_fullscan_db"), \
-             patch("workers.fullscan._get_cycle_start", return_value=None), \
              patch("workers.fullscan.set_heartbeat"), \
              patch("workers.fullscan.set_progress"), \
              patch("workers.fullscan.clear_heartbeat"), \
@@ -974,7 +839,6 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
                  patch("workers.fullscan.parse_slug", return_value={}), \
                  patch("workers.fullscan.get_config", return_value={}), \
                  patch("workers.fullscan._complete_fullscan_db"), \
-                 patch("workers.fullscan._get_cycle_start", return_value=None), \
                  patch("workers.fullscan.set_heartbeat"), \
                  patch("workers.fullscan.set_progress"), \
                  patch("workers.fullscan.clear_heartbeat"), \
@@ -1023,7 +887,6 @@ class TestInflightFullscanLifecycle(unittest.TestCase):
                  patch("workers.fullscan.parse_slug", return_value={}), \
                  patch("workers.fullscan.get_config", return_value={}), \
                  patch("workers.fullscan._complete_fullscan_db"), \
-                 patch("workers.fullscan._get_cycle_start", return_value=None), \
                  patch("workers.fullscan.set_heartbeat"), \
                  patch("workers.fullscan.set_progress"), \
                  patch("workers.fullscan.clear_heartbeat"), \
