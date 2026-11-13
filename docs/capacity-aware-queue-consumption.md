@@ -18,7 +18,7 @@ The core behavior: **when a worker hits the platform ceiling, put the job back i
 | Adaptive scan | XREADGROUP stream | XACK + ZADD `poll:adaptive` score=now+30s | `XREADGROUP` next message |
 | Fullscan | Checkpoint-based | `_write_checkpoint()` + requeue | Next company dispatch |
 
-> **Historical:** `ats_get()` has no production caller (adaptive-polling-architecture §19), so the `ats_get()` change below does not apply as written; retarget it to the live request path (the shared ceiling check used by the current fetch helpers) before building.
+> **Historical:** `ats_get()` has no production caller (adaptive-polling-architecture §19), so the `ats_get()` change below does not apply as written; retarget it to the live request path before building. The live fetch helpers (`jobs/ats/base.py`, `jobs/ats/icims.py`, ...) call `requests` directly and have no shared ceiling check today, so one must be added.
 
 Single code change unlocks all three (original proposal): `ats_get()` line 552-558 must raise `CeilingExceeded` instead of proceeding after retry exhaustion. Each worker already has infrastructure to handle the catch — just needs the catch added.
 
@@ -37,7 +37,7 @@ The structural fix described in this document (§3 onwards) solves that. **Only 
 
 ### Correct implementation order
 
-1. **Ship `CeilingExceeded` fix** — raise `CeilingExceeded` from the live production request path (the shared ceiling check used by the current fetch helpers; `ats_get()` has no production caller, see the Historical note above) and keep the catch in each worker. The intended behaviour is already designed in scaling-redesign.md.
+1. **Ship `CeilingExceeded` fix** — route the live fetch helpers (`jobs/ats/base.py`, `jobs/ats/icims.py`, ...) through `ats_get()`, or through a new shared helper that performs the ceiling check and raises `CeilingExceeded` (they call `requests` directly today and `ats_get()` has no production caller, see the Historical note above), and keep the catch in each worker. The intended behaviour is already designed in scaling-redesign.md.
 2. **Observe in production** — does the 500-job pile-up starvation actually manifest?
 3. **If yes, ship structural changes** from §3 of this document.
 

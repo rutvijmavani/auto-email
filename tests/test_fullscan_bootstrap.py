@@ -375,11 +375,11 @@ class TestBootstrapWarmingAdaptive(unittest.TestCase):
 
     def _interrupted_run(self, zscore, inflight):
         """Counter committed (warming=3, next_poll_at set) but no ZADD happened."""
-        from datetime import datetime, timezone
+        from datetime import datetime
         r = MagicMock()
         r.zscore.return_value = zscore
         r.exists.return_value = inflight
-        due = datetime(2026, 11, 12, 6, 0, tzinfo=timezone.utc)
+        due = datetime(2026, 11, 12, 6, 0)      # TIMESTAMP column: naive local
         row = {"warming_polls_remaining": 3, "initial_slot_offset_s": 3600,
                "id": 1, "next_poll_at": due}
         conn1 = MagicMock()

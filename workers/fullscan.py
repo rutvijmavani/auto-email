@@ -490,8 +490,8 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
         next_at = row["next_poll_at"] if row and row["warming_polls_remaining"] is not None else None
         if (next_at is not None and not pending
                 and not r.exists(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")):
-            if next_at.tzinfo is None:
-                next_at = next_at.replace(tzinfo=timezone.utc)
+            # next_poll_at is a naive-local TIMESTAMP (same as scheduler.py's write and
+            # rebuild.py's .timestamp() read), so .timestamp() here is correct as is.
             r.zadd(REDIS_POLL_ADAPTIVE, {company: next_at.timestamp()}, nx=True)
             logger.info("fullscan: WARMING bootstrap for %r — restored adaptive schedule from next_poll_at", company)
             return
@@ -513,7 +513,7 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
 
     # Spread across the next 24 h from now — always in the future.
     first_poll_at = now_ts + offset_s
-    first_poll_dt = datetime.fromtimestamp(first_poll_at, tz=timezone.utc)
+    first_poll_dt = datetime.fromtimestamp(first_poll_at)   # naive local, like scheduler.py / rebuild.py
 
     conn = get_conn()
     try:
