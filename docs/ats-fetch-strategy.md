@@ -231,7 +231,7 @@ Detect this: if response body is <500 bytes AND contains an off-icims.com redire
 - Smart early exit applicable (sorted by recency ✓)
 
 **Why Eightfold matters:**
-Amazon and Starbucks both use Eightfold with 10,000–20,000+ active job listings. Without smart early exit, Tier 1 would need to fetch hundreds of pages on every poll. With smart early exit (80% overlap threshold, 2-page confirm), it typically exits after 2–5 pages once the company's active listings are known.
+Amazon and Starbucks both use Eightfold with 10,000–20,000+ active job listings. Without smart early exit, Tier 1 would need to fetch hundreds of pages on every poll. With the `EarlyExitGate` (Section 4 note), the fetch can stop once every identifiable job ID on a page has been seen (old Bloom filter or `adaptive_seen`), confirmed over `PAGINATOR_CONFIRM_PAGES` consecutive pages. How many pages that takes in practice has not been measured here.
 
 ---
 
@@ -325,15 +325,25 @@ Oracle wraps jobs in `items[0].requisitionList`. The `hasMore` field is always `
 
 ## 4. Smart Early Exit — Which Platforms Support It
 
-Smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+> **SUPERSEDED.** The overlap-ratio algorithm and the per-platform "applicable" column below are the
+> original design and are no longer what runs. The adaptive scan now uses the `EarlyExitGate`
+> (`workers/paginator.py`, see Section 11 of `docs/adaptive-polling-architecture.md`) on paging
+> feeders whose `fetch_jobs` accepts `stop_check` (e.g. Workday, Taleo, iCIMS; Greenhouse and other
+> single-call feeders do not pass it). The gate is built only when `ADAPTIVE_EARLY_EXIT_ENABLED` is on,
+> the company has completed its first scan, and an old fullscan Bloom filter exists; otherwise the scan
+> may read the whole board. A page counts as seen only when ALL its job IDs are in the
+> old bloom or `adaptive_seen`, and the fetch stops after two consecutive fully-seen pages
+> (`PAGINATOR_CONFIRM_PAGES`). The "Sorted newest-first?" column is kept as background only.
 
-| Platform | Sorted newest-first? | Smart exit applicable? |
+Original design: smart early exit requires the listing to be sorted newest-first. Only use the overlap-ratio exit algorithm on these platforms:
+
+| Platform | Sorted newest-first? | Original design: smart exit applicable? (now: gate runs on feeders that accept `stop_check`, when enabled) |
 |----------|---------------------|----------------------|
 | Greenhouse | ✓ Default | ✓ Yes |
 | Lever | ✓ Default | ✓ Yes |
 | Ashby | ✓ Default | ✓ Yes |
 | SmartRecruiters | ✓ Default | ✓ Yes |
-| Eightfold | ✓ Default (`sort=date`) | ✓ Yes |
+| Eightfold | ✓ Server default newest-first (no `sort_by`; `sort_by=distance` shuffles) | ✓ Yes |
 | Oracle HCM | ✓ (`sortBy=POSTING_DATES_DESC` in URL) | ✓ Yes |
 | Workday | ✗ Unreliable | ✗ No |
 | iCIMS | ✗ No guaranteed order | ✗ No |
@@ -549,7 +559,8 @@ ATS_TIER1_CONFIG = {
 
 ### How the config is used
 
-During each Tier 1 poll:
+During each Tier 1 poll (illustrative; the `updated_at` refresh branch below is NOT implemented, a
+seen job is always skipped):
 
 ```python
 config = ATS_TIER1_CONFIG[company.ats_platform]
@@ -565,7 +576,7 @@ for job in jobs:
             job_updated_at = job[config["updated_at_field"]]
             last_known_updated = seen_ids[company][job.job_id].last_updated
             if (job_updated_at - last_known_updated).hours > config["refresh_window_hr"]:
-                enqueue_detail_refresh(job)  # re-fetch — job meaningfully changed
+                enqueue_detail_refresh(job)  # NOT IMPLEMENTED: design only; the worker skips known jobs and never refreshes changed ones
         continue  # skip, already processed
 
     # Genuinely new job
@@ -578,7 +589,10 @@ for job in jobs:
 
 ### Per-company overrides
 
-The `company_config` table can override any of these settings for a specific company. For example:
+> **NOT IMPLEMENTED (checked 2026-11-07):** the `company_config` table is created in `db/schema.py` but no
+> code reads it, so rows have no effect today. The examples below describe the intended design only.
+
+The `company_config` table is intended to override any of these settings for a specific company. For example:
 
 ```sql
 -- Force Workday for a specific tenant that sorts by recency (atypical)
@@ -590,4 +604,4 @@ INSERT INTO company_config (company, max_interval)
 VALUES ('Dream Company Inc', 900);
 ```
 
-Override lookup order: `company_config` → `ATS_TIER1_CONFIG` → defaults.
+Intended override lookup order (not wired): `company_config` → `ATS_TIER1_CONFIG` → defaults.

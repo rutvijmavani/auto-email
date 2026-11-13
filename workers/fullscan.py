@@ -11,7 +11,6 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
         → ZADD poll:fullscan {company: now + 300}   ← Rule 3 buffer
     [this worker]
         → ZPOPMIN poll:fullscan  (score-ascending = most overdue first)
-        → Rule 4 pre-check: if last_poll_at < cycle_start → adaptive first
         → SET fullscan:lock:{company} NX (no TTL)    ← exclusive lease, deleted by the scheduler reaper/sweep_inflight when the owner is gone
         → Resume from checkpoint if full_scan_interrupted=TRUE
         → Page-by-page: Bloom filter → save pending_detail → detail queue
@@ -47,15 +46,10 @@ Bloom filter to efficiently skip job IDs already seen during adaptive polling.
     On resume:     both keys are preserved; NEW bloom provides intra-scan dedup
                    so jobs queued before the pause are not re-queued.
 
-─── Rule 4 (adaptive-first) ──────────────────────────────────────────────────
+─── Order for a new company ──────────────────────────────────────────────────
 
-    If company_poll_stats.last_poll_at < cycle:start (Redis):
-        The company hasn't had its adaptive poll this cycle yet.
-        → ZADD poll:adaptive with score=now ONLY if the company is not already
-          scheduled there; a scheduled company (interval, backoff, reap delay)
-          keeps its schedule (R4W)
-        → ZADD poll:fullscan with score=adaptive time + 900 (retry 15 minutes after it)
-        → Skip this full scan run
+    One rule: first fullscan, and only then adaptive polling.  A fullscan never
+    waits for or triggers an adaptive poll (the former adaptive-first "Rule 4" is gone).
 
 ─── Pause / resume ───────────────────────────────────────────────────────────
 
@@ -110,7 +104,6 @@ from config import (
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
     REDIS_DETAIL_FULLSCAN,
-    REDIS_CYCLE_START,
     REDIS_FEED_VERIFY_PREFIX,
     JOBVITE_FEED_VERIFY_INTERVAL_H,
     REDIS_DB_MAINTENANCE,
@@ -188,9 +181,6 @@ _AVG_DURATION_SEED = 1800.0
 
 # Seconds to wait between pause-polling loops
 FULLSCAN_PAUSE_POLL_SECS = 10
-
-# Re-queue delay when adaptive-first pre-check fires (Rule 4)
-FULLSCAN_ADAPTIVE_FIRST_DELAY_S = 900   # 15 minutes
 
 
 # ─────────────────────────────────────────
@@ -432,41 +422,6 @@ def _clear_partial_retries(r, company: str) -> None:
         logger.warning("fullscan partial-retry counter clear failed for %s: %s", company, exc)
 
 
-def _defer_adaptive_first(company: str, r) -> None:
-    """
-    Rule 4: adaptive poll hasn't happened this cycle yet.
-
-    The fullscan only needs the adaptive poll to run BEFORE it retries, not
-    immediately.  A company already scheduled in poll:adaptive (normal interval,
-    a backoff, or a reap delay) keeps that schedule: pulling it to "now" would
-    poll an ATS we deliberately backed off from.  The fullscan then retries
-    FULLSCAN_ADAPTIVE_FIRST_DELAY_S after that adaptive time.  Only a company
-    absent from poll:adaptive is triggered now.
-    """
-    now = time.time()
-    scheduled = r.zscore(REDIS_POLL_ADAPTIVE, company)
-    if scheduled is None:
-        r.zadd(REDIS_POLL_ADAPTIVE, {company: now})       # not scheduled: trigger now
-        adaptive_at = now
-    else:
-        adaptive_at = max(float(scheduled), now)          # keep its schedule
-    r.zadd(REDIS_POLL_FULLSCAN, {company: adaptive_at + FULLSCAN_ADAPTIVE_FIRST_DELAY_S})
-    logger.info(
-        "fullscan [%s]: Rule 4 — adaptive-first (%s); "
-        "re-scheduling fullscan in %ds",
-        company,
-        "triggered now" if scheduled is None
-        else "adaptive already scheduled in %ds" % int(adaptive_at - now),
-        int(adaptive_at + FULLSCAN_ADAPTIVE_FIRST_DELAY_S - now),
-    )
-
-
-def _get_cycle_start(r) -> Optional[float]:
-    """Return current cycle:start Unix timestamp, or None if not set."""
-    val = r.get(REDIS_CYCLE_START)
-    return float(val) if val else None
-
-
 # ─────────────────────────────────────────
 # STREAM CONSUMER GROUP INIT
 # ─────────────────────────────────────────
@@ -518,12 +473,30 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
     conn = get_conn()
     try:
         row = conn.execute("""
-            SELECT id, initial_slot_offset_s
+            SELECT id, initial_slot_offset_s, warming_polls_remaining, next_poll_at
             FROM company_poll_stats
             WHERE company = %s
         """, (company,)).fetchone()
     finally:
         conn.close()
+
+    # Already bootstrapped (warming counter set, or a pending adaptive entry):
+    # keep the existing schedule and counter. last_poll_at stays NULL until the
+    # first adaptive scan completes, so a later fullscan would otherwise reset them.
+    pending = r.zscore(REDIS_POLL_ADAPTIVE, company) is not None
+    if (row and row["warming_polls_remaining"] is not None) or pending:
+        # A previous bootstrap committed the DB counter but died before the ZADD:
+        # restore the persisted schedule, unless it is queued or an adaptive scan is in flight.
+        next_at = row["next_poll_at"] if row and row["warming_polls_remaining"] is not None else None
+        if (next_at is not None and not pending
+                and not r.exists(f"{REDIS_INFLIGHT_MSG_PREFIX}:scan:{company}")):
+            # next_poll_at is a naive-local TIMESTAMP (same as scheduler.py's write and
+            # rebuild.py's .timestamp() read), so .timestamp() here is correct as is.
+            r.zadd(REDIS_POLL_ADAPTIVE, {company: next_at.timestamp()}, nx=True)
+            logger.info("fullscan: WARMING bootstrap for %r — restored adaptive schedule from next_poll_at", company)
+            return
+        logger.info("fullscan: WARMING bootstrap for %r skipped — adaptive schedule already pending", company)
+        return
 
     if row and row["initial_slot_offset_s"] is not None:
         offset_s = int(row["initial_slot_offset_s"])
@@ -540,7 +513,7 @@ def _bootstrap_warming_adaptive(company: str, r) -> None:
 
     # Spread across the next 24 h from now — always in the future.
     first_poll_at = now_ts + offset_s
-    first_poll_dt = datetime.fromtimestamp(first_poll_at, tz=timezone.utc)
+    first_poll_dt = datetime.fromtimestamp(first_poll_at)   # naive local, like scheduler.py / rebuild.py
 
     conn = get_conn()
     try:
@@ -578,7 +551,7 @@ def _get_fullscan_state(company: str) -> dict:
         full_scan_interrupted    bool
         interrupted_at_page      int | None
         full_scan_interval_s     int
-        last_poll_at             datetime | None   (for Rule 4 check)
+        last_poll_at             datetime | None   (None = never adaptive-polled = first fullscan)
         last_full_scan_at        datetime | None
         avg_fullscan_duration_s  float             (EMA of past scan durations)
     Returns empty dict if company not in company_poll_stats yet.
@@ -979,29 +952,11 @@ def _run_fullscan(company: str, r, skip_lock: bool = False,
 
     slug_info = parse_slug(platform, slug, config)
 
-    # ── 3. Rule 4 — adaptive-first check ─────────────────────────────────────
-    # If this company hasn't had its adaptive poll this cycle, trigger adaptive
-    # first and defer the full scan by 15 minutes.
-    cycle_start = _get_cycle_start(r)
-    if cycle_start is not None:
-        fs_state  = _get_fullscan_state(company)
-        last_poll = fs_state.get("last_poll_at")
-
-        if last_poll is not None:
-            last_poll_ts = (
-                last_poll.timestamp()
-                if hasattr(last_poll, "timestamp")
-                else float(last_poll)
-            )
-            if last_poll_ts < cycle_start:
-                _defer_adaptive_first(company, r)
-                result["outcome"] = "deferred"
-                _release_dc("adaptive-first-defer")
-                return result
-    else:
-        # cycle:start not set → --monitor-jobs hasn't run yet today.
-        # Proceed with full scan anyway (best-effort).
-        fs_state = _get_fullscan_state(company)
+    # ── 3. Fullscan state ────────────────────────────────────────────────────
+    # No adaptive-first rule: a fullscan never waits for an adaptive poll.  A new
+    # company gets its fullscan first and only then its adaptive polling (bootstrap
+    # at fullscan completion).
+    fs_state = _get_fullscan_state(company)
 
     # ── 4. Exclusive lock ─────────────────────────────────────────────────────
     if not skip_lock:
@@ -1731,7 +1686,6 @@ def run_worker(once: bool = False, skip_lock: bool = False,
                 "completed":       "[DONE]",
                 "partial":         "[PART]",
                 "paused":          "[PAUSE]",
-                "deferred":        "[DEFER]",
                 "skipped":         "[SKIP]",
                 "error":           "[ERR]",
                 "ceiling_exceeded": "[CEIL]",

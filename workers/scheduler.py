@@ -290,6 +290,10 @@ _OWNER_RUNNING, _OWNER_STALLED, _OWNER_ABANDONED, _OWNER_DEAD = (
 
 _reap_seen: dict = {}     # stream_key -> {msg_id: state seen on the previous call}
 
+# Start of this scheduler process.  A PEL entry delivered BEFORE this moment whose owner is now DEAD
+# was killed by the restart that created this process, not by the company failing.
+_PROCESS_STARTED_AT = time.time()
+
 _STREAM_WORKER_TYPE = {
     REDIS_STREAM_ADAPTIVE: "scan_worker",
     REDIS_STREAM_FULLSCAN: "fullscan_worker",
@@ -298,6 +302,15 @@ _STREAM_WORKER_TYPE = {
 
 def _s(v) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
+
+
+def _stream_id_tuple(sid) -> tuple:
+    """'1700000000000-3' -> (1700000000000, 3); (0, 0) when unparseable."""
+    try:
+        ms, _, seq = _s(sid).partition("-")
+        return int(ms), int(seq or 0)
+    except ValueError:
+        return 0, 0
 
 
 def _split_consumer(consumer: str):
@@ -372,6 +385,7 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
     now = time.time()
     seen_before = _reap_seen.get(stream_key, {})
     seen_now = {}
+    reaped_this_sweep = set()   # companies already counted in this call (one failure per company)
     for entry in pending:
         msg_id = _s(entry["message_id"])
         consumer = _s(entry["consumer"])
@@ -394,11 +408,40 @@ def claim_stale_work(r, stream_key: str, group: str, op_type: str = "scan") -> N
                            stream_key, msg_id, state)
             continue
 
+        # A newer dispatch of this company owns the slot: this entry is superseded.  It is acked
+        # above; it must not requeue, count a reap or release the newer dispatch's slot.  A missing
+        # stored id (slot already released) keeps the existing handling.
+        stored = r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
+        if stored and _stream_id_tuple(stored) > _stream_id_tuple(msg_id):
+            logger.info("claim_stale_work: %r entry %s (%s) superseded by dispatch %s — acked only",
+                        company, msg_id, state, _s(stored))
+            continue
+
+        target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
+        delivered_ms = entry.get("time_since_delivered")
+        restart_victim = (
+            state == _OWNER_DEAD
+            and delivered_ms is not None
+            and now - float(delivered_ms) / 1000.0 < _PROCESS_STARTED_AT
+        )
+        if restart_victim or company in reaped_this_sweep:
+            # RSTRT: a restart killed the owner (not the company failing), or another entry of the same
+            # company was already counted in this sweep.  Not a failure: no counter, no backoff.
+            # Requeue now (an existing later schedule wins) and free the slot.
+            r.zadd(target_zset, {company: now}, gt=True)
+            _release_inflight(r, op_type, company, _s(fields.get("dc_key", "")))
+            logger.info(
+                "claim_stale_work: reaped %r from %s (owner %s %s, %s) → requeued without backoff in %s",
+                company, stream_key, consumer, state,
+                "restart victim" if restart_victim else "duplicate entry in this sweep", target_zset,
+            )
+            continue
+        reaped_this_sweep.add(company)
+
         reaps = r.incr(f"{REDIS_REAPED_PREFIX}:{op_type}:{company}")
         if reaps == 1:
             r.expire(f"{REDIS_REAPED_PREFIX}:{op_type}:{company}", 86400)
         delay = backoff_delay_for(reaps - 1)
-        target_zset = REDIS_POLL_FULLSCAN if op_type == "fullscan" else REDIS_POLL_ADAPTIVE
         r.zadd(target_zset, {company: now + delay}, gt=True)
         _release_inflight(r, op_type, company, _s(fields.get("dc_key", "")))
         logger.log(
@@ -472,6 +515,13 @@ def sweep_inflight(r, op_type: str, stream_key: str, group: str) -> None:
                 live = bool(r.xpending_range(stream_key, group, min=msg_id, max=msg_id, count=1))
         if live:
             continue
+        # The slot list above is a snapshot: a scan that completed since then has already released
+        # the slot and its stored id (on_adaptive_complete), which is not a leak.  Re-read the
+        # slot and only release one that is still there with still no live stored id.
+        if r.zscore(zkey, company) is None:
+            continue
+        if r.get(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}") != raw:
+            continue                             # re-dispatched since the snapshot
         r.zrem(zkey, company)
         r.delete(f"{REDIS_INFLIGHT_MSG_PREFIX}:{op_type}:{company}")
         if op_type == "fullscan":
@@ -846,8 +896,7 @@ def on_adaptive_complete(company: str, new_jobs: int,
                 adaptive_score          = %s,
                 current_interval_s      = %s,
                 -- LPF (by design): last_poll_at is the last ATTEMPT, stamped on failure
-                -- too.  Rule 4 (fullscan) relies on this: a failing adaptive scan must
-                -- not defer the fullscan forever.  Success time is last_success_at.
+                -- too.  Success time is last_success_at.
                 last_poll_at            = CURRENT_TIMESTAMP,
                 next_poll_at            = %s,
                 consecutive_errors      = %s,

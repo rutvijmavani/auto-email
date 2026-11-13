@@ -100,6 +100,8 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(dd.capacity(1, 100, 1), 1.0)
         self.assertEqual(dd.refill(0, 7, 3.5, 200), 2.0)
         self.assertEqual(dd.refill(199, 100, 3.5, 200), 200)
+        # capacity reduced below the stored tokens: kept, not cut, and no further refill
+        self.assertEqual(dd.refill(150, 100, 3.5, 100), 150)
 
     def test_wake_k(self):
         with patch.object(dd, "DRAIN_MIN_WAKE_S", 1.0):

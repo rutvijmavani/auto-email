@@ -597,6 +597,10 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
         from workers.watchdog import WATCHDOG_SNAPSHOT_KEY
 
         r = MagicMock()
+        # An unconfigured MagicMock.exists is truthy.  Only the fullscan lock owner's
+        # heartbeat exists; no halt flag (Lever 1 / db:maintenance) is set.
+        r.exists.side_effect = lambda key: (
+            1 if str(key).startswith("worker:alive:fullscan_worker:") else 0)
 
         # zcard
         def _zcard(key):
@@ -750,6 +754,141 @@ class TestCheckQueueHealthVelocity(unittest.TestCase):
             scan_proc=50,            # same processed count
         )
         self.assertEqual(self._level(issues, "poll:adaptive"), Issue.ERROR)
+
+    # ── Restart vetoes: any sign of movement / deliberate halt blocks a restart ──
+
+    _STALL_SNAP = {
+        "adp_total": 10, "adp_overdue": 5,
+        "adp_head_c": "Acme", "adp_head_s": 1_699_990_000.0,
+        "fs_total": 10, "fs_overdue": 1, "fs_head_c": "Co", "fs_head_s": 1.0,
+        "detail_adp_depth": 0, "detail_fs_depth": 0,
+        "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+    }
+
+    def _stalled_run(self, snap_extra=None, **patches):
+        snap = dict(self._STALL_SNAP, **(snap_extra or {}))
+        r = self._make_r(snap=snap, adp_overdue=5,
+                         adp_head=("Acme", 1_699_990_000.0), scan_proc=50)
+        with patch("workers.watchdog.time.time", return_value=self._NOW), \
+             patch.multiple("workers.watchdog", **patches):
+            from workers.watchdog import check_queue_health
+            return check_queue_health(r)
+
+    def _mid_scan_count(self, cur_by_consumer, keys=("worker:alive:scan_worker:host1:1",)):
+        """Real _scan_workers_mid_scan against a fake Redis (heartbeat keys + worker:cur values)."""
+        from workers.watchdog import _scan_workers_mid_scan
+        from config import REDIS_WORKER_CUR_PREFIX
+        store = {f"{REDIS_WORKER_CUR_PREFIX}:{c}": v for c, v in cur_by_consumer.items()}
+        r = MagicMock()
+        r.scan.return_value = (0, [k.encode() for k in keys])
+        r.get.side_effect = lambda k: store.get(k)
+        return _scan_workers_mid_scan(r)
+
+    def test_mid_scan_helper_fresh_report_counts(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() + 600})
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": cur}), 1)
+
+    def test_mid_scan_helper_expired_report_not_counted(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() - 5})
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": cur}), 0)
+
+    def test_mid_scan_helper_missing_report_not_counted(self):
+        self.assertEqual(self._mid_scan_count({}), 0)
+
+    def test_mid_scan_helper_malformed_report_not_counted(self):
+        self.assertEqual(self._mid_scan_count({"worker-host1-1": "{not json"}), 0)
+
+    def test_mid_scan_helper_other_workers_report_not_counted(self):
+        import json, time
+        cur = json.dumps({"alive_until": time.time() + 600})
+        self.assertEqual(self._mid_scan_count({"worker-host2-9": cur}), 0)
+
+    def test_stall_with_worker_mid_scan_is_busy_not_error(self):
+        from workers.watchdog import Issue
+        issues = self._stalled_run(_scan_workers_mid_scan=lambda r: 3)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.WARNING)
+        self.assertTrue(any("mid-scan" in i.message for i in issues))
+
+    def test_stall_with_dispatcher_progress_is_not_error(self):
+        from workers.watchdog import Issue
+        issues = self._stalled_run(
+            snap_extra={"adp_dispatched": 10},
+            _dispatched_count=lambda r, loop: 14,
+            _scan_workers_mid_scan=lambda r: 0)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.WARNING)
+
+    def test_stall_with_deliberate_halt_is_not_error(self):
+        from workers.watchdog import Issue
+        issues = self._stalled_run(
+            _deliberate_halt=lambda r, pool: "Lever 1 active",
+            _scan_workers_mid_scan=lambda r: 0)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.OK)
+
+    def test_stall_after_scheduler_restart_counter_reset_still_errors(self):
+        """dispatched went DOWN (scheduler restarted) → unknown, not a veto."""
+        from workers.watchdog import Issue
+        issues = self._stalled_run(
+            snap_extra={"adp_dispatched": 500},
+            _dispatched_count=lambda r, loop: 3,
+            _scan_workers_mid_scan=lambda r: 0)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.ERROR)
+
+    def test_stall_with_nothing_moving_still_errors(self):
+        from workers.watchdog import Issue
+        issues = self._stalled_run(_scan_workers_mid_scan=lambda r: 0)
+        self.assertEqual(self._level(issues, "poll:adaptive"), Issue.ERROR)
+
+    # ── Fullscan restart vetoes (halt / dispatcher progress) ──────────────────
+
+    _FS_STALL_SNAP = {
+        "adp_total": 10, "adp_overdue": 1, "adp_head_c": "Co", "adp_head_s": 1.0,
+        "fs_total": 10, "fs_overdue": 3,
+        "fs_head_c": "BigCorp", "fs_head_s": 1_699_980_000.0,
+        "detail_adp_depth": 0, "detail_fs_depth": 0,
+        "scan_proc": 50, "fs_proc": 5, "detail_proc": 200,
+    }
+
+    def _fs_stalled_run(self, snap_extra=None, **patches):
+        snap = dict(self._FS_STALL_SNAP, **(snap_extra or {}))
+        r = self._make_r(snap=snap, fs_overdue=3,
+                         fs_head=("BigCorp", 1_699_980_000.0), fs_proc=5)
+        with patch("workers.watchdog.time.time", return_value=self._NOW), \
+             patch.multiple("workers.watchdog", **patches):
+            from workers.watchdog import check_queue_health
+            return check_queue_health(r)
+
+    def test_fullscan_stall_nothing_moving_errors(self):
+        from workers.watchdog import Issue
+        issues = self._fs_stalled_run(_deliberate_halt=lambda r, pool: None)
+        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.ERROR)
+
+    def test_fullscan_stall_with_deliberate_halt_is_ok(self):
+        from workers.watchdog import Issue
+        seen = []
+        def _halt(r, pool):
+            seen.append(pool)
+            return "Lever 1 active" if pool == "fullscan" else None
+        issues = self._fs_stalled_run(_deliberate_halt=_halt)
+        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.OK)
+        self.assertIn("fullscan", seen)
+
+    def test_fullscan_stall_with_dispatcher_progress_is_ok(self):
+        from workers.watchdog import Issue
+        issues = self._fs_stalled_run(
+            snap_extra={"fs_dispatched": 10},
+            _dispatched_count=lambda r, loop: 12,
+            _deliberate_halt=lambda r, pool: None)
+        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.WARNING)
+
+    def test_fullscan_stall_dispatched_counter_reset_still_errors(self):
+        from workers.watchdog import Issue
+        issues = self._fs_stalled_run(
+            snap_extra={"fs_dispatched": 500},
+            _dispatched_count=lambda r, loop: 3,
+            _deliberate_halt=lambda r, pool: None)
+        self.assertEqual(self._level(issues, "poll:fullscan"), Issue.ERROR)
 
     def test_two_stall_signals_produces_warning(self):
         """2/3 signals stalling → WARNING DEGRADED."""

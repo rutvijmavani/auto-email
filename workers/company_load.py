@@ -170,6 +170,42 @@ def steady_load(r, pool: str, default_d: float) -> "float | None":
         return None
 
 
+def entries(r, pool: str, names: list, default_d: float) -> list:
+    """
+    (d, T, in_table) of each named company.  A company without a usable entry gets
+    (default_d, None, False): it is not part of the stored total, so nothing may be
+    subtracted for it (see steady_excluding).
+    """
+    if not names:
+        return []
+    out = []
+    for value in r.hmget(_hash_key(pool), names):
+        d = t = None
+        if value:
+            try:
+                raw_d, raw_t = value.split(",", 1)
+                d, t = float(raw_d), float(raw_t)
+            except (ValueError, TypeError):
+                d = t = None
+        if d is not None and t is not None and math.isfinite(d) and math.isfinite(t):
+            out.append((d, t, True))
+        else:
+            out.append((float(default_d), None, False))
+    return out
+
+
+def steady_excluding(total: float, rows: list) -> float:
+    """
+    The pool's steady load without the given companies: total minus d / (d + T) of
+    each row that is in the table, clamped at 0.
+    """
+    rest = float(total)
+    for d, t, in_table in rows:
+        if in_table:
+            rest -= load_of(d, t)
+    return max(0.0, rest)
+
+
 def durations(r, pool: str, names: list, default_d: float) -> list:
     """
     d of each named company; a company without an entry (new, or the table was

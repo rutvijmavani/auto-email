@@ -20,16 +20,20 @@ Two independent upserts, both idempotent (ON CONFLICT (date, company) DO UPDATE)
                           start excluded). Safe to recompute for any past day.
 
 run_nightly(today) is called from the manager's nightly recompute: it writes today's
-counters, refreshes today (partial: the run is at 23:00) and yesterday (now complete)
+counters, refreshes today (partial: the run is at 23:00) and yesterday (re-read, not
+guaranteed final: rows can change status or be deleted later and are not reconciled)
 and fills any day missing inside the backfill window.
 
 Known limits (also in the design doc):
-  * created_at is when the DETAIL stage inserted the row, so detection age includes
-    detail-queue delay.
+  * created_at is when the SCAN inserted the pending_detail row (complete_pending_detail
+    does not change it), so detection age is posting time to scan-insert time and does
+    NOT include detail-queue delay.
   * Age buckets use only platforms in ADAPTIVE_TIMED_POSTED_AT_PLATFORMS (real time of
     day in posted_at). Other platforms contribute to counts, not to buckets.
-  * early_exit_missed is an UPPER BOUND: fullscan inserted it and it was posted more
-    than ADAPTIVE_MISS_LAG_HOURS earlier (listing-date-reliable platforms only).
+  * early_exit_missed is an INDICATOR, not a bound: fullscan inserted it and it was posted
+    more than ADAPTIVE_MISS_LAG_HOURS earlier (listing-date-reliable platforms only).
+    Dated jobs the fullscan inserted within that lag of their posting are excluded, and
+    other causes (long poll interval, failed scan, filter error) can also qualify.
   * Counters of days skipped (manager down) are attributed to the next snapshot day.
 """
 

@@ -97,6 +97,7 @@ from config import (
     REDIS_STREAM_FULLSCAN,
     REDIS_POLL_ADAPTIVE,
     REDIS_POLL_FULLSCAN,
+    REDIS_DB_MAINTENANCE,
     REDIS_DETAIL_ADAPTIVE,
     REDIS_DETAIL_FULLSCAN,
     REDIS_DETAIL_DLQ,
@@ -1124,6 +1125,73 @@ def _fullscan_lock_active(r) -> bool:
         return False
 
 
+def _scan_workers_mid_scan(r) -> int:
+    """
+    Number of scan_workers that hold a stream message and whose progress report
+    (worker:cur:{consumer}) is still fresh, i.e. alive_until has not passed.
+
+    A long scan (Workday can run 20+ min) completes nothing between two watchdog
+    cycles, so the overdue count, the queue head and `processed` all stay put even
+    though the pool is working.  A fresh report is direct evidence of work.  A
+    worker past its deadline is NOT counted: the scheduler's reaper kills and
+    replaces it (claim_stale_work), and if the reaper is not running the stall
+    check below is exactly what must still fire.
+    """
+    try:
+        from workers import progress as _progress
+        n = 0
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="worker:alive:scan_worker:*", count=100)
+            for key in keys:
+                k = key.decode() if isinstance(key, (bytes, bytearray)) else key
+                ident = k[len("worker:alive:scan_worker:"):]       # "{host}:{pid}"
+                host, _, pid = ident.rpartition(":")
+                if not host or not pid.isdigit():
+                    continue
+                consumer = f"worker-{host}-{pid}"                  # same form as the stream consumer
+                if _progress.read_cur(r, consumer) and not _progress.is_stalled(r, consumer):
+                    n += 1
+            if cursor == 0:
+                break
+        return n
+    except Exception:
+        return 0     # unknown: never blocks a restart
+
+
+def _dispatched_count(r, loop: str) -> Optional[int]:
+    """`dispatched` from worker:alive:scheduler:{loop} (total dispatches of the current run), or None."""
+    try:
+        raw = r.get(f"worker:alive:scheduler:{loop}")
+        if not raw:
+            return None
+        val = json.loads(raw).get("dispatched")
+        return int(val) if val is not None else None
+    except Exception:
+        return None
+
+
+def _deliberate_halt(r, pool: str) -> Optional[str]:
+    """
+    Reason dispatch is halted ON PURPOSE (a restart cannot help), or None.
+
+      manager:lever1:{pool}:active   the manager's last-resort dispatch halt
+      db:maintenance                 nightly DB maintenance pause
+
+    Outage and per-DC ceiling throttles are not listed: the dispatch loop
+    reschedules those companies into the future (scheduler.py outage +delay,
+    ceiling +30 s), so they do not stay overdue.
+    """
+    try:
+        if r.exists(f"manager:lever1:{pool}:active"):
+            return f"Lever 1 active ({pool} dispatch halted by the manager)"
+        if r.exists(REDIS_DB_MAINTENANCE):
+            return "db:maintenance set (dispatch paused)"
+    except Exception:
+        pass
+    return None
+
+
 def _counter_delta(cur, prev):
     """
     Change of a cumulative processed counter between two checks, or None when it
@@ -1543,7 +1611,13 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
          daemon thread every 10–60 s). An unchanged counter means the
          worker picked up nothing since last cycle.
 
-    All three signals stalling → ERROR + auto-restart.
+    All three signals stalling → ERROR + auto-restart, UNLESS poll:adaptive shows
+    other evidence of movement (any one blocks the restart, none can cause one):
+      · a scan_worker is mid-scan with a fresh worker:cur report  → WARNING "BUSY"
+      · the dispatcher's `dispatched` count rose since last cycle → OK
+      · dispatch is halted on purpose (Lever 1 / db:maintenance)  → OK
+    A frozen worker (report past its deadline) is replaced by the scheduler's
+    reaper, not by this restart.
     Two signals stalling       → WARNING, watch for next cycle.
     One or zero                → OK (queue is moving, even if behind).
 
@@ -1583,6 +1657,9 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     held             = _held_state(r, now)
     held_head        = held["oldest_id"] if held and held.get("count") else None
 
+    adp_dispatched   = _dispatched_count(r, "adaptive")
+    fs_dispatched    = _dispatched_count(r, "fullscan")
+
     scan_proc       = _worker_processed(r, "scan_worker")
     fs_proc          = _worker_processed(r, "fullscan_worker")
     detail_proc      = _worker_processed(r, "detail_worker")
@@ -1616,6 +1693,8 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
                 "detail_adp_head":  detail_adp_head,
                 "detail_fs_head":   detail_fs_head,
                 "held_head":        held_head,
+                "adp_dispatched":   adp_dispatched,
+                "fs_dispatched":    fs_dispatched,
                 "scan_proc":        scan_proc,
                 "fs_proc":          fs_proc,
                 "detail_proc":      detail_proc,
@@ -1685,6 +1764,8 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
     prev_detail_adp_head = snap.get("detail_adp_head")
     prev_detail_fs_head  = snap.get("detail_fs_head")
     prev_held_head       = snap.get("held_head")
+    prev_adp_dispatched = snap.get("adp_dispatched")
+    prev_fs_dispatched  = snap.get("fs_dispatched")
     prev_scan_proc  = snap.get("scan_proc")
     prev_fs_proc     = snap.get("fs_proc")
     prev_detail_proc = snap.get("detail_proc")
@@ -1715,11 +1796,32 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             + (f"scan_worker +{proc_delta} processed" if proc_delta is not None else "scan_worker processed=unknown")
         )
         if stall >= 3 and valid >= 3:
-            issues.append(Issue(Issue.ERROR, "queue:poll:adaptive",
-                f"STALL — {summary}  ({stall}/{valid} signals agree: no progress since last cycle)",
-                "sudo systemctl restart recruiter-scheduler",
-                alert_type="queue_poll_adaptive_stall",
-            ))
+            # Vetoes: any sign of movement, or a deliberate halt, means a scheduler
+            # restart would not help (and would kill scans in progress).  Each only
+            # ever blocks a restart; none can cause one.
+            mid_scan   = _scan_workers_mid_scan(r)
+            disp_delta = _counter_delta(adp_dispatched, prev_adp_dispatched)  # None after a scheduler restart
+            halt       = _deliberate_halt(r, "scan")
+            if halt:
+                issues.append(Issue(Issue.OK, "queue:poll:adaptive",
+                    f"{summary}  [no restart: {halt}]"))
+            elif disp_delta:
+                # Stall signals agree but the dispatcher is handing out work: no restart, yet not healthy.
+                issues.append(Issue(Issue.WARNING, "queue:poll:adaptive",
+                    f"{summary}  [no restart: dispatcher handed out +{disp_delta} since last cycle, "
+                    f"but {stall}/{valid} signals say no progress]"))
+            elif mid_scan:
+                issues.append(Issue(Issue.WARNING, "queue:poll:adaptive",
+                    f"BUSY — {summary}  ({stall}/{valid} signals say no progress, but "
+                    f"{mid_scan} scan_worker(s) are mid-scan with a fresh progress report; "
+                    "not restarting — capacity, not a scheduler stall)"))
+            else:
+                issues.append(Issue(Issue.ERROR, "queue:poll:adaptive",
+                    f"STALL — {summary}  ({stall}/{valid} signals agree: no progress since last cycle; "
+                    "no worker mid-scan, dispatcher idle, no deliberate halt)",
+                    "sudo systemctl restart recruiter-scheduler",
+                    alert_type="queue_poll_adaptive_stall",
+                ))
         elif stall >= 2 and valid >= 2:
             issues.append(Issue(Issue.WARNING, "queue:poll:adaptive",
                 f"DEGRADED — {summary}  ({stall}/{valid} signals: likely stalling)"))
@@ -1766,11 +1868,24 @@ def check_queue_health(r, persist_snapshot: bool = True) -> list:
             + (f"fullscan_worker +{proc_delta} scans" if proc_delta is not None else "fullscan_worker scans=unknown")
         )
         if stall >= 3 and valid >= 3:
-            issues.append(Issue(Issue.ERROR, "queue:poll:fullscan",
-                f"STALL — {summary}  ({stall}/{valid} signals agree: no progress since last cycle)",
-                "sudo systemctl restart recruiter-scheduler",
-                alert_type="queue_poll_fullscan_stall",
-            ))
+            # Vetoes (same as poll:adaptive): a deliberate halt or dispatcher
+            # progress means a restart would not help.  The mid-scan veto is the
+            # fullscan:lock check above.  Vetoes only block a restart.
+            fs_disp_delta = _counter_delta(fs_dispatched, prev_fs_dispatched)  # None after a scheduler restart
+            fs_halt       = _deliberate_halt(r, "fullscan")
+            if fs_halt:
+                issues.append(Issue(Issue.OK, "queue:poll:fullscan",
+                    f"{summary}  [no restart: {fs_halt}]"))
+            elif fs_disp_delta:
+                issues.append(Issue(Issue.WARNING, "queue:poll:fullscan",
+                    f"{summary}  [no restart: dispatcher handed out +{fs_disp_delta} since last cycle, "
+                    f"but {stall}/{valid} signals say no progress]"))
+            else:
+                issues.append(Issue(Issue.ERROR, "queue:poll:fullscan",
+                    f"STALL — {summary}  ({stall}/{valid} signals agree: no progress since last cycle)",
+                    "sudo systemctl restart recruiter-scheduler",
+                    alert_type="queue_poll_fullscan_stall",
+                ))
         elif stall >= 2 and valid >= 2:
             issues.append(Issue(Issue.WARNING, "queue:poll:fullscan",
                 f"DEGRADED — {summary}  ({stall}/{valid} signals: likely stalling)"))

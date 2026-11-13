@@ -936,7 +936,7 @@ def _build_adaptive_health_section() -> str:
             'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
             'Detection Age Distribution &nbsp;'
             '<span style="font-weight:400;font-size:10px;">'
-            '(posting time to insert time, so includes detail-queue delay; '
+            '(posting time to scan-insert time, not including detail-queue delay; '
             'only platforms that publish a posting time of day)</span></p>'
         )
 
@@ -1122,15 +1122,18 @@ def _build_adaptive_health_section() -> str:
                 'text-transform:uppercase;letter-spacing:0.5px;margin:14px 0 4px;">'
                 'Early-Exit Validation &nbsp;'
                 '<span style="font-weight:400;font-size:10px;">'
-                '(upper bound: full-scan inserts of jobs posted over 36h earlier, '
-                'listing-date platforms only — should be near zero)</span></p>'
+                '(indicator, not a bound: full-scan inserts of jobs posted well before the scan '
+                '(lag threshold as configured when each snapshot was taken), '
+                'listing-date platforms only; misses recovered sooner are not counted. '
+                'Other causes (long poll interval, failed scan, filter error) can also '
+                'qualify, so these are not confirmed early-exit misses)</span></p>'
             )
             sections.append(
                 '<table width="100%" cellpadding="0" cellspacing="0" '
                 'style="border-collapse:collapse;font-size:12px;">'
                 f'<tr>'
                 f'<th style="{th_style}">Platform</th>'
-                f'<th style="{th_style}">Missed by Early Exit</th>'
+                f'<th style="{th_style}">Delayed Full-Scan Discoveries (indicator)</th>'
                 f'<th style="{th_style}">Total New Jobs</th>'
                 f'<th style="{th_style}">Missed Rate</th>'
                 f'<th style="{th_style}">Days</th>'

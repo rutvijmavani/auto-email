@@ -73,8 +73,12 @@ def wake_k(tick: float) -> int:
 
 
 def refill(tokens: float, elapsed_s: float, tick: float, cap: float) -> float:
-    """Tokens after elapsed_s of refill at one per tick, capped at capacity."""
-    return min(cap, tokens + max(0.0, elapsed_s) / tick)
+    """Tokens after elapsed_s of refill at one per tick, capped at capacity.
+
+    Tokens already above a reduced capacity are kept, never cut (a lower ceiling
+    only stops further refill); they are spent by later releases.
+    """
+    return max(tokens, min(cap, tokens + max(0.0, elapsed_s) / tick))
 
 
 # ── Redis state ──────────────────────────────────────────────────────────────
